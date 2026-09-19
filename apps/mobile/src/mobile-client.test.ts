@@ -4,7 +4,7 @@ import {
   CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
-  JOKO_API_VERSION, NativeSessionBindingSchema, OperationSchema,
+  JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
   EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
@@ -12,7 +12,7 @@ import {
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  TargetState, WorkspaceKind, capabilityNames
+  TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -248,7 +248,9 @@ const runtimeBackend = create(BackendDescriptorSchema, {
       create(CapabilitySchema, { name: capabilityNames.contextUsage, support: CapabilitySupport.SUPPORTED,
         options: { kind: { case: "context", value: { reportsBoundary: true } } } }),
       create(CapabilitySchema, { name: capabilityNames.contextCompact, support: CapabilitySupport.SUPPORTED,
-        options: { kind: { case: "context", value: { manual: true } } } })
+        options: { kind: { case: "context", value: { manual: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.sessionTree, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.sessionRewind, support: CapabilitySupport.SUPPORTED })
     ]
   })
 });
@@ -295,6 +297,43 @@ function runtimeControlProjection(currentSession = runtimeSession, detail = fals
         })]
       })
     })
+  });
+}
+
+function branchTree(revision: bigint, etag: string, activeEntryId: "native-current" | "native-alternate") {
+  return create(NativeSessionTreeSchema, {
+    sessionId: "session",
+    activeEntryId,
+    revision: create(RevisionSchema, { value: revision, etag }),
+    ...nativeSessionTreeWireFields([{
+      ...create(NativeSessionTreeNodeSchema, {
+        entryId: "native-root",
+        kind: NativeEntryKind.USER_MESSAGE,
+        summary: "Initial prompt",
+        createdAt: { seconds: 1n }
+      }),
+      children: [{
+        ...create(NativeSessionTreeNodeSchema, {
+          entryId: "native-current",
+          parentEntryId: "native-root",
+          kind: NativeEntryKind.ASSISTANT_MESSAGE,
+          summary: "Current answer",
+          active: activeEntryId === "native-current",
+          createdAt: { seconds: 2n }
+        }),
+        children: []
+      }, {
+        ...create(NativeSessionTreeNodeSchema, {
+          entryId: "native-alternate",
+          parentEntryId: "native-root",
+          kind: NativeEntryKind.ASSISTANT_MESSAGE,
+          summary: "Alternate answer",
+          active: activeEntryId === "native-alternate",
+          createdAt: { seconds: 3n }
+        }),
+        children: []
+      }]
+    }])
   });
 }
 
@@ -347,6 +386,21 @@ function fakeNetwork(): MobileNetwork {
     completePairing: vi.fn(async () => ({ credential, identity: node })),
     readOwner: vi.fn(async () => ({ connection, device, snapshot })),
     readSession: vi.fn(async () => snapshot),
+    readNativeSessionTree: vi.fn(async () => create(NativeSessionTreeSchema, {
+      sessionId: "session",
+      activeEntryId: "native-current",
+      revision: create(RevisionSchema, { value: 9n, etag: "session-r9" }),
+      ...nativeSessionTreeWireFields([{
+        ...create(NativeSessionTreeNodeSchema, {
+          entryId: "native-current",
+          kind: NativeEntryKind.USER_MESSAGE,
+          summary: "Current prompt",
+          active: true,
+          createdAt: { seconds: 1n }
+        }),
+        children: []
+      }])
+    })),
     readHistory: vi.fn(async () => ({ events: [], before: undefined })),
     readAround: vi.fn(async () => []),
     searchSessionMessages: vi.fn(async () => []),
@@ -2194,6 +2248,173 @@ describe("native current-task context usage and compaction", () => {
       usage: { usedTokens: 50_000n, contextWindowTokens: 100_000n, percent: 50 }
     });
     expect(app.state.error).toBe("Context changed before compaction.");
+  });
+});
+
+describe("native current-task branch navigation", () => {
+  const ids = () => {
+    let value = 0;
+    return () => `session-branch-${++value}`;
+  };
+
+  it("loads the exact tree and navigates with revision, generation, and explicit summary input", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let current = runtimeSession;
+    let activeEntryId: "native-current" | "native-alternate" = "native-current";
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(current, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(current, true));
+    network.readNativeSessionTree = vi.fn(async () => branchTree(
+      current.version!.revision!.value,
+      current.version!.revision!.etag,
+      activeEntryId
+    ));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId) => {
+      current = create(SessionSchema, {
+        ...current,
+        version: create(EntityVersionSchema, {
+          revision: create(RevisionSchema, { value: 10n, etag: "session-r10" }),
+          generation: 8n
+        })
+      });
+      activeEntryId = "native-alternate";
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+      });
+    });
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    const controls = app.taskNativeTreeControls();
+    expect(controls).toMatchObject({ canNavigate: true });
+    const tree = await app.loadTaskNativeTree(controls!.authorityKey);
+    expect(tree.rows.map((row) => row.entryId)).toEqual(["native-root", "native-current", "native-alternate"]);
+    expect(tree.activeEntryId).toBe("native-current");
+
+    await expect(app.navigateTaskNativeTree(
+      controls!.authorityKey,
+      tree,
+      "native-alternate",
+      true,
+      "  Preserve the test evidence  "
+    )).resolves.toBe("navigated");
+
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedRevision: { value: 9n, etag: "session-r9" },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "navigateSessionBranch", value: {
+        sessionId: "session",
+        target: { kind: { case: "nativeEntryId", value: "native-alternate" } },
+        summarize: true,
+        customInstructions: "Preserve the test evidence"
+      } }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskNativeTreeControls()?.session.version?.revision).toMatchObject({ value: 10n, etag: "session-r10" });
+    const refreshed = await app.loadTaskNativeTree(app.taskNativeTreeControls()!.authorityKey);
+    expect(refreshed.activeEntryId).toBe("native-alternate");
+  });
+
+  it("retains an unknown branch receipt and never replays navigation", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.readNativeSessionTree = vi.fn(async () => branchTree(9n, "session-r9", "native-current"));
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "session-branch-1",
+      connectionId: credential.connectionId,
+      state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("operation watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const controls = app.taskNativeTreeControls()!;
+    const tree = await app.loadTaskNativeTree(controls.authorityKey);
+
+    await expect(app.navigateTaskNativeTree(
+      controls.authorityKey, tree, "native-alternate", false, "must not persist"
+    )).resolves.toBe("unknown");
+    expect(saved.pending()).toMatchObject([{
+      kind: "session-branch", sessionId: "session", state: "accepted"
+    }]);
+    await expect(app.navigateTaskNativeTree(
+      controls.authorityKey, tree, "native-alternate", false, ""
+    )).rejects.toThrow(/still pending/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles a saved branch receipt after restart without dispatching it again", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    await saved.storage.savePending([{
+      operationId: "branch-before-restart",
+      connectionId: credential.connectionId,
+      kind: "session-branch",
+      sessionId: "session",
+      state: "accepted"
+    }]);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, {
+      operationId: "branch-before-restart",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+
+    await app.start();
+
+    expect(saved.pending()).toEqual([]);
+    expect(network.getOperation).toHaveBeenCalledWith(credential, "branch-before-restart", expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps the loaded tree on rejection and fails closed without a typed acknowledgement", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.readNativeSessionTree = vi.fn(async () => branchTree(9n, "session-r9", "native-current"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const controls = app.taskNativeTreeControls()!;
+    const tree = await app.loadTaskNativeTree(controls.authorityKey);
+
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "session-branch-1",
+      connectionId: credential.connectionId,
+      state: OperationState.FAILED,
+      error: { code: "CONFLICT", message: "Native tree changed before navigation." }
+    }));
+    await expect(app.navigateTaskNativeTree(
+      controls.authorityKey, tree, "native-alternate", false, ""
+    )).resolves.toBe("rejected");
+    expect(tree.activeEntryId).toBe("native-current");
+    expect(saved.pending()).toEqual([]);
+
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "session-branch-2",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    await expect(app.navigateTaskNativeTree(
+      app.taskNativeTreeControls()!.authorityKey,
+      tree,
+      "native-alternate",
+      false,
+      ""
+    )).rejects.toThrow(/typed acknowledgement/u);
+    expect(saved.pending()).toEqual([]);
   });
 });
 

@@ -52,6 +52,7 @@ import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
 import { MobileContextSheet } from "./MobileContextSheet";
+import { MobileNativeTreeSheet } from "./MobileNativeTreeSheet";
 import {
   mobileInteractionDraftIdentity,
   mobileInteractionDraftIdentityKey,
@@ -772,6 +773,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [contextVisible, setContextVisible] = useState(false);
+  const [nativeTreeVisible, setNativeTreeVisible] = useState(false);
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -858,6 +860,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const runtimeControlsOwnerRef = useRef(runtimeControls?.surfaceOwnerKey);
   const contextControls = client.taskContextControls();
   const contextOwnerRef = useRef(contextControls?.surfaceOwnerKey);
+  const nativeTreeControls = client.taskNativeTreeControls();
+  const nativeTreeOwnerRef = useRef(nativeTreeControls?.surfaceOwnerKey);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -878,8 +882,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     && item.interactionId === activeInteractionId
     && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
   const runtimeControlPending = state.pending.some((item) => item.sessionId === state.selectedId
-    && ["session-model", "session-permission", "session-plan", "session-compact"].includes(item.kind));
+    && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind));
   const contextPending = runtimeControlPending;
+  const nativeTreePending = runtimeControlPending;
   const runtimeControlsAvailable = runtimeControls !== undefined && (runtimeControls.canSwitchModel
     || runtimeControls.canSetEffort || runtimeControls.canSetFastMode
     || runtimeControls.canSetPermission || runtimeControls.canSetPlanMode);
@@ -902,6 +907,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     }
     setRuntimeControlsVisible(false);
     setContextVisible(false);
+    setNativeTreeVisible(false);
     if (ownerChanged) {
       setSelectedInteractionId(interactions[0]!.interactionId);
       setInteractionVisible(true);
@@ -924,6 +930,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     contextOwnerRef.current = next;
     if (changed || next === undefined) setContextVisible(false);
   }, [contextControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const next = nativeTreeControls?.surfaceOwnerKey;
+    const changed = nativeTreeOwnerRef.current !== next;
+    nativeTreeOwnerRef.current = next;
+    if (changed || next === undefined) setNativeTreeVisible(false);
+  }, [nativeTreeControls?.surfaceOwnerKey]);
   useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
@@ -1171,10 +1183,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state) : "Loading…"}</Text>
       </View>
       <View style={styles.headerActions}>
+        <Action label="Branches"
+          onPress={() => { setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
+          disabled={nativeTreeControls === undefined || state.busy || interactions.length > 0} />
         <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
-          onPress={() => { setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
+          onPress={() => { setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
           disabled={contextControls === undefined || state.busy || interactions.length > 0} />
-        <Action label="Controls" onPress={() => { setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
+        <Action label="Controls" onPress={() => { setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
           disabled={!runtimeControlsAvailable || state.busy || interactions.length > 0} />
         {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
@@ -1331,6 +1346,18 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       controls={contextControls} busy={state.busy || contextPending} colors={colors}
       onClose={() => setContextVisible(false)}
       onCompact={(authorityKey) => client.compactTaskContext(authorityKey)}
+      onError={setLocalError} />
+    <MobileNativeTreeSheet visible={nativeTreeVisible && nativeTreeControls !== undefined}
+      controls={nativeTreeControls} busy={state.busy || nativeTreePending} colors={colors}
+      onClose={() => setNativeTreeVisible(false)}
+      onLoad={(authorityKey) => client.loadTaskNativeTree(authorityKey)}
+      onNavigate={(authorityKey, tree, entryId, summarize, customInstructions) => client.navigateTaskNativeTree(
+        authorityKey,
+        tree,
+        entryId,
+        summarize,
+        customInstructions
+      )}
       onError={setLocalError} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}

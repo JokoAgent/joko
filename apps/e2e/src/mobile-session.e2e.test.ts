@@ -4,13 +4,14 @@ import { create } from "@bufbuild/protobuf";
 import {
   CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
-  EventCursorSchema, InteractionResolutionSchema, InteractionState, OperationMutationSchema,
+  EventCursorSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
+  NavigateSessionBranchMutationSchema, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
   PermissionMode,
   PlanReviewResolutionSchema, QueueItemState, QuestionAnswerSchema, QuestionMultipleChoiceAnswerSchema,
   QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
   MessageRole, QueueDeliveryMode, RunState, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
-  capabilityNames, type Interaction, type OperationMutation
+  capabilityNames, nativeSessionTreeRoots, type Interaction, type OperationMutation
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext, PromptInput } from "@joko/core";
@@ -747,5 +748,99 @@ describe("native mobile device through the durable product chain", () => {
     expect(storedCompactions.map((event) => event.payload.type === "compaction" ? event.payload.state : undefined))
       .toEqual(["started", "completed"]);
     expect(after?.sessions.find((session) => session.sessionId === sessionId)?.contextState?.compacting).toBe(false);
+  });
+
+  it("reads and navigates native branches through HTTP, SQLite, and the Session Host", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const paired = await fixture.pair("Joko branch phone");
+    const adapter = fixture.adapter();
+    let activeEntryId = "native-current";
+    vi.spyOn(adapter, "getTree").mockImplementation(async () => ({
+      roots: [{
+        entryId: "native-root", kind: "message", role: "user", label: "Initial prompt", timestamp: 1,
+        children: [
+          { entryId: "native-current", parentId: "native-root", kind: "message", role: "assistant",
+            label: "Current answer", timestamp: 2, children: [] },
+          { entryId: "native-alternate", parentId: "native-root", kind: "message", role: "assistant",
+            label: "Alternate answer", timestamp: 3, children: [] }
+        ]
+      }],
+      leafId: activeEntryId
+    }));
+    const navigateTree = vi.spyOn(adapter, "navigateTree").mockImplementation(async (target) => {
+      activeEntryId = target.kind === "native_entry" ? target.entryId : "";
+      return { kind: "in_place" };
+    });
+    const sessionId = sessionIdFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId(), displayName: "Mobile branches" })
+    ));
+    const scope = { kind: { case: "session" as const, value: { sessionId, recentTimelineItems: 120 } } };
+    const before = (await paired.clients.event.getSnapshot({ scope })).snapshot;
+    const current = before?.sessions.find((session) => session.sessionId === sessionId);
+    const revision = current?.version?.revision;
+    const generation = current?.nativeBinding?.runtimeGeneration;
+    if (!revision || !generation) throw new Error("The mobile branch task has no exact Session authority.");
+
+    const capabilities = before?.backends.find((backend) => backend.backendId === adapter.id)
+      ?.capabilities?.capabilities ?? [];
+    expect(capabilities).toContainEqual(expect.objectContaining({
+      name: capabilityNames.sessionTree,
+      support: CapabilitySupport.SUPPORTED
+    }));
+    expect(capabilities).toContainEqual(expect.objectContaining({
+      name: capabilityNames.sessionRewind,
+      support: CapabilitySupport.SUPPORTED
+    }));
+
+    const initial = (await paired.clients.session.getNativeSessionTree({ sessionId })).tree;
+    if (!initial) throw new Error("The mobile branch task returned no native tree.");
+    expect(initial.revision).toEqual(revision);
+    expect(initial.activeEntryId).toBe("native-current");
+    expect(nativeSessionTreeRoots(initial)[0]).toMatchObject({
+      entryId: "native-root",
+      children: [
+        { entryId: "native-current", active: true },
+        { entryId: "native-alternate", active: false }
+      ]
+    });
+
+    const operation = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      preconditions: [create(OperationPreconditionSchema, {
+        entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+        expectedRevision: revision,
+        expectedGeneration: generation
+      })],
+      payload: { case: "navigateSessionBranch", value: create(NavigateSessionBranchMutationSchema, {
+        sessionId,
+        target: create(NativeNavigationTargetSchema, { kind: { case: "nativeEntryId", value: "native-alternate" } }),
+        summarize: true,
+        customInstructions: "  Preserve mobile verification evidence  "
+      }) }
+    }));
+
+    expect(operation.state).toBe(OperationState.SUCCEEDED);
+    expect(operation.result?.payload).toMatchObject({
+      case: "acknowledgement",
+      value: { accepted: true }
+    });
+    expect(fixture.application.store.getOperation(operation.operationId).status).toBe("completed");
+    expect(navigateTree).toHaveBeenCalledWith(
+      { kind: "native_entry", entryId: "native-alternate" },
+      true,
+      expect.anything(),
+      "Preserve mobile verification evidence",
+      expect.anything()
+    );
+
+    const refreshed = (await paired.clients.session.getNativeSessionTree({ sessionId })).tree;
+    expect(refreshed?.activeEntryId).toBe("native-alternate");
+    const after = (await paired.clients.event.getSnapshot({ scope })).snapshot;
+    expect(refreshed?.revision).toEqual(after?.sessions.find((session) => session.sessionId === sessionId)?.version?.revision);
+    expect(nativeSessionTreeRoots(refreshed!)[0]?.children).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entryId: "native-current", active: false }),
+      expect.objectContaining({ entryId: "native-alternate", active: true })
+    ]));
   });
 });

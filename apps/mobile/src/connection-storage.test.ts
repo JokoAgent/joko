@@ -281,6 +281,8 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "plan", connectionId: first.connectionId, kind: "session-plan" as const,
         sessionId: "session-one", state: "unknown" as const },
       { operationId: "compact", connectionId: first.connectionId, kind: "session-compact" as const,
+        sessionId: "session-one", state: "accepted" as const },
+      { operationId: "branch", connectionId: first.connectionId, kind: "session-branch" as const,
         sessionId: "session-one", state: "accepted" as const }
     ];
 
@@ -291,10 +293,12 @@ describe("current-v1 mobile connection storage", () => {
     expect(persisted).not.toContain("permissionMode");
     expect(persisted).not.toContain("fastMode");
     expect(persisted).not.toContain("customInstructions");
+    expect(persisted).not.toContain("nativeEntryId");
 
     memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
       ...receipts,
-      { operationId: "missing-session", connectionId: first.connectionId, kind: "session-model", state: "unknown" }
+      { operationId: "missing-session", connectionId: first.connectionId, kind: "session-model", state: "unknown" },
+      { operationId: "branch-without-session", connectionId: first.connectionId, kind: "session-branch", state: "unknown" }
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });

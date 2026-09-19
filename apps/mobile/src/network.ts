@@ -7,7 +7,7 @@ import {
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
-  type SessionMessageSearchMatch, type Snapshot, type Target, type WorkspaceEntry, type WorkspaceFileChange,
+  type NativeSessionTree, type SessionMessageSearchMatch, type Snapshot, type Target, type WorkspaceEntry, type WorkspaceFileChange,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
@@ -43,6 +43,7 @@ export interface MobileNetwork {
   completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
   readOwner(credential: PairedCredential, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
+  readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
@@ -497,6 +498,13 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The selected task is no longer available on this Joko node.");
     }
     return response.snapshot;
+  },
+  async readNativeSessionTree(credential, sessionId, signal) {
+    if (!sessionId) throw new Error("A current task is required for native branches.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .getNativeSessionTree({ sessionId }, options(signal));
+    if (!response.tree) throw new Error("The Joko node returned no native branch tree.");
+    return response.tree;
   },
   async readHistory(credential, sessionId, before, signal) {
     const response = await createClient(SessionService, transport(credential.origin, credential.authKey)).listSessionTimeline({

@@ -7,7 +7,7 @@ import {
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   InputContentSchema, InputPartSchema, ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
-  LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
+  LogoutConnectionMutationSchema, NavigateSessionBranchMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
@@ -76,6 +76,13 @@ import {
   type MobileCompactOutcome,
   type MobileContextControls
 } from "./mobile-context-controls";
+import {
+  assertMobileNativeTreeNavigation,
+  projectMobileNativeTree,
+  resolveMobileNativeTreeControls,
+  type MobileNativeTreeControls,
+  type MobileNativeTreeSnapshot
+} from "./mobile-native-tree";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -1820,6 +1827,64 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
+  taskNativeTreeControls(): MobileNativeTreeControls | undefined {
+    const credential = this.#credential;
+    if (!credential || !this.#taskAuthorityKey()) return undefined;
+    return resolveMobileNativeTreeControls({
+      profileId: credential.profileId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      serverId: credential.serverId
+    }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  async loadTaskNativeTree(authorityKey: string): Promise<MobileNativeTreeSnapshot> {
+    const controls = this.#nativeTreeContext(authorityKey);
+    const credential = this.#ready();
+    const epoch = this.#epoch;
+    const tree = await this.network.readNativeSessionTree(
+      credential,
+      controls.session.sessionId,
+      this.#abort?.signal
+    );
+    const current = this.taskNativeTreeControls();
+    if (!this.#current(epoch) || !current || current.authorityKey !== authorityKey) {
+      throw new Error("The task branch owner changed while its tree was loading.");
+    }
+    return projectMobileNativeTree(current, tree);
+  }
+
+  async navigateTaskNativeTree(
+    authorityKey: string,
+    tree: MobileNativeTreeSnapshot,
+    entryId: string,
+    summarize: boolean,
+    customInstructions: string
+  ): Promise<"navigated" | "rejected" | "unknown"> {
+    const controls = this.#nativeTreeContext(authorityKey);
+    const navigation = assertMobileNativeTreeNavigation(controls, tree, entryId, summarize, customInstructions);
+    this.#assertNoPendingRuntimeControl(controls.session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(controls.session)],
+        payload: { case: "navigateSessionBranch", value: create(NavigateSessionBranchMutationSchema, {
+          sessionId: controls.session.sessionId,
+          target: { kind: { case: "nativeEntryId", value: navigation.entryId } },
+          summarize: navigation.summarize,
+          customInstructions: navigation.customInstructions
+        }) }
+      }), { kind: "session-branch", sessionId: controls.session.sessionId });
+      if (!result.definitive) return "unknown";
+      if (!result.accepted) return "rejected";
+      if (result.operation?.state !== OperationState.SUCCEEDED
+        || result.operation.result?.payload.case !== "acknowledgement") {
+        throw new Error("The Joko node completed branch navigation without a typed acknowledgement.");
+      }
+      return "navigated";
+    } finally { this.#releaseMutation(action); }
+  }
+
   taskInteractions(): readonly Interaction[] {
     return pendingMobileInteractions(this.#state.detail, this.#state.selectedId);
   }
@@ -2149,6 +2214,15 @@ export class MobileClient {
     return controls;
   }
 
+  #nativeTreeContext(expectedAuthorityKey: string): MobileNativeTreeControls {
+    this.#ready();
+    const controls = this.taskNativeTreeControls();
+    if (!controls || !expectedAuthorityKey || controls.authorityKey !== expectedAuthorityKey) {
+      throw new Error("The task branch owner changed. Reopen branches from the current task.");
+    }
+    return controls;
+  }
+
   #sessionRuntimePrecondition(session: Session) {
     const revision = session.version?.revision;
     const generation = session.nativeBinding?.runtimeGeneration;
@@ -2165,7 +2239,7 @@ export class MobileClient {
 
   #assertNoPendingRuntimeControl(sessionId: string): void {
     if (this.#state.pending.some((item) => item.sessionId === sessionId
-      && ["session-model", "session-permission", "session-plan", "session-compact"].includes(item.kind))) {
+      && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
     }
   }
@@ -2956,7 +3030,7 @@ export class MobileClient {
           if (operation.state === OperationState.SUCCEEDED
             && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
-              "session-model", "session-permission", "session-plan", "session-compact"].includes(pending.kind)
+              "session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if (pending.kind === "message-delete" && this.#foreground
