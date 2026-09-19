@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import {
-  AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, KeyboardAvoidingView, Modal, Platform,
+  AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, Keyboard, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
   useWindowDimensions, View
 } from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
 import { randomUUID } from "expo-crypto";
@@ -28,7 +28,24 @@ import {
 } from "./connection-artwork";
 import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
-import { mobileStorage } from "./storage";
+import { mobileComposerDrafts, mobileStorage } from "./storage";
+import {
+  mobileComposerDraftIdentityKey,
+  type MobileComposerDraftIdentity
+} from "./composer-draft-store";
+import { addToMobileComposer, changeMobileComposerText } from "./composer-draft-behavior";
+import {
+  accessibleComposerHeight,
+  buildComposerResizeGestureConfig,
+  composerAutomaticMaximumHeight,
+  composerMinimumInputHeight,
+  computeComposerResizeBounds,
+  resizeComposerHeight,
+  resolveComposerHeight,
+  settleComposerHeight,
+  shouldDismissComposerKeyboard
+} from "./composer-layout";
+import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
@@ -70,8 +87,16 @@ export function App() {
   useEffect(() => {
     client.setForeground(AppState.currentState === "active");
     void client.start();
-    const subscription = AppState.addEventListener("change", (status) => client.setForeground(status === "active"));
-    return () => { subscription.remove(); client.setForeground(false); };
+    const subscription = AppState.addEventListener("change", (status) => {
+      const foreground = status === "active";
+      client.setForeground(foreground);
+      if (!foreground) void mobileComposerDrafts.flush().catch(() => undefined);
+    });
+    return () => {
+      subscription.remove();
+      client.setForeground(false);
+      void mobileComposerDrafts.flush().catch(() => undefined);
+    };
   }, []);
 
   useEffect(() => {
@@ -698,7 +723,17 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
 function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: () => void;
 }) {
-  const [draft, setDraft] = useState("");
+  const initialDraftIdentity = state.activeProfileId && state.selectedId
+    ? { profileId: state.activeProfileId, sessionId: state.selectedId }
+    : undefined;
+  const [draft, setDraft] = useState(() => initialDraftIdentity
+    ? mobileComposerDrafts.readSync(initialDraftIdentity) ?? ""
+    : "");
+  const [loadedDraftKey, setLoadedDraftKey] = useState(() => initialDraftIdentity
+    ? mobileComposerDraftIdentityKey(initialDraftIdentity)
+    : undefined);
+  const [draftReady, setDraftReady] = useState(() => initialDraftIdentity === undefined
+    || mobileComposerDrafts.readSync(initialDraftIdentity) !== null);
   const [localError, setLocalError] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMounted, setDrawerMounted] = useState(false);
@@ -706,11 +741,74 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [messageActionsVisible, setMessageActionsVisible] = useState(false);
   const [queueEdit, setQueueEdit] = useState<{
     readonly lease: MobileQueueEditLease;
+    readonly profileId: string;
     readonly stashedDraft: string;
   }>();
+  const [composerContentHeight, setComposerContentHeight] = useState(composerMinimumInputHeight);
+  const [composerManualHeight, setComposerManualHeight] = useState<number | null>(null);
   const queueEditRef = useRef(queueEdit);
+  const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
-  const { width } = useWindowDimensions();
+  const keyboard = useMobileKeyboardState();
+  const safeArea = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  const draftIdentity = state.activeProfileId && state.selectedId
+    ? { profileId: state.activeProfileId, sessionId: state.selectedId }
+    : undefined;
+  const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
+  draftIdentityRef.current = draftIdentity;
+  const composerBounds = computeComposerResizeBounds({
+    windowHeight: height,
+    keyboardHeight: keyboard.height,
+    composerChromeHeight: 76 + safeArea.top + (keyboard.visible ? 0 : safeArea.bottom)
+  });
+  const composerHeight = resolveComposerHeight({
+    contentHeight: composerContentHeight,
+    manualHeight: composerManualHeight,
+    automaticMaximumHeight: composerAutomaticMaximumHeight,
+    bounds: composerBounds
+  });
+  const composerBoundsRef = useRef(composerBounds);
+  const composerHeightRef = useRef(composerHeight.visibleHeight);
+  const composerContentHeightRef = useRef(composerContentHeight);
+  const composerDragStartRef = useRef(composerHeight.visibleHeight);
+  const composerDraggedHeightRef = useRef(composerHeight.visibleHeight);
+  composerBoundsRef.current = composerBounds;
+  composerHeightRef.current = composerHeight.visibleHeight;
+  composerContentHeightRef.current = composerContentHeight;
+  const composerResizeResponder = useMemo(() => PanResponder.create(buildComposerResizeGestureConfig({
+    onGrant: () => {
+      composerDragStartRef.current = composerHeightRef.current;
+      composerDraggedHeightRef.current = composerHeightRef.current;
+    },
+    onMove: (translationY) => {
+      const next = resizeComposerHeight({
+        startHeight: composerDragStartRef.current,
+        translationY,
+        bounds: composerBoundsRef.current
+      });
+      composerDraggedHeightRef.current = next;
+      setComposerManualHeight(next);
+    },
+    onEnd: (translationY) => {
+      const draggedHeight = resizeComposerHeight({
+        startHeight: composerDragStartRef.current,
+        translationY,
+        bounds: composerBoundsRef.current
+      });
+      composerDraggedHeightRef.current = draggedHeight;
+      setComposerManualHeight(settleComposerHeight({
+        draggedHeight,
+        contentHeight: composerContentHeightRef.current,
+        bounds: composerBoundsRef.current
+      }));
+      if (shouldDismissComposerKeyboard({
+        draggedHeight,
+        translationY,
+        bounds: composerBoundsRef.current
+      })) Keyboard.dismiss();
+    }
+  })), []);
   const wideNavigation = buildWideSessionNavLayout({ platform: Platform.OS, iosPad: Platform.OS === "ios" && Platform.isPad, windowWidth: width });
   const drawerWidthRef = useRef(wideNavigation.drawerWidth || 300);
   if (wideNavigation.enabled) drawerWidthRef.current = wideNavigation.drawerWidth;
@@ -728,6 +826,47 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const messageActionItems = messageAction
     ? buildMobileMessageActions(messageAction.row, { canDelete: client.canDeleteMessage(messageAction.row.eventId) })
     : [];
+  useEffect(() => mobileComposerDrafts.subscribeErrors((identity, error) => {
+    if (!taskMountedRef.current || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
+    setLocalError(error.message);
+  }), [draftIdentityKey]);
+  useEffect(() => {
+    const identity = draftIdentity;
+    draftIdentityRef.current = identity;
+    setComposerManualHeight(null);
+    setComposerContentHeight(composerMinimumInputHeight);
+    if (!identity) {
+      if (!queueEditRef.current) setDraft("");
+      setLoadedDraftKey(undefined);
+      setDraftReady(true);
+      return;
+    }
+    let current = true;
+    const key = mobileComposerDraftIdentityKey(identity);
+    const cached = mobileComposerDrafts.readSync(identity);
+    if (!queueEditRef.current) setDraft(cached ?? "");
+    setLoadedDraftKey(key);
+    setDraftReady(cached !== null);
+    void mobileComposerDrafts.read(identity).then((stored) => {
+      if (!current || !taskMountedRef.current || queueEditRef.current
+        || draftIdentityRef.current === undefined
+        || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== key) return;
+      setDraft(stored ?? "");
+      setLoadedDraftKey(key);
+      setDraftReady(true);
+    }).catch((error) => {
+      if (!current || !taskMountedRef.current || draftIdentityRef.current === undefined
+        || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== key) return;
+      setDraftReady(true);
+      setLoadedDraftKey(key);
+      setLocalError(errorText(error));
+    });
+    return () => {
+      current = false;
+      void mobileComposerDrafts.flush(identity).catch(() => undefined);
+    };
+  }, [draftIdentityKey]);
+  const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady;
   useEffect(() => {
     if (!wideNavigation.enabled && drawerOpen) setDrawerOpen(false);
   }, [drawerOpen, wideNavigation.enabled]);
@@ -750,11 +889,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     if (!authorityRetired && itemStillAccepted) return;
     queueEditRef.current = undefined;
     setQueueEdit(undefined);
-    setDraft(active.stashedDraft);
+    if (state.activeProfileId === active.profileId && state.selectedId === active.lease.sessionId) {
+      setDraft(active.stashedDraft);
+    }
     void client.cancelQueueEdit(active.lease).catch((error) => {
       if (taskMountedRef.current) setLocalError(errorText(error));
     });
-  }, [state.detail?.queueItems, state.selectedId, state.status]);
+  }, [state.activeProfileId, state.detail?.queueItems, state.selectedId, state.status]);
   useEffect(() => {
     taskMountedRef.current = true;
     return () => {
@@ -769,6 +910,26 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setMessageAction({ sessionId: state.selectedId, row });
     setMessageActionsVisible(true);
   };
+  const saveNormalDraft = (value: string, identity = draftIdentityRef.current): void => {
+    setDraft(value);
+    if (identity) mobileComposerDrafts.save(identity, value);
+  };
+  const appendToNormalDraft = (text: string): void => {
+    const active = queueEditRef.current;
+    const result = addToMobileComposer({
+      visibleText: draft,
+      ...(active ? { queueStashedDraft: active.stashedDraft } : {}),
+      addition: text
+    });
+    if (!active) {
+      saveNormalDraft(result.normalDraft);
+      return;
+    }
+    const updated = { ...active, stashedDraft: result.normalDraft };
+    queueEditRef.current = updated;
+    setQueueEdit(updated);
+    mobileComposerDrafts.save({ profileId: active.profileId, sessionId: active.lease.sessionId }, result.normalDraft);
+  };
   const runMessageAction = (action: MobileMessageActionId): void => {
     const selected = messageAction;
     setMessageAction(undefined);
@@ -778,7 +939,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       .find((row) => row.eventId === selected.row.eventId && row.completed);
     if (!latest) return;
     if (action === "add-to-composer") {
-      setDraft((current) => current ? `${current}\n\n${latest.text}` : latest.text);
+      appendToNormalDraft(latest.text);
       return;
     }
     if (!client.canDeleteMessage(latest.eventId)) {
@@ -800,15 +961,18 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     );
   };
   const beginQueueEdit = async (item: QueueItem): Promise<void> => {
+    const profileId = state.activeProfileId;
+    if (!profileId || !composerOwnerReady) return;
     const stashedDraft = draft;
     setLocalError("");
     try {
       const lease = await client.beginQueueEdit(item.queueItemId);
-      if (!taskMountedRef.current || client.state.selectedId !== lease.sessionId) {
+      if (!taskMountedRef.current || client.state.activeProfileId !== profileId
+        || client.state.selectedId !== lease.sessionId) {
         await client.cancelQueueEdit(lease).catch(() => undefined);
         return;
       }
-      const active = { lease, stashedDraft };
+      const active = { lease, profileId, stashedDraft };
       queueEditRef.current = active;
       setQueueEdit(active);
       setDraft(lease.text);
@@ -834,7 +998,17 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     const active = queueEditRef.current;
     try {
       if (!active) {
-        if (await client.send(draft)) setDraft("");
+        const identity = draftIdentityRef.current;
+        if (!await client.send(draft)) return;
+        if (!identity) {
+          setDraft("");
+          return;
+        }
+        const clearing = mobileComposerDrafts.clear(identity);
+        if (draftIdentityRef.current
+          && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity)
+          && !queueEditRef.current) setDraft("");
+        await clearing;
         return;
       }
       if (!await client.saveQueueEdit(active.lease, draft)) return;
@@ -858,7 +1032,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setDrawerOpen(false);
   };
   return <View style={styles.fill}>
-    <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === "ios" ? "padding" : undefined}
+    <MobileKeyboardAvoidingView style={styles.fill} keyboard={keyboard} consumedBottomInset={safeArea.bottom}
+      behavior={Platform.OS === "android" ? "height" : undefined}
       accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
     <View style={styles.header}>
       {wideNavigation.enabled ? <Pressable ref={drawerMenuRef} accessibilityRole="button" accessibilityLabel="Open task list"
@@ -950,14 +1125,47 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       <Action label="Cancel edit" colors={colors} compact disabled={state.busy} onPress={cancelQueueEdit} />
     </View>}
     <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-      <TextInput accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline value={draft} onChangeText={setDraft}
-        editable={!state.busy} placeholder={queueEdit ? "Edit queued input…" : "Message Joko…"} placeholderTextColor={colors.muted}
-        style={[styles.composerInput, { color: colors.ink }]} />
-      <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
-        disabled={!draft.trim() || (!queueEdit && unknown) || state.busy || state.status !== "connected"}
-        onPress={() => void submitComposer()} />
+      <View accessible accessibilityRole="adjustable" accessibilityLabel="Message input height"
+        accessibilityHint="Swipe up or down to resize. Accessibility actions resize or return to automatic height."
+        accessibilityActions={[{ name: "increment", label: "Increase height" }, { name: "decrement", label: "Decrease height" }, { name: "activate", label: "Use automatic height" }]}
+        accessibilityValue={{ min: composerBounds.minimumHeight, max: composerBounds.maximumHeight,
+          now: Math.round(composerHeight.visibleHeight), text: composerHeight.mode === "automatic" ? "Automatic height" : `Manual height ${Math.round(composerHeight.visibleHeight)}` }}
+        onAccessibilityAction={(event) => {
+          const direction = event.nativeEvent.actionName === "increment" ? "increase"
+            : event.nativeEvent.actionName === "decrement" ? "decrease" : "automatic";
+          setComposerManualHeight(accessibleComposerHeight({
+            currentHeight: composerHeight.visibleHeight,
+            direction,
+            bounds: composerBounds
+          }));
+        }}
+        style={styles.composerResizeHandle} {...composerResizeResponder.panHandlers}>
+        <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
+      </View>
+      <View style={styles.composerRow}>
+        <TextInput accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline
+          value={composerOwnerReady ? draft : ""}
+          onChangeText={(value) => {
+            const change = changeMobileComposerText(queueEditRef.current !== undefined, value);
+            setDraft(change.visibleText);
+            if (change.normalDraftToPersist !== null && draftIdentityRef.current) {
+              mobileComposerDrafts.save(draftIdentityRef.current, change.normalDraftToPersist);
+            }
+          }}
+          onContentSizeChange={(event) => setComposerContentHeight(Math.max(
+            composerMinimumInputHeight,
+            Math.ceil(event.nativeEvent.contentSize.height)
+          ))}
+          scrollEnabled={composerHeight.scrollEnabled}
+          editable={!state.busy && composerOwnerReady} placeholder={!composerOwnerReady ? "Restoring saved draft…" : queueEdit ? "Edit queued input…" : "Message Joko…"}
+          placeholderTextColor={colors.muted}
+          style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
+        <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
+          disabled={!composerOwnerReady || !draft.trim() || (!queueEdit && unknown) || state.busy || state.status !== "connected"}
+          onPress={() => void submitComposer()} />
+      </View>
     </View>
-    </KeyboardAvoidingView>
+    </MobileKeyboardAvoidingView>
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
@@ -1481,8 +1689,11 @@ const styles = StyleSheet.create({
   queueActions: { flexDirection: "row", flexWrap: "wrap", gap: 7, paddingTop: 3 },
   queueEditBanner: { minHeight: 52, borderTopWidth: 1, paddingHorizontal: 12, paddingVertical: 4, flexDirection: "row", alignItems: "center", gap: 10 },
   pendingReceipt: { gap: 4, paddingVertical: 4 },
-  composer: { flexDirection: "row", borderTopWidth: 1, paddingHorizontal: 12, paddingVertical: 8, alignItems: "flex-end", gap: 10 },
-  composerInput: { flex: 1, minHeight: 44, maxHeight: 144, fontSize: 16, paddingVertical: 8 },
+  composer: { borderTopWidth: 1, paddingHorizontal: 12, paddingBottom: 8 },
+  composerResizeHandle: { minHeight: 44, alignItems: "center", justifyContent: "center" },
+  composerGrabber: { width: 88, height: 4, borderRadius: 2 },
+  composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 10 },
+  composerInput: { flex: 1, minHeight: 44, fontSize: 16, lineHeight: 22, paddingVertical: 8 },
   sheetRoot: { flex: 1, justifyContent: "flex-end" },
   optionSheet: { borderTopWidth: 1, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 18, gap: 4 },
   dialogRoot: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: "rgba(0,0,0,0.38)" },

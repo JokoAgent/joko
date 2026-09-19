@@ -1,13 +1,18 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as SecureStore from "expo-secure-store";
 import { createMobileStorage } from "./connection-storage";
+import { MobileComposerDraftStore } from "./composer-draft-store";
+
+const plainStorage = {
+  getItem: (key: string) => AsyncStorage.getItem(key),
+  setItem: (key: string, value: string) => AsyncStorage.setItem(key, value),
+  removeItem: (key: string) => AsyncStorage.removeItem(key)
+};
+
+export const mobileComposerDrafts = new MobileComposerDraftStore(plainStorage);
 
 export const mobileStorage = createMobileStorage(
-  {
-    getItem: (key) => AsyncStorage.getItem(key),
-    setItem: (key, value) => AsyncStorage.setItem(key, value),
-    removeItem: (key) => AsyncStorage.removeItem(key)
-  },
+  plainStorage,
   {
     isAvailable: () => SecureStore.isAvailableAsync(),
     getItem: (key) => SecureStore.getItemAsync(key),
