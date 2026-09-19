@@ -5,11 +5,12 @@ import {
   DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
-  InputContentSchema, InputPartSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
+  InputContentSchema, InputPartSchema, ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
-  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, TargetState, capabilityNames,
+  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
+  SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   FileKind,
   type Artifact, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
@@ -60,6 +61,14 @@ import {
   type MobileInteractionSubmission
 } from "./mobile-interactions";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
+import {
+  assertMobileModelSelection,
+  assertMobilePermissionMode,
+  assertMobilePlanMode,
+  resolveMobileRuntimeControls,
+  type MobileModelControlSelection,
+  type MobileRuntimeControls
+} from "./mobile-runtime-controls";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -1700,6 +1709,72 @@ export class MobileClient {
     return mobileQueueCapabilities(this.#selectedBackend(this.#selectedSession()));
   }
 
+  taskRuntimeControls(): MobileRuntimeControls | undefined {
+    const credential = this.#credential;
+    if (!credential || !this.#taskAuthorityKey()) return undefined;
+    return resolveMobileRuntimeControls({
+      profileId: credential.profileId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      serverId: credential.serverId
+    }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  async setTaskModel(authorityKey: string, selection: MobileModelControlSelection): Promise<boolean> {
+    const controls = this.#runtimeControlContext(authorityKey);
+    const selected = assertMobileModelSelection(controls, selection);
+    this.#assertNoPendingRuntimeControl(controls.session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(controls.session)],
+        payload: { case: "setSessionModel", value: create(SetSessionModelMutationSchema, {
+          sessionId: controls.session.sessionId,
+          model: create(ModelSelectionSchema, {
+            model: create(ModelKeySchema, { providerId: selected.providerId, modelId: selected.modelId }),
+            effortId: selected.effortId ?? "",
+            fastMode: selected.fastMode
+          })
+        }) }
+      }), { kind: "session-model", sessionId: controls.session.sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async setTaskPermission(authorityKey: string, mode: PermissionMode): Promise<boolean> {
+    const controls = this.#runtimeControlContext(authorityKey);
+    const selected = assertMobilePermissionMode(controls, mode);
+    this.#assertNoPendingRuntimeControl(controls.session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(controls.session)],
+        payload: { case: "setSessionPermission", value: create(SetSessionPermissionMutationSchema, {
+          sessionId: controls.session.sessionId,
+          permissionMode: selected
+        }) }
+      }), { kind: "session-permission", sessionId: controls.session.sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async setTaskPlanMode(authorityKey: string, enabled: boolean): Promise<boolean> {
+    const controls = this.#runtimeControlContext(authorityKey);
+    const selected = assertMobilePlanMode(controls, enabled);
+    this.#assertNoPendingRuntimeControl(controls.session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(controls.session)],
+        payload: { case: "setSessionPlanMode", value: create(SetSessionPlanModeMutationSchema, {
+          sessionId: controls.session.sessionId,
+          enabled: selected
+        }) }
+      }), { kind: "session-plan", sessionId: controls.session.sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
   taskInteractions(): readonly Interaction[] {
     return pendingMobileInteractions(this.#state.detail, this.#state.selectedId);
   }
@@ -2009,6 +2084,36 @@ export class MobileClient {
 
   #selectedBackend(session: Session | undefined) {
     return this.#state.owner?.backends.find((item) => item.backendId === session?.backendId);
+  }
+
+  #runtimeControlContext(expectedAuthorityKey: string): MobileRuntimeControls {
+    this.#ready();
+    const controls = this.taskRuntimeControls();
+    if (!controls || !expectedAuthorityKey || controls.authorityKey !== expectedAuthorityKey) {
+      throw new Error("The task controls changed. Reopen them from the current task.");
+    }
+    return controls;
+  }
+
+  #sessionRuntimePrecondition(session: Session) {
+    const revision = session.version?.revision;
+    const generation = session.nativeBinding?.runtimeGeneration;
+    if (!revision || revision.value < 1n || !generation || generation < 1n
+      || session.version?.generation !== generation) {
+      throw new Error("A current task revision and runtime generation are required.");
+    }
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: session.sessionId }),
+      expectedRevision: revision,
+      expectedGeneration: generation
+    });
+  }
+
+  #assertNoPendingRuntimeControl(sessionId: string): void {
+    if (this.#state.pending.some((item) => item.sessionId === sessionId
+      && ["session-model", "session-permission", "session-plan"].includes(item.kind))) {
+      throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
+    }
   }
 
   #taskAuthorityKey(): string | undefined {
@@ -2796,7 +2901,8 @@ export class MobileClient {
           await this.#receipt(operation, pending, epoch);
           if (operation.state === OperationState.SUCCEEDED
             && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
-              "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss"].includes(pending.kind)
+              "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
+              "session-model", "session-permission", "session-plan"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if (pending.kind === "message-delete" && this.#foreground

@@ -269,4 +269,30 @@ describe("current-v1 mobile connection storage", () => {
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
+
+  it("round-trips task-control receipts without persisting selected settings", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = [
+      { operationId: "model", connectionId: first.connectionId, kind: "session-model" as const,
+        sessionId: "session-one", state: "unknown" as const },
+      { operationId: "permission", connectionId: first.connectionId, kind: "session-permission" as const,
+        sessionId: "session-one", state: "accepted" as const },
+      { operationId: "plan", connectionId: first.connectionId, kind: "session-plan" as const,
+        sessionId: "session-one", state: "unknown" as const }
+    ];
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+    const persisted = memory.plainValues.get("joko.mobile.pending.v1") ?? "";
+    expect(persisted).not.toContain("providerId");
+    expect(persisted).not.toContain("permissionMode");
+    expect(persisted).not.toContain("fastMode");
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { operationId: "missing-session", connectionId: first.connectionId, kind: "session-model", state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
 });

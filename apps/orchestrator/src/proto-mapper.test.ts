@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { CapabilitySupport, ProviderApiCompatibility, ProviderConfigurationField, capabilityNames } from "@joko/contracts";
+import { CapabilitySupport, PermissionMode, ProviderApiCompatibility, ProviderConfigurationField, capabilityNames } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
@@ -183,6 +183,67 @@ describe("proto mapper", () => {
         reportsResources: true,
         resourceKinds: ["extension", "skill", "prompt", "package"]
       }
+    });
+  });
+
+  it("projects typed model and permission control options without requiring unrelated string options", () => {
+    const stored: StoredBackend = {
+      descriptor: {
+        id: "backend-runtime-controls",
+        adapterKind: "runtime-controls",
+        instanceGeneration: 1,
+        displayName: "Runtime controls",
+        version: "1.0.0",
+        health: "healthy",
+        installationState: "installed",
+        authenticationState: "authenticated",
+        capabilities: new Map([
+          [capabilityNames.modelList, { key: capabilityNames.modelList, supported: true }],
+          [capabilityNames.modelSwitch, { key: capabilityNames.modelSwitch, supported: true }],
+          [capabilityNames.modelEffort, { key: capabilityNames.modelEffort, supported: true }],
+          [capabilityNames.modelFastMode, { key: capabilityNames.modelFastMode, supported: true }],
+          [capabilityNames.permissionModes, {
+            key: capabilityNames.permissionModes,
+            supported: true,
+            options: ["ask", "auto", "bypassPermissions"]
+          }],
+          [capabilityNames.permissionChange, { key: capabilityNames.permissionChange, supported: true }]
+        ]),
+        models: [],
+        tools: [],
+        diagnostics: []
+      },
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 3n
+    };
+
+    const capabilities = new Map((toProtoBackend(stored).capabilities?.capabilities ?? []).map((capability) => [
+      capability.name,
+      capability
+    ]));
+    expect(capabilities.get(capabilityNames.modelList)?.options?.kind).toMatchObject({
+      case: "model",
+      value: { providerAware: true, switchDuringSession: true, supportsEffort: false, supportsFastMode: false }
+    });
+    expect(capabilities.get(capabilityNames.modelEffort)?.options?.kind).toMatchObject({
+      case: "model",
+      value: { supportsEffort: true }
+    });
+    expect(capabilities.get(capabilityNames.modelFastMode)?.options?.kind).toMatchObject({
+      case: "model",
+      value: { supportsFastMode: true }
+    });
+    expect(capabilities.get(capabilityNames.permissionModes)?.options?.kind).toMatchObject({
+      case: "permission",
+      value: {
+        modes: [PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS],
+        mutableDuringSession: true
+      }
+    });
+    expect(capabilities.get(capabilityNames.permissionChange)?.options?.kind).toMatchObject({
+      case: "permission",
+      value: { modes: [], mutableDuringSession: true }
     });
   });
 

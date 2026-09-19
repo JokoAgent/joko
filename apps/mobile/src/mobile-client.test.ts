@@ -1,10 +1,14 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
-  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind,
+  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema,
+  CapabilityManifestSchema, CapabilitySchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   JOKO_API_VERSION, NativeSessionBindingSchema, OperationSchema,
   InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
-  EventCursorSchema, EventSchema, MessageRole, OperationMutationSchema, OperationState, SessionMessageSearchMatchSchema,
+  EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
+  ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
+  SettingsSnapshotSchema, SnapshotScopeSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind,
   SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
 } from "@joko/contracts";
@@ -191,6 +195,87 @@ const interactionSnapshot = create(SnapshotSchema, {
   ...snapshot,
   interactions: [questionInteraction, permissionInteraction, planInteraction]
 });
+const runtimeSession = create(SessionSchema, {
+  ...snapshot.sessions[0]!,
+  model: create(ModelSelectionSchema, {
+    model: create(ModelKeySchema, { providerId: "alpha", modelId: "a" }), effortId: "low", fastMode: false
+  }),
+  permissionMode: PermissionMode.ASK,
+  planMode: false,
+  version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 9n, etag: "session-r9" }), generation: 8n })
+});
+const runtimeBackend = create(BackendDescriptorSchema, {
+  ...snapshot.backends[0]!,
+  entityVersion: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 3n }), generation: 2n }),
+  capabilities: create(CapabilityManifestSchema, {
+    schemaVersion: "1",
+    revision: create(RevisionSchema, { value: 4n }),
+    capabilities: [
+      create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.modelList, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "model", value: { providerAware: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.modelSwitch, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "model", value: { providerAware: true, switchDuringSession: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.modelEffort, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "model", value: { providerAware: true, switchDuringSession: true, supportsEffort: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.modelFastMode, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "model", value: { providerAware: true, switchDuringSession: true, supportsFastMode: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.permissionModes, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "permission", value: {
+          modes: [PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS],
+          mutableDuringSession: true
+        } } } }),
+      create(CapabilitySchema, { name: capabilityNames.permissionChange, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "permission", value: { mutableDuringSession: true } } } }),
+      create(CapabilitySchema, { name: capabilityNames.planMode, support: CapabilitySupport.SUPPORTED })
+    ]
+  })
+});
+const runtimeModels = [
+  create(ModelDescriptorSchema, {
+    backendId: "backend", key: { providerId: "alpha", modelId: "a" }, displayName: "Alpha",
+    family: "alpha", contextWindowTokens: 64_000n, maximumOutputTokens: 8_000n,
+    outputModalities: [ModelOutputModality.TEXT], available: true,
+    effortLevels: [{ effortId: "low", displayName: "Low", order: 0, defaultLevel: true },
+      { effortId: "high", displayName: "High", order: 1 }]
+  }),
+  create(ModelDescriptorSchema, {
+    backendId: "backend", key: { providerId: "beta", modelId: "b" }, displayName: "Beta",
+    family: "beta", contextWindowTokens: 128_000n, maximumOutputTokens: 16_000n,
+    outputModalities: [ModelOutputModality.TEXT], available: true, supportsFastMode: true,
+    effortLevels: [{ effortId: "medium", displayName: "Medium", order: 0, defaultLevel: true },
+      { effortId: "high", displayName: "High", order: 1 }]
+  })
+];
+const runtimeProviders = [
+  create(ProviderDescriptorSchema, { backendId: "backend", providerId: "alpha", displayName: "Alpha Provider", kind: ProviderKind.SUBSCRIPTION }),
+  create(ProviderDescriptorSchema, { backendId: "backend", providerId: "beta", displayName: "Beta Provider", kind: ProviderKind.SUBSCRIPTION })
+];
+
+function runtimeControlProjection(currentSession = runtimeSession, detail = false): Snapshot {
+  return create(SnapshotSchema, {
+    ...snapshot,
+    snapshotId: detail ? "runtime-detail" : "runtime-owner",
+    scope: create(SnapshotScopeSchema, { kind: detail
+      ? { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session", recentTimelineItems: 120 }) }
+      : { case: "owner", value: create(OwnerSnapshotScopeSchema, {}) } }),
+    revision: create(RevisionSchema, { value: detail ? 31n : 30n, etag: detail ? "detail-r31" : "owner-r30" }),
+    sessions: [currentSession],
+    backends: [runtimeBackend],
+    ...(detail ? {
+      connections: [], devices: [], models: [], providers: [], settings: undefined
+    } : {
+      models: runtimeModels,
+      providers: runtimeProviders,
+      settings: create(SettingsSnapshotSchema, {
+        revision: create(RevisionSchema, { value: 6n }),
+        backends: [create(BackendSettingsSchema, {
+          backendId: "backend", enabled: true, modelAccess: create(BackendModelAccessSettingsSchema, {})
+        })]
+      })
+    })
+  });
+}
 
 function memoryStorage(saved?: PairedCredential | readonly PairedCredential[], automatic: boolean | string = saved !== undefined) {
   const initial = saved === undefined ? [] : Array.isArray(saved) ? [...saved] : [saved];
@@ -1762,6 +1847,155 @@ describe("native current-task Interaction ownership", () => {
     await app.refresh();
     expect(app.taskInteractions()).toEqual([]);
     await expect(app.dismissInteraction(permissionInteraction.interactionId)).rejects.toThrow(/no longer pending/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+});
+
+describe("native current-task runtime controls", () => {
+  const ids = () => {
+    let value = 0;
+    return () => `runtime-control-${++value}`;
+  };
+
+  it("applies model, permission, and Plan Mode with exact Session revision and generation receipts", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    let current = runtimeSession;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(current, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(current, true));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      const nextRevision = (current.version?.revision?.value ?? 0n) + 1n;
+      if (mutation.payload.case === "setSessionModel") {
+        current = create(SessionSchema, { ...current, model: mutation.payload.value.model,
+          version: create(EntityVersionSchema, {
+            revision: create(RevisionSchema, { value: nextRevision, etag: `session-r${nextRevision}` }), generation: 8n
+          }) });
+      } else if (mutation.payload.case === "setSessionPermission") {
+        current = create(SessionSchema, { ...current, permissionMode: mutation.payload.value.permissionMode,
+          version: create(EntityVersionSchema, {
+            revision: create(RevisionSchema, { value: nextRevision, etag: `session-r${nextRevision}` }), generation: 8n
+          }) });
+      } else if (mutation.payload.case === "setSessionPlanMode") {
+        current = create(SessionSchema, { ...current, planMode: mutation.payload.value.enabled,
+          version: create(EntityVersionSchema, {
+            revision: create(RevisionSchema, { value: nextRevision, etag: `session-r${nextRevision}` }), generation: 8n
+          }) });
+      }
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED });
+    });
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    let controls = app.taskRuntimeControls();
+    expect(controls).toMatchObject({ canSwitchModel: true, canSetEffort: true, canSetFastMode: true,
+      canSetPermission: true, canSetPlanMode: true });
+    await expect(app.setTaskModel(controls!.authorityKey, {
+      providerId: "beta", modelId: "b", effortId: "high", fastMode: true
+    })).resolves.toBe(true);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedRevision: { value: 9n, etag: "session-r9" },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "setSessionModel", value: {
+        sessionId: "session",
+        model: { model: { providerId: "beta", modelId: "b" }, effortId: "high", fastMode: true }
+      } }
+    });
+
+    controls = app.taskRuntimeControls();
+    await expect(app.setTaskPermission(controls!.authorityKey, PermissionMode.AUTO)).resolves.toBe(true);
+    expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
+      preconditions: [{ expectedRevision: { value: 10n }, expectedGeneration: 8n }],
+      payload: { case: "setSessionPermission", value: { sessionId: "session", permissionMode: PermissionMode.AUTO } }
+    });
+
+    controls = app.taskRuntimeControls();
+    await expect(app.setTaskPlanMode(controls!.authorityKey, true)).resolves.toBe(true);
+    expect(vi.mocked(network.submit).mock.calls[2]?.[2]).toMatchObject({
+      preconditions: [{ expectedRevision: { value: 11n }, expectedGeneration: 8n }],
+      payload: { case: "setSessionPlanMode", value: { sessionId: "session", enabled: true } }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskRuntimeControls()?.session).toMatchObject({
+      permissionMode: PermissionMode.AUTO,
+      planMode: true,
+      model: { model: { providerId: "beta", modelId: "b" }, effortId: "high", fastMode: true }
+    });
+  });
+
+  it("retains an unknown control receipt and never replays the mutation", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "runtime-control-1",
+      connectionId: credential.connectionId,
+      state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("operation watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const authorityKey = app.taskRuntimeControls()!.authorityKey;
+
+    await expect(app.setTaskPlanMode(authorityKey, true)).resolves.toBe(false);
+    expect(saved.pending()).toMatchObject([{
+      kind: "session-plan", sessionId: "session", state: "accepted"
+    }]);
+    await expect(app.setTaskPlanMode(authorityKey, true)).rejects.toThrow(/still pending/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles a saved control receipt after restart without dispatching it again", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    await saved.storage.savePending([{
+      operationId: "runtime-before-restart",
+      connectionId: credential.connectionId,
+      kind: "session-permission",
+      sessionId: "session",
+      state: "accepted"
+    }]);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    vi.mocked(network.getOperation).mockResolvedValue(create(OperationSchema, {
+      operationId: "runtime-before-restart",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+
+    await app.start();
+
+    expect(saved.pending()).toEqual([]);
+    expect(network.getOperation).toHaveBeenCalledWith(credential, "runtime-before-restart", expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid choices and retired control authority before dispatch", async () => {
+    const network = fakeNetwork();
+    let detailRevision = 31n;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(runtimeSession, false) }));
+    network.readSession = vi.fn(async () => create(SnapshotSchema, {
+      ...runtimeControlProjection(runtimeSession, true),
+      revision: create(RevisionSchema, { value: detailRevision, etag: `detail-r${detailRevision}` })
+    }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    await app.start();
+    const staleKey = app.taskRuntimeControls()!.authorityKey;
+
+    await expect(app.setTaskModel(staleKey, {
+      providerId: "beta", modelId: "b", effortId: "unknown", fastMode: false
+    })).rejects.toThrow(/not advertised/u);
+    expect(network.submit).not.toHaveBeenCalled();
+
+    detailRevision = 32n;
+    await app.refresh();
+    await expect(app.setTaskPermission(staleKey, PermissionMode.AUTO)).rejects.toThrow(/controls changed/u);
     expect(network.submit).not.toHaveBeenCalled();
   });
 });

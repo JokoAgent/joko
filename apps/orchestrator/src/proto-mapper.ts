@@ -4270,7 +4270,6 @@ function capabilityReason(support: CapabilitySupport): Capability["reason"] | un
 }
 
 function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | undefined {
-  if (capability.options === undefined || capability.options.length === 0) return undefined;
   let kind: CapabilityOptions["kind"];
   if (capability.key.startsWith("model.")) {
     kind = {
@@ -4281,9 +4280,26 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         switchDuringSession: true,
         supportsEffort: capability.key === "model.effort",
         supportsFastMode: capability.key === "model.fast_mode",
-        effortIds: [...capability.options]
+        effortIds: [...(capability.options ?? [])]
       }
     };
+  } else if (capability.key.startsWith("permission.")) {
+    kind = {
+      case: "permission",
+      value: {
+        $typeName: "joko.v1.PermissionCapabilityOptions",
+        modes: (capability.options ?? []).flatMap((value) =>
+          value === "ask" || value === "auto" || value === "bypassPermissions"
+            ? [toProtoPermissionMode(value)]
+            : []
+        ),
+        mutableDuringSession: true,
+        supportsPerTurnPolicy: false,
+        supportsPlanMode: capability.options?.includes("plan_mode") === true
+      }
+    };
+  } else if (capability.options === undefined || capability.options.length === 0) {
+    return undefined;
   } else if (capability.key.startsWith("input.")) {
     kind = {
       case: "input",
@@ -4292,21 +4308,6 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         mediaTypes: [...capability.options],
         maximumBytes: 0n,
         maximumItems: 0
-      }
-    };
-  } else if (capability.key.startsWith("permission.")) {
-    kind = {
-      case: "permission",
-      value: {
-        $typeName: "joko.v1.PermissionCapabilityOptions",
-        modes: capability.options.flatMap((value) =>
-          value === "ask" || value === "auto" || value === "bypassPermissions"
-            ? [toProtoPermissionMode(value)]
-            : []
-        ),
-        mutableDuringSession: true,
-        supportsPerTurnPolicy: false,
-        supportsPlanMode: capability.options.includes("plan_mode")
       }
     };
   } else if (capability.key === "runtime.resources") {

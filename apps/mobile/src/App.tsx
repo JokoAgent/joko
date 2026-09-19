@@ -50,6 +50,7 @@ import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
+import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
 import {
   mobileInteractionDraftIdentity,
   mobileInteractionDraftIdentityKey,
@@ -768,6 +769,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const initialInteractions = client.taskInteractions();
   const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
+  const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -850,6 +852,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const queueItems = client.taskQueueItems();
   const queueCapabilities = client.taskQueueCapabilities();
   const interactions = client.taskInteractions();
+  const runtimeControls = client.taskRuntimeControls();
+  const runtimeControlsOwnerRef = useRef(runtimeControls?.surfaceOwnerKey);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -869,6 +873,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const interactionMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && item.interactionId === activeInteractionId
     && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
+  const runtimeControlPending = state.pending.some((item) => item.sessionId === state.selectedId
+    && ["session-model", "session-permission", "session-plan"].includes(item.kind));
+  const runtimeControlsAvailable = runtimeControls !== undefined && (runtimeControls.canSwitchModel
+    || runtimeControls.canSetEffort || runtimeControls.canSetFastMode
+    || runtimeControls.canSetPermission || runtimeControls.canSetPlanMode);
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const messageActionItems = messageAction
@@ -886,6 +895,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       setInteractionVisible(false);
       return;
     }
+    setRuntimeControlsVisible(false);
     if (ownerChanged) {
       setSelectedInteractionId(interactions[0]!.interactionId);
       setInteractionVisible(true);
@@ -896,6 +906,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setSelectedInteractionId(interactions[0]!.interactionId);
     setInteractionVisible(true);
   }, [interactionIdsKey, interactionOwnerKey, selectedInteractionId]);
+  useEffect(() => {
+    const next = runtimeControls?.surfaceOwnerKey;
+    const changed = runtimeControlsOwnerRef.current !== next;
+    runtimeControlsOwnerRef.current = next;
+    if (changed || next === undefined) setRuntimeControlsVisible(false);
+  }, [runtimeControls?.surfaceOwnerKey]);
   useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
@@ -1143,6 +1159,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state) : "Loading…"}</Text>
       </View>
       <View style={styles.headerActions}>
+        <Action label="Controls" onPress={() => setRuntimeControlsVisible(true)} colors={colors} compact
+          disabled={!runtimeControlsAvailable || state.busy || interactions.length > 0} />
         {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
       </View>
@@ -1286,6 +1304,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         if (completed) setInteractionVisible(true);
         return completed;
       }}
+      onError={setLocalError} />
+    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined}
+      controls={runtimeControls} busy={state.busy || runtimeControlPending} colors={colors}
+      onClose={() => setRuntimeControlsVisible(false)}
+      onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}
+      onSetPermission={(authorityKey, mode) => client.setTaskPermission(authorityKey, mode)}
+      onSetPlanMode={(authorityKey, enabled) => client.setTaskPlanMode(authorityKey, enabled)}
       onError={setLocalError} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}

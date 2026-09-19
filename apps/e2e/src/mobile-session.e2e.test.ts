@@ -5,6 +5,7 @@ import {
   CapabilitySupport, ConnectionState, DeviceKind, DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
   EventCursorSchema, InteractionResolutionSchema, InteractionState, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
+  PermissionMode,
   PlanReviewResolutionSchema, QueueItemState, QuestionAnswerSchema, QuestionMultipleChoiceAnswerSchema,
   QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
   MessageRole, QueueDeliveryMode, RunState, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
@@ -17,7 +18,7 @@ import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixt
 import {
   archiveMutation, cancelQueuedInputMutation, createSessionMutation, deleteMutation, deleteSessionMessageMutation,
   editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, queueRunIdFrom, renameMutation,
-  reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
+  modelMutation, permissionMutation, planModeMutation, reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
   setQueueInteractionLockMutation, setQueueItemEditLockMutation, submit
 } from "./operations.js";
 
@@ -516,5 +517,137 @@ describe("native mobile device through the durable product chain", () => {
     ]);
     const persisted = fixture.application.store.listInteractions({ sessionId });
     expect(persisted.map((interaction) => interaction.status).sort()).toEqual(["dismissed", "resolved", "resolved"]);
+  });
+
+  it("applies mobile model, permission, and Plan Mode controls through HTTP, SQLite, and the Session Host", async () => {
+    const runtimeProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-runtime-controls",
+      displayName: "Mobile runtime controls",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => !new Set<string>([
+          capabilityNames.modelList,
+          capabilityNames.modelSwitch,
+          capabilityNames.modelEffort,
+          capabilityNames.modelFastMode,
+          capabilityNames.permissionModes,
+          capabilityNames.permissionChange,
+          capabilityNames.planMode
+        ]).has(capability.key)),
+        { key: capabilityNames.modelList, supported: true as const },
+        { key: capabilityNames.modelSwitch, supported: true as const },
+        { key: capabilityNames.modelEffort, supported: true as const },
+        { key: capabilityNames.modelFastMode, supported: true as const },
+        { key: capabilityNames.permissionModes, supported: true as const,
+          options: ["ask", "auto", "bypassPermissions"] },
+        { key: capabilityNames.permissionChange, supported: true as const },
+        { key: capabilityNames.planMode, supported: true as const }
+      ],
+      models: PI_LIKE_PROFILE.models.map((model) => ({ ...model, supportsFastMode: true }))
+    };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [runtimeProfile] });
+    const paired = await fixture.pair("Joko runtime-control phone");
+    const adapter = fixture.adapter();
+    const setModel = vi.spyOn(adapter, "setModel");
+    const setEffort = vi.spyOn(adapter, "setEffort");
+    const setFastMode = vi.spyOn(adapter, "setFastMode");
+    const setPermissionMode = vi.spyOn(adapter, "setPermissionMode");
+    const setPlanMode = vi.spyOn(adapter, "setPlanMode");
+    const initialModel = runtimeProfile.models[0]!;
+    const selectedModel = runtimeProfile.models[1]!;
+    const sessionId = sessionIdFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({
+        backendId: adapter.id,
+        targetId: fixture.targetId(),
+        displayName: "Mobile runtime settings",
+        providerId: initialModel.providerId,
+        modelId: initialModel.modelId,
+        effortId: initialModel.thinkingLevels[0],
+        fastMode: false
+      })
+    ));
+
+    const snapshot = async () => (await paired.clients.event.getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 120 } } }
+    })).snapshot!;
+    const submitControl = async (mutation: OperationMutation) => {
+      const before = await snapshot();
+      const current = before.sessions.find((session) => session.sessionId === sessionId);
+      const revision = current?.version?.revision;
+      const generation = current?.nativeBinding?.runtimeGeneration;
+      if (!revision || !generation) throw new Error("The mobile runtime-control task has no exact Session authority.");
+      const operation = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        ...mutation,
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+          expectedRevision: revision,
+          expectedGeneration: generation
+        })]
+      }));
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      expect(fixture!.application.store.getOperation(operation.operationId).status).toBe("completed");
+      return operation;
+    };
+
+    const initial = await snapshot();
+    const capabilities = initial.backends.find((backend) => backend.backendId === adapter.id)?.capabilities?.capabilities ?? [];
+    for (const name of [capabilityNames.modelList, capabilityNames.modelSwitch, capabilityNames.modelEffort,
+      capabilityNames.modelFastMode, capabilityNames.permissionModes, capabilityNames.permissionChange, capabilityNames.planMode]) {
+      expect(capabilities).toContainEqual(expect.objectContaining({ name, support: CapabilitySupport.SUPPORTED }));
+    }
+    const capabilityByName = new Map(capabilities.map((capability) => [capability.name, capability]));
+    expect(capabilityByName.get(capabilityNames.modelList)?.options?.kind).toMatchObject({
+      case: "model", value: { providerAware: true }
+    });
+    expect(capabilityByName.get(capabilityNames.modelSwitch)?.options?.kind).toMatchObject({
+      case: "model", value: { switchDuringSession: true }
+    });
+    expect(capabilityByName.get(capabilityNames.modelEffort)?.options?.kind).toMatchObject({
+      case: "model", value: { supportsEffort: true }
+    });
+    expect(capabilityByName.get(capabilityNames.modelFastMode)?.options?.kind).toMatchObject({
+      case: "model", value: { supportsFastMode: true }
+    });
+    const permissionOptions = capabilities.find((capability) => capability.name === capabilityNames.permissionModes)?.options?.kind;
+    expect(permissionOptions).toMatchObject({ case: "permission", value: {
+      modes: [PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS],
+      mutableDuringSession: true
+    } });
+    expect(capabilityByName.get(capabilityNames.permissionChange)?.options?.kind).toMatchObject({
+      case: "permission", value: { modes: [], mutableDuringSession: true }
+    });
+    expect(initial.models.find((model) => model.key?.providerId === selectedModel.providerId
+      && model.key.modelId === selectedModel.modelId)).toMatchObject({ available: true, supportsFastMode: true });
+
+    const selectedEffort = selectedModel.thinkingLevels.at(-1)!;
+    await submitControl(modelMutation(sessionId, selectedModel.providerId, selectedModel.modelId, selectedEffort, true));
+    await submitControl(permissionMutation(sessionId, PermissionMode.AUTO));
+    await submitControl(planModeMutation(sessionId, true));
+
+    const after = await snapshot();
+    expect(after.sessions.find((session) => session.sessionId === sessionId)).toMatchObject({
+      model: {
+        model: { providerId: selectedModel.providerId, modelId: selectedModel.modelId },
+        effortId: selectedEffort,
+        fastMode: true
+      },
+      permissionMode: PermissionMode.AUTO,
+      planMode: true
+    });
+    expect(fixture.application.store.getSession(sessionId).descriptor).toMatchObject({
+      providerId: selectedModel.providerId,
+      modelId: selectedModel.modelId,
+      effort: selectedEffort,
+      fastMode: true,
+      permissionMode: "auto",
+      planMode: true
+    });
+    expect(setModel).toHaveBeenCalledWith(selectedModel.providerId, selectedModel.modelId, expect.anything());
+    expect(setEffort).toHaveBeenCalledWith(selectedEffort, expect.anything());
+    expect(setFastMode).toHaveBeenCalledWith(true, expect.anything());
+    expect(setPermissionMode).toHaveBeenCalledWith("auto", expect.anything());
+    expect(setPlanMode).toHaveBeenCalledWith(true, expect.anything());
   });
 });

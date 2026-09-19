@@ -47,6 +47,7 @@ import {
   SendInputMutationSchema,
   SessionExportFormat,
   SetSessionPermissionMutationSchema,
+  SetSessionModelMutationSchema,
   SetSessionPlanModeMutationSchema,
   SetQueueInteractionLockMutationSchema,
   SetQueueItemEditLockMutationSchema,
@@ -407,6 +408,22 @@ export function permissionMutation(sessionId: string, permissionMode: Permission
     payload: {
       case: "setSessionPermission",
       value: create(SetSessionPermissionMutationSchema, { sessionId, permissionMode })
+    }
+  });
+}
+
+export function modelMutation(sessionId: string, providerId: string, modelId: string, effortId: string, fastMode: boolean): OperationMutation {
+  return create(OperationMutationSchema, {
+    payload: {
+      case: "setSessionModel",
+      value: create(SetSessionModelMutationSchema, {
+        sessionId,
+        model: create(ModelSelectionSchema, {
+          model: create(ModelKeySchema, { providerId, modelId }),
+          effortId,
+          fastMode
+        })
+      })
     }
   });
 }
