@@ -1,15 +1,33 @@
+import { randomUUID } from "node:crypto";
+
 import { create } from "@bufbuild/protobuf";
 import {
-  ConnectionState, DeviceKind, EntityKind, EntityRefSchema, EventCursorSchema, OperationMutationSchema,
+  CapabilitySupport, ConnectionState, DeviceKind, EntityKind, EntityRefSchema, EventCursorSchema, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RevokeDeviceMutationSchema,
-  SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
-  type OperationMutation
+  MessageRole, QueueDeliveryMode, RunState, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
+  capabilityNames, type OperationMutation
 } from "@joko/contracts";
+import { PI_LIKE_PROFILE } from "@joko/testkit";
+import type { AdapterContext, PromptInput } from "@joko/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
-  archiveMutation, createSessionMutation, deleteMutation, pinMutation, renameMutation, sendInputMutation, sessionIdFrom, submit
+  archiveMutation, cancelQueuedInputMutation, createSessionMutation, deleteMutation, deleteSessionMessageMutation,
+  editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, renameMutation,
+  reorderQueuedInputBeforeMutation, resumeQueueMutation, sendInputMutation, sessionIdFrom,
+  setQueueInteractionLockMutation, setQueueItemEditLockMutation, submit
 } from "./operations.js";
+
+class MobileMessageFixtureAdapter extends InstrumentedFakeAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    await context.emit({
+      type: "message_complete",
+      role: "user",
+      blocks: [{ kind: "text", text: input.text }]
+    });
+    await super.send(input, context);
+  }
+}
 
 describe("native mobile device through the durable product chain", () => {
   let fixture: OrchestratorE2eFixture | undefined;
@@ -180,5 +198,156 @@ describe("native mobile device through the durable product chain", () => {
     }));
     expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
+  });
+
+  it("executes mobile message deletion and touch Queue controls through HTTP, SQLite, and the Session Host", async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [{ ...PI_LIKE_PROFILE, streamDelayMs: 300 }],
+      createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
+    });
+    const paired = await fixture.pair("Joko mobile controls");
+    const adapter = fixture.adapter();
+    const owner = (await paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot;
+    const publicCapabilities = owner?.backends.find((backend) => backend.backendId === adapter.id)
+      ?.capabilities?.capabilities;
+    for (const name of [capabilityNames.queueCancel, capabilityNames.queueEdit, capabilityNames.queueReorder]) {
+      expect(publicCapabilities).toContainEqual(expect.objectContaining({ name, support: CapabilitySupport.SUPPORTED }));
+    }
+    const sessionId = sessionIdFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId(), displayName: "Mobile controls" })
+    ));
+    const generation = () => BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation);
+
+    const primary = queueItemFrom(await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, generation(), "Primary mobile turn")));
+    await waitFor(async () => adapter.sendCalls.length, (count) => count === 1, "primary mobile input to reach the Backend");
+    const activeControl = (await paired.clients.queue.getQueueControl({ sessionId })).queueControl;
+    if (!activeControl) throw new Error("The mobile task has no QueueControl.");
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      pauseQueueMutation(activeControl, "Exercise touch Queue controls")
+    )).state).toBe(OperationState.SUCCEEDED);
+
+    const editable = queueItemFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      sendInputMutation(sessionId, generation(), "Edit this queued input", QueueDeliveryMode.FOLLOW_UP)
+    ));
+    const afterwards = queueItemFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      sendInputMutation(sessionId, generation(), "Keep this after the edit", QueueDeliveryMode.FOLLOW_UP)
+    ));
+    const removable = queueItemFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      sendInputMutation(sessionId, generation(), "Remove this queued input", QueueDeliveryMode.FOLLOW_UP)
+    ));
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      cancelQueuedInputMutation(removable)
+    )).state).toBe(OperationState.SUCCEEDED);
+    expect((await paired.clients.queue.listQueueItems({ sessionId })).queueItems
+      .find((item) => item.queueItemId === removable.queueItemId)?.state).toBe(QueueItemState.CANCELLED);
+
+    const pausedControl = (await paired.clients.queue.getQueueControl({ sessionId })).queueControl;
+    if (!pausedControl) throw new Error("The paused mobile task lost its QueueControl.");
+    const interactionLockToken = randomUUID();
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      setQueueInteractionLockMutation(pausedControl, interactionLockToken, true)
+    )).state).toBe(OperationState.SUCCEEDED);
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      reorderQueuedInputBeforeMutation(afterwards, editable.queueItemId, interactionLockToken)
+    )).state).toBe(OperationState.SUCCEEDED);
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      setQueueInteractionLockMutation(pausedControl, interactionLockToken, false)
+    )).state).toBe(OperationState.SUCCEEDED);
+
+    const reordered = await paired.clients.queue.listQueueItems({ sessionId });
+    const currentEditable = reordered.queueItems.find((item) => item.queueItemId === editable.queueItemId);
+    if (!currentEditable) throw new Error("The editable Queue item disappeared.");
+    expect(reordered.queueItems.filter((item) => item.state === QueueItemState.ACCEPTED)
+      .map((item) => item.queueItemId)).toEqual([afterwards.queueItemId, editable.queueItemId]);
+    const editLockToken = randomUUID();
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      setQueueItemEditLockMutation(currentEditable, editLockToken, true)
+    )).state).toBe(OperationState.SUCCEEDED);
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      editQueuedInputMutation(currentEditable, "Edited from mobile", QueueDeliveryMode.FOLLOW_UP, editLockToken)
+    )).state).toBe(OperationState.SUCCEEDED);
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      setQueueItemEditLockMutation(currentEditable, editLockToken, false)
+    )).state).toBe(OperationState.SUCCEEDED);
+
+    const resumable = (await paired.clients.queue.getQueueControl({ sessionId })).queueControl;
+    if (!resumable) throw new Error("The mobile task lost its resumable QueueControl.");
+    expect((await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      resumeQueueMutation(resumable)
+    )).state).toBe(OperationState.SUCCEEDED);
+    await waitFor(
+      () => paired.clients.run.listRuns({ sessionId }),
+      (value) => value.runs.length === 4
+        && value.runs.filter((run) => run.state === RunState.SUCCEEDED).length === 3
+        && value.runs.filter((run) => run.state === RunState.ABORTED).length === 1,
+      "mobile Queue to drain"
+    );
+    expect(adapter.sendCalls.slice(0, 3).map((call) => call.text)).toEqual([
+      "Primary mobile turn",
+      "Keep this after the edit",
+      "Edited from mobile"
+    ]);
+    // Run rows become terminal just before the serialized Queue drain releases
+    // its in-memory fence. Yield once so the next destructive operation observes
+    // the same idle boundary that a mobile refresh does.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const history = await waitFor(
+      () => paired.clients.session.listSessionTimeline({ sessionId, limit: 120 }),
+      (value) => value.events.some((event) => event.payload?.kind.case === "messageCompleted"
+        && event.payload.kind.value.role === MessageRole.ASSISTANT
+        && event.identity?.runId === primary.runId),
+      "a durable mobile assistant message"
+    );
+    const selected = [...history.events].reverse().find((event) => event.payload?.kind.case === "messageCompleted"
+      && event.payload.kind.value.role === MessageRole.ASSISTANT
+      && event.identity?.runId === primary.runId);
+    if (!selected) throw new Error("The mobile task has no completed assistant message.");
+    const snapshot = (await paired.clients.event.getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 120 } } }
+    })).snapshot;
+    const currentSession = snapshot?.sessions.find((session) => session.sessionId === sessionId);
+    expect(currentSession?.state).toBe(SessionState.IDLE);
+    const currentGeneration = currentSession?.nativeBinding?.runtimeGeneration;
+    if (!currentGeneration) throw new Error("The mobile task has no current runtime generation.");
+    expect(currentSession?.version?.generation).toBe(currentGeneration);
+    const deleted = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      deleteSessionMessageMutation(sessionId, selected.eventId, currentGeneration)
+    );
+    expect(deleted.state).toBe(OperationState.SUCCEEDED);
+
+    const afterDelete = await paired.clients.session.listSessionTimeline({ sessionId, limit: 120 });
+    expect(afterDelete.events.some((event) => event.eventId === selected.eventId)).toBe(false);
+    expect(afterDelete.events.some((event) => event.payload?.kind.case === "messageDeleted"
+      && event.payload.kind.value.requestedEventId === selected.eventId)).toBe(true);
   });
 });

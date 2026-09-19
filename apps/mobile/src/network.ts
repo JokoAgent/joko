@@ -1,7 +1,7 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
-  ArtifactService, ConnectionService, DeviceKind, EventService, FileKind, OperationService, SessionService, TargetService,
+  ArtifactService, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState, SessionService, TargetService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
@@ -56,6 +56,7 @@ export interface MobileNetwork {
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
   prepareTarget(credential: PairedCredential, target: Target, signal?: AbortSignal): Promise<void>;
   submit(credential: PairedCredential, operationId: string, mutation: OperationMutation, signal?: AbortSignal): Promise<Operation>;
+  waitOperation(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation>;
   getOperation(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation | undefined>;
 }
 
@@ -661,6 +662,25 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The Joko node returned a mismatched operation receipt.");
     }
     return response.operation;
+  },
+  async waitOperation(credential, operationId, signal) {
+    const client = createClient(OperationService, transport(credential.origin, credential.authKey));
+    let revision = 0n;
+    for await (const response of client.watchOperation({ operationId }, options(signal))) {
+      const operation = response.operation;
+      if (!operation || operation.operationId !== operationId || operation.connectionId !== credential.connectionId) {
+        throw new Error("The Joko node returned a mismatched operation update.");
+      }
+      const nextRevision = operation.version?.revision?.value ?? 0n;
+      if (nextRevision > 0n && nextRevision < revision) {
+        throw new Error("The Joko node returned a regressed operation update.");
+      }
+      revision = nextRevision > revision ? nextRevision : revision;
+      if ([OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT].includes(operation.state)) {
+        return operation;
+      }
+    }
+    throw new Error("The Joko operation stream closed before a durable result.");
   },
   async getOperation(credential, operationId, signal) {
     let response;

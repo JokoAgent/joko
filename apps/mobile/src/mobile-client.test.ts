@@ -4,6 +4,7 @@ import {
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   JOKO_API_VERSION, OperationSchema,
   EventCursorSchema, EventSchema, MessageRole, OperationMutationSchema, OperationState, SessionMessageSearchMatchSchema,
+  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind,
   SessionMessageSearchSessionStatus, SessionState, SnapshotSchema, TargetState, WorkspaceKind, capabilityNames
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,7 @@ import { MobileClient, type MobileStorage, type PendingOperation } from "./mobil
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
 import { normalizeNodeOrigin, parseNodeIdentity, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
-import type { Event, SessionMessageSearchMatch, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import type { Event, Operation, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import { timelineRows } from "./timeline";
 
 const credential: PairedCredential = {
@@ -78,6 +79,63 @@ const filesSnapshot = create(SnapshotSchema, {
     ] })
   })],
   targets: [create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: "workspace" })]
+});
+const messageEvent = create(EventSchema, {
+  eventId: "event-completed",
+  identity: { sessionId: "session" },
+  cursor: { opaqueToken: "cursor-11", sequence: 11n, generation: 1n },
+  payload: { kind: { case: "messageCompleted", value: {
+    messageId: "message-1",
+    role: MessageRole.ASSISTANT,
+    blocks: [{ content: { case: "text", value: "Durable answer" } }]
+  } } }
+});
+const messageActionSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    capabilities: create(CapabilityManifestSchema, { capabilities: [
+      create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.sessionMessageDelete, support: CapabilitySupport.SUPPORTED })
+    ] })
+  })],
+  timeline: [messageEvent]
+});
+const queueOne = create(QueueItemSchema, {
+  queueItemId: "queue-1", backendId: "backend", targetId: "target", sessionId: "session",
+  sourceKind: QueueSourceKind.UI, deliveryMode: QueueDeliveryMode.FOLLOW_UP,
+  state: QueueItemState.ACCEPTED, ordinal: 10n, editLocked: false,
+  version: { revision: { value: 11n, etag: "queue-1-r11" }, generation: 1n },
+  input: { parts: [
+    { content: { case: "text", value: "First queued input" } },
+    { content: { case: "sessionMention", value: { sessionId: "related", displayText: "Related task" } } }
+  ] }
+});
+const queueTwo = create(QueueItemSchema, {
+  queueItemId: "queue-2", backendId: "backend", targetId: "target", sessionId: "session",
+  sourceKind: QueueSourceKind.UI, deliveryMode: QueueDeliveryMode.PROMPT,
+  state: QueueItemState.ACCEPTED, ordinal: 20n, editLocked: false,
+  version: { revision: { value: 12n, etag: "queue-2-r12" }, generation: 1n },
+  input: { parts: [{ content: { case: "text", value: "Second queued input" } }] }
+});
+const queueControl = create(QueueControlSchema, {
+  sessionId: "session", backendId: "backend", targetId: "target",
+  dispatchState: QueueDispatchState.PAUSED, queuedItemCount: 2n, interactionLocked: false,
+  version: { revision: { value: 21n, etag: "queue-control-r21" }, generation: 1n }
+});
+const queueSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    capabilities: create(CapabilityManifestSchema, { capabilities: [
+      create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.queueCancel, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.queueEdit, support: CapabilitySupport.SUPPORTED }),
+      create(CapabilitySchema, { name: capabilityNames.queueReorder, support: CapabilitySupport.SUPPORTED })
+    ] })
+  })],
+  queueItems: [queueTwo, queueOne],
+  queueControls: [queueControl]
 });
 
 function memoryStorage(saved?: PairedCredential | readonly PairedCredential[], automatic: boolean | string = saved !== undefined) {
@@ -157,8 +215,18 @@ function fakeNetwork(): MobileNetwork {
       operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED
       });
     }),
+    waitOperation: vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED
+    })),
     getOperation: vi.fn(async () => undefined)
   };
+}
+
+function projectedNetwork(projected: Snapshot): MobileNetwork {
+  const network = fakeNetwork();
+  network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projected }));
+  network.readSession = vi.fn(async () => projected);
+  return network;
 }
 
 function event(id: string, sequence: bigint, sessionId = "session"): Event {
@@ -185,8 +253,14 @@ function eventFeed(network: MobileNetwork) {
 }
 
 const clients: MobileClient[] = [];
-function client(network: MobileNetwork, storage: MobileStorage, discovery?: MobileDiscovery, now: () => number = () => 2_000) {
-  const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, () => "operation-1", "android", now);
+function client(
+  network: MobileNetwork,
+  storage: MobileStorage,
+  discovery?: MobileDiscovery,
+  now: () => number = () => 2_000,
+  newId: () => string = () => "operation-1"
+) {
+  const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now);
   clients.push(instance);
   return instance;
 }
@@ -942,7 +1016,7 @@ describe("native mobile connection and operation ownership", () => {
     await vi.waitFor(() => expect(app.state.detail?.timeline.map((item) => item.eventId)).toEqual(["start", "delta", "completed"]));
     expect(app.state.live).toHaveLength(0);
     expect(timelineRows([...(app.state.detail?.timeline ?? []), ...app.state.live])).toMatchObject([
-      { id: "assistant-message", text: "final", eventId: "start" }
+      { id: "assistant-message", text: "final", eventId: "completed", completed: true }
     ]);
     expect(network.submit).not.toHaveBeenCalled();
   });
@@ -1108,6 +1182,349 @@ describe("mobile Home search and task mutations", () => {
     expect(app.state.error).toBe("The task changed on another client.");
     expect(saved.pending()).toEqual([]);
     expect(network.readOwner).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("native current-task message and Queue actions", () => {
+  const ids = () => {
+    let value = 0;
+    return () => `mobile-id-${++value}`;
+  };
+
+  it("deletes only an exact completed visible message with the current Session generation", async () => {
+    const network = projectedNetwork(messageActionSnapshot);
+    const saved = memoryStorage(credential);
+    let deleted = false;
+    network.readAround = vi.fn(async () => [messageEvent]);
+    network.readSession = vi.fn(async () => deleted
+      ? create(SnapshotSchema, { ...messageActionSnapshot, timeline: [] })
+      : messageActionSnapshot);
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "deleteSessionMessage") deleted = true;
+      return create(OperationSchema, {
+        operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED
+      });
+    });
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    expect(app.canDeleteMessage(messageEvent.eventId)).toBe(true);
+    expect(app.canDeleteMessage("message-1")).toBe(false);
+    await app.around(messageEvent.eventId);
+    expect(app.state.window?.map((event) => event.eventId)).toEqual([messageEvent.eventId]);
+    await expect(app.deleteMessage(messageEvent.eventId)).resolves.toBe(true);
+    expect(app.state.window).toBeUndefined();
+    expect(app.canDeleteMessage(messageEvent.eventId)).toBe(false);
+
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.SESSION, id: "session" },
+        expectedGeneration: 8n
+      }],
+      payload: { case: "deleteSessionMessage", value: {
+        sessionId: "session",
+        eventId: messageEvent.eventId
+      } }
+    });
+    expect(saved.pending()).toEqual([]);
+  });
+
+  it("cancels the exact accepted Queue item at its projected revision", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    await app.start();
+
+    expect(app.taskQueueCapabilities()).toEqual({ cancel: true, edit: true, reorder: true });
+    expect(app.taskQueueItems().map((item) => item.queueItemId)).toEqual(["queue-1", "queue-2"]);
+    await expect(app.cancelQueueItem("queue-1")).resolves.toBe(true);
+
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.QUEUE_ITEM, id: "queue-1" },
+        expectedRevision: { value: 11n, etag: "queue-1-r11" },
+        expectedGeneration: 1n
+      }],
+      payload: { case: "cancelQueueItem", value: { queueItemId: "queue-1" } }
+    });
+  });
+
+  it("locks, edits, and unlocks one Queue item while preserving non-text InputContent", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    await app.start();
+
+    const lease = await app.beginQueueEdit("queue-1");
+    expect(lease).toMatchObject({
+      connectionId: credential.connectionId,
+      sessionId: "session",
+      queueItemId: "queue-1",
+      text: "First queued input"
+    });
+    await expect(app.saveQueueEdit(lease, "Revised queued input")).resolves.toBe(true);
+
+    const mutations = vi.mocked(network.submit).mock.calls.map((call) => call[2]);
+    expect(mutations).toHaveLength(3);
+    expect(mutations[0]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.QUEUE_ITEM, id: "queue-1" },
+        expectedRevision: { value: 11n },
+        expectedGeneration: 1n
+      }],
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1", lockToken: lease.lockToken, locked: true
+      } }
+    });
+    expect(mutations[1]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.QUEUE_ITEM, id: "queue-1" },
+        expectedRevision: { value: 11n },
+        expectedGeneration: 1n
+      }],
+      payload: { case: "editQueueItem", value: {
+        queueItemId: "queue-1",
+        deliveryMode: QueueDeliveryMode.FOLLOW_UP,
+        lockToken: lease.lockToken,
+        textSplices: [{ start: 0, end: 18, replacementText: "Revised queued input" }],
+        input: { parts: [
+          { content: { case: "text", value: "Revised queued input" } },
+          { content: { case: "sessionMention", value: { sessionId: "related", displayText: "Related task" } } }
+        ] }
+      } }
+    });
+    expect(mutations[2]).toMatchObject({
+      preconditions: [],
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1", lockToken: lease.lockToken, locked: false
+      } }
+    });
+  });
+
+  it("keeps the edit lease retryable when an unlock receipt cannot be persisted", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    const lease = await app.beginQueueEdit("queue-1");
+    vi.mocked(saved.storage.savePending).mockRejectedValueOnce(new Error("device storage unavailable"));
+    await expect(app.cancelQueueEdit(lease)).rejects.toThrow(/device storage unavailable/);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+
+    await expect(app.cancelQueueEdit(lease)).resolves.toBeUndefined();
+    expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1", lockToken: lease.lockToken, locked: false
+      } }
+    });
+  });
+
+  it("serializes Queue reorder under the exact QueueControl lock and disables edge moves", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    await app.start();
+
+    await expect(app.moveQueueItem("queue-1", "up")).resolves.toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+    await expect(app.moveQueueItem("queue-2", "up")).resolves.toBe(true);
+
+    const mutations = vi.mocked(network.submit).mock.calls.map((call) => call[2]);
+    expect(mutations).toHaveLength(3);
+    const firstPayload = mutations[0]?.payload;
+    if (firstPayload?.case !== "setQueueInteractionLock") throw new Error("Expected a Queue interaction-lock mutation.");
+    const lockToken = firstPayload.value.lockToken;
+    expect(mutations[0]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.QUEUE_CONTROL, id: "session" },
+        expectedRevision: { value: 21n, etag: "queue-control-r21" },
+        expectedGeneration: 1n
+      }],
+      payload: { case: "setQueueInteractionLock", value: {
+        sessionId: "session", locked: true
+      } }
+    });
+    expect(mutations[1]).toMatchObject({
+      preconditions: [{
+        entity: { kind: EntityKind.QUEUE_ITEM, id: "queue-2" },
+        expectedRevision: { value: 12n, etag: "queue-2-r12" },
+        expectedGeneration: 1n
+      }],
+      payload: { case: "reorderQueueItem", value: {
+        queueItemId: "queue-2",
+        placement: { anchor: { case: "beforeQueueItemId", value: "queue-1" } },
+        interactionLockToken: lockToken
+      } }
+    });
+    expect(mutations[2]).toMatchObject({
+      preconditions: [],
+      payload: { case: "setQueueInteractionLock", value: {
+        sessionId: "session", lockToken, locked: false
+      } }
+    });
+  });
+
+  it("best-effort releases the Queue interaction lock after an unknown reorder without replaying it", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const saved = memoryStorage(credential);
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: mutation.payload.case === "reorderQueueItem" ? OperationState.RUNNING : OperationState.SUCCEEDED
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("reorder watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    await expect(app.moveQueueItem("queue-2", "up")).resolves.toBe(false);
+
+    const mutations = vi.mocked(network.submit).mock.calls.map((call) => call[2]);
+    expect(mutations).toHaveLength(3);
+    const lock = mutations[0]?.payload;
+    if (lock?.case !== "setQueueInteractionLock") throw new Error("Expected a Queue interaction-lock mutation.");
+    expect(mutations[1]?.payload.case).toBe("reorderQueueItem");
+    expect(mutations[2]).toMatchObject({
+      payload: { case: "setQueueInteractionLock", value: {
+        sessionId: "session", lockToken: lock.value.lockToken, locked: false
+      } }
+    });
+    expect(vi.mocked(network.submit).mock.calls.filter((call) => call[2].payload.case === "reorderQueueItem"))
+      .toHaveLength(1);
+    expect(saved.pending()).toMatchObject([{
+      kind: "queue-reorder", sessionId: "session", queueItemId: "queue-2", state: "accepted"
+    }]);
+  });
+
+  it("compensates with the same interaction token when backgrounding during reorder-lock acquisition", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const saved = memoryStorage(credential);
+    let resolveAcquire!: (operation: Operation) => void;
+    let acquireOperationId = "";
+    vi.mocked(network.submit).mockImplementationOnce((_credential, operationId) => new Promise((resolve) => {
+      acquireOperationId = operationId;
+      resolveAcquire = resolve;
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    const moving = app.moveQueueItem("queue-2", "up");
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledTimes(1));
+    const acquire = vi.mocked(network.submit).mock.calls[0]?.[2].payload;
+    if (acquire?.case !== "setQueueInteractionLock") throw new Error("Expected Queue interaction-lock acquisition.");
+    app.setForeground(false);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
+      payload: { case: "setQueueInteractionLock", value: {
+        sessionId: "session", lockToken: acquire.value.lockToken, locked: false
+      } }
+    });
+    resolveAcquire(create(OperationSchema, {
+      operationId: acquireOperationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    await expect(moving).rejects.toThrow(/unknown result/);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(network.submit).mock.calls[2]?.[2]).toMatchObject({
+      payload: { case: "setQueueInteractionLock", value: {
+        sessionId: "session", lockToken: acquire.value.lockToken, locked: false
+      } }
+    });
+    await vi.waitFor(() => expect(saved.pending()).toMatchObject([{
+      kind: "queue-interaction-lock", sessionId: "session", state: "unknown"
+    }]));
+  });
+
+  it("waits for a terminal lock result and never replays an unknown Queue mutation", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const saved = memoryStorage(credential);
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    await expect(app.beginQueueEdit("queue-1")).rejects.toThrow(/unknown result/);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(saved.pending()).toMatchObject([{
+      kind: "queue-edit-lock", sessionId: "session", queueItemId: "queue-1", state: "accepted"
+    }]);
+    await expect(app.beginQueueEdit("queue-1")).rejects.toThrow(/still pending/);
+    expect(network.submit).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(network.submit).mock.calls.map((call) => call[2].payload)).toMatchObject([
+      { case: "setQueueItemEditLock", value: { queueItemId: "queue-1", locked: true } },
+      { case: "setQueueItemEditLock", value: { queueItemId: "queue-1", locked: false } }
+    ]);
+    expect(network.waitOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the exact Queue edit lock when switching tasks or leaving the foreground", async () => {
+    const switchNetwork = projectedNetwork(queueSnapshot);
+    const switching = client(switchNetwork, memoryStorage(credential).storage, undefined, undefined, ids());
+    await switching.start();
+    const switchLease = await switching.beginQueueEdit("queue-1");
+    await switching.select(undefined);
+    expect(vi.mocked(switchNetwork.submit).mock.calls[1]?.[2]).toMatchObject({
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1", lockToken: switchLease.lockToken, locked: false
+      } }
+    });
+
+    const backgroundNetwork = projectedNetwork(queueSnapshot);
+    const saved = memoryStorage(credential);
+    const backgrounding = client(backgroundNetwork, saved.storage, undefined, undefined, ids());
+    await backgrounding.start();
+    const backgroundLease = await backgrounding.beginQueueEdit("queue-1");
+    backgrounding.setForeground(false);
+    await vi.waitFor(() => expect(backgroundNetwork.submit).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(backgroundNetwork.submit).mock.calls[1]?.[2]).toMatchObject({
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1", lockToken: backgroundLease.lockToken, locked: false
+      } }
+    });
+    await vi.waitFor(() => expect(saved.pending()).toEqual([]));
+  });
+
+  it("compensates with the same lock token when the app backgrounds during lock acquisition", async () => {
+    const network = projectedNetwork(queueSnapshot);
+    const saved = memoryStorage(credential);
+    let resolveAcquire!: (operation: Operation) => void;
+    vi.mocked(network.submit).mockImplementationOnce((_credential, operationId) => new Promise((resolve) => {
+      resolveAcquire = resolve;
+      expect(operationId).toBe("mobile-id-2");
+    }));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    const opening = app.beginQueueEdit("queue-1");
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledTimes(1));
+    const acquirePayload = vi.mocked(network.submit).mock.calls[0]?.[2].payload;
+    if (acquirePayload?.case !== "setQueueItemEditLock") throw new Error("Expected Queue edit-lock acquisition.");
+    app.setForeground(false);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1",
+        lockToken: acquirePayload.value.lockToken,
+        locked: false
+      } }
+    });
+    resolveAcquire(create(OperationSchema, {
+      operationId: "mobile-id-2",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+    await expect(opening).rejects.toThrow(/unknown result|task changed/);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(network.submit).mock.calls[2]?.[2]).toMatchObject({
+      payload: { case: "setQueueItemEditLock", value: {
+        queueItemId: "queue-1",
+        lockToken: acquirePayload.value.lockToken,
+        locked: false
+      } }
+    });
+    await vi.waitFor(() => expect(saved.pending()).toMatchObject([{
+      operationId: "mobile-id-2", kind: "queue-edit-lock", queueItemId: "queue-1", state: "unknown"
+    }]));
   });
 });
 

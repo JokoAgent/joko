@@ -5,11 +5,13 @@ import type { Client } from "@connectrpc/connect";
 import {
   AbortRunMutationSchema,
   ArchiveSessionMutationSchema,
+  CancelQueueItemMutationSchema,
   CloneSessionMutationSchema,
   CompactSessionMutationSchema,
   CreateScheduleMutationSchema,
   CreateSessionMutationSchema,
   DeleteSessionMutationSchema,
+  DeleteSessionMessageMutationSchema,
   EditQueueItemMutationSchema,
   EventService,
   EntityKind,
@@ -217,6 +219,38 @@ export function editQueuedInputMutation(
         lockToken,
         textSplices: [{ start: 0, end: currentText.length, replacementText: text }]
       })
+    }
+  });
+}
+
+export function cancelQueuedInputMutation(item: QueueItem): OperationMutation {
+  if (item.version?.revision === undefined) throw new Error("Queue item has no entity version.");
+  return create(OperationMutationSchema, {
+    preconditions: [{
+      entity: { kind: EntityKind.QUEUE_ITEM, id: item.queueItemId },
+      expectedRevision: item.version.revision,
+      expectedGeneration: item.version.generation
+    }],
+    payload: {
+      case: "cancelQueueItem",
+      value: create(CancelQueueItemMutationSchema, { queueItemId: item.queueItemId })
+    }
+  });
+}
+
+export function deleteSessionMessageMutation(
+  sessionId: string,
+  eventId: string,
+  expectedGeneration: bigint
+): OperationMutation {
+  return create(OperationMutationSchema, {
+    preconditions: [{
+      entity: { kind: EntityKind.SESSION, id: sessionId },
+      expectedGeneration
+    }],
+    payload: {
+      case: "deleteSessionMessage",
+      value: create(DeleteSessionMessageMutationSchema, { sessionId, eventId })
     }
   });
 }

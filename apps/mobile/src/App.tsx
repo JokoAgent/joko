@@ -10,10 +10,15 @@ import { StatusBar } from "expo-status-bar";
 import { randomUUID } from "expo-crypto";
 import {
   CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, TargetState, capabilityNames,
-  type Session
+  type QueueItem, type Session
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
-import { MobileClient, type NearbyMobileNode, type SavedMobileConnection } from "./mobile-client";
+import {
+  MobileClient,
+  type MobileQueueEditLease,
+  type NearbyMobileNode,
+  type SavedMobileConnection
+} from "./mobile-client";
 import {
   mobileConnectionAppIcon,
   mobileConnectionArtworkFrame,
@@ -24,8 +29,9 @@ import {
 import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
 import { mobileStorage } from "./storage";
-import { timelineRows } from "./timeline";
+import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileDrawer } from "./MobileDrawer";
+import { MobileActionSheet } from "./MobileActionSheet";
 import { SwipeableSessionRow } from "./SwipeableSessionRow";
 import {
   buildMobileHomeSections, buildWideSessionNavLayout, createSwipeRowRegistry,
@@ -38,6 +44,7 @@ import {
   type MobileFileSearchResult,
   type MobileFilesSearchMode
 } from "./workspace-files";
+import { buildMobileMessageActions, queueItemText, type MobileMessageActionId } from "./task-actions";
 
 const client = new MobileClient(mobileNetwork, mobileStorage, mobileDiscovery, randomUUID, Platform.OS);
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
@@ -695,6 +702,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [localError, setLocalError] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMounted, setDrawerMounted] = useState(false);
+  const [messageAction, setMessageAction] = useState<{ readonly sessionId: string; readonly row: TimelineRow }>();
+  const [messageActionsVisible, setMessageActionsVisible] = useState(false);
+  const [queueEdit, setQueueEdit] = useState<{
+    readonly lease: MobileQueueEditLease;
+    readonly stashedDraft: string;
+  }>();
+  const queueEditRef = useRef(queueEdit);
+  const taskMountedRef = useRef(true);
   const { width } = useWindowDimensions();
   const wideNavigation = buildWideSessionNavLayout({ platform: Platform.OS, iosPad: Platform.OS === "ios" && Platform.isPad, windowWidth: width });
   const drawerWidthRef = useRef(wideNavigation.drawerWidth || 300);
@@ -706,9 +721,137 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
   const rows = timelineRows(state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
+  const queueItems = client.taskQueueItems();
+  const queueCapabilities = client.taskQueueCapabilities();
+  const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
+    && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
+  const messageActionItems = messageAction
+    ? buildMobileMessageActions(messageAction.row, { canDelete: client.canDeleteMessage(messageAction.row.eventId) })
+    : [];
   useEffect(() => {
     if (!wideNavigation.enabled && drawerOpen) setDrawerOpen(false);
   }, [drawerOpen, wideNavigation.enabled]);
+  useEffect(() => {
+    if (!messageAction) return;
+    const stillCurrent = state.selectedId === messageAction.sessionId
+      && rows.some((row) => row.eventId === messageAction.row.eventId && row.completed);
+    if (!stillCurrent) {
+      setMessageActionsVisible(false);
+      setMessageAction(undefined);
+    }
+  }, [messageAction, rows, state.selectedId]);
+  useEffect(() => {
+    const active = queueEditRef.current;
+    if (!active) return;
+    const itemStillAccepted = state.detail?.queueItems.some((item) => item.queueItemId === active.lease.queueItemId
+      && item.sessionId === active.lease.sessionId && item.state === QueueItemState.ACCEPTED) === true;
+    const authorityRetired = state.selectedId !== active.lease.sessionId
+      || state.status === "offline" || state.status === "unpaired" || state.status === "revoked";
+    if (!authorityRetired && itemStillAccepted) return;
+    queueEditRef.current = undefined;
+    setQueueEdit(undefined);
+    setDraft(active.stashedDraft);
+    void client.cancelQueueEdit(active.lease).catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    });
+  }, [state.detail?.queueItems, state.selectedId, state.status]);
+  useEffect(() => {
+    taskMountedRef.current = true;
+    return () => {
+      taskMountedRef.current = false;
+      queueEditRef.current = undefined;
+      client.leaveTask();
+    };
+  }, []);
+
+  const openMessageActions = (row: TimelineRow): void => {
+    if (!state.selectedId) return;
+    setMessageAction({ sessionId: state.selectedId, row });
+    setMessageActionsVisible(true);
+  };
+  const runMessageAction = (action: MobileMessageActionId): void => {
+    const selected = messageAction;
+    setMessageAction(undefined);
+    if (!selected || client.state.selectedId !== selected.sessionId) return;
+    const latest = timelineRows(client.state.window
+      ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
+      .find((row) => row.eventId === selected.row.eventId && row.completed);
+    if (!latest) return;
+    if (action === "add-to-composer") {
+      setDraft((current) => current ? `${current}\n\n${latest.text}` : latest.text);
+      return;
+    }
+    if (!client.canDeleteMessage(latest.eventId)) {
+      setLocalError("This message is no longer deletable in the current idle task.");
+      return;
+    }
+    Alert.alert(
+      "Delete this message?",
+      "This removes the selected durable message from the current task.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Delete", style: "destructive", onPress: () => {
+          setLocalError("");
+          void client.deleteMessage(latest.eventId).catch((error) => {
+            if (taskMountedRef.current) setLocalError(errorText(error));
+          });
+        } }
+      ]
+    );
+  };
+  const beginQueueEdit = async (item: QueueItem): Promise<void> => {
+    const stashedDraft = draft;
+    setLocalError("");
+    try {
+      const lease = await client.beginQueueEdit(item.queueItemId);
+      if (!taskMountedRef.current || client.state.selectedId !== lease.sessionId) {
+        await client.cancelQueueEdit(lease).catch(() => undefined);
+        return;
+      }
+      const active = { lease, stashedDraft };
+      queueEditRef.current = active;
+      setQueueEdit(active);
+      setDraft(lease.text);
+    } catch (error) {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    }
+  };
+  const cancelQueueEdit = (): void => {
+    const active = queueEditRef.current;
+    if (!active) return;
+    setLocalError("");
+    void client.cancelQueueEdit(active.lease).then(() => {
+      if (!taskMountedRef.current || queueEditRef.current !== active) return;
+      queueEditRef.current = undefined;
+      setQueueEdit(undefined);
+      setDraft(active.stashedDraft);
+    }).catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    });
+  };
+  const submitComposer = async (): Promise<void> => {
+    setLocalError("");
+    const active = queueEditRef.current;
+    try {
+      if (!active) {
+        if (await client.send(draft)) setDraft("");
+        return;
+      }
+      if (!await client.saveQueueEdit(active.lease, draft)) return;
+      if (queueEditRef.current !== active) return;
+      queueEditRef.current = undefined;
+      setQueueEdit(undefined);
+      setDraft(active.stashedDraft);
+    } catch (error) {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    }
+  };
+  const mutateQueue = (action: () => Promise<unknown>): void => {
+    setLocalError("");
+    void action().catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    });
+  };
   const queueDrawerAction = (action: () => void): void => {
     if (pendingDrawerActionRef.current) return;
     pendingDrawerActionRef.current = action;
@@ -748,14 +891,49 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       renderItem={({ item }) => <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
         <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
-        <Pressable accessibilityRole="button" accessibilityLabel={`View context for ${item.label}`}
-          disabled={state.historyBusy || state.status !== "connected"}
-          onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}>
-          <Text style={[styles.caption, { color: colors.accent }]}>View context</Text>
-        </Pressable>
+        <View style={styles.messageActions}>
+          <Pressable accessibilityRole="button" accessibilityLabel={`View context for ${item.label}`}
+            disabled={state.historyBusy || state.status !== "connected"}
+            onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
+            style={styles.inlineTouchAction}>
+            <Text style={[styles.caption, { color: colors.accent }]}>View context</Text>
+          </Pressable>
+          {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId) }).length > 0
+            && <Pressable accessibilityRole="button" accessibilityLabel={`More actions for ${item.label}`}
+              onPress={() => openMessageActions(item)} style={styles.inlineTouchAction}>
+              <Text style={[styles.caption, { color: colors.accent }]}>More</Text>
+            </Pressable>}
+        </View>
       </View>} />
-    {state.detail?.queueItems.filter((item) => item.sessionId === state.selectedId).map((item) => <Text key={item.queueItemId}
-      style={[styles.caption, styles.queue, { color: colors.muted }]}>Queue · {queueState(item.state)} · {item.input?.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : []).join(" ")}</Text>)}
+    {queueItems.length > 0 && <View style={styles.queueRegion}>
+      <Text style={[styles.section, { color: colors.muted }]}>Queue</Text>
+      <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList}
+        keyboardShouldPersistTaps="handled">
+      {queueItems.map((item, index) => {
+        const editing = queueEdit?.lease.queueItemId === item.queueItemId;
+        const disabled = state.busy || state.status !== "connected" || queueMutationPending || (!!queueEdit && !editing);
+        const editableText = queueItemText(item.input);
+        return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
+          <Text style={[styles.caption, { color: colors.muted }]}>Queued {index + 1} · {queueState(item.state)}{item.editLocked && !editing ? " · Editing elsewhere" : ""}</Text>
+          <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item)}</Text>
+          <View style={styles.queueActions}>
+            {queueCapabilities.edit && <Action label={editing ? "Editing" : "Edit"} colors={colors} compact
+              disabled={disabled || editing || item.editLocked || editableText === undefined}
+              onPress={() => void beginQueueEdit(item)} />}
+            {queueCapabilities.cancel && <Action label="Remove" colors={colors} compact
+              disabled={disabled || editing}
+              onPress={() => mutateQueue(() => client.cancelQueueItem(item.queueItemId))} />}
+            {queueCapabilities.reorder && <Action label="Move up" colors={colors} compact
+              disabled={disabled || editing || index === 0}
+              onPress={() => mutateQueue(() => client.moveQueueItem(item.queueItemId, "up"))} />}
+            {queueCapabilities.reorder && <Action label="Move down" colors={colors} compact
+              disabled={disabled || editing || index === queueItems.length - 1}
+              onPress={() => mutateQueue(() => client.moveQueueItem(item.queueItemId, "down"))} />}
+          </View>
+        </View>;
+      })}
+      </ScrollView>
+    </View>}
     {state.pending.filter((item) => item.sessionId === state.selectedId).map((item) => <View key={item.operationId} style={styles.pending}>
       <Text style={[styles.warning, { color: colors.negative }]}>{item.state === "unknown" ? "Delivery unknown" : "Awaiting durable result"} · {item.operationId}</Text>
       <Action label="Check status" onPress={() => void client.reconcile()} colors={colors} compact />
@@ -767,13 +945,21 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       )} colors={colors} compact />}
     </View>)}
     {localError && <Banner text={localError} colors={colors} />}
+    {queueEdit && <View style={[styles.queueEditBanner, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
+      <Text style={[styles.caption, styles.fill, { color: colors.ink }]} numberOfLines={1}>Editing queued input</Text>
+      <Action label="Cancel edit" colors={colors} compact disabled={state.busy} onPress={cancelQueueEdit} />
+    </View>}
     <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-      <TextInput accessibilityLabel="Task message" multiline value={draft} onChangeText={setDraft} placeholder="Message Joko…" placeholderTextColor={colors.muted}
+      <TextInput accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline value={draft} onChangeText={setDraft}
+        editable={!state.busy} placeholder={queueEdit ? "Edit queued input…" : "Message Joko…"} placeholderTextColor={colors.muted}
         style={[styles.composerInput, { color: colors.ink }]} />
-      <Action label={state.busy ? "Sending…" : "Send"} colors={colors} compact disabled={!draft.trim() || unknown || state.busy || state.status !== "connected"}
-        onPress={() => { setLocalError(""); void client.send(draft).then((accepted) => { if (accepted) setDraft(""); }).catch((error) => setLocalError(errorText(error))); }} />
+      <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
+        disabled={!draft.trim() || (!queueEdit && unknown) || state.busy || state.status !== "connected"}
+        onPress={() => void submitComposer()} />
     </View>
     </KeyboardAvoidingView>
+    <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
+      onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}
       onClosed={() => {
@@ -1214,6 +1400,15 @@ function queueState(value: QueueItemState): string {
   }
 }
 
+function queueItemSummary(item: QueueItem): string {
+  const parts = item.input?.parts.map((part) => {
+    if (part.content.case === "text") return part.content.value;
+    if (part.content.case === "sessionMention") return `@${part.content.value.displayText || part.content.value.sessionId}`;
+    return "[Attachment or reference]";
+  }) ?? [];
+  return parts.join(" ").trim() || "[Queued input]";
+}
+
 const styles = StyleSheet.create({
   root: { flex: 1 }, fill: { flex: 1 }, screen: { padding: 20, gap: 14, paddingBottom: 36 },
   title: { fontSize: 26, fontWeight: "700" },
@@ -1275,8 +1470,16 @@ const styles = StyleSheet.create({
   devices: { flexGrow: 0, maxHeight: 50 }, deviceList: { paddingHorizontal: 16, gap: 8 },
   deviceChip: { borderWidth: 1, borderRadius: 18, overflow: "hidden", paddingHorizontal: 12, paddingVertical: 8 },
   message: { borderWidth: 1, borderRadius: 14, padding: 14, gap: 6, marginBottom: 8 },
+  messageActions: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 18 },
+  inlineTouchAction: { minHeight: 44, justifyContent: "center" },
   historyActions: { gap: 8 },
   queue: { paddingHorizontal: 18, paddingVertical: 6 }, pending: { paddingHorizontal: 12, flexWrap: "wrap", flexDirection: "row", alignItems: "center" },
+  queueRegion: { maxHeight: 272, paddingHorizontal: 12, paddingBottom: 8, gap: 6 },
+  queueScroll: { flexGrow: 0 },
+  queueList: { gap: 8 },
+  queueCard: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, gap: 4 },
+  queueActions: { flexDirection: "row", flexWrap: "wrap", gap: 7, paddingTop: 3 },
+  queueEditBanner: { minHeight: 52, borderTopWidth: 1, paddingHorizontal: 12, paddingVertical: 4, flexDirection: "row", alignItems: "center", gap: 10 },
   pendingReceipt: { gap: 4, paddingVertical: 4 },
   composer: { flexDirection: "row", borderTopWidth: 1, paddingHorizontal: 12, paddingVertical: 8, alignItems: "flex-end", gap: 10 },
   composerInput: { flex: 1, minHeight: 44, maxHeight: 144, fontSize: 16, paddingVertical: 8 },

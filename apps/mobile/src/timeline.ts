@@ -6,6 +6,8 @@ export interface TimelineRow {
   readonly text: string;
   readonly sequence: bigint;
   readonly eventId: string;
+  readonly kind: "user" | "assistant" | "system" | "tool" | "status" | "error" | "activity";
+  readonly completed: boolean;
 }
 
 function inputText(input: InputContent | undefined): string {
@@ -25,7 +27,8 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       case "messageStarted": {
         const message = kind.value;
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
-          text: inputText(message.userInput) || "…", sequence, eventId: event.eventId });
+          text: inputText(message.userInput) || "…", sequence, eventId: event.eventId,
+          kind: roleKind(message.role), completed: false });
         break;
       }
       case "textDelta": {
@@ -41,24 +44,24 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
             : block.content.case === "toolCall" ? ["[Tool call]"] : []);
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
           text: blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
-          eventId: previous?.eventId ?? event.eventId });
+          eventId: event.eventId, kind: roleKind(message.role), completed: true });
         break;
       }
       case "statusStream":
-        byId.set(event.eventId, { id: event.eventId, label: "Status", text: kind.value.label + (kind.value.detail ? ` · ${kind.value.detail}` : ""), sequence, eventId: event.eventId });
+        byId.set(event.eventId, { id: event.eventId, label: "Status", text: kind.value.label + (kind.value.detail ? ` · ${kind.value.detail}` : ""), sequence, eventId: event.eventId, kind: "status", completed: false });
         break;
       case "recoverableError":
       case "terminalError":
-        byId.set(event.eventId, { id: event.eventId, label: "Error", text: kind.value.error?.message || "The task reported an error.", sequence, eventId: event.eventId });
+        byId.set(event.eventId, { id: event.eventId, label: "Error", text: kind.value.error?.message || "The task reported an error.", sequence, eventId: event.eventId, kind: "error", completed: false });
         break;
       case "toolCallStarted":
-        byId.set(event.eventId, { id: event.eventId, label: "Tool", text: "Tool call started", sequence, eventId: event.eventId });
+        byId.set(event.eventId, { id: event.eventId, label: "Tool", text: "Tool call started", sequence, eventId: event.eventId, kind: "tool", completed: false });
         break;
       case "runDone":
-        byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run finished", sequence, eventId: event.eventId });
+        byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run finished", sequence, eventId: event.eventId, kind: "activity", completed: false });
         break;
       default:
-        byId.set(event.eventId, { id: event.eventId, label: "Activity", text: kind.case.replace(/([A-Z])/g, " $1").trim(), sequence, eventId: event.eventId });
+        byId.set(event.eventId, { id: event.eventId, label: "Activity", text: kind.case.replace(/([A-Z])/g, " $1").trim(), sequence, eventId: event.eventId, kind: "activity", completed: false });
     }
   }
   return [...byId.values()].sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : a.id.localeCompare(b.id));
@@ -70,4 +73,12 @@ function roleLabel(role: MessageRole): string {
   if (role === MessageRole.SYSTEM) return "System";
   if (role === MessageRole.TOOL) return "Tool";
   return "Message";
+}
+
+function roleKind(role: MessageRole): TimelineRow["kind"] {
+  if (role === MessageRole.USER) return "user";
+  if (role === MessageRole.ASSISTANT) return "assistant";
+  if (role === MessageRole.SYSTEM) return "system";
+  if (role === MessageRole.TOOL) return "tool";
+  return "activity";
 }

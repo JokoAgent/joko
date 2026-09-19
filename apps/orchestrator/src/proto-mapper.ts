@@ -550,12 +550,24 @@ export function toProtoBackend(record: StoredBackend): ProtoBackendDescriptor {
       }),
     capabilities: message<CapabilityManifest>("joko.v1.CapabilityManifest", {
       schemaVersion: "joko.core.v1",
-      capabilities: [...backend.capabilities.values()].map(toProtoCapability),
+      capabilities: publicBackendCapabilities(backend).map(toProtoCapability),
       revision: toProtoRevision(record.revision)
     }),
     entityVersion: toProtoEntityVersion(record.revision, backend.instanceGeneration, record.updatedAt),
     error: optionalError(backend.error)
   });
+}
+
+const hostOwnedBackendCapabilities: readonly Capability[] = [
+  { key: contract.capabilityNames.queueCancel, supported: true },
+  { key: contract.capabilityNames.queueEdit, supported: true },
+  { key: contract.capabilityNames.queueReorder, supported: true }
+];
+
+function publicBackendCapabilities(backend: BackendDescriptor): readonly Capability[] {
+  const capabilities = new Map(backend.capabilities);
+  for (const capability of hostOwnedBackendCapabilities) capabilities.set(capability.key, capability);
+  return [...capabilities.values()];
 }
 
 export function toProtoTarget(record: StoredTarget): ProtoTarget {

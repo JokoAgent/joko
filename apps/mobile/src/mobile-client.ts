@@ -1,16 +1,18 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
-  ArchiveSessionMutationSchema, CapabilitySupport, ConnectionState, CreateSessionMutationSchema,
-  DeleteSessionMutationSchema, DeviceKind, EntityKind, EntityRefSchema,
+  ArchiveSessionMutationSchema, CancelQueueItemMutationSchema, CapabilitySupport, ConnectionState, CreateSessionMutationSchema,
+  DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   InputContentSchema, InputPartSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
-  PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, RenameSessionMutationSchema,
-  RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus, TargetState, capabilityNames,
+  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
+  ReorderQueueItemMutationSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
+  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, TargetState, capabilityNames,
   FileKind,
   type Artifact, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision,
-  type Operation, type OperationMutation, type Session, type Snapshot, type WorkspaceEntry, type WorkspaceSearchMatch
+  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
+  type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
   MobileCredentialStorageError, profileFromCredential,
@@ -43,6 +45,14 @@ import {
   type MobileFilesState,
   type MobileWorkspaceAuthority
 } from "./workspace-files";
+import {
+  acceptedQueueItems,
+  backendSupports,
+  editQueueItemText,
+  mobileQueueCapabilities,
+  queueItemText,
+  queueMove
+} from "./task-actions";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -100,6 +110,26 @@ interface MobileFilesContext {
   readonly key: string;
 }
 
+export interface MobileQueueEditLease {
+  readonly connectionId: string;
+  readonly sessionId: string;
+  readonly queueItemId: string;
+  readonly lockToken: string;
+  readonly authorityKey: string;
+  readonly text: string;
+}
+
+interface MobileQueueInteractionLease {
+  readonly credential: PairedCredential;
+  readonly sessionId: string;
+  readonly lockToken: string;
+  readonly authorityKey: string;
+}
+
+type TrackedMutationResult =
+  | { readonly accepted: true; readonly definitive: boolean }
+  | { readonly accepted: false; readonly definitive: boolean };
+
 const isTerminal = (state: OperationState): boolean => [
   OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT
 ].includes(state);
@@ -143,6 +173,8 @@ export class MobileClient {
   #filesPreviewAbort?: AbortController;
   #filesWatchAbort?: AbortController;
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
+  #queueEditLease?: MobileQueueEditLease;
+  #queueInteractionLease?: MobileQueueInteractionLease;
 
   constructor(
     private readonly network: MobileNetwork,
@@ -367,6 +399,7 @@ export class MobileClient {
       }
       return;
     }
+    await this.#releaseQueueEditBeforeTransition();
     const { generation, controller } = this.#beginConnectionAttempt();
     this.#set({
       ...(!this.#hasActiveConnection() ? { status: "connecting" as const } : {}),
@@ -462,6 +495,8 @@ export class MobileClient {
     preferenceError?: string
   ): Promise<void> {
     if (!this.#connectionAttemptCurrent(generation, controller)) return;
+    if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
+    if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     this.#connectionAttemptAbort = undefined;
     const epoch = this.#retire();
     if (!this.#current(epoch)) return;
@@ -705,6 +740,7 @@ export class MobileClient {
     }
     const profile = this.#profiles.find((candidate) => candidate.profileId === profileId);
     if (!profile) return;
+    if (this.#activeProfileId === profileId) await this.#releaseQueueEditBeforeTransition();
     this.cancel();
     this.#set({ busy: true });
     const wasActive = this.#activeProfileId === profileId;
@@ -788,6 +824,10 @@ export class MobileClient {
 
   setForeground(active: boolean): void {
     if (this.#foreground === active) return;
+    if (!active && this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
+    if (!active && this.#queueInteractionLease) {
+      this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
+    }
     this.#foreground = active;
     this.#retire();
     if (!active) {
@@ -1112,6 +1152,8 @@ export class MobileClient {
     if (sessionId !== undefined && !this.#state.owner?.sessions.some((session) => session.sessionId === sessionId)) {
       throw new Error("Select a task from the current Joko node.");
     }
+    if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
+    await this.#releaseQueueEditBeforeTransition();
     const profileId = this.#activeProfileId;
     if (!profileId) throw new Error("Reconnect to a saved Joko node before selecting a task.");
     const epoch = this.#retire();
@@ -1500,6 +1542,7 @@ export class MobileClient {
   }
 
   async logoutConnection(connectionId: string): Promise<boolean> {
+    if (this.#queueEditLease?.connectionId === connectionId) await this.#releaseQueueEditBeforeTransition();
     const connection = this.#state.owner?.connections.find((candidate) => candidate.connectionId === connectionId);
     const revision = connection?.version?.revision;
     if (!connection || !revision || revision.value < 1n) throw new Error("A current connection revision is required for logout.");
@@ -1599,6 +1642,241 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
+  leaveTask(): void {
+    if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
+    if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
+  }
+
+  canDeleteMessage(eventId: string): boolean {
+    const session = this.#selectedSession();
+    const backend = this.#selectedBackend(session);
+    return this.#state.status === "connected" && this.#foreground
+      && session?.state === SessionState.IDLE
+      && backendSupports(backend, capabilityNames.sessionMessageDelete)
+      && this.#activeQueueItems(session.sessionId).length === 0
+      && this.#completedMessageEvent(eventId) !== undefined;
+  }
+
+  async deleteMessage(eventId: string): Promise<boolean> {
+    const session = this.#selectedSession();
+    const generation = session?.nativeBinding?.runtimeGeneration;
+    if (!session || !generation || generation < 1n || !this.canDeleteMessage(eventId)) {
+      throw new Error("This message is no longer available for deletion in the current idle task.");
+    }
+    if (this.#state.pending.some((item) => item.kind === "message-delete"
+      && item.sessionId === session.sessionId && item.eventId === eventId)) {
+      throw new Error("This message deletion is already pending. Check its operation before trying again.");
+    }
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: session.sessionId }),
+          expectedGeneration: generation
+        })],
+        payload: { case: "deleteSessionMessage", value: create(DeleteSessionMessageMutationSchema, {
+          sessionId: session.sessionId,
+          eventId
+        }) }
+      }), { kind: "message-delete", sessionId: session.sessionId, eventId });
+      if (result.accepted && result.definitive) this.#clearHistory();
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  taskQueueItems(): readonly QueueItem[] {
+    return acceptedQueueItems(this.#state.detail?.queueItems ?? [], this.#state.selectedId);
+  }
+
+  taskQueueCapabilities() {
+    return mobileQueueCapabilities(this.#selectedBackend(this.#selectedSession()));
+  }
+
+  async cancelQueueItem(queueItemId: string): Promise<boolean> {
+    const { session, item, capabilities } = this.#queueItemContext(queueItemId);
+    if (!capabilities.cancel) throw new Error("This Backend does not support cancelling queued input.");
+    this.#assertNoPendingQueueMutation(session.sessionId, queueItemId);
+    const action = this.#claimMutation();
+    try {
+      return await this.#submit(create(OperationMutationSchema, {
+        preconditions: [this.#queueItemPrecondition(item)],
+        payload: { case: "cancelQueueItem", value: create(CancelQueueItemMutationSchema, { queueItemId }) }
+      }), { kind: "queue-cancel", sessionId: session.sessionId, queueItemId });
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async beginQueueEdit(queueItemId: string): Promise<MobileQueueEditLease> {
+    if (this.#queueEditLease) throw new Error("Finish or cancel the current queued-input edit first.");
+    const { session, item, capabilities, authorityKey } = this.#queueItemContext(queueItemId);
+    if (!capabilities.edit) throw new Error("This Backend does not support editing queued input.");
+    if (item.editLocked) throw new Error("This queued input is being edited by another client.");
+    const text = queueItemText(item.input);
+    if (text === undefined) throw new Error("This queued input cannot be represented by the current text editor.");
+    this.#assertNoPendingQueueMutation(session.sessionId, queueItemId);
+    const connectionId = this.#ready().connectionId;
+    const lockToken = this.newId();
+    const action = this.#claimMutation();
+    const lease = { connectionId, sessionId: session.sessionId, queueItemId, lockToken, authorityKey, text };
+    this.#queueEditLease = lease;
+    try {
+      let result: TrackedMutationResult;
+      try {
+        result = await this.#submitTerminal(create(OperationMutationSchema, {
+          preconditions: [this.#queueItemPrecondition(item)],
+          payload: { case: "setQueueItemEditLock", value: create(SetQueueItemEditLockMutationSchema, {
+            queueItemId,
+            lockToken,
+            locked: true
+          }) }
+        }), { kind: "queue-edit-lock", sessionId: session.sessionId, queueItemId });
+      } catch (error) {
+        if (this.#queueEditLease === lease) this.#queueEditLease = undefined;
+        throw error;
+      }
+      if (!result.accepted || !result.definitive) {
+        if (this.#queueEditLease === lease) {
+          if (result.definitive) this.#queueEditLease = undefined;
+          else await this.#releaseQueueEditLease(lease).catch(() => {
+            if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);
+          });
+        } else if (!result.definitive) this.#submitDetachedQueueEditUnlock(lease);
+        throw new Error(result.definitive
+          ? "The queued-input edit lock was rejected."
+          : "The queued-input edit lock has an unknown result. Check its operation before retrying.");
+      }
+      if (this.#queueEditLease !== lease || this.#taskAuthorityKey() !== authorityKey) {
+        await this.#releaseQueueEditLease(lease).catch(() => {
+          if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);
+        });
+        throw new Error("The task changed while the queued-input editor was opening.");
+      }
+      const current = this.#queueItem(queueItemId);
+      if (!current || current.state !== QueueItemState.ACCEPTED) {
+        await this.#releaseQueueEditLease(lease).catch(() => {
+          if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);
+        });
+        throw new Error("The queued input was dispatched or removed while its editor was opening.");
+      }
+      return lease;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async saveQueueEdit(lease: MobileQueueEditLease, text: string): Promise<boolean> {
+    this.#assertQueueEditLease(lease);
+    const { item, capabilities } = this.#queueItemContext(lease.queueItemId);
+    if (!capabilities.edit) throw new Error("This Backend no longer supports editing queued input.");
+    const edit = editQueueItemText(item.input, text);
+    if (!edit) throw new Error("Use non-empty text that the current queued-input editor can represent.");
+    if (queueItemText(item.input) === text) {
+      await this.cancelQueueEdit(lease);
+      return true;
+    }
+    const action = this.#claimMutation();
+    let result: TrackedMutationResult | undefined;
+    try {
+      result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#queueItemPrecondition(item)],
+        payload: { case: "editQueueItem", value: create(EditQueueItemMutationSchema, {
+          queueItemId: item.queueItemId,
+          input: edit.input,
+          deliveryMode: item.deliveryMode,
+          lockToken: lease.lockToken,
+          textSplices: [...edit.textSplices]
+        }) }
+      }), { kind: "queue-edit", sessionId: lease.sessionId, queueItemId: lease.queueItemId });
+      if (result.definitive) await this.#releaseQueueEditLease(lease).catch(() => {
+        if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);
+      });
+      if (!result.accepted || !result.definitive) {
+        if (!result.definitive) {
+          throw new Error("The queued-input edit has an unknown result. Check its operation before closing the editor.");
+        }
+        return false;
+      }
+      return true;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async cancelQueueEdit(lease: MobileQueueEditLease): Promise<void> {
+    if (this.#queueEditLease !== lease) return;
+    const action = this.#claimMutation();
+    try { await this.#releaseQueueEditLease(lease); }
+    finally { this.#releaseMutation(action); }
+  }
+
+  async moveQueueItem(queueItemId: string, direction: "up" | "down"): Promise<boolean> {
+    const initial = this.#queueItemContext(queueItemId);
+    if (!initial.capabilities.reorder) throw new Error("This Backend does not support reordering queued input.");
+    const control = this.#queueControl(initial.session.sessionId);
+    if (!control) throw new Error("The current task has no queue-control authority.");
+    if (control.interactionLocked) throw new Error("This queue is being reordered by another client.");
+    if (!queueMove(this.taskQueueItems(), queueItemId, direction)) return false;
+    this.#assertNoPendingQueueMutation(initial.session.sessionId, queueItemId);
+    const credential = this.#ready();
+    const lockToken = this.newId();
+    const action = this.#claimMutation();
+    const interactionLease: MobileQueueInteractionLease = {
+      credential,
+      sessionId: initial.session.sessionId,
+      lockToken,
+      authorityKey: initial.authorityKey
+    };
+    this.#queueInteractionLease = interactionLease;
+    let lockResult: TrackedMutationResult | undefined;
+    let reorderResult: TrackedMutationResult | undefined;
+    try {
+      lockResult = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#queueControlPrecondition(control)],
+        payload: { case: "setQueueInteractionLock", value: create(SetQueueInteractionLockMutationSchema, {
+          sessionId: initial.session.sessionId,
+          lockToken,
+          locked: true
+        }) }
+      }), { kind: "queue-interaction-lock", sessionId: initial.session.sessionId });
+      if (!lockResult.accepted || !lockResult.definitive) {
+        throw new Error(lockResult.definitive
+          ? "The queue reorder lock was rejected."
+          : "The queue reorder lock has an unknown result. Check its operation before retrying.");
+      }
+      if (this.#queueInteractionLease !== interactionLease || this.#taskAuthorityKey() !== initial.authorityKey) {
+        throw new Error("The task changed while the queue reorder lock was being acquired.");
+      }
+      const current = this.#queueItemContext(queueItemId);
+      const move = queueMove(this.taskQueueItems(), queueItemId, direction);
+      if (!move) {
+        reorderResult = { accepted: false, definitive: true };
+        return false;
+      }
+      reorderResult = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#queueItemPrecondition(current.item)],
+        payload: { case: "reorderQueueItem", value: create(ReorderQueueItemMutationSchema, {
+          queueItemId,
+          placement: { anchor: move.placement === "before"
+            ? { case: "beforeQueueItemId", value: move.anchorQueueItemId }
+            : { case: "afterQueueItemId", value: move.anchorQueueItemId } },
+          interactionLockToken: lockToken
+        }) }
+      }), { kind: "queue-reorder", sessionId: initial.session.sessionId, queueItemId });
+      return reorderResult.accepted && reorderResult.definitive;
+    } finally {
+      const lockMayBeHeld = lockResult?.accepted === true || lockResult?.definitive === false;
+      if (lockMayBeHeld) {
+        if (this.#queueInteractionLease === interactionLease) {
+          await this.#releaseQueueInteractionLease(interactionLease).catch(() => {
+            if (this.#queueInteractionLease === interactionLease) {
+              this.#releaseQueueInteractionLeaseDetached(interactionLease);
+            }
+          });
+        } else {
+          this.#submitDetachedQueueInteractionUnlock(interactionLease);
+        }
+      } else if (this.#queueInteractionLease === interactionLease) {
+        this.#queueInteractionLease = undefined;
+      }
+      this.#releaseMutation(action);
+    }
+  }
+
   async renameSession(sessionId: string, displayName: string): Promise<boolean> {
     const value = displayName.trim();
     if (!value || value.length > 256) throw new Error("Use a task name between 1 and 256 characters.");
@@ -1669,6 +1947,279 @@ export class MobileClient {
     if (this.#mutationOwner !== action) return;
     this.#mutationOwner = undefined;
     this.#set({ busy: false });
+  }
+
+  #selectedSession(): Session | undefined {
+    const sessionId = this.#state.selectedId;
+    if (!sessionId) return undefined;
+    return this.#state.detail?.sessions.find((item) => item.sessionId === sessionId)
+      ?? this.#state.owner?.sessions.find((item) => item.sessionId === sessionId);
+  }
+
+  #selectedBackend(session: Session | undefined) {
+    return this.#state.owner?.backends.find((item) => item.backendId === session?.backendId);
+  }
+
+  #taskAuthorityKey(): string | undefined {
+    const credential = this.#credential;
+    const session = this.#selectedSession();
+    const owner = this.#state.owner;
+    const detail = this.#state.detail;
+    const generation = session?.nativeBinding?.runtimeGeneration;
+    if (!credential || !owner || !detail || !session || !generation || generation < 1n
+      || !this.#foreground || this.#state.status !== "connected"
+      || detail.generation !== owner.generation || this.#state.activeProfileId !== credential.profileId
+      || this.#state.node?.serverId !== credential.serverId) return undefined;
+    return [
+      credential.profileId,
+      credential.connectionId,
+      credential.deviceId,
+      credential.serverId,
+      owner.generation.toString(10),
+      session.sessionId,
+      session.backendId,
+      session.targetId,
+      generation.toString(10),
+      session.version?.revision?.etag ?? "",
+      session.version?.revision?.value.toString(10) ?? ""
+    ].join("\u001f");
+  }
+
+  #completedMessageEvent(eventId: string): Event | undefined {
+    const sessionId = this.#state.selectedId;
+    const generation = this.#state.owner?.generation;
+    if (!sessionId || !eventId || !generation) return undefined;
+    const events = this.#state.window
+      ?? [...this.#state.older, ...(this.#state.detail?.timeline ?? []), ...this.#state.live];
+    return events.find((event) => {
+      const payload = event.payload?.kind;
+      return event.eventId === eventId && event.identity?.sessionId === sessionId
+        && event.cursor?.generation === generation && payload?.case === "messageCompleted"
+        && (payload.value.role === MessageRole.USER || payload.value.role === MessageRole.ASSISTANT);
+    });
+  }
+
+  #activeQueueItems(sessionId: string): readonly QueueItem[] {
+    return (this.#state.detail?.queueItems ?? []).filter((item) => item.sessionId === sessionId
+      && [QueueItemState.ACCEPTED, QueueItemState.DISPATCHING, QueueItemState.BACKEND_ACCEPTED,
+        QueueItemState.DISPATCH_UNKNOWN].includes(item.state));
+  }
+
+  #queueItem(queueItemId: string): QueueItem | undefined {
+    return this.#state.detail?.queueItems.find((item) => item.queueItemId === queueItemId
+      && item.sessionId === this.#state.selectedId);
+  }
+
+  #queueControl(sessionId: string): QueueControl | undefined {
+    const session = this.#selectedSession();
+    return this.#state.detail?.queueControls.find((control) => control.sessionId === sessionId
+      && control.backendId === session?.backendId && control.targetId === session.targetId);
+  }
+
+  #queueItemContext(queueItemId: string) {
+    this.#ready();
+    const authorityKey = this.#taskAuthorityKey();
+    const session = this.#selectedSession();
+    const backend = this.#selectedBackend(session);
+    const item = this.#queueItem(queueItemId);
+    const revision = item?.version?.revision;
+    if (!authorityKey || !session || !backend || !item || item.state !== QueueItemState.ACCEPTED
+      || item.backendId !== session.backendId || item.targetId !== session.targetId
+      || !revision || revision.value < 1n || item.version!.generation < 1n) {
+      throw new Error("This queued input is no longer accepted by the current task.");
+    }
+    return { authorityKey, session, backend, item, capabilities: mobileQueueCapabilities(backend) };
+  }
+
+  #queueItemPrecondition(item: QueueItem) {
+    const revision = item.version?.revision;
+    if (!revision || revision.value < 1n || !item.version || item.version.generation < 1n) {
+      throw new Error("A current queued-input version is required.");
+    }
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.QUEUE_ITEM, id: item.queueItemId }),
+      expectedRevision: revision,
+      expectedGeneration: item.version.generation
+    });
+  }
+
+  #queueControlPrecondition(control: QueueControl) {
+    const revision = control.version?.revision;
+    if (!revision || revision.value < 1n || !control.version || control.version.generation < 1n) {
+      throw new Error("A current queue-control version is required.");
+    }
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.QUEUE_CONTROL, id: control.sessionId }),
+      expectedRevision: revision,
+      expectedGeneration: control.version.generation
+    });
+  }
+
+  #assertNoPendingQueueMutation(sessionId: string, queueItemId: string): void {
+    if (this.#state.pending.some((item) => item.sessionId === sessionId
+      && (item.queueItemId === queueItemId || item.kind === "queue-interaction-lock")
+      && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind))) {
+      throw new Error("A previous change to this queued input is still pending. Check its operation before retrying.");
+    }
+  }
+
+  #assertQueueEditLease(lease: MobileQueueEditLease): void {
+    if (this.#queueEditLease !== lease || this.#taskAuthorityKey() !== lease.authorityKey
+      || this.#state.selectedId !== lease.sessionId) {
+      throw new Error("The queued-input edit lock no longer belongs to the current task.");
+    }
+  }
+
+  async #releaseQueueEditLease(lease: MobileQueueEditLease): Promise<void> {
+    if (this.#queueEditLease !== lease) return;
+    if (this.#credential?.connectionId !== lease.connectionId) {
+      this.#queueEditLease = undefined;
+      return;
+    }
+    const result = await this.#submitTerminal(create(OperationMutationSchema, {
+      payload: { case: "setQueueItemEditLock", value: create(SetQueueItemEditLockMutationSchema, {
+        queueItemId: lease.queueItemId,
+        lockToken: lease.lockToken,
+        locked: false
+      }) }
+    }), { kind: "queue-edit-lock", sessionId: lease.sessionId, queueItemId: lease.queueItemId });
+    if (this.#queueEditLease === lease) this.#queueEditLease = undefined;
+    if (!result.accepted && result.definitive) throw new Error("The queued-input edit lock could not be released.");
+  }
+
+  async #releaseQueueEditBeforeTransition(): Promise<void> {
+    const lease = this.#queueEditLease;
+    if (!lease) return;
+    try {
+      await this.cancelQueueEdit(lease);
+    } catch {
+      if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);
+    }
+  }
+
+  #releaseQueueEditLeaseDetached(lease: MobileQueueEditLease): void {
+    if (this.#queueEditLease !== lease) return;
+    this.#queueEditLease = undefined;
+    this.#submitDetachedQueueEditUnlock(lease);
+  }
+
+  #submitDetachedQueueEditUnlock(lease: MobileQueueEditLease): void {
+    const credential = this.#credential;
+    if (!credential || credential.connectionId !== lease.connectionId) return;
+    const pending: PendingOperation = {
+      operationId: this.newId(),
+      connectionId: lease.connectionId,
+      kind: "queue-edit-lock",
+      sessionId: lease.sessionId,
+      queueItemId: lease.queueItemId,
+      state: "unknown"
+    };
+    const mutation = create(OperationMutationSchema, {
+      payload: { case: "setQueueItemEditLock", value: create(SetQueueItemEditLockMutationSchema, {
+        queueItemId: lease.queueItemId,
+        lockToken: lease.lockToken,
+        locked: false
+      }) }
+    });
+    void this.#runDetachedMutation(credential, pending, mutation);
+  }
+
+  async #runDetachedMutation(
+    credential: PairedCredential,
+    pending: PendingOperation,
+    mutation: OperationMutation
+  ): Promise<void> {
+    try {
+      await this.#writeDetachedPending((items) => items.some((item) => item.operationId === pending.operationId)
+        ? items
+        : [...items, pending]);
+    } catch {
+      return;
+    }
+    let operation: Operation;
+    try {
+      operation = await this.network.submit(credential, pending.operationId, mutation);
+    } catch {
+      return;
+    }
+    if (!isTerminal(operation.state)) {
+      try {
+        await this.#writeDetachedPending((items) => items.map((item) => item.operationId === pending.operationId
+          ? { ...item, state: "accepted" as const }
+          : item));
+        operation = await this.network.waitOperation(credential, pending.operationId);
+      } catch {
+        return;
+      }
+    }
+    if (!isTerminal(operation.state)) return;
+    try {
+      await this.#writeDetachedPending((items) => items.filter((item) => item.operationId !== pending.operationId));
+    } catch {
+      return;
+    }
+    if (this.#foreground && this.#credential?.connectionId === credential.connectionId) void this.refresh();
+  }
+
+  async #writeDetachedPending(
+    update: (items: readonly PendingOperation[]) => readonly PendingOperation[]
+  ): Promise<void> {
+    const write = this.#pendingWrite.then(async () => {
+      const next = [...update(this.#allPending)].slice(-64);
+      await this.storage.savePending(next);
+      this.#allPending = next;
+      const connectionId = this.#credential?.connectionId;
+      if (connectionId) {
+        this.#set({
+          pending: next.filter((item) => item.connectionId === connectionId),
+          saved: this.#savedViews()
+        });
+      }
+    });
+    this.#pendingWrite = write.then(() => undefined, () => undefined);
+    await write;
+  }
+
+  async #releaseQueueInteractionLease(lease: MobileQueueInteractionLease): Promise<void> {
+    if (this.#queueInteractionLease !== lease) return;
+    if (this.#credential?.connectionId !== lease.credential.connectionId
+      || this.#state.selectedId !== lease.sessionId || this.#taskAuthorityKey() !== lease.authorityKey) {
+      this.#releaseQueueInteractionLeaseDetached(lease);
+      return;
+    }
+    const result = await this.#submitTerminal(create(OperationMutationSchema, {
+      payload: { case: "setQueueInteractionLock", value: create(SetQueueInteractionLockMutationSchema, {
+        sessionId: lease.sessionId,
+        lockToken: lease.lockToken,
+        locked: false
+      }) }
+    }), { kind: "queue-interaction-lock", sessionId: lease.sessionId });
+    if (this.#queueInteractionLease === lease) this.#queueInteractionLease = undefined;
+    if (!result.accepted && result.definitive) throw new Error("The queue reorder lock could not be released.");
+  }
+
+  #releaseQueueInteractionLeaseDetached(lease: MobileQueueInteractionLease): void {
+    if (this.#queueInteractionLease !== lease) return;
+    this.#queueInteractionLease = undefined;
+    this.#submitDetachedQueueInteractionUnlock(lease);
+  }
+
+  #submitDetachedQueueInteractionUnlock(lease: MobileQueueInteractionLease): void {
+    const pending: PendingOperation = {
+      operationId: this.newId(),
+      connectionId: lease.credential.connectionId,
+      kind: "queue-interaction-lock",
+      sessionId: lease.sessionId,
+      state: "unknown"
+    };
+    const mutation = create(OperationMutationSchema, {
+      payload: { case: "setQueueInteractionLock", value: create(SetQueueInteractionLockMutationSchema, {
+        sessionId: lease.sessionId,
+        lockToken: lease.lockToken,
+        locked: false
+      }) }
+    });
+    void this.#runDetachedMutation(lease.credential, pending, mutation);
   }
 
   #filesAuthorityKey(state: MobileState): string | undefined {
@@ -2028,8 +2579,23 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "targetConnectionId" | "targetDeviceId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "targetConnectionId" | "targetDeviceId">
   ): Promise<boolean> {
+    return (await this.#submitTracked(mutation, identity, false)).accepted;
+  }
+
+  async #submitTerminal(
+    mutation: OperationMutation,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "targetConnectionId" | "targetDeviceId">
+  ): Promise<TrackedMutationResult> {
+    return this.#submitTracked(mutation, identity, true);
+  }
+
+  async #submitTracked(
+    mutation: OperationMutation,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "targetConnectionId" | "targetDeviceId">,
+    waitForTerminal: boolean
+  ): Promise<TrackedMutationResult> {
     const credential = this.#ready();
     const epoch = this.#epoch;
     const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId: this.newId(), state: "unknown" };
@@ -2037,7 +2603,7 @@ export class MobileClient {
     const next = [...before, pending];
     this.#set({ pending: next, busy: true, error: undefined });
     try {
-      if (!await this.#persistPending(next, epoch)) return false;
+      if (!await this.#persistPending(next, epoch)) return { accepted: false, definitive: false };
     } catch (error) {
       if (this.#current(epoch)) this.#set({ pending: before, busy: false });
       throw error;
@@ -2047,10 +2613,23 @@ export class MobileClient {
       operation = await this.network.submit(credential, pending.operationId, mutation, this.#abort?.signal);
     } catch (error) {
       if (this.#current(epoch)) this.#set({ busy: false, error: `Operation ${pending.operationId}: ${message(error)}. Check status; it was not resent.` });
-      return false;
+      return { accepted: false, definitive: false };
     }
-    if (!this.#current(epoch)) return false;
+    if (!this.#current(epoch)) return { accepted: false, definitive: false };
     await this.#receipt(operation, pending, epoch);
+    if (waitForTerminal && !isTerminal(operation.state)) {
+      try {
+        operation = await this.network.waitOperation(credential, pending.operationId, this.#abort?.signal);
+      } catch (error) {
+        if (this.#current(epoch)) this.#set({
+          busy: false,
+          error: `Operation ${pending.operationId}: ${message(error)}. Its durable result is unknown; it was not resent.`
+        });
+        return { accepted: false, definitive: false };
+      }
+      if (!this.#current(epoch)) return { accepted: false, definitive: false };
+      await this.#receipt(operation, pending, epoch);
+    }
     const rejected = operation.state === OperationState.FAILED
       || operation.state === OperationState.CONFLICT
       || operation.state === OperationState.CANCELLED;
@@ -2062,7 +2641,7 @@ export class MobileClient {
         this.#set({ error: rejectionMessage });
       }
     }
-    return !rejected;
+    return { accepted: !rejected, definitive: isTerminal(operation.state) };
   }
 
   async #receipt(operation: Operation, pending: PendingOperation, epoch: number): Promise<void> {
@@ -2109,9 +2688,12 @@ export class MobileClient {
         if (operation) {
           await this.#receipt(operation, pending, epoch);
           if (operation.state === OperationState.SUCCEEDED
-            && ["rename", "pin", "archive", "delete"].includes(pending.kind)
+            && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
+              "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
+            if (pending.kind === "message-delete" && this.#foreground
+              && this.#state.selectedId === pending.sessionId) this.#clearHistory();
             return;
           }
         } else this.#set({ error: `Operation ${pending.operationId} is not yet confirmed. No input will be resent automatically.` });
@@ -2180,6 +2762,8 @@ export class MobileClient {
   }
 
   dispose(): void {
+    if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
+    if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     this.#disposed = true;
     if (this.#discoveryExpiryTimer !== undefined) clearTimeout(this.#discoveryExpiryTimer);
     this.#discoveryExpiryTimer = undefined;

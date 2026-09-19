@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { ProviderApiCompatibility, ProviderConfigurationField } from "@joko/contracts";
+import { CapabilitySupport, ProviderApiCompatibility, ProviderConfigurationField, capabilityNames } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
@@ -114,6 +114,41 @@ describe("proto mapper", () => {
     });
     const { providerRuntimeSupport: _support, ...withoutProviderSupport } = stored.descriptor;
     expect(toProtoBackend({ ...stored, descriptor: withoutProviderSupport }).providerRuntimeSupport).toBeUndefined();
+  });
+
+  it("adds Host-owned Queue controls to the public capability manifest", () => {
+    const stored: StoredBackend = {
+      descriptor: {
+        id: "backend-queue-controls",
+        adapterKind: "queue-runtime",
+        instanceGeneration: 1,
+        displayName: "Queue runtime",
+        version: "1.0.0",
+        health: "healthy",
+        installationState: "installed",
+        authenticationState: "authenticated",
+        capabilities: new Map([[capabilityNames.queueEdit, {
+          key: capabilityNames.queueEdit,
+          supported: false,
+          reason: "not_implemented"
+        }]]),
+        models: [],
+        tools: [],
+        diagnostics: []
+      },
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 3n
+    };
+
+    const capabilities = toProtoBackend(stored).capabilities?.capabilities;
+    expect(capabilities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: capabilityNames.queueCancel, support: CapabilitySupport.SUPPORTED }),
+      expect.objectContaining({ name: capabilityNames.queueEdit, support: CapabilitySupport.SUPPORTED }),
+      expect.objectContaining({ name: capabilityNames.queueReorder, support: CapabilitySupport.SUPPORTED })
+    ]));
+    expect(capabilities?.filter((capability) => capability.name === capabilityNames.queueEdit)).toHaveLength(1);
+    expect(stored.descriptor.capabilities.get(capabilityNames.queueEdit)?.supported).toBe(false);
   });
 
   it("preserves exact runtime resource kinds in the public Backend capability manifest", () => {

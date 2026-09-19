@@ -206,4 +206,37 @@ describe("current-v1 mobile connection storage", () => {
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
+
+  it("round-trips message and Queue receipts only with their exact durable entity identity", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = [
+      { operationId: "message-delete", connectionId: first.connectionId, kind: "message-delete" as const,
+        sessionId: "session-one", eventId: "event-one", state: "unknown" as const },
+      { operationId: "queue-cancel", connectionId: first.connectionId, kind: "queue-cancel" as const,
+        sessionId: "session-one", queueItemId: "queue-one", state: "accepted" as const },
+      { operationId: "queue-edit-lock", connectionId: first.connectionId, kind: "queue-edit-lock" as const,
+        sessionId: "session-one", queueItemId: "queue-one", state: "unknown" as const },
+      { operationId: "queue-edit", connectionId: first.connectionId, kind: "queue-edit" as const,
+        sessionId: "session-one", queueItemId: "queue-one", state: "unknown" as const },
+      { operationId: "queue-interaction-lock", connectionId: first.connectionId, kind: "queue-interaction-lock" as const,
+        sessionId: "session-one", state: "accepted" as const },
+      { operationId: "queue-reorder", connectionId: first.connectionId, kind: "queue-reorder" as const,
+        sessionId: "session-one", queueItemId: "queue-two", state: "unknown" as const }
+    ];
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { operationId: "message-without-event", connectionId: first.connectionId, kind: "message-delete",
+        sessionId: "session-one", state: "unknown" },
+      { operationId: "queue-without-item", connectionId: first.connectionId, kind: "queue-edit",
+        sessionId: "session-one", state: "unknown" },
+      { operationId: "control-without-session", connectionId: first.connectionId, kind: "queue-interaction-lock",
+        state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
 });

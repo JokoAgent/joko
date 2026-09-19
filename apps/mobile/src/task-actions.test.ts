@@ -1,0 +1,101 @@
+import { create } from "@bufbuild/protobuf";
+import {
+  BackendDescriptorSchema,
+  CapabilitySupport,
+  InputContentSchema,
+  InputPartSchema,
+  QueueItemSchema,
+  QueueItemState,
+  capabilityNames
+} from "@joko/contracts";
+import { describe, expect, it } from "vitest";
+import {
+  DeferredSheetAction,
+  acceptedQueueItems,
+  buildMobileMessageActions,
+  editQueueItemText,
+  mobileQueueCapabilities,
+  queueItemText,
+  queueMove
+} from "./task-actions";
+import type { TimelineRow } from "./timeline";
+
+describe("mobile message action sheet", () => {
+  const row: TimelineRow = {
+    id: "message-1", eventId: "event-complete", label: "You", text: "Keep this exact message",
+    sequence: 4n, kind: "user", completed: true
+  };
+
+  it("offers only actions backed by the current durable message and capability", () => {
+    expect(buildMobileMessageActions(row, { canDelete: true })).toEqual([
+      { id: "add-to-composer", label: "Add to composer" },
+      { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
+    ]);
+    expect(buildMobileMessageActions({ ...row, completed: false }, { canDelete: true })).toEqual([]);
+    expect(buildMobileMessageActions({ ...row, kind: "status" }, { canDelete: true })).toEqual([]);
+  });
+
+  it("runs a choice only after its matching close and cancels an old choice on reopen", () => {
+    const lifecycle = new DeferredSheetAction<string>();
+    lifecycle.open();
+    const firstClose = lifecycle.select("delete");
+    lifecycle.open();
+    expect(lifecycle.closed(firstClose)).toBeUndefined();
+    const secondClose = lifecycle.select("add");
+    expect(lifecycle.closed(secondClose)).toBe("add");
+    expect(lifecycle.closed(secondClose)).toBeUndefined();
+    lifecycle.open();
+    const cancelled = lifecycle.cancel();
+    expect(lifecycle.closed(cancelled)).toBeUndefined();
+  });
+});
+
+describe("mobile accepted Queue actions", () => {
+  const item = (id: string, ordinal: bigint, state = QueueItemState.ACCEPTED) => create(QueueItemSchema, {
+    queueItemId: id,
+    sessionId: "session-1",
+    ordinal,
+    state,
+    version: { revision: { value: ordinal + 1n, etag: `queue-${id}` } },
+    input: create(InputContentSchema, {
+      parts: [
+        create(InputPartSchema, { content: { case: "text", value: `text-${id}` } }),
+        create(InputPartSchema, { content: { case: "sessionMention", value: { sessionId: "other", displayText: "Other task" } } })
+      ]
+    })
+  });
+
+  it("sorts the current accepted queue stably and resolves edge-safe touch moves", () => {
+    const items = acceptedQueueItems([
+      item("b", 2n), item("done", 0n, QueueItemState.COMPLETED), item("a", 1n),
+      create(QueueItemSchema, { ...item("other", 0n), sessionId: "session-2" })
+    ], "session-1");
+    expect(items.map((value) => value.queueItemId)).toEqual(["a", "b"]);
+    expect(queueMove(items, "a", "up")).toBeUndefined();
+    expect(queueMove(items, "a", "down")).toEqual({ placement: "after", anchorQueueItemId: "b" });
+    expect(queueMove(items, "b", "up")).toEqual({ placement: "before", anchorQueueItemId: "a" });
+    expect(queueMove(items, "b", "down")).toBeUndefined();
+  });
+
+  it("preserves non-text input and emits UTF-16 replacement coordinates", () => {
+    const original = item("a", 1n).input;
+    expect(queueItemText(original)).toBe("text-a");
+    const edited = editQueueItemText(original, "Hello 👋");
+    expect(edited?.input.parts[0]?.content).toEqual({ case: "text", value: "Hello 👋" });
+    expect(edited?.input.parts[1]).toBe(original?.parts[1]);
+    expect(edited?.textSplices).toMatchObject([{ start: 0, end: 6, replacementText: "Hello 👋" }]);
+    expect(editQueueItemText(original, "   ")).toBeUndefined();
+  });
+
+  it("branches only on public capabilities", () => {
+    const backend = create(BackendDescriptorSchema, {
+      capabilities: {
+        capabilities: [
+          { name: capabilityNames.queueEdit, support: CapabilitySupport.SUPPORTED },
+          { name: capabilityNames.queueCancel, support: CapabilitySupport.NOT_IMPLEMENTED }
+        ]
+      }
+    });
+    expect(mobileQueueCapabilities(backend)).toEqual({ cancel: false, edit: true, reorder: false });
+  });
+});
