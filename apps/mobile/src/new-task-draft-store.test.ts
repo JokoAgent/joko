@@ -5,6 +5,12 @@ import {
   mobileNewTaskDraftTesting,
   type MobileNewTaskDraftIdentity
 } from "./new-task-draft-store";
+import {
+  insertMobileResourceMention,
+  insertMobileSessionMention,
+  insertMobileWorkspaceMention,
+  plainTextMobileComposerDraft
+} from "./mobile-composer-document";
 
 const first = { profileId: "profile-one" } satisfies MobileNewTaskDraftIdentity;
 const second = { profileId: "profile-two" } satisfies MobileNewTaskDraftIdentity;
@@ -29,6 +35,25 @@ function memoryDriver() {
   return { driver, values, writes };
 }
 
+function input(text: string) {
+  return plainTextMobileComposerDraft(text);
+}
+
+function structuredInput() {
+  const session = insertMobileSessionMention(
+    input("Review"),
+    { start: 6, end: 6 },
+    { sessionId: "session-history", displayText: "History" },
+    "mention-session"
+  );
+  return insertMobileWorkspaceMention(
+    session.draft,
+    session.selection,
+    { workspaceId: "workspace-one", relativePath: "src", displayText: "src", directory: true },
+    "mention-workspace"
+  ).draft;
+}
+
 describe("mobile new-task retained draft store", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
@@ -36,17 +61,17 @@ describe("mobile new-task retained draft store", () => {
   it("debounces editable drafts independently for each exact connection profile", async () => {
     const memory = memoryDriver();
     const store = new MobileNewTaskDraftStore(memory.driver);
-    store.save(first, { targetId: "target-one", name: "One", text: "older" });
-    store.save(first, { targetId: "target-one", name: "One", text: "latest" });
-    store.save(second, { targetId: "target-two", name: "Two", text: "other" });
+    store.save(first, { targetId: "target-one", name: "One", input: input("older") });
+    store.save(first, { targetId: "target-one", name: "One", input: input("latest") });
+    store.save(second, { targetId: "target-two", name: "Two", input: input("other") });
 
     await vi.advanceTimersByTimeAsync(mobileNewTaskDraftTesting.persistDebounceMilliseconds);
     await store.flush();
 
     const restoredFirst = await new MobileNewTaskDraftStore(memory.driver).read(first);
     const restoredSecond = await new MobileNewTaskDraftStore(memory.driver).read(second);
-    expect(restoredFirst).toEqual({ targetId: "target-one", name: "One", text: "latest" });
-    expect(restoredSecond).toEqual({ targetId: "target-two", name: "Two", text: "other" });
+    expect(restoredFirst).toEqual({ targetId: "target-one", name: "One", input: input("latest") });
+    expect(restoredSecond).toEqual({ targetId: "target-two", name: "Two", input: input("other") });
     expect(memory.writes.some((write) => write.value?.includes("older"))).toBe(false);
   });
 
@@ -61,21 +86,21 @@ describe("mobile new-task retained draft store", () => {
     };
     const edited = new MobileNewTaskDraftStore(driver);
     const firstRead = edited.read(first);
-    edited.save(first, { targetId: "target-one", name: "", text: "typed while loading" });
+    edited.save(first, { targetId: "target-one", name: "", input: input("typed while loading") });
     resolveFirst(JSON.stringify({
-      version: 1,
+      version: 2,
       identity: first,
-      draft: { targetId: "target-one", name: "", text: "stale" }
+      draft: { targetId: "target-one", name: "", input: input("stale") }
     }));
-    await expect(firstRead).resolves.toMatchObject({ text: "typed while loading" });
+    await expect(firstRead).resolves.toMatchObject({ input: { text: "typed while loading" } });
 
     const cleared = new MobileNewTaskDraftStore(driver);
     const secondRead = cleared.read(second);
     const clearing = cleared.clear(second);
     resolveSecond(JSON.stringify({
-      version: 1,
+      version: 2,
       identity: second,
-      draft: { targetId: "target-two", name: "", text: "must not return" }
+      draft: { targetId: "target-two", name: "", input: input("must not return") }
     }));
     await clearing;
     await expect(secondRead).resolves.toBeNull();
@@ -88,21 +113,21 @@ describe("mobile new-task retained draft store", () => {
     const creating = await store.beginSubmission(first, {
       targetId: "target-one",
       name: "  Release task  ",
-      text: "  ship this safely  "
+      input: structuredInput()
     }, authority);
     expect(creating).toMatchObject({
       phase: "creating",
       targetId: "target-one",
       displayName: "Release task",
-      inputText: "ship this safely",
+      input: structuredInput(),
       targetRevision: "7",
       targetRevisionEtag: "target-r7"
     });
-    store.save(first, { targetId: "target-two", name: "Changed", text: "changed after submit" });
+    store.save(first, { targetId: "target-two", name: "Changed", input: input("changed after submit") });
     expect(store.readSync(first)).toMatchObject({
       targetId: "target-one",
       name: "  Release task  ",
-      text: "  ship this safely  "
+      input: structuredInput()
     });
 
     const sending = await store.advanceToSending(first, "operation-create", "session-one", 11n);
@@ -116,17 +141,17 @@ describe("mobile new-task retained draft store", () => {
       sendOperationId: "operation-send",
       sessionId: "session-one",
       runtimeGeneration: "11",
-      inputText: "ship this safely"
+      input: structuredInput()
     });
   });
 
   it("releases only the matching operation while retaining the editable creation draft", async () => {
     const memory = memoryDriver();
     const store = new MobileNewTaskDraftStore(memory.driver);
-    await store.beginSubmission(first, { targetId: "target-one", name: "Name", text: "First" }, authority);
+    await store.beginSubmission(first, { targetId: "target-one", name: "Name", input: input("First") }, authority);
     await expect(store.clearSubmission(first, "another-operation")).rejects.toThrow(/changed/);
     await expect(store.clearSubmission(first, "operation-create")).resolves.toEqual({
-      targetId: "target-one", name: "Name", text: "First"
+      targetId: "target-one", name: "Name", input: input("First")
     });
     expect((await new MobileNewTaskDraftStore(memory.driver).read(first))?.submission).toBeUndefined();
   });
@@ -138,17 +163,39 @@ describe("mobile new-task retained draft store", () => {
     memory.values.set(key, JSON.stringify({ targetId: "legacy", text: "old shape" }));
     await expect(store.read(first)).rejects.toThrow(/could not be read/);
 
-    const crossProfile = new MobileNewTaskDraftStore(memory.driver);
     memory.values.set(key, JSON.stringify({
       version: 1,
+      identity: first,
+      draft: { targetId: "target-one", name: "", text: "old v1 text" }
+    }));
+    await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+
+    const crossProfile = new MobileNewTaskDraftStore(memory.driver);
+    memory.values.set(key, JSON.stringify({
+      version: 2,
       identity: second,
-      draft: { targetId: "target-one", name: "", text: "cross owner" }
+      draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
     await expect(crossProfile.read(first)).rejects.toThrow(/could not be read/);
 
     const oversized = new MobileNewTaskDraftStore(memory.driver);
-    expect(() => oversized.save(first, { targetId: "target-one", name: "", text: "x".repeat(1_000_001) }))
+    expect(() => oversized.save(first, { targetId: "target-one", name: "", input: input("x".repeat(1_000_001)) }))
       .toThrow(/too large/);
+
+    const runtimeResource = insertMobileResourceMention(
+      input("Use"),
+      { start: 3, end: 3 },
+      {
+        resourceId: "resource",
+        displayText: "Skill",
+        discoveredRevision: "sha256:resource",
+        resourceVersion: "1",
+        runtimeGeneration: "2"
+      },
+      "resource-occurrence"
+    ).draft;
+    expect(() => oversized.save(first, { targetId: "target-one", name: "", input: runtimeResource }))
+      .toThrow(/not runtime Resources or Artifacts/u);
   });
 
   it("reports write failures without discarding the in-memory workflow and can flush it later", async () => {
@@ -170,7 +217,7 @@ describe("mobile new-task retained draft store", () => {
     store.subscribeErrors((_identity, error) => errors.push(error));
 
     await expect(store.beginSubmission(first, {
-      targetId: "target-one", name: "", text: "keep this"
+      targetId: "target-one", name: "", input: input("keep this")
     }, authority)).rejects.toThrow(/could not be written/);
     expect(store.readSync(first)?.submission).toMatchObject({ createOperationId: "operation-create" });
     expect(errors.at(-1)?.message).toContain("could not be written");

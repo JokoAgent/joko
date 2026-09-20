@@ -17,14 +17,45 @@ import {
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   mobileComposerInput,
+  mobileComposerDraftWithoutPrefix,
   mobileInputSummary,
   normalizeMobileComposerDraft,
   plainTextMobileComposerDraft,
+  recoverMobileComposerDraft,
   reconcileMobileComposerText,
   removeMobileComposerMention
 } from "./mobile-composer-document";
 
 describe("mobile structured composer document", () => {
+  it("recovers a rejected structured prefix without flattening newer references and removes only that exact prefix", () => {
+    const first = insertMobileSessionMention(
+      plainTextMobileComposerDraft("Review"),
+      { start: 6, end: 6 },
+      { sessionId: "source", displayText: "History" },
+      "shared-occurrence"
+    ).draft;
+    const later = insertMobileWorkspaceMention(
+      plainTextMobileComposerDraft("Then inspect"),
+      { start: 12, end: 12 },
+      { workspaceId: "workspace", relativePath: "src", displayText: "src", directory: true },
+      "shared-occurrence"
+    ).draft;
+
+    const recovered = recoverMobileComposerDraft(first, later);
+
+    expect(recovered.text).toBe("Review @History\n\nThen inspect @src/");
+    expect(recovered.mentions).toMatchObject([
+      { kind: "session", mentionId: "shared-occurrence", start: 7, end: 15 },
+      { kind: "workspace", mentionId: "shared-occurrence-recovered-1", start: 30, end: 35 }
+    ]);
+    expect(recoverMobileComposerDraft(first, recovered)).toEqual(recovered);
+    expect(mobileComposerDraftWithoutPrefix(first, recovered)).toEqual({
+      text: later.text,
+      mentions: [{ ...later.mentions[0]!, mentionId: "shared-occurrence-recovered-1" }]
+    });
+    expect(mobileComposerDraftWithoutPrefix(first, plainTextMobileComposerDraft("Newer unrelated draft"))).toBeUndefined();
+  });
+
   it("inserts repeated equal labels as independent occurrences and serializes exact UTF-16 ranges", () => {
     const first = insertMobileSessionMention(
       plainTextMobileComposerDraft("Review 😀 then "),

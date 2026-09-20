@@ -6,7 +6,7 @@ import {
   DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
-  InputContentSchema, InputPartSchema, ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
+  ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, NavigateSessionBranchMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevisionSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
@@ -65,9 +65,11 @@ import {
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import type { MobileComposerDraftStore } from "./composer-draft-store";
 import {
+  mobileComposerDraftWithoutPrefix,
+  mobileComposerDraftsEqual,
   mobileComposerInput,
   normalizeMobileComposerDraft,
-  plainTextMobileComposerDraft,
+  recoverMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import {
@@ -82,13 +84,17 @@ import {
   type MobileCatalogMentionControls
 } from "./mobile-catalog-mentions";
 import {
+  assertMobileSessionMentionCandidate,
   assertMobileSessionMentionDraft,
+  createMobileNewTaskSessionMentionControls,
   createMobileSessionMentionControls,
+  type MobileSessionMentionCandidate,
   type MobileSessionMentionControls
 } from "./mobile-session-mentions";
 import {
   assertMobileWorkspaceMentionCandidate,
   assertMobileWorkspaceMentionDraft,
+  createMobileNewTaskWorkspaceMentionControls,
   createMobileWorkspaceMentionControls,
   projectMobileWorkspaceMentionDirectory,
   projectMobileWorkspaceMentionFileIndex,
@@ -1702,9 +1708,12 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  async create(targetId: string, name: string, firstInput: string): Promise<MobileNewTaskResult> {
-    const inputText = firstInput.trim();
-    if (!inputText) throw new Error("Enter the first message for this task.");
+  async create(targetId: string, name: string, firstInput: MobileComposerDraft): Promise<MobileNewTaskResult> {
+    const input = normalizeMobileComposerDraft(firstInput);
+    if (!input.text.trim()) throw new Error("Enter the first message for this task.");
+    if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+      throw new Error("A new task cannot reference runtime Resources or Artifacts before its Session exists.");
+    }
     if (name.length > 256) throw new Error("Use a task name no longer than 256 characters.");
     if (!this.newTaskDrafts || !this.composerDrafts) {
       throw new Error("Retained new-task drafts are unavailable on this mobile client.");
@@ -1725,12 +1734,16 @@ export class MobileClient {
     if (!node || node.serverId !== credential.serverId || this.#activeProfileId !== credential.profileId) {
       throw new Error("Reconnect to the exact saved Joko node before creating a task.");
     }
+    const authorityKey = this.#newTaskAuthorityKey(targetId);
+    if (!authorityKey) throw new Error("The selected project authority is unavailable.");
+    assertMobileSessionMentionDraft(this.newTaskSessionMentionControls(targetId), input);
+    assertMobileWorkspaceMentionDraft(this.newTaskWorkspaceMentionControls(targetId), input);
     const identity = { profileId: credential.profileId } satisfies MobileNewTaskDraftIdentity;
     const createOperationId = this.newId();
     const action = this.#claimMutation();
     this.#newTaskSubmissionActive = true;
     try {
-      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, text: firstInput }, {
+      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input }, {
         connectionId: credential.connectionId,
         serverId: credential.serverId,
         backendId: target.backendId,
@@ -1740,7 +1753,7 @@ export class MobileClient {
       });
       try {
         await this.network.prepareTarget(credential, target, this.#abort?.signal);
-        this.#assertNewTaskCreateAuthority(submission);
+        await this.#validateNewTaskSubmissionInput(submission, authorityKey);
       } catch (error) {
         await this.newTaskDrafts.clearSubmission(identity, createOperationId).catch(() => undefined);
         throw error;
@@ -1751,7 +1764,7 @@ export class MobileClient {
         createOperationId
       );
       if (this.#mutationOwner === action) this.#set({ busy: true });
-      return await this.#continueNewTaskCreation(identity, submission, result, false);
+      return await this.#continueNewTaskCreation(identity, submission, result);
     } finally {
       this.#newTaskSubmissionActive = false;
       this.#releaseMutation(action);
@@ -1780,10 +1793,10 @@ export class MobileClient {
     });
   }
 
-  #assertNewTaskCreateAuthority(submission: MobileNewTaskCreateSubmission): void {
+  #assertNewTaskCreateAuthority(submission: MobileNewTaskSubmission, owner = this.#state.owner): void {
     const credential = this.#ready();
-    const target = this.#state.owner?.targets.find((candidate) => candidate.targetId === submission.targetId);
-    const backend = this.#state.owner?.backends.find((candidate) => candidate.backendId === submission.backendId);
+    const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === submission.targetId);
+    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === submission.backendId);
     const revision = target?.version?.revision;
     if (credential.connectionId !== submission.connectionId || credential.serverId !== submission.serverId
       || this.#activeProfileId !== credential.profileId || this.#state.node?.serverId !== submission.serverId
@@ -1798,8 +1811,7 @@ export class MobileClient {
   async #continueNewTaskCreation(
     identity: MobileNewTaskDraftIdentity,
     submission: MobileNewTaskCreateSubmission,
-    result: TrackedMutationResult,
-    refreshBeforeSend: boolean
+    result: TrackedMutationResult
   ): Promise<MobileNewTaskResult> {
     if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
     if (!result.definitive) return { created: false, sent: false, definitive: false };
@@ -1815,17 +1827,13 @@ export class MobileClient {
       return { created: false, sent: false, definitive: true };
     }
     const generation = session.nativeBinding!.runtimeGeneration;
-    await this.#stageNewTaskComposerDraft(identity, session.sessionId, submission.inputText);
     const sending = await this.newTaskDrafts.advanceToSending(
       identity,
       submission.createOperationId,
       session.sessionId,
       generation
     );
-    if (refreshBeforeSend && this.#credential?.connectionId === submission.connectionId && this.#foreground) {
-      await this.refresh();
-      if (this.#mutationOwner !== undefined) this.#set({ busy: true });
-    }
+    await this.#selectCreatedNewTask(sending);
     return this.#sendNewTaskFirstInput(identity, sending);
   }
 
@@ -1838,15 +1846,58 @@ export class MobileClient {
     return session;
   }
 
-  async #stageNewTaskComposerDraft(
+  async #recoverNewTaskComposerDraft(
     identity: MobileNewTaskDraftIdentity,
     sessionId: string,
-    text: string
+    input: MobileComposerDraft
   ): Promise<void> {
     if (!this.composerDrafts) throw new Error("The task composer draft store is unavailable.");
     const composerIdentity = { profileId: identity.profileId, sessionId };
-    this.composerDrafts.save(composerIdentity, plainTextMobileComposerDraft(text));
-    await this.composerDrafts.flush(composerIdentity);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const snapshot = await this.composerDrafts.readSnapshot(composerIdentity);
+      const recovered = recoverMobileComposerDraft(input, snapshot.draft);
+      if (snapshot.draft !== undefined && mobileComposerDraftsEqual(recovered, snapshot.draft)) {
+        await this.composerDrafts.flush(composerIdentity);
+        return;
+      }
+      if (this.composerDrafts.saveIfRevision(composerIdentity, recovered, snapshot.revision)) {
+        await this.composerDrafts.flush(composerIdentity);
+        return;
+      }
+    }
+    throw new Error("The created task draft kept changing while the first message was being restored.");
+  }
+
+  async #removeRecoveredNewTaskComposerDraft(
+    identity: MobileNewTaskDraftIdentity,
+    sessionId: string,
+    input: MobileComposerDraft
+  ): Promise<void> {
+    if (!this.composerDrafts) throw new Error("The task composer draft store is unavailable.");
+    const composerIdentity = { profileId: identity.profileId, sessionId };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const snapshot = await this.composerDrafts.readSnapshot(composerIdentity);
+      if (snapshot.draft === undefined) return;
+      const remainder = mobileComposerDraftWithoutPrefix(input, snapshot.draft);
+      if (remainder === undefined) return;
+      const updated = remainder.text.length === 0 && remainder.mentions.length === 0
+        ? await this.composerDrafts.clearIfRevision(composerIdentity, snapshot.revision)
+        : this.composerDrafts.saveIfRevision(composerIdentity, remainder, snapshot.revision);
+      if (updated) {
+        await this.composerDrafts.flush(composerIdentity);
+        return;
+      }
+    }
+    throw new Error("The created task draft kept changing while the accepted first message was being removed.");
+  }
+
+  async #selectCreatedNewTask(submission: MobileNewTaskSendSubmission): Promise<void> {
+    if (this.#state.selectedId !== submission.sessionId || this.#state.detail?.sessions.some(
+      (candidate) => candidate.sessionId === submission.sessionId
+    ) !== true) {
+      await this.select(submission.sessionId);
+    }
+    if (this.#mutationOwner !== undefined) this.#set({ busy: true });
   }
 
   #newTaskSendAuthority(submission: MobileNewTaskSendSubmission):
@@ -1892,15 +1943,24 @@ export class MobileClient {
     initial: MobileNewTaskSendSubmission
   ): Promise<MobileNewTaskResult> {
     if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
+    if (initial.sendOperationId === undefined) await this.#selectCreatedNewTask(initial);
     const authority = this.#newTaskSendAuthority(initial);
     if (authority.status === "deferred") {
       this.#set({ error: authority.message });
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: false };
     }
     if (authority.status === "blocked") {
+      await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, initial.input);
       await this.newTaskDrafts.clear(identity);
       this.#set({ error: authority.message });
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: true };
+    }
+    try {
+      await this.#validateNewTaskSubmissionInput(initial);
+    } catch (error) {
+      await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, initial.input);
+      await this.newTaskDrafts.clear(identity);
+      throw error;
     }
     const sendOperationId = initial.sendOperationId ?? this.newId();
     const submission = initial.sendOperationId === undefined
@@ -1913,9 +1973,7 @@ export class MobileClient {
       })],
       payload: { case: "sendInput", value: create(SendInputMutationSchema, {
         sessionId: submission.sessionId,
-        input: create(InputContentSchema, {
-          parts: [create(InputPartSchema, { content: { case: "text", value: submission.inputText } })]
-        }),
+        input: mobileComposerInput(submission.input),
         deliveryMode: QueueDeliveryMode.PROMPT
       }) }
     }), { kind: "send", sessionId: submission.sessionId }, sendOperationId);
@@ -1929,9 +1987,11 @@ export class MobileClient {
   ): Promise<MobileNewTaskResult> {
     if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
     if (!result.definitive) {
+      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: false };
     }
     if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) {
+      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
       await this.newTaskDrafts.clear(identity);
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
     }
@@ -1943,11 +2003,12 @@ export class MobileClient {
       : undefined;
     if (!queued || queued.sessionId !== submission.sessionId || queued.backendId !== submission.backendId
       || queued.targetId !== submission.targetId) {
+      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
       await this.newTaskDrafts.clear(identity);
       this.#set({ error: "The first-message operation returned an invalid queue result. The text remains in the task composer; verify the task before sending again." });
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
     }
-    await this.composerDrafts.clear({ profileId: identity.profileId, sessionId: submission.sessionId });
+    await this.#removeRecoveredNewTaskComposerDraft(identity, submission.sessionId, submission.input);
     await this.newTaskDrafts.clear(identity);
     return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
   }
@@ -2097,6 +2158,130 @@ export class MobileClient {
       deviceId: credential.deviceId,
       serverId: credential.serverId
     }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  newTaskSessionMentionControls(targetId: string): MobileSessionMentionControls | undefined {
+    const owner = this.#state.owner;
+    const authorityKey = this.#newTaskAuthorityKey(targetId);
+    const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === targetId);
+    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === target?.backendId);
+    return createMobileNewTaskSessionMentionControls(authorityKey, owner, backend);
+  }
+
+  newTaskWorkspaceMentionControls(targetId: string): MobileWorkspaceMentionControls | undefined {
+    return createMobileNewTaskWorkspaceMentionControls(
+      this.#newTaskAuthorityKey(targetId),
+      this.#state.owner,
+      targetId
+    );
+  }
+
+  async validateNewTaskSessionMentionCandidate(
+    targetId: string,
+    expectedSurfaceOwnerKey: string,
+    value: MobileSessionMentionCandidate,
+    signal?: AbortSignal
+  ): Promise<MobileSessionMentionCandidate> {
+    this.#newTaskSessionMentionContext(targetId, expectedSurfaceOwnerKey);
+    const fresh = await this.#readNewTaskOwner(signal);
+    const controls = this.#newTaskSessionMentionControlsFromOwner(targetId, fresh.snapshot);
+    if (!controls || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Task reference authority changed while its candidate was being checked.");
+    }
+    this.#newTaskSessionMentionContext(targetId, expectedSurfaceOwnerKey);
+    return assertMobileSessionMentionCandidate(controls, value);
+  }
+
+  async listNewTaskWorkspaceMentionDirectory(
+    targetId: string,
+    expectedSurfaceOwnerKey: string,
+    parentPath: string,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionDirectory> {
+    const context = this.#newTaskWorkspaceMentionContext(targetId, expectedSurfaceOwnerKey);
+    const parent = canonicalWorkspacePath(parentPath, true);
+    const result = await this.network.listWorkspaceDirectory(
+      context.credential,
+      context.controls.workspaceId,
+      parent,
+      signal
+    );
+    const current = this.#newTaskWorkspaceMentionContext(targetId, expectedSurfaceOwnerKey);
+    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+      throw new Error("The new-task Workspace reference owner changed while its directory was loading.");
+    }
+    return projectMobileWorkspaceMentionDirectory(context.controls, parent, result.entries, result.revision);
+  }
+
+  async listNewTaskWorkspaceMentionFileIndex(
+    targetId: string,
+    expectedSurfaceOwnerKey: string,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionFileIndex> {
+    const context = this.#newTaskWorkspaceMentionContext(targetId, expectedSurfaceOwnerKey);
+    if (!context.controls.policy.files) throw new Error("This Backend does not support Workspace file references.");
+    const result = await this.network.listWorkspaceFileIndex(
+      context.credential,
+      context.controls.workspaceId,
+      signal
+    );
+    const current = this.#newTaskWorkspaceMentionContext(targetId, expectedSurfaceOwnerKey);
+    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+      throw new Error("The new-task Workspace reference owner changed while its file index was loading.");
+    }
+    return projectMobileWorkspaceMentionFileIndex(
+      context.controls,
+      result.paths,
+      result.revision,
+      result.truncated
+    );
+  }
+
+  async validateNewTaskWorkspaceMentionCandidate(
+    targetId: string,
+    expectedSurfaceOwnerKey: string,
+    value: MobileWorkspaceMentionCandidate,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionCandidate> {
+    this.#newTaskWorkspaceMentionContext(targetId, expectedSurfaceOwnerKey);
+    const fresh = await this.#readNewTaskOwner(signal);
+    const controls = createMobileNewTaskWorkspaceMentionControls(
+      this.#newTaskAuthorityKey(targetId, fresh.snapshot),
+      fresh.snapshot,
+      targetId
+    );
+    if (!controls || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace reference authority changed while the selected path was being checked.");
+    }
+    const expected = assertMobileWorkspaceMentionCandidate(controls, value);
+    const result = await this.network.listWorkspaceDirectory(
+      fresh.credential,
+      controls.workspaceId,
+      workspaceParentPath(expected.relativePath),
+      signal
+    );
+    const directory = projectMobileWorkspaceMentionDirectory(
+      controls,
+      workspaceParentPath(expected.relativePath),
+      result.entries,
+      result.revision
+    );
+    const after = await this.#readNewTaskOwner(signal);
+    const latestControls = createMobileNewTaskWorkspaceMentionControls(
+      this.#newTaskAuthorityKey(targetId, after.snapshot),
+      after.snapshot,
+      targetId
+    );
+    if (!latestControls || latestControls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace reference authority changed while the selected path was being checked.");
+    }
+    this.#newTaskWorkspaceMentionContext(targetId, expectedSurfaceOwnerKey);
+    const matches = directory.entries.filter((entry) => entry.relativePath === expected.relativePath);
+    const current = matches.length === 1 ? matches[0] : undefined;
+    if (!current || current.directory !== expected.directory) {
+      throw new Error("The selected Workspace path is no longer available with the same file type.");
+    }
+    return assertMobileWorkspaceMentionCandidate(latestControls, current);
   }
 
   taskSessionMentionControls(): MobileSessionMentionControls | undefined {
@@ -2741,6 +2926,143 @@ export class MobileClient {
     return controls;
   }
 
+  #newTaskSessionMentionControlsFromOwner(
+    targetId: string,
+    owner: Snapshot
+  ): MobileSessionMentionControls | undefined {
+    const target = uniqueValue(owner.targets, (candidate) => candidate.targetId === targetId);
+    const backend = uniqueValue(owner.backends, (candidate) => candidate.backendId === target?.backendId);
+    return createMobileNewTaskSessionMentionControls(
+      this.#newTaskAuthorityKey(targetId, owner),
+      owner,
+      backend
+    );
+  }
+
+  #newTaskSessionMentionContext(
+    targetId: string,
+    expectedSurfaceOwnerKey: string
+  ): { readonly credential: PairedCredential; readonly controls: MobileSessionMentionControls } {
+    const credential = this.#ready();
+    const controls = this.newTaskSessionMentionControls(targetId);
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Task reference authority changed. Reopen the reference list from this new task.");
+    }
+    return { credential, controls };
+  }
+
+  #newTaskWorkspaceMentionContext(
+    targetId: string,
+    expectedSurfaceOwnerKey: string
+  ): { readonly credential: PairedCredential; readonly controls: MobileWorkspaceMentionControls } {
+    const credential = this.#ready();
+    const controls = this.newTaskWorkspaceMentionControls(targetId);
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace reference authority changed. Reopen the reference list from this new task.");
+    }
+    return { credential, controls };
+  }
+
+  async #readNewTaskOwner(signal?: AbortSignal): Promise<{
+    readonly credential: PairedCredential;
+    readonly snapshot: Snapshot;
+  }> {
+    const credential = this.#ready();
+    const node = this.#state.node;
+    const profileId = this.#activeProfileId;
+    if (!node || profileId !== credential.profileId) {
+      throw new Error("Reconnect to the exact saved Joko node before checking new-task references.");
+    }
+    const owner = await this.network.readOwner(credential, signal ?? this.#abort?.signal);
+    if (this.#credential !== credential || this.#activeProfileId !== profileId
+      || this.#state.node?.serverId !== node.serverId || !this.#foreground) {
+      throw new Error("The saved Joko connection changed while new-task references were being checked.");
+    }
+    this.#assertOwner(credential, owner, node);
+    return { credential, snapshot: owner.snapshot };
+  }
+
+  async #validateNewTaskSubmissionInput(
+    submission: MobileNewTaskSubmission,
+    expectedAuthorityKey = this.#newTaskAuthorityKey(submission.targetId)
+  ): Promise<void> {
+    const input = normalizeMobileComposerDraft(submission.input);
+    if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+      throw new Error("A new task cannot reference runtime Resources or Artifacts before its Session exists.");
+    }
+    const hasSessionMentions = input.mentions.some((mention) => mention.kind === "session");
+    const hasWorkspaceMentions = input.mentions.some((mention) => mention.kind === "workspace");
+    const initialSessionControls = this.newTaskSessionMentionControls(submission.targetId);
+    const initialWorkspaceControls = this.newTaskWorkspaceMentionControls(submission.targetId);
+    const fresh = await this.#readNewTaskOwner();
+    this.#assertNewTaskCreateAuthority(submission, fresh.snapshot);
+    const freshAuthorityKey = this.#newTaskAuthorityKey(submission.targetId, fresh.snapshot);
+    if (!expectedAuthorityKey || freshAuthorityKey !== expectedAuthorityKey) {
+      throw new Error("The project, Backend, or Workspace changed while the structured first message was being checked.");
+    }
+    const sessionControls = this.#newTaskSessionMentionControlsFromOwner(submission.targetId, fresh.snapshot);
+    const workspaceControls = createMobileNewTaskWorkspaceMentionControls(
+      freshAuthorityKey,
+      fresh.snapshot,
+      submission.targetId
+    );
+    if (hasSessionMentions && sessionControls?.surfaceOwnerKey !== initialSessionControls?.surfaceOwnerKey) {
+      throw new Error("Referenced-task authority changed while the structured first message was being checked.");
+    }
+    if (hasWorkspaceMentions && workspaceControls?.surfaceOwnerKey !== initialWorkspaceControls?.surfaceOwnerKey) {
+      throw new Error("Workspace reference authority changed while the structured first message was being checked.");
+    }
+    assertMobileSessionMentionDraft(sessionControls, input);
+    assertMobileWorkspaceMentionDraft(workspaceControls, input);
+    if (!hasWorkspaceMentions) return;
+    await this.#revalidateNewTaskWorkspaceMentionPaths(fresh.credential, workspaceControls!, input);
+    const finalOwner = await this.#readNewTaskOwner();
+    this.#assertNewTaskCreateAuthority(submission, finalOwner.snapshot);
+    const finalAuthorityKey = this.#newTaskAuthorityKey(submission.targetId, finalOwner.snapshot);
+    const finalSessionControls = this.#newTaskSessionMentionControlsFromOwner(submission.targetId, finalOwner.snapshot);
+    const finalWorkspaceControls = createMobileNewTaskWorkspaceMentionControls(
+      finalAuthorityKey,
+      finalOwner.snapshot,
+      submission.targetId
+    );
+    if (finalAuthorityKey !== freshAuthorityKey
+      || hasSessionMentions && finalSessionControls?.surfaceOwnerKey !== sessionControls?.surfaceOwnerKey
+      || finalWorkspaceControls?.surfaceOwnerKey !== workspaceControls?.surfaceOwnerKey) {
+      throw new Error("New-task reference authority changed while Workspace paths were being checked.");
+    }
+    assertMobileSessionMentionDraft(finalSessionControls, input);
+    assertMobileWorkspaceMentionDraft(finalWorkspaceControls, input);
+  }
+
+  async #revalidateNewTaskWorkspaceMentionPaths(
+    credential: PairedCredential,
+    controls: MobileWorkspaceMentionControls,
+    draft: MobileComposerDraft
+  ): Promise<void> {
+    const mentions = draft.mentions.filter((mention) => mention.kind === "workspace");
+    const byParent = new Map<string, typeof mentions>();
+    for (const mention of mentions) {
+      const parent = workspaceParentPath(mention.relativePath);
+      byParent.set(parent, [...(byParent.get(parent) ?? []), mention]);
+    }
+    for (const [parent, expected] of byParent) {
+      const result = await this.network.listWorkspaceDirectory(
+        credential,
+        controls.workspaceId,
+        parent,
+        this.#abort?.signal
+      );
+      const directory = projectMobileWorkspaceMentionDirectory(controls, parent, result.entries, result.revision);
+      for (const mention of expected) {
+        const matches = directory.entries.filter((entry) => entry.relativePath === mention.relativePath);
+        const current = matches.length === 1 ? matches[0] : undefined;
+        if (!current || current.directory !== mention.directory) {
+          throw new Error("A referenced Workspace path disappeared or changed file type. The new-task draft was retained.");
+        }
+      }
+    }
+  }
+
   #workspaceMentionContext(expectedSurfaceOwnerKey: string): {
     readonly credential: PairedCredential;
     readonly controls: MobileWorkspaceMentionControls;
@@ -2806,6 +3128,41 @@ export class MobileClient {
       && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
     }
+  }
+
+  #newTaskAuthorityKey(targetId: string, owner = this.#state.owner): string | undefined {
+    const credential = this.#credential;
+    if (!credential || !owner || !targetId || !this.#foreground || this.#state.status !== "connected"
+      || this.#activeProfileId !== credential.profileId || this.#state.node?.serverId !== credential.serverId
+      || owner.server?.serverId !== credential.serverId) return undefined;
+    const connection = uniqueValue(owner.connections, (candidate) => candidate.connectionId === credential.connectionId);
+    const device = uniqueValue(owner.devices, (candidate) => candidate.deviceId === credential.deviceId);
+    const target = uniqueValue(owner.targets, (candidate) => candidate.targetId === targetId);
+    const backend = uniqueValue(owner.backends, (candidate) => candidate.backendId === target?.backendId);
+    const revision = target?.version?.revision;
+    if (!connection || !device || connection.connectionProfileId !== credential.profileId
+      || connection.deviceId !== credential.deviceId || connection.state !== ConnectionState.CONNECTED
+      || device.kind !== DeviceKind.MOBILE || device.revoked || !device.connectionIds.includes(credential.connectionId)
+      || !target || target.state !== TargetState.ACTIVE || !revision || revision.value < 1n
+      || !backend || backend.backendId !== target.backendId || !supportsText(backend)) return undefined;
+    const workspace = target.workspaceId
+      ? uniqueValue(owner.workspaces, (candidate) => candidate.workspaceId === target.workspaceId)
+      : undefined;
+    if (target.workspaceId && (!workspace || workspace.targetId !== target.targetId)) return undefined;
+    return [
+      credential.profileId,
+      credential.connectionId,
+      credential.deviceId,
+      credential.serverId,
+      entityVersionKey(connection.version),
+      entityVersionKey(device.version),
+      target.targetId,
+      target.backendId,
+      entityVersionKey(target.version),
+      backendAuthorityKey(backend),
+      workspace?.workspaceId ?? "",
+      entityVersionKey(workspace?.version)
+    ].join("\u001f");
   }
 
   #taskAuthorityKey(): string | undefined {
@@ -3591,31 +3948,6 @@ export class MobileClient {
       if (await this.#persistPending(next, epoch)) this.#set({ pending: next, error: operation.error?.message || "The operation was rejected." });
       return;
     }
-    if (pending.kind === "create" && operation.result?.payload.case === "session") {
-      const sessionId = operation.result.payload.value.sessionId;
-      if (sessionId && this.#activeProfileId) {
-        let maySelect = this.newTaskDrafts === undefined || this.composerDrafts === undefined;
-        if (this.newTaskDrafts && this.composerDrafts) {
-          try {
-            const identity = { profileId: this.#activeProfileId };
-            const draft = await this.newTaskDrafts.read(identity);
-            if (draft?.submission?.phase === "creating"
-              && draft.submission.createOperationId === pending.operationId
-              && this.#createdNewTaskSession(operation, draft.submission)) {
-              await this.#stageNewTaskComposerDraft(identity, sessionId, draft.submission.inputText);
-              maySelect = true;
-            }
-          } catch (error) {
-            if (this.#current(epoch)) this.#set({ error: message(error) });
-          }
-        }
-        if (maySelect) {
-          await this.storage.saveSelection(this.#activeProfileId, sessionId);
-          if (!this.#current(epoch)) return;
-          this.#set({ selectedId: sessionId });
-        }
-      }
-    }
     const next = isTerminal(operation.state)
       ? this.#state.pending.filter((item) => item.operationId !== pending.operationId)
       : this.#state.pending.map((item) => item.operationId === pending.operationId ? { ...item, state: "accepted" as const } : item);
@@ -3719,18 +4051,19 @@ export class MobileClient {
         }
         if (!observed) return;
         if (this.#mutationOwner === action) this.#set({ busy: true });
-        await this.#continueNewTaskCreation(identity, submission, trackedOperation(observed), true);
+        await this.#continueNewTaskCreation(identity, submission, trackedOperation(observed));
         return;
       }
-      await this.#stageNewTaskComposerDraft(identity, submission.sessionId, submission.inputText);
       if (submission.sendOperationId === undefined) {
         await this.#sendNewTaskFirstInput(identity, submission);
         return;
       }
+      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
       const observed = await this.#observeRetainedNewTaskOperation(submission, epoch);
       if (observed === "not-dispatched") {
+        await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
         await this.newTaskDrafts.clear(identity);
-        this.#set({ error: "The retained first message had no durable operation receipt and was not dispatched. Its text remains in the created task composer." });
+        this.#set({ error: "The retained first message had no durable operation receipt and was not dispatched. Its structured input remains in the created task composer." });
         return;
       }
       if (!observed) return;
@@ -3824,7 +4157,10 @@ export class MobileClient {
           : submission?.createOperationId;
         if (submission && retainedOperationId === operationId) {
           if (submission.phase === "creating") await this.newTaskDrafts.clearSubmission(identity, operationId);
-          else await this.newTaskDrafts.clear(identity);
+          else {
+            await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
+            await this.newTaskDrafts.clear(identity);
+          }
         }
       }
     }
@@ -3881,6 +4217,11 @@ export class MobileClient {
 
 function supportsText(backend: Snapshot["backends"][number]): boolean {
   return backend.capabilities?.capabilities.some((item) => item.name === capabilityNames.inputText && item.support === CapabilitySupport.SUPPORTED) === true;
+}
+
+function uniqueValue<T>(values: readonly T[], predicate: (value: T) => boolean): T | undefined {
+  const matches = values.filter(predicate);
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function savedConnection(

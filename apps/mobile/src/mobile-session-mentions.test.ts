@@ -16,8 +16,10 @@ import {
 import { describe, expect, it } from "vitest";
 import { insertMobileSessionMention, plainTextMobileComposerDraft } from "./mobile-composer-document";
 import {
+  assertMobileSessionMentionCandidate,
   assertMobileSessionMentionDraft,
   backendSupportsSessionMentions,
+  createMobileNewTaskSessionMentionControls,
   createMobileSessionMentionControls,
   filterMobileSessionMentionCandidates
 } from "./mobile-session-mentions";
@@ -82,6 +84,20 @@ describe("mobile Session mention controls", () => {
     ]);
     expect(filterMobileSessionMentionCandidates(controls?.candidates ?? [], "prior")).toMatchObject([{ sessionId: "source" }]);
     expect(controls?.surfaceOwnerKey).toContain("authority");
+  });
+
+  it("offers all unique non-closed historical tasks before a receiving Session exists", () => {
+    const descriptor = backend();
+    const owner = create(SnapshotSchema, { sessions: [source, current] });
+    const controls = createMobileNewTaskSessionMentionControls("new-authority", owner, descriptor);
+    expect(controls).toMatchObject({ authorityKey: "new-authority" });
+    expect(controls?.sessionId).toBeUndefined();
+    expect(controls?.candidates.map((candidate) => candidate.sessionId)).toEqual(["current", "source"]);
+    expect(assertMobileSessionMentionCandidate(controls, controls!.candidates[1]!)).toEqual(controls!.candidates[1]);
+    expect(() => assertMobileSessionMentionCandidate(controls, {
+      ...controls!.candidates[1]!,
+      displayText: "Stale label"
+    })).toThrow(/changed/u);
   });
 
   it("fails closed for absent, empty, duplicate, or ambiguous capability declarations", () => {

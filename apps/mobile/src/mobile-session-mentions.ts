@@ -17,7 +17,7 @@ export interface MobileSessionMentionCandidate {
 export interface MobileSessionMentionControls {
   readonly authorityKey: string;
   readonly surfaceOwnerKey: string;
-  readonly sessionId: string;
+  readonly sessionId?: string;
   readonly candidates: readonly MobileSessionMentionCandidate[];
 }
 
@@ -50,6 +50,20 @@ export function createMobileSessionMentionControls(
   };
 }
 
+export function createMobileNewTaskSessionMentionControls(
+  authorityKey: string | undefined,
+  owner: Snapshot | undefined,
+  backend: BackendDescriptor | undefined
+): MobileSessionMentionControls | undefined {
+  if (!authorityKey || !owner || !backend || !backendSupportsSessionMentions(backend)) return undefined;
+  const candidates = sessionMentionCandidates(owner);
+  return {
+    authorityKey,
+    surfaceOwnerKey: sessionMentionSurfaceOwnerKey(authorityKey, owner, backend, candidates, "new-task-session-mentions"),
+    candidates
+  };
+}
+
 export function filterMobileSessionMentionCandidates(
   candidates: readonly MobileSessionMentionCandidate[],
   query: string
@@ -74,6 +88,18 @@ export function assertMobileSessionMentionDraft(
   return exact;
 }
 
+export function assertMobileSessionMentionCandidate(
+  controls: MobileSessionMentionControls | undefined,
+  candidate: MobileSessionMentionCandidate
+): MobileSessionMentionCandidate {
+  const matches = controls?.candidates.filter((current) => current.sessionId === candidate.sessionId) ?? [];
+  const current = matches.length === 1 ? matches[0] : undefined;
+  if (!current || current.displayText !== candidate.displayText || current.state !== candidate.state) {
+    throw new Error("The referenced task changed. Reopen the reference list and try again.");
+  }
+  return current;
+}
+
 export function backendSupportsSessionMentions(backend: BackendDescriptor | undefined): boolean {
   const capabilities = backend?.capabilities?.capabilities.filter((capability) => capability.name === capabilityNames.inputMention) ?? [];
   if (capabilities.length !== 1) return false;
@@ -86,7 +112,7 @@ export function backendSupportsSessionMentions(backend: BackendDescriptor | unde
     && new Set(options).size === options.length;
 }
 
-function sessionMentionCandidates(owner: Snapshot, currentSessionId: string): MobileSessionMentionCandidate[] {
+function sessionMentionCandidates(owner: Snapshot, currentSessionId?: string): MobileSessionMentionCandidate[] {
   const groups = new Map<string, Session[]>();
   for (const candidate of owner.sessions) {
     if (!validSessionId(candidate.sessionId) || candidate.sessionId === currentSessionId || candidate.state === SessionState.CLOSED) continue;
@@ -100,6 +126,28 @@ function sessionMentionCandidates(owner: Snapshot, currentSessionId: string): Mo
     state: entries[0]!.state
   }]).sort((left, right) => left.displayText.localeCompare(right.displayText, "en")
     || left.sessionId.localeCompare(right.sessionId, "en"));
+}
+
+function sessionMentionSurfaceOwnerKey(
+  authorityKey: string,
+  owner: Snapshot,
+  backend: BackendDescriptor,
+  candidates: readonly MobileSessionMentionCandidate[],
+  kind = "session-mentions"
+): string {
+  return [
+    authorityKey,
+    kind,
+    backend.version,
+    backend.capabilities?.revision?.value.toString(10) ?? "",
+    ...candidates.map((candidate) => [
+      candidate.sessionId,
+      candidate.displayText,
+      candidate.state.toString(10),
+      owner.sessions.find((item) => item.sessionId === candidate.sessionId)?.version?.generation.toString(10) ?? "",
+      owner.sessions.find((item) => item.sessionId === candidate.sessionId)?.version?.revision?.value.toString(10) ?? ""
+    ].join("\u001e"))
+  ].join("\u001f");
 }
 
 function validSessionId(value: string): boolean {

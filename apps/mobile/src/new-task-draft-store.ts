@@ -1,4 +1,10 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import {
+  cloneMobileComposerDraft,
+  mobileComposerDraftsEqual,
+  normalizeMobileComposerDraft,
+  type MobileComposerDraft
+} from "./mobile-composer-document";
 
 export interface MobileNewTaskDraftIdentity {
   readonly profileId: string;
@@ -7,7 +13,7 @@ export interface MobileNewTaskDraftIdentity {
 export interface MobileNewTaskEditableDraft {
   readonly targetId: string;
   readonly name: string;
-  readonly text: string;
+  readonly input: MobileComposerDraft;
 }
 
 interface MobileNewTaskSubmissionBase {
@@ -19,7 +25,7 @@ interface MobileNewTaskSubmissionBase {
   readonly targetRevisionEtag?: string;
   readonly createOperationId: string;
   readonly displayName: string;
-  readonly inputText: string;
+  readonly input: MobileComposerDraft;
 }
 
 export interface MobileNewTaskCreateSubmission extends MobileNewTaskSubmissionBase {
@@ -44,9 +50,9 @@ export type MobileNewTaskDraftErrorListener = (
   error: Error
 ) => void;
 
-const storagePrefix = "joko.mobile.new-task-draft.v1";
+const storagePrefix = "joko.mobile.new-task-draft.v2";
 const persistDebounceMilliseconds = 400;
-const maximumStoredCharacters = 1_000_000;
+const maximumStoredCharacters = 1_016_384;
 
 export class MobileNewTaskDraftStore {
   readonly #memory = new Map<string, MobileNewTaskDraft>();
@@ -121,7 +127,7 @@ export class MobileNewTaskDraftStore {
   async beginSubmission(
     identity: MobileNewTaskDraftIdentity,
     draft: MobileNewTaskEditableDraft,
-    authority: Omit<MobileNewTaskSubmissionBase, "targetId" | "displayName" | "inputText">
+    authority: Omit<MobileNewTaskSubmissionBase, "targetId" | "displayName" | "input">
   ): Promise<MobileNewTaskCreateSubmission> {
     const exact = normalizeIdentity(identity);
     const key = identityKey(exact);
@@ -131,14 +137,13 @@ export class MobileNewTaskDraftStore {
     }
     const editable = normalizeEditableDraft(draft);
     const displayName = editable.name.trim() || "New task";
-    const inputText = editable.text.trim();
-    if (!editable.targetId || !inputText) throw new Error("Choose a project and enter the first message.");
+    if (!editable.targetId || !editable.input.text.trim()) throw new Error("Choose a project and enter the first message.");
     const submission = normalizeSubmission({
       phase: "creating",
       ...authority,
       targetId: editable.targetId,
       displayName,
-      inputText
+      input: editable.input
     });
     await this.#replace(exact, { ...editable, submission });
     return cloneSubmission(submission) as MobileNewTaskCreateSubmission;
@@ -203,7 +208,7 @@ export class MobileNewTaskDraftStore {
     }
     const editable = normalizeEditableDraft(current);
     await this.#replace(exact, editable);
-    return { ...editable };
+    return cloneEditableDraft(editable);
   }
 
   async clear(identity: MobileNewTaskDraftIdentity): Promise<void> {
@@ -333,13 +338,13 @@ function normalizeDraft(value: MobileNewTaskDraft): MobileNewTaskDraft {
 
 function normalizeEditableDraft(value: MobileNewTaskEditableDraft): MobileNewTaskEditableDraft {
   if (!value || typeof value !== "object") throw new Error("The local Joko new-task draft is invalid.");
-  if (typeof value.targetId !== "string" || typeof value.name !== "string" || typeof value.text !== "string") {
+  if (typeof value.targetId !== "string" || typeof value.name !== "string") {
     throw new Error("The local Joko new-task draft is invalid.");
   }
   if (value.targetId !== "") assertIdentity(value.targetId, "project");
   if (value.name.length > 256) throw new Error("The local Joko task name is too long.");
-  if (value.text.length > maximumStoredCharacters) throw new Error("The local Joko first-message draft is too large.");
-  return { targetId: value.targetId, name: value.name, text: value.text };
+  const input = normalizeNewTaskInput(value.input);
+  return { targetId: value.targetId, name: value.name, input };
 }
 
 function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmission {
@@ -358,7 +363,8 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
   }
   assertIdentity(value.createOperationId, "creation operation");
   if (!value.displayName.trim() || value.displayName.length > 256) throw new Error("The retained Joko task name is invalid.");
-  if (!value.inputText.trim() || value.inputText.length > maximumStoredCharacters) {
+  const input = normalizeNewTaskInput(value.input);
+  if (!input.text.trim()) {
     throw new Error("The retained Joko first message is invalid.");
   }
   const base: MobileNewTaskSubmissionBase = {
@@ -370,7 +376,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
     ...(value.targetRevisionEtag === undefined ? {} : { targetRevisionEtag: value.targetRevisionEtag }),
     createOperationId: value.createOperationId,
     displayName: value.displayName,
-    inputText: value.inputText
+    input
   };
   if (value.phase === "creating") return { phase: "creating", ...base };
   assertIdentity(value.sessionId, "task");
@@ -386,43 +392,87 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
 }
 
 function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): string {
-  const serialized = JSON.stringify({ version: 1, identity: normalizeIdentity(identity), draft });
-  if (serialized.length > maximumStoredCharacters + 4_096) throw new Error("The local Joko new-task draft is too large.");
+  const exact = normalizeDraft(draft);
+  const serialized = JSON.stringify({
+    version: 2,
+    identity: normalizeIdentity(identity),
+    draft: exact.submission === undefined
+      ? exact
+      : { ...cloneEditableDraft(exact), submission: persistedSubmission(exact.submission) }
+  });
+  if (serialized.length > maximumStoredCharacters) throw new Error("The local Joko new-task draft is too large.");
   return serialized;
 }
 
 function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
-  if (serialized.length > maximumStoredCharacters + 4_096) throw new Error("saved new-task draft is too large");
+  if (serialized.length > maximumStoredCharacters) throw new Error("saved new-task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 1 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 2 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId) {
     throw new Error("new-task draft identity mismatch");
   }
   const draft = value["draft"];
   if (!isRecord(draft) || typeof draft["targetId"] !== "string" || typeof draft["name"] !== "string"
-    || typeof draft["text"] !== "string") throw new Error("invalid new-task draft envelope");
-  const editable = normalizeEditableDraft({ targetId: draft["targetId"], name: draft["name"], text: draft["text"] });
+    || !isRecord(draft["input"])) throw new Error("invalid new-task draft envelope");
+  const editable = normalizeEditableDraft({
+    targetId: draft["targetId"],
+    name: draft["name"],
+    input: draft["input"] as unknown as MobileComposerDraft
+  });
   if (draft["submission"] === undefined) return editable;
-  if (!isRecord(draft["submission"])) throw new Error("invalid new-task submission envelope");
-  const submission = draft["submission"] as unknown as MobileNewTaskSubmission;
+  if (!isRecord(draft["submission"]) || "input" in draft["submission"]) {
+    throw new Error("invalid new-task submission envelope");
+  }
+  const submission = { ...draft["submission"], input: editable.input } as unknown as MobileNewTaskSubmission;
   return { ...editable, submission: normalizeSubmission(submission) };
 }
 
 function cloneDraft(draft: MobileNewTaskDraft): MobileNewTaskDraft {
   return {
-    targetId: draft.targetId,
-    name: draft.name,
-    text: draft.text,
+    ...cloneEditableDraft(draft),
     ...(draft.submission === undefined ? {} : { submission: cloneSubmission(draft.submission) })
   };
 }
 
 function cloneSubmission(submission: MobileNewTaskSubmission): MobileNewTaskSubmission {
-  return { ...submission };
+  return { ...submission, input: cloneMobileComposerDraft(submission.input) };
+}
+
+function persistedSubmission(submission: MobileNewTaskSubmission): Omit<MobileNewTaskSubmission, "input"> {
+  const { input: _input, ...persisted } = submission;
+  return persisted;
 }
 
 function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return left.targetId === right.targetId && left.name === right.name
+    && mobileComposerDraftsEqual(left.input, right.input)
+    && (left.submission === undefined && right.submission === undefined
+      || left.submission !== undefined && right.submission !== undefined
+        && sameSubmission(left.submission, right.submission));
+}
+
+function cloneEditableDraft(draft: MobileNewTaskEditableDraft): MobileNewTaskEditableDraft {
+  return { targetId: draft.targetId, name: draft.name, input: cloneMobileComposerDraft(draft.input) };
+}
+
+function normalizeNewTaskInput(value: MobileComposerDraft): MobileComposerDraft {
+  const input = normalizeMobileComposerDraft(value);
+  if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+    throw new Error("A new task can reference existing tasks and its selected Workspace, but not runtime Resources or Artifacts.");
+  }
+  return input;
+}
+
+function sameSubmission(left: MobileNewTaskSubmission, right: MobileNewTaskSubmission): boolean {
+  if (left.phase !== right.phase || left.connectionId !== right.connectionId || left.serverId !== right.serverId
+    || left.backendId !== right.backendId || left.targetId !== right.targetId
+    || left.targetRevision !== right.targetRevision || left.targetRevisionEtag !== right.targetRevisionEtag
+    || left.createOperationId !== right.createOperationId || left.displayName !== right.displayName
+    || !mobileComposerDraftsEqual(left.input, right.input)) return false;
+  return left.phase === "creating" && right.phase === "creating"
+    || left.phase === "sending" && right.phase === "sending"
+      && left.sessionId === right.sessionId && left.runtimeGeneration === right.runtimeGeneration
+      && left.sendOperationId === right.sendOperationId;
 }
 
 function assertIdentity(value: string, label: string): void {

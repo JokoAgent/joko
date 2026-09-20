@@ -142,6 +142,21 @@ describe("mobile composer draft store", () => {
     expect(store.readSync(first)).toBeNull();
   });
 
+  it("fences recovery writes and clears with the exact in-memory draft revision", async () => {
+    const memory = memoryDriver();
+    const store = new MobileComposerDraftStore(memory.driver);
+    const empty = await store.readSnapshot(first);
+    expect(empty).toEqual({ revision: 0 });
+    expect(store.saveIfRevision(first, plainTextMobileComposerDraft("recovered"), empty.revision)).toBe(true);
+    expect(store.saveIfRevision(first, plainTextMobileComposerDraft("stale overwrite"), empty.revision)).toBe(false);
+
+    const recovered = await store.readSnapshot(first);
+    expect(recovered).toMatchObject({ revision: 1, draft: { text: "recovered" } });
+    store.save(first, plainTextMobileComposerDraft("newer navigation draft"));
+    await expect(store.clearIfRevision(first, recovered.revision)).resolves.toBe(false);
+    expect(store.readSync(first)).toEqual(plainTextMobileComposerDraft("newer navigation draft"));
+  });
+
   it("rejects the previous plain-text shape, damaged mention ranges, and cross-owner records", async () => {
     const memory = memoryDriver();
     const key = mobileComposerDraftTesting.storageKey(first);

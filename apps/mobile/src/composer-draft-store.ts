@@ -16,6 +16,11 @@ export type MobileComposerDraftErrorListener = (
   error: Error
 ) => void;
 
+export interface MobileComposerDraftSnapshot {
+  readonly revision: number;
+  readonly draft?: MobileComposerDraft;
+}
+
 const storagePrefix = "joko.mobile.composer-draft.v2";
 const persistDebounceMilliseconds = 400;
 const maximumStoredCharacters = 1_008_192;
@@ -28,6 +33,7 @@ export class MobileComposerDraftStore {
   readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #operations = new Map<string, Promise<void>>();
   readonly #listeners = new Set<MobileComposerDraftErrorListener>();
+  readonly #revisions = new Map<string, number>();
 
   constructor(readonly driver: MobilePlainStorageDriver) {}
 
@@ -79,6 +85,7 @@ export class MobileComposerDraftStore {
     const value = normalizeMobileComposerDraft(draft);
     const key = identityKey(exact);
     this.#cancelTimer(key);
+    this.#bumpRevision(key);
     this.#identities.set(key, exact);
     this.#dirty.add(key);
     if (value.text.length === 0 && value.mentions.length === 0) {
@@ -102,6 +109,7 @@ export class MobileComposerDraftStore {
     const exact = normalizeIdentity(identity);
     const key = identityKey(exact);
     this.#cancelTimer(key);
+    this.#bumpRevision(key);
     this.#memory.delete(key);
     this.#cleared.add(key);
     this.#dirty.add(key);
@@ -114,6 +122,41 @@ export class MobileComposerDraftStore {
     const key = identityKey(exact);
     const current = this.#memory.get(key);
     if (current === undefined || !mobileComposerDraftsEqual(current, expected)) return false;
+    await this.clear(exact);
+    return true;
+  }
+
+  async readSnapshot(identity: MobileComposerDraftIdentity): Promise<MobileComposerDraftSnapshot> {
+    const exact = normalizeIdentity(identity);
+    const draft = await this.read(exact);
+    const revision = this.#revisions.get(identityKey(exact)) ?? 0;
+    return {
+      revision,
+      ...(draft === null ? {} : { draft })
+    };
+  }
+
+  saveIfRevision(
+    identity: MobileComposerDraftIdentity,
+    draft: MobileComposerDraft,
+    expectedRevision: number
+  ): boolean {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0
+      || (this.#revisions.get(key) ?? 0) !== expectedRevision) return false;
+    this.save(exact, draft);
+    return true;
+  }
+
+  async clearIfRevision(
+    identity: MobileComposerDraftIdentity,
+    expectedRevision: number
+  ): Promise<boolean> {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0
+      || (this.#revisions.get(key) ?? 0) !== expectedRevision) return false;
     await this.clear(exact);
     return true;
   }
@@ -185,6 +228,12 @@ export class MobileComposerDraftStore {
 
   #notify(identity: MobileComposerDraftIdentity, error: Error): void {
     for (const listener of this.#listeners) listener(identity, error);
+  }
+
+  #bumpRevision(key: string): void {
+    const current = this.#revisions.get(key) ?? 0;
+    if (current >= Number.MAX_SAFE_INTEGER) throw new Error("The local Joko task draft revision is exhausted.");
+    this.#revisions.set(key, current + 1);
   }
 }
 

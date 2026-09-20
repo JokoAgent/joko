@@ -29,12 +29,44 @@ export interface MobileWorkspaceMentionPolicy {
 export interface MobileWorkspaceMentionControls {
   readonly authorityKey: string;
   readonly surfaceOwnerKey: string;
-  readonly sessionId: string;
+  readonly sessionId?: string;
   readonly targetId: string;
   readonly backendId: string;
   readonly workspaceId: string;
   readonly workspaceDisplayName: string;
   readonly policy: MobileWorkspaceMentionPolicy;
+}
+
+export function createMobileNewTaskWorkspaceMentionControls(
+  authorityKey: string | undefined,
+  owner: Snapshot | undefined,
+  targetId: string
+): MobileWorkspaceMentionControls | undefined {
+  if (!authorityKey || !owner || !targetId) return undefined;
+  const target = unique(owner.targets, (item) => item.targetId === targetId);
+  if (!target || target.state !== TargetState.ACTIVE || !target.workspaceId) return undefined;
+  const backend = unique(owner.backends, (item) => item.backendId === target.backendId);
+  const workspace = unique(owner.workspaces, (item) => item.workspaceId === target.workspaceId);
+  const policy = mobileWorkspaceMentionPolicy(backend);
+  if (!backend || !workspace || workspace.targetId !== target.targetId || !policy) return undefined;
+  return {
+    authorityKey,
+    surfaceOwnerKey: [
+      authorityKey,
+      "new-task-workspace-mentions",
+      workspace.workspaceId,
+      entityKey(workspace.version),
+      workspace.displayName,
+      policy.files ? "file" : "",
+      policy.directories ? "directory" : "",
+      policy.lineRanges ? "lines" : ""
+    ].join("\u001f"),
+    targetId: target.targetId,
+    backendId: backend.backendId,
+    workspaceId: workspace.workspaceId,
+    workspaceDisplayName: safeWorkspaceLabel(workspace.displayName, workspace.workspaceId),
+    policy
+  };
 }
 
 export interface MobileWorkspaceMentionCandidate {

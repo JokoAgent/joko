@@ -743,13 +743,24 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [draft, setDraft] = useState(() => ({
     targetId: initialDraft?.targetId ?? "",
     name: initialDraft?.name ?? "",
-    text: initialDraft?.text ?? ""
+    input: initialDraft?.input ?? emptyMobileComposerDraft()
+  }));
+  const [composerSelection, setComposerSelection] = useState<MobileComposerSelection>(() => ({
+    start: initialDraft?.input.text.length ?? 0,
+    end: initialDraft?.input.text.length ?? 0
   }));
   const [loadedProfileId, setLoadedProfileId] = useState<string | undefined>();
   const [draftReady, setDraftReady] = useState(false);
   const [error, setError] = useState("");
+  const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
+  const [sessionMentionError, setSessionMentionError] = useState("");
+  const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
+  const [mentionBusy, setMentionBusy] = useState(false);
   const mountedRef = useRef(true);
+  const composerInputRef = useRef<TextInput>(null);
   const profileId = state.activeProfileId;
+  const profileIdRef = useRef(profileId);
+  profileIdRef.current = profileId;
   const identity = profileId ? { profileId } : undefined;
   const retained = identity ? mobileNewTaskDrafts.readSync(identity)?.submission : undefined;
   const pendingCreate = state.pending.some((item) => item.kind === "create");
@@ -757,12 +768,29 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     state.owner?.backends.some((backend) => backend.backendId === target.backendId
       && backend.capabilities?.capabilities.some((capability) => capability.name === capabilityNames.inputText && capability.support === CapabilitySupport.SUPPORTED))) ?? [];
   const targetAvailable = targets.some((target) => target.targetId === draft.targetId);
+  const sessionMentionControls = client.newTaskSessionMentionControls(draft.targetId);
+  const workspaceMentionControls = client.newTaskWorkspaceMentionControls(draft.targetId);
+  const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
+  const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
+  const draftRef = useRef(draft);
+  const selectionRef = useRef(composerSelection);
+  draftRef.current = draft;
+  selectionRef.current = composerSelection;
   const patchDraft = (patch: Partial<typeof draft>): void => {
     setDraft((current) => {
       const next = { ...current, ...patch };
+      draftRef.current = next;
       if (identity) mobileNewTaskDrafts.save(identity, next);
       return next;
     });
+  };
+  const replaceInput = (input: MobileComposerDraft, selection: MobileComposerSelection): void => {
+    const next = { ...draftRef.current, input };
+    draftRef.current = next;
+    selectionRef.current = selection;
+    setDraft(next);
+    setComposerSelection(selection);
+    if (identity) mobileNewTaskDrafts.save(identity, next);
   };
   useEffect(() => mobileNewTaskDrafts.subscribeErrors((failedIdentity, failure) => {
     if (mountedRef.current && failedIdentity.profileId === profileId) setError(failure.message);
@@ -770,19 +798,27 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   useEffect(() => {
     mountedRef.current = true;
     if (!identity) {
-      setDraft({ targetId: "", name: "", text: "" });
+      const input = emptyMobileComposerDraft();
+      setDraft({ targetId: "", name: "", input });
+      setComposerSelection({ start: 0, end: 0 });
       setLoadedProfileId(undefined);
       setDraftReady(true);
       return () => { mountedRef.current = false; };
     }
     let current = true;
     const cached = mobileNewTaskDrafts.readSync(identity);
-    setDraft({ targetId: cached?.targetId ?? "", name: cached?.name ?? "", text: cached?.text ?? "" });
+    const cachedInput = cached?.input ?? emptyMobileComposerDraft();
+    setDraft({ targetId: cached?.targetId ?? "", name: cached?.name ?? "", input: cachedInput });
+    setComposerSelection({ start: cachedInput.text.length, end: cachedInput.text.length });
     setLoadedProfileId(profileId);
     setDraftReady(false);
     void mobileNewTaskDrafts.read(identity).then((stored) => {
       if (!current || !mountedRef.current || state.activeProfileId !== identity.profileId) return;
-      setDraft({ targetId: stored?.targetId ?? "", name: stored?.name ?? "", text: stored?.text ?? "" });
+      const input = stored?.input ?? emptyMobileComposerDraft();
+      const next = { targetId: stored?.targetId ?? "", name: stored?.name ?? "", input };
+      draftRef.current = next;
+      setDraft(next);
+      setComposerSelection({ start: input.text.length, end: input.text.length });
       setLoadedProfileId(identity.profileId);
       setDraftReady(true);
     }).catch((failure) => {
@@ -796,12 +832,104 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       void mobileNewTaskDrafts.flush(identity).catch(() => undefined);
     };
   }, [profileId]);
+  useEffect(() => {
+    const next = sessionMentionControls?.surfaceOwnerKey;
+    const changed = sessionMentionOwnerRef.current !== next;
+    sessionMentionOwnerRef.current = next;
+    if (changed || next === undefined) {
+      setSessionMentionsVisible(false);
+      setSessionMentionError("");
+      setMentionBusy(false);
+    }
+  }, [sessionMentionControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const next = workspaceMentionControls?.surfaceOwnerKey;
+    const changed = workspaceMentionOwnerRef.current !== next;
+    workspaceMentionOwnerRef.current = next;
+    if (changed || next === undefined) {
+      setWorkspaceMentionsVisible(false);
+      setMentionBusy(false);
+    }
+  }, [workspaceMentionControls?.surfaceOwnerKey]);
   const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
+  const referencesEditable = ownerReady && !state.busy && !mentionBusy && retained === undefined;
+  const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
+    const controls = sessionMentionControls;
+    const targetId = draft.targetId;
+    const ownerProfileId = profileId;
+    if (!controls || sessionMentionOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable) {
+      setSessionMentionsVisible(false);
+      setSessionMentionError("");
+      setError("Task reference authority changed. Reopen the reference list and try again.");
+      return;
+    }
+    const ownerKey = controls.surfaceOwnerKey;
+    setMentionBusy(true);
+    setSessionMentionError("");
+    void client.validateNewTaskSessionMentionCandidate(targetId, ownerKey, candidate).then((current) => {
+      if (!mountedRef.current || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+        || sessionMentionOwnerRef.current !== ownerKey) {
+        throw new Error("Task reference authority changed while the candidate was being checked.");
+      }
+      const result = insertMobileSessionMention(draftRef.current.input, selectionRef.current, current, randomUUID());
+      replaceInput(result.draft, result.selection);
+      setSessionMentionsVisible(false);
+      setTimeout(() => composerInputRef.current?.focus(), 0);
+    }).catch((failure) => {
+      if (mountedRef.current && sessionMentionOwnerRef.current === ownerKey) {
+        setSessionMentionError(errorText(failure));
+      }
+    }).finally(() => {
+      if (mountedRef.current && sessionMentionOwnerRef.current === ownerKey) setMentionBusy(false);
+    });
+  };
+  const insertWorkspaceMention = async (
+    surfaceOwnerKey: string,
+    candidate: MobileWorkspaceMentionCandidate,
+    lineRange?: MobileWorkspaceLineRange
+  ): Promise<void> => {
+    const targetId = draftRef.current.targetId;
+    const ownerProfileId = profileIdRef.current;
+    const controls = workspaceMentionControls;
+    if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
+      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || !referencesEditable) {
+      setWorkspaceMentionsVisible(false);
+      throw new Error("Workspace reference authority changed. Reopen the reference list and try again.");
+    }
+    if (lineRange !== undefined && !controls.policy.lineRanges) {
+      throw new Error("This Backend no longer supports Workspace line references.");
+    }
+    const current = await client.validateNewTaskWorkspaceMentionCandidate(
+      targetId,
+      surfaceOwnerKey,
+      candidate
+    );
+    if (!mountedRef.current || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+      || workspaceMentionOwnerRef.current !== surfaceOwnerKey) {
+      setWorkspaceMentionsVisible(false);
+      throw new Error("Workspace reference authority changed while the path was being checked.");
+    }
+    const result = insertMobileWorkspaceMention(draftRef.current.input, selectionRef.current, {
+      ...current,
+      ...(lineRange === undefined ? {} : { lineRange })
+    }, randomUUID());
+    replaceInput(result.draft, result.selection);
+    setWorkspaceMentionsVisible(false);
+    setTimeout(() => composerInputRef.current?.focus(), 0);
+  };
+  const removeMention = (mentionId: string): void => {
+    try {
+      const result = removeMobileComposerMention(draftRef.current.input, mentionId);
+      replaceInput(result.draft, result.selection);
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  };
   const submit = (): void => {
     if (!identity) return;
     setError("");
     mobileNewTaskDrafts.save(identity, draft);
-    void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.text)).then((result) => {
+    void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.input)).then((result) => {
       if (result.sessionId) onCreated();
     }).catch((failure) => setError(errorText(failure)));
   };
@@ -813,7 +941,12 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No project currently supports text tasks. Create one on a connected Joko client, then refresh.</Text>}
     {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}
       accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || retained !== undefined}
-      onPress={() => patchDraft({ targetId: target.targetId })}
+      onPress={() => {
+        setSessionMentionsVisible(false);
+        setWorkspaceMentionsVisible(false);
+        setSessionMentionError("");
+        patchDraft({ targetId: target.targetId });
+      }}
       style={[styles.row, !ownerReady || state.busy || retained !== undefined ? styles.disabled : undefined,
         { backgroundColor: colors.surface, borderColor: draft.targetId === target.targetId ? colors.accent : colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{target.displayName}</Text>
@@ -824,20 +957,61 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       editable={ownerReady && !state.busy && retained === undefined} maxLength={256} />
     <View style={styles.field}>
       <Text style={[styles.caption, { color: colors.muted }]}>First message</Text>
-      <TextInput accessibilityLabel="First message" accessibilityHint="This message is sent after the task is created"
-        multiline textAlignVertical="top" maxLength={1_000_000} editable={ownerReady && !state.busy && retained === undefined}
-        placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={draft.text}
-        onChangeText={(text) => patchDraft({ text })}
+      {(sessionMentionControls || workspaceMentionControls || draft.input.mentions.length > 0) && <View style={styles.composerTools}>
+        {sessionMentionControls && <Action label="Reference task" colors={colors} compact
+          disabled={!referencesEditable || draft.input.mentions.filter((mention) => mention.kind === "session").length >= 8}
+          onPress={() => {
+            setWorkspaceMentionsVisible(false);
+            setSessionMentionError("");
+            setSessionMentionsVisible(true);
+          }} />}
+        {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
+          disabled={!referencesEditable}
+          onPress={() => {
+            setSessionMentionsVisible(false);
+            setSessionMentionError("");
+            setWorkspaceMentionsVisible(true);
+          }} />}
+        {draft.input.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
+          contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
+          {draft.input.mentions.map((mention) => <Pressable key={mention.mentionId}
+            accessibilityRole="button" accessibilityLabel={`Remove ${mention.kind === "session" ? "task"
+              : mention.kind === "workspace" && mention.directory ? "directory" : "file"} reference ${mention.displayText}`}
+            accessibilityHint="Removes this exact reference occurrence from the first message"
+            disabled={!referencesEditable} onPress={() => removeMention(mention.mentionId)}
+            style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
+              !referencesEditable && styles.disabled]}>
+            <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>
+              {draft.input.text.slice(mention.start, mention.end)} ×
+            </Text>
+          </Pressable>)}
+        </ScrollView>}
+      </View>}
+      <TextInput ref={composerInputRef} accessibilityLabel="First message" accessibilityHint="This structured message is sent after the task is created"
+        multiline textAlignVertical="top" maxLength={1_000_000} editable={referencesEditable}
+        placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={ownerReady ? draft.input.text : ""}
+        selection={composerSelection} onSelectionChange={(event) => {
+          selectionRef.current = event.nativeEvent.selection;
+          setComposerSelection(event.nativeEvent.selection);
+        }}
+        onChangeText={(text) => {
+          try {
+            const change = reconcileMobileComposerText(draftRef.current.input, text);
+            replaceInput(change.draft, change.selection);
+          } catch (failure) {
+            setError(errorText(failure));
+          }
+        }}
         style={[styles.input, styles.newTaskMessageInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
     </View>
     {retained && <View accessibilityLiveRegion="polite" style={[styles.card, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{retained.phase === "creating" ? "Task creation retained" : "First message retained"}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{retained.phase === "creating"
         ? "Joko will only reconcile this exact creation operation; it will not create a second task automatically."
-        : "The task exists and the same text is saved in its composer while delivery is confirmed."}</Text>
+        : "The task exists. If delivery failed or is unknown, the exact structured input is retained in its composer without automatic replay."}</Text>
     </View>}
     <Action label={state.busy ? "Creating and sending…" : "Create and send"}
-      disabled={!ownerReady || !draft.targetId || !targetAvailable || !draft.text.trim() || state.busy
+      disabled={!ownerReady || !draft.targetId || !targetAvailable || !draft.input.text.trim() || state.busy || mentionBusy
         || state.status !== "connected" || retained !== undefined || pendingCreate}
       colors={colors} onPress={submit} />
     {retained?.phase === "sending" && state.selectedId === retained.sessionId
@@ -851,6 +1025,25 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         if (current?.phase === "sending" && client.state.selectedId === current.sessionId) onCreated();
       }).catch((failure) => setError(errorText(failure)));
     }} colors={colors} disabled={state.busy || state.status !== "connected"} />}
+    <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined}
+      controls={sessionMentionControls} busy={state.busy || mentionBusy} error={sessionMentionError} colors={colors}
+      onClose={() => { if (!mentionBusy) { setSessionMentionsVisible(false); setSessionMentionError(""); } }}
+      onSelect={insertSessionMention} />
+    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined}
+      controls={workspaceMentionControls} busy={state.busy || mentionBusy} colors={colors}
+      onClose={() => setWorkspaceMentionsVisible(false)}
+      onLoadDirectory={(surfaceOwnerKey, parentPath, signal) => client.listNewTaskWorkspaceMentionDirectory(
+        draftRef.current.targetId,
+        surfaceOwnerKey,
+        parentPath,
+        signal
+      )}
+      onLoadFileIndex={(surfaceOwnerKey, signal) => client.listNewTaskWorkspaceMentionFileIndex(
+        draftRef.current.targetId,
+        surfaceOwnerKey,
+        signal
+      )}
+      onSelect={insertWorkspaceMention} />
   </ScrollView>;
 }
 

@@ -304,6 +304,63 @@ export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addi
   });
 }
 
+export function prependMobileComposerDraft(
+  prefix: MobileComposerDraft,
+  current: MobileComposerDraft
+): MobileComposerDraft {
+  const source = normalizeMobileComposerDraft(prefix);
+  const existing = normalizeMobileComposerDraft(current);
+  if (!source.text) return cloneMobileComposerDraft(existing);
+  if (!existing.text) return cloneMobileComposerDraft(source);
+  const separator = "\n\n";
+  const offset = source.text.length + separator.length;
+  const usedMentionIds = new Set(source.mentions.map((mention) => mention.mentionId));
+  const mentions = [
+    ...source.mentions.map((mention) => cloneMention(mention)),
+    ...existing.mentions.map((mention) => ({
+      ...cloneMention(mention),
+      mentionId: uniqueRecoveredMentionId(mention.mentionId, usedMentionIds),
+      start: mention.start + offset,
+      end: mention.end + offset
+    }))
+  ];
+  return normalizeMobileComposerDraft({ text: `${source.text}${separator}${existing.text}`, mentions });
+}
+
+export function mobileComposerDraftWithoutPrefix(
+  prefix: MobileComposerDraft,
+  current: MobileComposerDraft
+): MobileComposerDraft | undefined {
+  const source = normalizeMobileComposerDraft(prefix);
+  const existing = normalizeMobileComposerDraft(current);
+  if (!source.text) return cloneMobileComposerDraft(existing);
+  if (mobileComposerDraftsEqual(source, existing)) return emptyMobileComposerDraft();
+  const separator = "\n\n";
+  const offset = source.text.length + separator.length;
+  if (!existing.text.startsWith(`${source.text}${separator}`)) return undefined;
+  const sourceMentions = existing.mentions.filter((mention) => mention.end <= source.text.length);
+  if (!mobileComposerDraftsEqual(source, { text: source.text, mentions: sourceMentions })) return undefined;
+  if (existing.mentions.some((mention) => mention.start < offset && mention.end > source.text.length)) return undefined;
+  return normalizeMobileComposerDraft({
+    text: existing.text.slice(offset),
+    mentions: existing.mentions
+      .filter((mention) => mention.start >= offset)
+      .map((mention) => ({ ...cloneMention(mention), start: mention.start - offset, end: mention.end - offset }))
+  });
+}
+
+export function recoverMobileComposerDraft(
+  input: MobileComposerDraft,
+  current: MobileComposerDraft | undefined
+): MobileComposerDraft {
+  const source = normalizeMobileComposerDraft(input);
+  if (current === undefined) return cloneMobileComposerDraft(source);
+  const existing = normalizeMobileComposerDraft(current);
+  return mobileComposerDraftWithoutPrefix(source, existing) === undefined
+    ? prependMobileComposerDraft(source, existing)
+    : cloneMobileComposerDraft(existing);
+}
+
 export function removeMobileComposerMention(
   draft: MobileComposerDraft,
   mentionId: string
@@ -418,6 +475,28 @@ function mobileComposerMentionToken(mention: Pick<MobileComposerMention, "kind" 
         ...(mention.lineRange === undefined ? {} : { lineRange: mention.lineRange })
       })
     : mobileSessionMentionToken(mention.displayText);
+}
+
+function cloneMention(mention: MobileComposerMention): MobileComposerMention {
+  return mention.kind === "workspace" && mention.lineRange !== undefined
+    ? { ...mention, lineRange: { ...mention.lineRange } }
+    : { ...mention };
+}
+
+function uniqueRecoveredMentionId(value: string, used: Set<string>): string {
+  if (!used.has(value)) {
+    used.add(value);
+    return value;
+  }
+  for (let index = 1; index <= 10_000; index += 1) {
+    const suffix = `-recovered-${index}`;
+    const candidate = `${value.slice(0, 512 - suffix.length)}${suffix}`;
+    if (!used.has(candidate)) {
+      used.add(candidate);
+      return candidate;
+    }
+  }
+  throw new Error("The recovered Joko task references could not be assigned unique occurrences.");
 }
 
 function normalizeSessionMention(

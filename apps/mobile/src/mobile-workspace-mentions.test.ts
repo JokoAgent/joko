@@ -25,6 +25,7 @@ import { insertMobileWorkspaceMention, plainTextMobileComposerDraft } from "./mo
 import {
   assertMobileWorkspaceMentionCandidate,
   assertMobileWorkspaceMentionDraft,
+  createMobileNewTaskWorkspaceMentionControls,
   createMobileWorkspaceMentionControls,
   filterMobileWorkspaceMentionCandidates,
   mobileWorkspaceMentionPolicy,
@@ -116,6 +117,23 @@ describe("mobile Workspace mention ownership", () => {
     expect(createMobileWorkspaceMentionControls("authority", owner, create(SnapshotSchema, {
       ...owner, generation: 2n
     }), "session")).toBeUndefined();
+  });
+
+  it("binds a pre-creation Workspace surface directly to the selected Target", () => {
+    const owner = snapshot();
+    const controls = createMobileNewTaskWorkspaceMentionControls("new-authority", owner, "target");
+    expect(controls).toMatchObject({
+      authorityKey: "new-authority",
+      targetId: "target",
+      backendId: "backend",
+      workspaceId: "workspace",
+      policy: { files: true, directories: true, lineRanges: true }
+    });
+    expect(controls?.sessionId).toBeUndefined();
+    expect(createMobileNewTaskWorkspaceMentionControls("new-authority", create(SnapshotSchema, {
+      ...owner,
+      targets: [create(TargetSchema, { ...owner.targets[0]!, state: TargetState.ARCHIVED })]
+    }), "target")).toBeUndefined();
   });
 
   it("projects canonical current-directory entries and keeps browse directories separate from reference permission", () => {
