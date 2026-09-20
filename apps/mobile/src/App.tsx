@@ -183,6 +183,9 @@ import { mobileMediaPreviewFiles } from "./mobile-media-preview";
 import { MobilePdfViewer } from "./MobilePdfViewer";
 import type { MobilePdfViewerStatus } from "./mobile-pdf-viewer";
 import { mobilePdfPreviewFiles } from "./mobile-pdf-preview";
+import { MobileModelViewer } from "./MobileModelViewer";
+import type { MobileModelViewerStatus } from "./mobile-model-viewer";
+import { mobileModelPreviewFiles, mobileModelPreviewKind } from "./mobile-model-preview";
 import type { MobileBurnedImage, MobileComposerImageEditorSession } from "./mobile-composer-image-editor";
 import type { MobileImageAnnotationStroke } from "./mobile-image-annotation";
 import {
@@ -218,7 +221,8 @@ const client = new MobileClient(
   mobileComposerDrafts,
   mobileAttachmentFiles,
   mobileMediaPreviewFiles,
-  mobilePdfPreviewFiles
+  mobilePdfPreviewFiles,
+  mobileModelPreviewFiles
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
@@ -4186,7 +4190,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
               disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
               style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
                 disabled && styles.disabled]}>
-              <Text style={styles.messageImageGlyph}>{artifact.previewKind === "pdf" ? "▤" : "▶"}</Text>
+              <Text style={styles.messageImageGlyph}>{artifact.previewKind === "pdf" ? "▤"
+                : artifact.previewKind === "model" ? "⬡" : "▶"}</Text>
               <View style={styles.fill}>
                 <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifact.title}</Text>
                 <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
@@ -4777,6 +4782,8 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
           {files.artifacts.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No canonical Generated files are available for this task.</Text>}
           {files.artifacts.map((artifact) => {
             const galleryImage = mobileImageGalleryMediaType(artifact.blob?.mediaType ?? "") !== undefined;
+            const model = artifact.blob
+              ? mobileModelPreviewKind(artifact.blob.mediaType, artifact.blob.fileName) !== undefined : false;
             const source = { kind: "artifact" as const, artifact };
             return <View key={artifact.artifactId} style={styles.fileActionRow}>
             <Pressable accessibilityRole="button"
@@ -4787,7 +4794,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
                 : openPreview(source, () => client.previewArtifact(artifact))}
               style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
                 (!connected || filesBusy) && styles.disabled]}>
-              <Text style={styles.fileGlyph}>{galleryImage ? "▧" : "◆"}</Text>
+              <Text style={styles.fileGlyph}>{galleryImage ? "▧" : model ? "⬡" : "◆"}</Text>
               <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifactTitle(artifact)}</Text>
                 <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
                   {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}` : "Blob unavailable"}
@@ -4809,6 +4816,8 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
             const label = entry.displayName || workspaceBasename(entry.relativePath);
             const galleryImage = entry.kind === FileKind.REGULAR
               && mobileImageGalleryMediaType(entry.mediaType) !== undefined;
+            const model = entry.kind === FileKind.REGULAR
+              && mobileModelPreviewKind(entry.mediaType, entry.relativePath) !== undefined;
             const source = { kind: "workspace-entry" as const, entry };
             return <View key={entry.relativePath} style={styles.fileActionRow}>
               <Pressable accessibilityRole="button"
@@ -4821,7 +4830,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
                     : openPreview(source, () => client.previewWorkspaceEntry(entry))}
                 style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
                   (!connected || filesBusy) && styles.disabled]}>
-                <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : galleryImage ? "▧" : "◇"}</Text>
+                <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : galleryImage ? "▧" : model ? "⬡" : "◇"}</Text>
                 <View style={styles.fill}>
                   <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{label}</Text>
                   <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
@@ -4908,10 +4917,13 @@ function FilePreviewModal({ colors, preview, source, busy, backLabel = "Files",
 }) {
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
   const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
+  const [modelStatus, setModelStatus] = useState<MobileModelViewerStatus>();
   const mediaLeaseId = preview?.kind === "media" ? preview.leaseId : undefined;
   const pdfLeaseId = preview?.kind === "pdf" ? preview.leaseId : undefined;
+  const modelLeaseId = preview?.kind === "model" ? preview.leaseId : undefined;
   useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
   useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
+  useEffect(() => setModelStatus(undefined), [modelLeaseId]);
   return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={busy ? () => undefined : onClose}>
     <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       {preview && <>
@@ -4940,6 +4952,9 @@ function FilePreviewModal({ colors, preview, source, busy, backLabel = "Files",
           </Text>}
           {preview.kind === "pdf" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: pdfStatus?.state === "error" ? colors.negative : colors.muted }]}>
             {formatMobilePdfViewerStatus(pdfStatus)}
+          </Text>}
+          {preview.kind === "model" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: modelStatus?.state === "error" ? colors.negative : colors.muted }]}>
+            {formatMobileModelViewerStatus(modelStatus)}
           </Text>}
         </View>
         {preview.kind === "loading" ? <Centered label={loadingLabel} colors={colors} />
@@ -4983,6 +4998,21 @@ function FilePreviewModal({ colors, preview, source, busy, backLabel = "Files",
               uri={preview.uri}
             />
           </View>
+          : preview.kind === "model" ? <View style={styles.modelPreviewContainer}>
+            <MobileModelViewer
+              key={preview.leaseId}
+              accent={colors.accent}
+              background={colors.background}
+              border={colors.border}
+              ink={colors.ink}
+              lease={preview}
+              muted={colors.muted}
+              onStatusChange={setModelStatus}
+              style={styles.modelPreview}
+              surface={colors.surface}
+              title={preview.title}
+            />
+          </View>
           : preview.kind === "text" ? <ScrollView style={styles.fill} contentContainerStyle={styles.textPreviewContainer}>
             {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>Preview is truncated to the authenticated byte window shown above.</Text>}
             <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || "(empty file)"}</Text>
@@ -5006,6 +5036,15 @@ function formatMobilePdfViewerStatus(status: MobilePdfViewerStatus | undefined):
   if (status.state === "document") return `${status.pageCount} ${status.pageCount === 1 ? "page" : "pages"} · ${status.zoomPercent}%`;
   if (status.state === "complete") return `All ${status.pageCount} pages rendered · ${status.zoomPercent}%`;
   return `${status.renderedPages} of ${status.pageCount} pages rendered · ${status.zoomPercent}%`;
+}
+
+function formatMobileModelViewerStatus(status: MobileModelViewerStatus | undefined): string {
+  if (!status) return "Verified 3D model · preparing offline renderer";
+  if (status.state === "error") return status.error || "3D model preview failed";
+  if (status.state === "ready") return "Offline 3D renderer ready";
+  if (status.state === "receiving") return "Transferring verified model package";
+  if (status.state === "loading") return `Loading ${status.fileCount} verified model file${status.fileCount === 1 ? "" : "s"}`;
+  return `Interactive 3D model ready · ${status.fileCount} verified file${status.fileCount === 1 ? "" : "s"}`;
 }
 
 function formatMobileMediaPlayerStatus(
@@ -5583,6 +5622,8 @@ const styles = StyleSheet.create({
   mediaPreview: { flex: 1, minHeight: 240, overflow: "hidden", borderRadius: 16 },
   pdfPreviewContainer: { flex: 1, minHeight: 320, paddingHorizontal: 12, paddingBottom: 12 },
   pdfPreview: { flex: 1, minHeight: 280, overflow: "hidden", borderRadius: 16 },
+  modelPreviewContainer: { flex: 1, minHeight: 320, paddingHorizontal: 12, paddingBottom: 12 },
+  modelPreview: { flex: 1, minHeight: 280, overflow: "hidden", borderRadius: 16 },
   textPreviewContainer: { paddingHorizontal: 16, paddingBottom: 36 },
   textPreview: { fontSize: 13, lineHeight: 20, fontFamily: Platform.select({ ios: "Menlo", android: "monospace" }) }
 });

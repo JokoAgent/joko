@@ -1,0 +1,14 @@
+globalThis.ModelViewerElement = {
+  dracoDecoderLocation: "/joko-disabled-decoders/draco/",
+  ktx2TranscoderLocation: "/joko-disabled-decoders/basis/",
+  lottieLoaderLocation: "/joko-disabled-decoders/lottie.js"
+};
+
+globalThis.jokoModelViewerRuntime = {
+  ready: import("@google/model-viewer").then(() => {
+    if (typeof globalThis.customElements?.get("model-viewer") !== "function") {
+      throw new Error("The offline model-viewer custom element did not register.");
+    }
+    return true;
+  })
+};

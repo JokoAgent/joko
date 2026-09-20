@@ -96,11 +96,54 @@ function buildPdfJsRuntimeModule(src, filename) {
   })};`;
 }
 
+function nearestPackageManifest(entry) {
+  let directory = path.dirname(entry);
+  while (directory !== path.dirname(directory)) {
+    const manifest = path.join(directory, "package.json");
+    if (fs.existsSync(manifest)) return JSON.parse(fs.readFileSync(manifest, "utf8"));
+    directory = path.dirname(directory);
+  }
+  throw new Error("The package manifest is unavailable.");
+}
+
+function buildModelViewerRuntimeModule(src, filename) {
+  if (path.basename(filename) !== "model-viewer-runtime.modeljs") {
+    throw new Error("Only the audited Joko model-viewer runtime entry may use the .modeljs transformer.");
+  }
+  const modelViewerManifest = JSON.parse(fs.readFileSync(require.resolve("@google/model-viewer/package.json"), "utf8"));
+  const threeManifest = nearestPackageManifest(require.resolve("three"));
+  if (modelViewerManifest.version !== "4.3.1" || threeManifest.version !== "0.183.2") {
+    throw new Error("The mobile model-viewer runtime versions are not pinned.");
+  }
+  const result = esbuild.buildSync({
+    stdin: { contents: src, loader: "js", resolveDir: path.dirname(filename), sourcefile: filename },
+    bundle: true,
+    format: "iife",
+    platform: "browser",
+    target: ["chrome90", "safari15"],
+    legalComments: "inline",
+    minify: true,
+    write: false
+  });
+  const script = result.outputFiles?.[0]?.text;
+  if (!script || script.length < 100_000 || !script.includes("jokoModelViewerRuntime")
+    || !script.includes("model-viewer") || /<\/script/iu.test(script)) {
+    throw new Error("The mobile model-viewer runtime bundle is invalid.");
+  }
+  return `module.exports = ${JSON.stringify({
+    modelViewerVersion: modelViewerManifest.version,
+    threeVersion: threeManifest.version,
+    script,
+    scriptSha256Hex: crypto.createHash("sha256").update(script, "utf8").digest("hex")
+  })};`;
+}
+
 module.exports.transform = ({ src, filename, options }) => {
   const transformed = filename.endsWith(".svg")
     ? `module.exports = ${JSON.stringify(src)};`
-    : filename.endsWith(".pdfjs") ? buildPdfJsRuntimeModule(src, filename) : src;
+    : filename.endsWith(".pdfjs") ? buildPdfJsRuntimeModule(src, filename)
+      : filename.endsWith(".modeljs") ? buildModelViewerRuntimeModule(src, filename) : src;
   return upstreamTransformer.transform({ src: transformed, filename, options });
 };
 
-module.exports.testing = { buildPdfJsRuntimeModule, expectedStandardFonts };
+module.exports.testing = { buildModelViewerRuntimeModule, buildPdfJsRuntimeModule, expectedStandardFonts };

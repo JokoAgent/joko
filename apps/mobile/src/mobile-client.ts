@@ -63,6 +63,13 @@ import {
   type MobilePdfPreviewLease
 } from "./mobile-pdf-preview";
 import {
+  mobileModelPreviewKind,
+  type MobileModelPreviewFiles,
+  type MobileModelPreviewLease,
+  type MobileModelResourceKind,
+  type MobileModelResourceSnapshot
+} from "./mobile-model-preview";
+import {
   acceptedQueueItems,
   backendSupports,
   editQueueItemText,
@@ -310,6 +317,11 @@ interface MobileFilesContext {
   readonly key: string;
 }
 
+interface MobileWorkspaceModelObservation {
+  readonly revisionKey: string;
+  readonly mediaType: string;
+}
+
 interface MobileComposerImageEditLease {
   readonly leaseId: string;
   readonly request: MobileComposerImageEditorRequest;
@@ -382,6 +394,7 @@ interface MobileTimelinePreviewLease {
   readonly artifact: MobileTimelinePreviewArtifact;
   media?: MobileMediaPreviewLease;
   pdf?: MobilePdfPreviewLease;
+  model?: MobileModelPreviewLease;
 }
 
 export interface MobileQueueEditLease {
@@ -493,6 +506,7 @@ export class MobileClient {
   #filesPreviewAbort?: AbortController;
   #filesMediaPreview?: MobileMediaPreviewLease;
   #filesPdfPreview?: MobilePdfPreviewLease;
+  #filesModelPreview?: MobileModelPreviewLease;
   #timelinePreview?: MobileTimelinePreviewLease;
   #filesWatchAbort?: AbortController;
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
@@ -514,7 +528,8 @@ export class MobileClient {
     private readonly composerDrafts?: MobileComposerDraftStore,
     private readonly attachmentFiles?: MobileAttachmentFiles,
     private readonly mediaPreviewFiles?: MobileMediaPreviewFiles,
-    private readonly pdfPreviewFiles?: MobilePdfPreviewFiles
+    private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
+    private readonly modelPreviewFiles?: MobileModelPreviewFiles
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -580,6 +595,7 @@ export class MobileClient {
       homeSearchError: undefined,
       timelinePreview: undefined,
       ...(this.#state.files.preview?.kind === "media" || this.#state.files.preview?.kind === "pdf"
+        || this.#state.files.preview?.kind === "model"
         ? { files: { ...this.#state.files, preview: undefined } }
         : {})
     };
@@ -1803,6 +1819,7 @@ export class MobileClient {
     this.#set({ files: { ...this.#state.files, preview: { ...base, kind: "loading" } } });
     let stagedMedia: MobileMediaPreviewLease | undefined;
     let stagedPdf: MobilePdfPreviewLease | undefined;
+    let stagedModel: MobileModelPreviewLease | undefined;
     try {
       await this.#releaseFilesBinaryPreviews();
       if (controller.signal.aborted || this.#filesPreviewAbort !== controller
@@ -1817,6 +1834,25 @@ export class MobileClient {
         const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
         preview = { ...base, kind: "image", dataUri: bytesToDataUri(download.bytes, download.mediaType),
           altText: current.description.trim() || artifactTitle(current), widthPixels: 0, heightPixels: 0 };
+      } else if (mobileModelPreviewKind(mediaType, blob.fileName)) {
+        if (!this.modelPreviewFiles) {
+          preview = { ...base, kind: "unsupported", reason: "3D model preview is unavailable on this mobile runtime." };
+        } else {
+          const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
+          if (normalizeMediaType(download.mediaType) !== mediaType) {
+            throw new Error("The downloaded media type did not match the canonical Generated model Blob.");
+          }
+          stagedModel = await this.modelPreviewFiles.stage({
+            profileId: context.credential.profileId,
+            leaseId: this.newId(),
+            modelPath: blob.fileName,
+            mediaType,
+            expectedSha256Hex: blob.sha256Hex,
+            bytes: download.bytes,
+            signal: controller.signal
+          });
+          preview = { ...base, kind: "model", ...stagedModel };
+        }
       } else if (isTextMediaType(mediaType)) {
         if (blob.byteSize > 2_097_152n) {
           preview = { ...base, kind: "unsupported",
@@ -1873,16 +1909,20 @@ export class MobileClient {
         || !this.#currentFiles(epoch, context.key)) {
         if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
         if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
+        if (stagedModel) await this.modelPreviewFiles?.remove(stagedModel).catch(() => undefined);
         return;
       }
       this.#filesMediaPreview = stagedMedia;
       this.#filesPdfPreview = stagedPdf;
+      this.#filesModelPreview = stagedModel;
       stagedMedia = undefined;
       stagedPdf = undefined;
+      stagedModel = undefined;
       this.#set({ files: { ...this.#state.files, preview } });
     } catch (error) {
       if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
       if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
+      if (stagedModel) await this.modelPreviewFiles?.remove(stagedModel).catch(() => undefined);
       if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
       this.#set({ files: { ...this.#state.files,
         preview: { ...base, kind: "error", reason: message(error) } } });
@@ -1931,6 +1971,7 @@ export class MobileClient {
     this.#set({ timelinePreview: { ...base, kind: "loading" } });
     let stagedMedia: MobileMediaPreviewLease | undefined;
     let stagedPdf: MobilePdfPreviewLease | undefined;
+    let stagedModel: MobileModelPreviewLease | undefined;
     try {
       const download = await this.network.downloadBlob(credential, source.blob, controller.signal);
       if (normalizeMediaType(download.mediaType) !== source.artifact.mediaType) {
@@ -1949,7 +1990,7 @@ export class MobileClient {
           controller.signal
         );
         preview = { ...base, kind: "media", ...stagedMedia };
-      } else {
+      } else if (source.artifact.previewKind === "pdf") {
         if (!this.pdfPreviewFiles) throw new Error("PDF preview is unavailable on this mobile runtime.");
         stagedPdf = await this.pdfPreviewFiles.stage(
           credential.profileId,
@@ -1961,20 +2002,36 @@ export class MobileClient {
           controller.signal
         );
         preview = { ...base, kind: "pdf", ...stagedPdf };
+      } else {
+        if (!this.modelPreviewFiles) throw new Error("3D model preview is unavailable on this mobile runtime.");
+        stagedModel = await this.modelPreviewFiles.stage({
+          profileId: credential.profileId,
+          leaseId: this.newId(),
+          modelPath: source.blob.fileName,
+          mediaType: source.artifact.mediaType,
+          expectedSha256Hex: source.blob.sha256Hex,
+          bytes: download.bytes,
+          signal: controller.signal
+        });
+        preview = { ...base, kind: "model", ...stagedModel };
       }
       if (!this.#timelinePreviewLeaseCurrent(lease)) {
         if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
         if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
+        if (stagedModel) await this.modelPreviewFiles?.remove(stagedModel).catch(() => undefined);
         return;
       }
       lease.media = stagedMedia;
       lease.pdf = stagedPdf;
+      lease.model = stagedModel;
       stagedMedia = undefined;
       stagedPdf = undefined;
+      stagedModel = undefined;
       this.#set({ timelinePreview: preview });
     } catch (error) {
       if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
       if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
+      if (stagedModel) await this.modelPreviewFiles?.remove(stagedModel).catch(() => undefined);
       if (!this.#timelinePreviewLeaseCurrent(lease)) return;
       this.#set({ timelinePreview: { ...base, kind: "error", reason: message(error) } });
     }
@@ -6347,22 +6404,28 @@ export class MobileClient {
   async #releaseTimelinePreviewLease(lease: MobileTimelinePreviewLease): Promise<void> {
     const media = lease.media;
     const pdf = lease.pdf;
+    const model = lease.model;
     lease.media = undefined;
     lease.pdf = undefined;
+    lease.model = undefined;
     await Promise.all([
       media && this.mediaPreviewFiles ? this.mediaPreviewFiles.remove(media) : Promise.resolve(),
-      pdf && this.pdfPreviewFiles ? this.pdfPreviewFiles.remove(pdf) : Promise.resolve()
+      pdf && this.pdfPreviewFiles ? this.pdfPreviewFiles.remove(pdf) : Promise.resolve(),
+      model && this.modelPreviewFiles ? this.modelPreviewFiles.remove(model) : Promise.resolve()
     ]);
   }
 
   async #releaseFilesBinaryPreviews(): Promise<void> {
     const mediaLease = this.#filesMediaPreview;
     const pdfLease = this.#filesPdfPreview;
+    const modelLease = this.#filesModelPreview;
     this.#filesMediaPreview = undefined;
     this.#filesPdfPreview = undefined;
+    this.#filesModelPreview = undefined;
     await Promise.all([
       mediaLease && this.mediaPreviewFiles ? this.mediaPreviewFiles.remove(mediaLease) : Promise.resolve(),
-      pdfLease && this.pdfPreviewFiles ? this.pdfPreviewFiles.remove(pdfLease) : Promise.resolve()
+      pdfLease && this.pdfPreviewFiles ? this.pdfPreviewFiles.remove(pdfLease) : Promise.resolve(),
+      modelLease && this.modelPreviewFiles ? this.modelPreviewFiles.remove(modelLease) : Promise.resolve()
     ]);
   }
 
@@ -6549,6 +6612,10 @@ export class MobileClient {
       revision,
       controller.signal
     );
+    if (result.entry?.relativePath !== relativePath || !result.entry.revision
+      || workspaceEntryRevisionKey(result.entry.revision) !== workspaceEntryRevisionKey(revision)) {
+      throw new Error("The Workspace file changed before its exact preview was returned.");
+    }
     if (controller.signal.aborted || this.#filesPreviewAbort !== controller
       || !this.#currentFiles(epoch, context.key)) return;
     const preview = await this.#workspacePreview(context, result, title, controller.signal);
@@ -6556,10 +6623,12 @@ export class MobileClient {
       || !this.#currentFiles(epoch, context.key)) {
       if (preview.kind === "media") await this.mediaPreviewFiles?.remove(preview).catch(() => undefined);
       if (preview.kind === "pdf") await this.pdfPreviewFiles?.remove(preview).catch(() => undefined);
+      if (preview.kind === "model") await this.modelPreviewFiles?.remove(preview).catch(() => undefined);
       return;
     }
     this.#filesMediaPreview = preview.kind === "media" ? preview : undefined;
     this.#filesPdfPreview = preview.kind === "pdf" ? preview : undefined;
+    this.#filesModelPreview = preview.kind === "model" ? preview : undefined;
     this.#set({ files: { ...this.#state.files, preview } });
   }
 
@@ -6661,6 +6730,43 @@ export class MobileClient {
         );
         return { ...base, kind: "pdf", ...lease };
       }
+      if (mobileModelPreviewKind(blobType, entry.relativePath)) {
+        if (blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
+          return { ...base, kind: "unsupported",
+            reason: `This 3D model is ${blob.byteSize.toString(10)} bytes and exceeds the mobile preview limit.` };
+        }
+        if (!this.modelPreviewFiles) {
+          return { ...base, kind: "unsupported", reason: "3D model preview is unavailable on this mobile runtime." };
+        }
+        const download = await this.network.downloadBlob(context.credential, blob, signal);
+        if (normalizeMediaType(download.mediaType) !== blobType) {
+          throw new Error("The downloaded media type did not match the canonical Workspace model Blob.");
+        }
+        const observations = new Map<string, MobileWorkspaceModelObservation>([[entry.relativePath, {
+          revisionKey: workspaceEntryRevisionKey(revision),
+          mediaType
+        }]]);
+        let lease: MobileModelPreviewLease | undefined;
+        try {
+          lease = await this.modelPreviewFiles.stage({
+            profileId: context.credential.profileId,
+            leaseId: this.newId(),
+            modelPath: entry.relativePath,
+            mediaType: blobType,
+            expectedSha256Hex: blob.sha256Hex,
+            bytes: download.bytes,
+            loadResource: (path, kind, dependencySignal) => this.#loadWorkspaceModelDependency(
+              context, path, kind, observations, dependencySignal ?? signal
+            ),
+            signal
+          });
+          await this.#revalidateWorkspaceModelFiles(context, observations, signal);
+          return { ...base, kind: "model", ...lease };
+        } catch (error) {
+          if (lease) await this.modelPreviewFiles.remove(lease).catch(() => undefined);
+          throw error;
+        }
+      }
       return { ...base, kind: "unsupported",
         reason: `No safe in-app preview is available for ${blobType} (${blob.byteSize.toString(10)} bytes).` };
     }
@@ -6673,6 +6779,95 @@ export class MobileClient {
     }
     return { ...base, kind: "unsupported",
       reason: `No safe in-app preview is available for ${mediaType} (${revision.byteSize.toString(10)} bytes).` };
+  }
+
+  async #loadWorkspaceModelDependency(
+    context: MobileFilesContext,
+    relativePath: string,
+    kind: MobileModelResourceKind,
+    observations: Map<string, MobileWorkspaceModelObservation>,
+    signal: AbortSignal
+  ): Promise<MobileModelResourceSnapshot> {
+    signal.throwIfAborted();
+    const path = canonicalWorkspacePath(relativePath);
+    const directory = await this.network.listWorkspaceDirectory(
+      context.credential,
+      context.authority.workspace.workspaceId,
+      workspaceParentPath(path),
+      signal
+    );
+    signal.throwIfAborted();
+    const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+    const entry = matches.length === 1 ? matches[0] : undefined;
+    if (!entry?.revision || entry.kind !== FileKind.REGULAR
+      || entry.workspaceId !== context.authority.workspace.workspaceId) {
+      throw new Error(`The model dependency ${path} is not one exact regular Workspace file.`);
+    }
+    const mediaType = normalizeMediaType(entry.mediaType) || "application/octet-stream";
+    const observation = { revisionKey: workspaceEntryRevisionKey(entry.revision), mediaType };
+    const existing = observations.get(path);
+    if (existing && (existing.revisionKey !== observation.revisionKey || existing.mediaType !== mediaType)) {
+      throw new Error(`The model dependency ${path} changed while it was being resolved.`);
+    }
+    observations.set(path, observation);
+    const preview = await this.network.readWorkspaceFile(
+      context.credential,
+      context.authority.workspace.workspaceId,
+      path,
+      entry.revision,
+      signal
+    );
+    signal.throwIfAborted();
+    const returned = preview.entry;
+    if (!returned?.revision || returned.kind !== FileKind.REGULAR || returned.relativePath !== path
+      || returned.workspaceId !== context.authority.workspace.workspaceId
+      || workspaceEntryRevisionKey(returned.revision) !== observation.revisionKey
+      || (normalizeMediaType(returned.mediaType) || "application/octet-stream") !== mediaType) {
+      throw new Error(`The model dependency ${path} changed before its exact preview was returned.`);
+    }
+    const blob = preview.content.case === "blob" ? preview.content.value
+      : kind === "image" && preview.content.case === "image" ? preview.content.value.blob : undefined;
+    if (!blob || blob.byteSize !== returned.revision.byteSize
+      || blob.sha256Hex !== returned.revision.sha256Hex
+      || (normalizeMediaType(blob.mediaType) || "application/octet-stream") !== mediaType) {
+      throw new Error(`The model dependency ${path} did not return an exact typed Blob.`);
+    }
+    const download = await this.network.downloadBlob(context.credential, blob, signal);
+    signal.throwIfAborted();
+    if ((normalizeMediaType(download.mediaType) || "application/octet-stream") !== mediaType) {
+      throw new Error(`The downloaded model dependency ${path} changed media type.`);
+    }
+    return { path, mediaType, sha256Hex: blob.sha256Hex, bytes: download.bytes };
+  }
+
+  async #revalidateWorkspaceModelFiles(
+    context: MobileFilesContext,
+    observations: ReadonlyMap<string, MobileWorkspaceModelObservation>,
+    signal: AbortSignal
+  ): Promise<void> {
+    const directories = new Map<string, Awaited<ReturnType<MobileNetwork["listWorkspaceDirectory"]>>>();
+    for (const [path, observation] of observations) {
+      signal.throwIfAborted();
+      const parent = workspaceParentPath(path);
+      let directory = directories.get(parent);
+      if (!directory) {
+        directory = await this.network.listWorkspaceDirectory(
+          context.credential,
+          context.authority.workspace.workspaceId,
+          parent,
+          signal
+        );
+        directories.set(parent, directory);
+      }
+      const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+      const entry = matches.length === 1 ? matches[0] : undefined;
+      if (!entry?.revision || entry.kind !== FileKind.REGULAR
+        || entry.workspaceId !== context.authority.workspace.workspaceId
+        || workspaceEntryRevisionKey(entry.revision) !== observation.revisionKey
+        || (normalizeMediaType(entry.mediaType) || "application/octet-stream") !== observation.mediaType) {
+        throw new Error(`The model file ${path} changed before the verified preview lease was adopted.`);
+      }
+    }
   }
 
   #ready(): PairedCredential {

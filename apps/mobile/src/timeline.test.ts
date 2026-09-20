@@ -48,7 +48,8 @@ describe("mobile Timeline quote source", () => {
       } } } }
     ])])[0];
     expect(row?.artifacts).toMatchObject([
-      { eventId: "complete", messageId: "message", contentIndex: 0, title: "Recording", previewKind: "media" }
+      { eventId: "complete", messageId: "message", contentIndex: 0, title: "Recording", previewKind: "media" },
+      { eventId: "complete", messageId: "message", contentIndex: 1, title: "Model", previewKind: "model" }
     ]);
   });
 });

@@ -10,6 +10,7 @@ import {
   type WorkspaceEntry,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
+import type { MobileModelPreviewLease } from "./mobile-model-preview";
 
 export type MobileFilesLocation =
   | { readonly kind: "workspace"; readonly path: string }
@@ -86,6 +87,9 @@ export type MobileFilePreview =
       readonly localByteSize: number;
       readonly sha256Hex: string;
     })
+  | (MobilePreviewBase & {
+      readonly kind: "model";
+    } & MobileModelPreviewLease)
   | (MobilePreviewBase & {
       readonly kind: "unsupported";
       readonly reason: string;

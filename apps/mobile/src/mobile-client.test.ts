@@ -1,4 +1,5 @@
 import { create, toBinary } from "@bufbuild/protobuf";
+import { createHash } from "node:crypto";
 import {
   ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
@@ -36,6 +37,11 @@ import {
   type MobilePdfPreviewFileDriver,
   type MobilePdfPreviewFileSnapshot
 } from "./mobile-pdf-preview";
+import {
+  MobileModelPreviewFiles,
+  type MobileModelPreviewFileDriver,
+  type MobileModelPreviewFileSnapshot
+} from "./mobile-model-preview";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
@@ -997,6 +1003,32 @@ function pdfPreviewFixture(
   };
 }
 
+function modelPreviewFixture(
+  write?: (fileName: string, bytes: Uint8Array) => Promise<MobileModelPreviewFileSnapshot>
+) {
+  const stored = new Map<string, Uint8Array>();
+  const removed: string[] = [];
+  const driver: MobileModelPreviewFileDriver = {
+    prepare: vi.fn(async () => { stored.clear(); }),
+    write: vi.fn(async (fileName, bytes) => {
+      if (write) return write(fileName, bytes);
+      const exact = Uint8Array.from(bytes);
+      stored.set(fileName, exact);
+      return { uri: `file:///model/${fileName}`, fileName, byteSize: exact.byteLength, bytes: exact };
+    }),
+    remove: vi.fn(async (snapshot) => {
+      removed.push(snapshot.fileName);
+      stored.delete(snapshot.fileName);
+    })
+  };
+  return {
+    files: new MobileModelPreviewFiles(driver, async (bytes) => sha256Hex(bytes)),
+    driver,
+    removed,
+    stored
+  };
+}
+
 function fixedIds(...values: readonly string[]): () => string {
   let index = 0;
   return () => values[index++] ?? `fallback-${index}`;
@@ -1021,6 +1053,41 @@ function previewPdfBytes(): Uint8Array {
   const body = "%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n";
   const xref = new TextEncoder().encode(body).byteLength;
   return new TextEncoder().encode(`${body}xref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000060 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+}
+
+function previewGltfBytes(input: {
+  readonly bufferUri?: string;
+  readonly imageUri?: string;
+} = {}): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify({
+    asset: { version: "2.0" },
+    ...(input.bufferUri ? { buffers: [{ uri: input.bufferUri, byteLength: 4 }] } : {}),
+    ...(input.imageUri ? { images: [{ uri: input.imageUri }] } : {})
+  }));
+}
+
+function workspaceModelEntry(
+  relativePath: string,
+  mediaType: string,
+  bytes: Uint8Array,
+  opaqueRevision: string
+): WorkspaceEntry {
+  return create(WorkspaceEntrySchema, {
+    workspaceId: "workspace",
+    relativePath,
+    displayName: relativePath.slice(relativePath.lastIndexOf("/") + 1),
+    kind: FileKind.REGULAR,
+    mediaType,
+    revision: create(FileRevisionSchema, {
+      opaqueRevision,
+      sha256Hex: sha256Hex(bytes),
+      byteSize: BigInt(bytes.byteLength)
+    })
+  });
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function galleryPngBytes(width: number, height: number): Uint8Array {
@@ -1155,10 +1222,12 @@ function client(
   drafts = memoryDraftStores(),
   attachmentFiles?: MobileAttachmentFiles,
   mediaPreviewFiles?: MobileMediaPreviewFiles,
-  pdfPreviewFiles?: MobilePdfPreviewFiles
+  pdfPreviewFiles?: MobilePdfPreviewFiles,
+  modelPreviewFiles?: MobileModelPreviewFiles
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
-    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles);
+    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
+    modelPreviewFiles);
   clients.push(instance);
   return instance;
 }
@@ -5897,6 +5966,184 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.open).toBe(false);
     expect(app.state.files.preview).toBeUndefined();
     expect(pdf.removed).toEqual(["preview-late-pdf-lease.pdf"]);
+  });
+
+  it("materializes an authenticated Generated glTF into one offline model lease", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewGltfBytes();
+    const hash = sha256Hex(bytes);
+    const artifact = create(ArtifactSchema, {
+      artifactId: "model-generated",
+      sessionId: "session",
+      kind: ArtifactKind.FILE,
+      title: "Generated scene",
+      blob: { blobId: "model-generated-blob", fileName: "scene.gltf", mediaType: "model/gltf+json",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: hash, disposition: BlobDisposition.INLINE }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "artifacts-model" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "model/gltf+json" });
+    const model = modelPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "model-generated-lease", undefined, undefined, undefined, undefined, undefined, model.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+
+    expect(app.state.files.preview).toMatchObject({
+      kind: "model", modelKind: "gltf", leaseId: "model-generated-lease", modelPath: "scene.gltf",
+      uri: "file:///model/preview-model-generated-lease.joko-model", files: [{ path: "scene.gltf" }]
+    });
+    expect(model.driver.write).toHaveBeenCalledOnce();
+    app.setForeground(false);
+    await vi.waitFor(() => expect(model.removed).toEqual(["preview-model-generated-lease.joko-model"]));
+    expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("resolves exact same-Workspace glTF dependencies and revalidates every revision before adoption", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const modelBytes = previewGltfBytes({ bufferUri: "assets/mesh.bin", imageUri: "assets/texture.png" });
+    const bufferBytes = Uint8Array.from([1, 2, 3, 4]);
+    const imageBytes = galleryPngBytes(2, 2);
+    const modelEntry = workspaceModelEntry("scene.gltf", "model/gltf+json", modelBytes, "model-r1");
+    const bufferEntry = workspaceModelEntry("assets/mesh.bin", "application/octet-stream", bufferBytes, "buffer-r1");
+    const imageEntry = workspaceModelEntry("assets/texture.png", "image/png", imageBytes, "image-r1");
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+      entries: parentPath === "" ? [modelEntry] : parentPath === "assets" ? [bufferEntry, imageEntry] : [],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
+      paths: [modelEntry.relativePath, bufferEntry.relativePath, imageEntry.relativePath],
+      revision: "index-model", truncated: false
+    });
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspaceId, path) => {
+      const entry = path === modelEntry.relativePath ? modelEntry
+        : path === bufferEntry.relativePath ? bufferEntry : imageEntry;
+      const blobId = path === modelEntry.relativePath ? "workspace-model"
+        : path === bufferEntry.relativePath ? "workspace-buffer" : "workspace-image";
+      const blob = create(BlobRefSchema, {
+        blobId, fileName: path.slice(path.lastIndexOf("/") + 1), mediaType: entry.mediaType,
+        byteSize: entry.revision!.byteSize, sha256Hex: entry.revision!.sha256Hex,
+        disposition: BlobDisposition.INLINE
+      });
+      return create(FilePreviewSchema, {
+        entry,
+        content: path === imageEntry.relativePath
+          ? { case: "image", value: { blob, altText: "Texture" } }
+          : { case: "blob", value: blob }
+      });
+    });
+    vi.mocked(network.downloadBlob).mockImplementation(async (_credential, blob) => {
+      if (blob.blobId === "workspace-model") return { bytes: modelBytes, mediaType: "model/gltf+json" };
+      if (blob.blobId === "workspace-buffer") return { bytes: bufferBytes, mediaType: "application/octet-stream" };
+      return { bytes: imageBytes, mediaType: "image/png" };
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [], revision: "artifacts-model" });
+    const model = modelPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "workspace-model-lease", undefined, undefined, undefined, undefined, undefined, model.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewWorkspaceEntry(app.state.files.entries[0]!);
+
+    expect(app.state.files.preview).toMatchObject({
+      kind: "model", leaseId: "workspace-model-lease", modelPath: "scene.gltf",
+      files: [
+        { path: "scene.gltf", byteOffset: 0 },
+        { path: "assets/mesh.bin" },
+        { path: "assets/texture.png" }
+      ],
+      references: [
+        { uri: "assets/mesh.bin", path: "assets/mesh.bin", kind: "buffer", fileIndex: 1 },
+        { uri: "assets/texture.png", path: "assets/texture.png", kind: "image", fileIndex: 2 }
+      ]
+    });
+    expect(network.readWorkspaceFile).toHaveBeenCalledWith(
+      credential, "workspace", "assets/mesh.bin", bufferEntry.revision, expect.any(AbortSignal)
+    );
+    expect(network.readWorkspaceFile).toHaveBeenCalledWith(
+      credential, "workspace", "assets/texture.png", imageEntry.revision, expect.any(AbortSignal)
+    );
+    expect(vi.mocked(network.listWorkspaceDirectory).mock.calls.filter((call) => call[2] === "")).toHaveLength(2);
+    expect(vi.mocked(network.listWorkspaceDirectory).mock.calls.filter((call) => call[2] === "assets")).toHaveLength(3);
+  });
+
+  it("removes a staged Workspace model when its main revision drifts before adoption", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewGltfBytes();
+    const stable = workspaceModelEntry("scene.gltf", "model/gltf+json", bytes, "model-r1");
+    const changed = create(WorkspaceEntrySchema, {
+      ...stable,
+      revision: create(FileRevisionSchema, {
+        opaqueRevision: "model-r2",
+        sha256Hex: stable.revision!.sha256Hex,
+        byteSize: stable.revision!.byteSize,
+        modifiedAt: stable.revision!.modifiedAt
+      })
+    });
+    let rootReads = 0;
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+      entries: parentPath === "" ? [++rootReads === 1 ? stable : changed] : [],
+      revision: `directory-${rootReads}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [stable.relativePath],
+      revision: "index-model", truncated: false });
+    const blob = create(BlobRefSchema, { blobId: "workspace-model", fileName: "scene.gltf",
+      mediaType: stable.mediaType, byteSize: stable.revision!.byteSize,
+      sha256Hex: stable.revision!.sha256Hex, disposition: BlobDisposition.INLINE });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry: stable, content: { case: "blob", value: blob }
+    }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "model/gltf+json" });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [], revision: "artifacts-model" });
+    const model = modelPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "workspace-drift-lease", undefined, undefined, undefined, undefined, undefined, model.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewWorkspaceEntry(app.state.files.entries[0]!);
+
+    expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/changed/u) });
+    expect(model.removed).toEqual(["preview-workspace-drift-lease.joko-model"]);
+  });
+
+  it("previews an embedded durable Timeline glTF and rejects unattached external dependencies", async () => {
+    const embedded = previewGltfBytes();
+    const event = timelinePreviewEvent("scene.gltf", "model/gltf+json", embedded, sha256Hex(embedded), "Scene");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: embedded, mediaType: "model/gltf+json" });
+    const model = modelPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "timeline-model-lease", undefined, undefined, undefined, undefined, undefined, model.files);
+    await app.start();
+    const artifact = timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!;
+
+    await app.previewTimelineArtifact(artifact);
+    expect(app.state.timelinePreview).toMatchObject({
+      kind: "model", title: "Scene", leaseId: "timeline-model-lease", modelPath: "scene.gltf"
+    });
+    app.closeTimelinePreview();
+    await vi.waitFor(() => expect(model.removed).toEqual(["preview-timeline-model-lease.joko-model"]));
+
+    const external = previewGltfBytes({ bufferUri: "mesh.bin" });
+    const externalEvent = timelinePreviewEvent(
+      "external.gltf", "model/gltf+json", external, sha256Hex(external), "External scene"
+    );
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: timelineGallerySnapshot(externalEvent) });
+    vi.mocked(network.readSession).mockResolvedValue(timelineGallerySnapshot(externalEvent));
+    await app.refresh();
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: external, mediaType: "model/gltf+json" });
+    const externalArtifact = timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!;
+    await app.previewTimelineArtifact(externalArtifact);
+    expect(app.state.timelinePreview).toMatchObject({
+      kind: "error", reason: expect.stringMatching(/external dependency files are unavailable/u)
+    });
+    expect(model.driver.write).toHaveBeenCalledTimes(1);
   });
 
   it("previews an exact durable Timeline video and removes its lease when closed", async () => {

@@ -28,7 +28,8 @@ describe("mobile Timeline preview artifacts", () => {
     ]);
     expect(mobileTimelinePreviewArtifacts(event)).toMatchObject([
       { contentIndex: 0, title: "Demo", mediaType: "video/mp4", previewKind: "media" },
-      { contentIndex: 2, title: "Notes", mediaType: "application/pdf", previewKind: "pdf" }
+      { contentIndex: 2, title: "Notes", mediaType: "application/pdf", previewKind: "pdf" },
+      { contentIndex: 3, title: "Mesh", mediaType: "model/gltf-binary", previewKind: "model" }
     ]);
   });
 
@@ -36,7 +37,8 @@ describe("mobile Timeline preview artifacts", () => {
     const malformed = completedEvent([
       artifactBlock("song.mp3", "audio/mpeg", "", { sha256Hex: "bad" }),
       artifactBlock("huge.pdf", "application/pdf", "", { byteSize: 33_554_433n }),
-      artifactBlock("missing.pdf", "application/pdf", "", { blobId: "" })
+      artifactBlock("missing.pdf", "application/pdf", "", { blobId: "" }),
+      artifactBlock("wrong.bin", "model/gltf-binary", "")
     ]);
     expect(mobileTimelinePreviewArtifacts(malformed)).toEqual([]);
     expect(mobileTimelinePreviewArtifacts(create(EventSchema, {

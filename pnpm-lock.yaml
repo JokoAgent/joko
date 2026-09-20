@@ -148,6 +148,9 @@ importers:
       '@connectrpc/connect-web':
         specifier: 2.1.2
         version: 2.1.2(@bufbuild/protobuf@2.14.0)(@connectrpc/connect@2.1.2(@bufbuild/protobuf@2.14.0))
+      '@google/model-viewer':
+        specifier: 4.3.1
+        version: 4.3.1(three@0.183.2)
       '@joko/brand-assets':
         specifier: workspace:*
         version: link:../../packages/brand-assets
@@ -220,6 +223,9 @@ importers:
       react-native-webview:
         specifier: 13.16.1
         version: 13.16.1(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(react@19.2.3)(supports-color@8.1.1))(react@19.2.3)
+      three:
+        specifier: 0.183.2
+        version: 0.183.2
     devDependencies:
       '@types/react':
         specifier: 19.2.2

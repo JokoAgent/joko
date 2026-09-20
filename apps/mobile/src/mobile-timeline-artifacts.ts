@@ -1,5 +1,6 @@
 import { MessageRole, type BlobRef, type Event } from "@joko/contracts";
 import { mobileMediaPreviewKind } from "./mobile-media-preview";
+import { mobileModelPreviewKind } from "./mobile-model-preview";
 import { isMobilePdfPreviewMediaType } from "./mobile-pdf-preview";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
 import { normalizeMediaType } from "./workspace-files";
@@ -13,7 +14,7 @@ export interface MobileTimelinePreviewArtifact {
   readonly mediaType: string;
   readonly byteSize: bigint;
   readonly sourceKey: string;
-  readonly previewKind: "media" | "pdf";
+  readonly previewKind: "media" | "pdf" | "model";
 }
 
 export interface MobileTimelinePreviewArtifactSource {
@@ -32,7 +33,8 @@ export function mobileTimelinePreviewArtifacts(event: Event): readonly MobileTim
     const blob = block.content.value.blob;
     const mediaType = normalizeMediaType(blob.mediaType);
     const previewKind = mobileMediaPreviewKind(mediaType) ? "media"
-      : isMobilePdfPreviewMediaType(mediaType) ? "pdf" : undefined;
+      : isMobilePdfPreviewMediaType(mediaType) ? "pdf"
+        : mobileModelPreviewKind(mediaType, blob.fileName) ? "model" : undefined;
     if (!previewKind || !validBlobIdentity(blob)) return [];
     const title = boundedLabel(block.content.value.label) || boundedLabel(blob.fileName) || "Message file";
     return [{
