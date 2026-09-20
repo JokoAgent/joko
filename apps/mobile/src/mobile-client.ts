@@ -2,8 +2,8 @@ import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
-  ConnectionState, CreateSessionMutationSchema,
-  DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
+  ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema,
+  DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema, ExecuteUserShellMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
@@ -13,13 +13,15 @@ import {
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
   RevisionSchema, RevokeDeviceMutationSchema,
+  CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
+  ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
   ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
-  StartReviewMutationSchema, TriggerScheduleMutationSchema,
+  StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   FileKind,
   type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
-  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot,
+  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
@@ -284,6 +286,18 @@ import {
   type MobileAutomationSchedule,
   type MobileAutomationsState
 } from "./mobile-automation";
+import {
+  buildMobileAutomationScheduleInput,
+  mobileAutomationDispositionProto,
+  mobileAutomationScheduleRevisionKey,
+  mobileAutomationTargetOptions,
+  projectMobileAutomationDeletionResult,
+  type MobileAutomationDeletionOutcome,
+  type MobileAutomationDeletionPreview,
+  type MobileAutomationDisposition,
+  type MobileAutomationDraft,
+  type MobileAutomationWorktreeProof
+} from "./mobile-automation-authoring";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -2110,10 +2124,7 @@ export class MobileClient {
         || rawHistory.nextPageToken === "" && history.length !== rawHistory.totalSize) {
         throw new Error("The Joko node returned an incomplete Automation history.");
       }
-      if (!this.#automationRequestCurrent(generation, controller, authorityKey)
-        || this.#state.automations.selectedScheduleId !== preferredScheduleId
-          && preferredScheduleId !== undefined
-          && schedules.some((schedule) => schedule.scheduleId === preferredScheduleId)) return;
+      if (!this.#automationRequestCurrent(generation, controller, authorityKey)) return;
       this.#automationHistoryPageTokens = new Set([
         "",
         ...(rawHistory.nextPageToken === "" ? [] : [rawHistory.nextPageToken])
@@ -2249,6 +2260,394 @@ export class MobileClient {
       preconditions: [this.#automationSchedulePrecondition(schedule)],
       payload: { case: "deleteScheduleRun", value: create(DeleteScheduleRunMutationSchema, { scheduleId, triggerId }) }
     }));
+  }
+
+  async loadAutomationWorktree(targetId: string): Promise<MobileAutomationWorktreeProof> {
+    const credential = this.#ready();
+    const authorityKey = this.#automationOwnerKey();
+    const owner = this.#state.owner;
+    if (!authorityKey || !owner || !this.#state.automations.open || this.#state.automations.status !== "ready") {
+      throw new Error("Reopen Automations from the current Joko node before loading Worktree options.");
+    }
+    const options = mobileAutomationTargetOptions(owner).filter((candidate) => candidate.targetId === targetId);
+    if (options.length !== 1 || options[0]!.workspaceKind !== "project"
+      || !options[0]!.projectAutomationEligible) {
+      throw new Error("Choose a current local project before loading Worktree options.");
+    }
+    let probe: Awaited<ReturnType<MobileNetwork["probeTargetWorktree"]>>;
+    try {
+      probe = await this.network.probeTargetWorktree(credential, targetId, this.#abort?.signal);
+    } catch (error) {
+      const code = (error as { readonly code?: number }).code;
+      if (code !== Code.Unimplemented && code !== Code.Unavailable) throw error;
+      probe = { targetId, eligibility: "unavailable", canRefreshRemote: false };
+    }
+    const sources = probe.eligibility === "eligible"
+      ? await this.network.listTargetWorktreeSources(credential, targetId, this.#abort?.signal)
+      : [];
+    if (this.#state.owner !== owner || this.#automationOwnerKey() !== authorityKey
+      || !this.#state.automations.open) {
+      throw new Error("The Automation owner changed while Worktree options were loading.");
+    }
+    return {
+      targetId,
+      eligibility: probe.eligibility,
+      canRefreshRemote: probe.canRefreshRemote,
+      sources: sources.map((source) => ({ ...source }))
+    };
+  }
+
+  async saveAutomation(
+    draft: MobileAutomationDraft,
+    scheduleId?: string
+  ): Promise<MobileAutomationSchedule | undefined> {
+    const kind = scheduleId === undefined ? "schedule-create" as const : "schedule-update" as const;
+    this.#assertNoPendingAutomationAuthoring(scheduleId, draft.targetId);
+    const action = this.#claimMutation();
+    try {
+      const owner = this.#state.owner;
+      const authorityKey = this.#automationOwnerKey();
+      if (!owner || !authorityKey || !this.#state.automations.open || this.#state.automations.status !== "ready") {
+        throw new Error("Reopen Automations from the current Joko node before saving.");
+      }
+      const existing = scheduleId === undefined ? undefined : await this.#revalidateAutomationSchedule(scheduleId);
+      if (this.#state.owner !== owner || this.#automationOwnerKey() !== authorityKey) {
+        throw new Error("The Automation owner changed before the Schedule could be saved.");
+      }
+      const worktree = draft.useWorktree ? await this.loadAutomationWorktree(draft.targetId) : undefined;
+      if (this.#state.owner !== owner || this.#automationOwnerKey() !== authorityKey) {
+        throw new Error("The Automation owner changed before the Schedule could be saved.");
+      }
+      const built = buildMobileAutomationScheduleInput(owner, draft, existing, worktree, this.now());
+      const preconditions = [
+        this.#automationTargetPrecondition(built.target),
+        ...(built.boundSession === undefined ? [] : [this.#automationSessionPrecondition(built.boundSession)]),
+        ...(existing === undefined ? [] : [this.#automationSchedulePrecondition(existing)])
+      ];
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions,
+        payload: scheduleId === undefined
+          ? { case: "createSchedule", value: create(CreateScheduleMutationSchema, { schedule: built.schedule }) }
+          : { case: "updateSchedule", value: create(UpdateScheduleMutationSchema, { scheduleId, schedule: built.schedule }) }
+      }), {
+        kind,
+        targetId: built.target.targetId,
+        ...(scheduleId === undefined ? {} : { scheduleId })
+      }, undefined, true, false);
+      let projected: MobileAutomationSchedule | undefined;
+      let validationError: unknown;
+      if (result.accepted && result.definitive) {
+        try {
+          projected = this.#automationOperationSchedule(
+            result.operation,
+            scheduleId,
+            built.target.targetId,
+            existing?.source ?? "dialogue"
+          );
+        } catch (error) { validationError = error; }
+      }
+      if (result.definitive) await this.refreshAutomations(projected?.scheduleId ?? scheduleId);
+      const rejection = automationMutationRejection(result, "save");
+      if (rejection !== undefined) throw rejection;
+      if (validationError !== undefined) throw validationError;
+      return projected;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async prepareAutomationDeletion(scheduleId: string): Promise<MobileAutomationDeletionPreview> {
+    return this.#prepareAutomationDeletion(scheduleId);
+  }
+
+  async deleteAutomation(
+    scheduleId: string,
+    disposition: MobileAutomationDisposition,
+    expectedPreview: MobileAutomationDeletionPreview
+  ): Promise<MobileAutomationDeletionOutcome | undefined> {
+    this.#assertNoPendingAutomationAuthoring(scheduleId);
+    const action = this.#claimMutation();
+    try {
+      const currentPreview = await this.#prepareAutomationDeletion(scheduleId);
+      if (!sameAutomationDeletionPreview(expectedPreview, currentPreview)) {
+        throw new Error("The Automation deletion preview changed. Review the current generated tasks before deleting.");
+      }
+      const schedule = await this.#revalidateAutomationSchedule(scheduleId);
+      if (schedule.source !== "dialogue") {
+        throw new Error("Use the project Automation removal action for a project-owned Schedule.");
+      }
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#automationSchedulePrecondition(schedule)],
+        payload: { case: "deleteSchedule", value: create(DeleteScheduleMutationSchema, {
+          scheduleId,
+          generatedSessionDisposition: mobileAutomationDispositionProto(disposition)
+        }) }
+      }), { kind: "schedule-delete", scheduleId }, undefined, true, false);
+      let outcome: MobileAutomationDeletionOutcome | undefined;
+      let validationError: unknown;
+      if (result.accepted && result.definitive) {
+        try {
+          const payload = result.operation?.result?.payload;
+          if (payload?.case !== "scheduleDeletion") {
+            throw new Error("The Joko node completed Automation deletion without its typed result.");
+          }
+          outcome = projectMobileAutomationDeletionResult(payload.value, scheduleId, disposition);
+        } catch (error) { validationError = error; }
+      }
+      if (result.definitive) await this.refreshAutomations();
+      const rejection = automationMutationRejection(result, "deletion");
+      if (rejection !== undefined) throw rejection;
+      if (validationError !== undefined) throw validationError;
+      return outcome;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async promoteAutomation(scheduleId: string): Promise<MobileAutomationSchedule | undefined> {
+    return this.#submitProjectAutomationScheduleMutation(scheduleId, "schedule-promote", "dialogue", (schedule) => ({
+      mutation: create(OperationMutationSchema, {
+        preconditions: [this.#automationSchedulePrecondition(schedule), this.#automationTargetForSchedulePrecondition(schedule)],
+        payload: { case: "promoteScheduleToProject", value: create(PromoteScheduleToProjectMutationSchema, { scheduleId }) }
+      }),
+      resultSource: "project"
+    }));
+  }
+
+  async cloneProjectAutomation(scheduleId: string, displayName: string): Promise<MobileAutomationSchedule | undefined> {
+    const name = boundedMobileAutomationName(displayName);
+    return this.#submitProjectAutomationScheduleMutation(scheduleId, "schedule-clone", "project", (schedule) => ({
+      mutation: create(OperationMutationSchema, {
+        preconditions: [this.#automationSchedulePrecondition(schedule), this.#automationTargetForSchedulePrecondition(schedule)],
+        payload: { case: "cloneProjectScheduleToUser", value: create(CloneProjectScheduleToUserMutationSchema, {
+          scheduleId, displayName: name
+        }) }
+      }),
+      resultSource: "dialogue"
+    }));
+  }
+
+  async removeProjectAutomation(
+    scheduleId: string,
+    keepPersonalCopy: boolean
+  ): Promise<MobileAutomationSchedule | boolean | undefined> {
+    this.#assertNoPendingAutomationAuthoring(scheduleId);
+    const action = this.#claimMutation();
+    try {
+      const schedule = await this.#revalidateAutomationSchedule(scheduleId);
+      if (schedule.source !== "project") throw new Error("Only a project-owned Automation can be removed from project configuration.");
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#automationSchedulePrecondition(schedule), this.#automationTargetForSchedulePrecondition(schedule)],
+        payload: { case: "removeProjectSchedule", value: create(RemoveProjectScheduleMutationSchema, {
+          scheduleId, keepPersonalCopy
+        }) }
+      }), { kind: "schedule-project-remove", scheduleId }, undefined, true, false);
+      let outcome: MobileAutomationSchedule | boolean | undefined;
+      let validationError: unknown;
+      if (result.accepted && result.definitive) {
+        try {
+          outcome = keepPersonalCopy
+            ? this.#automationOperationSchedule(result.operation, undefined, schedule.targetId, "dialogue")
+            : this.#automationOperationAcknowledgement(result.operation);
+        } catch (error) { validationError = error; }
+      }
+      if (result.definitive) await this.refreshAutomations(outcome && typeof outcome !== "boolean" ? outcome.scheduleId : undefined);
+      if (!result.definitive) {
+        throw new Error("The durable project Automation removal result is unknown. It was not resent.");
+      }
+      const rejection = automationMutationRejection(result, "project removal");
+      if (rejection !== undefined) throw rejection;
+      if (validationError !== undefined) throw validationError;
+      return outcome;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async reconcileProjectAutomations(targetId: string): Promise<boolean> {
+    this.#assertNoPendingAutomationAuthoring(undefined, targetId);
+    const action = this.#claimMutation();
+    try {
+      const owner = this.#state.owner;
+      const authorityKey = this.#automationOwnerKey();
+      const options = mobileAutomationTargetOptions(owner).filter((candidate) => candidate.targetId === targetId);
+      const target = owner?.targets.filter((candidate) => candidate.targetId === targetId);
+      if (!owner || !authorityKey || !this.#state.automations.open || this.#state.automations.status !== "ready"
+        || options.length !== 1 || options[0]!.workspaceKind !== "project"
+        || !options[0]!.projectAutomationEligible || target?.length !== 1) {
+        throw new Error("Choose a current local project before reconciling its Automations.");
+      }
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#automationTargetPrecondition(target[0]!)],
+        payload: { case: "reconcileProjectAutomations", value: create(ReconcileProjectAutomationsMutationSchema, { targetId }) }
+      }), { kind: "schedule-project-reconcile", targetId }, undefined, true, false);
+      let accepted = false;
+      let validationError: unknown;
+      if (result.accepted && result.definitive) {
+        try { accepted = this.#automationOperationAcknowledgement(result.operation); }
+        catch (error) { validationError = error; }
+      }
+      if (result.definitive) await this.refreshAutomations();
+      if (!result.definitive) {
+        throw new Error("The durable project Automation reconciliation result is unknown. It was not resent.");
+      }
+      const rejection = automationMutationRejection(result, "project reconciliation");
+      if (rejection !== undefined) throw rejection;
+      if (validationError !== undefined) throw validationError;
+      return accepted;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async #prepareAutomationDeletion(scheduleId: string): Promise<MobileAutomationDeletionPreview> {
+    const owner = this.#state.owner;
+    const authorityKey = this.#automationOwnerKey();
+    if (!owner || !authorityKey || !this.#state.automations.open || this.#state.automations.status !== "ready") {
+      throw new Error("Reopen this Automation from the current Joko catalog before deleting it.");
+    }
+    const schedule = await this.#revalidateAutomationSchedule(scheduleId);
+    if (schedule.source !== "dialogue") {
+      throw new Error("Use the project Automation removal action for a project-owned Schedule.");
+    }
+    if (this.#state.owner !== owner || this.#automationOwnerKey() !== authorityKey) {
+      throw new Error("The Automation owner changed while deletion was being prepared.");
+    }
+    const generatedSessionIds: string[] = [];
+    const seen = new Set<string>();
+    for (const session of owner.sessions) {
+      if (session.automationOrigin?.scheduleId !== scheduleId) continue;
+      if (!validMobileAutomationIdentity(session.sessionId) || seen.has(session.sessionId)) {
+        throw new Error("The Joko node returned an invalid generated-task deletion manifest.");
+      }
+      seen.add(session.sessionId);
+      generatedSessionIds.push(session.sessionId);
+    }
+    generatedSessionIds.sort(compareMobileAutomationIdentity);
+    const runtime = projectMobileSchedulerRuntime(
+      await this.network.readSchedulerRuntime(this.#ready(), this.#abort?.signal),
+      new Set(this.#state.automations.schedules.map((candidate) => candidate.scheduleId))
+    );
+    if (this.#state.owner !== owner || this.#automationOwnerKey() !== authorityKey
+      || !this.#state.automations.open) {
+      throw new Error("The Automation owner changed while deletion was being prepared.");
+    }
+    return {
+      scheduleId,
+      scheduleRevision: mobileAutomationScheduleRevisionKey(schedule),
+      generatedSessionIds,
+      inflightCount: runtime.inFlightBySchedule[scheduleId] ?? 0
+    };
+  }
+
+  async #submitProjectAutomationScheduleMutation(
+    scheduleId: string,
+    kind: Extract<PendingOperation["kind"], "schedule-promote" | "schedule-clone">,
+    requiredSource: MobileAutomationSchedule["source"],
+    build: (schedule: MobileAutomationSchedule) => {
+      readonly mutation: OperationMutation;
+      readonly resultSource: MobileAutomationSchedule["source"];
+    }
+  ): Promise<MobileAutomationSchedule | undefined> {
+    this.#assertNoPendingAutomationAuthoring(scheduleId);
+    const action = this.#claimMutation();
+    try {
+      const schedule = await this.#revalidateAutomationSchedule(scheduleId);
+      if (schedule.source !== requiredSource) {
+        throw new Error(requiredSource === "project"
+          ? "Only a project-owned Automation can use this action."
+          : "Only a personal Automation can be promoted to project configuration.");
+      }
+      if (kind === "schedule-promote" && schedule.sessionMode === "bound") {
+        throw new Error("A task-bound Automation cannot be promoted to project configuration.");
+      }
+      const request = build(schedule);
+      const result = await this.#submitTerminal(
+        request.mutation,
+        { kind, scheduleId },
+        undefined,
+        true,
+        false
+      );
+      let projected: MobileAutomationSchedule | undefined;
+      let validationError: unknown;
+      if (result.accepted && result.definitive) {
+        try {
+          projected = this.#automationOperationSchedule(
+            result.operation,
+            undefined,
+            schedule.targetId,
+            request.resultSource
+          );
+        } catch (error) { validationError = error; }
+      }
+      if (result.definitive) await this.refreshAutomations(projected?.scheduleId);
+      if (!result.definitive) {
+        throw new Error("The durable project Automation result is unknown. It was not resent.");
+      }
+      const rejection = automationMutationRejection(result, "project change");
+      if (rejection !== undefined) throw rejection;
+      if (validationError !== undefined) throw validationError;
+      return projected;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  #automationOperationSchedule(
+    operation: Operation | undefined,
+    expectedScheduleId: string | undefined,
+    expectedTargetId: string,
+    expectedSource: MobileAutomationSchedule["source"]
+  ): MobileAutomationSchedule {
+    const payload = operation?.result?.payload;
+    if (payload?.case !== "schedule") {
+      throw new Error("The Joko node completed the Automation operation without its typed Schedule result.");
+    }
+    const schedule = projectMobileAutomationSchedule(payload.value, expectedScheduleId);
+    if (schedule.targetId !== expectedTargetId || schedule.source !== expectedSource) {
+      throw new Error("The Joko node returned an Automation Schedule outside the requested owner and source.");
+    }
+    return schedule;
+  }
+
+  #automationOperationAcknowledgement(operation: Operation | undefined): true {
+    const payload = operation?.result?.payload;
+    if (payload?.case !== "acknowledgement" || payload.value.accepted !== true) {
+      throw new Error("The Joko node completed the Automation operation without an accepted acknowledgement.");
+    }
+    return true;
+  }
+
+  #automationTargetForSchedulePrecondition(schedule: MobileAutomationSchedule) {
+    const owner = this.#state.owner;
+    const targets = owner?.targets.filter((candidate) => candidate.targetId === schedule.targetId) ?? [];
+    const options = mobileAutomationTargetOptions(owner).filter((candidate) => candidate.targetId === schedule.targetId);
+    if (targets.length !== 1 || options.length !== 1 || options[0]!.workspaceKind !== "project"
+      || !options[0]!.projectAutomationEligible) {
+      throw new Error("The Automation project is no longer eligible for project configuration.");
+    }
+    return this.#automationTargetPrecondition(targets[0]!);
+  }
+
+  #automationTargetPrecondition(target: Target) {
+    const revision = target.version?.revision;
+    if (!revision || revision.value < 1n) throw new Error("A current Automation Target revision is required.");
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.TARGET, id: target.targetId }),
+      expectedRevision: create(RevisionSchema, revision)
+    });
+  }
+
+  #automationSessionPrecondition(session: Session) {
+    const revision = session.version?.revision;
+    if (!revision || revision.value < 1n) throw new Error("A current bound-task revision is required.");
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: session.sessionId }),
+      expectedRevision: create(RevisionSchema, revision)
+    });
+  }
+
+  #assertNoPendingAutomationAuthoring(scheduleId?: string, targetId?: string): void {
+    const kinds: readonly PendingOperation["kind"][] = [
+      "schedule-create", "schedule-update", "schedule-delete", "schedule-promote", "schedule-clone",
+      "schedule-project-remove", "schedule-project-reconcile"
+    ];
+    if (this.#state.pending.some((pending) => kinds.includes(pending.kind)
+      && (scheduleId !== undefined && pending.scheduleId === scheduleId
+        || targetId !== undefined && pending.targetId === targetId))) {
+      throw new Error("A related Automation change still has an unknown durable result. Check its receipt before retrying.");
+    }
   }
 
   async openAutomationRunTask(scheduleId: string, triggerId: string): Promise<void> {
@@ -8063,14 +8462,14 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false)).accepted;
   }
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
     operationId?: string,
     markBusy = true,
     refreshAfter = true
@@ -8080,7 +8479,7 @@ export class MobileClient {
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId">,
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
@@ -8202,7 +8601,9 @@ export class MobileClient {
         if (operation) {
           await this.#receipt(operation, pending, epoch);
           const scheduleMutation = ["schedule-run", "schedule-enable", "schedule-run-restart",
-            "schedule-run-read", "schedule-runs-read", "schedule-all-read", "schedule-run-delete"]
+            "schedule-run-read", "schedule-runs-read", "schedule-all-read", "schedule-run-delete",
+            "schedule-create", "schedule-update", "schedule-delete", "schedule-promote", "schedule-clone",
+            "schedule-project-remove", "schedule-project-reconcile"]
             .includes(pending.kind);
           if (scheduleMutation && isTerminal(operation.state) && this.#current(epoch)) {
             const rejection = operation.state === OperationState.SUCCEEDED
@@ -8781,6 +9182,41 @@ function mergeRecentNearby(
   }
   return [...byServer.values()].sort((left, right) =>
     left.displayName.localeCompare(right.displayName) || left.serverId.localeCompare(right.serverId));
+}
+
+function sameAutomationDeletionPreview(
+  left: MobileAutomationDeletionPreview,
+  right: MobileAutomationDeletionPreview
+): boolean {
+  return left.scheduleId === right.scheduleId
+    && left.scheduleRevision === right.scheduleRevision
+    && left.inflightCount === right.inflightCount
+    && left.generatedSessionIds.length === right.generatedSessionIds.length
+    && left.generatedSessionIds.every((value, index) => value === right.generatedSessionIds[index]);
+}
+
+function validMobileAutomationIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function compareMobileAutomationIdentity(left: string, right: string): number {
+  const a = left.toLocaleLowerCase("en-US");
+  const b = right.toLocaleLowerCase("en-US");
+  return a < b ? -1 : a > b ? 1 : left < right ? -1 : left > right ? 1 : 0;
+}
+
+function boundedMobileAutomationName(value: string): string {
+  const result = value.trim();
+  if (result.length === 0 || result.length > 512 || /[\u0000-\u001f\u007f]/u.test(result)) {
+    throw new Error("Enter an Automation copy name of at most 512 characters.");
+  }
+  return result;
+}
+
+function automationMutationRejection(result: TrackedMutationResult, label: string): Error | undefined {
+  if (!result.definitive || result.accepted) return undefined;
+  return new Error(result.operation?.error?.message || `The Automation ${label} was rejected.`);
 }
 
 class CredentialIdentityError extends Error {}

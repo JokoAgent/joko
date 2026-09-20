@@ -1,4 +1,5 @@
 import {
+  PermissionMode,
   ScheduleExecutionMode,
   ScheduleFireSource,
   ScheduleMisfirePolicy,
@@ -6,6 +7,7 @@ import {
   ScheduleRunCostAttribution,
   ScheduleRunOutcome,
   ScheduleRunPhase,
+  ScheduleScriptCapability,
   ScheduleSessionMode,
   ScheduleSource,
   ScheduleState,
@@ -74,9 +76,37 @@ export interface MobileAutomationSchedule {
   readonly sessionMode: "fresh" | "persistent" | "bound";
   readonly recurrence: "manual" | "once" | "cron" | "interval";
   readonly recurrenceLabel: string;
+  readonly recurrenceExpression: string;
+  readonly intervalAnchorAt?: number;
   readonly timeZone: string;
   readonly inputText: string;
+  readonly editableInputText?: string;
   readonly executionMode: "agent" | "script";
+  readonly script?: {
+    readonly command: string;
+    readonly timeoutMs?: number;
+    readonly dispatchSessions: boolean;
+  };
+  readonly model?: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly effortId?: string;
+    readonly fastMode: boolean;
+  };
+  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly planMode: boolean;
+  readonly useWorktree: boolean;
+  readonly worktreeSourceRef?: string;
+  readonly refreshWorktreeRemote: boolean;
+  readonly extraDirectoryIds: readonly string[];
+  readonly silentWhenIdle: boolean;
+  readonly notifyDesktop: boolean;
+  readonly expireAt?: number;
+  readonly preRunHook?: {
+    readonly command: string;
+    readonly filePath: string;
+    readonly timeoutMs?: number;
+  };
   readonly overlapPolicy: "queue" | "skip";
   readonly misfirePolicy: "runOnce" | "skip";
   readonly nextTriggerAt?: number;
@@ -166,7 +196,8 @@ export function projectMobileAutomationSchedule(
     throw new Error("The Joko node returned a bound Automation Schedule without a task.");
   }
   const recurrence = scheduleRecurrence(schedule);
-  const executionMode = scheduleExecutionMode(schedule.execution?.executionMode);
+  const execution = scheduleExecution(schedule);
+  const editableInputText = editableScheduleInputText(schedule);
   const overlapPolicy = scheduleOverlapPolicy(schedule.overlapPolicy);
   const misfirePolicy = scheduleMisfirePolicy(schedule.misfirePolicy);
   const projectConfigId = optionalIdentifier(schedule.projectConfigId, "project Automation configuration");
@@ -194,7 +225,8 @@ export function projectMobileAutomationSchedule(
     ...recurrence,
     timeZone: optionalLabel(schedule.timeZone, "Schedule time zone") ?? "UTC",
     inputText: mobileInputSummary(schedule.input),
-    executionMode,
+    ...(editableInputText === undefined ? {} : { editableInputText }),
+    ...execution,
     overlapPolicy,
     misfirePolicy,
     ...(schedule.nextTriggerAt === undefined ? {} : { nextTriggerAt: requiredTimestamp(schedule.nextTriggerAt, "next trigger") }),
@@ -384,21 +416,120 @@ function scheduleMisfirePolicy(value: ScheduleMisfirePolicy): MobileAutomationSc
   throw new Error("The Joko node returned an unknown Automation missed-run policy.");
 }
 
-function scheduleRecurrence(schedule: Schedule): Pick<MobileAutomationSchedule, "recurrence" | "recurrenceLabel"> {
+function scheduleRecurrence(
+  schedule: Schedule
+): Pick<MobileAutomationSchedule, "recurrence" | "recurrenceLabel" | "recurrenceExpression" | "intervalAnchorAt"> {
   const recurrence = schedule.recurrence?.kind;
-  if (recurrence?.case === "manual") return { recurrence: "manual", recurrenceLabel: "Manual" };
+  if (recurrence?.case === "manual") {
+    return { recurrence: "manual", recurrenceLabel: "Manual", recurrenceExpression: "" };
+  }
   if (recurrence?.case === "oneShot") {
-    return { recurrence: "once", recurrenceLabel: new Date(requiredTimestamp(recurrence.value.triggerAt, "one-shot trigger")).toISOString() };
+    const value = new Date(requiredTimestamp(recurrence.value.triggerAt, "one-shot trigger")).toISOString();
+    return { recurrence: "once", recurrenceLabel: value, recurrenceExpression: value };
   }
   if (recurrence?.case === "cron") {
-    return { recurrence: "cron", recurrenceLabel: `cron ${requiredLabel(recurrence.value.expression, "cron expression")}` };
+    const expression = requiredLabel(recurrence.value.expression, "cron expression");
+    return { recurrence: "cron", recurrenceLabel: `cron ${expression}`, recurrenceExpression: expression };
   }
   if (recurrence?.case === "interval") {
     const interval = recurrence.value.interval;
     if (interval === undefined) throw new Error("The Joko node returned an Automation interval without a duration.");
-    return { recurrence: "interval", recurrenceLabel: `Every ${requiredDuration(interval, "Schedule interval")} ms` };
+    const milliseconds = requiredDuration(interval, "Schedule interval");
+    if (!Number.isSafeInteger(milliseconds) || milliseconds < 1_000 || milliseconds % 1_000 !== 0) {
+      throw new Error("The Joko node returned an unsupported Automation interval.");
+    }
+    return {
+      recurrence: "interval",
+      recurrenceLabel: `Every ${milliseconds} ms`,
+      recurrenceExpression: String(milliseconds / 1_000),
+      intervalAnchorAt: requiredTimestamp(recurrence.value.anchorAt, "Schedule interval anchor")
+    };
   }
   throw new Error("The Joko node returned an unknown Automation recurrence.");
+}
+
+function scheduleExecution(
+  schedule: Schedule
+): Pick<MobileAutomationSchedule,
+  "executionMode" | "script" | "model" | "permissionMode" | "planMode" | "useWorktree"
+  | "worktreeSourceRef" | "refreshWorktreeRemote" | "extraDirectoryIds" | "silentWhenIdle"
+  | "notifyDesktop" | "expireAt" | "preRunHook"> {
+  const execution = schedule.execution;
+  if (execution === undefined) throw new Error("The Joko node returned an Automation without an execution snapshot.");
+  const executionMode = scheduleExecutionMode(execution.executionMode);
+  const modelKey = execution.model?.model;
+  const model = modelKey === undefined ? undefined : {
+    providerId: requiredIdentifier(modelKey.providerId, "Automation model Provider"),
+    modelId: requiredIdentifier(modelKey.modelId, "Automation model"),
+    ...(execution.model!.effortId.length === 0
+      ? {}
+      : { effortId: requiredIdentifier(execution.model!.effortId, "Automation model effort") }),
+    fastMode: execution.model!.fastMode
+  };
+  let script: MobileAutomationSchedule["script"];
+  if (executionMode === "script") {
+    if (execution.script === undefined) throw new Error("The Joko node returned a script Automation without a command.");
+    const capabilities = execution.script.capabilities;
+    if (capabilities.some((value) => value !== ScheduleScriptCapability.SESSIONS_DISPATCH)
+      || new Set(capabilities).size !== capabilities.length) {
+      throw new Error("The Joko node returned an unknown Automation script capability.");
+    }
+    script = {
+      command: requiredLabel(execution.script.command, "Automation script command", 32_768),
+      ...(execution.script.timeout === undefined
+        ? {}
+        : { timeoutMs: requiredDuration(execution.script.timeout, "Automation script timeout") }),
+      dispatchSessions: capabilities.includes(ScheduleScriptCapability.SESSIONS_DISPATCH)
+    };
+  } else if (execution.script !== undefined) {
+    throw new Error("The Joko node returned script settings on an agent Automation.");
+  }
+  const worktreeSourceRef = execution.worktreeSourceRef === undefined
+    ? undefined
+    : requiredLabel(execution.worktreeSourceRef, "Automation Worktree source", 1_024);
+  if (!execution.useWorktree && (worktreeSourceRef !== undefined || execution.refreshWorktreeRemote)) {
+    throw new Error("The Joko node returned detached Automation Worktree options.");
+  }
+  const extraDirectoryIds = execution.extraDirectoryIds.map((value) => requiredIdentifier(value, "Automation extra directory"));
+  assertUnique(extraDirectoryIds, "Automation extra directory");
+  const expireAt = optionalTimestamp(execution.expireAt, "Automation expiration");
+  const hook = execution.preRunHook;
+  const preRunHook = hook === undefined ? undefined : {
+    command: requiredLabel(hook.command, "Automation pre-run command", 32_768),
+    filePath: requiredLabel(hook.filePath, "Automation pre-run file", 4_096),
+    ...(hook.timeout === undefined ? {} : { timeoutMs: requiredDuration(hook.timeout, "Automation pre-run timeout") })
+  };
+  return {
+    executionMode,
+    ...(script === undefined ? {} : { script }),
+    ...(model === undefined ? {} : { model }),
+    permissionMode: schedulePermissionMode(execution.permissionMode),
+    planMode: execution.planMode,
+    useWorktree: execution.useWorktree,
+    ...(worktreeSourceRef === undefined ? {} : { worktreeSourceRef }),
+    refreshWorktreeRemote: execution.refreshWorktreeRemote,
+    extraDirectoryIds,
+    silentWhenIdle: execution.silentWhenIdle,
+    notifyDesktop: execution.notify?.desktop ?? true,
+    ...(expireAt === undefined ? {} : { expireAt }),
+    ...(preRunHook === undefined ? {} : { preRunHook })
+  };
+}
+
+function editableScheduleInputText(schedule: Schedule): string | undefined {
+  const input = schedule.input;
+  if (input === undefined || input.quotesEncoded || input.mentionRanges.length > 0 || input.pastedTextRanges.length > 0) {
+    return input === undefined || input.parts.length === 0 ? "" : undefined;
+  }
+  if (input.parts.some((part) => part.content.case !== "text")) return undefined;
+  return input.parts.map((part) => part.content.case === "text" ? part.content.value : "").join("");
+}
+
+function schedulePermissionMode(value: PermissionMode): MobileAutomationSchedule["permissionMode"] {
+  if (value === PermissionMode.ASK) return "ask";
+  if (value === PermissionMode.AUTO) return "auto";
+  if (value === PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
+  throw new Error("The Joko node returned an unknown Automation permission mode.");
 }
 
 function scheduleRunOutcome(value: ScheduleRunOutcome): MobileAutomationRunState {
@@ -491,8 +622,8 @@ function optionalIdentifier(value: string, label: string): string | undefined {
   return value.length === 0 ? undefined : requiredIdentifier(value, label);
 }
 
-function requiredLabel(value: string, label: string): string {
-  if (value.trim().length === 0 || value.length > 4_096 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+function requiredLabel(value: string, label: string, maximum = 4_096): string {
+  if (value.trim().length === 0 || value.length > maximum || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
     throw new Error(`The Joko node returned an invalid ${label}.`);
   }
   return value;

@@ -1,7 +1,8 @@
 import { create, toBinary } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
 import {
-  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
+  AcknowledgementSchema, ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
@@ -15,7 +16,8 @@ import {
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
-  ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
+  ScheduleGeneratedSessionDisposition,
+  ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
   TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
@@ -32,7 +34,7 @@ import {
   type NodeIdentity,
   type PairedCredential
 } from "./network";
-import type { Event, Operation, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -68,6 +70,7 @@ import {
   plainTextMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
+import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -149,7 +152,7 @@ const automationSchedule = create(ScheduleSchema, {
   recurrence: { kind: { case: "manual", value: {} } },
   timeZone: "UTC",
   input: { parts: [{ content: { case: "text", value: "Check the build" } }] },
-  execution: { executionMode: ScheduleExecutionMode.AGENT },
+  execution: { executionMode: ScheduleExecutionMode.AGENT, permissionMode: PermissionMode.ASK },
   overlapPolicy: ScheduleOverlapPolicy.QUEUE,
   misfirePolicy: ScheduleMisfirePolicy.RUN_ONCE,
   recentRuns: [automationCompletedRun],
@@ -162,6 +165,46 @@ const automationOwnerSnapshot = create(SnapshotSchema, {
   ...snapshot,
   revision: create(RevisionSchema, { value: 12n, etag: "owner-r12" }),
   schedules: [automationSchedule]
+});
+const automationGeneratedSession = create(SessionSchema, {
+  sessionId: "generated-session",
+  backendId: "backend",
+  targetId: "target",
+  displayName: "Generated task",
+  state: SessionState.IDLE,
+  automationOrigin: { scheduleId: automationSchedule.scheduleId, scheduleName: "Morning check", runId: "run-generated" },
+  version: { revision: { value: 2n }, generation: 1n }
+});
+const automationAuthoringOwnerSnapshot = create(SnapshotSchema, {
+  ...automationOwnerSnapshot,
+  scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    entityVersion: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 2n }), generation: 1n })
+  })],
+  targets: [create(TargetSchema, {
+    ...snapshot.targets[0]!,
+    workspaceId: "workspace",
+    version: create(EntityVersionSchema, {
+      revision: create(RevisionSchema, { value: 3n, etag: "target-r3" }), generation: 1n
+    })
+  })],
+  workspaces: [create(WorkspaceDescriptorSchema, {
+    ...snapshot.workspaces[0]!,
+    serverPathDisplay: "D:\\project",
+    trusted: true,
+    version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 3n }), generation: 1n })
+  })],
+  sessions: [snapshot.sessions[0]!, automationGeneratedSession],
+  settings: create(SettingsSnapshotSchema, {
+    revision: { value: 4n },
+    backends: [create(BackendSettingsSchema, {
+      backendId: "backend",
+      enabled: true,
+      defaultPermissionMode: PermissionMode.ASK,
+      modelAccess: create(BackendModelAccessSettingsSchema)
+    })]
+  })
 });
 const automationRuntime = create(SchedulerRuntimeSnapshotSchema, {
   schedulerInstanceId: "scheduler-one",
@@ -920,6 +963,10 @@ function fakeNetwork(): MobileNetwork {
     readSchedule: vi.fn(async () => { throw new Error("No Automation Schedule fixture was configured."); }),
     listScheduleHistory: vi.fn(async () => ({ history: [], nextPageToken: "", totalSize: 0 })),
     readSchedulerRuntime: vi.fn(async () => { throw new Error("No Scheduler runtime fixture was configured."); }),
+    probeTargetWorktree: vi.fn(async (_credential, targetId) => ({
+      targetId, eligibility: "eligible" as const, canRefreshRemote: true
+    })),
+    listTargetWorktreeSources: vi.fn(async () => []),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
@@ -961,6 +1008,172 @@ function automationNetwork(): MobileNetwork {
     : { history: [automationCompletedRun], nextPageToken: "", totalSize: 2 });
   network.readSchedulerRuntime = vi.fn(async () => automationRuntime);
   return network;
+}
+
+function authoringAutomationNetwork(initial: readonly Schedule[] = [automationSchedule]): {
+  readonly network: MobileNetwork;
+  readonly catalog: () => readonly Schedule[];
+} {
+  const network = fakeNetwork();
+  let catalog = [...initial];
+  let revision = 20n;
+  network.readOwner = vi.fn(async () => ({ connection, device, snapshot: automationAuthoringOwnerSnapshot }));
+  network.readSession = vi.fn(async () => automationAuthoringOwnerSnapshot);
+  network.listSchedules = vi.fn(async () => [...catalog]);
+  network.readSchedule = vi.fn(async (_credential, scheduleId) => {
+    const matches = catalog.filter((candidate) => candidate.scheduleId === scheduleId);
+    if (matches.length !== 1) throw new Error("No Automation Schedule fixture was configured.");
+    return matches[0]!;
+  });
+  network.listScheduleHistory = vi.fn(async () => ({ history: [], nextPageToken: "", totalSize: 0 }));
+  network.readSchedulerRuntime = vi.fn(async () => catalog.some((schedule) => schedule.scheduleId === automationSchedule.scheduleId)
+    ? automationRuntime
+    : create(SchedulerRuntimeSnapshotSchema, {
+      schedulerInstanceId: "scheduler-one", maxConcurrentRuns: 4
+    }));
+  network.probeTargetWorktree = vi.fn(async (_credential, targetId) => ({
+    targetId, eligibility: "eligible" as const, canRefreshRemote: true
+  }));
+  network.listTargetWorktreeSources = vi.fn(async () => [{
+    ref: "refs/heads/main", commit: "abc123", displayName: "main", remote: false, current: true
+  }]);
+  network.submit = vi.fn(async (_credential, operationId, mutation) => {
+    toBinary(OperationMutationSchema, mutation);
+    const payload = mutation.payload;
+    if (payload.case === "createSchedule") {
+      const input = payload.value.schedule!;
+      const created = scheduleFromAuthoringInput("schedule-created", input, ScheduleSource.USER, ++revision);
+      catalog = [...catalog, created];
+      return successfulOperation(operationId, { case: "schedule", value: created });
+    }
+    if (payload.case === "updateSchedule") {
+      const current = catalog.find((candidate) => candidate.scheduleId === payload.value.scheduleId)!;
+      const updated = scheduleFromAuthoringInput(
+        current.scheduleId,
+        payload.value.schedule!,
+        current.source,
+        ++revision,
+        current.source === ScheduleSource.PROJECT
+          ? { projectConfigId: current.projectConfigId, projectConfigPath: current.projectConfigPath }
+          : undefined
+      );
+      catalog = catalog.map((candidate) => candidate.scheduleId === current.scheduleId ? updated : candidate);
+      return successfulOperation(operationId, { case: "schedule", value: updated });
+    }
+    if (payload.case === "deleteSchedule") {
+      catalog = catalog.filter((candidate) => candidate.scheduleId !== payload.value.scheduleId);
+      return successfulOperation(operationId, { case: "scheduleDeletion", value: create(ScheduleDeletionResultSchema, {
+        scheduleId: payload.value.scheduleId,
+        generatedSessionDisposition: payload.value.generatedSessionDisposition,
+        generatedSessionIds: [automationGeneratedSession.sessionId],
+        completedSessionIds: [automationGeneratedSession.sessionId],
+        failures: [],
+        inflightCount: 1
+      }) });
+    }
+    if (payload.case === "promoteScheduleToProject") {
+      const current = catalog.find((candidate) => candidate.scheduleId === payload.value.scheduleId)!;
+      const promoted = create(ScheduleSchema, {
+        ...current,
+        scheduleId: "schedule-project",
+        source: ScheduleSource.PROJECT,
+        projectConfigId: "project-config",
+        projectConfigPath: ".joko/automations/project-config.json",
+        version: create(EntityVersionSchema, {
+          revision: create(RevisionSchema, { value: ++revision, etag: `schedule-r${revision}` }), generation: 2n
+        })
+      });
+      catalog = [...catalog.filter((candidate) => candidate.scheduleId !== current.scheduleId), promoted];
+      return successfulOperation(operationId, { case: "schedule", value: promoted });
+    }
+    if (payload.case === "cloneProjectScheduleToUser") {
+      const current = catalog.find((candidate) => candidate.scheduleId === payload.value.scheduleId)!;
+      const clone = create(ScheduleSchema, {
+        ...current,
+        scheduleId: "schedule-clone",
+        displayName: payload.value.displayName,
+        source: ScheduleSource.USER,
+        projectConfigId: "",
+        projectConfigPath: "",
+        version: create(EntityVersionSchema, {
+          revision: create(RevisionSchema, { value: ++revision, etag: `schedule-r${revision}` }), generation: 2n
+        })
+      });
+      catalog = [...catalog, clone];
+      return successfulOperation(operationId, { case: "schedule", value: clone });
+    }
+    if (payload.case === "removeProjectSchedule") {
+      const current = catalog.find((candidate) => candidate.scheduleId === payload.value.scheduleId)!;
+      catalog = catalog.filter((candidate) => candidate.scheduleId !== current.scheduleId);
+      if (!payload.value.keepPersonalCopy) {
+        return successfulOperation(operationId, {
+          case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true })
+        });
+      }
+      const copy = create(ScheduleSchema, {
+        ...current,
+        scheduleId: "schedule-personal-copy",
+        source: ScheduleSource.USER,
+        projectConfigId: "",
+        projectConfigPath: "",
+        version: create(EntityVersionSchema, {
+          revision: create(RevisionSchema, { value: ++revision, etag: `schedule-r${revision}` }), generation: 2n
+        })
+      });
+      catalog = [...catalog, copy];
+      return successfulOperation(operationId, { case: "schedule", value: copy });
+    }
+    if (payload.case === "reconcileProjectAutomations") {
+      return successfulOperation(operationId, {
+        case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true })
+      });
+    }
+    return successfulOperation(operationId, {
+      case: "acknowledgement", value: create(AcknowledgementSchema, { accepted: true })
+    });
+  });
+  return { network, catalog: () => catalog };
+}
+
+function scheduleFromAuthoringInput(
+  scheduleId: string,
+  input: ScheduleInput,
+  source: ScheduleSource,
+  revision: bigint,
+  project?: { readonly projectConfigId: string; readonly projectConfigPath: string }
+): Schedule {
+  return create(ScheduleSchema, {
+    scheduleId,
+    displayName: input.displayName,
+    state: input.enabled ? ScheduleState.ENABLED : ScheduleState.DISABLED,
+    backendId: input.backendId,
+    targetId: input.targetId,
+    sessionId: input.sessionId,
+    sessionMode: input.sessionMode,
+    recurrence: input.recurrence,
+    timeZone: input.timeZone,
+    input: input.input,
+    execution: input.execution,
+    overlapPolicy: input.overlapPolicy,
+    misfirePolicy: input.misfirePolicy,
+    source,
+    ...(project === undefined ? {} : project),
+    version: create(EntityVersionSchema, {
+      revision: create(RevisionSchema, { value: revision, etag: `schedule-r${revision}` }), generation: 2n
+    })
+  });
+}
+
+function successfulOperation(
+  operationId: string,
+  payload: NonNullable<Operation["result"]>["payload"]
+): Operation {
+  return create(OperationSchema, {
+    operationId,
+    connectionId: credential.connectionId,
+    state: OperationState.SUCCEEDED,
+    result: { payload }
+  });
 }
 
 function event(id: string, sequence: bigint, sessionId = "session"): Event {
@@ -1557,6 +1770,190 @@ describe("native mobile Automation ownership and recovery", () => {
     expect(app.state.selectedId).toBe("session");
     await expect(app.openAutomationRunTask(automationSchedule.scheduleId, "trigger-interrupted"))
       .rejects.toThrow(/no task/);
+  });
+
+  it("creates and updates a complete Automation behind Target and Schedule revision fences", async () => {
+    const fixture = authoringAutomationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(fixture.network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    const submit = vi.mocked(fixture.network.submit).getMockImplementation()!;
+    const receipts: PendingOperation[] = [];
+    vi.mocked(fixture.network.submit).mockImplementation(async (...args) => {
+      receipts.push(saved.pending()[0]!);
+      return submit(...args);
+    });
+    const draft = {
+      ...createMobileAutomationDraft(app.state.owner),
+      name: "Created on mobile",
+      inputText: "Check the release",
+      notifyDesktop: false
+    };
+
+    const created = await app.saveAutomation(draft);
+
+    expect(created).toMatchObject({
+      scheduleId: "schedule-created",
+      displayName: "Created on mobile",
+      inputText: "Check the release",
+      notifyDesktop: false
+    });
+    expect(receipts[0]).toEqual(expect.objectContaining({
+      kind: "schedule-create", targetId: "target", state: "unknown"
+    }));
+    expect(JSON.stringify(receipts[0])).not.toContain("Check the release");
+    const createMutation = vi.mocked(fixture.network.submit).mock.calls[0]?.[2];
+    expect(createMutation?.preconditions).toMatchObject([
+      { entity: { kind: EntityKind.TARGET, id: "target" }, expectedRevision: { value: 3n } }
+    ]);
+    expect(createMutation?.payload).toMatchObject({ case: "createSchedule", value: {
+      schedule: { displayName: "Created on mobile", targetId: "target" }
+    } });
+
+    const editedDraft = {
+      ...createMobileAutomationDraft(app.state.owner, created),
+      name: "Edited on mobile",
+      inputText: "Check the release and notes"
+    };
+    const updated = await app.saveAutomation(editedDraft, created!.scheduleId);
+
+    expect(updated).toMatchObject({ scheduleId: "schedule-created", displayName: "Edited on mobile" });
+    expect(receipts[1]).toEqual(expect.objectContaining({
+      kind: "schedule-update", scheduleId: "schedule-created", targetId: "target"
+    }));
+    const updateMutation = vi.mocked(fixture.network.submit).mock.calls[1]?.[2];
+    expect(updateMutation?.preconditions.map((value) => value.entity?.kind)).toEqual([
+      EntityKind.TARGET, EntityKind.SCHEDULE
+    ]);
+  });
+
+  it("keeps an ineligible Worktree probe authoritative without requesting an invalid source catalog", async () => {
+    const fixture = authoringAutomationNetwork();
+    const app = client(fixture.network, memoryStorage(credential).storage);
+    vi.mocked(fixture.network.probeTargetWorktree).mockResolvedValueOnce({
+      targetId: "target", eligibility: "notGitRepository", canRefreshRemote: false
+    });
+    await app.start();
+    await app.openAutomations();
+
+    await expect(app.loadAutomationWorktree("target")).resolves.toEqual({
+      targetId: "target", eligibility: "notGitRepository", canRefreshRemote: false, sources: []
+    });
+    expect(fixture.network.listTargetWorktreeSources).not.toHaveBeenCalled();
+  });
+
+  it("projects unavailable Worktree service authority so disabled schedules can be retained safely", async () => {
+    const fixture = authoringAutomationNetwork();
+    const app = client(fixture.network, memoryStorage(credential).storage);
+    vi.mocked(fixture.network.probeTargetWorktree).mockRejectedValueOnce(Object.assign(
+      new Error("Worktree support is unavailable."),
+      { code: Code.Unimplemented }
+    ));
+    await app.start();
+    await app.openAutomations();
+
+    await expect(app.loadAutomationWorktree("target")).resolves.toEqual({
+      targetId: "target", eligibility: "unavailable", canRefreshRemote: false, sources: []
+    });
+    expect(fixture.network.listTargetWorktreeSources).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a definitive Automation authoring rejection instead of reporting an unknown result", async () => {
+    const fixture = authoringAutomationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(fixture.network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    vi.mocked(fixture.network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "operation-1",
+      connectionId: credential.connectionId,
+      state: OperationState.FAILED,
+      error: { message: "Schedule policy rejected the change" }
+    }));
+    const draft = {
+      ...createMobileAutomationDraft(app.state.owner),
+      name: "Rejected schedule",
+      inputText: "Run"
+    };
+
+    await expect(app.saveAutomation(draft)).rejects.toThrow("Schedule policy rejected the change");
+    expect(saved.pending()).toEqual([]);
+  });
+
+  it("previews authoritative generated tasks and validates the typed deletion result", async () => {
+    const fixture = authoringAutomationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(fixture.network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+
+    const preview = await app.prepareAutomationDeletion(automationSchedule.scheduleId);
+    expect(preview).toMatchObject({
+      scheduleId: automationSchedule.scheduleId,
+      generatedSessionIds: [automationGeneratedSession.sessionId],
+      inflightCount: 1
+    });
+    await expect(app.deleteAutomation(automationSchedule.scheduleId, "archive", {
+      ...preview, inflightCount: 0
+    })).rejects.toThrow(/preview changed/);
+    const outcome = await app.deleteAutomation(automationSchedule.scheduleId, "archive", preview);
+
+    expect(outcome).toMatchObject({
+      scheduleId: automationSchedule.scheduleId,
+      disposition: "archive",
+      completedSessionIds: [automationGeneratedSession.sessionId]
+    });
+    const mutation = vi.mocked(fixture.network.submit).mock.calls.at(-1)?.[2];
+    expect(mutation?.payload).toMatchObject({ case: "deleteSchedule", value: {
+      scheduleId: automationSchedule.scheduleId,
+      generatedSessionDisposition: ScheduleGeneratedSessionDisposition.ARCHIVE
+    } });
+    expect(fixture.catalog()).toEqual([]);
+  });
+
+  it("uses dedicated typed operations for project promotion, clone, removal and reconcile", async () => {
+    const fixture = authoringAutomationNetwork();
+    const app = client(fixture.network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openAutomations();
+
+    const promoted = await app.promoteAutomation(automationSchedule.scheduleId);
+    expect(promoted).toMatchObject({ scheduleId: "schedule-project", source: "project" });
+    const clone = await app.cloneProjectAutomation(promoted!.scheduleId, "Mobile copy");
+    expect(clone).toMatchObject({ scheduleId: "schedule-clone", source: "dialogue", displayName: "Mobile copy" });
+    await expect(app.removeProjectAutomation(promoted!.scheduleId, false)).resolves.toBe(true);
+    await expect(app.reconcileProjectAutomations("target")).resolves.toBe(true);
+
+    expect(vi.mocked(fixture.network.submit).mock.calls.map((call) => call[2].payload.case)).toEqual([
+      "promoteScheduleToProject",
+      "cloneProjectScheduleToUser",
+      "removeProjectSchedule",
+      "reconcileProjectAutomations"
+    ]);
+  });
+
+  it("retains only a body-free create receipt when dispatch is unknown and blocks related replay", async () => {
+    const fixture = authoringAutomationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(fixture.network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    vi.mocked(fixture.network.submit).mockRejectedValueOnce(new Error("transport closed"));
+    const draft = {
+      ...createMobileAutomationDraft(app.state.owner),
+      name: "Secret title",
+      inputText: "private scheduled body"
+    };
+
+    await expect(app.saveAutomation(draft)).resolves.toBeUndefined();
+
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      kind: "schedule-create", targetId: "target", state: "unknown"
+    })]);
+    expect(JSON.stringify(saved.pending())).not.toContain("private scheduled body");
+    await expect(app.saveAutomation(draft)).rejects.toThrow(/unknown durable result/);
+    expect(fixture.network.submit).toHaveBeenCalledTimes(1);
   });
 });
 

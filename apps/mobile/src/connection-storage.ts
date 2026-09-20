@@ -23,7 +23,9 @@ export interface PendingOperation {
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
     | "session-shell" | "session-reset" | "session-review"
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
-    | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete";
+    | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
+    | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
+    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly queueItemId?: string;
@@ -35,6 +37,7 @@ export interface PendingOperation {
   readonly targetDeviceId?: string;
   readonly scheduleId?: string;
   readonly triggerId?: string;
+  readonly targetId?: string;
   readonly state: "unknown" | "accepted";
 }
 
@@ -391,7 +394,8 @@ function isPending(value: unknown): value is PendingOperation {
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
       "session-branch", "session-shell", "session-reset", "session-review", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
-      "schedule-run-delete"].includes(String(record.kind))
+      "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
+      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
@@ -404,6 +408,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.targetDeviceId !== undefined && typeof record.targetDeviceId !== "string") return false;
   if (record.scheduleId !== undefined && !validReceiptIdentity(record.scheduleId)) return false;
   if (record.triggerId !== undefined && !validReceiptIdentity(record.triggerId)) return false;
+  if (record.targetId !== undefined && !validReceiptIdentity(record.targetId)) return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
   if (record.kind === "revoke" && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "send" && typeof record.sessionId !== "string") return false;
@@ -423,10 +428,20 @@ function isPending(value: unknown): value is PendingOperation {
   if (["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
     && (!validReceiptIdentity(record.scheduleId) || !validReceiptIdentity(record.triggerId))) return false;
   if (record.kind === "schedule-all-read" && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
+  if (record.kind === "schedule-create" && (!validReceiptIdentity(record.targetId) || record.scheduleId !== undefined)) return false;
+  if (record.kind === "schedule-update" && (!validReceiptIdentity(record.targetId) || !validReceiptIdentity(record.scheduleId))) return false;
+  if (["schedule-delete", "schedule-promote", "schedule-clone", "schedule-project-remove"].includes(String(record.kind))
+    && !validReceiptIdentity(record.scheduleId)) return false;
+  if (record.kind === "schedule-project-reconcile"
+    && (!validReceiptIdentity(record.targetId) || record.scheduleId !== undefined)) return false;
   if (!["schedule-run", "schedule-enable", "schedule-run-restart", "schedule-run-read", "schedule-runs-read",
-    "schedule-run-delete"].includes(String(record.kind)) && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
+    "schedule-run-delete", "schedule-update", "schedule-delete", "schedule-promote", "schedule-clone",
+    "schedule-project-remove"].includes(String(record.kind))
+    && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
   if (!["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
     && record.triggerId !== undefined) return false;
+  if (!["schedule-create", "schedule-update", "schedule-project-reconcile"].includes(String(record.kind))
+    && record.targetId !== undefined) return false;
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined
       || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;

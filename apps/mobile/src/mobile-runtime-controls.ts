@@ -82,6 +82,17 @@ export interface MobileTrustedModelAuthority {
   readonly authorityKey: string;
 }
 
+export interface MobileNewTaskExecutionAuthority {
+  readonly backend: BackendDescriptor;
+  readonly models: readonly MobileModelRoute[];
+  readonly canSelectModel: boolean;
+  readonly canSetEffort: boolean;
+  readonly canSetFastMode: boolean;
+  readonly permissionModes: readonly PermissionMode[];
+  readonly canSetPlanMode: boolean;
+  readonly supportsExtraDirectories: boolean;
+}
+
 const permissionModeOrder = [
   PermissionMode.ASK,
   PermissionMode.AUTO,
@@ -290,6 +301,51 @@ export function resolveMobileExplicitNewTaskModelAuthority(
 ): MobileTrustedModelAuthority | undefined {
   if (!owner || !strictText(backendId) || !selection) return undefined;
   return resolveTrustedMobileModel(owner, backendId, selection, true);
+}
+
+export function resolveMobileNewTaskExecutionAuthority(
+  owner: Snapshot | undefined,
+  backendId: string | undefined
+): MobileNewTaskExecutionAuthority | undefined {
+  if (!owner || owner.scope?.kind.case !== "owner" || !strictText(backendId) || owner.settings === undefined) {
+    return undefined;
+  }
+  const backends = owner.backends.filter((candidate) => candidate.backendId === backendId);
+  const settings = owner.settings.backends.filter((candidate) => candidate.backendId === backendId);
+  if (backends.length !== 1 || settings.length > 1 || settings[0]?.enabled === false) return undefined;
+  const backend = backends[0]!;
+  if (supportedCapability(backend, capabilityNames.inputText) === undefined) return undefined;
+  const canListModels = typedModelCapability(backend, capabilityNames.modelList)?.providerAware === true;
+  const canSelectModel = canListModels
+    && typedModelCapability(backend, capabilityNames.modelSwitch)?.switchDuringSession === true;
+  const canSetEffort = typedModelCapability(backend, capabilityNames.modelEffort)?.supportsEffort === true;
+  const canSetFastMode = typedModelCapability(backend, capabilityNames.modelFastMode)?.supportsFastMode === true;
+  const providers = groupBy(owner.providers.filter((provider) => provider.backendId === backendId), providerKey);
+  const models: MobileModelRoute[] = [];
+  if (canListModels) {
+    for (const [key, matches] of groupBy(owner.models.filter((model) => model.backendId === backendId), modelKey)) {
+      if (matches.length !== 1) continue;
+      const model = matches[0]!;
+      const providerId = model.key?.providerId;
+      const providerMatches = strictText(providerId) ? providers.get(providerId) ?? [] : [];
+      if (providerMatches.length > 1) continue;
+      const route = mobileModelRoute(model, providerMatches[0]);
+      if (route !== undefined && key === route.key
+        && modelRouteEnabled(owner, settings[0], providerMatches[0], route)) models.push(route);
+    }
+  }
+  models.sort(compareModelRoutes);
+  const permissionModes = advertisedPermissionModes(backend);
+  return {
+    backend,
+    models,
+    canSelectModel,
+    canSetEffort,
+    canSetFastMode,
+    permissionModes: permissionModes.length === 0 ? [PermissionMode.ASK] : permissionModes,
+    canSetPlanMode: supportedCapability(backend, capabilityNames.planMode) !== undefined,
+    supportsExtraDirectories: supportedCapability(backend, capabilityNames.workspaceExtraDirs) !== undefined
+  };
 }
 
 export function filterMobileModelRoutes(

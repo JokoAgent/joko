@@ -1,6 +1,8 @@
 import { create } from "@bufbuild/protobuf";
 import { TimestampSchema, type Timestamp } from "@bufbuild/protobuf/wkt";
 import {
+  PermissionMode,
+  InputContentSchema,
   RunState,
   ScheduleExecutionMode,
   ScheduleFireSource,
@@ -10,6 +12,9 @@ import {
   ScheduleRunHistorySchema,
   ScheduleRunOutcome,
   ScheduleRunPhase,
+  ScheduleExecutionSnapshotSchema,
+  ScheduleRecurrenceSchema,
+  ScheduleScriptCapability,
   ScheduleSchema,
   ScheduleSessionMode,
   ScheduleSource,
@@ -67,7 +72,7 @@ function schedule(
     targetId: "target",
     recurrence: { kind: { case: "manual", value: {} } },
     timeZone: "UTC",
-    execution: { executionMode: ScheduleExecutionMode.AGENT },
+    execution: { executionMode: ScheduleExecutionMode.AGENT, permissionMode: PermissionMode.ASK },
     overlapPolicy: ScheduleOverlapPolicy.QUEUE,
     misfirePolicy: ScheduleMisfirePolicy.RUN_ONCE,
     sessionMode: ScheduleSessionMode.FRESH,
@@ -114,6 +119,80 @@ describe("mobile Automation projection", () => {
     expect(() => projectMobileAutomationSchedule(schedule("project", { source: ScheduleSource.PROJECT }))).toThrow(/configuration identity/);
     expect(() => projectMobileAutomationSchedule(schedule("bound", { sessionMode: ScheduleSessionMode.BOUND }))).toThrow(/without a task/);
     expect(() => projectMobileAutomationSchedule(schedule("recurrence", { recurrence: undefined }))).toThrow(/unknown Automation recurrence/);
+  });
+
+  it("preserves every editable v1 execution field and rejects lossy snapshots", () => {
+    const projected = projectMobileAutomationSchedule(schedule("complete", {
+      recurrence: create(ScheduleRecurrenceSchema, { kind: { case: "interval", value: {
+        interval: { seconds: 90n, nanos: 0 },
+        anchorAt: timestamp(10_000)
+      } } }),
+      input: create(InputContentSchema, {
+        parts: [{ content: { case: "text", value: "Inspect the project" } }],
+        mentionRanges: [], pastedTextRanges: [], quotesEncoded: false
+      }),
+      execution: create(ScheduleExecutionSnapshotSchema, {
+        executionMode: ScheduleExecutionMode.AGENT,
+        model: { model: { providerId: "provider", modelId: "model" }, effortId: "high", fastMode: true },
+        permissionMode: PermissionMode.AUTO,
+        planMode: true,
+        useWorktree: true,
+        worktreeSourceRef: "refs/heads/main",
+        refreshWorktreeRemote: true,
+        extraDirectoryIds: ["extra"],
+        silentWhenIdle: true,
+        notify: { desktop: false },
+        expireAt: timestamp(20_000),
+        preRunHook: { command: "pnpm check", filePath: ".joko/pre-run.mjs", timeout: { seconds: 5n, nanos: 0 } }
+      })
+    }));
+
+    expect(projected).toMatchObject({
+      recurrence: "interval",
+      recurrenceExpression: "90",
+      intervalAnchorAt: 10_000,
+      editableInputText: "Inspect the project",
+      model: { providerId: "provider", modelId: "model", effortId: "high", fastMode: true },
+      permissionMode: "auto",
+      planMode: true,
+      useWorktree: true,
+      worktreeSourceRef: "refs/heads/main",
+      refreshWorktreeRemote: true,
+      extraDirectoryIds: ["extra"],
+      silentWhenIdle: true,
+      notifyDesktop: false,
+      expireAt: 20_000,
+      preRunHook: { command: "pnpm check", filePath: ".joko/pre-run.mjs", timeoutMs: 5_000 }
+    });
+
+    const script = projectMobileAutomationSchedule(schedule("script", {
+      execution: create(ScheduleExecutionSnapshotSchema, {
+        executionMode: ScheduleExecutionMode.SCRIPT,
+        permissionMode: PermissionMode.ASK,
+        extraDirectoryIds: [],
+        script: {
+          command: "node task.mjs",
+          timeout: { seconds: 30n, nanos: 0 },
+          capabilities: [ScheduleScriptCapability.SESSIONS_DISPATCH]
+        }
+      })
+    }));
+    expect(script.script).toEqual({ command: "node task.mjs", timeoutMs: 30_000, dispatchSessions: true });
+    expect(() => projectMobileAutomationSchedule(schedule("permission", {
+      execution: create(ScheduleExecutionSnapshotSchema, {
+        executionMode: ScheduleExecutionMode.AGENT,
+        permissionMode: PermissionMode.UNSPECIFIED,
+        extraDirectoryIds: []
+      })
+    }))).toThrow(/unknown Automation permission mode/);
+    expect(projectMobileAutomationSchedule(schedule("structured", {
+      input: create(InputContentSchema, {
+        parts: [{ content: { case: "sessionMention", value: {
+          sessionId: "session", displayText: "Task"
+        } } }],
+        mentionRanges: [], pastedTextRanges: [], quotesEncoded: false
+      })
+    })).editableInputText).toBeUndefined();
   });
 });
 

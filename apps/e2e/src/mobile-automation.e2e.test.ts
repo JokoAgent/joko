@@ -2,15 +2,27 @@ import { randomUUID } from "node:crypto";
 
 import { create } from "@bufbuild/protobuf";
 import {
+  CloneProjectScheduleToUserMutationSchema,
+  DeleteScheduleMutationSchema,
+  EntityRefSchema,
   EntityKind,
   OperationMutationSchema,
+  OperationPreconditionSchema,
   OperationState,
+  PromoteScheduleToProjectMutationSchema,
+  ReconcileProjectAutomationsMutationSchema,
+  RemoveProjectScheduleMutationSchema,
+  ScheduleGeneratedSessionDisposition,
+  ScheduleInputSchema,
   ScheduleRunOutcome,
+  ScheduleSource,
   ScheduleState,
   SetScheduleEnabledMutationSchema,
   TriggerScheduleMutationSchema,
+  UpdateScheduleMutationSchema,
   type OperationMutation,
-  type Schedule
+  type Schedule,
+  type Target
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it } from "vitest";
@@ -159,6 +171,140 @@ describe("Mobile Automation product chain", () => {
     expect(reread.state).toBe(ScheduleState.DISABLED);
     expect(reread.version?.revision?.value).toBeGreaterThan(current.version!.revision!.value);
   });
+
+  it("persists mobile authoring, project ownership actions and typed deletion outcomes end to end", async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [{ ...PI_LIKE_PROFILE, streamDelayMs: 20 }]
+    });
+    const backendId = fixture.adapter().id;
+    const targetId = fixture.targetId();
+    const initialTarget = fixture.application.store.getTarget(targetId).descriptor;
+    await fixture.application.sessionHost.registerTarget({
+      ...initialTarget,
+      managed: false
+    }, { workspaceId: "workspace-main" });
+    const mobile = await fixture.pair("mobile Automation authoring client");
+    const owner = required((await mobile.clients.event.getSnapshot({
+      scope: { kind: { case: "owner", value: {} } }
+    })).snapshot, "owner snapshot");
+    const target = required(owner.targets.find((candidate) => candidate.targetId === targetId), "Automation Target");
+    const createBase = createManualScheduleMutation({
+      backendId,
+      targetId,
+      sessionId: "",
+      text: "Inspect the mobile authoring chain"
+    });
+    const created = resultSchedule(await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        ...createBase,
+        preconditions: [targetPrecondition(target)]
+      })
+    ));
+    expect(created).toMatchObject({ source: ScheduleSource.USER, targetId, displayName: "E2E unattended schedule" });
+
+    const updated = resultSchedule(await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        preconditions: [targetPrecondition(target), schedulePrecondition(created)],
+        payload: { case: "updateSchedule", value: create(UpdateScheduleMutationSchema, {
+          scheduleId: created.scheduleId,
+          schedule: scheduleInput(created, "E2E mobile edited schedule")
+        }) }
+      })
+    ));
+    expect(updated.displayName).toBe("E2E mobile edited schedule");
+    expect(updated.version?.revision?.value).toBeGreaterThan(created.version!.revision!.value);
+
+    const promoted = resultSchedule(await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        preconditions: [schedulePrecondition(updated), targetPrecondition(target)],
+        payload: { case: "promoteScheduleToProject", value: create(PromoteScheduleToProjectMutationSchema, {
+          scheduleId: updated.scheduleId
+        }) }
+      })
+    ));
+    expect(promoted).toMatchObject({ source: ScheduleSource.PROJECT, targetId });
+    expect(promoted.projectConfigId).not.toBe("");
+    expect(promoted.projectConfigPath).not.toBe("");
+
+    const cloned = resultSchedule(await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        preconditions: [schedulePrecondition(promoted), targetPrecondition(target)],
+        payload: { case: "cloneProjectScheduleToUser", value: create(CloneProjectScheduleToUserMutationSchema, {
+          scheduleId: promoted.scheduleId,
+          displayName: "E2E mobile personal copy"
+        }) }
+      })
+    ));
+    expect(cloned).toMatchObject({ source: ScheduleSource.USER, displayName: "E2E mobile personal copy", targetId });
+
+    const reconciled = await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        preconditions: [targetPrecondition(target)],
+        payload: { case: "reconcileProjectAutomations", value: create(ReconcileProjectAutomationsMutationSchema, { targetId }) }
+      })
+    );
+    expect(reconciled.result?.payload).toMatchObject({ case: "acknowledgement", value: { accepted: true } });
+
+    const currentProject = required(
+      (await mobile.clients.scheduler.getSchedule({ scheduleId: promoted.scheduleId })).schedule,
+      "reconciled project Schedule"
+    );
+    const personalCopy = resultSchedule(await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        preconditions: [schedulePrecondition(currentProject), targetPrecondition(target)],
+        payload: { case: "removeProjectSchedule", value: create(RemoveProjectScheduleMutationSchema, {
+          scheduleId: currentProject.scheduleId,
+          keepPersonalCopy: true
+        }) }
+      })
+    ));
+    expect(personalCopy).toMatchObject({ source: ScheduleSource.USER, targetId });
+
+    const deletionSubmitted = await submit(
+      mobile.clients.operation,
+      mobile.connectionId,
+      create(OperationMutationSchema, {
+        preconditions: [schedulePrecondition(cloned)],
+        payload: { case: "deleteSchedule", value: create(DeleteScheduleMutationSchema, {
+          scheduleId: cloned.scheduleId,
+          generatedSessionDisposition: ScheduleGeneratedSessionDisposition.KEEP
+        }) }
+      })
+    );
+    const deleted = deletionSubmitted.state === OperationState.SUCCEEDED
+      ? deletionSubmitted
+      : await waitFor(
+        async () => required(
+          (await mobile.clients.operation.getOperation({ operationId: deletionSubmitted.operationId })).operation,
+          "Automation deletion Operation"
+        ),
+        (operation) => operation.state === OperationState.SUCCEEDED,
+        "mobile Automation deletion"
+      );
+    expect(deleted.result?.payload).toMatchObject({
+      case: "scheduleDeletion",
+      value: {
+        scheduleId: cloned.scheduleId,
+        generatedSessionDisposition: ScheduleGeneratedSessionDisposition.KEEP,
+        generatedSessionIds: [],
+        completedSessionIds: [],
+        failures: []
+      }
+    });
+    await expect(mobile.clients.scheduler.getSchedule({ scheduleId: cloned.scheduleId })).rejects.toBeDefined();
+  });
 });
 
 function scheduleMutation(
@@ -174,6 +320,45 @@ function scheduleMutation(
     }],
     payload
   });
+}
+
+function targetPrecondition(target: Target) {
+  return create(OperationPreconditionSchema, {
+    entity: create(EntityRefSchema, { kind: EntityKind.TARGET, id: target.targetId }),
+    expectedRevision: required(target.version?.revision, "Target revision")
+  });
+}
+
+function schedulePrecondition(schedule: Schedule) {
+  return create(OperationPreconditionSchema, {
+    entity: create(EntityRefSchema, { kind: EntityKind.SCHEDULE, id: schedule.scheduleId }),
+    expectedRevision: required(schedule.version?.revision, "Schedule revision")
+  });
+}
+
+function scheduleInput(schedule: Schedule, displayName: string) {
+  return create(ScheduleInputSchema, {
+    displayName,
+    backendId: schedule.backendId,
+    targetId: schedule.targetId,
+    sessionId: schedule.sessionId,
+    sessionMode: schedule.sessionMode,
+    recurrence: required(schedule.recurrence, "Schedule recurrence"),
+    timeZone: schedule.timeZone,
+    input: schedule.input,
+    execution: schedule.execution,
+    overlapPolicy: schedule.overlapPolicy,
+    misfirePolicy: schedule.misfirePolicy,
+    enabled: schedule.state === ScheduleState.ENABLED || schedule.state === ScheduleState.RUNNING
+  });
+}
+
+function resultSchedule(operation: Awaited<ReturnType<typeof submit>>): Schedule {
+  const payload = operation.result?.payload;
+  if (payload?.case !== "schedule") {
+    throw new Error(`Expected typed Schedule result, received ${String(payload?.case)}.`);
+  }
+  return payload.value;
 }
 
 function required<T>(value: T | undefined, label: string): T {

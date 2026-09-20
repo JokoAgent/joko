@@ -2,7 +2,7 @@ import { Code, ConnectError, createClient, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
-  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
+  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
@@ -71,6 +71,8 @@ export interface MobileNetwork {
   readSchedule(credential: PairedCredential, scheduleId: string, signal?: AbortSignal): Promise<Schedule>;
   listScheduleHistory(credential: PairedCredential, scheduleId: string, pageToken?: string, signal?: AbortSignal): Promise<ScheduleHistoryPage>;
   readSchedulerRuntime(credential: PairedCredential, signal?: AbortSignal): Promise<SchedulerRuntimeSnapshot>;
+  probeTargetWorktree(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<MobileTargetWorktreeProbe>;
+  listTargetWorktreeSources(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly MobileTargetWorktreeSource[]>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
@@ -113,6 +115,20 @@ export interface ScheduleHistoryPage {
   readonly history: readonly ScheduleRunHistory[];
   readonly nextPageToken: string;
   readonly totalSize: number;
+}
+
+export interface MobileTargetWorktreeProbe {
+  readonly targetId: string;
+  readonly eligibility: "eligible" | "notGitRepository" | "alreadyLinked" | "gitNotFound" | "unsafe" | "unavailable";
+  readonly canRefreshRemote: boolean;
+}
+
+export interface MobileTargetWorktreeSource {
+  readonly ref: string;
+  readonly commit: string;
+  readonly displayName: string;
+  readonly remote: boolean;
+  readonly current: boolean;
 }
 
 export interface VerifiedBlobDownload {
@@ -192,8 +208,24 @@ interface ScheduleCatalogPage {
   readonly totalSize: bigint;
 }
 
+interface TargetWorktreeSourcePage {
+  readonly sources: readonly MobileTargetWorktreeSource[];
+  readonly nextPageToken: string;
+  readonly totalSize: bigint;
+}
+
 function validSchedulePageToken(value: string): boolean {
   return value.length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function mobileWorktreeEligibility(value: WorktreeEligibility): MobileTargetWorktreeProbe["eligibility"] {
+  if (value === WorktreeEligibility.ELIGIBLE) return "eligible";
+  if (value === WorktreeEligibility.NOT_GIT_REPOSITORY) return "notGitRepository";
+  if (value === WorktreeEligibility.ALREADY_LINKED) return "alreadyLinked";
+  if (value === WorktreeEligibility.GIT_NOT_FOUND) return "gitNotFound";
+  if (value === WorktreeEligibility.UNSAFE) return "unsafe";
+  if (value === WorktreeEligibility.UNAVAILABLE) return "unavailable";
+  throw new Error("The Joko node returned an unspecified Worktree eligibility.");
 }
 
 export async function collectSchedulePages(
@@ -226,6 +258,43 @@ export async function collectSchedulePages(
     if (page.schedules.length === 0 || page.nextPageToken === pageToken || pageTokens.has(page.nextPageToken)
       || pageTokens.size >= 10_000) {
       throw new Error("The Joko node returned a cyclic Automation catalog page token.");
+    }
+    pageTokens.add(page.nextPageToken);
+    pageToken = page.nextPageToken;
+  }
+}
+
+export async function collectTargetWorktreeSourcePages(
+  readPage: (pageToken: string) => Promise<TargetWorktreeSourcePage>
+): Promise<readonly MobileTargetWorktreeSource[]> {
+  const sources: MobileTargetWorktreeSource[] = [];
+  const refs = new Set<string>();
+  const pageTokens = new Set<string>();
+  let pageToken = "";
+  let totalSize: bigint | undefined;
+  while (true) {
+    const page = await readPage(pageToken);
+    if (page.totalSize < 0n || page.totalSize > 10_000n || page.sources.length > WORKSPACE_PAGE_SIZE
+      || !validSchedulePageToken(page.nextPageToken)) {
+      throw new Error("The Joko node returned invalid Worktree source metadata.");
+    }
+    if (totalSize === undefined) totalSize = page.totalSize;
+    else if (totalSize !== page.totalSize) throw new Error("The Worktree source catalog changed while paging.");
+    for (const source of page.sources) {
+      if (!validCatalogIdentity(source.ref, 4_096) || !validCatalogIdentity(source.commit, 512)
+        || !validCatalogLabel(source.displayName) || refs.has(source.ref)) {
+        throw new Error("The Joko node returned a duplicate or invalid Worktree source.");
+      }
+      refs.add(source.ref);
+      sources.push(source);
+    }
+    if (page.nextPageToken === "") {
+      if (BigInt(sources.length) !== totalSize) throw new Error("The Joko node returned an incomplete Worktree source catalog.");
+      return sources;
+    }
+    if (page.sources.length === 0 || page.nextPageToken === pageToken || pageTokens.has(page.nextPageToken)
+      || pageTokens.size >= 10_000) {
+      throw new Error("The Joko node returned a cyclic Worktree source page token.");
     }
     pageTokens.add(page.nextPageToken);
     pageToken = page.nextPageToken;
@@ -1094,6 +1163,39 @@ export const mobileNetwork: MobileNetwork = {
       .getSchedulerRuntime({}, options(signal));
     if (!response.runtime) throw new Error("The Joko node returned no Scheduler runtime.");
     return response.runtime;
+  },
+  async probeTargetWorktree(credential, targetId, signal) {
+    if (!validCatalogIdentity(targetId, 512)) throw new Error("A current Target is required for Worktree discovery.");
+    const response = await createClient(WorktreeService, transport(credential.origin, credential.authKey))
+      .probeTargetWorktree({ targetId }, options(signal));
+    if (response.targetId !== targetId) throw new Error("The Joko node returned a Worktree probe for another Target.");
+    return {
+      targetId,
+      eligibility: mobileWorktreeEligibility(response.eligibility),
+      canRefreshRemote: response.canRefreshRemote
+    };
+  },
+  async listTargetWorktreeSources(credential, targetId, signal) {
+    if (!validCatalogIdentity(targetId, 512)) throw new Error("A current Target is required for Worktree discovery.");
+    const client = createClient(WorktreeService, transport(credential.origin, credential.authKey));
+    return collectTargetWorktreeSourcePages(async (pageToken) => {
+      const response = await client.listTargetWorktreeSources({
+        targetId,
+        page: { pageSize: WORKSPACE_PAGE_SIZE, pageToken }
+      }, options(signal));
+      if (!response.page) throw new Error("The Joko node did not return Worktree source page metadata.");
+      return {
+        sources: response.sources.map((source) => ({
+          ref: source.ref,
+          commit: source.commit,
+          displayName: source.displayName,
+          remote: source.remote,
+          current: source.current
+        })),
+        nextPageToken: response.page.nextPageToken,
+        totalSize: response.page.totalSize
+      };
+    });
   },
   async downloadBlob(credential, blob, signal) {
     assertDownloadBlob(blob);

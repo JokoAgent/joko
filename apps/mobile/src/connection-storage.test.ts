@@ -341,7 +341,21 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "all-read", connectionId: first.connectionId, kind: "schedule-all-read" as const,
         state: "accepted" as const },
       { operationId: "run-delete", connectionId: first.connectionId, kind: "schedule-run-delete" as const,
-        scheduleId: "schedule-one", triggerId: "trigger-two", state: "unknown" as const }
+        scheduleId: "schedule-one", triggerId: "trigger-two", state: "unknown" as const },
+      { operationId: "schedule-create", connectionId: first.connectionId, kind: "schedule-create" as const,
+        targetId: "target-one", state: "unknown" as const },
+      { operationId: "schedule-update", connectionId: first.connectionId, kind: "schedule-update" as const,
+        scheduleId: "schedule-one", targetId: "target-one", state: "accepted" as const },
+      { operationId: "schedule-delete", connectionId: first.connectionId, kind: "schedule-delete" as const,
+        scheduleId: "schedule-one", state: "unknown" as const },
+      { operationId: "schedule-promote", connectionId: first.connectionId, kind: "schedule-promote" as const,
+        scheduleId: "schedule-one", state: "accepted" as const },
+      { operationId: "schedule-clone", connectionId: first.connectionId, kind: "schedule-clone" as const,
+        scheduleId: "schedule-one", state: "unknown" as const },
+      { operationId: "schedule-project-remove", connectionId: first.connectionId, kind: "schedule-project-remove" as const,
+        scheduleId: "schedule-one", state: "accepted" as const },
+      { operationId: "schedule-project-reconcile", connectionId: first.connectionId,
+        kind: "schedule-project-reconcile" as const, targetId: "target-one", state: "unknown" as const }
     ];
 
     await storage.savePending(receipts);
@@ -356,7 +370,12 @@ describe("current-v1 mobile connection storage", () => {
       { operationId: "wrong-trigger", connectionId: first.connectionId, kind: "schedule-enable",
         scheduleId: "schedule-one", triggerId: "trigger-one", state: "unknown" },
       { operationId: "metadata-on-send", connectionId: first.connectionId, kind: "send",
-        sessionId: "session-one", scheduleId: "schedule-one", state: "unknown" }
+        sessionId: "session-one", scheduleId: "schedule-one", state: "unknown" },
+      { operationId: "create-without-target", connectionId: first.connectionId, kind: "schedule-create", state: "unknown" },
+      { operationId: "update-without-target", connectionId: first.connectionId, kind: "schedule-update",
+        scheduleId: "schedule-one", state: "unknown" },
+      { operationId: "reconcile-with-schedule", connectionId: first.connectionId, kind: "schedule-project-reconcile",
+        targetId: "target-one", scheduleId: "schedule-one", state: "unknown" }
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });

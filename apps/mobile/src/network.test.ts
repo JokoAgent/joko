@@ -31,6 +31,7 @@ import {
   collectArtifactPages,
   collectArtifactReferencePages,
   collectSchedulePages,
+  collectTargetWorktreeSourcePages,
   collectSessionMessageSearchPages,
   collectWorkspaceDirectoryPages,
   collectWorkspaceSearchPages,
@@ -119,6 +120,17 @@ describe("mobile Automation paging", () => {
     expect(() => validateScheduleHistoryPage("schedule", "", {
       history: [item], nextPageToken: "x".repeat(4_097), totalSize: 2n
     })).toThrow(/invalid Automation history page metadata/);
+  });
+
+  it("collects complete Worktree sources and rejects duplicate refs", async () => {
+    const first = { ref: "refs/heads/main", commit: "abc", displayName: "main", remote: false, current: true };
+    const second = { ref: "refs/remotes/origin/release", commit: "def", displayName: "origin/release", remote: true, current: false };
+    await expect(collectTargetWorktreeSourcePages(async (token) => token === ""
+      ? { sources: [first], nextPageToken: "next", totalSize: 2n }
+      : { sources: [second], nextPageToken: "", totalSize: 2n })).resolves.toEqual([first, second]);
+    await expect(collectTargetWorktreeSourcePages(async () => ({
+      sources: [first, first], nextPageToken: "", totalSize: 2n
+    }))).rejects.toThrow(/duplicate or invalid Worktree source/);
   });
 });
 
