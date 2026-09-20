@@ -76,6 +76,17 @@ import {
   type MobileSessionMentionControls
 } from "./mobile-session-mentions";
 import {
+  assertMobileWorkspaceMentionCandidate,
+  assertMobileWorkspaceMentionDraft,
+  createMobileWorkspaceMentionControls,
+  projectMobileWorkspaceMentionDirectory,
+  projectMobileWorkspaceMentionFileIndex,
+  type MobileWorkspaceMentionCandidate,
+  type MobileWorkspaceMentionControls,
+  type MobileWorkspaceMentionDirectory,
+  type MobileWorkspaceMentionFileIndex
+} from "./mobile-workspace-mentions";
+import {
   type MobileNewTaskCreateSubmission,
   type MobileNewTaskDraftIdentity,
   type MobileNewTaskDraftStore,
@@ -1946,7 +1957,12 @@ export class MobileClient {
     const authorityKey = this.#taskAuthorityKey();
     if (!authorityKey) throw new Error("The current task authority is unavailable.");
     const mentionControls = this.taskSessionMentionControls();
-    const sendDraft = assertMobileSessionMentionDraft(mentionControls, exactDraft);
+    const workspaceMentionControls = this.taskWorkspaceMentionControls();
+    const workspaceMentionOwnerKey = workspaceMentionControls?.surfaceOwnerKey;
+    const sendDraft = assertMobileWorkspaceMentionDraft(
+      workspaceMentionControls,
+      assertMobileSessionMentionDraft(mentionControls, exactDraft)
+    );
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
     const draftIdentity = { profileId: credential.profileId, sessionId };
     this.composerDrafts.save(draftIdentity, sendDraft);
@@ -1958,6 +1974,19 @@ export class MobileClient {
       throw new Error("The task changed while its structured draft was being saved. Review the retained draft before sending.");
     }
     assertMobileSessionMentionDraft(this.taskSessionMentionControls(), sendDraft);
+    const currentWorkspaceMentionControls = this.taskWorkspaceMentionControls();
+    assertMobileWorkspaceMentionDraft(currentWorkspaceMentionControls, sendDraft);
+    if (sendDraft.mentions.some((mention) => mention.kind === "workspace")) {
+      if (!currentWorkspaceMentionControls || currentWorkspaceMentionControls.surfaceOwnerKey !== workspaceMentionOwnerKey) {
+        throw new Error("The Workspace reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
+      }
+      await this.#revalidateWorkspaceMentionPaths(currentWorkspaceMentionControls, sendDraft);
+      if (this.#taskAuthorityKey() !== authorityKey
+        || this.taskWorkspaceMentionControls()?.surfaceOwnerKey !== currentWorkspaceMentionControls.surfaceOwnerKey) {
+        throw new Error("The Workspace reference owner changed while its paths were being checked. Review the retained draft before sending.");
+      }
+      assertMobileWorkspaceMentionDraft(this.taskWorkspaceMentionControls(), sendDraft);
+    }
     const action = this.#claimMutation();
     try {
       const accepted = await this.#submit(create(OperationMutationSchema, {
@@ -2046,6 +2075,81 @@ export class MobileClient {
     const session = this.#selectedSession();
     const backend = this.#selectedBackend(session);
     return createMobileSessionMentionControls(authorityKey, this.#state.owner, session, backend);
+  }
+
+  taskWorkspaceMentionControls(): MobileWorkspaceMentionControls | undefined {
+    return createMobileWorkspaceMentionControls(
+      this.#taskAuthorityKey(),
+      this.#state.owner,
+      this.#state.detail,
+      this.#state.selectedId
+    );
+  }
+
+  async listTaskWorkspaceMentionDirectory(
+    expectedSurfaceOwnerKey: string,
+    parentPath: string,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionDirectory> {
+    const context = this.#workspaceMentionContext(expectedSurfaceOwnerKey);
+    const parent = canonicalWorkspacePath(parentPath, true);
+    const result = await this.network.listWorkspaceDirectory(
+      context.credential,
+      context.controls.workspaceId,
+      parent,
+      signal
+    );
+    const current = this.#workspaceMentionContext(expectedSurfaceOwnerKey);
+    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+      throw new Error("The Workspace reference owner changed while its directory was loading.");
+    }
+    return projectMobileWorkspaceMentionDirectory(context.controls, parent, result.entries, result.revision);
+  }
+
+  async listTaskWorkspaceMentionFileIndex(
+    expectedSurfaceOwnerKey: string,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionFileIndex> {
+    const context = this.#workspaceMentionContext(expectedSurfaceOwnerKey);
+    if (!context.controls.policy.files) throw new Error("This Backend does not support Workspace file references.");
+    const result = await this.network.listWorkspaceFileIndex(
+      context.credential,
+      context.controls.workspaceId,
+      signal
+    );
+    const current = this.#workspaceMentionContext(expectedSurfaceOwnerKey);
+    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+      throw new Error("The Workspace reference owner changed while its file index was loading.");
+    }
+    return projectMobileWorkspaceMentionFileIndex(
+      context.controls,
+      result.paths,
+      result.revision,
+      result.truncated
+    );
+  }
+
+  async validateTaskWorkspaceMentionCandidate(
+    expectedSurfaceOwnerKey: string,
+    value: MobileWorkspaceMentionCandidate,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionCandidate> {
+    const context = this.#workspaceMentionContext(expectedSurfaceOwnerKey);
+    const expected = assertMobileWorkspaceMentionCandidate(context.controls, value);
+    const directory = await this.listTaskWorkspaceMentionDirectory(
+      expectedSurfaceOwnerKey,
+      workspaceParentPath(expected.relativePath),
+      signal
+    );
+    const matches = directory.entries.filter((entry) => entry.relativePath === expected.relativePath);
+    const current = matches.length === 1 ? matches[0] : undefined;
+    if (!current || current.directory !== expected.directory) {
+      throw new Error("The selected Workspace path is no longer available with the same file type.");
+    }
+    return assertMobileWorkspaceMentionCandidate(
+      this.#workspaceMentionContext(expectedSurfaceOwnerKey).controls,
+      current
+    );
   }
 
   async setTaskModel(authorityKey: string, selection: MobileModelControlSelection): Promise<boolean> {
@@ -2543,6 +2647,40 @@ export class MobileClient {
       throw new Error("The task branch owner changed. Reopen branches from the current task.");
     }
     return controls;
+  }
+
+  #workspaceMentionContext(expectedSurfaceOwnerKey: string): {
+    readonly credential: PairedCredential;
+    readonly controls: MobileWorkspaceMentionControls;
+  } {
+    const credential = this.#ready();
+    const controls = this.taskWorkspaceMentionControls();
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("The Workspace reference owner changed. Reopen the reference list from the current task.");
+    }
+    return { credential, controls };
+  }
+
+  async #revalidateWorkspaceMentionPaths(
+    controls: MobileWorkspaceMentionControls,
+    draft: MobileComposerDraft
+  ): Promise<void> {
+    const mentions = draft.mentions.filter((mention) => mention.kind === "workspace");
+    const byParent = new Map<string, typeof mentions>();
+    for (const mention of mentions) {
+      const parent = workspaceParentPath(mention.relativePath);
+      byParent.set(parent, [...(byParent.get(parent) ?? []), mention]);
+    }
+    for (const [parent, expected] of byParent) {
+      const directory = await this.listTaskWorkspaceMentionDirectory(controls.surfaceOwnerKey, parent);
+      for (const mention of expected) {
+        const matches = directory.entries.filter((entry) => entry.relativePath === mention.relativePath);
+        const current = matches.length === 1 ? matches[0] : undefined;
+        if (!current || current.directory !== mention.directory) {
+          throw new Error("A referenced Workspace path disappeared or changed file type. The draft was retained.");
+        }
+      }
+    }
   }
 
   #sessionRuntimePrecondition(session: Session) {

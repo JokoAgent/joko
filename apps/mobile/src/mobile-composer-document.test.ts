@@ -4,12 +4,15 @@ import {
   InputContentSchema,
   InputMentionRangeSchema,
   InputPartSchema,
-  SessionMentionSchema
+  SessionMentionSchema,
+  WorkspaceLineRangeSchema,
+  WorkspaceMentionSchema
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import {
   appendPlainTextToMobileComposer,
   insertMobileSessionMention,
+  insertMobileWorkspaceMention,
   mobileComposerInput,
   mobileInputSummary,
   normalizeMobileComposerDraft,
@@ -70,6 +73,74 @@ describe("mobile structured composer document", () => {
     expect(backspaceInside.selection).toEqual({ start: 8, end: 8 });
     const explicitlyRemoved = removeMobileComposerMention(inserted.draft, "mention");
     expect(explicitlyRemoved.draft).toEqual(plainTextMobileComposerDraft("Before  after"));
+  });
+
+  it("serializes Workspace files, directories, and line ranges without folding authority into the path", () => {
+    const file = insertMobileWorkspaceMention(
+      plainTextMobileComposerDraft("Inspect 😀 "),
+      { start: 11, end: 11 },
+      {
+        workspaceId: "workspace",
+        relativePath: "src/main.ts",
+        displayText: "main.ts",
+        directory: false,
+        lineRange: { startLine: 7, endLine: 12 }
+      },
+      "workspace-one"
+    );
+    const directory = insertMobileWorkspaceMention(
+      file.draft,
+      file.selection,
+      { workspaceId: "workspace", relativePath: "src", displayText: "src", directory: true },
+      "workspace-two"
+    );
+
+    expect(directory.draft.text).toBe("Inspect 😀 @main.ts:7–12 @src/");
+    expect(directory.draft.mentions).toMatchObject([
+      {
+        kind: "workspace", mentionId: "workspace-one", workspaceId: "workspace",
+        relativePath: "src/main.ts", directory: false, lineRange: { startLine: 7, endLine: 12 },
+        start: 11, end: 24
+      },
+      {
+        kind: "workspace", mentionId: "workspace-two", workspaceId: "workspace",
+        relativePath: "src", directory: true, start: 25, end: 30
+      }
+    ]);
+    expect(mobileComposerInput(directory.draft)).toMatchObject({
+      parts: [
+        { content: { case: "text", value: directory.draft.text } },
+        { content: { case: "workspaceMention", value: {
+          workspaceId: "workspace", relativePath: "src/main.ts", displayText: "main.ts", directory: false,
+          lineRange: { startLine: 7, endLine: 12 }
+        } } },
+        { content: { case: "workspaceMention", value: {
+          workspaceId: "workspace", relativePath: "src", displayText: "src", directory: true
+        } } }
+      ],
+      mentionRanges: [
+        { start: 11, end: 24, mentionIndex: 0 },
+        { start: 25, end: 30, mentionIndex: 1 }
+      ]
+    });
+  });
+
+  it("rejects non-canonical Workspace paths and invalid file/directory line semantics", () => {
+    const invalid = (overrides: Record<string, unknown> = {}) => normalizeMobileComposerDraft({
+      text: "@src/",
+      mentions: [{
+        kind: "workspace", mentionId: "workspace", workspaceId: "workspace", relativePath: "src",
+        displayText: "src", directory: true, start: 0, end: 5,
+        ...overrides
+      }]
+    });
+
+    expect(() => invalid({ relativePath: "src/../secret" })).toThrow(/path/u);
+    expect(() => invalid({ lineRange: { startLine: 1, endLine: 2 } })).toThrow(/requires a file/u);
+    expect(() => invalid({ directory: false, lineRange: { startLine: 0, endLine: 2 } })).toThrow(/one-based/u);
+    expect(() => invalid({ directory: false, lineRange: { startLine: 1 } })).toThrow(/paired/u);
+    expect(() => invalid({ directory: false, lineRange: { startLine: 4, endLine: 2 } })).toThrow(/ordered/u);
+    expect(() => invalid({ directory: false, lineRange: { startLine: 1, endLine: 0x1_0000_0000 } })).toThrow(/one-based/u);
   });
 
   it("reconciles emoji substitutions without splitting a UTF-16 surrogate pair", () => {
@@ -140,5 +211,29 @@ describe("mobile structured composer document", () => {
       ]
     });
     expect(mobileInputSummary(duplicateOccurrence)).toBe("Ask @Task\n[Invalid reference metadata]");
+
+    const workspace = create(InputContentSchema, {
+      parts: [
+        create(InputPartSchema, { content: { case: "text", value: "Inspect @main.ts:7–12" } }),
+        create(InputPartSchema, { content: { case: "workspaceMention", value: create(WorkspaceMentionSchema, {
+          workspaceId: "workspace", relativePath: "src/main.ts", displayText: "main.ts", directory: false,
+          lineRange: create(WorkspaceLineRangeSchema, { startLine: 7, endLine: 12 })
+        }) } })
+      ],
+      mentionRanges: [create(InputMentionRangeSchema, { start: 8, end: 21, mentionIndex: 0 })]
+    });
+    expect(mobileInputSummary(workspace)).toBe("Inspect @main.ts:7–12");
+
+    const invalidWorkspace = create(InputContentSchema, {
+      parts: [
+        workspace.parts[0]!,
+        create(InputPartSchema, { content: { case: "workspaceMention", value: create(WorkspaceMentionSchema, {
+          workspaceId: "workspace", relativePath: "src", displayText: "src", directory: true,
+          lineRange: create(WorkspaceLineRangeSchema, { startLine: 1, endLine: 2 })
+        }) } })
+      ],
+      mentionRanges: workspace.mentionRanges
+    });
+    expect(mobileInputSummary(invalidWorkspace)).toBe("Inspect @main.ts:7–12\n[Invalid reference metadata]");
   });
 });

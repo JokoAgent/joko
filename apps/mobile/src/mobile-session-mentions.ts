@@ -65,10 +65,11 @@ export function assertMobileSessionMentionDraft(
   draft: MobileComposerDraft
 ): MobileComposerDraft {
   const exact = normalizeMobileComposerDraft(draft);
-  if (exact.mentions.length === 0) return exact;
+  const mentions = exact.mentions.filter((mention) => mention.kind === "session");
+  if (mentions.length === 0) return exact;
   if (!controls) throw new Error("This Backend no longer supports task references. The draft was retained.");
   const candidates = new Set(controls.candidates.map((candidate) => candidate.sessionId));
-  const retired = exact.mentions.find((mention) => !candidates.has(mention.sessionId));
+  const retired = mentions.find((mention) => !candidates.has(mention.sessionId));
   if (retired) throw new Error("A referenced task is no longer available. Remove or replace that reference before sending.");
   return exact;
 }

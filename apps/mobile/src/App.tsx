@@ -37,12 +37,14 @@ import { addToMobileComposer } from "./composer-draft-behavior";
 import {
   emptyMobileComposerDraft,
   insertMobileSessionMention,
+  insertMobileWorkspaceMention,
   mobileInputSummary,
   plainTextMobileComposerDraft,
   reconcileMobileComposerText,
   removeMobileComposerMention,
   type MobileComposerDraft,
-  type MobileComposerSelection
+  type MobileComposerSelection,
+  type MobileWorkspaceLineRange
 } from "./mobile-composer-document";
 import {
   accessibleComposerHeight,
@@ -65,6 +67,8 @@ import { MobileContextSheet } from "./MobileContextSheet";
 import { MobileNativeTreeSheet } from "./MobileNativeTreeSheet";
 import { MobileSessionMentionSheet } from "./MobileSessionMentionSheet";
 import type { MobileSessionMentionCandidate } from "./mobile-session-mentions";
+import { MobileWorkspaceMentionSheet } from "./MobileWorkspaceMentionSheet";
+import type { MobileWorkspaceMentionCandidate } from "./mobile-workspace-mentions";
 import {
   mobileInteractionDraftIdentity,
   mobileInteractionDraftIdentityKey,
@@ -883,6 +887,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [nativeTreeVisible, setNativeTreeVisible] = useState(false);
   const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
   const [sessionMentionError, setSessionMentionError] = useState("");
+  const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -974,6 +979,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const nativeTreeOwnerRef = useRef(nativeTreeControls?.surfaceOwnerKey);
   const sessionMentionControls = client.taskSessionMentionControls();
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
+  const workspaceMentionControls = client.taskWorkspaceMentionControls();
+  const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -1021,6 +1028,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setContextVisible(false);
     setNativeTreeVisible(false);
     setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
     if (ownerChanged) {
       setSelectedInteractionId(interactions[0]!.interactionId);
       setInteractionVisible(true);
@@ -1059,6 +1067,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     }
   }, [sessionMentionControls?.surfaceOwnerKey]);
   useEffect(() => {
+    const next = workspaceMentionControls?.surfaceOwnerKey;
+    const changed = workspaceMentionOwnerRef.current !== next;
+    workspaceMentionOwnerRef.current = next;
+    if (changed || next === undefined) setWorkspaceMentionsVisible(false);
+  }, [workspaceMentionControls?.surfaceOwnerKey]);
+  useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
       for (const interaction of interactions) {
@@ -1081,6 +1095,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setComposerManualHeight(null);
     setComposerContentHeight(composerMinimumInputHeight);
     setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
     if (!identity) {
       setDraft(emptyMobileComposerDraft());
       setComposerSelection({ start: 0, end: 0 });
@@ -1195,7 +1210,41 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       setSessionMentionError(errorText(error));
     }
   };
-  const removeSessionMention = (mentionId: string): void => {
+  const insertWorkspaceMention = async (
+    surfaceOwnerKey: string,
+    candidate: MobileWorkspaceMentionCandidate,
+    lineRange?: MobileWorkspaceLineRange
+  ): Promise<void> => {
+    const controls = workspaceMentionControls;
+    const identity = draftIdentityRef.current;
+    if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
+      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current || !identity) {
+      setWorkspaceMentionsVisible(false);
+      throw new Error("Workspace reference authority changed. Reopen the reference list and try again.");
+    }
+    if (lineRange !== undefined && !controls.policy.lineRanges) {
+      throw new Error("This Backend no longer supports Workspace line references.");
+    }
+    const current = await client.validateTaskWorkspaceMentionCandidate(surfaceOwnerKey, candidate);
+    const latestControls = client.taskWorkspaceMentionControls();
+    if (!latestControls || latestControls.surfaceOwnerKey !== surfaceOwnerKey
+      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current
+      || !draftIdentityRef.current
+      || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== mobileComposerDraftIdentityKey(identity)) {
+      setWorkspaceMentionsVisible(false);
+      throw new Error("Workspace reference authority changed while the path was being checked.");
+    }
+    const result = insertMobileWorkspaceMention(draft, composerSelection, {
+      ...current,
+      ...(lineRange === undefined ? {} : { lineRange })
+    }, randomUUID());
+    setDraft(result.draft);
+    setComposerSelection(result.selection);
+    mobileComposerDrafts.save(identity, result.draft);
+    setWorkspaceMentionsVisible(false);
+    setTimeout(() => composerInputRef.current?.focus(), 0);
+  };
+  const removeComposerMention = (mentionId: string): void => {
     try {
       const result = removeMobileComposerMention(draft, mentionId);
       setDraft(result.draft);
@@ -1256,6 +1305,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     if (!profileId || !composerOwnerReady || interactions.length > 0) return;
     const stashedDraft = draft;
     setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
     setLocalError("");
     try {
       const lease = await client.beginQueueEdit(item.queueItemId);
@@ -1360,12 +1410,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       </View>
       <View style={styles.headerActions}>
         <Action label="Branches"
-          onPress={() => { setSessionMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
+          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
           disabled={nativeTreeControls === undefined || state.busy || interactions.length > 0} />
         <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
-          onPress={() => { setSessionMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
+          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
           disabled={contextControls === undefined || state.busy || interactions.length > 0} />
-        <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
+        <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
           disabled={!runtimeControlsAvailable || state.busy || interactions.length > 0} />
         {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
@@ -1474,24 +1524,35 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         style={styles.composerResizeHandle} {...composerResizeResponder.panHandlers}>
         <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
       </View>
-      {!queueEdit && (sessionMentionControls || draft.mentions.length > 0) && <View style={styles.composerTools}>
+      {!queueEdit && (sessionMentionControls || workspaceMentionControls || draft.mentions.length > 0) && <View style={styles.composerTools}>
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
-          disabled={state.busy || !composerOwnerReady || draft.mentions.length >= 8}
+          disabled={state.busy || !composerOwnerReady || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
             setRuntimeControlsVisible(false);
+            setWorkspaceMentionsVisible(false);
             setSessionMentionError("");
             setSessionMentionsVisible(true);
+          }} />}
+        {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
+          disabled={state.busy || !composerOwnerReady}
+          onPress={() => {
+            setNativeTreeVisible(false);
+            setContextVisible(false);
+            setRuntimeControlsVisible(false);
+            setSessionMentionsVisible(false);
+            setSessionMentionError("");
+            setWorkspaceMentionsVisible(true);
           }} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.mentions.map((mention) => <Pressable key={mention.mentionId}
-            accessibilityRole="button" accessibilityLabel={`Remove task reference ${mention.displayText}`}
+            accessibilityRole="button" accessibilityLabel={`Remove ${mention.kind === "session" ? "task" : mention.directory ? "directory" : "file"} reference ${mention.displayText}`}
             accessibilityHint="Removes this exact reference occurrence from the message"
-            disabled={state.busy} onPress={() => removeSessionMention(mention.mentionId)}
+            disabled={state.busy} onPress={() => removeComposerMention(mention.mentionId)}
             style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }, state.busy && styles.disabled]}>
-            <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>@{mention.displayText} ×</Text>
+            <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>{draft.text.slice(mention.start, mention.end)} ×</Text>
           </Pressable>)}
         </ScrollView>}
       </View>}
@@ -1573,6 +1634,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined}
       controls={sessionMentionControls} busy={state.busy} error={sessionMentionError} colors={colors}
       onClose={() => { setSessionMentionsVisible(false); setSessionMentionError(""); }} onSelect={insertSessionMention} />
+    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined}
+      controls={workspaceMentionControls} busy={state.busy} colors={colors}
+      onClose={() => setWorkspaceMentionsVisible(false)}
+      onLoadDirectory={(surfaceOwnerKey, parentPath, signal) => client.listTaskWorkspaceMentionDirectory(surfaceOwnerKey, parentPath, signal)}
+      onLoadFileIndex={(surfaceOwnerKey, signal) => client.listTaskWorkspaceMentionFileIndex(surfaceOwnerKey, signal)}
+      onSelect={insertWorkspaceMention} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}
       onClosed={() => {

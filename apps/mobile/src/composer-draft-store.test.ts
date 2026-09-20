@@ -5,7 +5,11 @@ import {
   type MobileComposerDraftIdentity
 } from "./composer-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
-import { insertMobileSessionMention, plainTextMobileComposerDraft } from "./mobile-composer-document";
+import {
+  insertMobileSessionMention,
+  insertMobileWorkspaceMention,
+  plainTextMobileComposerDraft
+} from "./mobile-composer-document";
 
 const first = { profileId: "profile-one", sessionId: "session-one" } satisfies MobileComposerDraftIdentity;
 const second = { profileId: "profile-one", sessionId: "session-two" } satisfies MobileComposerDraftIdentity;
@@ -94,11 +98,20 @@ describe("mobile composer draft store", () => {
   it("round-trips structured occurrences and clears only the exact submitted version", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);
-    const submitted = insertMobileSessionMention(
+    const session = insertMobileSessionMention(
       plainTextMobileComposerDraft("Use "),
       { start: 4, end: 4 },
       { sessionId: "source", displayText: "Task" },
       "mention-one"
+    );
+    const submitted = insertMobileWorkspaceMention(
+      session.draft,
+      session.selection,
+      {
+        workspaceId: "workspace", relativePath: "src/main.ts", displayText: "main.ts", directory: false,
+        lineRange: { startLine: 2, endLine: 4 }
+      },
+      "mention-two"
     ).draft;
     store.save(first, submitted);
     await store.flush(first);

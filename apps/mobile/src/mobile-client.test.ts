@@ -25,7 +25,12 @@ import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import { timelineRows } from "./timeline";
-import { insertMobileSessionMention, mobileComposerInput, plainTextMobileComposerDraft } from "./mobile-composer-document";
+import {
+  insertMobileSessionMention,
+  insertMobileWorkspaceMention,
+  mobileComposerInput,
+  plainTextMobileComposerDraft
+} from "./mobile-composer-document";
 
 const credential: PairedCredential = {
   profileId: "mobile-profile", origin: "http://192.168.1.20:4318", serverId: "node-1", connectionId: "mobile-connection",
@@ -113,6 +118,36 @@ const sessionMentionSnapshot = create(SnapshotSchema, {
     })
   })],
   sessions: [snapshot.sessions[0]!, relatedSession]
+});
+const workspaceMentionSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    version: "backend-v1",
+    capabilities: create(CapabilityManifestSchema, {
+      schemaVersion: "1",
+      revision: create(RevisionSchema, { value: 4n, etag: "capabilities-r4" }),
+      capabilities: [
+        create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, {
+          name: capabilityNames.inputMention,
+          support: CapabilitySupport.SUPPORTED,
+          options: create(CapabilityOptionsSchema, {
+            kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+              mediaTypes: ["workspace_file", "workspace_directory", "workspace_line_range"]
+            }) }
+          })
+        })
+      ]
+    })
+  })],
+  targets: [create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: "workspace" })]
+});
+const workspaceMentionDirectory = create(WorkspaceEntrySchema, {
+  workspaceId: "workspace", relativePath: "src", displayName: "src", kind: FileKind.DIRECTORY
+});
+const workspaceMentionFile = create(WorkspaceEntrySchema, {
+  workspaceId: "workspace", relativePath: "src/main.ts", displayName: "main.ts", kind: FileKind.REGULAR
 });
 const filesSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -1810,6 +1845,38 @@ describe("native current-task message and Queue actions", () => {
     ).draft;
   };
 
+  const workspaceMentionDraft = () => {
+    const text = "Inspect 😀 ";
+    const file = insertMobileWorkspaceMention(
+      plainTextMobileComposerDraft(text),
+      { start: text.length, end: text.length },
+      {
+        workspaceId: "workspace", relativePath: "src/main.ts", displayText: "main.ts", directory: false,
+        lineRange: { startLine: 7, endLine: 12 }
+      },
+      "workspace-occurrence-1"
+    );
+    return insertMobileWorkspaceMention(
+      file.draft,
+      file.selection,
+      { workspaceId: "workspace", relativePath: "src", displayText: "src", directory: true },
+      "workspace-occurrence-2"
+    ).draft;
+  };
+
+  function configureWorkspaceMentionDirectories(network: MobileNetwork): void {
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, workspaceId, parentPath) => ({
+      entries: workspaceId !== "workspace" ? []
+        : parentPath === "" ? [workspaceMentionDirectory]
+        : parentPath === "src" ? [workspaceMentionFile]
+        : [],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
+      paths: ["src/main.ts"], revision: "index-r1", truncated: false
+    });
+  }
+
   it("sends a retained Session reference with exact UTF-16 range and body-free receipt", async () => {
     const network = projectedNetwork(sessionMentionSnapshot);
     const saved = memoryStorage(credential);
@@ -1937,6 +2004,176 @@ describe("native current-task message and Queue actions", () => {
 
     expect(network.submit).not.toHaveBeenCalled();
     expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+  });
+
+  it("loads Workspace reference candidates under the exact owner and never requests an index for directory-only policy", async () => {
+    const network = projectedNetwork(workspaceMentionSnapshot);
+    configureWorkspaceMentionDirectories(network);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskWorkspaceMentionControls()!;
+
+    await expect(app.listTaskWorkspaceMentionDirectory(controls.surfaceOwnerKey, "")).resolves.toMatchObject({
+      parentPath: "", entries: [{ relativePath: "src", directory: true }]
+    });
+    await expect(app.listTaskWorkspaceMentionFileIndex(controls.surfaceOwnerKey)).resolves.toMatchObject({
+      paths: ["src/main.ts"], revision: "index-r1"
+    });
+
+    const directoryOnly = create(SnapshotSchema, {
+      ...workspaceMentionSnapshot,
+      backends: [create(BackendDescriptorSchema, {
+        ...workspaceMentionSnapshot.backends[0]!,
+        capabilities: create(CapabilityManifestSchema, {
+          ...workspaceMentionSnapshot.backends[0]!.capabilities!,
+          capabilities: [
+            create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+            create(CapabilitySchema, {
+              name: capabilityNames.inputMention,
+              support: CapabilitySupport.SUPPORTED,
+              options: create(CapabilityOptionsSchema, {
+                kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+                  mediaTypes: ["workspace_directory"]
+                }) }
+              })
+            })
+          ]
+        })
+      })]
+    });
+    const directoryNetwork = projectedNetwork(directoryOnly);
+    configureWorkspaceMentionDirectories(directoryNetwork);
+    const directoryApp = client(directoryNetwork, memoryStorage(credential).storage);
+    await directoryApp.start();
+    const directoryControls = directoryApp.taskWorkspaceMentionControls()!;
+
+    await expect(directoryApp.listTaskWorkspaceMentionDirectory(directoryControls.surfaceOwnerKey, ""))
+      .resolves.toMatchObject({ entries: [{ relativePath: "src", directory: true }] });
+    await expect(directoryApp.listTaskWorkspaceMentionFileIndex(directoryControls.surfaceOwnerKey))
+      .rejects.toThrow(/does not support Workspace file references/u);
+    expect(directoryNetwork.listWorkspaceFileIndex).not.toHaveBeenCalled();
+  });
+
+  it("sends current Workspace file, line, and directory occurrences with exact wire ranges and a body-free receipt", async () => {
+    const network = projectedNetwork(workspaceMentionSnapshot);
+    configureWorkspaceMentionDirectories(network);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = workspaceMentionDraft();
+
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(network.listWorkspaceDirectory).toHaveBeenCalledWith(
+      credential, "workspace", "src", undefined
+    );
+    expect(network.listWorkspaceDirectory).toHaveBeenCalledWith(
+      credential, "workspace", "", undefined
+    );
+    expect(vi.mocked(network.listWorkspaceDirectory).mock.invocationCallOrder[1])
+      .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[0]!);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      payload: { case: "sendInput", value: {
+        sessionId: "session",
+        input: {
+          parts: [
+            { content: { case: "text", value: draft.text } },
+            { content: { case: "workspaceMention", value: {
+              workspaceId: "workspace", relativePath: "src/main.ts", displayText: "main.ts", directory: false,
+              lineRange: { startLine: 7, endLine: 12 }
+            } } },
+            { content: { case: "workspaceMention", value: {
+              workspaceId: "workspace", relativePath: "src", displayText: "src", directory: true
+            } } }
+          ],
+          mentionRanges: [
+            { start: draft.mentions[0]!.start, end: draft.mentions[0]!.end, mentionIndex: 0 },
+            { start: draft.mentions[1]!.start, end: draft.mentions[1]!.end, mentionIndex: 1 }
+          ]
+        }
+      } }
+    });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    expect(JSON.stringify(saved.pending())).not.toContain(draft.text);
+    expect(JSON.stringify(saved.pending())).not.toContain("src/main.ts");
+  });
+
+  it("retains a Workspace-reference draft and a body-free receipt for unknown and rejected sends", async () => {
+    for (const outcome of ["unknown", "rejected"] as const) {
+      const network = projectedNetwork(workspaceMentionSnapshot);
+      configureWorkspaceMentionDirectories(network);
+      const saved = memoryStorage(credential);
+      const drafts = memoryDraftStores();
+      if (outcome === "unknown") {
+        vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+      } else {
+        vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+          operationId: "mobile-id-1", connectionId: credential.connectionId, state: OperationState.CONFLICT,
+          error: { code: "GENERATION_CONFLICT", message: "The task runtime changed." }
+        }));
+      }
+      const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+      await app.start();
+      const draft = workspaceMentionDraft();
+
+      await expect(app.send(draft)).resolves.toBe(false);
+
+      expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+      expect(JSON.stringify(saved.pending())).not.toContain(draft.text);
+      expect(JSON.stringify(saved.pending())).not.toContain("src/main.ts");
+      if (outcome === "unknown") expect(saved.pending()).toMatchObject([{ kind: "send", state: "unknown" }]);
+      else expect(saved.pending()).toEqual([]);
+    }
+  });
+
+  it("retains the Workspace draft when a referenced path disappears or changes kind before dispatch", async () => {
+    for (const replacement of [undefined, workspaceMentionDirectory] as const) {
+      const network = projectedNetwork(workspaceMentionSnapshot);
+      vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+        entries: parentPath === "" ? [workspaceMentionDirectory]
+          : replacement === undefined ? [] : [create(WorkspaceEntrySchema, {
+              ...replacement, relativePath: "src/main.ts", displayName: "main.ts"
+            })],
+        revision: "directory-r2"
+      }));
+      const drafts = memoryDraftStores();
+      const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+      await app.start();
+      const draft = workspaceMentionDraft();
+
+      await expect(app.send(draft)).rejects.toThrow(/disappeared or changed file type/u);
+
+      expect(network.submit).not.toHaveBeenCalled();
+      expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+    }
+  });
+
+  it("retires a late Workspace candidate listing when its exact capability owner changes", async () => {
+    const network = projectedNetwork(workspaceMentionSnapshot);
+    let resolveDirectory!: (value: { entries: readonly WorkspaceEntry[]; revision: string }) => void;
+    vi.mocked(network.listWorkspaceDirectory).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveDirectory = resolve;
+    }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskWorkspaceMentionControls()!;
+    const loading = app.listTaskWorkspaceMentionDirectory(controls.surfaceOwnerKey, "");
+    await vi.waitFor(() => expect(resolveDirectory).toBeDefined());
+
+    const changed = create(SnapshotSchema, {
+      ...workspaceMentionSnapshot,
+      backends: [create(BackendDescriptorSchema, {
+        ...workspaceMentionSnapshot.backends[0]!,
+        version: "backend-v2"
+      })]
+    });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: changed });
+    vi.mocked(network.readSession).mockResolvedValue(changed);
+    await app.refresh();
+    resolveDirectory({ entries: [workspaceMentionDirectory], revision: "late-r1" });
+
+    await expect(loading).rejects.toThrow(/owner changed/u);
   });
 
   it("deletes only an exact completed visible message with the current Session generation", async () => {

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import {
@@ -369,6 +371,136 @@ describe("native mobile device through the durable product chain", () => {
     expect(dispatched?.text).toContain("MOBILE SOURCE HISTORY");
     expect(dispatched?.mentions).toEqual([]);
     expect(dispatched?.mentionRanges).toEqual([]);
+  });
+
+  it("admits mobile Workspace file, directory, and line references through HTTP, SQLite, and the Session Host", async () => {
+    const mentionProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-workspace-reference",
+      displayName: "Mobile Workspace reference",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== capabilityNames.inputMention),
+        {
+          key: capabilityNames.inputMention,
+          supported: true as const,
+          options: ["workspace_file", "workspace_directory", "workspace_line_range"]
+        }
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [mentionProfile],
+      createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
+    });
+    await mkdir(join(fixture.workspaceDirectory, "src"), { recursive: true });
+    await writeFile(join(fixture.workspaceDirectory, "src", "main.ts"), "export const mobile = true;\n");
+
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko Workspace phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile Workspace fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko Workspace phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection?.connectionId) throw new Error("The mobile Workspace fixture did not pair.");
+    const clients = fixture.clients(paired.authKey);
+    const connectionId = paired.connection.connectionId;
+    const owner = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot;
+    const target = owner?.targets.find((candidate) => candidate.targetId === fixture!.targetId(mentionProfile.id));
+    const workspaceId = target?.workspaceId;
+    if (!target || !workspaceId) throw new Error("The mobile Workspace fixture has no current target Workspace.");
+    expect(owner?.backends.find((backend) => backend.backendId === mentionProfile.id)
+      ?.capabilities?.capabilities.find((capability) => capability.name === capabilityNames.inputMention))
+      .toMatchObject({
+        support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "input", value: {
+          mediaTypes: ["workspace_file", "workspace_directory", "workspace_line_range", "session"]
+        } } }
+      });
+
+    const sessionId = sessionIdFrom(await submit(
+      clients.operation,
+      connectionId,
+      createSessionMutation({
+        backendId: mentionProfile.id,
+        targetId: target.targetId,
+        displayName: "Current mobile Workspace task"
+      })
+    ));
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const tokens = ["@README.md", "@main.ts:1–1", "@src/"];
+    const text = `Inspect ${tokens.join(" ")}`;
+    const mutation = sendInputMutation(sessionId, generation, text);
+    if (mutation.payload.case !== "sendInput" || mutation.payload.value.input === undefined) {
+      throw new Error("The mobile Workspace mutation has no InputContent.");
+    }
+    mutation.payload.value.input.parts.push(
+      create(InputPartSchema, { content: { case: "workspaceMention", value: {
+        workspaceId, relativePath: "README.md", displayText: "README.md", directory: false
+      } } }),
+      create(InputPartSchema, { content: { case: "workspaceMention", value: {
+        workspaceId, relativePath: "src/main.ts", displayText: "main.ts", directory: false,
+        lineRange: { startLine: 1, endLine: 1 }
+      } } }),
+      create(InputPartSchema, { content: { case: "workspaceMention", value: {
+        workspaceId, relativePath: "src", displayText: "src", directory: true
+      } } })
+    );
+    let cursor = "Inspect ".length;
+    tokens.forEach((token, mentionIndex) => {
+      mutation.payload.case === "sendInput" && mutation.payload.value.input?.mentionRanges.push(
+        create(InputMentionRangeSchema, { start: cursor, end: cursor + token.length, mentionIndex })
+      );
+      cursor += token.length + 1;
+    });
+
+    const sent = await submit(clients.operation, connectionId, mutation);
+    const queued = queueItemFrom(sent);
+    expect(queued.input).toMatchObject(mutation.payload.value.input);
+    await waitFor(
+      () => clients.run.getRun({ runId: queueRunIdFrom(sent) }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      "mobile Workspace reference dispatch"
+    );
+    const timeline = await waitFor(
+      () => clients.session.listSessionTimeline({ sessionId, limit: 120 }),
+      (value) => value.events.some((event) => event.identity?.runId === queued.runId
+        && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER),
+      "accepted mobile Workspace-reference input"
+    );
+    const accepted = timeline.events.find((event) => event.identity?.runId === queued.runId
+      && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER);
+    if (accepted?.payload?.kind.case !== "messageStarted") throw new Error("The mobile Workspace input was not projected.");
+    expect(accepted.payload.kind.value.userInputAccepted).toBe(true);
+    expect(accepted.payload.kind.value.userInput).toMatchObject(queued.input!);
+
+    const dispatched = fixture.adapter(mentionProfile.id).sendCalls.at(-1);
+    expect(dispatched?.text).toBe(text);
+    expect(dispatched?.mentions).toEqual([
+      { kind: "workspace_file", workspaceId, label: "README.md", reference: "README.md" },
+      {
+        kind: "workspace_file", workspaceId, label: "main.ts", reference: "src/main.ts",
+        lineRange: { startLine: 1, endLine: 1 }
+      },
+      { kind: "workspace_directory", workspaceId, label: "src", reference: "src" }
+    ]);
+    expect(dispatched?.mentionRanges).toEqual([
+      { start: "Inspect ".length, end: "Inspect ".length + tokens[0]!.length, mentionIndex: 0 },
+      {
+        start: "Inspect ".length + tokens[0]!.length + 1,
+        end: "Inspect ".length + tokens[0]!.length + 1 + tokens[1]!.length,
+        mentionIndex: 1
+      },
+      { start: text.length - tokens[2]!.length, end: text.length, mentionIndex: 2 }
+    ]);
   });
 
   it("executes mobile message deletion and touch Queue controls through HTTP, SQLite, and the Session Host", async () => {
