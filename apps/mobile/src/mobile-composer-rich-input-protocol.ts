@@ -49,6 +49,18 @@ export interface MobileComposerRichBlurMessage extends MobileComposerRichWebBase
   readonly type: "blur";
 }
 
+export interface MobileComposerRichCompositionMessage extends MobileComposerRichWebBaseMessage {
+  readonly type: "composition";
+  readonly composing: boolean;
+}
+
+export type MobileComposerCommandPaletteKey = "ArrowUp" | "ArrowDown" | "Enter" | "Tab" | "Escape";
+
+export interface MobileComposerRichPaletteKeyMessage extends MobileComposerRichWebBaseMessage {
+  readonly type: "paletteKey";
+  readonly key: MobileComposerCommandPaletteKey;
+}
+
 export interface MobileComposerRichActivateMessage extends MobileComposerRichWebBaseMessage {
   readonly type: "activate";
   readonly documentId: number;
@@ -63,6 +75,8 @@ export type MobileComposerRichWebMessage = MobileComposerRichReadyMessage
   | MobileComposerRichHeightMessage
   | MobileComposerRichFocusMessage
   | MobileComposerRichBlurMessage
+  | MobileComposerRichCompositionMessage
+  | MobileComposerRichPaletteKeyMessage
   | MobileComposerRichActivateMessage;
 
 const maximumProtocolCharacters = 16_777_216;
@@ -134,6 +148,14 @@ export function parseMobileComposerRichWebMessage(raw: string): MobileComposerRi
   if (value.type === "blur" && exactKeys(value, ["type", "instanceId"])) {
     return { type: "blur", instanceId };
   }
+  if (value.type === "composition" && exactKeys(value, ["type", "instanceId", "composing"])
+    && typeof value.composing === "boolean") {
+    return { type: "composition", instanceId, composing: value.composing };
+  }
+  if (value.type === "paletteKey" && exactKeys(value, ["type", "instanceId", "key"])
+    && isCommandPaletteKey(value.key)) {
+    return { type: "paletteKey", instanceId, key: value.key };
+  }
   if (value.type === "activate" && exactKeys(value, ["type", "instanceId", "documentId", "occurrenceKey"])
     && validDocumentId(value.documentId) && validIdentity(value.occurrenceKey, maximumIdentityCharacters)) {
     return {
@@ -177,6 +199,10 @@ function validSelection(start: unknown, end: unknown): start is number {
 
 function validDocumentId(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1;
+}
+
+function isCommandPaletteKey(value: unknown): value is MobileComposerCommandPaletteKey {
+  return value === "ArrowUp" || value === "ArrowDown" || value === "Enter" || value === "Tab" || value === "Escape";
 }
 
 function validIdentity(value: unknown, maximum: number): value is string {

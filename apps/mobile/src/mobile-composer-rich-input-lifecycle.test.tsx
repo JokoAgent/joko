@@ -95,6 +95,9 @@ afterEach(() => {
 function mount(initialDraft: MobileComposerDraft) {
   const onEdit = vi.fn();
   const onError = vi.fn();
+  const onBlur = vi.fn();
+  const onCommandPaletteKey = vi.fn();
+  const onCompositionChange = vi.fn();
   const onPasteText = vi.fn();
   const onSelectionChange = vi.fn();
   const page: Page = {
@@ -115,12 +118,16 @@ function mount(initialDraft: MobileComposerDraft) {
   root = createRoot(document.createElement("div"));
   const render = (draft: MobileComposerDraft) => act(() => root!.render(createElement(MobileComposerRichInput, {
     accessibilityLabel: "Task message",
+    commandPaletteOpen: true,
     draft,
     editable: true,
     height: 88,
     maxHeight: 264,
+    onBlur,
     onEdit,
     onError,
+    onCommandPaletteKey,
+    onCompositionChange,
     onPasteText,
     onSelectionChange,
     ownerKey: "profile\u001fsession",
@@ -133,7 +140,10 @@ function mount(initialDraft: MobileComposerDraft) {
     nativeEvent: { data: JSON.stringify({ ...message, instanceId }) }
   }));
   const ready = () => send({ type: "ready" });
-  return { onEdit, onError, onPasteText, onSelectionChange, page, ready, render, send };
+  return {
+    onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError, onPasteText,
+    onSelectionChange, page, ready, render, send
+  };
 }
 
 describe("mobile composer rich input lifecycle", () => {
@@ -187,6 +197,26 @@ describe("mobile composer rich input lifecycle", () => {
       end: 10
     });
     expect(mounted.onEdit).not.toHaveBeenCalled();
+  });
+
+  it("forwards composition and consumed palette keys only from the active editor instance", () => {
+    const mounted = mount(plainTextMobileComposerDraft("/re"));
+    mounted.ready();
+    const activeInstanceId = bridge.instanceId;
+    mounted.send({ type: "composition", composing: true });
+    mounted.send({ type: "paletteKey", key: "ArrowDown" });
+    expect(mounted.onCompositionChange).toHaveBeenCalledWith(true);
+    expect(mounted.onCommandPaletteKey).toHaveBeenCalledWith("ArrowDown");
+
+    mounted.send({ type: "composition", composing: false }, "retired-instance");
+    mounted.send({ type: "paletteKey", key: "Enter" }, "retired-instance");
+    expect(mounted.onCompositionChange).toHaveBeenCalledTimes(1);
+    expect(mounted.onCommandPaletteKey).toHaveBeenCalledTimes(1);
+
+    act(() => bridge.onContentProcessDidTerminate());
+    expect(activeInstanceId).not.toBe(bridge.instanceId);
+    expect(mounted.onCompositionChange).toHaveBeenLastCalledWith(false);
+    expect(mounted.onBlur).toHaveBeenCalledTimes(1);
   });
 
   it("repairs background DOM changes and forwards paste with the exact accepted draft", () => {

@@ -43,6 +43,12 @@ describe("mobile composer rich input protocol", () => {
       end: 5,
       text: "plain"
     }))).toMatchObject({ type: "paste", text: "plain" });
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "composition", instanceId: "instance-1", composing: true
+    }))).toEqual({ type: "composition", instanceId: "instance-1", composing: true });
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "paletteKey", instanceId: "instance-1", key: "ArrowDown"
+    }))).toEqual({ type: "paletteKey", instanceId: "instance-1", key: "ArrowDown" });
   });
 
   it("rejects aliases, unknown fields, malformed ranges, and unbounded payloads", () => {
@@ -71,6 +77,15 @@ describe("mobile composer rich input protocol", () => {
       text: "x".repeat(mobileComposerRichProtocolLimits.maximumPasteCharacters + 1)
     }))).toBeUndefined();
     expect(parseMobileComposerRichWebMessage("{" )).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "composition", instanceId: "instance-1", composing: "yes"
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "paletteKey", instanceId: "instance-1", key: "Space"
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "paletteKey", instanceId: "instance-1", key: "Enter", send: true
+    }))).toBeUndefined();
   });
 
   it("rejects malformed or over-budget semantic segments", () => {

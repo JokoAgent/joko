@@ -17,6 +17,7 @@ export interface MobileComposerRichInputConfig {
   readonly documentId: number;
   readonly editable: boolean;
   readonly instanceId: string;
+  readonly commandPaletteOpen: boolean;
   readonly maxHeight: number;
   readonly placeholder: string;
   readonly selection: MobileComposerSelection;
@@ -24,7 +25,7 @@ export interface MobileComposerRichInputConfig {
 }
 
 export type MobileComposerRichRuntimeConfig = Pick<MobileComposerRichInputConfig,
-  "accessibilityLabel" | "editable" | "maxHeight" | "placeholder" | "theme">;
+  "accessibilityLabel" | "commandPaletteOpen" | "editable" | "maxHeight" | "placeholder" | "theme">;
 
 const singleLineHeight = 44;
 
@@ -83,6 +84,12 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
     if (!window.ReactNativeWebView || typeof window.ReactNativeWebView.postMessage !== 'function') return;
     window.ReactNativeWebView.postMessage(JSON.stringify(Object.assign({ instanceId }, message)));
   };
+  const setComposing = (value) => {
+    const next = value === true;
+    if (composing === next) return;
+    composing = next;
+    post({ type: 'composition', composing });
+  };
   const safeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
   const applyTheme = (theme) => {
     const style = document.documentElement.style;
@@ -128,7 +135,7 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
     if (!richDocument || richDocument.version !== 1 || !Array.isArray(richDocument.nodes)
       || !Number.isSafeInteger(nextDocumentId) || nextDocumentId < 1) return;
     applying = true;
-    composing = false;
+    setComposing(false);
     documentId = nextDocumentId;
     const fragment = document.createDocumentFragment();
     richDocument.nodes.forEach((node) => makeNodes(node).forEach((child) => fragment.appendChild(child)));
@@ -314,6 +321,17 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
     }
     reportHeight();
   };
+  const finishComposition = () => {
+    if (!composing) {
+      notify();
+      return;
+    }
+    composing = false;
+    // Publish the final document while native still treats the editor as
+    // composing. Only then reopen palette eligibility for that exact draft.
+    notify();
+    post({ type: 'composition', composing: false });
+  };
   const occurrenceRanges = () => {
     const ranges = [];
     let offset = 0;
@@ -354,13 +372,20 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
     return true;
   };
   root.addEventListener('input', notify);
-  root.addEventListener('compositionstart', () => { composing = true; });
-  root.addEventListener('compositionend', () => { composing = false; notify(); });
-  root.addEventListener('compositioncancel', () => { composing = false; notify(); });
+  root.addEventListener('compositionstart', () => { setComposing(true); });
+  root.addEventListener('compositionend', finishComposition);
+  root.addEventListener('compositioncancel', finishComposition);
   root.addEventListener('focus', () => post({ type: 'focus' }));
-  root.addEventListener('blur', () => { if (!composing) notify(); post({ type: 'blur' }); });
+  root.addEventListener('blur', () => { finishComposition(); post({ type: 'blur' }); });
   root.addEventListener('keydown', (event) => {
     if (!runtime.editable) return;
+    if (runtime.commandPaletteOpen === true && !composing && event.isComposing !== true
+      && ['ArrowUp', 'ArrowDown', 'Enter', 'Tab', 'Escape'].includes(event.key)) {
+      event.preventDefault();
+      event.stopPropagation();
+      post({ type: 'paletteKey', key: event.key });
+      return;
+    }
     const focusedOccurrence = event.target && event.target.closest && event.target.closest('.occurrence');
     if (event.key === 'Backspace' || event.key === 'Delete') {
       if (focusedOccurrence) {
@@ -377,6 +402,14 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
     if (focusedOccurrence && (event.key === 'Enter' || event.key === ' ')) {
       event.preventDefault();
       post({ type: 'activate', documentId, occurrenceKey: focusedOccurrence.dataset.occurrenceKey || '' });
+    }
+  });
+  root.addEventListener('beforeinput', (event) => {
+    if (runtime.editable && runtime.commandPaletteOpen === true && !composing && event.isComposing !== true
+      && (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak')) {
+      event.preventDefault();
+      event.stopPropagation();
+      post({ type: 'paletteKey', key: 'Enter' });
     }
   });
   root.addEventListener('paste', (event) => {

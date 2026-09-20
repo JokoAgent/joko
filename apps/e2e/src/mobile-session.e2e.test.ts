@@ -12,7 +12,7 @@ import {
   PermissionMode,
   PlanReviewResolutionSchema, QueueItemState, QuestionAnswerSchema, QuestionMultipleChoiceAnswerSchema,
   QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
-  MessageRole, QueueDeliveryMode, RunState, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
+  MessageRole, QueueDeliveryMode, RunState, RuntimeCommandSource, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
   AppendVoiceAudioRequestSchema, GetVoiceInputCapabilitiesRequestSchema, GetVoiceInputSessionRequestSchema,
   StartVoiceInputRequestSchema, StopVoiceInputRequestSchema, VoiceInputState, VoiceInputTerminalOutcome,
   capabilityNames, nativeSessionTreeRoots, type Interaction, type OperationMutation
@@ -74,6 +74,26 @@ class MobileInteractionFixtureAdapter extends InstrumentedFakeAdapter {
         : "plan:cancelled");
     }
     await super.send(input, context);
+  }
+}
+
+class MobileRuntimeCommandFixtureAdapter extends InstrumentedFakeAdapter {
+  override async getCommands(_context: AdapterContext) {
+    return [
+      {
+        name: "review",
+        description: "Review current mobile changes",
+        source: "skill" as const,
+        resourceId: "mobile-review-skill",
+        loaded: true
+      },
+      {
+        name: "future",
+        description: "Not loaded in this runtime",
+        source: "prompt" as const,
+        loaded: false
+      }
+    ];
   }
 }
 
@@ -341,6 +361,89 @@ describe("native mobile device through the durable product chain", () => {
     }));
     expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
+  });
+
+  it("lists an exact mobile runtime command catalog and dispatches the selected slash through HTTP, SQLite, and the Session Host", async () => {
+    const runtimeCommandProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-runtime-commands",
+      displayName: "Mobile runtime commands",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== capabilityNames.runtimeCommands),
+        { key: capabilityNames.runtimeCommands, supported: true as const }
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [runtimeCommandProfile],
+      createAdapter: (profile) => new MobileRuntimeCommandFixtureAdapter(profile)
+    });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko command phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile runtime-command fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko command phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection?.connectionId) {
+      throw new Error("The mobile runtime-command fixture did not pair.");
+    }
+    const clients = fixture.clients(paired.authKey);
+    const connectionId = paired.connection.connectionId;
+    const owner = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    expect(owner.backends.find((backend) => backend.backendId === runtimeCommandProfile.id)
+      ?.capabilities?.capabilities.filter((capability) => capability.name === capabilityNames.runtimeCommands))
+      .toEqual([expect.objectContaining({ support: CapabilitySupport.SUPPORTED })]);
+
+    const created = await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: runtimeCommandProfile.id,
+      targetId: fixture.targetId(runtimeCommandProfile.id),
+      displayName: "Mobile slash catalog"
+    }));
+    expect(created.state).toBe(OperationState.SUCCEEDED);
+    const sessionId = sessionIdFrom(created);
+    if (created.result?.payload.case !== "session") throw new Error("The command fixture did not return a Session.");
+    const generation = created.result.payload.value.nativeBinding?.runtimeGeneration;
+    expect(generation).toBeGreaterThan(0n);
+
+    const listed = await clients.session.listRuntimeCommands({ sessionId });
+    expect(listed.commands).toHaveLength(2);
+    expect(listed.commands).toContainEqual(expect.objectContaining({
+      sessionId,
+      name: "review",
+      description: "Review current mobile changes",
+      source: RuntimeCommandSource.SKILL,
+      resourceId: "mobile-review-skill",
+      loaded: true
+    }));
+    expect(listed.commands).toContainEqual(expect.objectContaining({
+      sessionId,
+      name: "future",
+      source: RuntimeCommandSource.PROMPT,
+      loaded: false
+    }));
+    expect(new Set(listed.commands.map((command) => command.commandId)).size).toBe(2);
+    expect(listed.commands.every((command) => /^[a-f0-9]{64}$/u.test(command.commandId))).toBe(true);
+
+    const exactSlash = "/review mobile touch selection";
+    const queued = await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation!, exactSlash));
+    expect(queued.state).toBe(OperationState.SUCCEEDED);
+    const queueItem = queueItemFrom(queued);
+    expect(queueItem.input).toMatchObject({ parts: [{ content: { case: "text", value: exactSlash } }] });
+    const adapter = fixture.adapter(runtimeCommandProfile.id);
+    await waitFor(async () => adapter.sendCalls.length, (count) => count === 1, "mobile slash input to reach the Session Host");
+    expect(adapter.sendCalls[0]?.text).toBe(exactSlash);
+    const stored = fixture.application.store.getSession(sessionId);
+    expect(stored.descriptor.binding.generation).toBe(Number(generation));
+    expect(fixture.application.store.getQueueItem(queueItem.queueItemId).body.text).toBe(exactSlash);
   });
 
   it("uploads mobile image/file Blobs and preserves canonical typed parts through Queue, Timeline, and Adapter dispatch", async () => {

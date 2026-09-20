@@ -31,6 +31,7 @@ describe("mobile composer rich input HTML", () => {
       accessibilityLabel: "Task message",
       document,
       documentId: 1,
+      commandPaletteOpen: true,
       editable: true,
       instanceId: "instance-1",
       maxHeight: 260,
@@ -42,6 +43,13 @@ describe("mobile composer rich input HTML", () => {
     expect(html).toContain("connect-src 'none'");
     expect(html).toContain("contentEditable = runtime.editable");
     expect(html).toContain("compositionstart");
+    expect(html).toContain("type: 'composition'");
+    expect(html).toContain("root.addEventListener('compositionend', finishComposition)");
+    expect(html).toContain("notify();\n    post({ type: 'composition', composing: false })");
+    expect(html).toContain("type: 'paletteKey'");
+    expect(html).toContain("root.addEventListener('beforeinput'");
+    expect(html).toContain("event.inputType === 'insertParagraph'");
+    expect(html).toContain("event.preventDefault()");
     expect(html).toContain("removeOccurrenceAtCaret");
     expect(html).toContain("window.jokoComposer");
     expect(html).toContain("type: 'paste'");
@@ -70,6 +78,7 @@ describe("mobile composer rich input HTML", () => {
     });
     const runtime = buildMobileComposerRichConfigScript({
       accessibilityLabel: dangerous,
+      commandPaletteOpen: false,
       editable: false,
       maxHeight: 144,
       placeholder: dangerous,
@@ -89,6 +98,7 @@ describe("mobile composer rich input HTML", () => {
           accessibilityLabel: "Quote from Assistant", block: true }]
       },
       documentId: 8,
+      commandPaletteOpen: false,
       editable: true,
       instanceId: "instance-2",
       maxHeight: 132,

@@ -30,7 +30,10 @@ import {
   type MobileComposerRichInputTheme,
   type MobileComposerRichRuntimeConfig
 } from "./mobile-composer-rich-input-html";
-import { parseMobileComposerRichWebMessage } from "./mobile-composer-rich-input-protocol";
+import {
+  parseMobileComposerRichWebMessage,
+  type MobileComposerCommandPaletteKey
+} from "./mobile-composer-rich-input-protocol";
 
 export interface MobileComposerRichInputHandle {
   blur(): void;
@@ -47,11 +50,14 @@ export interface MobileComposerRichInputProps {
   readonly accessibilityHint?: string;
   readonly accessibilityLabel: string;
   readonly bordered?: boolean;
+  readonly commandPaletteOpen?: boolean;
   readonly draft: MobileComposerDraft;
   readonly editable: boolean;
   readonly height: number;
   readonly maxHeight: number;
   readonly onBlur?: () => void;
+  readonly onCommandPaletteKey?: (key: MobileComposerCommandPaletteKey) => void;
+  readonly onCompositionChange?: (composing: boolean) => void;
   readonly onEdit: (result: MobileComposerEditResult, sourceDraft: MobileComposerDraft) => void;
   readonly onError: (message: string) => void;
   readonly onFocus?: () => void;
@@ -98,11 +104,14 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     accessibilityHint,
     accessibilityLabel,
     bordered = false,
+    commandPaletteOpen = false,
     draft,
     editable,
     height,
     maxHeight,
     onBlur,
+    onCommandPaletteKey,
+    onCompositionChange,
     onEdit,
     onError,
     onFocus,
@@ -126,7 +135,10 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     const ownerKeyRef = useRef(ownerKey);
     const editableRef = useRef(editable);
     const selectionRef = useRef(selection);
-    const callbacksRef = useRef({ onBlur, onEdit, onError, onFocus, onHeightChange, onOpenAtom, onPasteText, onSelectionChange });
+    const callbacksRef = useRef({
+      onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError, onFocus,
+      onHeightChange, onOpenAtom, onPasteText, onSelectionChange
+    });
     const acceptedRef = useRef<AcceptedDocument>({
       document: mobileComposerRichDocument(draft),
       documentId: 1,
@@ -141,15 +153,19 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     ownerKeyRef.current = ownerKey;
     editableRef.current = editable;
     selectionRef.current = selection;
-    callbacksRef.current = { onBlur, onEdit, onError, onFocus, onHeightChange, onOpenAtom, onPasteText, onSelectionChange };
+    callbacksRef.current = {
+      onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError, onFocus,
+      onHeightChange, onOpenAtom, onPasteText, onSelectionChange
+    };
 
     const runtimeConfig = useMemo<MobileComposerRichRuntimeConfig>(() => ({
       accessibilityLabel,
+      commandPaletteOpen,
       editable,
       maxHeight: Math.max(44, Math.min(4_096, Math.ceil(maxHeight))),
       placeholder,
       theme
-    }), [accessibilityLabel, editable, maxHeight, placeholder, theme]);
+    }), [accessibilityLabel, commandPaletteOpen, editable, maxHeight, placeholder, theme]);
 
     const initialHtml = useMemo(() => buildMobileComposerRichInputHtml({
       ...runtimeConfig,
@@ -207,6 +223,8 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       recoveringRef.current = true;
       activeInstanceIdRef.current = "";
       clearHeartbeat();
+      callbacksRef.current.onCompositionChange?.(false);
+      callbacksRef.current.onBlur?.();
       callbacksRef.current.onError(message);
       if (AppState.currentState !== "active") {
         deferredRecoveryRef.current = true;
@@ -316,7 +334,16 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         return;
       }
       if (message.type === "blur") {
+        callbacksRef.current.onCompositionChange?.(false);
         callbacksRef.current.onBlur?.();
+        return;
+      }
+      if (message.type === "composition") {
+        callbacksRef.current.onCompositionChange?.(message.composing);
+        return;
+      }
+      if (message.type === "paletteKey") {
+        callbacksRef.current.onCommandPaletteKey?.(message.key);
         return;
       }
       const current = acceptedRef.current;

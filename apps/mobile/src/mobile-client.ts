@@ -155,6 +155,12 @@ import {
   type MobileCompactOutcome,
   type MobileContextControls
 } from "./mobile-context-controls";
+import {
+  createMobileRuntimeCommandControls,
+  projectMobileRuntimeCommandCatalog,
+  type MobileRuntimeCommandCatalog,
+  type MobileRuntimeCommandControls
+} from "./mobile-runtime-commands";
 import type { MobileVoiceTransport } from "./mobile-voice-input";
 import {
   assertMobileNativeTreeNavigation,
@@ -3256,6 +3262,15 @@ export class MobileClient {
     );
   }
 
+  taskRuntimeCommandControls(): MobileRuntimeCommandControls | undefined {
+    return createMobileRuntimeCommandControls(
+      this.#taskAuthorityKey(),
+      this.#state.owner,
+      this.#state.detail,
+      this.#state.selectedId
+    );
+  }
+
   taskAttachmentControls(): MobileAttachmentControls | undefined {
     const authorityKey = this.#taskAuthorityKey();
     const credential = this.#credential;
@@ -3702,6 +3717,32 @@ export class MobileClient {
         )
       })
     };
+  }
+
+  async listTaskRuntimeCommands(
+    expectedSurfaceOwnerKey: string,
+    signal?: AbortSignal
+  ): Promise<MobileRuntimeCommandCatalog> {
+    const context = this.#runtimeCommandContext(expectedSurfaceOwnerKey);
+    const commands = await this.network.listRuntimeCommands(
+      context.credential,
+      context.controls.sessionId,
+      signal
+    );
+    const afterCommands = this.#runtimeCommandContext(expectedSurfaceOwnerKey);
+    const detail = await this.network.readSession(afterCommands.credential, afterCommands.controls.sessionId, signal);
+    signal?.throwIfAborted();
+    const current = this.#runtimeCommandContext(expectedSurfaceOwnerKey);
+    const refreshed = createMobileRuntimeCommandControls(
+      current.controls.authorityKey,
+      this.#state.owner,
+      detail,
+      this.#state.selectedId
+    );
+    if (!refreshed || refreshed.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+      throw new Error("The task runtime changed while its command catalog was loading.");
+    }
+    return projectMobileRuntimeCommandCatalog(refreshed, commands);
   }
 
   async validateTaskCatalogMentionCandidate(
@@ -4471,6 +4512,18 @@ export class MobileClient {
     const controls = this.taskCatalogMentionControls();
     if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
       throw new Error("The catalog reference owner changed. Reopen the reference list from the current task.");
+    }
+    return { credential, controls };
+  }
+
+  #runtimeCommandContext(expectedSurfaceOwnerKey: string): {
+    readonly credential: PairedCredential;
+    readonly controls: MobileRuntimeCommandControls;
+  } {
+    const credential = this.#ready();
+    const controls = this.taskRuntimeCommandControls();
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("The runtime command catalog owner changed. Type the slash command again.");
     }
     return { credential, controls };
   }

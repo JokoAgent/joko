@@ -8,7 +8,7 @@ import {
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
-  type NativeSessionTree, type PendingBlobUpload, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
+  type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceFileChange,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
@@ -62,6 +62,7 @@ export interface MobileNetwork {
   watchWorkspace(credential: PairedCredential, workspaceId: string, signal: AbortSignal): AsyncIterable<WorkspaceFileChange>;
   readWorkspaceFile(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<FilePreview>;
   listSessionArtifacts(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
+  listRuntimeCommands(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommand[]>;
   listSessionResources(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly SessionResource[]>;
   listArtifactReferenceCatalog(credential: PairedCredential, sessionId: string, generation: bigint, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
@@ -834,6 +835,12 @@ export const mobileNetwork: MobileNetwork = {
         revision: responseRevision(response.revision)
       };
     });
+  },
+  async listRuntimeCommands(credential, sessionId, signal) {
+    if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its runtime command catalog.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .listRuntimeCommands({ sessionId }, options(signal));
+    return response.commands;
   },
   async listSessionResources(credential, sessionId, signal) {
     if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its Resource catalog.");

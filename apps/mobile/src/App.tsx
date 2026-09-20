@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import {
-  AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
+  AccessibilityInfo, ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
   useWindowDimensions, View
 } from "react-native";
@@ -51,6 +51,7 @@ import {
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   mobileComposerNativeInputMaximumCharacters,
+  mobileComposerDraftsEqual,
   mobileInputSummary,
   mobileComposerAtomLabel,
   plainTextMobileComposerDraft,
@@ -98,6 +99,19 @@ import {
   type MobileComposerRichInputHandle,
   type MobileComposerRichPasteRequest
 } from "./MobileComposerRichInput";
+import { MobileRuntimeCommandPalette, type MobileRuntimeCommandPaletteStatus } from "./MobileRuntimeCommandPalette";
+import {
+  MobileRuntimeCommandCatalogCache,
+  assertMobileRuntimeCommandCandidate,
+  detectMobileRuntimeCommandActivation,
+  filterMobileRuntimeCommands,
+  replaceMobileRuntimeCommandRun,
+  resolveMobileRuntimeCommandPaletteKey,
+  type MobileRuntimeCommandActivation,
+  type MobileRuntimeCommandCandidate,
+  type MobileRuntimeCommandCatalog
+} from "./mobile-runtime-commands";
+import type { MobileComposerCommandPaletteKey } from "./mobile-composer-rich-input-protocol";
 import { MobileQuoteSelectionSheet } from "./MobileQuoteSelectionSheet";
 import {
   captureMobileQuoteSelection,
@@ -172,6 +186,7 @@ const client = new MobileClient(
   mobileComposerDrafts,
   mobileAttachmentFiles
 );
+const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
 
 interface MobilePhotoLibraryLease {
@@ -184,6 +199,41 @@ interface MobilePhotoLibraryLease {
 interface MobileComposerImageEditorLease {
   readonly session: MobileComposerImageEditorSession;
   readonly scopeKey: string;
+}
+
+interface MobileRuntimeCommandLoadState {
+  readonly ownerKey?: string;
+  readonly catalog?: MobileRuntimeCommandCatalog;
+  readonly status: MobileRuntimeCommandPaletteStatus;
+  readonly error?: string;
+}
+
+interface MobileRuntimeCommandDismissal {
+  readonly ownerKey: string;
+  readonly sourceDraft: MobileComposerDraft;
+  readonly selection: MobileComposerSelection;
+  readonly activation: MobileRuntimeCommandActivation;
+}
+
+interface MobileRuntimeCommandDraftLease {
+  readonly ownerKey: string;
+  readonly draftIdentityKey: string;
+  readonly revision: number;
+  readonly sourceDraft: MobileComposerDraft;
+  readonly selection: MobileComposerSelection;
+  readonly activation: MobileRuntimeCommandActivation;
+  readonly catalog: MobileRuntimeCommandCatalog;
+}
+
+interface MobileRuntimeCommandPaletteSnapshot {
+  readonly visible: boolean;
+  readonly ownerKey?: string;
+  readonly activation?: MobileRuntimeCommandActivation;
+  readonly catalog?: MobileRuntimeCommandCatalog;
+  readonly items: readonly MobileRuntimeCommandCandidate[];
+  readonly selectedIndex: number;
+  readonly status: MobileRuntimeCommandPaletteStatus;
+  readonly draftLease?: MobileRuntimeCommandDraftLease;
 }
 
 interface MobileImageGalleryView {
@@ -2064,6 +2114,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [sessionMentionError, setSessionMentionError] = useState("");
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [catalogMentionsVisible, setCatalogMentionsVisible] = useState(false);
+  const [composerComposing, setComposerComposing] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
+  const [runtimeCommandLoad, setRuntimeCommandLoad] = useState<MobileRuntimeCommandLoadState>({ status: "loading" });
+  const [runtimeCommandSelectedIndex, setRuntimeCommandSelectedIndex] = useState(0);
+  const [runtimeCommandDismissal, setRuntimeCommandDismissal] = useState<MobileRuntimeCommandDismissal>();
+  const [runtimeCommandDraftLease, setRuntimeCommandDraftLease] = useState<MobileRuntimeCommandDraftLease>();
+  const [runtimeCommandCommitting, setRuntimeCommandCommitting] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [composerNotice, setComposerNotice] = useState("");
@@ -2083,6 +2140,18 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
   const composerPasteEditableRef = useRef(false);
+  const composerComposingRef = useRef(false);
+  const composerFocusedRef = useRef(false);
+  const runtimeCommandControlsRef = useRef(client.taskRuntimeCommandControls());
+  const runtimeCommandAbortRef = useRef<AbortController | undefined>(undefined);
+  const runtimeCommandRequestRef = useRef(0);
+  const runtimeCommandPaletteRef = useRef<MobileRuntimeCommandPaletteSnapshot>({
+    visible: false,
+    items: [],
+    selectedIndex: 0,
+    status: "loading"
+  });
+  const runtimeCommandCommittingRef = useRef(false);
   const composerTheme = useMemo(() => mobileComposerRichTheme(colors), [colors]);
   const keyboard = useMobileKeyboardState();
   const safeArea = useSafeAreaInsets();
@@ -2178,6 +2247,19 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
   const catalogMentionControls = client.taskCatalogMentionControls();
   const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
+  const runtimeCommandControls = client.taskRuntimeCommandControls();
+  runtimeCommandControlsRef.current = runtimeCommandControls;
+  const runtimeCommandObservationKey = JSON.stringify([
+    ...(state.owner?.runtimeCommands ?? []),
+    ...(state.detail?.runtimeCommands ?? [])
+  ].filter((command) => command.sessionId === state.selectedId).map((command) => [
+    command.commandId,
+    command.name,
+    command.description,
+    command.source,
+    command.resourceId,
+    command.loaded
+  ]));
   const voiceTransport = client.taskVoiceTransport();
   const attachmentControls = client.taskAttachmentControls();
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
@@ -2188,6 +2270,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
   composerDraftRef.current = draft;
   composerSelectionRef.current = composerSelection;
+  composerComposingRef.current = composerComposing;
+  composerFocusedRef.current = composerFocused;
   const closeImageEditor = useCallback(() => {
     const lease = imageEditorLeaseRef.current;
     if (!lease) return;
@@ -2248,6 +2332,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
     setCatalogMentionsVisible(false);
+    composerComposingRef.current = false;
+    setComposerComposing(false);
+    composerFocusedRef.current = false;
+    setComposerFocused(false);
+    setRuntimeCommandDismissal(undefined);
+    setRuntimeCommandDraftLease(undefined);
     setQuoteSelection(undefined);
     setComposerAtomId(undefined);
     if (ownerChanged) {
@@ -2299,6 +2389,50 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     catalogMentionOwnerRef.current = next;
     if (changed || next === undefined) setCatalogMentionsVisible(false);
   }, [catalogMentionControls?.surfaceOwnerKey]);
+  const loadRuntimeCommandCatalog = useCallback(() => {
+    const controls = runtimeCommandControlsRef.current;
+    runtimeCommandAbortRef.current?.abort();
+    runtimeCommandAbortRef.current = undefined;
+    const request = runtimeCommandRequestRef.current + 1;
+    runtimeCommandRequestRef.current = request;
+    if (!controls) {
+      setRuntimeCommandLoad({ status: "loading" });
+      return;
+    }
+    const ownerKey = controls.surfaceOwnerKey;
+    const cached = runtimeCommandCatalogCache.read(ownerKey);
+    const controller = new AbortController();
+    runtimeCommandAbortRef.current = controller;
+    setRuntimeCommandLoad({
+      ownerKey,
+      ...(cached === undefined ? {} : { catalog: cached }),
+      status: cached === undefined ? "loading" : "refreshing"
+    });
+    void client.listTaskRuntimeCommands(ownerKey, controller.signal).then((catalog) => {
+      if (!taskMountedRef.current || controller.signal.aborted || runtimeCommandRequestRef.current !== request
+        || runtimeCommandControlsRef.current?.surfaceOwnerKey !== ownerKey
+        || catalog.surfaceOwnerKey !== ownerKey) return;
+      runtimeCommandCatalogCache.write(catalog);
+      setRuntimeCommandLoad({ ownerKey, catalog, status: "ready" });
+    }).catch((failure) => {
+      if (!taskMountedRef.current || controller.signal.aborted || runtimeCommandRequestRef.current !== request
+        || runtimeCommandControlsRef.current?.surfaceOwnerKey !== ownerKey) return;
+      setRuntimeCommandLoad({
+        ownerKey,
+        ...(cached === undefined ? {} : { catalog: cached }),
+        status: "error",
+        error: errorText(failure)
+      });
+    }).finally(() => {
+      if (runtimeCommandAbortRef.current === controller) runtimeCommandAbortRef.current = undefined;
+    });
+  }, []);
+  useEffect(() => {
+    setRuntimeCommandDismissal(undefined);
+    setRuntimeCommandDraftLease(undefined);
+    setRuntimeCommandSelectedIndex(0);
+    loadRuntimeCommandCatalog();
+  }, [loadRuntimeCommandCatalog, runtimeCommandControls?.surfaceOwnerKey, runtimeCommandObservationKey]);
   useEffect(() => {
     const next = attachmentControls?.surfaceOwnerKey;
     const observed = observeMobileAttachmentAuthority(
@@ -2371,6 +2505,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     draftIdentityRef.current = identity;
     setComposerManualHeight(null);
     setComposerContentHeight(composerMinimumInputHeight);
+    composerComposingRef.current = false;
+    setComposerComposing(false);
+    composerFocusedRef.current = false;
+    setComposerFocused(false);
+    setRuntimeCommandDismissal(undefined);
+    setRuntimeCommandDraftLease(undefined);
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
     setCatalogMentionsVisible(false);
@@ -2461,6 +2601,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     taskMountedRef.current = true;
     return () => {
       taskMountedRef.current = false;
+      runtimeCommandAbortRef.current?.abort();
+      runtimeCommandAbortRef.current = undefined;
+      runtimeCommandRequestRef.current += 1;
       attachmentAbortRef.current?.abort();
       attachmentNativeActivityRef.current = false;
       photoLibraryLeaseRef.current = undefined;
@@ -2515,6 +2658,224 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const composerPasteEditable = composerOwnerReady && queueEdit === undefined && !state.busy
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
+  const runtimeCommandEnabled = composerPasteEditable && composerFocused && interactions.length === 0
+    && state.status === "connected" && runtimeCommandControls !== undefined;
+  const runtimeCommandActivation = runtimeCommandEnabled
+    ? detectMobileRuntimeCommandActivation(draft, composerSelection, composerComposing)
+    : undefined;
+  const runtimeCommandDismissed = runtimeCommandActivation !== undefined && runtimeCommandControls !== undefined
+    && runtimeCommandDismissal?.ownerKey === runtimeCommandControls.surfaceOwnerKey
+    && runtimeCommandDismissal.sourceDraft === draft
+    && sameComposerSelection(runtimeCommandDismissal.selection, composerSelection)
+    && sameRuntimeCommandActivation(runtimeCommandDismissal.activation, runtimeCommandActivation);
+  const runtimeCommandPaletteVisible = runtimeCommandActivation !== undefined && runtimeCommandControls !== undefined
+    && !runtimeCommandDismissed;
+  const runtimeCommandLoadMatches = runtimeCommandControls !== undefined
+    && runtimeCommandLoad.ownerKey === runtimeCommandControls.surfaceOwnerKey;
+  const runtimeCommandCatalog = runtimeCommandLoadMatches ? runtimeCommandLoad.catalog : undefined;
+  const runtimeCommandPaletteStatus: MobileRuntimeCommandPaletteStatus = runtimeCommandLoadMatches
+    ? runtimeCommandLoad.status : "loading";
+  const runtimeCommandResults = useMemo(() => runtimeCommandCatalog === undefined || runtimeCommandActivation === undefined
+    ? { items: [] as readonly MobileRuntimeCommandCandidate[], truncated: false }
+    : filterMobileRuntimeCommands(runtimeCommandCatalog, runtimeCommandActivation.query), [
+      runtimeCommandActivation?.query,
+      runtimeCommandCatalog
+    ]);
+  const runtimeCommandResultKey = runtimeCommandResults.items.map((item) => item.commandId).join("\u001f");
+  useEffect(() => {
+    setRuntimeCommandSelectedIndex(0);
+  }, [
+    runtimeCommandActivation?.caret,
+    runtimeCommandActivation?.from,
+    runtimeCommandActivation?.query,
+    runtimeCommandActivation?.to,
+    runtimeCommandControls?.surfaceOwnerKey,
+    runtimeCommandResultKey
+  ]);
+  useEffect(() => {
+    let active = true;
+    setRuntimeCommandDraftLease(undefined);
+    const activation = runtimeCommandActivation;
+    const controls = runtimeCommandControls;
+    const catalog = runtimeCommandCatalog;
+    const identity = draftIdentity;
+    if (!runtimeCommandPaletteVisible || !activation || !controls || !catalog || !identity
+      || runtimeCommandPaletteStatus !== "ready" || runtimeCommandCommittingRef.current) return;
+    const sourceDraft = draft;
+    const selection = { ...composerSelection };
+    const identityKey = mobileComposerDraftIdentityKey(identity);
+    void mobileComposerDrafts.readSnapshot(identity).then((snapshot) => {
+      const currentActivation = detectMobileRuntimeCommandActivation(
+        composerDraftRef.current,
+        composerSelectionRef.current,
+        composerComposingRef.current
+      );
+      if (!active || !taskMountedRef.current || snapshot.draft === undefined
+        || !mobileComposerDraftsEqual(snapshot.draft, sourceDraft)
+        || composerDraftRef.current !== sourceDraft
+        || !sameComposerSelection(composerSelectionRef.current, selection)
+        || !sameRuntimeCommandActivation(currentActivation, activation)
+        || draftIdentityRef.current === undefined
+        || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== identityKey
+        || runtimeCommandControlsRef.current?.surfaceOwnerKey !== controls.surfaceOwnerKey
+        || runtimeCommandPaletteRef.current.catalog !== catalog
+        || runtimeCommandPaletteRef.current.status !== "ready") return;
+      setRuntimeCommandDraftLease({
+        ownerKey: controls.surfaceOwnerKey,
+        draftIdentityKey: identityKey,
+        revision: snapshot.revision,
+        sourceDraft,
+        selection,
+        activation,
+        catalog
+      });
+    }).catch((failure) => {
+      if (active && taskMountedRef.current) setLocalError(errorText(failure));
+    });
+    return () => { active = false; };
+  }, [
+    composerSelection.end,
+    composerSelection.start,
+    draft,
+    draftIdentityKey,
+    runtimeCommandActivation?.caret,
+    runtimeCommandActivation?.from,
+    runtimeCommandActivation?.query,
+    runtimeCommandActivation?.to,
+    runtimeCommandCatalog,
+    runtimeCommandControls?.surfaceOwnerKey,
+    runtimeCommandPaletteStatus,
+    runtimeCommandPaletteVisible
+  ]);
+  const selectedRuntimeCommandIndex = runtimeCommandResults.items.length === 0 ? 0
+    : Math.min(runtimeCommandSelectedIndex, runtimeCommandResults.items.length - 1);
+  const currentRuntimeCommandDraftLease = runtimeCommandDraftLease
+    && runtimeCommandControls && runtimeCommandActivation && runtimeCommandCatalog
+    && runtimeCommandDraftLease.ownerKey === runtimeCommandControls.surfaceOwnerKey
+    && runtimeCommandDraftLease.sourceDraft === draft
+    && runtimeCommandDraftLease.catalog === runtimeCommandCatalog
+    && sameComposerSelection(runtimeCommandDraftLease.selection, composerSelection)
+    && sameRuntimeCommandActivation(runtimeCommandDraftLease.activation, runtimeCommandActivation)
+    ? runtimeCommandDraftLease : undefined;
+  runtimeCommandPaletteRef.current = {
+    visible: runtimeCommandPaletteVisible,
+    ...(runtimeCommandControls === undefined ? {} : { ownerKey: runtimeCommandControls.surfaceOwnerKey }),
+    ...(runtimeCommandActivation === undefined ? {} : { activation: runtimeCommandActivation }),
+    ...(runtimeCommandCatalog === undefined ? {} : { catalog: runtimeCommandCatalog }),
+    items: runtimeCommandResults.items,
+    selectedIndex: selectedRuntimeCommandIndex,
+    status: runtimeCommandPaletteStatus,
+    ...(currentRuntimeCommandDraftLease === undefined ? {} : { draftLease: currentRuntimeCommandDraftLease })
+  };
+  const dismissRuntimeCommandPalette = useCallback(() => {
+    const palette = runtimeCommandPaletteRef.current;
+    if (!palette.visible || !palette.ownerKey || !palette.activation) return;
+    setRuntimeCommandDismissal({
+      ownerKey: palette.ownerKey,
+      sourceDraft: composerDraftRef.current,
+      selection: { ...composerSelectionRef.current },
+      activation: palette.activation
+    });
+    setRuntimeCommandDraftLease(undefined);
+  }, []);
+  const commitRuntimeCommand = useCallback(async (candidate: MobileRuntimeCommandCandidate): Promise<void> => {
+    const palette = runtimeCommandPaletteRef.current;
+    const lease = palette.draftLease;
+    const identity = draftIdentityRef.current;
+    if (runtimeCommandCommittingRef.current || !palette.visible || palette.status !== "ready"
+      || !lease || !identity || !palette.catalog || palette.catalog !== lease.catalog
+      || palette.ownerKey !== lease.ownerKey || mobileComposerDraftIdentityKey(identity) !== lease.draftIdentityKey) return;
+    runtimeCommandCommittingRef.current = true;
+    setRuntimeCommandCommitting(true);
+    setLocalError("");
+    try {
+      const controls = client.taskRuntimeCommandControls();
+      const currentActivation = detectMobileRuntimeCommandActivation(
+        composerDraftRef.current,
+        composerSelectionRef.current,
+        composerComposingRef.current
+      );
+      if (!controls || controls.surfaceOwnerKey !== lease.ownerKey
+        || composerDraftRef.current !== lease.sourceDraft
+        || !sameComposerSelection(composerSelectionRef.current, lease.selection)
+        || !sameRuntimeCommandActivation(currentActivation, lease.activation)) {
+        throw new Error("The task draft or runtime command owner changed. Type the slash command again.");
+      }
+      const exact = assertMobileRuntimeCommandCandidate(controls, lease.catalog, candidate);
+      const result = replaceMobileRuntimeCommandRun(lease.sourceDraft, lease.activation, exact);
+      if (!mobileComposerDrafts.saveIfRevision(identity, result.draft, lease.revision)) {
+        throw new Error("The task draft changed before the runtime command could be inserted.");
+      }
+      composerDraftRef.current = result.draft;
+      composerSelectionRef.current = result.selection;
+      setDraft(result.draft);
+      setComposerSelection(result.selection);
+      setRuntimeCommandDraftLease(undefined);
+      setRuntimeCommandDismissal(undefined);
+      setRuntimeCommandSelectedIndex(0);
+      try {
+        await mobileComposerDrafts.flush(identity);
+      } catch (failure) {
+        if (taskMountedRef.current && draftIdentityRef.current
+          && mobileComposerDraftIdentityKey(draftIdentityRef.current) === lease.draftIdentityKey) {
+          setLocalError(errorText(failure));
+        }
+      }
+      if (taskMountedRef.current && draftIdentityRef.current
+        && mobileComposerDraftIdentityKey(draftIdentityRef.current) === lease.draftIdentityKey
+        && mobileComposerDraftsEqual(composerDraftRef.current, result.draft)) {
+        setTimeout(() => {
+          if (!taskMountedRef.current || AppState.currentState !== "active" || draftIdentityRef.current === undefined
+            || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== lease.draftIdentityKey
+            || !mobileComposerDraftsEqual(composerDraftRef.current, result.draft)) return;
+          composerInputRef.current?.focus();
+        }, 0);
+      }
+    } catch (failure) {
+      if (taskMountedRef.current) {
+        const retained = mobileComposerDrafts.readSync(identity);
+        if (retained && !mobileComposerDraftsEqual(retained, composerDraftRef.current)) {
+          composerDraftRef.current = retained;
+          setDraft(retained);
+          const selection = boundedComposerSelection(composerSelectionRef.current, retained.text.length);
+          composerSelectionRef.current = selection;
+          setComposerSelection(selection);
+        }
+        setRuntimeCommandDraftLease(undefined);
+        setLocalError(errorText(failure));
+      }
+    } finally {
+      runtimeCommandCommittingRef.current = false;
+      if (taskMountedRef.current) setRuntimeCommandCommitting(false);
+    }
+  }, []);
+  const handleRuntimeCommandPaletteKey = useCallback((key: MobileComposerCommandPaletteKey) => {
+    const palette = runtimeCommandPaletteRef.current;
+    if (!palette.visible) return;
+    const decision = resolveMobileRuntimeCommandPaletteKey(
+      key,
+      palette.items,
+      palette.selectedIndex,
+      palette.status === "ready" && palette.draftLease !== undefined
+    );
+    if (decision.kind === "dismiss") {
+      dismissRuntimeCommandPalette();
+      return;
+    }
+    if (decision.kind === "move") {
+      setRuntimeCommandSelectedIndex(decision.selectedIndex);
+      return;
+    }
+    if (decision.kind === "commit") void commitRuntimeCommand(decision.candidate);
+  }, [commitRuntimeCommand, dismissRuntimeCommandPalette]);
+  useEffect(() => {
+    if (!runtimeCommandPaletteVisible) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      dismissRuntimeCommandPalette();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [dismissRuntimeCommandPalette, runtimeCommandPaletteVisible]);
   const openTimelineImage = (row: TimelineRow, image: MobileImageGalleryPageSummary): void => {
     if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
       || attachmentBusy || voice.busy || !row.completed) return;
@@ -3436,6 +3797,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
         busy={state.busy || voice.busy || attachmentBusy}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
+      <MobileRuntimeCommandPalette visible={runtimeCommandPaletteVisible}
+        query={runtimeCommandActivation?.query ?? ""} items={runtimeCommandResults.items}
+        selectedIndex={selectedRuntimeCommandIndex} status={runtimeCommandPaletteStatus}
+        error={runtimeCommandLoadMatches ? runtimeCommandLoad.error : undefined}
+        disabled={runtimeCommandCommitting}
+        checkingDraft={runtimeCommandPaletteStatus === "ready" && currentRuntimeCommandDraftLease === undefined}
+        colors={colors} onClose={dismissRuntimeCommandPalette}
+        onRefresh={loadRuntimeCommandCatalog} onRetry={loadRuntimeCommandCatalog}
+        onSelect={(candidate) => { void commitRuntimeCommand(candidate); }} />
       <View style={styles.composerRow}>
         {queueEdit ? <TextInput ref={queueInputRef} accessibilityLabel="Queued input" multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection}
@@ -3456,6 +3826,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
           : <MobileComposerRichInput key={`task-rich-${draftIdentityKey ?? "none"}`}
             ref={composerInputRef} accessibilityLabel="Task message"
+            commandPaletteOpen={runtimeCommandPaletteVisible}
             draft={composerOwnerReady ? draft : emptyMobileComposerDraft()}
             editable={composerPasteEditable} height={composerHeight.visibleHeight}
             maxHeight={composerBounds.maximumHeight} ownerKey={`task\u001f${draftIdentityKey ?? "none"}`}
@@ -3475,6 +3846,23 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
               mobileComposerDrafts.save(identity, result.draft);
             }}
             onError={setLocalError}
+            onBlur={() => {
+              composerFocusedRef.current = false;
+              composerComposingRef.current = false;
+              setComposerFocused(false);
+              setComposerComposing(false);
+              setRuntimeCommandDraftLease(undefined);
+            }}
+            onCommandPaletteKey={handleRuntimeCommandPaletteKey}
+            onCompositionChange={(composing) => {
+              composerComposingRef.current = composing;
+              setComposerComposing(composing);
+              if (composing) setRuntimeCommandDraftLease(undefined);
+            }}
+            onFocus={() => {
+              composerFocusedRef.current = true;
+              setComposerFocused(true);
+            }}
             onHeightChange={(nextHeight) => setComposerContentHeight(Math.max(composerMinimumInputHeight, nextHeight))}
             onOpenAtom={setComposerAtomId}
             onPasteText={(request) => { void pasteClipboardText(request); }}
@@ -4264,6 +4652,21 @@ function focusNative(ref: RefObject<View | null>): void {
   if (node !== null) setTimeout(() => AccessibilityInfo.setAccessibilityFocus(node), 0);
 }
 function errorText(error: unknown): string { return error instanceof Error ? error.message : "The Joko node is unavailable."; }
+
+function sameComposerSelection(
+  left: MobileComposerSelection | undefined,
+  right: MobileComposerSelection | undefined
+): boolean {
+  return left !== undefined && right !== undefined && left.start === right.start && left.end === right.end;
+}
+
+function sameRuntimeCommandActivation(
+  left: MobileRuntimeCommandActivation | undefined,
+  right: MobileRuntimeCommandActivation | undefined
+): boolean {
+  return left !== undefined && right !== undefined && left.from === right.from && left.to === right.to
+    && left.caret === right.caret && left.query === right.query;
+}
 
 function boundedComposerSelection(
   selection: MobileComposerSelection,

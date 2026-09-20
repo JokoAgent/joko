@@ -12,7 +12,7 @@ import {
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
-  SessionResourceSchema,
+  RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
   TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
@@ -173,6 +173,40 @@ const newTaskMentionSnapshot = create(SnapshotSchema, {
     })
   })],
   sessions: [snapshot.sessions[0]!, relatedSession]
+});
+const runtimeCommandSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    version: "backend-runtime-commands-v1",
+    entityVersion: create(EntityVersionSchema, {
+      generation: 1n,
+      revision: create(RevisionSchema, { value: 5n, etag: "backend-r5" })
+    }),
+    capabilities: create(CapabilityManifestSchema, {
+      schemaVersion: "1",
+      revision: create(RevisionSchema, { value: 6n, etag: "capabilities-r6" }),
+      capabilities: [
+        create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, { name: capabilityNames.runtimeCommands, support: CapabilitySupport.SUPPORTED })
+      ]
+    })
+  })],
+  targets: [create(TargetSchema, {
+    ...snapshot.targets[0]!,
+    version: create(EntityVersionSchema, {
+      generation: 1n,
+      revision: create(RevisionSchema, { value: 3n, etag: "target-r3" })
+    })
+  })],
+  sessions: [create(SessionSchema, {
+    ...snapshot.sessions[0]!,
+    nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 8n }),
+    version: create(EntityVersionSchema, {
+      generation: 8n,
+      revision: create(RevisionSchema, { value: 9n, etag: "session-r9" })
+    })
+  })]
 });
 const attachmentSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -654,6 +688,7 @@ function fakeNetwork(): MobileNetwork {
     }),
     readWorkspaceFile: vi.fn(async () => { throw new Error("No Workspace file fixture was configured."); }),
     listSessionArtifacts: vi.fn(async () => ({ artifacts: [], revision: "artifacts-1" })),
+    listRuntimeCommands: vi.fn(async () => []),
     listSessionResources: vi.fn(async () => []),
     listArtifactReferenceCatalog: vi.fn(async () => ({ artifacts: [], revision: "artifact-references-1" })),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
@@ -3502,6 +3537,123 @@ describe("native current-task message and Queue actions", () => {
       resources: { items: [{ resourceId: "resource-one" }] }
     });
     expect(resourceNetwork.listArtifactReferenceCatalog).not.toHaveBeenCalled();
+  });
+
+  it("loads runtime commands only from the exact typed Session catalog and fences it with a fresh generation read", async () => {
+    const network = projectedNetwork(runtimeCommandSnapshot);
+    vi.mocked(network.listRuntimeCommands).mockResolvedValue([
+      create(RuntimeCommandSchema, {
+        commandId: "skill-review",
+        name: "skill:review",
+        description: "Review current changes",
+        source: RuntimeCommandSource.SKILL,
+        resourceId: "review-skill",
+        loaded: true,
+        sessionId: "session"
+      }),
+      create(RuntimeCommandSchema, {
+        commandId: "not-loaded",
+        name: "future",
+        description: "Not loaded",
+        source: RuntimeCommandSource.PROMPT,
+        loaded: false,
+        sessionId: "session"
+      })
+    ]);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskRuntimeCommandControls()!;
+
+    await expect(app.listTaskRuntimeCommands(controls.surfaceOwnerKey)).resolves.toMatchObject({
+      sessionId: "session",
+      runtimeGeneration: "8",
+      items: [{
+        commandId: "skill-review", name: "skill:review", source: RuntimeCommandSource.SKILL,
+        resourceId: "review-skill"
+      }]
+    });
+    expect(network.listRuntimeCommands).toHaveBeenCalledWith(credential, "session", undefined);
+    expect(vi.mocked(network.listRuntimeCommands).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(network.readSession).mock.invocationCallOrder.at(-1)!);
+  });
+
+  it("retires a runtime command response when the fresh Session generation no longer matches its owner", async () => {
+    const network = projectedNetwork(runtimeCommandSnapshot);
+    vi.mocked(network.listRuntimeCommands).mockResolvedValue([create(RuntimeCommandSchema, {
+      commandId: "review",
+      name: "review",
+      description: "Review",
+      source: RuntimeCommandSource.PROMPT,
+      loaded: true,
+      sessionId: "session"
+    })]);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskRuntimeCommandControls()!;
+    const nextGeneration = create(SnapshotSchema, {
+      ...runtimeCommandSnapshot,
+      sessions: [create(SessionSchema, {
+        ...runtimeCommandSnapshot.sessions[0]!,
+        nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 9n }),
+        version: create(EntityVersionSchema, {
+          generation: 9n,
+          revision: create(RevisionSchema, { value: 10n, etag: "session-r10" })
+        })
+      })]
+    });
+    vi.mocked(network.readSession).mockResolvedValueOnce(nextGeneration);
+
+    await expect(app.listTaskRuntimeCommands(controls.surfaceOwnerKey)).rejects.toThrow(/runtime changed/u);
+  });
+
+  it("retires an in-flight runtime command catalog when the app leaves the foreground", async () => {
+    const network = projectedNetwork(runtimeCommandSnapshot);
+    let resolveCommands!: (commands: Awaited<ReturnType<MobileNetwork["listRuntimeCommands"]>>) => void;
+    vi.mocked(network.listRuntimeCommands).mockReturnValue(new Promise((resolve) => {
+      resolveCommands = resolve;
+    }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskRuntimeCommandControls()!;
+    vi.mocked(network.readSession).mockClear();
+    const pending = app.listTaskRuntimeCommands(controls.surfaceOwnerKey);
+
+    app.setForeground(false);
+    resolveCommands([create(RuntimeCommandSchema, {
+      commandId: "review",
+      name: "review",
+      description: "Review",
+      source: RuntimeCommandSource.PROMPT,
+      loaded: true,
+      sessionId: "session"
+    })]);
+
+    await expect(pending).rejects.toThrow(/Reconnect/u);
+    expect(network.readSession).not.toHaveBeenCalled();
+    expect(app.taskRuntimeCommandControls()).toBeUndefined();
+  });
+
+  it("does not expose runtime command controls without one supported public capability", async () => {
+    const missing = create(SnapshotSchema, {
+      ...runtimeCommandSnapshot,
+      backends: [create(BackendDescriptorSchema, {
+        ...runtimeCommandSnapshot.backends[0]!,
+        capabilities: create(CapabilityManifestSchema, {
+          ...runtimeCommandSnapshot.backends[0]!.capabilities!,
+          capabilities: [create(CapabilitySchema, {
+            name: capabilityNames.inputText,
+            support: CapabilitySupport.SUPPORTED
+          })]
+        })
+      })]
+    });
+    const network = projectedNetwork(missing);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    expect(app.taskRuntimeCommandControls()).toBeUndefined();
+    await expect(app.listTaskRuntimeCommands("guessed-owner")).rejects.toThrow(/owner changed/u);
+    expect(network.listRuntimeCommands).not.toHaveBeenCalled();
   });
 
   it("re-reads the exact catalog before selection and rejects retired authorities", async () => {
