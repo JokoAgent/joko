@@ -246,6 +246,12 @@ import {
   mobileImageOutputExtension,
   mobileImageOutputMediaType
 } from "./mobile-image-output-format";
+import {
+  mobileTimelinePreviewWindowKey,
+  resolveMobileTimelinePreviewArtifact,
+  sameMobileTimelinePreviewArtifact,
+  type MobileTimelinePreviewArtifact
+} from "./mobile-timeline-artifacts";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -293,6 +299,7 @@ export interface MobileState {
   readonly homeSearchStatus: "idle" | "searching" | "ready" | "error";
   readonly homeSearchSessionIds: readonly string[];
   readonly homeSearchError?: string;
+  readonly timelinePreview?: MobileFilePreview;
   readonly files: MobileFilesState;
   readonly error?: string;
 }
@@ -364,6 +371,17 @@ interface MobileImageGalleryLease {
     confirmed: boolean;
   };
   operationInFlight: boolean;
+}
+
+interface MobileTimelinePreviewLease {
+  readonly controller: AbortController;
+  readonly profileId: string;
+  readonly sessionId: string;
+  readonly taskAuthorityKey: string;
+  readonly windowKey: string;
+  readonly artifact: MobileTimelinePreviewArtifact;
+  media?: MobileMediaPreviewLease;
+  pdf?: MobilePdfPreviewLease;
 }
 
 export interface MobileQueueEditLease {
@@ -475,6 +493,7 @@ export class MobileClient {
   #filesPreviewAbort?: AbortController;
   #filesMediaPreview?: MobileMediaPreviewLease;
   #filesPdfPreview?: MobilePdfPreviewLease;
+  #timelinePreview?: MobileTimelinePreviewLease;
   #filesWatchAbort?: AbortController;
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
   #queueEditLease?: MobileQueueEditLease;
@@ -524,6 +543,10 @@ export class MobileClient {
     } else if (next.files.open && next.status !== "connected" && next.files.status !== "offline") {
       next = { ...next, files: { ...next.files, status: "offline" } };
     }
+    if (this.#timelinePreview && !this.#timelinePreviewSourceCurrent(this.#timelinePreview, next)) {
+      this.#cancelTimelinePreviewLease();
+      next = { ...next, timelinePreview: undefined };
+    }
     this.#state = next;
     for (const listener of this.#listeners) listener(this.#state);
   }
@@ -536,6 +559,7 @@ export class MobileClient {
     this.#homeSearchAbort = undefined;
     this.#homeSearchEpoch += 1;
     this.#cancelFilesRequests();
+    this.#cancelTimelinePreviewLease();
     this.#composerImageEdit = undefined;
     this.#imageGallery = undefined;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
@@ -554,6 +578,7 @@ export class MobileClient {
       homeSearchStatus: "idle",
       homeSearchSessionIds: [],
       homeSearchError: undefined,
+      timelinePreview: undefined,
       ...(this.#state.files.preview?.kind === "media" || this.#state.files.preview?.kind === "pdf"
         ? { files: { ...this.#state.files, preview: undefined } }
         : {})
@@ -1547,6 +1572,7 @@ export class MobileClient {
 
   async openFiles(): Promise<void> {
     const context = this.#filesContext();
+    this.closeTimelinePreview();
     this.#cancelFilesRequests();
     const epoch = this.#filesEpoch;
     const location = { kind: "workspace" as const, path: "" };
@@ -1870,6 +1896,93 @@ export class MobileClient {
     this.#filesPreviewAbort = undefined;
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
+  }
+
+  async previewTimelineArtifact(selected: MobileTimelinePreviewArtifact): Promise<void> {
+    const credential = this.#ready();
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    const sessionId = this.#state.selectedId;
+    const events = this.#timelineEvents();
+    const source = resolveMobileTimelinePreviewArtifact(events, selected);
+    const generation = this.#state.owner?.generation;
+    if (!taskAuthorityKey || !sessionId || !generation || !source
+      || source.event.identity?.sessionId !== sessionId
+      || source.event.cursor?.generation !== generation) {
+      throw new Error("Select a verified file from the current task Timeline.");
+    }
+    this.#cancelTimelinePreviewLease();
+    const controller = new AbortController();
+    const lease: MobileTimelinePreviewLease = {
+      controller,
+      profileId: credential.profileId,
+      sessionId,
+      taskAuthorityKey,
+      windowKey: mobileTimelinePreviewWindowKey(events),
+      artifact: source.artifact
+    };
+    this.#timelinePreview = lease;
+    const base = {
+      title: source.artifact.title,
+      sourceLabel: "Timeline message file",
+      mediaType: source.artifact.mediaType,
+      byteSize: source.blob.byteSize,
+      revisionKey: [source.artifact.artifactId, source.artifact.sourceKey].join(":")
+    };
+    this.#set({ timelinePreview: { ...base, kind: "loading" } });
+    let stagedMedia: MobileMediaPreviewLease | undefined;
+    let stagedPdf: MobilePdfPreviewLease | undefined;
+    try {
+      const download = await this.network.downloadBlob(credential, source.blob, controller.signal);
+      if (normalizeMediaType(download.mediaType) !== source.artifact.mediaType) {
+        throw new Error("The downloaded media type did not match the canonical Timeline Blob.");
+      }
+      let preview: MobileFilePreview;
+      if (source.artifact.previewKind === "media") {
+        if (!this.mediaPreviewFiles) throw new Error("Audio/video preview is unavailable on this mobile runtime.");
+        stagedMedia = await this.mediaPreviewFiles.stage(
+          credential.profileId,
+          this.newId(),
+          source.blob.fileName,
+          source.artifact.mediaType,
+          source.blob.sha256Hex,
+          download.bytes,
+          controller.signal
+        );
+        preview = { ...base, kind: "media", ...stagedMedia };
+      } else {
+        if (!this.pdfPreviewFiles) throw new Error("PDF preview is unavailable on this mobile runtime.");
+        stagedPdf = await this.pdfPreviewFiles.stage(
+          credential.profileId,
+          this.newId(),
+          source.blob.fileName,
+          source.artifact.mediaType,
+          source.blob.sha256Hex,
+          download.bytes,
+          controller.signal
+        );
+        preview = { ...base, kind: "pdf", ...stagedPdf };
+      }
+      if (!this.#timelinePreviewLeaseCurrent(lease)) {
+        if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
+        if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
+        return;
+      }
+      lease.media = stagedMedia;
+      lease.pdf = stagedPdf;
+      stagedMedia = undefined;
+      stagedPdf = undefined;
+      this.#set({ timelinePreview: preview });
+    } catch (error) {
+      if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
+      if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
+      if (!this.#timelinePreviewLeaseCurrent(lease)) return;
+      this.#set({ timelinePreview: { ...base, kind: "error", reason: message(error) } });
+    }
+  }
+
+  closeTimelinePreview(): void {
+    this.#cancelTimelinePreviewLease();
+    if (this.#state.timelinePreview) this.#set({ timelinePreview: undefined });
   }
 
   async addFilesItemToComposer(
@@ -3262,6 +3375,7 @@ export class MobileClient {
   }
 
   leaveTask(): void {
+    this.closeTimelinePreview();
     if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
   }
@@ -5600,8 +5714,7 @@ export class MobileClient {
   }
 
   #timelineEvents(): readonly Event[] {
-    return this.#state.window
-      ?? [...this.#state.older, ...(this.#state.detail?.timeline ?? []), ...this.#state.live];
+    return mobileStateTimelineEvents(this.#state);
   }
 
   #assertFilesGalleryOpenCurrent(
@@ -6202,6 +6315,44 @@ export class MobileClient {
     this.#filesWatchAbort = undefined;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = undefined;
+  }
+
+  #timelinePreviewSourceCurrent(lease: MobileTimelinePreviewLease, state: MobileState): boolean {
+    if (state.status !== "connected" || state.activeProfileId !== lease.profileId
+      || state.selectedId !== lease.sessionId) return false;
+    const events = mobileStateTimelineEvents(state);
+    if (mobileTimelinePreviewWindowKey(events) !== lease.windowKey) return false;
+    const source = resolveMobileTimelinePreviewArtifact(events, lease.artifact);
+    return source !== undefined
+      && source.event.identity?.sessionId === lease.sessionId
+      && source.event.cursor?.generation === state.owner?.generation
+      && sameMobileTimelinePreviewArtifact(source.artifact, lease.artifact);
+  }
+
+  #timelinePreviewLeaseCurrent(lease: MobileTimelinePreviewLease): boolean {
+    return this.#timelinePreview === lease && !lease.controller.signal.aborted
+      && this.#foreground && this.#credential?.profileId === lease.profileId
+      && this.#taskAuthorityKey() === lease.taskAuthorityKey
+      && this.#timelinePreviewSourceCurrent(lease, this.#state);
+  }
+
+  #cancelTimelinePreviewLease(): void {
+    const lease = this.#timelinePreview;
+    if (!lease) return;
+    this.#timelinePreview = undefined;
+    lease.controller.abort();
+    void this.#releaseTimelinePreviewLease(lease).catch(() => undefined);
+  }
+
+  async #releaseTimelinePreviewLease(lease: MobileTimelinePreviewLease): Promise<void> {
+    const media = lease.media;
+    const pdf = lease.pdf;
+    lease.media = undefined;
+    lease.pdf = undefined;
+    await Promise.all([
+      media && this.mediaPreviewFiles ? this.mediaPreviewFiles.remove(media) : Promise.resolve(),
+      pdf && this.pdfPreviewFiles ? this.pdfPreviewFiles.remove(pdf) : Promise.resolve()
+    ]);
   }
 
   async #releaseFilesBinaryPreviews(): Promise<void> {
@@ -6952,6 +7103,10 @@ export class MobileClient {
     this.#retire();
     this.#listeners.clear();
   }
+}
+
+function mobileStateTimelineEvents(state: MobileState): readonly Event[] {
+  return state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live];
 }
 
 function filesComposerArtifact(source: MobileFilesComposerSource): Artifact | undefined {

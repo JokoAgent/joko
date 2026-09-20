@@ -1069,6 +1069,35 @@ function timelineGalleryEvent(bytes: Uint8Array): Event {
   });
 }
 
+function timelinePreviewEvent(
+  fileName: string,
+  mediaType: string,
+  bytes: Uint8Array,
+  sha256Hex: string,
+  label = "Timeline file"
+): Event {
+  return create(EventSchema, {
+    eventId: "timeline-preview-event",
+    identity: { sessionId: "session" },
+    cursor: { opaqueToken: `timeline-preview-${fileName}`, sequence: 12n, generation: 1n },
+    payload: { kind: { case: "messageCompleted", value: {
+      messageId: "timeline-preview-message",
+      role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "artifact", value: {
+        label,
+        blob: create(BlobRefSchema, {
+          blobId: `timeline-${fileName}`,
+          fileName,
+          mediaType,
+          byteSize: BigInt(bytes.byteLength),
+          sha256Hex,
+          disposition: BlobDisposition.INLINE
+        })
+      } } }]
+    } } }
+  });
+}
+
 function acceptedTimelineGalleryEvent(bytes: Uint8Array): Event {
   const image = (blobId: string, fileName: string) => create(ImageRefSchema, {
     blob: create(BlobRefSchema, {
@@ -5868,6 +5897,87 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.open).toBe(false);
     expect(app.state.files.preview).toBeUndefined();
     expect(pdf.removed).toEqual(["preview-late-pdf-lease.pdf"]);
+  });
+
+  it("previews an exact durable Timeline video and removes its lease when closed", async () => {
+    const bytes = previewMp4Bytes();
+    const event = timelinePreviewEvent("demo.mp4", "video/mp4", bytes, "c".repeat(64), "Demo video");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
+    const media = mediaPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "timeline-media-lease", undefined, undefined, undefined, media.files);
+    await app.start();
+    const artifact = timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!;
+
+    await app.previewTimelineArtifact(artifact);
+
+    expect(app.state.timelinePreview).toMatchObject({
+      kind: "media",
+      mediaKind: "video",
+      title: "Demo video",
+      leaseId: "timeline-media-lease",
+      uri: "file:///media/preview-timeline-media-lease.mp4"
+    });
+    expect(network.downloadBlob).toHaveBeenCalledWith(
+      credential,
+      expect.objectContaining({ blobId: "timeline-demo.mp4", sha256Hex: "c".repeat(64) }),
+      expect.any(AbortSignal)
+    );
+    app.closeTimelinePreview();
+    await vi.waitFor(() => expect(media.removed).toEqual(["preview-timeline-media-lease.mp4"]));
+    expect(app.state.timelinePreview).toBeUndefined();
+  });
+
+  it("previews an exact durable Timeline PDF and retires it on background", async () => {
+    const bytes = previewPdfBytes();
+    const event = timelinePreviewEvent("proof.pdf", "application/pdf", bytes, "f".repeat(64), "Proof");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/pdf" });
+    const pdf = pdfPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "timeline-pdf-lease", undefined, undefined, undefined, undefined, pdf.files);
+    await app.start();
+    const artifact = timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!;
+
+    await app.previewTimelineArtifact(artifact);
+    expect(app.state.timelinePreview).toMatchObject({
+      kind: "pdf", title: "Proof", leaseId: "timeline-pdf-lease",
+      uri: "file:///pdf/preview-timeline-pdf-lease.pdf"
+    });
+
+    app.setForeground(false);
+    await vi.waitFor(() => expect(pdf.removed).toEqual(["preview-timeline-pdf-lease.pdf"]));
+    expect(app.state.timelinePreview).toBeUndefined();
+  });
+
+  it("cleans a late Timeline stage after the exact source window changes", async () => {
+    const bytes = previewMp4Bytes();
+    const event = timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video");
+    const replacement = timelinePreviewEvent("replacement.mp4", "video/mp4", bytes, "d".repeat(64), "Replacement");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
+    vi.mocked(network.readAround).mockResolvedValue([replacement]);
+    let resolveWrite!: (snapshot: MobileMediaPreviewFileSnapshot) => void;
+    const media = mediaPreviewFixture("e".repeat(64), async () => new Promise((resolve) => { resolveWrite = resolve; }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "timeline-late-lease", undefined, undefined, undefined, media.files);
+    await app.start();
+    const artifact = timelineRows(app.state.detail?.timeline ?? [])[0]!.artifacts![0]!;
+
+    const preview = app.previewTimelineArtifact(artifact);
+    await vi.waitFor(() => expect(media.driver.write).toHaveBeenCalled());
+    await app.around(event.eventId);
+    resolveWrite({
+      uri: "file:///media/preview-timeline-late-lease.mp4",
+      fileName: "preview-timeline-late-lease.mp4",
+      byteSize: bytes.byteLength,
+      bytes
+    });
+    await preview;
+
+    expect(app.state.timelinePreview).toBeUndefined();
+    expect(media.removed).toEqual(["preview-timeline-late-lease.mp4"]);
   });
 
   it("adds an authenticated Workspace Blob as an exact-profile attachment without replacing structured draft state", async () => {

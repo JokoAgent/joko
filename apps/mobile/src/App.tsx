@@ -100,6 +100,7 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
+import type { MobileTimelinePreviewArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
@@ -167,6 +168,7 @@ import {
   artifactTitle,
   workspaceBasename,
   workspaceParentPath,
+  type MobileFilePreview,
   type MobileFileSearchResult,
   type MobileFilesComposerSource,
   type MobileFilesSearchMode
@@ -3190,6 +3192,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         if (taskMountedRef.current) setGalleryOpening(false);
       });
   };
+  const openTimelineArtifact = (artifact: MobileTimelinePreviewArtifact): void => {
+    if (state.timelinePreview || galleryOpening || imageGallery.view || state.status !== "connected"
+      || state.busy || attachmentBusy || voice.busy) return;
+    setComposerNotice("");
+    setLocalError("");
+    void client.previewTimelineArtifact(artifact).catch((error) => {
+      if (taskMountedRef.current) setLocalError(errorText(error));
+    });
+  };
   useEffect(() => {
     if (!voice.busy) return;
     setRuntimeControlsVisible(false);
@@ -4165,6 +4176,27 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             <Text style={[styles.caption, { color: colors.accent }]}>Open</Text>
           </Pressable>)}
         </View>}
+        {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} files`} style={styles.messageImages}>
+          {item.artifacts.map((artifact) => {
+            const disabled = state.timelinePreview !== undefined || galleryOpening || imageGallery.view !== undefined
+              || state.status !== "connected" || state.busy || attachmentBusy || voice.busy;
+            return <Pressable key={artifact.artifactId} accessibilityRole="button"
+              accessibilityLabel={`Open ${artifact.title}, ${artifact.mediaType}`}
+              accessibilityHint="Opens this verified completed-message file in the full-screen preview"
+              disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
+              style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
+                disabled && styles.disabled]}>
+              <Text style={styles.messageImageGlyph}>{artifact.previewKind === "pdf" ? "▤" : "▶"}</Text>
+              <View style={styles.fill}>
+                <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifact.title}</Text>
+                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+                  {artifact.mediaType} · {formatByteSize(artifact.byteSize)}
+                </Text>
+              </View>
+              <Text style={[styles.caption, { color: colors.accent }]}>Open</Text>
+            </Pressable>;
+          })}
+        </View>}
         <View style={styles.messageActions}>
           <Pressable accessibilityRole="button" accessibilityLabel={`View context for ${item.label}`}
             disabled={state.historyBusy || state.status !== "connected"}
@@ -4477,6 +4509,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       }}
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={imageGallery.close} onSave={imageGallery.save} />}
+    <FilePreviewModal colors={colors} preview={state.timelinePreview} busy={false}
+      backLabel="Task" loadingLabel="Verifying the exact Timeline file…"
+      onClose={() => client.closeTimelinePreview()} />
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileCommandHelpSheet visible={commandHelpItems !== undefined} items={commandHelpItems ?? []}
@@ -4859,13 +4894,16 @@ function FileSearchResultRow({ result, colors, disabled, onPress, onAdd }: {
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, onClose }: {
+function FilePreviewModal({ colors, preview, source, busy, backLabel = "Files",
+  loadingLabel = "Loading the exact observed file revision…", onAdd, onOpenImage, onClose }: {
   colors: Colors;
-  preview: MobileClient["state"]["files"]["preview"];
-  source: MobileFilesComposerSource | undefined;
+  preview: MobileFilePreview | undefined;
+  source?: MobileFilesComposerSource;
   busy: boolean;
-  onAdd: (source: MobileFilesComposerSource) => void;
-  onOpenImage: (source: MobileFilesComposerSource) => void;
+  backLabel?: string;
+  loadingLabel?: string;
+  onAdd?: (source: MobileFilesComposerSource) => void;
+  onOpenImage?: (source: MobileFilesComposerSource) => void;
   onClose: () => void;
 }) {
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
@@ -4878,13 +4916,13 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
     <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       {preview && <>
         <View style={[styles.header, { borderBottomColor: colors.border }]}>
-          <Back onPress={onClose} colors={colors} label="Files" disabled={busy} />
+          <Back onPress={onClose} colors={colors} label={backLabel} disabled={busy} />
           <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{preview.title}</Text>
             <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{preview.sourceLabel}</Text></View>
-          {source && preview.kind === "image" && <Action label="Gallery"
+          {source && onOpenImage && preview.kind === "image" && <Action label="Gallery"
             accessibilityLabel={`Open image gallery for ${preview.title}`} compact colors={colors}
             disabled={busy} onPress={() => onOpenImage(source)} />}
-          {source && <Action label={busy ? "Adding…" : "Add"}
+          {source && onAdd && <Action label={busy ? "Adding…" : "Add"}
             accessibilityLabel={`Add ${preview.title} to composer`} compact colors={colors}
             disabled={busy || preview.kind === "loading"} onPress={() => onAdd(source)} />}
         </View>
@@ -4904,7 +4942,7 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
             {formatMobilePdfViewerStatus(pdfStatus)}
           </Text>}
         </View>
-        {preview.kind === "loading" ? <Centered label="Loading the exact observed file revision…" colors={colors} />
+        {preview.kind === "loading" ? <Centered label={loadingLabel} colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
             <Image source={{ uri: preview.dataUri }} accessibilityLabel={preview.altText} resizeMode="contain" style={styles.imagePreview} />
             {(preview.widthPixels > 0 || preview.heightPixels > 0) && <Text style={[styles.caption, { color: colors.muted }]}>

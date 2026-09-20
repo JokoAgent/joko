@@ -5,6 +5,10 @@ import {
   mobileTimelineGalleryPages,
   type MobileImageGalleryPageSummary
 } from "./mobile-image-gallery";
+import {
+  mobileTimelinePreviewArtifacts,
+  type MobileTimelinePreviewArtifact
+} from "./mobile-timeline-artifacts";
 
 export interface TimelineRow {
   readonly id: string;
@@ -20,6 +24,7 @@ export interface TimelineRow {
     readonly text: string;
   };
   readonly images?: readonly MobileImageGalleryPageSummary[];
+  readonly artifacts?: readonly MobileTimelinePreviewArtifact[];
 }
 
 export function timelineRows(events: readonly Event[]): TimelineRow[] {
@@ -52,6 +57,7 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
         const message = kind.value;
         const previous = byId.get(message.messageId);
         const completedImages = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
+        const artifacts = mobileTimelinePreviewArtifacts(event);
         const images = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
           && previous?.images && previous.images.length > 0
           ? previous.images
@@ -74,7 +80,8 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
             sourceEventId: event.eventId,
             text: quoteText
           } } : {}),
-          ...(images.length === 0 ? {} : { images }) });
+          ...(images.length === 0 ? {} : { images }),
+          ...(artifacts.length === 0 ? {} : { artifacts }) });
         break;
       }
       case "statusStream":
