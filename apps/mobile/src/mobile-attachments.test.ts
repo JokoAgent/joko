@@ -15,9 +15,11 @@ import {
   assertMobileAttachmentPolicy,
   classifyMobileAttachment,
   mobileAttachmentPickerMediaTypes,
+  mobileComposerAttachmentStorageIds,
   mobileComposerAttachmentsEqual,
   removeMobileComposerAttachment,
   replaceMobileComposerAttachment,
+  replaceMobileComposerAttachmentSlot,
   resolveMobileAttachmentPolicy,
   type MobileAttachmentPolicy,
   type MobileLocalComposerAttachment,
@@ -187,5 +189,45 @@ describe("mobile attachment capability and draft identity", () => {
       .toThrow(/at most 2 attachments/u);
     expect(() => assertMobileAttachmentPolicy([{ ...localFile, mediaType: "text/plain" }], policy))
       .toThrow(/file type is not supported/u);
+  });
+
+  it("retains normalized annotation source truth while atomically replacing one visible slot", () => {
+    const annotated = {
+      ...localImage,
+      attachmentId: "image-annotated",
+      fileName: "pixel-annotated.png",
+      sha256Hex: "c".repeat(64),
+      annotation: {
+        source: {
+          storageId: "annotation-source-one",
+          fileName: localImage.fileName,
+          mediaType: localImage.mediaType,
+          byteSize: localImage.byteSize,
+          sha256Hex: localImage.sha256Hex,
+          capturedAtUnixMs: localImage.capturedAtUnixMs
+        },
+        strokes: [{ points: [{ x: 0.1, y: 0.2 }, { x: 0.3, y: 0.4 }] }]
+      }
+    } satisfies MobileLocalComposerAttachment;
+    const replaced = replaceMobileComposerAttachmentSlot([localImage, localFile], localImage, annotated);
+    expect(replaced).toEqual([annotated, localFile]);
+    expect(mobileComposerAttachmentsEqual(replaced[0]!, annotated)).toBe(true);
+    expect(mobileComposerAttachmentStorageIds([annotated, localFile])).toEqual([
+      "image-annotated", "annotation-source-one", "file-one"
+    ]);
+    expect(() => replaceMobileComposerAttachmentSlot([localImage], { ...localImage, byteSize: 5 }, annotated))
+      .toThrow(/changed/u);
+    expect(() => assertMobileAttachmentPolicy([{ ...annotated, annotation: {
+      ...annotated.annotation,
+      source: { ...annotated.annotation.source, storageId: annotated.attachmentId }
+    } }], policy)).toThrow(/isolated/u);
+    expect(() => assertMobileAttachmentPolicy([annotated, {
+      ...localFile,
+      attachmentId: annotated.annotation.source.storageId
+    }], policy)).toThrow(/every visible attachment/u);
+    expect(() => assertMobileAttachmentPolicy([annotated, {
+      ...annotated,
+      attachmentId: "image-annotated-two"
+    }], policy)).toThrow(/source identity is duplicated/u);
   });
 });

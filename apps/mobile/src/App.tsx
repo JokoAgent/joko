@@ -118,6 +118,9 @@ import {
 import { buildMobileMessageActions, queueItemText, type MobileMessageActionId } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
 import type { MobileVoiceRunError } from "./mobile-voice-input";
+import { MobileImageLightbox } from "./MobileImageLightbox";
+import type { MobileBurnedImage, MobileComposerImageEditorSession } from "./mobile-composer-image-editor";
+import type { MobileImageAnnotationStroke } from "./mobile-image-annotation";
 
 const client = new MobileClient(
   mobileNetwork,
@@ -138,6 +141,11 @@ interface MobilePhotoLibraryLease {
   readonly scopeKey: string;
   readonly generation: number;
   readonly controller: AbortController;
+}
+
+interface MobileComposerImageEditorLease {
+  readonly session: MobileComposerImageEditorSession;
+  readonly scopeKey: string;
 }
 
 export function App() {
@@ -799,6 +807,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [mentionBusy, setMentionBusy] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
+  const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const mountedRef = useRef(true);
   const composerInputRef = useRef<TextInput>(null);
   const profileId = state.activeProfileId;
@@ -822,10 +831,22 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
   const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
+  const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
   const draftRef = useRef(draft);
   const selectionRef = useRef(composerSelection);
   draftRef.current = draft;
   selectionRef.current = composerSelection;
+  const closeImageEditor = useCallback(() => {
+    const lease = imageEditorLeaseRef.current;
+    if (!lease) return;
+    client.cancelComposerImageEditor(lease.session.leaseId);
+    imageEditorLeaseRef.current = undefined;
+    setImageEditorLease(undefined);
+    attachmentNativeActivityRef.current = false;
+    attachmentGenerationRef.current += 1;
+    attachmentOwnerRef.current = client.newTaskAttachmentControls(draftRef.current.targetId)?.surfaceOwnerKey;
+    setAttachmentBusy(false);
+  }, []);
   const patchDraft = (patch: Partial<typeof draft>): void => {
     setDraft((current) => {
       const next = { ...current, ...patch };
@@ -882,6 +903,10 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       attachmentAbortRef.current?.abort();
       attachmentNativeActivityRef.current = false;
       photoLibraryLeaseRef.current = undefined;
+      if (imageEditorLeaseRef.current) {
+        client.cancelComposerImageEditor(imageEditorLeaseRef.current.session.leaseId);
+        imageEditorLeaseRef.current = undefined;
+      }
       void mobileNewTaskDrafts.flush(identity).catch(() => undefined);
     };
   }, [profileId]);
@@ -918,6 +943,11 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       attachmentNativeActivityRef.current = false;
       photoLibraryLeaseRef.current = undefined;
       setPhotoLibraryLease(undefined);
+      if (imageEditorLeaseRef.current) {
+        client.cancelComposerImageEditor(imageEditorLeaseRef.current.session.leaseId);
+        imageEditorLeaseRef.current = undefined;
+        setImageEditorLease(undefined);
+      }
       attachmentGenerationRef.current += 1;
       setAttachmentBusy(false);
     }
@@ -935,6 +965,13 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     attachmentGenerationRef.current += 1;
     setAttachmentBusy(false);
   }, [draft.targetId, profileId, state.status]);
+  useEffect(() => {
+    const lease = imageEditorLeaseRef.current;
+    if (!lease) return;
+    const scopeKey = profileId && draft.targetId ? `${profileId}\u001f${draft.targetId}` : "";
+    if (lease.scopeKey === scopeKey && state.status === "connected") return;
+    closeImageEditor();
+  }, [closeImageEditor, draft.targetId, profileId, state.status]);
   const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
   const voice = useMobileVoiceInput({
     transport: voiceTransport,
@@ -1254,6 +1291,66 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
     }
   };
+  const openImageEditor = async (attachmentId: string): Promise<void> => {
+    const ownerProfileId = profileIdRef.current;
+    const targetId = draftRef.current.targetId;
+    const attachment = draftRef.current.input.attachments.find((candidate) => candidate.attachmentId === attachmentId);
+    if (!ownerProfileId || !targetId || attachment?.kind !== "image" || !referencesEditable
+      || attachmentNativeActivityRef.current || imageEditorLeaseRef.current) return;
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setAttachmentBusy(true);
+    setError("");
+    let opened = false;
+    try {
+      const session = await client.openComposerImageEditor({
+        surface: "new-task",
+        targetId,
+        attachmentId
+      }, controller.signal);
+      const scopeKey = `${ownerProfileId}\u001f${targetId}`;
+      if (!mountedRef.current || attachmentGenerationRef.current !== generation
+        || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId) {
+        client.cancelComposerImageEditor(session.leaseId);
+        return;
+      }
+      const lease = { session, scopeKey };
+      attachmentNativeActivityRef.current = false;
+      imageEditorLeaseRef.current = lease;
+      setImageEditorLease(lease);
+      opened = true;
+    } catch (failure) {
+      if (!controller.signal.aborted && mountedRef.current && attachmentGenerationRef.current === generation) {
+        setError(errorText(failure));
+      }
+    } finally {
+      if (attachmentAbortRef.current === controller) attachmentAbortRef.current = undefined;
+      if (!opened && mountedRef.current && attachmentGenerationRef.current === generation) {
+        attachmentNativeActivityRef.current = false;
+        setAttachmentBusy(false);
+      }
+    }
+  };
+  const saveImageEditor = async (
+    strokes: readonly MobileImageAnnotationStroke[],
+    burned: MobileBurnedImage | undefined,
+    signal: AbortSignal
+  ): Promise<void> => {
+    const lease = imageEditorLeaseRef.current;
+    if (!lease) throw new Error("The image editor is no longer open.");
+    const result = await client.commitComposerImageEditor(lease.session.leaseId, strokes, burned, signal);
+    if (!mountedRef.current || imageEditorLeaseRef.current !== lease || result.surface !== "new-task"
+      || lease.scopeKey !== `${profileIdRef.current ?? ""}\u001f${draftRef.current.targetId}`) {
+      throw new Error("The new-task image editor owner changed before its result could be displayed.");
+    }
+    const next = { ...draftRef.current, input: result.draft };
+    draftRef.current = next;
+    setDraft(next);
+  };
   const submit = (): void => {
     if (!identity || voice.busy) return;
     setError("");
@@ -1332,7 +1429,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         </ScrollView>}
       </View>}
       <MobileAttachmentTray attachments={draft.input.attachments} colors={colors}
-        disabled={!referencesEditable} busy={attachmentBusy || state.busy} onRemove={removeAttachment} />
+        disabled={!referencesEditable} busy={attachmentBusy || state.busy}
+        onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />
       <TextInput ref={composerInputRef} accessibilityLabel="First message" accessibilityHint="This structured message is sent after the task is created"
         multiline textAlignVertical="top" maxLength={1_000_000} editable={referencesEditable}
         placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={ownerReady ? draft.input.text : ""}
@@ -1398,6 +1496,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         - draft.input.attachments.length)}
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
+    {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
+      onClose={closeImageEditor} onSave={saveImageEditor} />}
   </ScrollView>;
 }
 
@@ -1443,6 +1543,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [catalogMentionsVisible, setCatalogMentionsVisible] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
+  const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -1547,8 +1648,20 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
   const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
+  const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
   composerDraftRef.current = draft;
   composerSelectionRef.current = composerSelection;
+  const closeImageEditor = useCallback(() => {
+    const lease = imageEditorLeaseRef.current;
+    if (!lease) return;
+    client.cancelComposerImageEditor(lease.session.leaseId);
+    imageEditorLeaseRef.current = undefined;
+    setImageEditorLease(undefined);
+    attachmentNativeActivityRef.current = false;
+    attachmentGenerationRef.current += 1;
+    attachmentOwnerRef.current = client.taskAttachmentControls()?.surfaceOwnerKey;
+    setAttachmentBusy(false);
+  }, []);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -1661,6 +1774,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       attachmentNativeActivityRef.current = false;
       photoLibraryLeaseRef.current = undefined;
       setPhotoLibraryLease(undefined);
+      if (imageEditorLeaseRef.current) {
+        client.cancelComposerImageEditor(imageEditorLeaseRef.current.session.leaseId);
+        imageEditorLeaseRef.current = undefined;
+        setImageEditorLease(undefined);
+      }
       attachmentGenerationRef.current += 1;
       setAttachmentBusy(false);
     }
@@ -1678,6 +1796,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     attachmentGenerationRef.current += 1;
     setAttachmentBusy(false);
   }, [draftIdentityKey, state.status]);
+  useEffect(() => {
+    const lease = imageEditorLeaseRef.current;
+    if (!lease) return;
+    if (lease.scopeKey === (draftIdentityKey ?? "") && state.status === "connected") return;
+    closeImageEditor();
+  }, [closeImageEditor, draftIdentityKey, state.status]);
   useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
@@ -1793,6 +1917,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       attachmentAbortRef.current?.abort();
       attachmentNativeActivityRef.current = false;
       photoLibraryLeaseRef.current = undefined;
+      if (imageEditorLeaseRef.current) {
+        client.cancelComposerImageEditor(imageEditorLeaseRef.current.session.leaseId);
+        imageEditorLeaseRef.current = undefined;
+      }
       queueEditRef.current = undefined;
       client.leaveTask();
     };
@@ -2067,6 +2195,73 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       if (taskMountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
     }
   };
+  const openImageEditor = async (attachmentId: string): Promise<void> => {
+    const identity = draftIdentityRef.current;
+    const attachment = composerDraftRef.current.attachments.find((candidate) => candidate.attachmentId === attachmentId);
+    if (!identity || attachment?.kind !== "image" || !composerOwnerReady || queueEditRef.current
+      || state.busy || voice.busy || attachmentNativeActivityRef.current || imageEditorLeaseRef.current) return;
+    const scopeKey = mobileComposerDraftIdentityKey(identity);
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    setRuntimeControlsVisible(false);
+    setContextVisible(false);
+    setNativeTreeVisible(false);
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
+    setAttachmentBusy(true);
+    setLocalError("");
+    let opened = false;
+    try {
+      const editor = await client.openComposerImageEditor({ surface: "task", attachmentId }, controller.signal);
+      const currentIdentity = draftIdentityRef.current;
+      if (!taskMountedRef.current || attachmentGenerationRef.current !== generation || !currentIdentity
+        || mobileComposerDraftIdentityKey(currentIdentity) !== scopeKey) {
+        client.cancelComposerImageEditor(editor.leaseId);
+        return;
+      }
+      const lease = { session: editor, scopeKey };
+      attachmentNativeActivityRef.current = false;
+      imageEditorLeaseRef.current = lease;
+      setImageEditorLease(lease);
+      opened = true;
+    } catch (failure) {
+      if (!controller.signal.aborted && taskMountedRef.current && attachmentGenerationRef.current === generation) {
+        setLocalError(errorText(failure));
+      }
+    } finally {
+      if (attachmentAbortRef.current === controller) attachmentAbortRef.current = undefined;
+      if (!opened && taskMountedRef.current && attachmentGenerationRef.current === generation) {
+        attachmentNativeActivityRef.current = false;
+        setAttachmentBusy(false);
+      }
+    }
+  };
+  const saveImageEditor = async (
+    strokes: readonly MobileImageAnnotationStroke[],
+    burned: MobileBurnedImage | undefined,
+    signal: AbortSignal
+  ): Promise<void> => {
+    const lease = imageEditorLeaseRef.current;
+    if (!lease) throw new Error("The image editor is no longer open.");
+    const result = await client.commitComposerImageEditor(lease.session.leaseId, strokes, burned, signal);
+    const identity = draftIdentityRef.current;
+    if (!taskMountedRef.current || imageEditorLeaseRef.current !== lease || result.surface !== "task"
+      || !identity || lease.scopeKey !== mobileComposerDraftIdentityKey(identity)) {
+      throw new Error("The task image editor owner changed before its result could be displayed.");
+    }
+    composerDraftRef.current = result.draft;
+    setDraft(result.draft);
+    const selection = composerSelectionRef.current;
+    const bounded = {
+      start: Math.min(selection.start, result.draft.text.length),
+      end: Math.min(selection.end, result.draft.text.length)
+    };
+    composerSelectionRef.current = bounded;
+    setComposerSelection(bounded);
+  };
   const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
     const controls = sessionMentionControls;
     if (!controls || sessionMentionOwnerRef.current !== controls.surfaceOwnerKey || queueEditRef.current) {
@@ -2334,14 +2529,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       <View style={styles.headerActions}>
         <Action label="Branches"
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
-          disabled={nativeTreeControls === undefined || state.busy || voice.busy || interactions.length > 0} />
+          disabled={nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
         <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
-          disabled={contextControls === undefined || state.busy || voice.busy || interactions.length > 0} />
+          disabled={contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
         <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
           disabled={!runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
-        <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
+        {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact disabled={attachmentBusy} />}
+        <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
       </View>
     </View>
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
@@ -2518,7 +2713,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       </View>}
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
         disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
-        busy={state.busy || voice.busy || attachmentBusy} onRemove={removeAttachment} />}
+        busy={state.busy || voice.busy || attachmentBusy}
+        onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
       <View style={styles.composerRow}>
         <TextInput ref={composerInputRef} accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection} maxLength={1_000_000}
@@ -2564,6 +2760,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         - draft.attachments.length)}
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
+    {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
+      onClose={closeImageEditor} onSave={saveImageEditor} />}
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}
@@ -3015,11 +3213,12 @@ function ModeTab({ label, selected, onPress, colors, disabled }: {
   </Pressable>;
 }
 
-function MobileAttachmentTray({ attachments, colors, disabled, busy, onRemove }: {
+function MobileAttachmentTray({ attachments, colors, disabled, busy, onPreview, onRemove }: {
   attachments: readonly MobileComposerAttachment[];
   colors: Colors;
   disabled: boolean;
   busy: boolean;
+  onPreview: (attachmentId: string) => void;
   onRemove: (attachmentId: string) => void;
 }) {
   if (attachments.length === 0) return null;
@@ -3034,6 +3233,13 @@ function MobileAttachmentTray({ attachments, colors, disabled, busy, onRemove }:
         </Text>
       </View>
       {busy && attachment.state === "local" && <ActivityIndicator color={colors.accent} size="small" />}
+      {attachment.kind === "image" && <Pressable accessibilityRole="button"
+        accessibilityLabel={`Preview image ${attachment.fileName}`}
+        accessibilityHint="Opens the full-screen image viewer and annotation tools" disabled={disabled}
+        onPress={() => onPreview(attachment.attachmentId)}
+        style={[styles.attachmentPreview, disabled && styles.disabled]}>
+        <Text style={[styles.attachmentPreviewText, { color: colors.accent }]}>Preview</Text>
+      </Pressable>}
       <Pressable accessibilityRole="button" accessibilityLabel={`Remove attachment ${attachment.fileName}`}
         accessibilityHint="Removes this exact attachment from the draft" disabled={disabled}
         onPress={() => onRemove(attachment.attachmentId)} style={[styles.attachmentRemove, disabled && styles.disabled]}>
@@ -3342,6 +3548,8 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderRadius: 12, paddingLeft: 12, paddingRight: 6, paddingVertical: 7,
     flexDirection: "row", alignItems: "center", gap: 8 },
   attachmentName: { fontSize: 13, lineHeight: 18, fontWeight: "700" },
+  attachmentPreview: { minWidth: 68, minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 8 },
+  attachmentPreviewText: { fontSize: 13, lineHeight: 18, fontWeight: "700" },
   attachmentRemove: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
   attachmentRemoveText: { fontSize: 24, lineHeight: 26, fontWeight: "500" },
   composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 10 },

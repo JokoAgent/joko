@@ -155,6 +155,91 @@ describe("mobile durable attachment files", () => {
     );
   });
 
+  it("keeps a separately verified annotation source and removes it with the visible attachment", async () => {
+    const fixture = fileFixture([], {});
+    const files = new MobileAttachmentFiles(fixture.driver, digest, () => 7_000);
+    const bytes = new Uint8Array([1, 9]);
+    await expect(files.stageOwnedBytes(
+      "profile-one", "annotation-source-one", bytes, "a".repeat(64)
+    )).resolves.toMatchObject({
+      uri: "file:///durable/profile-one/annotation-source-one",
+      byteSize: 2,
+      sha256Hex: "a".repeat(64)
+    });
+    await expect(files.readOwnedBytes(
+      "profile-one", "annotation-source-one", 2, "a".repeat(64)
+    )).resolves.toMatchObject({ byteSize: 2, bytes });
+
+    fixture.stored.set(fixture.key("profile-one", "annotation-source-one"), {
+      uri: "file:///durable/profile-one/annotation-source-one", byteSize: 2, bytes: new Uint8Array([2, 9])
+    });
+    await expect(files.readOwnedBytes(
+      "profile-one", "annotation-source-one", 2, "a".repeat(64)
+    )).rejects.toThrow(/SHA-256/u);
+    fixture.stored.set(fixture.key("profile-one", "annotation-source-one"), {
+      uri: "file:///durable/profile-one/annotation-source-one", byteSize: 2, bytes
+    });
+
+    await files.remove("profile-one", {
+      state: "uploaded",
+      attachmentId: "rendered-one",
+      kind: "image",
+      fileName: "annotated.png",
+      mediaType: "image/png",
+      byteSize: 2,
+      sha256Hex: "a".repeat(64),
+      capturedAtUnixMs: 7_001,
+      blobId: "blob-one",
+      annotation: {
+        source: {
+          storageId: "annotation-source-one",
+          fileName: "original.png",
+          mediaType: "image/png",
+          byteSize: 2,
+          sha256Hex: "a".repeat(64),
+          capturedAtUnixMs: 7_000
+        },
+        strokes: [{ points: [{ x: 0.2, y: 0.3 }] }]
+      }
+    });
+    expect(fixture.stored.has(fixture.key("profile-one", "annotation-source-one"))).toBe(false);
+  });
+
+  it("reserves annotation source identities before writing a new visible attachment", async () => {
+    const fixture = fileFixture([], {});
+    const files = new MobileAttachmentFiles(fixture.driver, digest, () => 7_000);
+    const current: MobileLocalComposerAttachment = {
+      state: "local",
+      attachmentId: "rendered-one",
+      kind: "image",
+      fileName: "annotated.png",
+      mediaType: "image/png",
+      byteSize: 2,
+      sha256Hex: "a".repeat(64),
+      capturedAtUnixMs: 7_001,
+      annotation: {
+        source: {
+          storageId: "annotation-source-one",
+          fileName: "original.png",
+          mediaType: "image/png",
+          byteSize: 2,
+          sha256Hex: "a".repeat(64),
+          capturedAtUnixMs: 7_000
+        },
+        strokes: [{ points: [{ x: 0.2, y: 0.3 }] }]
+      }
+    };
+
+    await expect(files.stageVerifiedBytes("profile-one", [current], policy, {
+      bytes: new Uint8Array([1, 9]),
+      fileName: "next.png",
+      mediaType: "image/png",
+      byteSize: 2,
+      sha256Hex: "a".repeat(64)
+    }, () => "annotation-source-one")).rejects.toThrow(/already in use/u);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+  });
+
   it("cleans every copied item when a later picker result changes during staging", async () => {
     const selected = [
       { uri: "content://picker/one", fileName: "one.png", mediaType: "image/png", byteSize: 2 },

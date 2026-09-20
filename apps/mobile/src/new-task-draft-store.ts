@@ -58,6 +58,11 @@ export type MobileNewTaskDraftErrorListener = (
   error: Error
 ) => void;
 
+export interface MobileNewTaskDraftSnapshot {
+  readonly revision: number;
+  readonly draft?: MobileNewTaskDraft;
+}
+
 const storagePrefix = "joko.mobile.new-task-draft.v3";
 const persistDebounceMilliseconds = 400;
 const maximumStoredCharacters = 1_040_960;
@@ -70,6 +75,7 @@ export class MobileNewTaskDraftStore {
   readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #operations = new Map<string, Promise<void>>();
   readonly #listeners = new Set<MobileNewTaskDraftErrorListener>();
+  readonly #revisions = new Map<string, number>();
 
   constructor(readonly driver: MobilePlainStorageDriver) {}
 
@@ -121,6 +127,7 @@ export class MobileNewTaskDraftStore {
     const value = normalizeEditableDraft(draft);
     const serialized = serializeRecord(exact, value);
     this.#cancelTimer(key);
+    this.#bumpRevision(key);
     this.#memory.set(key, value);
     this.#cleared.delete(key);
     this.#dirty.add(key);
@@ -130,6 +137,30 @@ export class MobileNewTaskDraftStore {
       void this.#persistIfCurrent(exact, value, serialized).catch(() => undefined);
     }, persistDebounceMilliseconds);
     this.#timers.set(key, timer);
+  }
+
+  async readSnapshot(identity: MobileNewTaskDraftIdentity): Promise<MobileNewTaskDraftSnapshot> {
+    const exact = normalizeIdentity(identity);
+    await this.read(exact);
+    const draft = this.readSync(exact);
+    return {
+      revision: this.#revisions.get(identityKey(exact)) ?? 0,
+      ...(draft === null ? {} : { draft })
+    };
+  }
+
+  saveIfRevision(
+    identity: MobileNewTaskDraftIdentity,
+    draft: MobileNewTaskEditableDraft,
+    expectedRevision: number
+  ): boolean {
+    const exact = normalizeIdentity(identity);
+    const key = identityKey(exact);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0
+      || (this.#revisions.get(key) ?? 0) !== expectedRevision
+      || this.#memory.get(key)?.submission !== undefined) return false;
+    this.save(exact, draft);
+    return (this.#revisions.get(key) ?? 0) === expectedRevision + 1;
   }
 
   async beginSubmission(
@@ -246,6 +277,7 @@ export class MobileNewTaskDraftStore {
     const exact = normalizeIdentity(identity);
     const key = identityKey(exact);
     this.#cancelTimer(key);
+    this.#bumpRevision(key);
     this.#memory.delete(key);
     this.#cleared.add(key);
     this.#dirty.add(key);
@@ -281,6 +313,7 @@ export class MobileNewTaskDraftStore {
     const serialized = serializeRecord(identity, value);
     const key = identityKey(identity);
     this.#cancelTimer(key);
+    this.#bumpRevision(key);
     this.#memory.set(key, value);
     this.#cleared.delete(key);
     this.#dirty.add(key);
@@ -340,6 +373,12 @@ export class MobileNewTaskDraftStore {
 
   #notify(identity: MobileNewTaskDraftIdentity, error: Error): void {
     for (const listener of this.#listeners) listener(identity, error);
+  }
+
+  #bumpRevision(key: string): void {
+    const current = this.#revisions.get(key) ?? 0;
+    if (current >= Number.MAX_SAFE_INTEGER) throw new Error("The local Joko new-task draft revision is exhausted.");
+    this.#revisions.set(key, current + 1);
   }
 }
 

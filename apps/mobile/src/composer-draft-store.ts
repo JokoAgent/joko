@@ -128,8 +128,9 @@ export class MobileComposerDraftStore {
 
   async readSnapshot(identity: MobileComposerDraftIdentity): Promise<MobileComposerDraftSnapshot> {
     const exact = normalizeIdentity(identity);
-    const draft = await this.read(exact);
+    await this.read(exact);
     const revision = this.#revisions.get(identityKey(exact)) ?? 0;
+    const draft = this.readSync(exact);
     return {
       revision,
       ...(draft === null ? {} : { draft })

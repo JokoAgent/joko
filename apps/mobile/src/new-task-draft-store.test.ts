@@ -92,6 +92,40 @@ describe("mobile new-task retained draft store", () => {
     expect(memory.writes.some((write) => write.value?.includes("older"))).toBe(false);
   });
 
+  it("exposes an exact editable revision and rejects stale or retained-submission CAS writes", async () => {
+    const memory = memoryDriver();
+    const store = new MobileNewTaskDraftStore(memory.driver);
+    store.save(first, { targetId: "target-one", name: "One", input: input("before") });
+    const snapshot = await store.readSnapshot(first);
+    expect(snapshot).toMatchObject({ revision: 1, draft: { input: { text: "before" } } });
+    expect(store.saveIfRevision(first, {
+      targetId: "target-one", name: "One", input: input("after")
+    }, snapshot.revision)).toBe(true);
+    expect(store.saveIfRevision(first, {
+      targetId: "target-one", name: "One", input: input("stale")
+    }, snapshot.revision)).toBe(false);
+    await store.flush(first);
+    expect(store.readSync(first)?.input.text).toBe("after");
+
+    await store.beginSubmission(first, store.readSync(first)!, authority);
+    const retained = await store.readSnapshot(first);
+    expect(store.saveIfRevision(first, {
+      targetId: "target-one", name: "One", input: input("must not replace retained work")
+    }, retained.revision)).toBe(false);
+  });
+
+  it("returns one atomic content and revision snapshot when an edit lands during the async read boundary", async () => {
+    const store = new MobileNewTaskDraftStore(memoryDriver().driver);
+    store.save(first, { targetId: "target-one", name: "One", input: input("before") });
+    const pending = store.readSnapshot(first);
+    store.save(first, { targetId: "target-one", name: "One", input: input("after") });
+
+    await expect(pending).resolves.toEqual({
+      revision: 2,
+      draft: { targetId: "target-one", name: "One", input: input("after") }
+    });
+  });
+
   it("lets a newer edit win over a late read and never revives a cleared draft", async () => {
     let resolveFirst!: (value: string | null) => void;
     let resolveSecond!: (value: string | null) => void;

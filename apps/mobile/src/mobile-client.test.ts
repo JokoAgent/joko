@@ -750,6 +750,27 @@ function localAttachmentDraft(text = ""): MobileComposerDraft {
   };
 }
 
+function annotatedLocalImageDraft(text = ""): MobileComposerDraft {
+  const image = localAttachmentDraft(text).attachments[0]!;
+  return {
+    ...plainTextMobileComposerDraft(text),
+    attachments: [{
+      ...image,
+      annotation: {
+        source: {
+          storageId: "image-source",
+          fileName: "pixel.png",
+          mediaType: "image/png",
+          byteSize: 4,
+          sha256Hex: "a".repeat(64),
+          capturedAtUnixMs: 90
+        },
+        strokes: [{ points: [{ x: 0.25, y: 0.5 }] }]
+      }
+    }]
+  };
+}
+
 function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
   const removed: string[] = [];
   const bytes = new Map<string, Uint8Array>([
@@ -790,9 +811,17 @@ function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
       async (value) => value[0] === 1 ? "a".repeat(64) : "b".repeat(64)
     ),
     driver,
-    removed
+    removed,
+    bytes
   };
 }
+
+function fixedIds(...values: readonly string[]): () => string {
+  let index = 0;
+  return () => values[index++] ?? `fallback-${index}`;
+}
+
+const renderedPngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function committedAttachment(attachment: MobileLocalComposerAttachment) {
   return create(BlobRefSchema, {
@@ -2623,6 +2652,53 @@ describe("native current-task message and Queue actions", () => {
     expect(drafts.composer.readSync(identity)).toBeNull();
   });
 
+  it("retains an annotation source through upload and removes it only after the exact task draft is accepted and cleared", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const fixture = attachmentFileFixture();
+    fixture.bytes.set("image-source", new Uint8Array([1, 1, 1, 1]));
+    const draft = annotatedLocalImageDraft();
+    vi.mocked(network.uploadBlob).mockImplementation(async () => committedAttachment(
+      draft.attachments[0] as MobileLocalComposerAttachment
+    ));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      ids(), undefined, drafts, fixture.files);
+    await app.start();
+
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(drafts.composer.readSync(identity)).toBeNull();
+    expect(fixture.removed).toEqual(["image-one", "image-source"]);
+    expect(fixture.bytes.has("image-source")).toBe(false);
+  });
+
+  it("retains an uploaded annotation source while the task send result is unknown", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const fixture = attachmentFileFixture();
+    fixture.bytes.set("image-source", new Uint8Array([1, 1, 1, 1]));
+    const draft = annotatedLocalImageDraft("Review");
+    vi.mocked(network.uploadBlob).mockImplementation(async () => committedAttachment(
+      draft.attachments[0] as MobileLocalComposerAttachment
+    ));
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      ids(), undefined, drafts, fixture.files);
+    await app.start();
+
+    await expect(app.send(draft)).resolves.toBe(false);
+
+    expect(drafts.composer.readSync(identity)?.attachments[0]).toMatchObject({
+      state: "uploaded",
+      blobId: "blob-image-one",
+      annotation: { source: { storageId: "image-source" } }
+    });
+    expect(fixture.removed).toEqual(["image-one"]);
+    expect(fixture.bytes.has("image-source")).toBe(true);
+  });
+
   it("retains canonical uploaded attachment identities and body-free receipt when current send is unknown", async () => {
     const network = projectedNetwork(attachmentSnapshot);
     const saved = memoryStorage(credential);
@@ -2668,6 +2744,288 @@ describe("native current-task message and Queue actions", () => {
     expect(network.submit).not.toHaveBeenCalled();
     expect(fixture.removed).toEqual([]);
     expect(drafts.composer.readSync(identity)).toEqual(plainTextMobileComposerDraft("Newer navigation draft"));
+  });
+
+  it("commits an image annotation into the exact task slot and restores its isolated original on re-edit", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("Keep the caption");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("image-source", "editor-one", "rendered-image", "editor-two", "restored-image"),
+      undefined, drafts, fixture.files);
+    await app.start();
+
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
+    expect(editor).toMatchObject({
+      previewUri: "file:///durable/mobile-profile/image-one",
+      sourceBase64: "AQEBAQ==",
+      sourceMediaType: "image/png",
+      fileName: "pixel.png",
+      initialStrokes: [],
+      annotatable: true,
+      maximumBytes: 1_024
+    });
+    const stroke = { points: [{ x: 0.1, y: 0.2 }, { x: 0.8, y: 0.7 }] };
+    const committed = await app.commitComposerImageEditor(editor.leaseId, [stroke], {
+      bytes: renderedPngBytes,
+      mediaType: "image/png",
+      width: 320,
+      height: 240
+    });
+
+    expect(committed.surface).toBe("task");
+    expect(committed.draft).toMatchObject({
+      text: "Keep the caption",
+      attachments: [
+        {
+          state: "local",
+          attachmentId: "rendered-image",
+          fileName: "pixel-annotated.png",
+          mediaType: "image/png",
+          byteSize: renderedPngBytes.byteLength,
+          sha256Hex: "b".repeat(64),
+          annotation: {
+            source: {
+              storageId: "image-source",
+              fileName: "pixel.png",
+              mediaType: "image/png",
+              byteSize: 4,
+              sha256Hex: "a".repeat(64)
+            },
+            strokes: [stroke]
+          }
+        },
+        original.attachments[1]
+      ]
+    });
+    expect(await drafts.composer.read(identity)).toEqual(committed.draft);
+    expect(fixture.bytes.get("image-source")).toEqual(new Uint8Array([1, 1, 1, 1]));
+    expect(fixture.bytes.get("rendered-image")).toEqual(renderedPngBytes);
+    expect(fixture.removed).toEqual(["image-one"]);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(network.uploadBlob).not.toHaveBeenCalled();
+
+    const reopened = await app.openComposerImageEditor({ surface: "task", attachmentId: "rendered-image" });
+    expect(reopened.initialStrokes).toEqual([stroke]);
+    expect(reopened.previewUri).toBe("file:///durable/mobile-profile/image-source");
+    const restored = await app.commitComposerImageEditor(reopened.leaseId, []);
+
+    expect(restored.draft.attachments).toMatchObject([
+      {
+        state: "local",
+        attachmentId: "restored-image",
+        fileName: "pixel.png",
+        mediaType: "image/png",
+        byteSize: 4,
+        sha256Hex: "a".repeat(64)
+      },
+      original.attachments[1]
+    ]);
+    expect(restored.draft.attachments[0]?.annotation).toBeUndefined();
+    expect(fixture.bytes.has("image-source")).toBe(false);
+    expect(fixture.bytes.get("restored-image")).toEqual(new Uint8Array([1, 1, 1, 1]));
+    expect(fixture.removed).toEqual(["image-one", "rendered-image", "image-source"]);
+  });
+
+  it("single-flights duplicate image saves while keeping the exact editor lease retryable", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("Keep one result");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const originalStageBytes = vi.mocked(fixture.driver.stageBytes).getMockImplementation()!;
+    let releaseSource!: () => void;
+    const sourceGate = new Promise<void>((resolve) => { releaseSource = resolve; });
+    vi.mocked(fixture.driver.stageBytes).mockImplementation(async (...args) => {
+      if (args[1] === "single-source") await sourceGate;
+      return originalStageBytes(...args);
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("single-source", "single-editor", "single-output"), undefined, drafts, fixture.files);
+    await app.start();
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
+    const stroke = [{ points: [{ x: 0.25, y: 0.5 }] }];
+
+    const first = app.commitComposerImageEditor(editor.leaseId, stroke, {
+      bytes: renderedPngBytes, mediaType: "image/png", width: 20, height: 20
+    });
+    await vi.waitFor(() => expect(fixture.driver.stageBytes).toHaveBeenCalledWith(
+      credential.profileId, "single-source", expect.any(Uint8Array)
+    ));
+    await expect(app.commitComposerImageEditor(editor.leaseId, stroke, {
+      bytes: renderedPngBytes, mediaType: "image/png", width: 20, height: 20
+    })).rejects.toThrow(/already being saved/u);
+    releaseSource();
+    await expect(first).resolves.toMatchObject({ draft: { attachments: [
+      expect.objectContaining({ attachmentId: "single-output" }),
+      original.attachments[1]
+    ] } });
+  });
+
+  it("rejects an invalid rendered raster before staging and allows a corrected retry", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("Retry the render");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("retry-source", "retry-editor", "retry-output"), undefined, drafts, fixture.files);
+    await app.start();
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
+    const strokes = [{ points: [{ x: 0.25, y: 0.5 }] }];
+
+    await expect(app.commitComposerImageEditor(editor.leaseId, strokes, {
+      bytes: new Uint8Array([2, 2, 2, 2]), mediaType: "image/png", width: 20, height: 20
+    })).rejects.toThrow(/rendered annotation output is invalid/u);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    await expect(app.commitComposerImageEditor(editor.leaseId, strokes, {
+      bytes: renderedPngBytes, mediaType: "image/png", width: 20, height: 20
+    })).resolves.toMatchObject({ draft: { attachments: [
+      expect.objectContaining({ attachmentId: "retry-output" }),
+      original.attachments[1]
+    ] } });
+  });
+
+  it("restores the exact task draft and cleans new bytes when durable annotation flush fails", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("Keep after storage failure");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("failed-source", "failed-editor", "failed-output"), undefined, drafts, fixture.files);
+    await app.start();
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
+    vi.spyOn(drafts.composer.driver, "setItem").mockRejectedValueOnce(new Error("disk unavailable"));
+
+    await expect(app.commitComposerImageEditor(editor.leaseId, [{ points: [{ x: 0.2, y: 0.4 }] }], {
+      bytes: renderedPngBytes, mediaType: "image/png", width: 20, height: 20
+    })).rejects.toThrow(/could not be written/u);
+
+    expect(await drafts.composer.read(identity)).toEqual(original);
+    expect(fixture.removed).toEqual(["failed-output", "failed-source"]);
+    expect(fixture.bytes.has("image-one")).toBe(true);
+    expect(fixture.bytes.has("failed-output")).toBe(false);
+    expect(fixture.bytes.has("failed-source")).toBe(false);
+  });
+
+  it("rejects a stale image editor without staging or replacing a concurrently changed task draft", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = localAttachmentDraft("Original");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("stale-source", "stale-editor", "must-not-stage"), undefined, drafts, fixture.files);
+    await app.start();
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
+    const newer = plainTextMobileComposerDraft("Concurrent navigation draft");
+    drafts.composer.save(identity, newer);
+    await drafts.composer.flush(identity);
+
+    await expect(app.commitComposerImageEditor(editor.leaseId, [{ points: [{ x: 0.2, y: 0.3 }] }], {
+      bytes: renderedPngBytes,
+      mediaType: "image/png",
+      width: 20,
+      height: 20
+    })).rejects.toThrow(/composer changed/u);
+
+    expect(await drafts.composer.read(identity)).toEqual(newer);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    expect(fixture.removed).toEqual([]);
+    expect(network.submit).not.toHaveBeenCalled();
+    app.cancelComposerImageEditor(editor.leaseId);
+  });
+
+  it("CAS-commits a new-task image annotation without creating or sending the task", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId };
+    const original = localAttachmentDraft("First input");
+    drafts.newTask.save(identity, { targetId: "target", name: "Annotated task", input: original });
+    await drafts.newTask.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("new-source", "new-editor", "new-rendered"), undefined, drafts, fixture.files);
+    await app.start();
+
+    const editor = await app.openComposerImageEditor({
+      surface: "new-task",
+      targetId: "target",
+      attachmentId: "image-one"
+    });
+    const result = await app.commitComposerImageEditor(editor.leaseId, [{ points: [{ x: 0.5, y: 0.5 }] }], {
+      bytes: renderedPngBytes,
+      mediaType: "image/png",
+      width: 64,
+      height: 64
+    });
+
+    expect(result.surface).toBe("new-task");
+    const retained = drafts.newTask.readSync(identity);
+    expect(retained).toMatchObject({
+      targetId: "target",
+      name: "Annotated task"
+    });
+    expect(retained?.input.attachments[0]).toMatchObject({
+      attachmentId: "new-rendered",
+      annotation: { source: { storageId: "new-source" } }
+    });
+    expect(network.prepareTarget).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it("authenticates an uploaded image into an editor lease and retires the lease on backgrounding", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    vi.mocked(network.downloadBlob).mockResolvedValue({
+      bytes: new Uint8Array([1, 1, 1, 1]),
+      mediaType: "image/png"
+    });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const uploaded: MobileComposerDraft = {
+      ...plainTextMobileComposerDraft("Uploaded"),
+      attachments: [{
+        state: "uploaded",
+        attachmentId: "uploaded-image",
+        blobId: "blob-uploaded-image",
+        kind: "image",
+        fileName: "pixel.png",
+        mediaType: "image/png",
+        byteSize: 4,
+        sha256Hex: "a".repeat(64),
+        capturedAtUnixMs: 100
+      }]
+    };
+    drafts.composer.save(identity, uploaded);
+    await drafts.composer.flush(identity);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("uploaded-source", "uploaded-editor"), undefined, drafts, attachmentFileFixture().files);
+    await app.start();
+
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "uploaded-image" });
+    expect(editor.previewUri).toBe("data:image/png;base64,AQEBAQ==");
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({
+      blobId: "blob-uploaded-image",
+      disposition: BlobDisposition.ATTACHMENT
+    }), undefined);
+    app.setForeground(false);
+    await expect(app.commitComposerImageEditor(editor.leaseId, []))
+      .rejects.toThrow(/no longer owns/u);
+    expect(await drafts.composer.read(identity)).toEqual(uploaded);
   });
 
   it("sends a retained Session reference with exact UTF-16 range and body-free receipt", async () => {

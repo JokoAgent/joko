@@ -197,6 +197,18 @@ describe("mobile composer draft store", () => {
     expect(store.readSync(first)).toEqual(plainTextMobileComposerDraft("newer navigation draft"));
   });
 
+  it("returns one atomic content and revision snapshot when an edit lands during the async read boundary", async () => {
+    const store = new MobileComposerDraftStore(memoryDriver().driver);
+    store.save(first, plainTextMobileComposerDraft("before"));
+    const pending = store.readSnapshot(first);
+    store.save(first, plainTextMobileComposerDraft("after"));
+
+    await expect(pending).resolves.toEqual({
+      revision: 2,
+      draft: plainTextMobileComposerDraft("after")
+    });
+  });
+
   it("rejects the previous plain-text shape, damaged mention ranges, and cross-owner records", async () => {
     const memory = memoryDriver();
     const key = mobileComposerDraftTesting.storageKey(first);

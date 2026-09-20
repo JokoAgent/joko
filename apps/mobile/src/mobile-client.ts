@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
-  ArchiveSessionMutationSchema, BlobDisposition, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
+  ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateSessionMutationSchema,
   DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
@@ -84,10 +84,15 @@ import {
   appendMobileComposerAttachments,
   assertMobileAttachmentCandidate,
   assertMobileAttachmentPolicy,
+  mobileComposerAttachmentStorageIds,
+  mobileComposerAttachmentsEqual,
+  normalizeMobileComposerAttachment,
   replaceMobileComposerAttachment,
+  replaceMobileComposerAttachmentSlot,
   resolveMobileAttachmentPolicy,
   type MobileAttachmentControls,
   type MobileComposerAttachment,
+  type MobileComposerImageAnnotationSource,
   type MobileLocalComposerAttachment,
   type MobileUploadedComposerAttachment
 } from "./mobile-attachments";
@@ -126,7 +131,9 @@ import {
 } from "./mobile-workspace-mentions";
 import {
   type MobileNewTaskCreateSubmission,
+  type MobileNewTaskDraft,
   type MobileNewTaskDraftIdentity,
+  type MobileNewTaskDraftSnapshot,
   type MobileNewTaskDraftStore,
   type MobileNewTaskSendSubmission,
   type MobileNewTaskSubmission
@@ -156,6 +163,22 @@ import {
   type MobileNativeTreeControls,
   type MobileNativeTreeSnapshot
 } from "./mobile-native-tree";
+import {
+  MOBILE_ANNOTATION_MAX_BURN_DIMENSION,
+  canAnnotateMobileImage,
+  encodeMobileBase64,
+  mobileAnnotationOutputMediaType,
+  normalizeMobileAnnotationStrokes,
+  sniffMobileImageMediaType,
+  type MobileImageAnnotationStroke
+} from "./mobile-image-annotation";
+import {
+  mobileAnnotatedImageFileName,
+  type MobileBurnedImage,
+  type MobileComposerImageCommitResult,
+  type MobileComposerImageEditorRequest,
+  type MobileComposerImageEditorSession
+} from "./mobile-composer-image-editor";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -211,6 +234,34 @@ interface MobileFilesContext {
   readonly credential: PairedCredential;
   readonly authority: MobileWorkspaceAuthority;
   readonly key: string;
+}
+
+interface MobileComposerImageEditLease {
+  readonly leaseId: string;
+  readonly request: MobileComposerImageEditorRequest;
+  readonly profileId: string;
+  readonly credentialKey: string;
+  readonly surfaceOwnerKey: string;
+  readonly attachment: MobileComposerAttachment;
+  readonly source: MobileComposerImageAnnotationSource;
+  readonly sourceBytes: Uint8Array;
+  readonly sourceUri: string;
+  readonly sourceStored: boolean;
+  commitInFlight: boolean;
+  readonly owner:
+    | {
+        readonly kind: "task";
+        readonly authorityKey: string;
+        readonly identity: MobileComposerDraftIdentity;
+        readonly snapshot: MobileComposerDraftSnapshot;
+        readonly draft: MobileComposerDraft;
+      }
+    | {
+        readonly kind: "new-task";
+        readonly identity: MobileNewTaskDraftIdentity;
+        readonly snapshot: MobileNewTaskDraftSnapshot;
+        readonly draft: MobileNewTaskDraft;
+      };
 }
 
 export interface MobileQueueEditLease {
@@ -318,6 +369,7 @@ export class MobileClient {
   #queueEditLease?: MobileQueueEditLease;
   #queueInteractionLease?: MobileQueueInteractionLease;
   #newTaskSubmissionActive = false;
+  #composerImageEdit?: MobileComposerImageEditLease;
 
   constructor(
     private readonly network: MobileNetwork,
@@ -370,6 +422,7 @@ export class MobileClient {
     this.#homeSearchAbort = undefined;
     this.#homeSearchEpoch += 1;
     this.#cancelFilesRequests();
+    this.#composerImageEdit = undefined;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
     if (this.#projectionTimer !== undefined) clearTimeout(this.#projectionTimer);
@@ -2025,21 +2078,21 @@ export class MobileClient {
     identity: MobileNewTaskDraftIdentity,
     sessionId: string,
     input: MobileComposerDraft
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (!this.composerDrafts) throw new Error("The task composer draft store is unavailable.");
     const composerIdentity = { profileId: identity.profileId, sessionId };
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const snapshot = await this.composerDrafts.readSnapshot(composerIdentity);
-      if (snapshot.draft === undefined) return;
+      if (snapshot.draft === undefined) return true;
       const remainder = mobileComposerDraftWithoutPrefix(input, snapshot.draft);
-      if (remainder === undefined) return;
+      if (remainder === undefined) return false;
       const updated = remainder.text.length === 0 && remainder.mentions.length === 0
         && remainder.attachments.length === 0
         ? await this.composerDrafts.clearIfRevision(composerIdentity, snapshot.revision)
         : this.composerDrafts.saveIfRevision(composerIdentity, remainder, snapshot.revision);
       if (updated) {
         await this.composerDrafts.flush(composerIdentity);
-        return;
+        return true;
       }
     }
     throw new Error("The created task draft kept changing while the accepted first message was being removed.");
@@ -2236,8 +2289,15 @@ export class MobileClient {
       this.#set({ error: "The first-message operation returned an invalid queue result. The text remains in the task composer; verify the task before sending again." });
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
     }
-    await this.#removeRecoveredNewTaskComposerDraft(identity, submission.sessionId, submission.input);
+    const recoveredInputRemoved = await this.#removeRecoveredNewTaskComposerDraft(
+      identity,
+      submission.sessionId,
+      submission.input
+    );
     await this.newTaskDrafts.clear(identity);
+    if (recoveredInputRemoved) {
+      await this.#removeCommittedAnnotationSources(identity.profileId, submission.input.attachments);
+    }
     return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
   }
 
@@ -2340,7 +2400,11 @@ export class MobileClient {
         }) }
       }), { kind: "send", sessionId });
       if (accepted) {
-        try { await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft); }
+        try {
+          if (await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft)) {
+            await this.#removeCommittedAnnotationSources(draftIdentity.profileId, sendDraft.attachments);
+          }
+        }
         catch (error) {
           this.#set({ error: `${message(error)} The accepted message will not be sent again automatically.` });
         }
@@ -2459,9 +2523,26 @@ export class MobileClient {
     attachment: MobileLocalComposerAttachment
   ): Promise<void> {
     if (!this.attachmentFiles) return;
-    try { await this.attachmentFiles.remove(profileId, attachment); }
+    try { await this.attachmentFiles.removeVisibleBytes(profileId, attachment); }
     catch (error) {
       this.#set({ error: `${message(error)} The committed attachment will not be uploaded again.` });
+    }
+  }
+
+  async #removeCommittedAnnotationSources(
+    profileId: string,
+    attachments: readonly MobileComposerAttachment[]
+  ): Promise<void> {
+    if (!this.attachmentFiles) return;
+    const storageIds = new Set(attachments.flatMap((attachment) => {
+      const exact = normalizeMobileComposerAttachment(attachment);
+      return exact.annotation ? [exact.annotation.source.storageId] : [];
+    }));
+    try {
+      await Promise.all([...storageIds].map((storageId) =>
+        this.attachmentFiles!.removeOwnedBytes(profileId, storageId)));
+    } catch (error) {
+      this.#set({ error: `${message(error)} The accepted message will not be sent again automatically.` });
     }
   }
 
@@ -2714,6 +2795,393 @@ export class MobileClient {
       surfaceOwnerKey: `${authorityKey}\u001fattachments\u001f${model?.authorityKey ?? "native-default"}`,
       policy
     };
+  }
+
+  async openComposerImageEditor(
+    request: MobileComposerImageEditorRequest,
+    signal?: AbortSignal
+  ): Promise<MobileComposerImageEditorSession> {
+    signal?.throwIfAborted();
+    if (!this.attachmentFiles || !this.composerDrafts || !this.newTaskDrafts) {
+      throw new Error("Retained image attachment bytes are unavailable on this mobile client.");
+    }
+    const credential = this.#ready();
+    if (!this.#foreground) throw new Error("Return Joko to the foreground before opening an image attachment.");
+    this.#composerImageEdit = undefined;
+
+    let owner: MobileComposerImageEditLease["owner"];
+    let controls: MobileAttachmentControls | undefined;
+    if (request.surface === "task") {
+      const sessionId = this.#state.selectedId;
+      const authorityKey = this.#taskAuthorityKey();
+      controls = this.taskAttachmentControls();
+      if (!sessionId || !authorityKey || !controls || controls.profileId !== credential.profileId) {
+        throw new Error("The current task image attachment authority is unavailable.");
+      }
+      const identity = { profileId: credential.profileId, sessionId };
+      const snapshot = await this.composerDrafts.readSnapshot(identity);
+      const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+      owner = { kind: "task", authorityKey, identity, snapshot, draft };
+    } else {
+      controls = this.newTaskAttachmentControls(request.targetId);
+      if (!controls || controls.profileId !== credential.profileId) {
+        throw new Error("The new-task image attachment authority is unavailable.");
+      }
+      const identity = { profileId: credential.profileId };
+      const snapshot = await this.newTaskDrafts.readSnapshot(identity);
+      const draft = snapshot.draft;
+      if (!draft || draft.submission || draft.targetId !== request.targetId) {
+        throw new Error("The editable new-task image draft is unavailable.");
+      }
+      owner = { kind: "new-task", identity, snapshot, draft };
+    }
+    const input = owner.kind === "task" ? owner.draft : owner.draft.input;
+    assertMobileAttachmentPolicy(input.attachments, controls.policy);
+    const attachment = exactComposerAttachment(input.attachments, request.attachmentId);
+    if (attachment.kind !== "image") throw new Error("Only an image attachment can open the image editor.");
+
+    const annotation = attachment.annotation;
+    const occupiedStorageIds = mobileComposerAttachmentStorageIds(input.attachments);
+    const source: MobileComposerImageAnnotationSource = annotation?.source ?? {
+      storageId: distinctAttachmentStorageId(this.newId, ...occupiedStorageIds),
+      fileName: attachment.fileName,
+      mediaType: attachment.mediaType,
+      byteSize: attachment.byteSize,
+      sha256Hex: attachment.sha256Hex,
+      capturedAtUnixMs: attachment.capturedAtUnixMs
+    };
+    let sourceBytes: Uint8Array;
+    let sourceUri: string;
+    if (annotation) {
+      const verified = await this.attachmentFiles.readOwnedBytes(
+        credential.profileId,
+        source.storageId,
+        source.byteSize,
+        source.sha256Hex,
+        signal
+      );
+      sourceBytes = verified.bytes;
+      sourceUri = verified.uri;
+    } else if (attachment.state === "local") {
+      const verified = await this.attachmentFiles.readOwnedBytes(
+        credential.profileId,
+        attachment.attachmentId,
+        attachment.byteSize,
+        attachment.sha256Hex,
+        signal
+      );
+      sourceBytes = verified.bytes;
+      sourceUri = verified.uri;
+    } else {
+      const blob = create(BlobRefSchema, {
+        blobId: attachment.blobId,
+        fileName: attachment.fileName,
+        mediaType: attachment.mediaType,
+        byteSize: BigInt(attachment.byteSize),
+        sha256Hex: attachment.sha256Hex,
+        disposition: BlobDisposition.ATTACHMENT
+      });
+      const downloaded = await this.network.downloadBlob(credential, blob, signal);
+      if (normalizeMediaType(downloaded.mediaType) !== attachment.mediaType
+        || downloaded.bytes.byteLength !== attachment.byteSize
+        || await this.attachmentFiles.digestOwnedBytes(downloaded.bytes, signal) !== attachment.sha256Hex) {
+        throw new Error("The authenticated uploaded image changed before editing.");
+      }
+      sourceBytes = Uint8Array.from(downloaded.bytes);
+      sourceUri = bytesToDataUri(sourceBytes, attachment.mediaType);
+    }
+
+    const lease: MobileComposerImageEditLease = {
+      leaseId: distinctAttachmentStorageId(this.newId, attachment.attachmentId, source.storageId),
+      request,
+      profileId: credential.profileId,
+      credentialKey: mobileCredentialKey(credential),
+      surfaceOwnerKey: controls.surfaceOwnerKey,
+      attachment: normalizeMobileComposerAttachment(attachment),
+      source,
+      sourceBytes: Uint8Array.from(sourceBytes),
+      sourceUri,
+      sourceStored: annotation !== undefined,
+      commitInFlight: false,
+      owner
+    };
+    this.#composerImageEdit = lease;
+    try {
+      await this.#assertComposerImageEditCurrent(lease, undefined, signal);
+      const outputMediaType = mobileAnnotationOutputMediaType(source.mediaType);
+      let annotatable = canAnnotateMobileImage(source.mediaType);
+      if (annotatable) {
+        try {
+          assertMobileAttachmentCandidate({
+            fileName: mobileAnnotatedImageFileName(source.fileName, outputMediaType),
+            mediaType: outputMediaType,
+            byteSize: 1
+          }, controls.policy);
+        } catch {
+          annotatable = false;
+        }
+      }
+      return {
+        leaseId: lease.leaseId,
+        previewUri: sourceUri,
+        sourceBase64: encodeMobileBase64(sourceBytes),
+        sourceMediaType: source.mediaType,
+        fileName: source.fileName,
+        initialStrokes: (annotation?.strokes ?? []).map((stroke) => ({
+          points: stroke.points.map((point) => ({ ...point }))
+        })),
+        annotatable,
+        maximumBytes: controls.policy.maximumBytes
+      };
+    } catch (error) {
+      if (this.#composerImageEdit === lease) this.#composerImageEdit = undefined;
+      throw error;
+    }
+  }
+
+  cancelComposerImageEditor(leaseId: string): void {
+    if (this.#composerImageEdit?.leaseId === leaseId) this.#composerImageEdit = undefined;
+  }
+
+  async commitComposerImageEditor(
+    leaseId: string,
+    strokes: readonly MobileImageAnnotationStroke[],
+    burned?: MobileBurnedImage,
+    signal?: AbortSignal
+  ): Promise<MobileComposerImageCommitResult> {
+    signal?.throwIfAborted();
+    const lease = this.#composerImageEdit;
+    if (!lease || lease.leaseId !== leaseId || !this.attachmentFiles || !this.composerDrafts || !this.newTaskDrafts) {
+      throw new Error("The image editor no longer owns this attachment.");
+    }
+    if (lease.commitInFlight) throw new Error("This image annotation is already being saved.");
+    const exactStrokes = normalizeMobileAnnotationStrokes(strokes);
+    const controls = this.#composerImageEditControls(lease);
+    await this.#assertComposerImageEditCurrent(lease, undefined, signal);
+    if (this.#composerImageEdit !== lease || lease.commitInFlight) {
+      throw new Error("This image annotation is already being saved or no longer owns the attachment.");
+    }
+    lease.commitInFlight = true;
+    try {
+    if (exactStrokes.length === 0 && lease.attachment.annotation === undefined) {
+      this.#composerImageEdit = undefined;
+      const draft = lease.owner.kind === "task" ? lease.owner.draft : lease.owner.draft.input;
+      return { surface: lease.request.surface, draft };
+    }
+
+    let outputBytes: Uint8Array;
+    let outputMediaType: string;
+    let outputFileName: string;
+    let outputSha256Hex: string;
+    if (exactStrokes.length === 0) {
+      outputBytes = Uint8Array.from(lease.sourceBytes);
+      outputMediaType = lease.source.mediaType;
+      outputFileName = lease.source.fileName;
+      outputSha256Hex = lease.source.sha256Hex;
+    } else {
+      if (!canAnnotateMobileImage(lease.source.mediaType) || !burned) {
+        throw new Error("This image cannot be rendered with annotations.");
+      }
+      const expectedMediaType = mobileAnnotationOutputMediaType(lease.source.mediaType);
+      if (!(burned.bytes instanceof Uint8Array) || burned.bytes.byteLength < 1
+        || burned.mediaType !== expectedMediaType
+        || sniffMobileImageMediaType(burned.bytes) !== expectedMediaType
+        || !Number.isSafeInteger(burned.width) || burned.width < 1
+        || burned.width > MOBILE_ANNOTATION_MAX_BURN_DIMENSION
+        || !Number.isSafeInteger(burned.height) || burned.height < 1
+        || burned.height > MOBILE_ANNOTATION_MAX_BURN_DIMENSION) {
+        throw new Error("The rendered annotation output is invalid.");
+      }
+      outputBytes = Uint8Array.from(burned.bytes);
+      outputMediaType = burned.mediaType;
+      outputFileName = mobileAnnotatedImageFileName(lease.source.fileName, burned.mediaType);
+      outputSha256Hex = await this.attachmentFiles.digestOwnedBytes(outputBytes, signal);
+    }
+    assertMobileAttachmentCandidate({
+      fileName: outputFileName,
+      mediaType: outputMediaType,
+      byteSize: outputBytes.byteLength
+    }, controls.policy);
+
+    const originalInput = lease.owner.kind === "task" ? lease.owner.draft : lease.owner.draft.input;
+    let sourceStaged = false;
+    let output: MobileLocalComposerAttachment | undefined;
+    let nextInput: MobileComposerDraft | undefined;
+    let committed = false;
+    try {
+      if (exactStrokes.length > 0 && !lease.sourceStored) {
+        await this.attachmentFiles.stageOwnedBytes(
+          lease.profileId,
+          lease.source.storageId,
+          lease.sourceBytes,
+          lease.source.sha256Hex,
+          signal
+        );
+        sourceStaged = true;
+      }
+      const otherAttachments = originalInput.attachments.filter(
+        (candidate) => candidate.attachmentId !== lease.attachment.attachmentId
+      );
+      output = await this.attachmentFiles.stageVerifiedBytes(
+        lease.profileId,
+        otherAttachments,
+        controls.policy,
+        {
+          bytes: outputBytes,
+          fileName: outputFileName,
+          mediaType: outputMediaType,
+          byteSize: outputBytes.byteLength,
+          sha256Hex: outputSha256Hex
+        },
+        () => distinctAttachmentStorageId(
+          this.newId,
+          ...mobileComposerAttachmentStorageIds(originalInput.attachments),
+          lease.source.storageId
+        ),
+        signal
+      );
+      const replacement = normalizeMobileComposerAttachment(exactStrokes.length === 0 ? output : {
+        ...output,
+        annotation: { source: lease.source, strokes: exactStrokes }
+      });
+      nextInput = normalizeMobileComposerDraft({
+        ...originalInput,
+        attachments: replaceMobileComposerAttachmentSlot(
+          originalInput.attachments,
+          lease.attachment,
+          replacement
+        )
+      });
+      assertMobileAttachmentPolicy(nextInput.attachments, controls.policy);
+      await this.#assertComposerImageEditCurrent(lease, undefined, signal);
+      if (lease.owner.kind === "task") {
+        if (!this.composerDrafts.saveIfRevision(
+          lease.owner.identity,
+          nextInput,
+          lease.owner.snapshot.revision
+        )) throw new Error("The task composer changed while the annotated image was being saved.");
+        committed = true;
+        await this.composerDrafts.flush(lease.owner.identity);
+      } else {
+        if (!this.newTaskDrafts.saveIfRevision(lease.owner.identity, {
+          targetId: lease.owner.draft.targetId,
+          name: lease.owner.draft.name,
+          input: nextInput
+        }, lease.owner.snapshot.revision)) {
+          throw new Error("The new-task composer changed while the annotated image was being saved.");
+        }
+        committed = true;
+        await this.newTaskDrafts.flush(lease.owner.identity);
+      }
+      await this.#assertComposerImageEditCurrent(lease, nextInput, signal);
+      await this.attachmentFiles.removeVisibleBytes(lease.profileId, lease.attachment).catch(() => undefined);
+      if (exactStrokes.length === 0) {
+        await this.attachmentFiles.removeOwnedBytes(lease.profileId, lease.source.storageId).catch(() => undefined);
+      }
+      this.#composerImageEdit = undefined;
+      return { surface: lease.request.surface, draft: nextInput };
+    } catch (error) {
+      if (committed && nextInput) {
+        committed = !await this.#restoreComposerImageDraft(lease, nextInput);
+      }
+      if (!committed && output) {
+        await this.attachmentFiles.removeVisibleBytes(lease.profileId, output).catch(() => undefined);
+      }
+      if (!committed && sourceStaged) {
+        await this.attachmentFiles.removeOwnedBytes(lease.profileId, lease.source.storageId).catch(() => undefined);
+      }
+      if (committed) this.#composerImageEdit = undefined;
+      throw error;
+    }
+    } finally {
+      if (this.#composerImageEdit === lease) lease.commitInFlight = false;
+    }
+  }
+
+  #composerImageEditControls(lease: MobileComposerImageEditLease): MobileAttachmentControls {
+    const credential = this.#ready();
+    const controls = lease.owner.kind === "task"
+      ? this.taskAttachmentControls()
+      : this.newTaskAttachmentControls(lease.request.surface === "new-task" ? lease.request.targetId : "");
+    const authorityCurrent = lease.owner.kind === "task"
+      ? this.#taskAuthorityKey() === lease.owner.authorityKey
+        && this.#state.selectedId === lease.owner.identity.sessionId
+      : lease.request.surface === "new-task"
+        ? this.#newTaskAuthorityKey(lease.request.targetId) !== undefined
+          && lease.owner.draft.targetId === lease.request.targetId
+        : false;
+    if (this.#composerImageEdit !== lease || mobileCredentialKey(credential) !== lease.credentialKey
+      || !authorityCurrent || !controls || controls.profileId !== lease.profileId
+      || controls.surfaceOwnerKey !== lease.surfaceOwnerKey) {
+      throw new Error("The image attachment owner changed while the editor was open.");
+    }
+    return controls;
+  }
+
+  async #assertComposerImageEditCurrent(
+    lease: MobileComposerImageEditLease,
+    expectedCommitted: MobileComposerDraft | undefined,
+    signal?: AbortSignal
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    let current: MobileComposerDraft;
+    if (lease.owner.kind === "task") {
+      const snapshot = await this.composerDrafts!.readSnapshot(lease.owner.identity);
+      signal?.throwIfAborted();
+      if (snapshot.draft === undefined
+        || expectedCommitted === undefined && snapshot.revision !== lease.owner.snapshot.revision) {
+        throw new Error("The task composer changed while the image editor was open.");
+      }
+      current = snapshot.draft;
+    } else {
+      const snapshot = await this.newTaskDrafts!.readSnapshot(lease.owner.identity);
+      signal?.throwIfAborted();
+      if (!snapshot.draft || snapshot.draft.submission
+        || snapshot.draft.targetId !== lease.owner.draft.targetId
+        || snapshot.draft.name !== lease.owner.draft.name
+        || expectedCommitted === undefined && snapshot.revision !== lease.owner.snapshot.revision) {
+        throw new Error("The new-task composer changed while the image editor was open.");
+      }
+      current = snapshot.draft.input;
+    }
+    const expected = expectedCommitted
+      ?? (lease.owner.kind === "task" ? lease.owner.draft : lease.owner.draft.input);
+    if (!mobileComposerDraftsEqual(current, expected)) {
+      throw new Error("The composer changed while the image editor was open.");
+    }
+    const controls = this.#composerImageEditControls(lease);
+    assertMobileAttachmentPolicy(current.attachments, controls.policy);
+    if (expectedCommitted === undefined) {
+      const attachment = exactComposerAttachment(current.attachments, lease.attachment.attachmentId);
+      if (!mobileComposerAttachmentsEqual(attachment, lease.attachment)) {
+        throw new Error("The selected image changed while the editor was open.");
+      }
+    }
+  }
+
+  async #restoreComposerImageDraft(
+    lease: MobileComposerImageEditLease,
+    committed: MobileComposerDraft
+  ): Promise<boolean> {
+    if (lease.owner.kind === "task") {
+      return this.#restoreFilesComposerDraft(lease.owner.identity, lease.owner.snapshot, committed);
+    }
+    try {
+      const current = await this.newTaskDrafts!.readSnapshot(lease.owner.identity);
+      if (!current.draft || current.draft.submission
+        || current.draft.targetId !== lease.owner.draft.targetId
+        || current.draft.name !== lease.owner.draft.name
+        || !mobileComposerDraftsEqual(current.draft.input, committed)) return false;
+      if (!this.newTaskDrafts!.saveIfRevision(lease.owner.identity, {
+        targetId: lease.owner.draft.targetId,
+        name: lease.owner.draft.name,
+        input: lease.owner.draft.input
+      }, current.revision)) return false;
+      await this.newTaskDrafts!.flush(lease.owner.identity);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   taskVoiceTransport(): MobileVoiceTransport | undefined {
@@ -5061,6 +5529,29 @@ function filesComposerArtifact(source: MobileFilesComposerSource): Artifact | un
   return source.kind === "search-result" && source.result.kind === "artifact"
     ? source.result.artifact
     : undefined;
+}
+
+function exactComposerAttachment(
+  attachments: readonly MobileComposerAttachment[],
+  attachmentId: string
+): MobileComposerAttachment {
+  const matches = attachments.map(normalizeMobileComposerAttachment)
+    .filter((attachment) => attachment.attachmentId === attachmentId);
+  if (matches.length !== 1) throw new Error("The selected image attachment is no longer in this draft.");
+  return matches[0]!;
+}
+
+function distinctAttachmentStorageId(newId: () => string, ...excluded: readonly string[]): string {
+  const reserved = new Set(excluded);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidate = newId();
+    if (/^[a-zA-Z0-9_-]{1,128}$/u.test(candidate) && !reserved.has(candidate)) return candidate;
+  }
+  throw new Error("A distinct local image identity could not be created.");
+}
+
+function mobileCredentialKey(credential: PairedCredential): string {
+  return [credential.profileId, credential.connectionId, credential.deviceId, credential.serverId].join("\u001f");
 }
 
 function filesComposerSourceIsCurrent(files: MobileFilesState, source: MobileFilesComposerSource): boolean {

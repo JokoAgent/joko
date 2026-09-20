@@ -4,6 +4,11 @@ import {
   type BackendDescriptor
 } from "@joko/contracts";
 import { normalizeMediaType } from "./workspace-files";
+import {
+  canAnnotateMobileImage,
+  normalizeMobileAnnotationStrokes,
+  type MobileImageAnnotationStroke
+} from "./mobile-image-annotation";
 
 export type MobileComposerAttachmentKind = "image" | "file";
 
@@ -15,6 +20,21 @@ interface MobileComposerAttachmentBase {
   readonly byteSize: number;
   readonly sha256Hex: string;
   readonly capturedAtUnixMs: number;
+  readonly annotation?: MobileComposerImageAnnotation;
+}
+
+export interface MobileComposerImageAnnotationSource {
+  readonly storageId: string;
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+  readonly capturedAtUnixMs: number;
+}
+
+export interface MobileComposerImageAnnotation {
+  readonly source: MobileComposerImageAnnotationSource;
+  readonly strokes: readonly MobileImageAnnotationStroke[];
 }
 
 export interface MobileLocalComposerAttachment extends MobileComposerAttachmentBase {
@@ -154,7 +174,10 @@ export function normalizeMobileComposerAttachment(value: MobileComposerAttachmen
     mediaType,
     byteSize: value.byteSize,
     sha256Hex: value.sha256Hex,
-    capturedAtUnixMs: value.capturedAtUnixMs
+    capturedAtUnixMs: value.capturedAtUnixMs,
+    ...(value.annotation === undefined ? {} : {
+      annotation: normalizeMobileComposerImageAnnotation(value.annotation, value.attachmentId, value.kind)
+    })
   };
   if (value.state === "local") return { state: "local", ...base };
   assertBlobId(value.blobId);
@@ -162,7 +185,18 @@ export function normalizeMobileComposerAttachment(value: MobileComposerAttachmen
 }
 
 export function cloneMobileComposerAttachment(value: MobileComposerAttachment): MobileComposerAttachment {
-  return { ...normalizeMobileComposerAttachment(value) };
+  const exact = normalizeMobileComposerAttachment(value);
+  return {
+    ...exact,
+    ...(exact.annotation === undefined ? {} : {
+      annotation: {
+        source: { ...exact.annotation.source },
+        strokes: exact.annotation.strokes.map((stroke) => ({
+          points: stroke.points.map((point) => ({ ...point }))
+        }))
+      }
+    })
+  };
 }
 
 export function mobileComposerAttachmentsEqual(
@@ -175,7 +209,45 @@ export function mobileComposerAttachmentsEqual(
     && first.kind === second.kind && first.fileName === second.fileName
     && first.mediaType === second.mediaType && first.byteSize === second.byteSize
     && first.sha256Hex === second.sha256Hex && first.capturedAtUnixMs === second.capturedAtUnixMs
+    && mobileComposerAnnotationsEqual(first.annotation, second.annotation)
     && (first.state === "local" || second.state === "local" || first.blobId === second.blobId);
+}
+
+export function normalizeMobileComposerAttachmentSet(
+  attachments: readonly MobileComposerAttachment[]
+): readonly MobileComposerAttachment[] {
+  const exact = attachments.map(normalizeMobileComposerAttachment);
+  const visibleIds = new Set<string>();
+  for (const attachment of exact) {
+    if (visibleIds.has(attachment.attachmentId)) {
+      throw new Error("The local Joko attachment identity is duplicated.");
+    }
+    visibleIds.add(attachment.attachmentId);
+  }
+  const sourceIds = new Set<string>();
+  for (const attachment of exact) {
+    const sourceId = attachment.annotation?.source.storageId;
+    if (!sourceId) continue;
+    if (visibleIds.has(sourceId)) {
+      throw new Error("An image annotation source must be isolated from every visible attachment.");
+    }
+    if (sourceIds.has(sourceId)) {
+      throw new Error("The image annotation source identity is duplicated.");
+    }
+    sourceIds.add(sourceId);
+  }
+  return exact;
+}
+
+export function mobileComposerAttachmentStorageIds(
+  attachments: readonly MobileComposerAttachment[]
+): readonly string[] {
+  const storageIds = new Set<string>();
+  for (const attachment of normalizeMobileComposerAttachmentSet(attachments)) {
+    storageIds.add(attachment.attachmentId);
+    if (attachment.annotation) storageIds.add(attachment.annotation.source.storageId);
+  }
+  return [...storageIds];
 }
 
 export function assertMobileAttachmentPolicy(
@@ -186,8 +258,7 @@ export function assertMobileAttachmentPolicy(
   if (attachments.length > exact.maximumItems) {
     throw new Error(`A task message can include at most ${exact.maximumItems} attachments.`);
   }
-  return attachments.map((attachment) => {
-    const normalized = normalizeMobileComposerAttachment(attachment);
+  return normalizeMobileComposerAttachmentSet(attachments).map((normalized) => {
     if (normalized.byteSize > exact.maximumBytes) {
       throw new Error(`${normalized.fileName} exceeds the ${formatMobileAttachmentBytes(exact.maximumBytes)} attachment limit.`);
     }
@@ -205,10 +276,12 @@ export function appendMobileComposerAttachments(
   policy: MobileAttachmentPolicy
 ): readonly MobileComposerAttachment[] {
   const exact = [...current, ...additions].map(normalizeMobileComposerAttachment);
-  const ids = new Set<string>();
+  const attachmentIds = new Set<string>();
   for (const attachment of exact) {
-    if (ids.has(attachment.attachmentId)) throw new Error("The selected attachment is already in this draft.");
-    ids.add(attachment.attachmentId);
+    if (attachmentIds.has(attachment.attachmentId)) {
+      throw new Error("The selected attachment is already in this draft.");
+    }
+    attachmentIds.add(attachment.attachmentId);
   }
   return assertMobileAttachmentPolicy(exact, policy).map(cloneMobileComposerAttachment);
 }
@@ -230,7 +303,35 @@ export function replaceMobileComposerAttachment(
     return exact;
   });
   if (!replaced) throw new Error("The selected attachment is no longer in this draft.");
-  return next;
+  return normalizeMobileComposerAttachmentSet(next).map(cloneMobileComposerAttachment);
+}
+
+export function replaceMobileComposerAttachmentSlot(
+  attachments: readonly MobileComposerAttachment[],
+  expected: MobileComposerAttachment,
+  replacement: MobileComposerAttachment
+): readonly MobileComposerAttachment[] {
+  const exactExpected = normalizeMobileComposerAttachment(expected);
+  const exactReplacement = normalizeMobileComposerAttachment(replacement);
+  let replaced = false;
+  const next = attachments.map((candidate) => {
+    const current = normalizeMobileComposerAttachment(candidate);
+    if (current.attachmentId !== exactExpected.attachmentId) return current;
+    if (replaced || !mobileComposerAttachmentsEqual(current, exactExpected)) {
+      throw new Error("The selected attachment changed before it could be replaced.");
+    }
+    replaced = true;
+    return exactReplacement;
+  });
+  if (!replaced) throw new Error("The selected attachment is no longer in this draft.");
+  const attachmentIds = new Set<string>();
+  for (const attachment of next) {
+    if (attachmentIds.has(attachment.attachmentId)) {
+      throw new Error("The replacement attachment identity is already in use.");
+    }
+    attachmentIds.add(attachment.attachmentId);
+  }
+  return normalizeMobileComposerAttachmentSet(next).map(cloneMobileComposerAttachment);
 }
 
 export function removeMobileComposerAttachment(
@@ -238,7 +339,7 @@ export function removeMobileComposerAttachment(
   attachmentId: string
 ): { readonly attachments: readonly MobileComposerAttachment[]; readonly removed: MobileComposerAttachment } {
   assertAttachmentId(attachmentId);
-  const exact = attachments.map(normalizeMobileComposerAttachment);
+  const exact = normalizeMobileComposerAttachmentSet(attachments);
   const matches = exact.filter((candidate) => candidate.attachmentId === attachmentId);
   if (matches.length !== 1) throw new Error("The selected attachment is no longer in this draft.");
   return {
@@ -334,4 +435,64 @@ function assertBlobId(value: string): void {
   if (typeof value !== "string" || value.trim() === "" || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
     throw new Error("The committed Joko Blob identity is invalid.");
   }
+}
+
+function normalizeMobileComposerImageAnnotation(
+  value: MobileComposerImageAnnotation,
+  attachmentId: string,
+  kind: MobileComposerAttachmentKind
+): MobileComposerImageAnnotation {
+  if (kind !== "image" || !value || typeof value !== "object" || !value.source
+    || typeof value.source !== "object") {
+    throw new Error("The local Joko image annotation is invalid.");
+  }
+  const source = value.source;
+  assertAttachmentId(source.storageId);
+  if (source.storageId === attachmentId) {
+    throw new Error("The image annotation source must be isolated from its rendered attachment.");
+  }
+  const fileName = normalizeMobileAttachmentFileName(source.fileName);
+  const mediaType = normalizeAttachmentMediaType(source.mediaType);
+  if (!canAnnotateMobileImage(mediaType)) throw new Error("The image annotation source type is not editable.");
+  if (!Number.isSafeInteger(source.byteSize) || source.byteSize <= 0
+    || source.byteSize > MOBILE_MAXIMUM_ATTACHMENT_BYTES
+    || !/^[0-9a-f]{64}$/u.test(source.sha256Hex)
+    || !Number.isSafeInteger(source.capturedAtUnixMs) || source.capturedAtUnixMs < 0) {
+    throw new Error("The image annotation source identity is invalid.");
+  }
+  const strokes = normalizeMobileAnnotationStrokes(value.strokes);
+  if (strokes.length === 0) throw new Error("An annotated image must retain at least one stroke.");
+  return {
+    source: {
+      storageId: source.storageId,
+      fileName,
+      mediaType,
+      byteSize: source.byteSize,
+      sha256Hex: source.sha256Hex,
+      capturedAtUnixMs: source.capturedAtUnixMs
+    },
+    strokes
+  };
+}
+
+function mobileComposerAnnotationsEqual(
+  left: MobileComposerImageAnnotation | undefined,
+  right: MobileComposerImageAnnotation | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.source.storageId !== right.source.storageId
+    || left.source.fileName !== right.source.fileName
+    || left.source.mediaType !== right.source.mediaType
+    || left.source.byteSize !== right.source.byteSize
+    || left.source.sha256Hex !== right.source.sha256Hex
+    || left.source.capturedAtUnixMs !== right.source.capturedAtUnixMs
+    || left.strokes.length !== right.strokes.length) return false;
+  return left.strokes.every((stroke, index) => {
+    const candidate = right.strokes[index];
+    return candidate !== undefined && stroke.points.length === candidate.points.length
+      && stroke.points.every((point, pointIndex) => {
+        const other = candidate.points[pointIndex];
+        return other !== undefined && point.x === other.x && point.y === other.y;
+      });
+  });
 }

@@ -16,6 +16,7 @@ import {
 import {
   cloneMobileComposerAttachment,
   mobileComposerAttachmentsEqual,
+  normalizeMobileComposerAttachmentSet,
   normalizeMobileComposerAttachment,
   type MobileComposerAttachment,
   type MobileUploadedComposerAttachment
@@ -149,15 +150,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
       end: candidate.end
     };
   });
-  const attachmentIds = new Set<string>();
-  const attachments = value.attachments.map((candidate) => {
-    const attachment = normalizeMobileComposerAttachment(candidate);
-    if (attachmentIds.has(attachment.attachmentId)) {
-      throw new Error("The local Joko attachment identity is duplicated.");
-    }
-    attachmentIds.add(attachment.attachmentId);
-    return attachment;
-  });
+  const attachments = normalizeMobileComposerAttachmentSet(value.attachments);
   return { text: value.text, mentions, attachments };
 }
 

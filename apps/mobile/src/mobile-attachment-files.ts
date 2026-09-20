@@ -1,6 +1,8 @@
 import {
   appendMobileComposerAttachments,
   assertMobileAttachmentCandidate,
+  MOBILE_MAXIMUM_ATTACHMENT_BYTES,
+  mobileComposerAttachmentStorageIds,
   mobileAttachmentPickerMediaTypes,
   normalizeMobileComposerAttachment,
   type MobileAttachmentPolicy,
@@ -47,6 +49,10 @@ export interface MobileVerifiedAttachmentBytes {
   readonly sha256Hex: string;
 }
 
+export interface MobileVerifiedOwnedBytes extends MobileAttachmentFileSnapshot {
+  readonly sha256Hex: string;
+}
+
 type DigestBytes = (bytes: Uint8Array) => Promise<string>;
 
 export class MobileAttachmentFiles {
@@ -86,7 +92,7 @@ export class MobileAttachmentFiles {
     if (current.length + candidates.length > policy.maximumItems) {
       throw new Error(`A task message can include at most ${policy.maximumItems} attachments.`);
     }
-    const existingIds = new Set(current.map((attachment) => normalizeMobileComposerAttachment(attachment).attachmentId));
+    const existingIds = new Set(mobileComposerAttachmentStorageIds(current));
     const staged: MobileLocalComposerAttachment[] = [];
     const stagedIds: string[] = [];
     try {
@@ -182,7 +188,7 @@ export class MobileAttachmentFiles {
     if (sourceSha256Hex !== candidate.sha256Hex) {
       throw new Error(`${metadata.fileName} failed its authenticated SHA-256 check before staging.`);
     }
-    const existingIds = new Set(current.map((attachment) => normalizeMobileComposerAttachment(attachment).attachmentId));
+    const existingIds = new Set(mobileComposerAttachmentStorageIds(current));
     const attachmentId = newId();
     assertAttachmentId(attachmentId);
     if (existingIds.has(attachmentId)) throw new Error("The new attachment identity is already in use.");
@@ -218,10 +224,103 @@ export class MobileAttachmentFiles {
     }
   }
 
-  async remove(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
+  async digestOwnedBytes(bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1
+      || bytes.byteLength > MOBILE_MAXIMUM_ATTACHMENT_BYTES) {
+      throw new Error("The owned attachment bytes are invalid.");
+    }
+    signal?.throwIfAborted();
+    const sha256Hex = await this.digestBytes(bytes);
+    signal?.throwIfAborted();
+    if (!/^[0-9a-f]{64}$/u.test(sha256Hex)) throw new Error("The attachment SHA-256 result is invalid.");
+    return sha256Hex;
+  }
+
+  async stageOwnedBytes(
+    profileId: string,
+    storageId: string,
+    bytes: Uint8Array,
+    expectedSha256Hex: string,
+    signal?: AbortSignal
+  ): Promise<MobileVerifiedOwnedBytes> {
+    assertProfileId(profileId);
+    assertAttachmentId(storageId);
+    signal?.throwIfAborted();
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1
+      || bytes.byteLength > MOBILE_MAXIMUM_ATTACHMENT_BYTES || !/^[0-9a-f]{64}$/u.test(expectedSha256Hex)) {
+      throw new Error("The owned image source bytes are invalid.");
+    }
+    const sourceSha256Hex = await this.digestBytes(bytes);
+    signal?.throwIfAborted();
+    if (sourceSha256Hex !== expectedSha256Hex) throw new Error("The owned image source failed its SHA-256 check.");
+    let staged = false;
+    try {
+      const snapshot = await this.driver.stageBytes(profileId, storageId, bytes);
+      staged = true;
+      signal?.throwIfAborted();
+      assertSnapshot(snapshot);
+      if (snapshot.byteSize !== bytes.byteLength) throw new Error("The owned image source changed while it was staged.");
+      const sha256Hex = await this.digestBytes(snapshot.bytes);
+      signal?.throwIfAborted();
+      if (sha256Hex !== expectedSha256Hex) throw new Error("The staged image source failed its SHA-256 check.");
+      return { ...snapshot, bytes: Uint8Array.from(snapshot.bytes), sha256Hex };
+    } catch (error) {
+      if (staged) await this.driver.remove(profileId, storageId).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async readOwnedBytes(
+    profileId: string,
+    storageId: string,
+    expectedByteSize: number,
+    expectedSha256Hex: string,
+    signal?: AbortSignal
+  ): Promise<MobileVerifiedOwnedBytes> {
+    assertProfileId(profileId);
+    assertAttachmentId(storageId);
+    if (!Number.isSafeInteger(expectedByteSize) || expectedByteSize < 1
+      || expectedByteSize > MOBILE_MAXIMUM_ATTACHMENT_BYTES || !/^[0-9a-f]{64}$/u.test(expectedSha256Hex)) {
+      throw new Error("The owned image source identity is invalid.");
+    }
+    signal?.throwIfAborted();
+    const snapshot = await this.driver.read(profileId, storageId);
+    signal?.throwIfAborted();
+    assertSnapshot(snapshot);
+    if (snapshot.byteSize !== expectedByteSize || snapshot.bytes.byteLength !== expectedByteSize) {
+      throw new Error("The owned image source changed after it was staged.");
+    }
+    const sha256Hex = await this.digestBytes(snapshot.bytes);
+    signal?.throwIfAborted();
+    if (sha256Hex !== expectedSha256Hex) throw new Error("The owned image source failed its staged SHA-256 check.");
+    return { ...snapshot, bytes: Uint8Array.from(snapshot.bytes), sha256Hex };
+  }
+
+  async removeOwnedBytes(profileId: string, storageId: string): Promise<void> {
+    assertProfileId(profileId);
+    assertAttachmentId(storageId);
+    await this.driver.remove(profileId, storageId);
+  }
+
+  async removeVisibleBytes(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
     assertProfileId(profileId);
     const exact = normalizeMobileComposerAttachment(attachment);
     if (exact.state === "local") await this.driver.remove(profileId, exact.attachmentId);
+  }
+
+  async removeAnnotationSource(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
+    assertProfileId(profileId);
+    const exact = normalizeMobileComposerAttachment(attachment);
+    if (exact.annotation) await this.driver.remove(profileId, exact.annotation.source.storageId);
+  }
+
+  async remove(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
+    assertProfileId(profileId);
+    const exact = normalizeMobileComposerAttachment(attachment);
+    await Promise.all([
+      ...(exact.state === "local" ? [this.driver.remove(profileId, exact.attachmentId)] : []),
+      ...(exact.annotation ? [this.driver.remove(profileId, exact.annotation.source.storageId)] : [])
+    ]);
   }
 
   async clearProfile(profileId: string): Promise<void> {
