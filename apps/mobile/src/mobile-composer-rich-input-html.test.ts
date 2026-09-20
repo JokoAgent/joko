@@ -58,6 +58,15 @@ describe("mobile composer rich input HTML", () => {
     expect(html).toContain("{ slashCommand }");
     expect(html).toContain("window.jokoComposer");
     expect(html).toContain("type: 'paste'");
+    expect(html).toContain("type: 'pasteImagesStart'");
+    expect(html).toContain("type: 'pasteImage'");
+    expect(html).toContain("type: 'pasteImageFailed'");
+    expect(html).toContain("new FileReader()");
+    expect(html).toContain("SUPPORTED_PASTED_IMAGE_MEDIA_TYPES.has(mediaType)");
+    expect(html).toContain("character.charCodeAt(0) <= 31");
+    expect(html).toContain("reader.onabort = reader.onerror");
+    expect(html).toContain("try { reader.readAsDataURL(file); }");
+    expect(html.indexOf("if (images.length > 0)")).toBeLessThan(html.lastIndexOf("const clipboardText ="));
     expect(html).not.toContain("fetch(");
     expect(html).not.toContain("XMLHttpRequest");
     expect(html).not.toContain("quoted source payload");

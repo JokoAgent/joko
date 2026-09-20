@@ -36,6 +36,30 @@ export interface MobileComposerRichPasteMessage extends MobileComposerRichWebBas
   readonly text?: string;
 }
 
+export interface MobileComposerRichPasteImagesStartMessage extends MobileComposerRichWebBaseMessage {
+  readonly type: "pasteImagesStart";
+  readonly documentId: number;
+  readonly requestId: string;
+  readonly count: number;
+}
+
+export interface MobileComposerRichPasteImageMessage extends MobileComposerRichWebBaseMessage {
+  readonly type: "pasteImage";
+  readonly documentId: number;
+  readonly requestId: string;
+  readonly index: number;
+  readonly mediaType: MobileComposerPastedImageMediaType;
+  readonly name: string;
+  readonly base64: string;
+}
+
+export interface MobileComposerRichPasteImageFailedMessage extends MobileComposerRichWebBaseMessage {
+  readonly type: "pasteImageFailed";
+  readonly documentId: number;
+  readonly requestId: string;
+  readonly index: number;
+}
+
 export interface MobileComposerRichHeightMessage extends MobileComposerRichWebBaseMessage {
   readonly type: "height";
   readonly height: number;
@@ -72,6 +96,9 @@ export type MobileComposerRichWebMessage = MobileComposerRichReadyMessage
   | MobileComposerRichChangeMessage
   | MobileComposerRichSelectionMessage
   | MobileComposerRichPasteMessage
+  | MobileComposerRichPasteImagesStartMessage
+  | MobileComposerRichPasteImageMessage
+  | MobileComposerRichPasteImageFailedMessage
   | MobileComposerRichHeightMessage
   | MobileComposerRichFocusMessage
   | MobileComposerRichBlurMessage
@@ -79,7 +106,21 @@ export type MobileComposerRichWebMessage = MobileComposerRichReadyMessage
   | MobileComposerRichPaletteKeyMessage
   | MobileComposerRichActivateMessage;
 
-const maximumProtocolCharacters = 16_777_216;
+export const mobileComposerPastedImageMediaTypes = [
+  "image/gif",
+  "image/heic",
+  "image/heif",
+  "image/jpeg",
+  "image/png",
+  "image/webp"
+] as const;
+export type MobileComposerPastedImageMediaType = typeof mobileComposerPastedImageMediaTypes[number];
+
+const maximumPastedImageCount = 20;
+const maximumPastedImageBase64Characters = 40_000_000;
+const maximumPastedImageNameCharacters = 255;
+const maximumPasteRequestIdCharacters = 64;
+const maximumProtocolCharacters = maximumPastedImageBase64Characters + 4_096;
 const maximumInstanceCharacters = 128;
 const maximumIdentityCharacters = 2_100;
 const maximumDocumentCharacters = 1_000_000;
@@ -135,6 +176,53 @@ export function parseMobileComposerRichWebMessage(raw: string): MobileComposerRi
       start: value.start as number,
       end: value.end as number,
       ...(value.text === undefined ? {} : { text: value.text })
+    };
+  }
+  if (value.type === "pasteImagesStart"
+    && exactKeys(value, ["type", "instanceId", "documentId", "requestId", "count"])
+    && validDocumentId(value.documentId) && validPasteRequestId(value.requestId)
+    && Number.isSafeInteger(value.count) && (value.count as number) >= 1
+    && (value.count as number) <= maximumPastedImageCount) {
+    return {
+      type: "pasteImagesStart",
+      instanceId,
+      documentId: value.documentId,
+      requestId: value.requestId,
+      count: value.count as number
+    };
+  }
+  if (value.type === "pasteImageFailed"
+    && exactKeys(value, ["type", "instanceId", "documentId", "requestId", "index"])
+    && validDocumentId(value.documentId) && validPasteRequestId(value.requestId)
+    && validPastedImageIndex(value.index)) {
+    return {
+      type: "pasteImageFailed",
+      instanceId,
+      documentId: value.documentId,
+      requestId: value.requestId,
+      index: value.index as number
+    };
+  }
+  if (value.type === "pasteImage"
+    && exactKeys(value, [
+      "type", "instanceId", "documentId", "requestId", "index", "mediaType", "name", "base64"
+    ])
+    && validDocumentId(value.documentId) && validPasteRequestId(value.requestId)
+    && validPastedImageIndex(value.index) && isPastedImageMediaType(value.mediaType)
+    && typeof value.name === "string" && value.name.length > 0
+    && value.name.length <= maximumPastedImageNameCharacters
+    && !/[\u0000-\u001f\u007f]/u.test(value.name)
+    && typeof value.base64 === "string" && value.base64.length > 0
+    && value.base64.length <= maximumPastedImageBase64Characters) {
+    return {
+      type: "pasteImage",
+      instanceId,
+      documentId: value.documentId,
+      requestId: value.requestId,
+      index: value.index as number,
+      mediaType: value.mediaType,
+      name: value.name,
+      base64: value.base64
     };
   }
   if (value.type === "height" && exactKeys(value, ["type", "instanceId", "height"])
@@ -209,6 +297,19 @@ function validDocumentId(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1;
 }
 
+function validPasteRequestId(value: unknown): value is string {
+  return validIdentity(value, maximumPasteRequestIdCharacters);
+}
+
+function validPastedImageIndex(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    && (value as number) < maximumPastedImageCount;
+}
+
+function isPastedImageMediaType(value: unknown): value is MobileComposerPastedImageMediaType {
+  return typeof value === "string" && (mobileComposerPastedImageMediaTypes as readonly string[]).includes(value);
+}
+
 function isCommandPaletteKey(value: unknown): value is MobileComposerCommandPaletteKey {
   return value === "ArrowUp" || value === "ArrowDown" || value === "Enter" || value === "Tab" || value === "Escape";
 }
@@ -232,6 +333,10 @@ export const mobileComposerRichProtocolLimits = {
   maximumDocumentCharacters,
   maximumHeight,
   maximumPasteCharacters,
+  maximumPasteRequestIdCharacters,
+  maximumPastedImageBase64Characters,
+  maximumPastedImageCount,
+  maximumPastedImageNameCharacters,
   maximumProtocolCharacters,
   maximumSegments
 };

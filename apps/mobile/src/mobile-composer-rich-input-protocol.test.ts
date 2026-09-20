@@ -46,6 +46,30 @@ describe("mobile composer rich input protocol", () => {
       text: "plain"
     }))).toMatchObject({ type: "paste", text: "plain" });
     expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImagesStart",
+      instanceId: "instance-1",
+      documentId: 7,
+      requestId: "paste-1",
+      count: 2
+    }))).toMatchObject({ type: "pasteImagesStart", requestId: "paste-1", count: 2 });
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImage",
+      instanceId: "instance-1",
+      documentId: 7,
+      requestId: "paste-1",
+      index: 0,
+      mediaType: "image/png",
+      name: "clipboard.png",
+      base64: "AQID"
+    }))).toMatchObject({ type: "pasteImage", index: 0, mediaType: "image/png", base64: "AQID" });
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImageFailed",
+      instanceId: "instance-1",
+      documentId: 7,
+      requestId: "paste-1",
+      index: 1
+    }))).toMatchObject({ type: "pasteImageFailed", index: 1 });
+    expect(parseMobileComposerRichWebMessage(encode({
       type: "composition", instanceId: "instance-1", composing: true
     }))).toEqual({ type: "composition", instanceId: "instance-1", composing: true });
     expect(parseMobileComposerRichWebMessage(encode({
@@ -77,6 +101,22 @@ describe("mobile composer rich input protocol", () => {
       start: 0,
       end: 0,
       text: "x".repeat(mobileComposerRichProtocolLimits.maximumPasteCharacters + 1)
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImagesStart", instanceId: "instance-1", documentId: 1,
+      requestId: "paste-1", count: mobileComposerRichProtocolLimits.maximumPastedImageCount + 1
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImage", instanceId: "instance-1", documentId: 1, requestId: "paste-1", index: 0,
+      mediaType: "image/svg+xml", name: "forged.svg", base64: "AQID"
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImage", instanceId: "instance-1", documentId: 1, requestId: "paste-1", index: 0,
+      mediaType: "image/png", name: "forged.png", base64: "AQID", authority: "forged"
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      type: "pasteImage", instanceId: "instance-1", documentId: 1, requestId: "paste-1", index: 20,
+      mediaType: "image/png", name: "forged.png", base64: "AQID"
     }))).toBeUndefined();
     expect(parseMobileComposerRichWebMessage("{" )).toBeUndefined();
     expect(parseMobileComposerRichWebMessage(encode({

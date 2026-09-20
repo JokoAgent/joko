@@ -40,8 +40,13 @@ import {
 } from "./storage";
 import {
   mobileComposerDraftIdentityKey,
-  type MobileComposerDraftIdentity
+  type MobileComposerDraftIdentity,
+  type MobileComposerDraftSnapshot
 } from "./composer-draft-store";
+import type {
+  MobileNewTaskDraftSnapshot,
+  MobileNewTaskEditableDraft
+} from "./new-task-draft-store";
 import { addToMobileComposer } from "./composer-draft-behavior";
 import {
   emptyMobileComposerDraft,
@@ -71,6 +76,7 @@ import {
   formatMobileAttachmentBytes,
   removeMobileComposerAttachment,
   type MobileAttachmentControls,
+  type MobileAttachmentPolicy,
   type MobileComposerAttachment
 } from "./mobile-attachments";
 import { mobileCameraCaptureSupported } from "./mobile-attachment-camera";
@@ -99,9 +105,15 @@ import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
   MobileComposerRichInput,
+  type MobileComposerRichImagePasteRequest,
+  type MobileComposerRichImagePasteStartRequest,
   type MobileComposerRichInputHandle,
   type MobileComposerRichPasteRequest
 } from "./MobileComposerRichInput";
+import {
+  MobileComposerImagePaste,
+  commitMobileComposerImagePaste
+} from "./mobile-composer-image-paste";
 import { MobileRuntimeCommandPalette, type MobileRuntimeCommandPaletteStatus } from "./MobileRuntimeCommandPalette";
 import { MobileCommandHelpSheet } from "./MobileCommandHelpSheet";
 import {
@@ -199,6 +211,7 @@ const client = new MobileClient(
   mobileAttachmentFiles
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
+const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
 
 interface MobilePhotoLibraryLease {
@@ -211,6 +224,27 @@ interface MobilePhotoLibraryLease {
 interface MobileComposerImageEditorLease {
   readonly session: MobileComposerImageEditorSession;
   readonly scopeKey: string;
+}
+
+interface MobileNewTaskImagePasteLease {
+  readonly count: number;
+  readonly controller: AbortController;
+  readonly controls: MobileAttachmentControls;
+  readonly draft: MobileNewTaskEditableDraft;
+  readonly generation: number;
+  readonly profileId: string;
+  readonly snapshot: Promise<MobileNewTaskDraftSnapshot>;
+  readonly targetId: string;
+}
+
+interface MobileTaskImagePasteLease {
+  readonly count: number;
+  readonly controller: AbortController;
+  readonly controls: MobileAttachmentControls;
+  readonly draft: MobileComposerDraft;
+  readonly generation: number;
+  readonly identity: MobileComposerDraftIdentity;
+  readonly snapshot: Promise<MobileComposerDraftSnapshot>;
 }
 
 interface MobileRuntimeCommandLoadState {
@@ -1107,6 +1141,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [mentionBusy, setMentionBusy] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [pastedImageCount, setPastedImageCount] = useState(0);
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const [composerAtomId, setComposerAtomId] = useState<string>();
@@ -1133,6 +1168,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
+  const imagePasteLeaseRef = useRef<MobileNewTaskImagePasteLease | undefined>(undefined);
   const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
   const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
   const draftRef = useRef(draft);
@@ -1175,6 +1211,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     mountedRef.current = true;
     if (!identity) {
       const input = emptyMobileComposerDraft();
+      imagePasteLeaseRef.current = undefined;
+      setPastedImageCount(0);
       setDraft({ targetId: "", name: "", input });
       setComposerSelection({ start: 0, end: 0 });
       setLoadedProfileId(undefined);
@@ -1209,6 +1247,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       mountedRef.current = false;
       attachmentAbortRef.current?.abort();
       attachmentNativeActivityRef.current = false;
+      imagePasteLeaseRef.current = undefined;
       photoLibraryLeaseRef.current = undefined;
       if (imageEditorLeaseRef.current) {
         client.cancelComposerImageEditor(imageEditorLeaseRef.current.session.leaseId);
@@ -1248,6 +1287,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       attachmentAbortRef.current?.abort();
       attachmentAbortRef.current = undefined;
       attachmentNativeActivityRef.current = false;
+      imagePasteLeaseRef.current = undefined;
+      setPastedImageCount(0);
       photoLibraryLeaseRef.current = undefined;
       setPhotoLibraryLease(undefined);
       if (imageEditorLeaseRef.current) {
@@ -1259,6 +1300,19 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setAttachmentBusy(false);
     }
   }, [attachmentControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const lease = imagePasteLeaseRef.current;
+    if (!lease) return;
+    const scopeMatches = profileId === lease.profileId && draft.targetId === lease.targetId;
+    if (scopeMatches && state.status === "connected" && AppState.currentState === "active") return;
+    lease.controller.abort();
+    if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+    imagePasteLeaseRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    attachmentGenerationRef.current += 1;
+    setPastedImageCount(0);
+    setAttachmentBusy(false);
+  }, [draft.targetId, profileId, state.status]);
   useEffect(() => {
     const lease = photoLibraryLeaseRef.current;
     if (!lease) return;
@@ -1480,6 +1534,130 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       }
     } catch (failure) {
       if (mountedRef.current && profileIdRef.current === ownerProfileId) setError(errorText(failure));
+    }
+  };
+  const startClipboardImagePaste = (request: MobileComposerRichImagePasteStartRequest): boolean => {
+    const controls = attachmentControls;
+    const ownerProfileId = profileIdRef.current;
+    const current = draftRef.current;
+    if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId || !controls.policy.images
+      || request.draft !== current.input || request.count > controls.policy.maximumItems - current.input.attachments.length
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditableRef.current
+      || imagePasteLeaseRef.current !== undefined || attachmentNativeActivityRef.current
+      || client.state.activeProfileId !== ownerProfileId || client.state.status !== "connected"
+      || client.state.busy || AppState.currentState !== "active") return false;
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    const snapshot = mobileNewTaskDrafts.readSnapshot({ profileId: ownerProfileId });
+    void snapshot.catch(() => undefined);
+    const lease: MobileNewTaskImagePasteLease = {
+      count: request.count,
+      controller,
+      controls,
+      draft: current,
+      generation,
+      profileId: ownerProfileId,
+      snapshot,
+      targetId: current.targetId
+    };
+    imagePasteLeaseRef.current = lease;
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setAttachmentBusy(true);
+    setPastedImageCount(request.count);
+    setError("");
+    return true;
+  };
+  const cancelClipboardImagePaste = (sourceDraft: MobileComposerDraft): void => {
+    const lease = imagePasteLeaseRef.current;
+    if (!lease || lease.draft.input !== sourceDraft) return;
+    lease.controller.abort();
+    imagePasteLeaseRef.current = undefined;
+    if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    attachmentGenerationRef.current += 1;
+    setPastedImageCount(0);
+    setAttachmentBusy(false);
+  };
+  const pasteClipboardImages = async (request: MobileComposerRichImagePasteRequest): Promise<void> => {
+    const lease = imagePasteLeaseRef.current;
+    if (!lease || request.draft !== lease.draft.input || request.count !== request.images.length
+      || request.count !== lease.count) {
+      if (lease) cancelClipboardImagePaste(lease.draft.input);
+      setError("The clipboard image batch no longer belongs to this new-task draft. Paste it again.");
+      return;
+    }
+    try {
+      const result = await commitMobileComposerImagePaste({
+        buildDraft: (input) => ({ targetId: lease.draft.targetId, name: lease.draft.name, input }),
+        files: mobileAttachmentFiles,
+        flush: () => mobileNewTaskDrafts.flush({ profileId: lease.profileId }),
+        imagePaste: mobileComposerImagePaste,
+        input: lease.draft.input,
+        newId: randomUUID,
+        payloads: request.images,
+        policy: lease.controls.policy,
+        profileId: lease.profileId,
+        readBackMatches: (committed) => {
+          const retainedDraft = mobileNewTaskDrafts.readSync({ profileId: lease.profileId });
+          return retainedDraft !== null && retainedDraft.submission === undefined
+            && sameMobileNewTaskEditableDraft(retainedDraft, committed);
+        },
+        saveIfRevision: (next, revision) => mobileNewTaskDrafts.saveIfRevision(
+          { profileId: lease.profileId },
+          next,
+          revision
+        ),
+        signal: lease.controller.signal,
+        snapshot: lease.snapshot,
+        snapshotMatches: (stored) => stored !== undefined && stored.submission === undefined
+          && sameMobileNewTaskEditableDraft(stored, lease.draft),
+        validateAuthority: () => {
+          const latest = client.newTaskAttachmentControls(lease.targetId);
+          if (!mountedRef.current || imagePasteLeaseRef.current !== lease
+            || attachmentGenerationRef.current !== lease.generation
+            || attachmentAbortRef.current !== lease.controller || lease.controller.signal.aborted
+            || profileIdRef.current !== lease.profileId || draftRef.current !== lease.draft
+            || client.state.activeProfileId !== lease.profileId || client.state.status !== "connected"
+            || client.state.busy || AppState.currentState !== "active"
+            || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey
+            || !sameMobileAttachmentControls(latest, lease.controls)) {
+            throw new Error("Attachment authority changed while the clipboard images were being prepared.");
+          }
+        }
+      });
+      if (!mountedRef.current || imagePasteLeaseRef.current !== lease
+        || attachmentGenerationRef.current !== lease.generation || profileIdRef.current !== lease.profileId) return;
+      draftRef.current = result.draft;
+      setDraft(result.draft);
+      setComposerSelection(selectionRef.current);
+    } catch (failure) {
+      if (mountedRef.current && profileIdRef.current === lease.profileId) {
+        const retainedDraft = mobileNewTaskDrafts.readSync({ profileId: lease.profileId });
+        if (retainedDraft !== null && retainedDraft.submission === undefined) {
+          const recovered = {
+            targetId: retainedDraft.targetId,
+            name: retainedDraft.name,
+            input: retainedDraft.input
+          };
+          const selection = boundedComposerSelection(selectionRef.current, recovered.input.text.length);
+          draftRef.current = recovered;
+          selectionRef.current = selection;
+          setDraft(recovered);
+          setComposerSelection(selection);
+        }
+        if (attachmentGenerationRef.current === lease.generation) setError(errorText(failure));
+      }
+    } finally {
+      if (imagePasteLeaseRef.current === lease) imagePasteLeaseRef.current = undefined;
+      if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+      if (mountedRef.current && attachmentGenerationRef.current === lease.generation) {
+        attachmentNativeActivityRef.current = false;
+        setPastedImageCount(0);
+        setAttachmentBusy(false);
+      }
     }
   };
   const removeComposerAtom = (atomId: string): void => {
@@ -2040,7 +2218,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
           disabled={!referencesEditable} onOpen={setComposerAtomId} />
       </View>}
       <MobileAttachmentTray attachments={draft.input.attachments} colors={colors}
-        disabled={!referencesEditable} busy={attachmentBusy || state.busy}
+        disabled={!referencesEditable} busy={attachmentBusy || state.busy} pendingCount={pastedImageCount}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />
       <MobileComposerRichInput key={`new-task-rich-${profileId ?? "none"}-${draft.targetId}`}
         ref={composerInputRef} accessibilityLabel="First message"
@@ -2059,6 +2237,9 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         onError={setError}
         onHeightChange={(nextHeight) => setComposerHeight(Math.max(132, Math.min(260, nextHeight)))}
         onOpenAtom={setComposerAtomId}
+        onPasteImages={(request) => { void pasteClipboardImages(request); }}
+        onPasteImagesCancel={cancelClipboardImagePaste}
+        onPasteImagesStart={startClipboardImagePaste}
         onPasteText={(request) => { void pasteClipboardText(request); }}
         onSelectionChange={(nextSelection, sourceDraft) => {
           if (draftRef.current.input !== sourceDraft) return;
@@ -2196,6 +2377,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [appCommandRunning, setAppCommandRunning] = useState(false);
   const [commandHelpItems, setCommandHelpItems] = useState<readonly MobileCommandPaletteCandidate[]>();
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [pastedImageCount, setPastedImageCount] = useState(0);
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [composerNotice, setComposerNotice] = useState("");
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
@@ -2341,6 +2523,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
+  const imagePasteLeaseRef = useRef<MobileTaskImagePasteLease | undefined>(undefined);
   const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
   const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
   composerDraftRef.current = draft;
@@ -2527,6 +2710,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       attachmentAbortRef.current?.abort();
       attachmentAbortRef.current = undefined;
       attachmentNativeActivityRef.current = false;
+      imagePasteLeaseRef.current = undefined;
+      setPastedImageCount(0);
       photoLibraryLeaseRef.current = undefined;
       setPhotoLibraryLease(undefined);
       if (imageEditorLeaseRef.current) {
@@ -2538,6 +2723,21 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       setAttachmentBusy(false);
     }
   }, [attachmentControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const lease = imagePasteLeaseRef.current;
+    if (!lease) return;
+    const identity = draftIdentityRef.current;
+    const scopeMatches = identity !== undefined
+      && mobileComposerDraftIdentityKey(identity) === mobileComposerDraftIdentityKey(lease.identity);
+    if (scopeMatches && state.status === "connected" && AppState.currentState === "active") return;
+    lease.controller.abort();
+    if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+    imagePasteLeaseRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    attachmentGenerationRef.current += 1;
+    setPastedImageCount(0);
+    setAttachmentBusy(false);
+  }, [draftIdentityKey, state.status]);
   useEffect(() => {
     const lease = photoLibraryLeaseRef.current;
     if (!lease) return;
@@ -2597,6 +2797,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     setWorkspaceMentionsVisible(false);
     setCatalogMentionsVisible(false);
     if (!identity) {
+      imagePasteLeaseRef.current = undefined;
+      setPastedImageCount(0);
       setDraft(emptyMobileComposerDraft());
       setComposerSelection({ start: 0, end: 0 });
       setLoadedDraftKey(undefined);
@@ -2688,6 +2890,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       runtimeCommandRequestRef.current += 1;
       attachmentAbortRef.current?.abort();
       attachmentNativeActivityRef.current = false;
+      imagePasteLeaseRef.current = undefined;
       photoLibraryLeaseRef.current = undefined;
       if (imageEditorLeaseRef.current) {
         client.cancelComposerImageEditor(imageEditorLeaseRef.current.session.leaseId);
@@ -3475,6 +3678,128 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       }
     }
   };
+  const startClipboardImagePaste = (request: MobileComposerRichImagePasteStartRequest): boolean => {
+    const controls = attachmentControls;
+    const identity = draftIdentityRef.current;
+    const current = composerDraftRef.current;
+    if (!controls || !identity || controls.profileId !== identity.profileId || !controls.policy.images
+      || request.draft !== current || request.count > controls.policy.maximumItems - current.attachments.length
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerPasteEditableRef.current
+      || imagePasteLeaseRef.current !== undefined || attachmentNativeActivityRef.current || queueEditRef.current
+      || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+      || client.state.status !== "connected" || client.state.busy || AppState.currentState !== "active") return false;
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    const snapshot = mobileComposerDrafts.readSnapshot(identity);
+    void snapshot.catch(() => undefined);
+    const lease: MobileTaskImagePasteLease = {
+      controller,
+      controls,
+      count: request.count,
+      draft: current,
+      generation,
+      identity,
+      snapshot
+    };
+    imagePasteLeaseRef.current = lease;
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    setRuntimeControlsVisible(false);
+    setContextVisible(false);
+    setNativeTreeVisible(false);
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
+    setAttachmentBusy(true);
+    setPastedImageCount(request.count);
+    setLocalError("");
+    return true;
+  };
+  const cancelClipboardImagePaste = (sourceDraft: MobileComposerDraft): void => {
+    const lease = imagePasteLeaseRef.current;
+    if (!lease || lease.draft !== sourceDraft) return;
+    lease.controller.abort();
+    imagePasteLeaseRef.current = undefined;
+    if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    attachmentGenerationRef.current += 1;
+    setPastedImageCount(0);
+    setAttachmentBusy(false);
+  };
+  const pasteClipboardImages = async (request: MobileComposerRichImagePasteRequest): Promise<void> => {
+    const lease = imagePasteLeaseRef.current;
+    if (!lease || request.draft !== lease.draft || request.count !== request.images.length
+      || request.count !== lease.count) {
+      if (lease) cancelClipboardImagePaste(lease.draft);
+      setLocalError("The clipboard image batch no longer belongs to this task draft. Paste it again.");
+      return;
+    }
+    const identityKey = mobileComposerDraftIdentityKey(lease.identity);
+    try {
+      const result = await commitMobileComposerImagePaste({
+        buildDraft: (input) => input,
+        files: mobileAttachmentFiles,
+        flush: () => mobileComposerDrafts.flush(lease.identity),
+        imagePaste: mobileComposerImagePaste,
+        input: lease.draft,
+        newId: randomUUID,
+        payloads: request.images,
+        policy: lease.controls.policy,
+        profileId: lease.identity.profileId,
+        readBackMatches: (committed) => {
+          const retainedDraft = mobileComposerDrafts.readSync(lease.identity);
+          return retainedDraft !== null && mobileComposerDraftsEqual(retainedDraft, committed);
+        },
+        saveIfRevision: (next, revision) => mobileComposerDrafts.saveIfRevision(lease.identity, next, revision),
+        signal: lease.controller.signal,
+        snapshot: lease.snapshot,
+        snapshotMatches: (stored) => mobileComposerDraftsEqual(stored ?? emptyMobileComposerDraft(), lease.draft),
+        validateAuthority: () => {
+          const currentIdentity = draftIdentityRef.current;
+          const latest = client.taskAttachmentControls();
+          if (!taskMountedRef.current || imagePasteLeaseRef.current !== lease
+            || attachmentGenerationRef.current !== lease.generation
+            || attachmentAbortRef.current !== lease.controller || lease.controller.signal.aborted
+            || !currentIdentity || mobileComposerDraftIdentityKey(currentIdentity) !== identityKey
+            || composerDraftRef.current !== lease.draft || queueEditRef.current
+            || client.state.activeProfileId !== lease.identity.profileId
+            || client.state.selectedId !== lease.identity.sessionId || client.state.status !== "connected"
+            || client.state.busy || AppState.currentState !== "active"
+            || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey
+            || !sameMobileAttachmentControls(latest, lease.controls)) {
+            throw new Error("Attachment authority changed while the clipboard images were being prepared.");
+          }
+        }
+      });
+      const currentIdentity = draftIdentityRef.current;
+      if (!taskMountedRef.current || imagePasteLeaseRef.current !== lease
+        || attachmentGenerationRef.current !== lease.generation || !currentIdentity
+        || mobileComposerDraftIdentityKey(currentIdentity) !== identityKey) return;
+      composerDraftRef.current = result.draft;
+      setDraft(result.draft);
+      setComposerSelection(composerSelectionRef.current);
+    } catch (failure) {
+      const currentIdentity = draftIdentityRef.current;
+      if (taskMountedRef.current && currentIdentity
+        && mobileComposerDraftIdentityKey(currentIdentity) === identityKey && !queueEditRef.current) {
+        const recovered = mobileComposerDrafts.readSync(lease.identity) ?? emptyMobileComposerDraft();
+        const selection = boundedComposerSelection(composerSelectionRef.current, recovered.text.length);
+        composerDraftRef.current = recovered;
+        composerSelectionRef.current = selection;
+        setDraft(recovered);
+        setComposerSelection(selection);
+        if (attachmentGenerationRef.current === lease.generation) setLocalError(errorText(failure));
+      }
+    } finally {
+      if (imagePasteLeaseRef.current === lease) imagePasteLeaseRef.current = undefined;
+      if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+      if (taskMountedRef.current && attachmentGenerationRef.current === lease.generation) {
+        attachmentNativeActivityRef.current = false;
+        setPastedImageCount(0);
+        setAttachmentBusy(false);
+      }
+    }
+  };
   const removeComposerAtom = (atomId: string): void => {
     const identity = draftIdentityRef.current;
     if (!identity || queueEditRef.current) return;
@@ -4007,6 +4332,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
         disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
         busy={state.busy || composerOperationPending || voice.busy || attachmentBusy}
+        pendingCount={pastedImageCount}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
       <MobileRuntimeCommandPalette visible={runtimeCommandPaletteVisible}
         query={runtimeCommandActivation?.query ?? ""} items={runtimeCommandResults.items}
@@ -4077,6 +4403,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             }}
             onHeightChange={(nextHeight) => setComposerContentHeight(Math.max(composerMinimumInputHeight, nextHeight))}
             onOpenAtom={setComposerAtomId}
+            onPasteImages={(request) => { void pasteClipboardImages(request); }}
+            onPasteImagesCancel={cancelClipboardImagePaste}
+            onPasteImagesStart={startClipboardImagePaste}
             onPasteText={(request) => { void pasteClipboardText(request); }}
             onSelectionChange={(nextSelection, sourceDraft) => {
               if (composerDraftRef.current !== sourceDraft) return;
@@ -4685,16 +5014,30 @@ function MobileComposerAtomChips({ atoms, colors, disabled, onOpen }: {
   </ScrollView>;
 }
 
-function MobileAttachmentTray({ attachments, colors, disabled, busy, onPreview, onRemove }: {
+function MobileAttachmentTray({ attachments, colors, disabled, busy, pendingCount = 0, onPreview, onRemove }: {
   attachments: readonly MobileComposerAttachment[];
   colors: Colors;
   disabled: boolean;
   busy: boolean;
+  pendingCount?: number;
   onPreview: (attachmentId: string) => void;
   onRemove: (attachmentId: string) => void;
 }) {
-  if (attachments.length === 0) return null;
+  if (attachments.length === 0 && pendingCount === 0) return null;
   return <View accessibilityLabel="Attachments" style={styles.attachmentTray}>
+    {pendingCount > 0 && <View accessible accessibilityLiveRegion="polite"
+      accessibilityLabel={`Adding ${pendingCount} pasted ${pendingCount === 1 ? "image" : "images"}`}
+      style={[styles.attachmentChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
+      <ActivityIndicator color={colors.accent} size="small" />
+      <View style={styles.fill}>
+        <Text style={[styles.attachmentName, { color: colors.ink }]} numberOfLines={1}>
+          Adding {pendingCount} pasted {pendingCount === 1 ? "image" : "images"}…
+        </Text>
+        <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+          Verifying and saving the complete clipboard batch
+        </Text>
+      </View>
+    </View>}
     {attachments.map((attachment) => <View key={attachment.attachmentId}
       style={[styles.attachmentChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <View style={styles.fill}>
@@ -4867,6 +5210,34 @@ function focusNative(ref: RefObject<View | null>): void {
   if (node !== null) setTimeout(() => AccessibilityInfo.setAccessibilityFocus(node), 0);
 }
 function errorText(error: unknown): string { return error instanceof Error ? error.message : "The Joko node is unavailable."; }
+
+function sameMobileAttachmentControls(
+  left: MobileAttachmentControls | undefined,
+  right: MobileAttachmentControls
+): boolean {
+  return left !== undefined && left.profileId === right.profileId
+    && left.surfaceOwnerKey === right.surfaceOwnerKey
+    && sameMobileAttachmentPolicy(left.policy, right.policy);
+}
+
+function sameMobileAttachmentPolicy(left: MobileAttachmentPolicy, right: MobileAttachmentPolicy): boolean {
+  return left.images === right.images && left.files === right.files
+    && left.maximumItems === right.maximumItems && left.maximumBytes === right.maximumBytes
+    && sameStrings(left.imageMediaTypes, right.imageMediaTypes)
+    && sameStrings(left.fileMediaTypes, right.fileMediaTypes);
+}
+
+function sameMobileNewTaskEditableDraft(
+  left: MobileNewTaskEditableDraft,
+  right: MobileNewTaskEditableDraft
+): boolean {
+  return left.targetId === right.targetId && left.name === right.name
+    && mobileComposerDraftsEqual(left.input, right.input);
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
 
 function sameComposerSelection(
   left: MobileComposerSelection | undefined,

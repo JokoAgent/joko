@@ -1,5 +1,9 @@
 import type { MobileComposerSelection } from "./mobile-composer-document";
 import type { MobileComposerRichDocument } from "./mobile-composer-rich-document";
+import {
+  mobileComposerPastedImageMediaTypes,
+  mobileComposerRichProtocolLimits
+} from "./mobile-composer-rich-input-protocol";
 
 export interface MobileComposerRichInputTheme {
   readonly background: string;
@@ -79,8 +83,13 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
   let runtime = initial;
   let applying = false;
   let composing = false;
+  let pasteRequestSequence = 0;
   let lastSignature = '';
   let lastHeight = -1;
+  const MAX_PASTED_IMAGE_BASE64_CHARACTERS = ${mobileComposerRichProtocolLimits.maximumPastedImageBase64Characters};
+  const MAX_PASTED_IMAGE_COUNT = ${mobileComposerRichProtocolLimits.maximumPastedImageCount};
+  const MAX_PASTED_IMAGE_NAME_CHARACTERS = ${mobileComposerRichProtocolLimits.maximumPastedImageNameCharacters};
+  const SUPPORTED_PASTED_IMAGE_MEDIA_TYPES = new Set(${mobileComposerRichJson(mobileComposerPastedImageMediaTypes)});
   const post = (message) => {
     if (!window.ReactNativeWebView || typeof window.ReactNativeWebView.postMessage !== 'function') return;
     window.ReactNativeWebView.postMessage(JSON.stringify(Object.assign({ instanceId }, message)));
@@ -435,6 +444,39 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
   root.addEventListener('paste', (event) => {
     if (!runtime.editable) return;
     event.preventDefault();
+    const items = Array.from(event.clipboardData && event.clipboardData.items || []);
+    const images = items.filter((item) => String(item.type || '').startsWith('image/')).slice(0, MAX_PASTED_IMAGE_COUNT);
+    if (images.length > 0) {
+      const requestId = 'paste-' + String(++pasteRequestSequence);
+      post({ type: 'pasteImagesStart', documentId, requestId, count: images.length });
+      images.forEach((item, index) => {
+        const file = item.getAsFile && item.getAsFile();
+        const mediaType = String(file && file.type || item.type || '');
+        const name = String(file && file.name || ('pasted-image-' + String(index + 1)));
+        if (!file || !SUPPORTED_PASTED_IMAGE_MEDIA_TYPES.has(mediaType)
+          || name.length < 1 || name.length > MAX_PASTED_IMAGE_NAME_CHARACTERS
+          || Array.from(name).some((character) => character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127)) {
+          post({ type: 'pasteImageFailed', documentId, requestId, index });
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || '');
+          const comma = result.indexOf(',');
+          const base64 = comma >= 0 ? result.slice(comma + 1) : '';
+          if (!base64 || base64.length > MAX_PASTED_IMAGE_BASE64_CHARACTERS) {
+            post({ type: 'pasteImageFailed', documentId, requestId, index });
+            return;
+          }
+          post({ type: 'pasteImage', documentId, requestId, index, mediaType, name, base64 });
+        };
+        reader.onerror = () => post({ type: 'pasteImageFailed', documentId, requestId, index });
+        reader.onabort = reader.onerror;
+        try { reader.readAsDataURL(file); }
+        catch (_) { post({ type: 'pasteImageFailed', documentId, requestId, index }); }
+      });
+      return;
+    }
     const selection = currentSelection();
     if (!selection) return;
     const clipboardText = (event.clipboardData && event.clipboardData.getData('text/plain') || '').split(CARET_ANCHOR).join('');

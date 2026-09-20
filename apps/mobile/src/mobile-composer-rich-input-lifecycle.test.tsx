@@ -102,6 +102,9 @@ function mount(initialDraft: MobileComposerDraft) {
   const onBlur = vi.fn();
   const onCommandPaletteKey = vi.fn();
   const onCompositionChange = vi.fn();
+  const onPasteImages = vi.fn();
+  const onPasteImagesCancel = vi.fn();
+  const onPasteImagesStart = vi.fn(() => true);
   const onPasteText = vi.fn();
   const onSelectionChange = vi.fn();
   const page: Page = {
@@ -132,6 +135,9 @@ function mount(initialDraft: MobileComposerDraft) {
     onError,
     onCommandPaletteKey,
     onCompositionChange,
+    onPasteImages,
+    onPasteImagesCancel,
+    onPasteImagesStart,
     onPasteText,
     onSelectionChange,
     ownerKey: "profile\u001fsession",
@@ -145,7 +151,8 @@ function mount(initialDraft: MobileComposerDraft) {
   }));
   const ready = () => send({ type: "ready" });
   return {
-    onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError, onPasteText,
+    onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError,
+    onPasteImages, onPasteImagesCancel, onPasteImagesStart, onPasteText,
     onSelectionChange, page, ready, render, send
   };
 }
@@ -276,6 +283,78 @@ describe("mobile composer rich input lifecycle", () => {
       selection: { start: 4, end: 4 },
       text: "paste"
     });
+  });
+
+  it("collects one exact image batch in clipboard order and cancels malformed or reclaimed batches", () => {
+    const draft = plainTextMobileComposerDraft("kept");
+    const mounted = mount(draft);
+    mounted.ready();
+    mounted.send({
+      type: "pasteImagesStart", documentId: mounted.page.documentId - 1, requestId: "stale", count: 1
+    });
+    expect(mounted.onPasteImagesStart).not.toHaveBeenCalled();
+    mounted.send({
+      type: "pasteImagesStart", documentId: mounted.page.documentId, requestId: "paste-1", count: 2
+    });
+    expect(mounted.onPasteImagesStart).toHaveBeenCalledWith({ count: 2, draft });
+    mounted.send({
+      type: "pasteImage", documentId: mounted.page.documentId, requestId: "paste-1", index: 1,
+      mediaType: "image/jpeg", name: "second.jpg", base64: "AgM="
+    });
+    mounted.send({
+      type: "pasteImage", documentId: mounted.page.documentId, requestId: "paste-1", index: 0,
+      mediaType: "image/png", name: "first.png", base64: "AQI="
+    });
+    expect(mounted.onPasteImages).toHaveBeenCalledWith({
+      count: 2,
+      draft,
+      images: [
+        { mediaType: "image/png", name: "first.png", base64: "AQI=" },
+        { mediaType: "image/jpeg", name: "second.jpg", base64: "AgM=" }
+      ]
+    });
+    expect(mounted.onPasteImagesCancel).not.toHaveBeenCalled();
+
+    mounted.send({
+      type: "pasteImagesStart", documentId: mounted.page.documentId, requestId: "paste-2", count: 1
+    });
+    mounted.send({
+      type: "pasteImageFailed", documentId: mounted.page.documentId, requestId: "paste-2", index: 0
+    });
+    expect(mounted.onPasteImagesCancel).toHaveBeenCalledWith(draft);
+    expect(mounted.onError).toHaveBeenCalledWith(expect.stringMatching(/batch was discarded/u));
+
+    mounted.send({
+      type: "pasteImagesStart", documentId: mounted.page.documentId, requestId: "paste-3", count: 1
+    });
+    act(() => bridge.onContentProcessDidTerminate());
+    expect(mounted.onPasteImagesCancel).toHaveBeenCalledTimes(2);
+  });
+
+  it("retires an unfinished image batch on backgrounding or read timeout", () => {
+    vi.useFakeTimers();
+    const draft = plainTextMobileComposerDraft("kept");
+    const mounted = mount(draft);
+    mounted.ready();
+    mounted.send({
+      type: "pasteImagesStart", documentId: mounted.page.documentId, requestId: "background", count: 1
+    });
+    bridge.state = "background";
+    act(() => bridge.onAppStateChange("background"));
+    expect(mounted.onPasteImagesCancel).toHaveBeenCalledWith(draft);
+
+    bridge.state = "active";
+    act(() => bridge.onAppStateChange("active"));
+    mounted.send({
+      type: "pasteImagesStart", documentId: mounted.page.documentId, requestId: "timeout", count: 1
+    });
+    act(() => vi.advanceTimersByTime(15_000));
+    const heartbeatId = mounted.page.ping.mock.calls.at(-1)?.[0];
+    expect(heartbeatId).toEqual(expect.any(String));
+    mounted.send({ type: "pong", id: heartbeatId });
+    act(() => vi.advanceTimersByTime(15_000));
+    expect(mounted.onPasteImagesCancel).toHaveBeenCalledTimes(2);
+    expect(mounted.onError).toHaveBeenCalledWith(expect.stringMatching(/too long/u));
   });
 
   it("defers a background process recovery until the app becomes active", () => {

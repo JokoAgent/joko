@@ -32,7 +32,8 @@ import {
 } from "./mobile-composer-rich-input-html";
 import {
   parseMobileComposerRichWebMessage,
-  type MobileComposerCommandPaletteKey
+  type MobileComposerCommandPaletteKey,
+  type MobileComposerPastedImageMediaType
 } from "./mobile-composer-rich-input-protocol";
 
 export interface MobileComposerRichInputHandle {
@@ -44,6 +45,21 @@ export interface MobileComposerRichPasteRequest {
   readonly draft: MobileComposerDraft;
   readonly selection: MobileComposerSelection;
   readonly text?: string;
+}
+
+export interface MobileComposerRichPastedImage {
+  readonly base64: string;
+  readonly mediaType: MobileComposerPastedImageMediaType;
+  readonly name: string;
+}
+
+export interface MobileComposerRichImagePasteStartRequest {
+  readonly count: number;
+  readonly draft: MobileComposerDraft;
+}
+
+export interface MobileComposerRichImagePasteRequest extends MobileComposerRichImagePasteStartRequest {
+  readonly images: readonly MobileComposerRichPastedImage[];
 }
 
 export interface MobileComposerRichInputProps {
@@ -63,6 +79,9 @@ export interface MobileComposerRichInputProps {
   readonly onFocus?: () => void;
   readonly onHeightChange?: (height: number) => void;
   readonly onOpenAtom?: (atomId: string) => void;
+  readonly onPasteImages?: (request: MobileComposerRichImagePasteRequest) => void;
+  readonly onPasteImagesCancel?: (sourceDraft: MobileComposerDraft) => void;
+  readonly onPasteImagesStart?: (request: MobileComposerRichImagePasteStartRequest) => boolean;
   readonly onPasteText: (request: MobileComposerRichPasteRequest) => void;
   readonly onSelectionChange: (selection: MobileComposerSelection, sourceDraft: MobileComposerDraft) => void;
   readonly ownerKey: string;
@@ -86,12 +105,24 @@ interface SurfaceIdentity {
   readonly key: number;
 }
 
+interface PendingImagePaste {
+  readonly count: number;
+  readonly documentId: number;
+  readonly draft: MobileComposerDraft;
+  readonly images: Array<MobileComposerRichPastedImage | undefined>;
+  readonly requestId: string;
+  readonly settled: Set<number>;
+  readonly timeout: ReturnType<typeof setTimeout>;
+  failed: boolean;
+}
+
 const RichInputWebView = WebView as unknown as ForwardRefExoticComponent<
   WebViewProps & RefAttributes<MobileComposerWebViewHandle>
 >;
 const richInputBaseUrl = "https://joko-composer.invalid";
 const heartbeatIntervalMilliseconds = 15_000;
 const heartbeatTimeoutMilliseconds = 5_000;
+const pastedImageReadTimeoutMilliseconds = 30_000;
 let surfaceSequence = 0;
 
 function createSurfaceIdentity(): SurfaceIdentity {
@@ -117,6 +148,9 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     onFocus,
     onHeightChange,
     onOpenAtom,
+    onPasteImages,
+    onPasteImagesCancel,
+    onPasteImagesStart,
     onPasteText,
     onSelectionChange,
     ownerKey,
@@ -137,7 +171,8 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     const selectionRef = useRef(selection);
     const callbacksRef = useRef({
       onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError, onFocus,
-      onHeightChange, onOpenAtom, onPasteText, onSelectionChange
+      onHeightChange, onOpenAtom, onPasteImages, onPasteImagesCancel, onPasteImagesStart,
+      onPasteText, onSelectionChange
     });
     const acceptedRef = useRef<AcceptedDocument>({
       document: mobileComposerRichDocument(draft),
@@ -149,13 +184,15 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     const pendingHeartbeatRef = useRef<string | undefined>(undefined);
     const heartbeatSequenceRef = useRef(0);
     const recoveryTimesRef = useRef<number[]>([]);
+    const pendingImagePasteRef = useRef<PendingImagePaste | undefined>(undefined);
 
     ownerKeyRef.current = ownerKey;
     editableRef.current = editable;
     selectionRef.current = selection;
     callbacksRef.current = {
       onBlur, onCommandPaletteKey, onCompositionChange, onEdit, onError, onFocus,
-      onHeightChange, onOpenAtom, onPasteText, onSelectionChange
+      onHeightChange, onOpenAtom, onPasteImages, onPasteImagesCancel, onPasteImagesStart,
+      onPasteText, onSelectionChange
     };
 
     const runtimeConfig = useMemo<MobileComposerRichRuntimeConfig>(() => ({
@@ -185,6 +222,15 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       heartbeatIntervalRef.current = undefined;
       heartbeatTimeoutRef.current = undefined;
       pendingHeartbeatRef.current = undefined;
+    }, []);
+
+    const cancelPendingImagePaste = useCallback(() => {
+      const pending = pendingImagePasteRef.current;
+      pendingImagePasteRef.current = undefined;
+      if (pending) {
+        clearTimeout(pending.timeout);
+        callbacksRef.current.onPasteImagesCancel?.(pending.draft);
+      }
     }, []);
 
     const applyAcceptedDocument = useCallback((
@@ -223,6 +269,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       recoveringRef.current = true;
       activeInstanceIdRef.current = "";
       clearHeartbeat();
+      cancelPendingImagePaste();
       callbacksRef.current.onCompositionChange?.(false);
       callbacksRef.current.onBlur?.();
       callbacksRef.current.onError(message);
@@ -231,7 +278,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         return;
       }
       rebuildSurface();
-    }, [clearHeartbeat, rebuildSurface]);
+    }, [cancelPendingImagePaste, clearHeartbeat, rebuildSurface]);
 
     const sendHeartbeat = useCallback(() => {
       if (!readyRef.current || AppState.currentState !== "active" || pendingHeartbeatRef.current) return;
@@ -270,12 +317,13 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         acceptedRef.current = { ...current, draft };
         return;
       }
+      cancelPendingImagePaste();
       try {
         applyAcceptedDocument(draft, selectionRef.current);
       } catch (failure) {
         callbacksRef.current.onError(errorText(failure));
       }
-    }, [applyAcceptedDocument, draft]);
+    }, [applyAcceptedDocument, cancelPendingImagePaste, draft]);
 
     useEffect(() => {
       if (readyRef.current) inject(buildMobileComposerRichConfigScript(runtimeConfig));
@@ -287,13 +335,15 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         mountedRef.current = false;
         readyRef.current = false;
         clearHeartbeat();
+        cancelPendingImagePaste();
       };
-    }, [clearHeartbeat]);
+    }, [cancelPendingImagePaste, clearHeartbeat]);
 
     useEffect(() => {
       const subscription = AppState.addEventListener("change", (nextState) => {
         if (nextState !== "active") {
           clearHeartbeat();
+          cancelPendingImagePaste();
           return;
         }
         if (deferredRecoveryRef.current) {
@@ -303,7 +353,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         if (readyRef.current) startHeartbeat();
       });
       return () => subscription.remove();
-    }, [clearHeartbeat, rebuildSurface, startHeartbeat]);
+    }, [cancelPendingImagePaste, clearHeartbeat, rebuildSurface, startHeartbeat]);
 
     const handleMessage = useCallback((event: WebViewMessageEvent) => {
       const message = parseMobileComposerRichWebMessage(event.nativeEvent.data);
@@ -373,6 +423,80 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         }
         return;
       }
+      if (message.type === "pasteImagesStart") {
+        if (message.documentId !== current.documentId) return;
+        if (!editableRef.current || AppState.currentState !== "active" || pendingImagePasteRef.current) {
+          callbacksRef.current.onError("Finish the active attachment action before pasting more images.");
+          return;
+        }
+        let accepted = false;
+        try {
+          accepted = callbacksRef.current.onPasteImages !== undefined
+            && callbacksRef.current.onPasteImagesStart?.({ count: message.count, draft: current.draft }) === true;
+        } catch (failure) {
+          callbacksRef.current.onError(errorText(failure));
+          return;
+        }
+        if (!accepted) {
+          callbacksRef.current.onError("Image paste is unavailable for this task and model.");
+          return;
+        }
+        const timeout = setTimeout(() => {
+          const pending = pendingImagePasteRef.current;
+          if (!pending || pending.documentId !== message.documentId || pending.requestId !== message.requestId) return;
+          cancelPendingImagePaste();
+          callbacksRef.current.onError("The clipboard images took too long to read. The batch was discarded.");
+        }, pastedImageReadTimeoutMilliseconds);
+        pendingImagePasteRef.current = {
+          count: message.count,
+          documentId: message.documentId,
+          draft: current.draft,
+          images: Array.from({ length: message.count }),
+          requestId: message.requestId,
+          settled: new Set(),
+          timeout,
+          failed: false
+        };
+        return;
+      }
+      if (message.type === "pasteImage" || message.type === "pasteImageFailed") {
+        const pending = pendingImagePasteRef.current;
+        if (!pending || pending.documentId !== message.documentId || pending.requestId !== message.requestId) return;
+        if (message.index >= pending.count || pending.settled.has(message.index)) {
+          cancelPendingImagePaste();
+          callbacksRef.current.onError("The clipboard image batch was malformed and was discarded.");
+          return;
+        }
+        pending.settled.add(message.index);
+        if (message.type === "pasteImage") {
+          pending.images[message.index] = {
+            base64: message.base64,
+            mediaType: message.mediaType,
+            name: message.name
+          };
+        } else {
+          pending.failed = true;
+        }
+        if (pending.settled.size < pending.count) return;
+        pendingImagePasteRef.current = undefined;
+        clearTimeout(pending.timeout);
+        if (pending.failed || pending.images.some((image) => image === undefined)) {
+          callbacksRef.current.onPasteImagesCancel?.(pending.draft);
+          callbacksRef.current.onError("One or more clipboard images could not be read. The batch was discarded.");
+          return;
+        }
+        try {
+          callbacksRef.current.onPasteImages?.({
+            count: pending.count,
+            draft: pending.draft,
+            images: pending.images as MobileComposerRichPastedImage[]
+          });
+        } catch (failure) {
+          callbacksRef.current.onPasteImagesCancel?.(pending.draft);
+          callbacksRef.current.onError(errorText(failure));
+        }
+        return;
+      }
       if (message.type === "activate") {
         if (!message.occurrenceKey.startsWith("atom:")) return;
         const atomId = message.occurrenceKey.slice("atom:".length);
@@ -398,7 +522,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         callbacksRef.current.onError(errorText(failure));
         applyAcceptedDocument(current.draft, selectionRef.current);
       }
-    }, [applyAcceptedDocument, inject, maxHeight, ownerKey, runtimeConfig, startHeartbeat]);
+    }, [applyAcceptedDocument, cancelPendingImagePaste, inject, maxHeight, ownerKey, runtimeConfig, startHeartbeat]);
 
     return <View style={[
       styles.frame,
