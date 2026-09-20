@@ -11,6 +11,7 @@ import {
   mobileLightboxPointerIntent,
   mobileLightboxIsTap,
   mobileLightboxIsZoomed,
+  mobileLightboxSwipePageIndex,
   mobilePinchTransform,
   mobileTouchCentroid,
   mobileTouchDistance
@@ -85,5 +86,23 @@ describe("mobile image lightbox", () => {
     expect(mobileLightboxIsTap(1_000, 1_501, 3)).toBe(false);
     expect(mobileLightboxIsTap(1_000, 1_200, 13)).toBe(false);
     expect(mobileLightboxIsTap(1_000, 999, 0)).toBe(false);
+  });
+
+  it("pages only on a bounded horizontal swipe at 1x outside annotation mode", () => {
+    expect(mobileLightboxSwipePageIndex({
+      currentIndex: 1, pageCount: 3, translationX: -80, translationY: 10, scale: 1, annotating: false
+    })).toBe(2);
+    expect(mobileLightboxSwipePageIndex({
+      currentIndex: 1, pageCount: 3, translationX: 80, translationY: 10, scale: 1, annotating: false
+    })).toBe(0);
+    expect(mobileLightboxSwipePageIndex({
+      currentIndex: 2, pageCount: 3, translationX: -80, translationY: 0, scale: 1, annotating: false
+    })).toBeUndefined();
+    expect(mobileLightboxSwipePageIndex({
+      currentIndex: 1, pageCount: 3, translationX: -80, translationY: 0, scale: 1.5, annotating: false
+    })).toBeUndefined();
+    expect(mobileLightboxSwipePageIndex({
+      currentIndex: 1, pageCount: 3, translationX: -80, translationY: 0, scale: 1, annotating: true
+    })).toBeUndefined();
   });
 });

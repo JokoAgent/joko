@@ -406,7 +406,7 @@ describe("native mobile device through the durable product chain", () => {
       const response = await fetch(`${fixture!.baseUrl}${pending.upload!.ticket!.relativeEndpoint}`, {
         method: "PUT",
         headers: { authorization: `Bearer ${paired.authKey}`, "content-type": "application/octet-stream" },
-        body: bytes.toString("utf8")
+        body: Uint8Array.from(bytes).buffer
       });
       expect(response.status).toBe(201);
       const completed = (await clients.artifact.completeBlobUpload({ uploadId: pending.upload!.uploadId })).blob;
@@ -420,7 +420,11 @@ describe("native mobile device through the durable product chain", () => {
       if (!completed?.blobId) throw new Error("The mobile attachment Blob was not committed.");
       return completed;
     };
-    const image = await upload("pixel.png", "image/png", Buffer.from("PNG-MOBILE", "utf8"));
+    const imageBytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64"
+    );
+    const image = await upload("pixel.png", "image/png", imageBytes);
     const file = await upload("proof.pdf", "application/pdf", Buffer.from("%PDF-MOBILE", "utf8"));
     const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
       backendId: attachmentProfile.id,
@@ -454,13 +458,47 @@ describe("native mobile device through the durable product chain", () => {
     const timeline = await waitFor(
       () => clients.session.listSessionTimeline({ sessionId, limit: 120 }),
       (value) => value.events.some((event) => event.payload?.kind.case === "messageStarted"
-        && event.payload.kind.value.role === MessageRole.USER),
+        && event.payload.kind.value.role === MessageRole.USER
+        && event.payload.kind.value.userInputAccepted
+        && event.payload.kind.value.userInput?.parts.some((part) => part.content.case === "image"
+          && part.content.value.blob?.blobId === image.blobId)),
       "accepted mobile attachment input"
     );
     const accepted = timeline.events.find((event) => event.identity?.runId === queued.runId
       && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER);
     if (accepted?.payload?.kind.case !== "messageStarted") throw new Error("The accepted attachment input was not projected.");
     expect(accepted.payload.kind.value.userInput).toMatchObject(queued.input!);
+    const durableImage = timeline.events.flatMap((event) => event.payload?.kind.case === "messageStarted"
+      && event.payload.kind.value.userInputAccepted
+      ? event.payload.kind.value.userInput?.parts ?? [] : []).find((part) => part.content.case === "image"
+        && part.content.value.blob?.blobId === image.blobId);
+    if (durableImage?.content.case !== "image" || !durableImage.content.value.blob) {
+      throw new Error("The durable mobile image message block was not projected.");
+    }
+    expect(durableImage.content.value).toMatchObject({
+      widthPixels: 0,
+      heightPixels: 0,
+      altText: "pixel.png",
+      blob: {
+        blobId: image.blobId,
+        mediaType: "image/png",
+        byteSize: BigInt(imageBytes.byteLength),
+        sha256Hex: createHash("sha256").update(imageBytes).digest("hex")
+      }
+    });
+    const imageDownloadTicket = await clients.artifact.getBlobDownloadTicket({ blobId: image.blobId });
+    expect(imageDownloadTicket.ticket).toMatchObject({
+      blobId: image.blobId,
+      requiredMediaType: "image/png",
+      maximumBytes: BigInt(imageBytes.byteLength)
+    });
+    const imageDownload = await fetch(`${fixture.baseUrl}${imageDownloadTicket.ticket!.relativeEndpoint}`, {
+      headers: { authorization: `Bearer ${paired.authKey}`, connection: "close" }
+    });
+    expect(imageDownload.status).toBe(200);
+    expect(imageDownload.headers.get("content-type")).toBe("image/png");
+    expect(imageDownload.headers.get("content-length")).toBe(String(imageBytes.byteLength));
+    expect(Buffer.from(await imageDownload.arrayBuffer())).toEqual(imageBytes);
     const dispatched = fixture.adapter(attachmentProfile.id).sendCalls.at(-1);
     expect(dispatched).toMatchObject({
       text: "",

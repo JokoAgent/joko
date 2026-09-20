@@ -121,6 +121,13 @@ import type { MobileVoiceRunError } from "./mobile-voice-input";
 import { MobileImageLightbox } from "./MobileImageLightbox";
 import type { MobileBurnedImage, MobileComposerImageEditorSession } from "./mobile-composer-image-editor";
 import type { MobileImageAnnotationStroke } from "./mobile-image-annotation";
+import {
+  mobileImageGalleryMediaType,
+  type MobileImageGalleryDescriptor,
+  type MobileImageGalleryNativeDecode,
+  type MobileImageGalleryPageSession,
+  type MobileImageGalleryPageSummary
+} from "./mobile-image-gallery";
 
 const client = new MobileClient(
   mobileNetwork,
@@ -146,6 +153,130 @@ interface MobilePhotoLibraryLease {
 interface MobileComposerImageEditorLease {
   readonly session: MobileComposerImageEditorSession;
   readonly scopeKey: string;
+}
+
+interface MobileImageGalleryView {
+  readonly descriptor: MobileImageGalleryDescriptor;
+  readonly session: MobileImageGalleryPageSession;
+  readonly busy: boolean;
+  readonly error?: string;
+}
+
+function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void) {
+  const [view, setView] = useState<MobileImageGalleryView>();
+  const viewRef = useRef<MobileImageGalleryView | undefined>(undefined);
+  const pageControllerRef = useRef<AbortController | undefined>(undefined);
+  const onCommittedRef = useRef(onCommitted);
+  viewRef.current = view;
+  onCommittedRef.current = onCommitted;
+
+  const close = useCallback(() => {
+    pageControllerRef.current?.abort();
+    pageControllerRef.current = undefined;
+    const current = viewRef.current;
+    viewRef.current = undefined;
+    setView(undefined);
+    if (current) client.cancelImageGallery(current.descriptor.leaseId);
+  }, []);
+
+  useEffect(() => close, [close]);
+
+  const open = useCallback(async (
+    begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>
+  ): Promise<void> => {
+    close();
+    const controller = new AbortController();
+    pageControllerRef.current = controller;
+    let descriptor: MobileImageGalleryDescriptor | undefined;
+    try {
+      descriptor = await begin(controller.signal);
+      const session = await client.loadImageGalleryPage(
+        descriptor.leaseId,
+        descriptor.initialIndex,
+        controller.signal
+      );
+      controller.signal.throwIfAborted();
+      const next = { descriptor, session, busy: false };
+      viewRef.current = next;
+      setView(next);
+    } catch (error) {
+      if (descriptor) client.cancelImageGallery(descriptor.leaseId);
+      if (!controller.signal.aborted) throw error;
+    } finally {
+      if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
+    }
+  }, [close]);
+
+  const navigate = useCallback((pageIndex: number): void => {
+    const current = viewRef.current;
+    if (!current || current.busy || pageIndex === current.session.pageIndex) return;
+    pageControllerRef.current?.abort();
+    const controller = new AbortController();
+    pageControllerRef.current = controller;
+    const pending = { ...current, busy: true, error: undefined };
+    viewRef.current = pending;
+    setView(pending);
+    void client.loadImageGalleryPage(current.descriptor.leaseId, pageIndex, controller.signal).then((session) => {
+      if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
+      const next = { descriptor: current.descriptor, session, busy: false };
+      viewRef.current = next;
+      setView(next);
+    }).catch((error) => {
+      if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
+      const failed = { ...current, busy: false, error: errorText(error) };
+      viewRef.current = failed;
+      setView(failed);
+    }).finally(() => {
+      if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
+    });
+  }, []);
+
+  const decoded = useCallback((value: MobileImageGalleryNativeDecode): void => {
+    const current = viewRef.current;
+    if (!current) throw new Error("The image gallery was closed before decode completed.");
+    client.confirmImageGalleryPageDecoded(
+      current.descriptor.leaseId,
+      current.session.leaseId,
+      current.session.pageId,
+      value
+    );
+  }, []);
+
+  const addOriginal = useCallback(async (signal: AbortSignal): Promise<void> => {
+    const current = viewRef.current;
+    if (!current) throw new Error("The image gallery was closed before the item could be added.");
+    const draft = await client.addImageGalleryPageToComposer(
+      current.descriptor.leaseId,
+      current.session.leaseId,
+      signal
+    );
+    signal.throwIfAborted();
+    viewRef.current = undefined;
+    setView(undefined);
+    onCommittedRef.current(draft);
+  }, []);
+
+  const save = useCallback(async (
+    strokes: readonly MobileImageAnnotationStroke[],
+    burned: MobileBurnedImage | undefined,
+    signal: AbortSignal
+  ): Promise<void> => {
+    const current = viewRef.current;
+    if (!current) throw new Error("The image gallery was closed before the annotation could be added.");
+    const draft = await client.commitImageGalleryPageToComposer(
+      current.descriptor.leaseId,
+      current.session.leaseId,
+      strokes,
+      burned,
+      signal
+    );
+    signal.throwIfAborted();
+    viewRef.current = undefined;
+    setView(undefined);
+    onCommittedRef.current(draft);
+  }, []);
+
+  return { view, open, close, navigate, decoded, addOriginal, save };
 }
 
 export function App() {
@@ -1542,6 +1673,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [catalogMentionsVisible, setCatalogMentionsVisible] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [galleryOpening, setGalleryOpening] = useState(false);
+  const [composerNotice, setComposerNotice] = useState("");
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
@@ -1564,6 +1697,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     : undefined;
   const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
   draftIdentityRef.current = draftIdentity;
+  const imageGallery = useMobileImageGallery((nextDraft) => {
+    const identity = draftIdentityRef.current;
+    if (!identity || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
+    composerDraftRef.current = nextDraft;
+    setDraft(nextDraft);
+    setComposerNotice("Image added to the composer. Review it before sending.");
+    setTimeout(() => composerInputRef.current?.focus(), 0);
+  });
+  const galleryOwnerRef = useRef(draftIdentityKey);
   const composerBounds = computeComposerResizeBounds({
     windowHeight: height,
     keyboardHeight: keyboard.height,
@@ -1803,6 +1945,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     closeImageEditor();
   }, [closeImageEditor, draftIdentityKey, state.status]);
   useEffect(() => {
+    const changed = galleryOwnerRef.current !== draftIdentityKey;
+    galleryOwnerRef.current = draftIdentityKey;
+    if (changed || state.status !== "connected") {
+      imageGallery.close();
+      setGalleryOpening(false);
+    }
+  }, [draftIdentityKey, imageGallery.close, state.status]);
+  useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
       for (const interaction of interactions) {
@@ -1965,6 +2115,19 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error);
+  const openTimelineImage = (row: TimelineRow, image: MobileImageGalleryPageSummary): void => {
+    if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
+      || attachmentBusy || voice.busy || !row.completed) return;
+    setGalleryOpening(true);
+    setComposerNotice("");
+    setLocalError("");
+    void imageGallery.open((signal) => client.openTimelineImageGallery(image.sourceEventId ?? row.eventId, image.pageId, signal))
+      .catch((error) => {
+        if (taskMountedRef.current) setLocalError(errorText(error));
+      }).finally(() => {
+        if (taskMountedRef.current) setGalleryOpening(false);
+      });
+  };
   useEffect(() => {
     if (!voice.busy) return;
     setRuntimeControlsVisible(false);
@@ -2555,6 +2718,26 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       renderItem={({ item }) => <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
         <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
+        {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} images`} style={styles.messageImages}>
+          {item.images.map((image, index) => <Pressable key={image.pageId} accessibilityRole="imagebutton"
+            accessibilityLabel={`Open image ${index + 1} of ${item.images!.length}, ${image.title}`}
+            accessibilityHint="Opens this completed message image in the full-screen gallery"
+            disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
+            onPress={() => openTimelineImage(item, image)}
+            style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
+              (galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy)
+                && styles.disabled]}>
+            <Text style={styles.messageImageGlyph}>▧</Text>
+            <View style={styles.fill}>
+              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{image.title}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+                {image.mediaType}{image.widthPixels && image.heightPixels
+                  ? ` · ${image.widthPixels} × ${image.heightPixels}` : ""} · {formatByteSize(BigInt(image.byteSize))}
+              </Text>
+            </View>
+            <Text style={[styles.caption, { color: colors.accent }]}>Open</Text>
+          </Pressable>)}
+        </View>}
         <View style={styles.messageActions}>
           <Pressable accessibilityRole="button" accessibilityLabel={`View context for ${item.label}`}
             disabled={state.historyBusy || state.status !== "connected"}
@@ -2610,6 +2793,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       )} colors={colors} compact />}
     </View>)}
     {localError && <Banner text={localError} colors={colors} />}
+    {composerNotice && <View accessibilityLiveRegion="polite"
+      style={[styles.connectionNotice, { backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>
+      <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>{composerNotice}</Text>
+      <Pressable accessibilityRole="button" accessibilityLabel="Dismiss composer notice" onPress={() => setComposerNotice("")}
+        style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>Dismiss</Text></Pressable>
+    </View>}
     {queueEdit && <View style={[styles.queueEditBanner, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>
         {queueEdit.lease.replacesStructuredInput
@@ -2762,6 +2951,17 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
     {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
       onClose={closeImageEditor} onSave={saveImageEditor} />}
+    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
+      session={imageGallery.view.session}
+      gallery={{
+        session: imageGallery.view.session,
+        busy: imageGallery.view.busy,
+        ...(imageGallery.view.error ? { error: imageGallery.view.error } : {}),
+        onNavigate: imageGallery.navigate,
+        onAddOriginal: imageGallery.addOriginal,
+        onDecoded: imageGallery.decoded
+      }}
+      onClose={imageGallery.close} onSave={imageGallery.save} />}
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}
@@ -2843,12 +3043,18 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [localError, setLocalError] = useState("");
   const [handoffBusy, setHandoffBusy] = useState(false);
+  const [galleryOpening, setGalleryOpening] = useState(false);
   const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource>();
   const handoffRef = useRef<AbortController | undefined>(undefined);
   const authorityKey = client.filesAuthorityKey();
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
   const searching = query.trim().length > 0;
+  const imageGallery = useMobileImageGallery(() => {
+    client.closeFiles();
+    onAdded();
+  });
+  const filesBusy = handoffBusy || galleryOpening || imageGallery.view !== undefined;
 
   useEffect(() => {
     if (!connected || !authorityKey) return;
@@ -2865,26 +3071,27 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   }, []);
 
   useEffect(() => {
-    if (!files.open || handoffBusy) return;
+    if (!files.open || filesBusy) return;
     const timer = setTimeout(() => {
       void client.searchFiles(query, mode, caseSensitive).catch((error) => setLocalError(errorText(error)));
     }, 250);
     return () => clearTimeout(timer);
-  }, [caseSensitive, files.artifactsRevision, files.authorityKey, files.fileIndexRevision, files.open, handoffBusy, mode, query]);
+  }, [caseSensitive, files.artifactsRevision, files.authorityKey, files.fileIndexRevision, files.open, filesBusy, mode, query]);
 
   const run = (action: () => Promise<void>): void => {
-    if (handoffRef.current) return;
+    if (handoffRef.current || filesBusy) return;
     setLocalError("");
     void action().catch((error) => setLocalError(errorText(error)));
   };
   const leave = (): void => {
     handoffRef.current?.abort();
     handoffRef.current = undefined;
+    imageGallery.close();
     client.closeFiles();
     onBack();
   };
   const openPreview = (source: MobileFilesComposerSource, action: () => Promise<void>): void => {
-    if (handoffRef.current) return;
+    if (handoffRef.current || filesBusy) return;
     setPreviewSource(source);
     run(action);
   };
@@ -2892,8 +3099,18 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
     { kind: "search-result", result },
     () => client.previewFileSearchResult(result)
   );
+  const openGallery = (source: MobileFilesComposerSource): void => {
+    if (handoffRef.current || galleryOpening || imageGallery.view) return;
+    setGalleryOpening(true);
+    setLocalError("");
+    client.closeFilesPreview();
+    setPreviewSource(undefined);
+    void imageGallery.open((signal) => client.openFilesImageGallery(source, signal))
+      .catch((error) => setLocalError(errorText(error)))
+      .finally(() => setGalleryOpening(false));
+  };
   const addToComposer = (source: MobileFilesComposerSource): void => {
-    if (handoffRef.current) return;
+    if (handoffRef.current || galleryOpening || imageGallery.view) return;
     const controller = new AbortController();
     handoffRef.current = controller;
     setHandoffBusy(true);
@@ -2926,7 +3143,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
         <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{locationTitle}</Text>
       </View>
       <Action label={files.status === "loading" ? "Refreshing…" : "Refresh"} compact colors={colors}
-        disabled={!connected || files.status === "loading" || handoffBusy} onPress={() => run(() => client.refreshFiles())} />
+        disabled={!connected || files.status === "loading" || filesBusy} onPress={() => run(() => client.refreshFiles())} />
     </View>
 
     {files.status === "offline" && <View style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -2938,13 +3155,17 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Adding the verified item to this task’s composer…</Text>
     </View>}
+    {galleryOpening && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <ActivityIndicator color={colors.accent} />
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Verifying the current image gallery…</Text>
+    </View>}
     {files.watchStatus === "error" && files.watchError && <Banner text={`Live file refresh unavailable: ${files.watchError}`} colors={colors} />}
 
     <View accessibilityRole="tablist" style={styles.filesTabs}>
       <ModeTab label="Workspace" selected={files.location.kind === "workspace"}
-        disabled={!connected || handoffBusy} onPress={() => run(() => client.openFilesDirectory(""))} colors={colors} />
+        disabled={!connected || filesBusy} onPress={() => run(() => client.openFilesDirectory(""))} colors={colors} />
       <ModeTab label={`Generated${files.artifacts.length ? ` (${files.artifacts.length})` : ""}`}
-        selected={files.location.kind === "generated"} disabled={!connected || handoffBusy} onPress={() => {
+        selected={files.location.kind === "generated"} disabled={!connected || filesBusy} onPress={() => {
           setLocalError("");
           try { client.openGeneratedFiles(); } catch (error) { setLocalError(errorText(error)); }
         }} colors={colors} />
@@ -2953,18 +3174,18 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
     <View style={styles.filesSearchControls}>
       <TextInput accessibilityLabel="Search files" placeholder={mode === "name" ? "Search file names" : "Search file contents"}
         placeholderTextColor={colors.muted} value={query} onChangeText={setQuery} autoCapitalize="none" autoCorrect={false}
-        editable={!handoffBusy}
+        editable={!filesBusy}
         style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
       {files.searchStatus === "searching" && <ActivityIndicator color={colors.accent} />}
     </View>
     <View style={styles.filesSearchOptions}>
       <View accessibilityRole="tablist" style={styles.filesSearchModes}>
-        <ModeTab label="Name" selected={mode === "name"} disabled={handoffBusy} onPress={() => setMode("name")} colors={colors} />
-        <ModeTab label="Content" selected={mode === "content"} disabled={handoffBusy} onPress={() => setMode("content")} colors={colors} />
+        <ModeTab label="Name" selected={mode === "name"} disabled={filesBusy} onPress={() => setMode("name")} colors={colors} />
+        <ModeTab label="Content" selected={mode === "content"} disabled={filesBusy} onPress={() => setMode("content")} colors={colors} />
       </View>
-      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: caseSensitive, disabled: handoffBusy }}
-        accessibilityLabel="Case-sensitive file search" disabled={handoffBusy}
-        onPress={() => setCaseSensitive((value) => !value)} style={[styles.caseChoice, handoffBusy && styles.disabled]}>
+      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: caseSensitive, disabled: filesBusy }}
+        accessibilityLabel="Case-sensitive file search" disabled={filesBusy}
+        onPress={() => setCaseSensitive((value) => !value)} style={[styles.caseChoice, filesBusy && styles.disabled]}>
         <View style={[styles.choiceBox, { borderColor: caseSensitive ? colors.accent : colors.border,
           backgroundColor: caseSensitive ? colors.accent : colors.surface }]}>
           {caseSensitive && <Text style={styles.choiceCheck}>✓</Text>}
@@ -2985,7 +3206,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
           {files.searchStatus === "ready" && files.searchResults.length === 0
             && <Text style={[styles.description, { color: colors.muted }]}>No matching files</Text>}
           {files.searchResults.map((result, index) => <FileSearchResultRow key={fileSearchResultKey(result, index)}
-            result={result} colors={colors} disabled={!connected || handoffBusy} onPress={() => openResult(result)}
+            result={result} colors={colors} disabled={!connected || filesBusy} onPress={() => openResult(result)}
             onAdd={() => addToComposer({ kind: "search-result", result })} />)}
           {files.searchStatus === "ready" && <Text style={[styles.caption, { color: colors.muted }]}>
             {files.searchResults.length} result{files.searchResults.length === 1 ? "" : "s"}
@@ -2994,13 +3215,19 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
         </> : files.location.kind === "generated" ? <>
           <Text style={[styles.section, { color: colors.muted }]}>Generated by this task</Text>
           {files.artifacts.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No canonical Generated files are available for this task.</Text>}
-          {files.artifacts.map((artifact) => <View key={artifact.artifactId} style={styles.fileActionRow}>
+          {files.artifacts.map((artifact) => {
+            const galleryImage = mobileImageGalleryMediaType(artifact.blob?.mediaType ?? "") !== undefined;
+            const source = { kind: "artifact" as const, artifact };
+            return <View key={artifact.artifactId} style={styles.fileActionRow}>
             <Pressable accessibilityRole="button"
-              accessibilityLabel={`Preview Generated file ${artifactTitle(artifact)}`} disabled={!connected || handoffBusy}
-              onPress={() => openPreview({ kind: "artifact", artifact }, () => client.previewArtifact(artifact))}
+              accessibilityLabel={`${galleryImage ? "Open image gallery for" : "Preview Generated file"} ${artifactTitle(artifact)}`}
+              disabled={!connected || filesBusy}
+              onPress={() => galleryImage
+                ? openGallery(source)
+                : openPreview(source, () => client.previewArtifact(artifact))}
               style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
-                (!connected || handoffBusy) && styles.disabled]}>
-              <Text style={styles.fileGlyph}>◆</Text>
+                (!connected || filesBusy) && styles.disabled]}>
+              <Text style={styles.fileGlyph}>{galleryImage ? "▧" : "◆"}</Text>
               <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifactTitle(artifact)}</Text>
                 <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
                   {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}` : "Blob unavailable"}
@@ -3008,28 +3235,33 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
               <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
             </Pressable>
             <Action label="Add" accessibilityLabel={`Add Generated file ${artifactTitle(artifact)} to composer`}
-              compact colors={colors} disabled={!connected || handoffBusy}
-              onPress={() => addToComposer({ kind: "artifact", artifact })} />
-          </View>)}
+              compact colors={colors} disabled={!connected || filesBusy}
+              onPress={() => addToComposer(source)} />
+          </View>})}
         </> : <>
           <View style={styles.sectionHeader}>
             <Text style={[styles.section, { color: colors.muted }]}>{files.location.path || "Workspace root"}</Text>
-            {files.location.path && <Action label="Up" compact colors={colors} disabled={!connected || handoffBusy}
+            {files.location.path && <Action label="Up" compact colors={colors} disabled={!connected || filesBusy}
               onPress={() => run(() => client.openFilesDirectory(workspaceParentPath(files.location.kind === "workspace" ? files.location.path : "")))} />}
           </View>
           {files.entries.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>This directory is empty.</Text>}
           {files.entries.map((entry) => {
             const label = entry.displayName || workspaceBasename(entry.relativePath);
+            const galleryImage = entry.kind === FileKind.REGULAR
+              && mobileImageGalleryMediaType(entry.mediaType) !== undefined;
+            const source = { kind: "workspace-entry" as const, entry };
             return <View key={entry.relativePath} style={styles.fileActionRow}>
               <Pressable accessibilityRole="button"
-                accessibilityLabel={`${entry.kind === FileKind.DIRECTORY ? "Open directory" : "Preview file"} ${label}`}
-                disabled={!connected || handoffBusy}
+                accessibilityLabel={`${entry.kind === FileKind.DIRECTORY ? "Open directory" : galleryImage ? "Open image gallery for" : "Preview file"} ${label}`}
+                disabled={!connected || filesBusy}
                 onPress={() => entry.kind === FileKind.DIRECTORY
                   ? run(() => client.previewWorkspaceEntry(entry))
-                  : openPreview({ kind: "workspace-entry", entry }, () => client.previewWorkspaceEntry(entry))}
+                  : galleryImage
+                    ? openGallery(source)
+                    : openPreview(source, () => client.previewWorkspaceEntry(entry))}
                 style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border },
-                  (!connected || handoffBusy) && styles.disabled]}>
-                <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : "◇"}</Text>
+                  (!connected || filesBusy) && styles.disabled]}>
+                <Text style={styles.fileGlyph}>{entry.kind === FileKind.DIRECTORY ? "▰" : galleryImage ? "▧" : "◇"}</Text>
                 <View style={styles.fill}>
                   <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{label}</Text>
                   <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
@@ -3040,17 +3272,28 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
                 <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
               </Pressable>
               <Action label="Add" accessibilityLabel={`Add ${entry.kind === FileKind.DIRECTORY ? "directory" : "file"} ${label} to composer`}
-                compact colors={colors} disabled={!connected || handoffBusy}
-                onPress={() => addToComposer({ kind: "workspace-entry", entry })} />
+                compact colors={colors} disabled={!connected || filesBusy}
+                onPress={() => addToComposer(source)} />
             </View>;
           })}
         </>}
       </ScrollView>}
     <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy}
-      onAdd={addToComposer} onClose={() => {
+      onAdd={addToComposer} onOpenImage={openGallery} onClose={() => {
         setPreviewSource(undefined);
         client.closeFilesPreview();
       }} />
+    {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
+      session={imageGallery.view.session}
+      gallery={{
+        session: imageGallery.view.session,
+        busy: imageGallery.view.busy,
+        ...(imageGallery.view.error ? { error: imageGallery.view.error } : {}),
+        onNavigate: imageGallery.navigate,
+        onAddOriginal: imageGallery.addOriginal,
+        onDecoded: imageGallery.decoded
+      }}
+      onClose={imageGallery.close} onSave={imageGallery.save} />}
   </View>;
 }
 
@@ -3077,12 +3320,13 @@ function FileSearchResultRow({ result, colors, disabled, onPress, onAdd }: {
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, busy, onAdd, onClose }: {
+function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, onClose }: {
   colors: Colors;
   preview: MobileClient["state"]["files"]["preview"];
   source: MobileFilesComposerSource | undefined;
   busy: boolean;
   onAdd: (source: MobileFilesComposerSource) => void;
+  onOpenImage: (source: MobileFilesComposerSource) => void;
   onClose: () => void;
 }) {
   return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={busy ? () => undefined : onClose}>
@@ -3092,6 +3336,9 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onClose }: {
           <Back onPress={onClose} colors={colors} label="Files" disabled={busy} />
           <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{preview.title}</Text>
             <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{preview.sourceLabel}</Text></View>
+          {source && preview.kind === "image" && <Action label="Gallery"
+            accessibilityLabel={`Open image gallery for ${preview.title}`} compact colors={colors}
+            disabled={busy} onPress={() => onOpenImage(source)} />}
           {source && <Action label={busy ? "Adding…" : "Add"}
             accessibilityLabel={`Add ${preview.title} to composer`} compact colors={colors}
             disabled={busy || preview.kind === "loading"} onPress={() => onAdd(source)} />}
@@ -3519,6 +3766,10 @@ const styles = StyleSheet.create({
   devices: { flexGrow: 0, maxHeight: 50 }, deviceList: { paddingHorizontal: 16, gap: 8 },
   deviceChip: { borderWidth: 1, borderRadius: 18, overflow: "hidden", paddingHorizontal: 12, paddingVertical: 8 },
   message: { borderWidth: 1, borderRadius: 14, padding: 14, gap: 6, marginBottom: 8 },
+  messageImages: { gap: 8, paddingTop: 4 },
+  messageImageTile: { minHeight: 58, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8,
+    flexDirection: "row", alignItems: "center", gap: 10 },
+  messageImageGlyph: { fontSize: 24, color: "#ff9800" },
   messageActions: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 18 },
   inlineTouchAction: { minHeight: 44, justifyContent: "center" },
   historyActions: { gap: 8 },

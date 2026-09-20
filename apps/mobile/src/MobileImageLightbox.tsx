@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   ActivityIndicator,
   AppState,
-  Image,
   Modal,
   PanResponder,
   Pressable,
@@ -12,6 +11,7 @@ import {
   type GestureResponderEvent,
   type LayoutChangeEvent
 } from "react-native";
+import { Image as ExpoImage, type ImageLoadEventData, type ImageProps as ExpoImageProps } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { SvgXml } from "react-native-svg";
 import type {
@@ -44,6 +44,7 @@ import {
   mobileDoubleTapTransform,
   mobileLightboxIsTap,
   mobileLightboxPointerIntent,
+  mobileLightboxSwipePageIndex,
   mobilePinchTransform,
   mobileTouchCentroid,
   mobileTouchDistance,
@@ -53,9 +54,22 @@ import {
   type MobileTouchPoint
 } from "./mobile-image-lightbox";
 import { useMobileAnnotationBurn } from "./use-mobile-annotation-burn";
+import type { MobileImageGalleryNativeDecode, MobileImageGalleryPageSession } from "./mobile-image-gallery";
+
+interface MobileImageLightboxGalleryControls {
+  readonly session: MobileImageGalleryPageSession;
+  readonly busy: boolean;
+  readonly error?: string;
+  readonly onNavigate: (pageIndex: number) => void;
+  readonly onAddOriginal: (signal: AbortSignal) => Promise<void>;
+  readonly onDecoded: (decoded: MobileImageGalleryNativeDecode) => void;
+}
+
+const PreviewImage = ExpoImage as unknown as ComponentType<ExpoImageProps>;
 
 interface MobileImageLightboxProps {
   readonly session: MobileComposerImageEditorSession;
+  readonly gallery?: MobileImageLightboxGalleryControls;
   readonly onClose: () => void;
   readonly onSave: (
     strokes: readonly MobileImageAnnotationStroke[],
@@ -77,7 +91,7 @@ interface ActiveGesture {
 const initialTransform: MobileImageTransform = { scale: 1, translateX: 0, translateY: 0 };
 const emptySize: MobileImageSize = { width: 0, height: 0 };
 
-export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLightboxProps) {
+export function MobileImageLightbox({ session, gallery, onClose, onSave }: MobileImageLightboxProps) {
   const initialStrokes = useMemo(() => cloneStrokes(session.initialStrokes), [session.leaseId]);
   const [strokes, setStrokes] = useState<readonly MobileImageAnnotationStroke[]>(initialStrokes);
   const [draftStroke, setDraftStroke] = useState<MobileImageAnnotationStroke>();
@@ -85,6 +99,7 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
   const [transform, setTransform] = useState<MobileImageTransform>(initialTransform);
   const [container, setContainer] = useState<MobileImageSize>(emptySize);
   const [natural, setNatural] = useState<MobileImageSize>(emptySize);
+  const [decoded, setDecoded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const { burnIn, host } = useMobileAnnotationBurn();
@@ -98,12 +113,34 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
   const lastTapRef = useRef<{ readonly at: number; readonly point: MobileTouchPoint } | undefined>(undefined);
   const saveControllerRef = useRef<AbortController | undefined>(undefined);
   const closedRef = useRef(false);
+  const galleryRef = useRef(gallery);
   strokesRef.current = strokes;
   draftStrokeRef.current = draftStroke;
   annotatingRef.current = annotating;
   transformRef.current = transform;
   containerRef.current = container;
   naturalRef.current = natural;
+  galleryRef.current = gallery;
+
+  useEffect(() => {
+    const nextStrokes = cloneStrokes(session.initialStrokes);
+    strokesRef.current = nextStrokes;
+    draftStrokeRef.current = undefined;
+    annotatingRef.current = false;
+    transformRef.current = initialTransform;
+    naturalRef.current = emptySize;
+    gestureRef.current = undefined;
+    lastTapRef.current = undefined;
+    closedRef.current = false;
+    setStrokes(nextStrokes);
+    setDraftStroke(undefined);
+    setAnnotating(false);
+    setTransform(initialTransform);
+    setNatural(emptySize);
+    setDecoded(false);
+    setBusy(false);
+    setError("");
+  }, [session.leaseId]);
 
   const close = useCallback(() => {
     if (closedRef.current) return;
@@ -129,8 +166,8 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
   }, [container, natural]);
 
   const panResponder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => !saveControllerRef.current,
-    onMoveShouldSetPanResponder: () => !saveControllerRef.current,
+    onStartShouldSetPanResponder: () => !saveControllerRef.current && galleryRef.current?.busy !== true,
+    onMoveShouldSetPanResponder: () => !saveControllerRef.current && galleryRef.current?.busy !== true,
     onPanResponderGrant: (event) => {
       setError("");
       const points = responderTouches(event);
@@ -259,6 +296,28 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
         lastTapRef.current = undefined;
         return;
       }
+      const activeGallery = galleryRef.current;
+      const nextPage = activeGallery ? mobileLightboxSwipePageIndex({
+        currentIndex: activeGallery.session.pageIndex,
+        pageCount: activeGallery.session.pageCount,
+        translationX: gestureState.dx,
+        translationY: gestureState.dy,
+        scale: transformRef.current.scale,
+        annotating: annotatingRef.current
+      }) : undefined;
+      if (nextPage !== undefined && activeGallery) {
+        lastTapRef.current = undefined;
+        strokesRef.current = cloneStrokes(session.initialStrokes);
+        draftStrokeRef.current = undefined;
+        annotatingRef.current = false;
+        transformRef.current = initialTransform;
+        setStrokes(strokesRef.current);
+        setDraftStroke(undefined);
+        setAnnotating(false);
+        setTransform(initialTransform);
+        activeGallery.onNavigate(nextPage);
+        return;
+      }
       const now = Date.now();
       const distance = Math.hypot(gestureState.dx, gestureState.dy);
       if (!mobileLightboxIsTap(active.startedAt, now, distance)) {
@@ -288,12 +347,15 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
       setDraftStroke(undefined);
       lastTapRef.current = undefined;
     }
-  }), [session.annotatable]);
+  }), [session.annotatable, session.initialStrokes]);
 
   const displayed = mobileContainedImageSize(container, natural);
   const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
   const dirty = !annotationStrokesEqual(strokes, initialStrokes);
-  const drawingReady = natural.width > 0 && natural.height > 0 && container.width > 0 && container.height > 0;
+  const interactionBusy = busy || gallery?.busy === true;
+  const visibleError = error || gallery?.error || "";
+  const drawingReady = decoded && natural.width > 0 && natural.height > 0
+    && container.width > 0 && container.height > 0;
   const updateContainer = (event: LayoutChangeEvent): void => {
     const next = {
       width: event.nativeEvent.layout.width,
@@ -333,8 +395,48 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
     setAnnotating(false);
     setError("");
   };
+  const navigate = (pageIndex: number): void => {
+    if (!gallery || interactionBusy || pageIndex < 0 || pageIndex >= gallery.session.pageCount
+      || pageIndex === gallery.session.pageIndex) return;
+    const next = cloneStrokes(session.initialStrokes);
+    strokesRef.current = next;
+    draftStrokeRef.current = undefined;
+    annotatingRef.current = false;
+    transformRef.current = initialTransform;
+    setStrokes(next);
+    setDraftStroke(undefined);
+    setAnnotating(false);
+    setTransform(initialTransform);
+    setError("");
+    gallery.onNavigate(pageIndex);
+  };
+  const addOriginal = async (): Promise<void> => {
+    if (!gallery || saveControllerRef.current || !gallery.session.addable || !drawingReady) return;
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setError("");
+    try {
+      await gallery.onAddOriginal(controller.signal);
+      controller.signal.throwIfAborted();
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+      close();
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : "The gallery image could not be added.");
+      }
+    } finally {
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+    }
+  };
   const save = async (): Promise<void> => {
-    if (saveControllerRef.current || !dirty) return;
+    if (saveControllerRef.current || !dirty || gallery?.busy) return;
     const controller = new AbortController();
     saveControllerRef.current = controller;
     setBusy(true);
@@ -382,7 +484,9 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
         <ToolButton label="Close" onPress={close} disabled={false} />
         <View style={styles.heading}>
           <Text numberOfLines={1} style={styles.fileName}>{session.fileName}</Text>
-          <Text style={styles.meta}>{transform.scale.toFixed(1)}× · pinch or double-tap to zoom</Text>
+          <Text style={styles.meta}>{gallery
+            ? `${gallery.session.sourceLabel} · ${gallery.session.pageIndex + 1} of ${gallery.session.pageCount} · ${transform.scale.toFixed(1)}×`
+            : `${transform.scale.toFixed(1)}× · pinch or double-tap to zoom`}</Text>
         </View>
       </View>
       <View accessibilityRole="image" accessibilityLabel={`Image preview ${session.fileName}`}
@@ -397,18 +501,31 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
           }
         ]}>
           <View style={[styles.imageScale, { transform: [{ scale: transform.scale }] }]}>
-            <Image accessible={false} source={{ uri: session.previewUri }} resizeMode="stretch" style={styles.image}
-              onLoad={(event) => {
-                const width = event.nativeEvent.source.width;
-                const height = event.nativeEvent.source.height;
-                if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+            <PreviewImage accessible={false} source={{ uri: session.previewUri }} contentFit="fill" style={styles.image}
+              onLoad={(event: ImageLoadEventData) => {
+                const { width, height, mediaType, isAnimated } = event.source;
+                try {
+                  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+                    throw new Error("The image decoder returned invalid dimensions.");
+                  }
+                  if (gallery) {
+                    if (width !== gallery.session.expectedWidthPixels || height !== gallery.session.expectedHeightPixels
+                      || isAnimated === true) {
+                      throw new Error("The decoded image does not match its canonical gallery metadata.");
+                    }
+                    gallery.onDecoded({ width, height, mediaType, isAnimated });
+                  }
                   const next = { width, height };
                   naturalRef.current = next;
                   setNatural(next);
+                  setDecoded(true);
                   setError("");
+                } catch (failure) {
+                  setDecoded(false);
+                  setError(failure instanceof Error ? failure.message : "The image preview could not be verified.");
                 }
               }}
-              onError={() => setError("The image preview could not be displayed.")} />
+              onError={() => { setDecoded(false); setError("The image preview could not be displayed."); }} />
             {natural.width > 0 && natural.height > 0 && paths.length > 0 && <View
               pointerEvents="none" style={styles.annotation}>
               <SvgXml xml={annotationSvgXml(paths, natural)} width="100%" height="100%" />
@@ -419,20 +536,29 @@ export function MobileImageLightbox({ session, onClose, onSave }: MobileImageLig
           <ActivityIndicator color="#ff9800" />
         </View>}
       </View>
-      {error !== "" && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
+      {visibleError !== "" && <Text accessibilityRole="alert" style={styles.error}>{visibleError}</Text>}
       <View style={styles.toolbar}>
+        {gallery && <ToolButton label="Previous image" onPress={() => navigate(gallery.session.pageIndex - 1)}
+          disabled={interactionBusy || gallery.session.pageIndex === 0} />}
+        {gallery && <Text accessibilityLiveRegion="polite" style={styles.pageCount}>
+          {gallery.session.pageIndex + 1} / {gallery.session.pageCount}
+        </Text>}
+        {gallery && <ToolButton label="Next image" onPress={() => navigate(gallery.session.pageIndex + 1)}
+          disabled={interactionBusy || gallery.session.pageIndex + 1 >= gallery.session.pageCount} />}
         <ToolButton label="Zoom out" onPress={() => zoom(-0.5)}
-          disabled={busy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />
+          disabled={interactionBusy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />
         <ToolButton label="Zoom in" onPress={() => zoom(0.5)}
-          disabled={busy || transform.scale >= MOBILE_LIGHTBOX_MAX_SCALE} />
+          disabled={interactionBusy || transform.scale >= MOBILE_LIGHTBOX_MAX_SCALE} />
         <ToolButton label="Reset" onPress={resetTransform}
-          disabled={busy || transform.scale === 1 && transform.translateX === 0 && transform.translateY === 0} />
+          disabled={interactionBusy || transform.scale === 1 && transform.translateX === 0 && transform.translateY === 0} />
+        {gallery && gallery.session.addable && <ToolButton label={busy ? "Adding…" : "Add original"}
+          onPress={() => void addOriginal()} disabled={interactionBusy || !drawingReady} emphasized />}
         {session.annotatable && <ToolButton label="Annotate" selected={annotating}
-          onPress={() => { setAnnotating((value) => !value); setError(""); }} disabled={busy || !drawingReady} />}
-        {session.annotatable && <ToolButton label="Undo" onPress={undo} disabled={busy || strokes.length === 0} />}
-        {session.annotatable && <ToolButton label="Discard" onPress={discard} disabled={busy || !dirty} />}
-        {session.annotatable && <ToolButton label={busy ? "Saving…" : "Save"}
-          onPress={() => void save()} disabled={busy || !dirty || !drawingReady} emphasized />}
+          onPress={() => { setAnnotating((value) => !value); setError(""); }} disabled={interactionBusy || !drawingReady} />}
+        {session.annotatable && <ToolButton label="Undo" onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
+        {session.annotatable && <ToolButton label="Discard" onPress={discard} disabled={interactionBusy || !dirty} />}
+        {session.annotatable && <ToolButton label={busy ? "Saving…" : gallery ? "Add marked" : "Save"}
+          onPress={() => void save()} disabled={interactionBusy || !dirty || !drawingReady} emphasized />}
       </View>
       {annotating && <Text accessibilityLiveRegion="polite" style={styles.hint}>
         Draw with one finger. Use two fingers to move and zoom.
@@ -531,6 +657,8 @@ const styles = StyleSheet.create({
   loading: { position: "absolute", inset: 0, alignItems: "center", justifyContent: "center" },
   error: { color: "#ff9c87", paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
   toolbar: { minHeight: 64, paddingHorizontal: 10, paddingVertical: 8, flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 8 },
+  pageCount: { color: "#f7f6f3", minHeight: 44, minWidth: 52, textAlign: "center", textAlignVertical: "center",
+    paddingHorizontal: 6, paddingVertical: 12, fontSize: 14, lineHeight: 18, fontWeight: "700" },
   toolButton: { minHeight: 44, borderWidth: 1, borderColor: "#566064", borderRadius: 22,
     paddingHorizontal: 14, alignItems: "center", justifyContent: "center", backgroundColor: "#171b1e" },
   toolSelected: { borderColor: "#ff9800", backgroundColor: "#3c2b14" },

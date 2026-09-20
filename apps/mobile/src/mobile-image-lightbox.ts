@@ -5,6 +5,7 @@ export const MOBILE_LIGHTBOX_ZOOM_EPSILON = 0.01;
 export const MOBILE_LIGHTBOX_TAP_DISTANCE = 12;
 export const MOBILE_LIGHTBOX_TAP_MILLISECONDS = 500;
 export const MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS = 280;
+export const MOBILE_LIGHTBOX_PAGE_SWIPE_DISTANCE = 56;
 
 export interface MobileImageTransform {
   readonly scale: number;
@@ -46,6 +47,24 @@ export function mobileLightboxIsTap(startedAt: number, releasedAt: number, dista
   const duration = releasedAt - startedAt;
   return Number.isFinite(duration) && duration >= 0 && duration <= MOBILE_LIGHTBOX_TAP_MILLISECONDS
     && Number.isFinite(distance) && distance >= 0 && distance <= MOBILE_LIGHTBOX_TAP_DISTANCE;
+}
+
+export function mobileLightboxSwipePageIndex(input: {
+  readonly currentIndex: number;
+  readonly pageCount: number;
+  readonly translationX: number;
+  readonly translationY: number;
+  readonly scale: number;
+  readonly annotating: boolean;
+}): number | undefined {
+  if (!Number.isSafeInteger(input.currentIndex) || !Number.isSafeInteger(input.pageCount)
+    || input.pageCount < 2 || input.currentIndex < 0 || input.currentIndex >= input.pageCount
+    || input.annotating || mobileLightboxIsZoomed(input.scale)
+    || !Number.isFinite(input.translationX) || !Number.isFinite(input.translationY)
+    || Math.abs(input.translationX) < MOBILE_LIGHTBOX_PAGE_SWIPE_DISTANCE
+    || Math.abs(input.translationX) <= Math.abs(input.translationY) * 1.2) return undefined;
+  const next = input.translationX < 0 ? input.currentIndex + 1 : input.currentIndex - 1;
+  return next >= 0 && next < input.pageCount ? next : undefined;
 }
 
 export function mobileContainedImageSize(

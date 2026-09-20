@@ -1,5 +1,10 @@
 import { MessageRole, type Event } from "@joko/contracts";
 import { mobileInputSummary } from "./mobile-composer-document";
+import {
+  mobileImageGalleryPageSummary,
+  mobileTimelineGalleryPages,
+  type MobileImageGalleryPageSummary
+} from "./mobile-image-gallery";
 
 export interface TimelineRow {
   readonly id: string;
@@ -9,6 +14,7 @@ export interface TimelineRow {
   readonly eventId: string;
   readonly kind: "user" | "assistant" | "system" | "tool" | "status" | "error" | "activity";
   readonly completed: boolean;
+  readonly images?: readonly MobileImageGalleryPageSummary[];
 }
 
 export function timelineRows(events: readonly Event[]): TimelineRow[] {
@@ -25,9 +31,11 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       case "messageStarted": {
         const message = kind.value;
         if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
+        const images = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
           text: mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
-          kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted });
+          kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted,
+          ...(images.length === 0 ? {} : { images }) });
         break;
       }
       case "textDelta": {
@@ -38,6 +46,11 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       case "messageCompleted": {
         const message = kind.value;
         const previous = byId.get(message.messageId);
+        const completedImages = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
+        const images = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
+          && previous?.images && previous.images.length > 0
+          ? previous.images
+          : completedImages;
         const blocks = message.blocks.flatMap((block) => block.content.case === "text" ? [block.content.value]
           : block.content.case === "image" ? ["[Image]"] : block.content.case === "artifact" ? ["[Artifact]"]
             : block.content.case === "toolCall" ? ["[Tool call]"] : []);
@@ -46,7 +59,8 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
           : undefined;
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
           text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
-          eventId: event.eventId, kind: roleKind(message.role), completed: true });
+          eventId: event.eventId, kind: roleKind(message.role), completed: true,
+          ...(images.length === 0 ? {} : { images }) });
         break;
       }
       case "statusStream":

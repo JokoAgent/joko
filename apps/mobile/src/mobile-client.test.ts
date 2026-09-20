@@ -7,7 +7,7 @@ import {
   WorkspaceSearchMatchSchema,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
-  EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  EventCursorSchema, EventSchema, ImageRefSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
@@ -822,6 +822,87 @@ function fixedIds(...values: readonly string[]): () => string {
 }
 
 const renderedPngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function galleryPngBytes(width: number, height: number): Uint8Array {
+  const bytes = new Uint8Array(45);
+  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  bytes.set([0, 0, 0, 13, 73, 72, 68, 82], 8);
+  bytes[16] = width >>> 24 & 0xff;
+  bytes[17] = width >>> 16 & 0xff;
+  bytes[18] = width >>> 8 & 0xff;
+  bytes[19] = width & 0xff;
+  bytes[20] = height >>> 24 & 0xff;
+  bytes[21] = height >>> 16 & 0xff;
+  bytes[22] = height >>> 8 & 0xff;
+  bytes[23] = height & 0xff;
+  bytes.set([8, 6, 0, 0, 0], 24);
+  bytes.set([0, 0, 0, 0, 73, 69, 78, 68], 33);
+  return bytes;
+}
+
+function timelineGalleryEvent(bytes: Uint8Array): Event {
+  const first = create(BlobRefSchema, {
+    blobId: "timeline-image-one", fileName: "first.png", mediaType: "image/png",
+    byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE
+  });
+  const second = create(BlobRefSchema, {
+    blobId: "timeline-image-two", fileName: "second.png", mediaType: "image/png",
+    byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE
+  });
+  return create(EventSchema, {
+    eventId: "timeline-gallery-event",
+    identity: { sessionId: "session" },
+    cursor: { opaqueToken: "timeline-gallery-cursor", sequence: 11n, generation: 1n },
+    payload: { kind: { case: "messageCompleted", value: {
+      messageId: "timeline-gallery-message",
+      role: MessageRole.ASSISTANT,
+      blocks: [
+        { content: { case: "text", value: "Two durable images" } },
+        { content: { case: "image", value: create(ImageRefSchema, {
+          blob: first, widthPixels: 5, heightPixels: 4, altText: "First image"
+        }) } },
+        { content: { case: "image", value: create(ImageRefSchema, {
+          blob: second, widthPixels: 5, heightPixels: 4, altText: "Second image"
+        }) } }
+      ]
+    } } }
+  });
+}
+
+function acceptedTimelineGalleryEvent(bytes: Uint8Array): Event {
+  const image = (blobId: string, fileName: string) => create(ImageRefSchema, {
+    blob: create(BlobRefSchema, {
+      blobId, fileName, mediaType: "image/png", byteSize: BigInt(bytes.byteLength),
+      sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE
+    }),
+    widthPixels: 0,
+    heightPixels: 0,
+    altText: fileName === "first.png" ? "First image" : "Second image"
+  });
+  return create(EventSchema, {
+    eventId: "accepted-timeline-gallery-event",
+    identity: { sessionId: "session" },
+    cursor: { opaqueToken: "accepted-timeline-gallery-cursor", sequence: 11n, generation: 1n },
+    payload: { kind: { case: "messageStarted", value: {
+      messageId: "accepted-timeline-gallery-message",
+      role: MessageRole.USER,
+      userInputAccepted: true,
+      userInput: { parts: [
+        { content: { case: "image", value: image("timeline-image-one", "first.png") } },
+        { content: { case: "image", value: image("timeline-image-two", "second.png") } }
+      ] }
+    } } }
+  });
+}
+
+function timelineGallerySnapshot(event: Event): Snapshot {
+  return create(SnapshotSchema, {
+    ...attachmentSnapshot,
+    snapshotId: "timeline-gallery-snapshot",
+    resumeCursor: event.cursor,
+    timeline: [event]
+  });
+}
 
 function committedAttachment(attachment: MobileLocalComposerAttachment) {
   return create(BlobRefSchema, {
@@ -4727,6 +4808,334 @@ describe("native current-task Files ownership", () => {
     );
     expect(network.submit).not.toHaveBeenCalled();
     expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it("freezes a same-directory raster gallery and appends only its decoded authenticated page", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const bytes = galleryPngBytes(3, 2);
+    const firstRevision = create(FileRevisionSchema, {
+      opaqueRevision: "image-a", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+    });
+    const secondRevision = create(FileRevisionSchema, {
+      opaqueRevision: "image-b", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+    });
+    const entries = [
+      create(WorkspaceEntrySchema, {
+        workspaceId: "workspace", relativePath: "images/a.png", displayName: "a.png",
+        kind: FileKind.REGULAR, mediaType: "image/png", revision: firstRevision
+      }),
+      create(WorkspaceEntrySchema, {
+        workspaceId: "workspace", relativePath: "images/b.png", displayName: "b.png",
+        kind: FileKind.REGULAR, mediaType: "image/png", revision: secondRevision
+      }),
+      create(WorkspaceEntrySchema, {
+        workspaceId: "workspace", relativePath: "images/moving.gif", displayName: "moving.gif",
+        kind: FileKind.REGULAR, mediaType: "image/gif", revision: firstRevision
+      })
+    ];
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+      entries: parentPath === "" ? [sourceDirectory] : parentPath === "images" ? entries : [],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
+      paths: entries.map((entry) => entry.relativePath), revision: "gallery-index", truncated: false
+    });
+    vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspaceId, relativePath, exactRevision) => {
+      const entry = entries.find((candidate) => candidate.relativePath === relativePath)!;
+      return create(FilePreviewSchema, {
+        entry: create(WorkspaceEntrySchema, { ...entry, revision: exactRevision }),
+        content: { case: "image", value: { blob: {
+          blobId: `blob-${relativePath}`, fileName: entry.displayName, mediaType: entry.mediaType,
+          byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE
+        }, widthPixels: 3, heightPixels: 2, altText: entry.displayName } }
+      });
+    });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep this text"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("gallery-lease", "gallery-load", "gallery-attachment"), undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+    await app.openFilesDirectory("images");
+
+    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[1]! });
+    expect(descriptor).toMatchObject({
+      sourceKind: "workspace", initialIndex: 1,
+      pages: [{ title: "a.png" }, { title: "b.png" }]
+    });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
+    expect(page).toMatchObject({
+      pageIndex: 1, pageCount: 2, expectedWidthPixels: 3, expectedHeightPixels: 2,
+      addable: true, annotatable: true
+    });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
+      width: 3, height: 2, mediaType: "image/png", isAnimated: false
+    });
+    const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
+
+    expect(committed.text).toBe("Keep this text");
+    expect(committed.attachments).toEqual([expect.objectContaining({
+      state: "local", attachmentId: "gallery-attachment", kind: "image", fileName: "b.png",
+      mediaType: "image/png", byteSize: bytes.byteLength, sha256Hex: "b".repeat(64)
+    })]);
+    expect(await drafts.composer.read(identity)).toEqual(committed);
+    expect(fixture.driver.stageBytes).toHaveBeenCalledWith(
+      credential.profileId, "gallery-attachment", bytes
+    );
+    await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
+      .rejects.toThrow(/no longer owns/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("freezes the current Generated catalog order and excludes non-raster and duplicate pages", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const bytes = galleryPngBytes(3, 2);
+    const first = create(ArtifactSchema, {
+      artifactId: "generated-image-one", sessionId: "session", kind: ArtifactKind.IMAGE, title: "First generated image",
+      blob: create(BlobRefSchema, {
+        blobId: "generated-blob-one", fileName: "one.png", mediaType: "image/png",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
+      })
+    });
+    const duplicate = create(ArtifactSchema, {
+      artifactId: "generated-image-duplicate", sessionId: "session", kind: ArtifactKind.IMAGE, title: "First generated image duplicate",
+      blob: create(BlobRefSchema, {
+        blobId: "generated-blob-one", fileName: "duplicate.png", mediaType: "image/png",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
+      })
+    });
+    const second = create(ArtifactSchema, {
+      artifactId: "generated-image-two", sessionId: "session", kind: ArtifactKind.IMAGE, title: "Second generated image",
+      blob: create(BlobRefSchema, {
+        blobId: "generated-blob-two", fileName: "two.png", mediaType: "image/png",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64)
+      })
+    });
+    const ignored = create(ArtifactSchema, {
+      artifactId: "generated-text", sessionId: "session", kind: ArtifactKind.FILE, title: "Not an image",
+      blob: create(BlobRefSchema, {
+        blobId: "generated-text-blob", fileName: "notes.txt", mediaType: "text/plain",
+        byteSize: 4n, sha256Hex: "c".repeat(64)
+      })
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({
+      artifacts: [first, duplicate, second, ignored], revision: "generated-gallery-r1"
+    });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Generated"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("generated-gallery", "generated-load", "generated-output"), undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+    app.openGeneratedFiles();
+    const selected = app.state.files.artifacts.find((candidate) => candidate.artifactId === second.artifactId)!;
+
+    const descriptor = await app.openFilesImageGallery({ kind: "artifact", artifact: selected });
+    expect(descriptor).toMatchObject({
+      sourceKind: "generated", initialIndex: 1,
+      pages: [{ title: "First generated image" }, { title: "Second generated image" }]
+    });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
+    expect(page).toMatchObject({ fileName: "two.png", pageIndex: 1, pageCount: 2 });
+  });
+
+  it("appends a gallery annotation with an isolated source and refuses an unconfirmed decode", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const bytes = galleryPngBytes(4, 3);
+    const imageRevision = create(FileRevisionSchema, {
+      opaqueRevision: "gallery-image", sha256Hex: "b".repeat(64), byteSize: BigInt(bytes.byteLength)
+    });
+    const imageEntry = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace", relativePath: "image.png", displayName: "image.png",
+      kind: FileKind.REGULAR, mediaType: "image/png", revision: imageRevision
+    });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [imageEntry], revision: "gallery-directory" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: ["image.png"], revision: "gallery-index", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry: imageEntry,
+      content: { case: "image", value: { blob: {
+        blobId: "gallery-blob", fileName: "image.png", mediaType: "image/png",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: "b".repeat(64), disposition: BlobDisposition.INLINE
+      }, widthPixels: 4, heightPixels: 3 } }
+    }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Annotate"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("annotation-gallery", "annotation-load", "annotation-source", "annotation-output"),
+      undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+    const descriptor = await app.openFilesImageGallery({ kind: "workspace-entry", entry: app.state.files.entries[0]! });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    await expect(app.commitImageGalleryPageToComposer(
+      descriptor.leaseId,
+      page.leaseId,
+      [{ points: [{ x: 0.25, y: 0.5 }] }],
+      { bytes, mediaType: "image/png", width: 4, height: 3 }
+    )).rejects.toThrow(/decoded gallery image/u);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
+      width: 4, height: 3, mediaType: "image/png"
+    });
+
+    const committed = await app.commitImageGalleryPageToComposer(
+      descriptor.leaseId,
+      page.leaseId,
+      [{ points: [{ x: 0.25, y: 0.5 }] }],
+      { bytes, mediaType: "image/png", width: 4, height: 3 }
+    );
+
+    expect(committed.attachments).toEqual([expect.objectContaining({
+      attachmentId: "annotation-output",
+      fileName: "image-annotated.png",
+      annotation: {
+        source: expect.objectContaining({ storageId: "annotation-source", fileName: "image.png" }),
+        strokes: [{ points: [{ x: 0.25, y: 0.5 }] }]
+      }
+    })]);
+    expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(1, credential.profileId, "annotation-source", bytes);
+    expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(2, credential.profileId, "annotation-output", bytes);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("opens only the selected durable message gallery and appends its authenticated decoded page", async () => {
+    const bytes = galleryPngBytes(5, 4);
+    const accepted = acceptedTimelineGalleryEvent(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(accepted));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep timeline draft"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("timeline-gallery", "timeline-load", "timeline-output"), undefined, drafts, fixture.files);
+    await app.start();
+    const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
+    expect(row.images).toMatchObject([{ title: "First image" }, { title: "Second image" }]);
+
+    const descriptor = await app.openTimelineImageGallery(row.eventId, row.images![1]!.pageId);
+    expect(descriptor).toMatchObject({ sourceKind: "timeline", sourceLabel: "Your message", initialIndex: 1, pages: [{}, {}] });
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
+    expect(page).toMatchObject({ fileName: "second.png", pageIndex: 1, pageCount: 2, addable: true, annotatable: true });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
+      width: 5, height: 4, mediaType: "image/png", isAnimated: false
+    });
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
+      width: 5, height: 4, mediaType: "image/png", isAnimated: false
+    });
+
+    const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
+    expect(committed).toMatchObject({
+      text: "Keep timeline draft",
+      attachments: [{ attachmentId: "timeline-output", fileName: "second.png", kind: "image" }]
+    });
+    expect(network.downloadBlob).toHaveBeenCalledWith(
+      credential,
+      expect.objectContaining({ blobId: "timeline-image-two", sha256Hex: "b".repeat(64) }),
+      undefined
+    );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects gallery composer drift before staging managed bytes", async () => {
+    const bytes = galleryPngBytes(5, 4);
+    const completed = timelineGalleryEvent(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(completed));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Original"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("drift-gallery", "drift-load", "must-not-stage"), undefined, drafts, fixture.files);
+    await app.start();
+    const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
+    const descriptor = await app.openTimelineImageGallery(row.eventId, row.images![0]!.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
+      width: 5, height: 4, mediaType: "image/png"
+    });
+    const newer = plainTextMobileComposerDraft("Newer draft");
+    drafts.composer.save(identity, newer);
+    await drafts.composer.flush(identity);
+
+    await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
+      .rejects.toThrow(/composer changed/u);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    expect(await drafts.composer.read(identity)).toEqual(newer);
+  });
+
+  it("restores the exact draft and removes staged gallery bytes when durable flush fails", async () => {
+    const bytes = galleryPngBytes(5, 4);
+    const completed = timelineGalleryEvent(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(completed));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = plainTextMobileComposerDraft("Retain me");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("flush-gallery", "flush-load", "flush-output"), undefined, drafts, fixture.files);
+    await app.start();
+    const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
+    const descriptor = await app.openTimelineImageGallery(row.eventId, row.images![0]!.pageId);
+    const page = await app.loadImageGalleryPage(descriptor.leaseId, 0);
+    app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
+      width: 5, height: 4, mediaType: "image/png"
+    });
+    vi.spyOn(drafts.composer, "flush").mockRejectedValueOnce(new Error("durable write failed"));
+
+    await expect(app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId))
+      .rejects.toThrow("durable write failed");
+    expect(await drafts.composer.read(identity)).toEqual(original);
+    expect(fixture.removed).toContain("flush-output");
+    expect(fixture.bytes.has("flush-output")).toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("does not adopt a late gallery download after the app backgrounds", async () => {
+    const bytes = galleryPngBytes(5, 4);
+    const completed = timelineGalleryEvent(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(completed));
+    let resolveDownload!: (value: { bytes: Uint8Array; mediaType: string }) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(() => new Promise((resolve) => { resolveDownload = resolve; }));
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Stay unchanged"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("late-gallery", "late-load", "late-output"), undefined, drafts, fixture.files);
+    await app.start();
+    const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
+    const descriptor = await app.openTimelineImageGallery(row.eventId, row.images![0]!.pageId);
+    const loading = app.loadImageGalleryPage(descriptor.leaseId, 0);
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalledTimes(1));
+    app.setForeground(false);
+    resolveDownload({ bytes, mediaType: "image/png" });
+
+    await expect(loading).rejects.toThrow();
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    expect(await drafts.composer.read(identity)).toEqual(plainTextMobileComposerDraft("Stay unchanged"));
+    expect(network.submit).not.toHaveBeenCalled();
   });
 
   it("falls back to validated Workspace and Artifact mentions without auto-sending", async () => {
