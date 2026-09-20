@@ -54,7 +54,6 @@ import {
   mobileInputSummary,
   mobileComposerAtomLabel,
   plainTextMobileComposerDraft,
-  reconcileMobileComposerText,
   removeMobileComposerAtom,
   removeMobileComposerMention,
   updateMobilePastedTextAtom,
@@ -94,6 +93,11 @@ import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
+import {
+  MobileComposerRichInput,
+  type MobileComposerRichInputHandle,
+  type MobileComposerRichPasteRequest
+} from "./MobileComposerRichInput";
 import { MobileQuoteSelectionSheet } from "./MobileQuoteSelectionSheet";
 import {
   captureMobileQuoteSelection,
@@ -477,6 +481,18 @@ export function App() {
 
 type Colors = { background: string; surface: string; ink: string; muted: string; border: string; accent: string; negative: string; brandBackground: string };
 type ScreenProps = { colors: Colors; state: MobileClient["state"] };
+
+function mobileComposerRichTheme(colors: Colors) {
+  return {
+    background: colors.surface,
+    border: colors.border,
+    chip: colors.brandBackground,
+    focus: colors.accent,
+    placeholder: colors.muted,
+    text: colors.ink,
+    textSecondary: colors.muted
+  };
+}
 
 function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenProps & {
   dark: boolean; onBack?: () => void; onConnected: () => void;
@@ -1032,8 +1048,9 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const [composerAtomId, setComposerAtomId] = useState<string>();
+  const [composerHeight, setComposerHeight] = useState(132);
   const mountedRef = useRef(true);
-  const composerInputRef = useRef<TextInput>(null);
+  const composerInputRef = useRef<MobileComposerRichInputHandle>(null);
   const profileId = state.activeProfileId;
   const profileIdRef = useRef(profileId);
   profileIdRef.current = profileId;
@@ -1059,6 +1076,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const draftRef = useRef(draft);
   const selectionRef = useRef(composerSelection);
   const referencesEditableRef = useRef(false);
+  const composerTheme = useMemo(() => mobileComposerRichTheme(colors), [colors]);
   draftRef.current = draft;
   selectionRef.current = composerSelection;
   const closeImageEditor = useCallback(() => {
@@ -1315,10 +1333,10 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setError(errorText(failure));
     }
   };
-  const pasteClipboardText = async (): Promise<void> => {
+  const pasteClipboardText = async (request?: MobileComposerRichPasteRequest): Promise<void> => {
     const ownerProfileId = profileIdRef.current;
-    const captured = draftRef.current.input;
-    const selection = selectionRef.current;
+    const captured = request?.draft ?? draftRef.current.input;
+    const selection = request?.selection ?? selectionRef.current;
     const targetId = draftRef.current.targetId;
     if (!ownerProfileId || !referencesEditableRef.current || AppState.currentState !== "active") {
       setError("Return to the active new-task composer before pasting text.");
@@ -1326,7 +1344,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     }
     setError("");
     try {
-      const text = await Clipboard.getStringAsync();
+      const text = request?.text ?? await Clipboard.getStringAsync();
       if (!mountedRef.current || profileIdRef.current !== ownerProfileId
         || draftRef.current.targetId !== targetId || draftRef.current.input !== captured
         || selectionRef.current.start !== selection.start || selectionRef.current.end !== selection.end
@@ -1902,23 +1920,29 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       <MobileAttachmentTray attachments={draft.input.attachments} colors={colors}
         disabled={!referencesEditable} busy={attachmentBusy || state.busy}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />
-      <TextInput ref={composerInputRef} accessibilityLabel="First message" accessibilityHint="This structured message is sent after the task is created"
-        multiline textAlignVertical="top" maxLength={mobileComposerNativeInputMaximumCharacters} editable={referencesEditable}
-        placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={ownerReady ? draft.input.text : ""}
-        selection={composerSelection} onSelectionChange={(event) => {
-          const selection = boundedComposerSelection(event.nativeEvent.selection, draftRef.current.input.text.length);
-          selectionRef.current = selection;
-          setComposerSelection(selection);
-        }}
-        onChangeText={(text) => {
-          try {
-            const change = reconcileMobileComposerText(draftRef.current.input, text, randomUUID());
-            replaceInput(change.draft, change.selection);
-          } catch (failure) {
-            setError(errorText(failure));
+      <MobileComposerRichInput key={`new-task-rich-${profileId ?? "none"}-${draft.targetId}`}
+        ref={composerInputRef} accessibilityLabel="First message"
+        accessibilityHint="This structured message is sent after the task is created"
+        bordered draft={ownerReady ? draft.input : emptyMobileComposerDraft()} editable={referencesEditable}
+        height={composerHeight} maxHeight={260} ownerKey={`new-task\u001f${profileId ?? "none"}\u001f${draft.targetId}`}
+        placeholder={ownerReady ? "What should Joko do?" : "Restoring saved draft…"}
+        selection={ownerReady ? composerSelection : { start: 0, end: 0 }} theme={composerTheme}
+        onEdit={(result, sourceDraft) => {
+          if (!referencesEditableRef.current || draftRef.current.input !== sourceDraft) {
+            setError("Return to the active new-task composer before editing the first message.");
+            return;
           }
+          replaceInput(result.draft, result.selection);
         }}
-        style={[styles.input, styles.newTaskMessageInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
+        onError={setError}
+        onHeightChange={(nextHeight) => setComposerHeight(Math.max(132, Math.min(260, nextHeight)))}
+        onOpenAtom={setComposerAtomId}
+        onPasteText={(request) => { void pasteClipboardText(request); }}
+        onSelectionChange={(nextSelection, sourceDraft) => {
+          if (draftRef.current.input !== sourceDraft) return;
+          selectionRef.current = nextSelection;
+          setComposerSelection(nextSelection);
+        }} />
     </View>
     {retained && <View accessibilityLiveRegion="polite" style={[styles.card, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{retained.phase === "creating" ? "Task creation retained" : "First message retained"}</Text>
@@ -2052,12 +2076,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     values: new Map()
   });
   const queueEditRef = useRef(queueEdit);
-  const composerInputRef = useRef<TextInput>(null);
+  const composerInputRef = useRef<MobileComposerRichInputHandle>(null);
+  const queueInputRef = useRef<TextInput>(null);
   const composerDraftRef = useRef(draft);
   const composerSelectionRef = useRef(composerSelection);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
   const composerPasteEditableRef = useRef(false);
+  const composerTheme = useMemo(() => mobileComposerRichTheme(colors), [colors]);
   const keyboard = useMobileKeyboardState();
   const safeArea = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
@@ -2892,10 +2918,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       setLocalError(errorText(error));
     }
   };
-  const pasteClipboardText = async (): Promise<void> => {
+  const pasteClipboardText = async (request?: MobileComposerRichPasteRequest): Promise<void> => {
     const identity = draftIdentityRef.current;
-    const captured = composerDraftRef.current;
-    const selection = composerSelectionRef.current;
+    const captured = request?.draft ?? composerDraftRef.current;
+    const selection = request?.selection ?? composerSelectionRef.current;
     if (!identity || !composerPasteEditableRef.current || AppState.currentState !== "active") {
       setLocalError("Return to the active task composer before pasting text.");
       return;
@@ -2903,7 +2929,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     const identityKey = mobileComposerDraftIdentityKey(identity);
     setLocalError("");
     try {
-      const text = await Clipboard.getStringAsync();
+      const text = request?.text ?? await Clipboard.getStringAsync();
       if (!taskMountedRef.current || draftIdentityRef.current === undefined
         || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== identityKey
         || composerDraftRef.current !== captured
@@ -3411,39 +3437,52 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         busy={state.busy || voice.busy || attachmentBusy}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
       <View style={styles.composerRow}>
-        <TextInput ref={composerInputRef} accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline
+        {queueEdit ? <TextInput ref={queueInputRef} accessibilityLabel="Queued input" multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection}
           maxLength={mobileComposerNativeInputMaximumCharacters}
           onSelectionChange={(event) => {
-            const selection = boundedComposerSelection(event.nativeEvent.selection, composerDraftRef.current.text.length);
-            composerSelectionRef.current = selection;
-            setComposerSelection(selection);
+            const nextSelection = boundedComposerSelection(event.nativeEvent.selection, draft.text.length);
+            composerSelectionRef.current = nextSelection;
+            setComposerSelection(nextSelection);
           }}
-          onChangeText={(value) => {
-            try {
-              if (queueEditRef.current) {
-                setDraft(plainTextMobileComposerDraft(value));
-                return;
-              }
-              const change = reconcileMobileComposerText(composerDraftRef.current, value, randomUUID());
-              setDraft(change.draft);
-              composerDraftRef.current = change.draft;
-              setComposerSelection(change.selection);
-              if (draftIdentityRef.current) {
-                mobileComposerDrafts.save(draftIdentityRef.current, change.draft);
-              }
-            } catch (error) {
-              setLocalError(errorText(error));
-            }
-          }}
+          onChangeText={(value) => setDraft(plainTextMobileComposerDraft(value))}
           onContentSizeChange={(event) => setComposerContentHeight(Math.max(
             composerMinimumInputHeight,
             Math.ceil(event.nativeEvent.contentSize.height)
           ))}
           scrollEnabled={composerHeight.scrollEnabled}
-          editable={!state.busy && !voice.busy && !attachmentBusy && composerOwnerReady} placeholder={!composerOwnerReady ? "Restoring saved draft…" : queueEdit ? "Edit queued input…" : "Message Joko…"}
+          editable={!state.busy && composerOwnerReady} placeholder="Edit queued input…"
           placeholderTextColor={colors.muted}
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
+          : <MobileComposerRichInput key={`task-rich-${draftIdentityKey ?? "none"}`}
+            ref={composerInputRef} accessibilityLabel="Task message"
+            draft={composerOwnerReady ? draft : emptyMobileComposerDraft()}
+            editable={composerPasteEditable} height={composerHeight.visibleHeight}
+            maxHeight={composerBounds.maximumHeight} ownerKey={`task\u001f${draftIdentityKey ?? "none"}`}
+            placeholder={composerOwnerReady ? "Message Joko…" : "Restoring saved draft…"}
+            selection={composerOwnerReady ? composerSelection : { start: 0, end: 0 }} theme={composerTheme}
+            onEdit={(result, sourceDraft) => {
+              const identity = draftIdentityRef.current;
+              if (!identity || queueEditRef.current || !composerPasteEditableRef.current
+                || composerDraftRef.current !== sourceDraft) {
+                setLocalError("Return to the active task composer before editing this message.");
+                return;
+              }
+              composerDraftRef.current = result.draft;
+              composerSelectionRef.current = result.selection;
+              setDraft(result.draft);
+              setComposerSelection(result.selection);
+              mobileComposerDrafts.save(identity, result.draft);
+            }}
+            onError={setLocalError}
+            onHeightChange={(nextHeight) => setComposerContentHeight(Math.max(composerMinimumInputHeight, nextHeight))}
+            onOpenAtom={setComposerAtomId}
+            onPasteText={(request) => { void pasteClipboardText(request); }}
+            onSelectionChange={(nextSelection, sourceDraft) => {
+              if (composerDraftRef.current !== sourceDraft) return;
+              composerSelectionRef.current = nextSelection;
+              setComposerSelection(nextSelection);
+            }} />}
         <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
           disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
             || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || state.status !== "connected"}
@@ -4311,7 +4350,6 @@ const styles = StyleSheet.create({
   label: { fontSize: 16, fontWeight: "600" }, body: { fontSize: 15, lineHeight: 22 },
   section: { fontSize: 13, fontWeight: "700", marginTop: 12, textTransform: "uppercase" },
   field: { gap: 7 }, input: { borderWidth: 1, borderRadius: 12, minHeight: 48, paddingHorizontal: 14, fontSize: 16 },
-  newTaskMessageInput: { minHeight: 132, maxHeight: 260, paddingTop: 12, paddingBottom: 12, lineHeight: 22 },
   choice: { minHeight: 48, flexDirection: "row", alignItems: "flex-start", gap: 12 },
   choiceBox: { width: 24, height: 24, borderWidth: 1, borderRadius: 7, alignItems: "center", justifyContent: "center", marginTop: 1 },
   choiceCheck: { color: "#2b2316", fontSize: 16, fontWeight: "800", lineHeight: 18 }, disabled: { opacity: 0.55 },
