@@ -881,6 +881,7 @@ interface HostMutationInput<T> {
   readonly body: unknown;
   readonly commit: (store: OperationalStore) => T;
   readonly precondition?: (store: OperationalStore) => void;
+  readonly preconditionScope?: "claim-and-commit" | "claim";
   readonly effect?: () => Promise<void>;
   readonly sessionLifecycleFenceId?: string;
   readonly targetSessionCreationFenceId?: string;
@@ -16511,16 +16512,25 @@ async function dispatchMutation(
       }
       return presented(execution);
     }
-    case "triggerSchedule":
+    case "triggerSchedule": {
       dependencies.store.getSchedule(payload.value.scheduleId);
-      return ackOperation(
-        dependencies,
+      // runNow durably advances this Schedule while the Operation effect is in
+      // flight. Its exact revision is therefore fenced when the receipt is
+      // claimed, but cannot be rechecked after the effect against that same
+      // pre-run revision without making every correctly fenced trigger fail.
+      return presented(await host.mutate({
         operationId,
         connection,
-        mutation,
-        payload.case,
-        () => dependencies.scheduleCoordinator.runNow(payload.value.scheduleId, operationId)
-      );
+        kind: payload.case,
+        body: mutation,
+        preconditionScope: "claim",
+        effect: () => dependencies.scheduleCoordinator.runNow(payload.value.scheduleId, operationId),
+        commit: () => ({
+          accepted: true,
+          resultCase: "acknowledgement"
+        } satisfies OperationOutcome)
+      }));
+    }
     case "setScheduleEnabled": {
       const schedule = dependencies.store.getSchedule(payload.value.scheduleId);
       const changedAt = (dependencies.now ?? Date.now)();

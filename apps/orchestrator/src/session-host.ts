@@ -2332,6 +2332,11 @@ export class SessionHost {
     readonly afterCommit?: (execution: OperationExecution<T>) => void;
     /** Rechecked both when the effect is claimed and in the final commit transaction. */
     readonly precondition?: (store: OperationalStore) => void;
+    /**
+     * Claim-only is reserved for effects whose own durable work necessarily
+     * advances the fenced entity before this Operation can be finalized.
+     */
+    readonly preconditionScope?: "claim-and-commit" | "claim";
     readonly effect?: () => Promise<void>;
     /** Fence task admission while this claimed lifecycle effect reaches its final commit. */
     readonly sessionLifecycleFenceId?: string;
@@ -2400,7 +2405,7 @@ export class SessionHost {
           claim.operation.id,
           claim.operation.bodyHash,
           (store) => {
-            input.precondition?.(store);
+            if (input.preconditionScope !== "claim") input.precondition?.(store);
             finalize?.(store);
             return input.commit(store);
           }

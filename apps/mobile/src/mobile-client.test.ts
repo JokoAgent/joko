@@ -14,6 +14,9 @@ import {
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
+  RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
+  ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
+  ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
   TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
@@ -112,6 +115,69 @@ const snapshot = create(SnapshotSchema, {
   workspaces: [{ workspaceId: "workspace", targetId: "target", displayName: "Project", kind: WorkspaceKind.USER_PROJECT }],
   sessions: [{ sessionId: "session", backendId: "backend", targetId: "target", displayName: "Task", state: SessionState.IDLE,
     nativeBinding: { runtimeGeneration: 8n }, version: { revision: { value: 9n } } }]
+});
+const automationInterruptedRun = create(ScheduleRunHistorySchema, {
+  triggerId: "trigger-interrupted",
+  runId: "run-interrupted",
+  scheduledFor: { seconds: 10n },
+  triggeredAt: { seconds: 11n },
+  finishedAt: { seconds: 12n },
+  state: RunState.ABORTED,
+  outcome: ScheduleRunOutcome.INTERRUPTED,
+  costAttribution: ScheduleRunCostAttribution.UNAVAILABLE,
+  duration: { seconds: 1n }
+});
+const automationCompletedRun = create(ScheduleRunHistorySchema, {
+  triggerId: "trigger-completed",
+  runId: "run-completed",
+  sessionId: "session",
+  scheduledFor: { seconds: 20n },
+  triggeredAt: { seconds: 21n },
+  finishedAt: { seconds: 22n },
+  state: RunState.SUCCEEDED,
+  outcome: ScheduleRunOutcome.SUCCEEDED,
+  costAttribution: ScheduleRunCostAttribution.ZERO,
+  zeroCost: true,
+  duration: { seconds: 1n }
+});
+const automationSchedule = create(ScheduleSchema, {
+  scheduleId: "schedule-one",
+  displayName: "Morning check",
+  state: ScheduleState.ENABLED,
+  backendId: "backend",
+  targetId: "target",
+  recurrence: { kind: { case: "manual", value: {} } },
+  timeZone: "UTC",
+  input: { parts: [{ content: { case: "text", value: "Check the build" } }] },
+  execution: { executionMode: ScheduleExecutionMode.AGENT },
+  overlapPolicy: ScheduleOverlapPolicy.QUEUE,
+  misfirePolicy: ScheduleMisfirePolicy.RUN_ONCE,
+  recentRuns: [automationCompletedRun],
+  sessionMode: ScheduleSessionMode.FRESH,
+  source: ScheduleSource.USER,
+  unreadRunCount: 1,
+  version: { revision: { value: 7n, etag: "schedule-r7" }, generation: 2n, updatedAt: { seconds: 23n } }
+});
+const automationOwnerSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  revision: create(RevisionSchema, { value: 12n, etag: "owner-r12" }),
+  schedules: [automationSchedule]
+});
+const automationRuntime = create(SchedulerRuntimeSnapshotSchema, {
+  schedulerInstanceId: "scheduler-one",
+  inFlight: 1,
+  slotsInUse: 1,
+  maxConcurrentRuns: 4,
+  inFlightRuns: [{
+    scheduleId: automationSchedule.scheduleId,
+    scheduleName: automationSchedule.displayName,
+    runId: "inflight-one",
+    source: ScheduleFireSource.AUTOMATIC,
+    executionMode: ScheduleExecutionMode.AGENT,
+    startedAt: { seconds: 24n },
+    phase: ScheduleRunPhase.RUNNING,
+    lastProgressAt: { seconds: 25n }
+  }]
 });
 const extendedSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -850,6 +916,10 @@ function fakeNetwork(): MobileNetwork {
     listRuntimeCommands: vi.fn(async () => []),
     listSessionResources: vi.fn(async () => []),
     listArtifactReferenceCatalog: vi.fn(async () => ({ artifacts: [], revision: "artifact-references-1" })),
+    listSchedules: vi.fn(async () => []),
+    readSchedule: vi.fn(async () => { throw new Error("No Automation Schedule fixture was configured."); }),
+    listScheduleHistory: vi.fn(async () => ({ history: [], nextPageToken: "", totalSize: 0 })),
+    readSchedulerRuntime: vi.fn(async () => { throw new Error("No Scheduler runtime fixture was configured."); }),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
@@ -877,6 +947,19 @@ function projectedNetwork(projected: Snapshot): MobileNetwork {
   const network = fakeNetwork();
   network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projected }));
   network.readSession = vi.fn(async () => projected);
+  return network;
+}
+
+function automationNetwork(): MobileNetwork {
+  const network = fakeNetwork();
+  network.readOwner = vi.fn(async () => ({ connection, device, snapshot: automationOwnerSnapshot }));
+  network.readSession = vi.fn(async () => automationOwnerSnapshot);
+  network.listSchedules = vi.fn(async () => [automationSchedule]);
+  network.readSchedule = vi.fn(async () => automationSchedule);
+  network.listScheduleHistory = vi.fn(async (_credential, _scheduleId, pageToken = "") => pageToken === ""
+    ? { history: [automationInterruptedRun], nextPageToken: "history-2", totalSize: 2 }
+    : { history: [automationCompletedRun], nextPageToken: "", totalSize: 2 });
+  network.readSchedulerRuntime = vi.fn(async () => automationRuntime);
   return network;
 }
 
@@ -1306,6 +1389,176 @@ function clientWithOfflineCache(
     undefined, undefined, undefined, undefined, undefined, offlineCache);
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); });
+
+describe("native mobile Automation ownership and recovery", () => {
+  it("loads exact catalog/detail/history pages and persists Schedule+trigger receipt before dispatch", async () => {
+    const network = automationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+
+    await app.openAutomations();
+    expect(app.state.automations).toMatchObject({
+      open: true,
+      status: "ready",
+      selectedScheduleId: automationSchedule.scheduleId,
+      historyTotalSize: 2,
+      historyNextPageToken: "history-2",
+      runtime: { inFlightBySchedule: { [automationSchedule.scheduleId]: 1 } }
+    });
+    expect(app.state.automations.detail?.displayName).toBe("Morning check");
+    expect(app.state.automations.history.map((run) => run.triggerId)).toEqual(["trigger-interrupted"]);
+
+    await app.loadMoreAutomationHistory();
+    expect(app.state.automations.history.map((run) => run.triggerId)).toEqual([
+      "trigger-interrupted", "trigger-completed"
+    ]);
+    expect(app.state.automations.historyNextPageToken).toBeUndefined();
+
+    let receiptAtDispatch: PendingOperation | undefined;
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      receiptAtDispatch = saved.pending()[0];
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED
+      });
+    });
+    await expect(app.restartAutomationRun(automationSchedule.scheduleId, "trigger-interrupted")).resolves.toBe(true);
+
+    expect(receiptAtDispatch).toMatchObject({
+      kind: "schedule-run-restart",
+      connectionId: credential.connectionId,
+      scheduleId: automationSchedule.scheduleId,
+      triggerId: "trigger-interrupted",
+      state: "unknown"
+    });
+    const submitted = vi.mocked(network.submit).mock.calls.at(-1)?.[2];
+    expect(submitted?.preconditions[0]).toMatchObject({
+      entity: { kind: EntityKind.SCHEDULE, id: automationSchedule.scheduleId },
+      expectedRevision: { value: 7n, etag: "schedule-r7" }
+    });
+    expect(submitted?.payload).toMatchObject({
+      case: "restartScheduleRun",
+      value: { scheduleId: automationSchedule.scheduleId, triggerId: "trigger-interrupted" }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(network.listSchedules).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when later Automation history cursors cycle", async () => {
+    const network = automationNetwork();
+    const third = create(ScheduleRunHistorySchema, {
+      ...automationCompletedRun,
+      triggerId: "trigger-third",
+      runId: "run-third"
+    });
+    network.listScheduleHistory = vi.fn(async (_credential, _scheduleId, pageToken = "") => {
+      if (pageToken === "") {
+        return { history: [automationInterruptedRun], nextPageToken: "history-2", totalSize: 3 };
+      }
+      if (pageToken === "history-2") {
+        return { history: [automationCompletedRun], nextPageToken: "history-3", totalSize: 3 };
+      }
+      return { history: [third], nextPageToken: "history-2", totalSize: 3 };
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openAutomations();
+    await app.loadMoreAutomationHistory();
+
+    await app.loadMoreAutomationHistory();
+
+    expect(app.state.automations.historyStatus).toBe("error");
+    expect(app.state.automations.history.map((run) => run.triggerId)).toEqual([
+      "trigger-interrupted", "trigger-completed"
+    ]);
+    expect(app.state.automations.error).toMatch(/changed while paging/);
+  });
+
+  it("retains an unknown receipt, does not optimistically change authority and blocks exact replay", async () => {
+    const network = automationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    const before = app.state.automations.schedules;
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("transport closed"));
+
+    await expect(app.runAutomation(automationSchedule.scheduleId)).resolves.toBe(false);
+
+    expect(app.state.automations.schedules).toBe(before);
+    expect(saved.pending()).toEqual([expect.objectContaining({
+      kind: "schedule-run",
+      scheduleId: automationSchedule.scheduleId,
+      state: "unknown"
+    })]);
+    await expect(app.runAutomation(automationSchedule.scheduleId)).rejects.toThrow(/unknown durable result/);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("rereads Automation authority after a recovered terminal rejection", async () => {
+    const network = automationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("transport closed"));
+    await app.runAutomation(automationSchedule.scheduleId);
+    const readsBeforeRecovery = vi.mocked(network.listSchedules).mock.calls.length;
+    vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "operation-1",
+      connectionId: credential.connectionId,
+      state: OperationState.FAILED,
+      error: { message: "Run was rejected" }
+    }));
+
+    await app.reconcile();
+
+    expect(saved.pending()).toEqual([]);
+    expect(network.listSchedules).toHaveBeenCalledTimes(readsBeforeRecovery + 1);
+    expect(app.state.automations.status).toBe("ready");
+    expect(app.state.error).toBe("Run was rejected");
+  });
+
+  it("retires late catalog reads and exposes only cached Schedule summaries while inactive", async () => {
+    const network = automationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    let resolveCatalog!: (value: readonly typeof automationSchedule[]) => void;
+    vi.mocked(network.listSchedules).mockImplementationOnce(() => new Promise((resolve) => { resolveCatalog = resolve; }));
+
+    const opening = app.openAutomations();
+    app.setForeground(false);
+    resolveCatalog([create(ScheduleSchema, { ...automationSchedule, displayName: "Late authority" })]);
+    await opening;
+
+    expect(app.state.automations.status).toBe("offline");
+    expect(app.state.automations.schedules.map((schedule) => schedule.displayName)).toEqual(["Morning check"]);
+    expect(app.state.automations.detail).toBeUndefined();
+    expect(app.state.automations.history).toEqual([]);
+    await expect(app.runAutomation(automationSchedule.scheduleId)).rejects.toThrow(/Reconnect/);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("opens only the run's actual available task and never the Schedule binding", async () => {
+    const network = automationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    await app.loadMoreAutomationHistory();
+
+    await app.openAutomationRunTask(automationSchedule.scheduleId, "trigger-completed");
+
+    expect(app.state.automations.open).toBe(false);
+    expect(app.state.selectedId).toBe("session");
+    await expect(app.openAutomationRunTask(automationSchedule.scheduleId, "trigger-interrupted"))
+      .rejects.toThrow(/no task/);
+  });
+});
 
 describe("native mobile connection and operation ownership", () => {
   it("binds Voice Input RPCs to the exact live surface and retains only exact-session cleanup after retirement", async () => {

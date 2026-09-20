@@ -21,7 +21,9 @@ export interface PendingOperation {
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
-    | "session-shell" | "session-reset" | "session-review";
+    | "session-shell" | "session-reset" | "session-review"
+    | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
+    | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete";
   readonly sessionId?: string;
   readonly eventId?: string;
   readonly queueItemId?: string;
@@ -31,6 +33,8 @@ export interface PendingOperation {
   readonly interactionDraftKind?: "question" | "plan";
   readonly targetConnectionId?: string;
   readonly targetDeviceId?: string;
+  readonly scheduleId?: string;
+  readonly triggerId?: string;
   readonly state: "unknown" | "accepted";
 }
 
@@ -385,7 +389,9 @@ function isPending(value: unknown): value is PendingOperation {
     || !["create", "send", "logout", "revoke", "rename", "pin", "archive", "delete", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
-      "session-branch", "session-shell", "session-reset", "session-review"].includes(String(record.kind))
+      "session-branch", "session-shell", "session-reset", "session-review", "schedule-run", "schedule-enable",
+      "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
+      "schedule-run-delete"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
@@ -396,6 +402,8 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.interactionDraftKind !== undefined && record.interactionDraftKind !== "question" && record.interactionDraftKind !== "plan") return false;
   if (record.targetConnectionId !== undefined && typeof record.targetConnectionId !== "string") return false;
   if (record.targetDeviceId !== undefined && typeof record.targetDeviceId !== "string") return false;
+  if (record.scheduleId !== undefined && !validReceiptIdentity(record.scheduleId)) return false;
+  if (record.triggerId !== undefined && !validReceiptIdentity(record.triggerId)) return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
   if (record.kind === "revoke" && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "send" && typeof record.sessionId !== "string") return false;
@@ -410,10 +418,24 @@ function isPending(value: unknown): value is PendingOperation {
   if (["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
     "session-shell", "session-reset", "session-review"].includes(String(record.kind))
     && typeof record.sessionId !== "string") return false;
+  if (["schedule-run", "schedule-enable", "schedule-runs-read"].includes(String(record.kind))
+    && !validReceiptIdentity(record.scheduleId)) return false;
+  if (["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
+    && (!validReceiptIdentity(record.scheduleId) || !validReceiptIdentity(record.triggerId))) return false;
+  if (record.kind === "schedule-all-read" && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
+  if (!["schedule-run", "schedule-enable", "schedule-run-restart", "schedule-run-read", "schedule-runs-read",
+    "schedule-run-delete"].includes(String(record.kind)) && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
+  if (!["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
+    && record.triggerId !== undefined) return false;
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined
       || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;
   return true;
+}
+
+function validReceiptIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 async function readSelections(plain: MobilePlainStorageDriver): Promise<Record<string, string>> {

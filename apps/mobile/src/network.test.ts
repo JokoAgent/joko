@@ -11,6 +11,8 @@ import {
   FileRevisionSchema,
   PendingBlobUploadSchema,
   ResourceKind,
+  ScheduleRunHistorySchema,
+  ScheduleSchema,
   SessionMessageSearchMatchSchema,
   SessionResourceSchema,
   TextFilePreviewSchema,
@@ -28,11 +30,13 @@ import {
   authorizeVerifiedBlobDownload,
   collectArtifactPages,
   collectArtifactReferencePages,
+  collectSchedulePages,
   collectSessionMessageSearchPages,
   collectWorkspaceDirectoryPages,
   collectWorkspaceSearchPages,
   downloadVerifiedBlob,
-  uploadVerifiedBlob
+  uploadVerifiedBlob,
+  validateScheduleHistoryPage
 } from "./network";
 
 function matches(count: number, offset = 0) {
@@ -64,6 +68,57 @@ describe("mobile message-search paging", () => {
 
     await expect(collectSessionMessageSearchPages(readPage)).rejects.toThrow("invalid message-search page sequence");
     expect(readPage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("mobile Automation paging", () => {
+  it("collects every Schedule page with one stable total and unique identity", async () => {
+    const first = create(ScheduleSchema, { scheduleId: "schedule-1" });
+    const second = create(ScheduleSchema, { scheduleId: "schedule-2" });
+    const readPage = vi.fn(async (token: string) => token === ""
+      ? { schedules: [first], nextPageToken: "next", totalSize: 2n }
+      : { schedules: [second], nextPageToken: "", totalSize: 2n });
+
+    await expect(collectSchedulePages(readPage)).resolves.toEqual([first, second]);
+    expect(readPage.mock.calls).toEqual([[""], ["next"]]);
+  });
+
+  it("rejects Schedule cursor cycles, total drift, duplicates and incomplete results", async () => {
+    const value = create(ScheduleSchema, { scheduleId: "schedule" });
+    await expect(collectSchedulePages(async (token) => ({
+      schedules: [token === "" ? value : create(ScheduleSchema, { scheduleId: "other" })],
+      nextPageToken: "repeat",
+      totalSize: 3n
+    }))).rejects.toThrow(/cyclic Automation catalog/);
+    await expect(collectSchedulePages(async (token) => token === ""
+      ? { schedules: [value], nextPageToken: "next", totalSize: 2n }
+      : { schedules: [create(ScheduleSchema, { scheduleId: "other" })], nextPageToken: "", totalSize: 3n }))
+      .rejects.toThrow(/changed while paging/);
+    await expect(collectSchedulePages(async () => ({
+      schedules: [value, value], nextPageToken: "", totalSize: 2n
+    }))).rejects.toThrow(/duplicate or missing/);
+    await expect(collectSchedulePages(async () => ({
+      schedules: [value], nextPageToken: "", totalSize: 2n
+    }))).rejects.toThrow(/incomplete Automation catalog/);
+    await expect(collectSchedulePages(async () => ({
+      schedules: [value], nextPageToken: "bad\u0001cursor", totalSize: 2n
+    }))).rejects.toThrow(/invalid Automation catalog metadata/);
+  });
+
+  it("validates history cursor metadata and page-local trigger identity", () => {
+    const item = create(ScheduleRunHistorySchema, { triggerId: "trigger" });
+    expect(validateScheduleHistoryPage("schedule", "", {
+      history: [item], nextPageToken: "next", totalSize: 2n
+    })).toEqual({ history: [item], nextPageToken: "next", totalSize: 2 });
+    expect(() => validateScheduleHistoryPage("schedule", "next", {
+      history: [item], nextPageToken: "next", totalSize: 2n
+    })).toThrow(/invalid Automation history page metadata/);
+    expect(() => validateScheduleHistoryPage("schedule", "", {
+      history: [item, item], nextPageToken: "", totalSize: 2n
+    })).toThrow(/duplicate or missing/);
+    expect(() => validateScheduleHistoryPage("schedule", "", {
+      history: [item], nextPageToken: "x".repeat(4_097), totalSize: 2n
+    })).toThrow(/invalid Automation history page metadata/);
   });
 });
 

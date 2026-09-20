@@ -2,13 +2,14 @@ import { Code, ConnectError, createClient, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
-  ResourceKind, SessionService, TargetService, VoiceInputService,
+  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
-  type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
+  type NativeSessionTree, type PendingBlobUpload, type RuntimeCommand, type Schedule, type ScheduleRunHistory,
+  type SchedulerRuntimeSnapshot, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceFileChange,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
@@ -66,6 +67,10 @@ export interface MobileNetwork {
   listRuntimeCommands(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommand[]>;
   listSessionResources(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly SessionResource[]>;
   listArtifactReferenceCatalog(credential: PairedCredential, sessionId: string, generation: bigint, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
+  listSchedules(credential: PairedCredential, signal?: AbortSignal): Promise<readonly Schedule[]>;
+  readSchedule(credential: PairedCredential, scheduleId: string, signal?: AbortSignal): Promise<Schedule>;
+  listScheduleHistory(credential: PairedCredential, scheduleId: string, pageToken?: string, signal?: AbortSignal): Promise<ScheduleHistoryPage>;
+  readSchedulerRuntime(credential: PairedCredential, signal?: AbortSignal): Promise<SchedulerRuntimeSnapshot>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
@@ -102,6 +107,12 @@ export interface WorkspaceSearchSnapshot {
 export interface ArtifactCatalogSnapshot {
   readonly artifacts: readonly Artifact[];
   readonly revision: string;
+}
+
+export interface ScheduleHistoryPage {
+  readonly history: readonly ScheduleRunHistory[];
+  readonly nextPageToken: string;
+  readonly totalSize: number;
 }
 
 export interface VerifiedBlobDownload {
@@ -147,6 +158,8 @@ interface SessionMessageSearchPage {
 
 const MESSAGE_SEARCH_PAGE_SIZE = 100;
 const WORKSPACE_PAGE_SIZE = 500;
+const SCHEDULE_PAGE_SIZE = 100;
+const SCHEDULE_HISTORY_PAGE_SIZE = 50;
 export const MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES = 32 * 1024 * 1024;
 export const MOBILE_FILE_SHARE_MAXIMUM_BYTES = 256 * 1024 * 1024;
 
@@ -171,6 +184,76 @@ interface ArtifactPage {
   readonly nextPageToken: string;
   readonly totalSize: bigint;
   readonly revision: string;
+}
+
+interface ScheduleCatalogPage {
+  readonly schedules: readonly Schedule[];
+  readonly nextPageToken: string;
+  readonly totalSize: bigint;
+}
+
+function validSchedulePageToken(value: string): boolean {
+  return value.length <= 4_096 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+export async function collectSchedulePages(
+  readPage: (pageToken: string) => Promise<ScheduleCatalogPage>
+): Promise<readonly Schedule[]> {
+  const schedules: Schedule[] = [];
+  const identities = new Set<string>();
+  const pageTokens = new Set<string>();
+  let pageToken = "";
+  let totalSize: bigint | undefined;
+  while (true) {
+    const page = await readPage(pageToken);
+    if (page.totalSize < 0n || page.totalSize > 10_000n || page.schedules.length > SCHEDULE_PAGE_SIZE
+      || !validSchedulePageToken(page.nextPageToken)) {
+      throw new Error("The Joko node returned invalid Automation catalog metadata.");
+    }
+    if (totalSize === undefined) totalSize = page.totalSize;
+    else if (page.totalSize !== totalSize) throw new Error("The Automation catalog changed while paging.");
+    for (const schedule of page.schedules) {
+      if (!schedule.scheduleId || identities.has(schedule.scheduleId)) {
+        throw new Error("The Joko node returned a duplicate or missing Automation Schedule identity.");
+      }
+      identities.add(schedule.scheduleId);
+      schedules.push(schedule);
+    }
+    if (!page.nextPageToken) {
+      if (BigInt(schedules.length) !== totalSize) throw new Error("The Joko node returned an incomplete Automation catalog.");
+      return schedules;
+    }
+    if (page.schedules.length === 0 || page.nextPageToken === pageToken || pageTokens.has(page.nextPageToken)
+      || pageTokens.size >= 10_000) {
+      throw new Error("The Joko node returned a cyclic Automation catalog page token.");
+    }
+    pageTokens.add(page.nextPageToken);
+    pageToken = page.nextPageToken;
+  }
+}
+
+export function validateScheduleHistoryPage(
+  scheduleId: string,
+  requestedPageToken: string,
+  page: { readonly history: readonly ScheduleRunHistory[]; readonly nextPageToken: string; readonly totalSize: bigint }
+): ScheduleHistoryPage {
+  if (!scheduleId || !validSchedulePageToken(requestedPageToken) || !validSchedulePageToken(page.nextPageToken)
+    || page.totalSize < 0n || page.totalSize > 100_000n
+    || page.history.length > SCHEDULE_HISTORY_PAGE_SIZE
+    || page.nextPageToken !== "" && (page.nextPageToken === requestedPageToken || page.history.length === 0)) {
+    throw new Error("The Joko node returned invalid Automation history page metadata.");
+  }
+  const triggers = new Set<string>();
+  for (const run of page.history) {
+    if (!run.triggerId || triggers.has(run.triggerId)) {
+      throw new Error("The Joko node returned a duplicate or missing Automation run identity.");
+    }
+    triggers.add(run.triggerId);
+  }
+  if (requestedPageToken === "" && page.nextPageToken === "" && BigInt(page.history.length) !== page.totalSize) {
+    throw new Error("The Joko node returned an incomplete Automation history.");
+  }
+  return { history: page.history, nextPageToken: page.nextPageToken, totalSize: safeResultCount(page.totalSize, "Automation history") };
 }
 
 export async function collectSessionMessageSearchPages(
@@ -966,6 +1049,51 @@ export const mobileNetwork: MobileNetwork = {
         revision: responseRevision(response.revision)
       };
     });
+  },
+  async listSchedules(credential, signal) {
+    const client = createClient(SchedulerService, transport(credential.origin, credential.authKey));
+    return collectSchedulePages(async (pageToken) => {
+      const response = await client.listSchedules({
+        page: { pageSize: SCHEDULE_PAGE_SIZE, pageToken }
+      }, options(signal));
+      if (!response.page) throw new Error("The Joko node did not return Automation catalog page metadata.");
+      return {
+        schedules: response.schedules,
+        nextPageToken: response.page.nextPageToken,
+        totalSize: response.page.totalSize
+      };
+    });
+  },
+  async readSchedule(credential, scheduleId, signal) {
+    if (!validCatalogIdentity(scheduleId, 512)) throw new Error("A current Automation Schedule is required.");
+    const response = await createClient(SchedulerService, transport(credential.origin, credential.authKey))
+      .getSchedule({ scheduleId }, options(signal));
+    if (!response.schedule || response.schedule.scheduleId !== scheduleId) {
+      throw new Error("The Joko node returned a different Automation Schedule.");
+    }
+    return response.schedule;
+  },
+  async listScheduleHistory(credential, scheduleId, pageToken = "", signal) {
+    if (!validCatalogIdentity(scheduleId, 512) || !validSchedulePageToken(pageToken)) {
+      throw new Error("A current Automation Schedule and valid history cursor are required.");
+    }
+    const response = await createClient(SchedulerService, transport(credential.origin, credential.authKey))
+      .listScheduleRunHistory({
+        scheduleId,
+        page: { pageSize: SCHEDULE_HISTORY_PAGE_SIZE, pageToken }
+      }, options(signal));
+    if (!response.page) throw new Error("The Joko node did not return Automation history page metadata.");
+    return validateScheduleHistoryPage(scheduleId, pageToken, {
+      history: response.history,
+      nextPageToken: response.page.nextPageToken,
+      totalSize: response.page.totalSize
+    });
+  },
+  async readSchedulerRuntime(credential, signal) {
+    const response = await createClient(SchedulerService, transport(credential.origin, credential.authKey))
+      .getSchedulerRuntime({}, options(signal));
+    if (!response.runtime) throw new Error("The Joko node returned no Scheduler runtime.");
+    return response.runtime;
   },
   async downloadBlob(credential, blob, signal) {
     assertDownloadBlob(blob);

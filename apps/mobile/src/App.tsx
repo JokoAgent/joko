@@ -204,6 +204,7 @@ import {
 import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-share";
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
+import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import {
   commitMobileIncomingShare,
   mobileIncomingShare,
@@ -232,7 +233,7 @@ const client = new MobileClient(
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
-type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "connections" | "devices" | "device";
 
 interface MobilePhotoLibraryLease {
   readonly controls: MobileAttachmentControls;
@@ -569,6 +570,8 @@ export function App() {
                     setFocusTaskComposer(true);
                     setPage("task");
                   }} /> :
+                page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
+                  onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
                   onSwitch={() => setPage("connection")} /> :
                 page === "devices" ? <DevicesScreen {...common} onBack={() => setPage("home")}
@@ -588,6 +591,7 @@ export function App() {
             if (action) action(); else focusNative(homeMenuButtonRef);
           }}
           onSearch={() => queueHomeMenuAction(() => setHomeSearchFocusRequest((value) => value + 1))}
+          onAutomations={() => queueHomeMenuAction(() => setPage("automations"))}
           onSwitch={() => queueHomeMenuAction(() => { client.setConnectionMode("saved"); setPage("connection"); })}
           onConnections={() => queueHomeMenuAction(() => setPage("connections"))}
           onDevices={() => queueHomeMenuAction(() => setPage("devices"))} />
@@ -958,9 +962,9 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
 
 type SessionOption = "rename" | "pin" | "archive" | "delete";
 
-function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, onSearch, onSwitch, onConnections, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onConnections, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
-  onSearch: () => void; onSwitch: () => void; onConnections: () => void; onDevices: () => void;
+  onSearch: () => void; onAutomations: () => void; onSwitch: () => void; onConnections: () => void; onDevices: () => void;
 }) {
   const { width } = useWindowDimensions();
   const closeRef = useRef<View>(null);
@@ -979,6 +983,7 @@ function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, 
           </View>
         </View>
         <MenuRow label="Search" description="Find tasks and message text" onPress={onSearch} colors={colors} />
+        <MenuRow label="Automations" description="Schedules, run status, and history" onPress={onAutomations} colors={colors} />
         <MenuRow label="Switch or add Joko node" description="Nearby, saved, and manual connections" onPress={onSwitch} colors={colors} />
         <MenuRow label="Devices" description="Devices authorized by this Joko node" onPress={onDevices} colors={colors} />
         <MenuRow label="Connection settings" description="Automatic entry and exact server connections" onPress={onConnections} colors={colors} />

@@ -323,4 +323,41 @@ describe("current-v1 mobile connection storage", () => {
     ]));
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
+
+  it("round-trips body-free Automation receipts only with exact Schedule and trigger identities", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = [
+      { operationId: "schedule-run", connectionId: first.connectionId, kind: "schedule-run" as const,
+        scheduleId: "schedule-one", state: "unknown" as const },
+      { operationId: "schedule-enable", connectionId: first.connectionId, kind: "schedule-enable" as const,
+        scheduleId: "schedule-one", state: "accepted" as const },
+      { operationId: "run-restart", connectionId: first.connectionId, kind: "schedule-run-restart" as const,
+        scheduleId: "schedule-one", triggerId: "trigger-one", state: "unknown" as const },
+      { operationId: "run-read", connectionId: first.connectionId, kind: "schedule-run-read" as const,
+        scheduleId: "schedule-one", triggerId: "trigger-one", state: "accepted" as const },
+      { operationId: "runs-read", connectionId: first.connectionId, kind: "schedule-runs-read" as const,
+        scheduleId: "schedule-one", state: "unknown" as const },
+      { operationId: "all-read", connectionId: first.connectionId, kind: "schedule-all-read" as const,
+        state: "accepted" as const },
+      { operationId: "run-delete", connectionId: first.connectionId, kind: "schedule-run-delete" as const,
+        scheduleId: "schedule-one", triggerId: "trigger-two", state: "unknown" as const }
+    ];
+
+    await storage.savePending(receipts);
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+    expect(memory.plainValues.get("joko.mobile.pending.v1")).not.toContain("result text");
+
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { operationId: "missing-schedule", connectionId: first.connectionId, kind: "schedule-run", state: "unknown" },
+      { operationId: "missing-trigger", connectionId: first.connectionId, kind: "schedule-run-delete",
+        scheduleId: "schedule-one", state: "unknown" },
+      { operationId: "wrong-trigger", connectionId: first.connectionId, kind: "schedule-enable",
+        scheduleId: "schedule-one", triggerId: "trigger-one", state: "unknown" },
+      { operationId: "metadata-on-send", connectionId: first.connectionId, kind: "send",
+        sessionId: "session-one", scheduleId: "schedule-one", state: "unknown" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual(receipts);
+  });
 });

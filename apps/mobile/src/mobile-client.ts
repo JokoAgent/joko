@@ -7,16 +7,19 @@ import {
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema, ExecuteUserShellMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
-  LogoutConnectionMutationSchema, NavigateSessionBranchMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
+  DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
+  MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
+  OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
-  ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
+  ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
+  RevisionSchema, RevokeDeviceMutationSchema,
   ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
-  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
+  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
-  StartReviewMutationSchema,
+  StartReviewMutationSchema, TriggerScheduleMutationSchema,
   FileKind,
   type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
-  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
+  type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
@@ -267,6 +270,20 @@ import {
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
+import {
+  canRestartMobileAutomationRun,
+  emptyMobileAutomationsState,
+  isMobileAutomationRunTerminal,
+  isMobileAutomationRunUnread,
+  projectMobileAutomationCatalog,
+  projectMobileAutomationHistory,
+  projectMobileAutomationSchedule,
+  projectMobileSchedulerRuntime,
+  type MobileAutomationFilter,
+  type MobileAutomationRun,
+  type MobileAutomationSchedule,
+  type MobileAutomationsState
+} from "./mobile-automation";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -316,6 +333,7 @@ export interface MobileState {
   readonly homeSearchError?: string;
   readonly timelinePreview?: MobileFilePreview;
   readonly files: MobileFilesState;
+  readonly automations: MobileAutomationsState;
   readonly offlineSnapshotAt?: number;
   readonly error?: string;
 }
@@ -481,6 +499,21 @@ function entityVersionKey(version: {
   ].join("\u001e");
 }
 
+function automationCatalogAuthorityKey(schedules: readonly Schedule[]): string {
+  return schedules.map((schedule) => [
+    schedule.scheduleId,
+    entityVersionKey(schedule.version),
+    String(schedule.state),
+    String(schedule.unreadRunCount),
+    schedule.recentRuns.map((run) => [
+      run.triggerId,
+      run.runId,
+      String(run.outcome),
+      run.readAt === undefined ? "" : `${run.readAt.seconds.toString(10)}:${run.readAt.nanos}`
+    ].join("\u001d")).sort().join("\u001c")
+  ].join("\u001e")).sort().join("\u001f");
+}
+
 function backendAuthorityKey(backend: BackendDescriptor): string {
   return [
     backend.backendId,
@@ -496,7 +529,8 @@ export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
-    homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState() };
+    homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState(),
+    automations: emptyMobileAutomationsState() };
   #credential?: PairedCredential;
   #profiles: MobileConnectionProfile[] = [];
   #automaticProfileId?: string;
@@ -544,6 +578,10 @@ export class MobileClient {
   #newTaskSubmissionActive = false;
   #composerImageEdit?: MobileComposerImageEditLease;
   #imageGallery?: MobileImageGalleryLease;
+  #automationEpoch = 0;
+  #automationAbort?: AbortController;
+  #automationHistoryAbort?: AbortController;
+  #automationHistoryPageTokens = new Set<string>();
 
   constructor(
     private readonly network: MobileNetwork,
@@ -589,6 +627,31 @@ export class MobileClient {
     } else if (next.files.open && next.status !== "connected" && next.files.status !== "offline") {
       next = { ...next, files: { ...next.files, status: "offline" } };
     }
+    if (next.automations.open && next.status !== "connected") {
+      let schedules: readonly MobileAutomationSchedule[] = [];
+      let automationError: string | undefined;
+      try { schedules = projectMobileAutomationCatalog(next.owner?.schedules ?? []); }
+      catch (error) { automationError = message(error); }
+      const selectedScheduleId = schedules.some((schedule) => schedule.scheduleId === next.automations.selectedScheduleId)
+        ? next.automations.selectedScheduleId
+        : schedules[0]?.scheduleId;
+      next = {
+        ...next,
+        automations: {
+          ...next.automations,
+          status: "offline",
+          schedules,
+          ...(selectedScheduleId === undefined ? { selectedScheduleId: undefined } : { selectedScheduleId }),
+          detail: undefined,
+          history: [],
+          historyStatus: "idle",
+          historyNextPageToken: undefined,
+          historyTotalSize: 0,
+          runtime: undefined,
+          error: automationError ?? "Reconnect to inspect or control Automations."
+        }
+      };
+    }
     if (this.#timelinePreview && !this.#timelinePreviewSourceCurrent(this.#timelinePreview, next)) {
       this.#cancelTimelinePreviewLease();
       next = { ...next, timelinePreview: undefined };
@@ -608,6 +671,7 @@ export class MobileClient {
     this.#homeSearchAbort?.abort();
     this.#homeSearchAbort = undefined;
     this.#homeSearchEpoch += 1;
+    this.#cancelAutomationRequests();
     this.#cancelFilesRequests();
     this.#cancelTimelinePreviewLease();
     this.#cancelPreparingFileShare();
@@ -640,6 +704,15 @@ export class MobileClient {
   }
 
   #current(epoch: number): boolean { return !this.#disposed && this.#foreground && this.#epoch === epoch; }
+
+  #cancelAutomationRequests(): void {
+    this.#automationAbort?.abort();
+    this.#automationHistoryAbort?.abort();
+    this.#automationAbort = undefined;
+    this.#automationHistoryAbort = undefined;
+    this.#automationHistoryPageTokens.clear();
+    this.#automationEpoch += 1;
+  }
 
   #beginConnectionAttempt(): { readonly generation: number; readonly controller: AbortController } {
     if (this.#mutationOwner) throw new Error("Finish the current task operation before changing Joko nodes.");
@@ -1103,11 +1176,16 @@ export class MobileClient {
       historyBusy: false,
       live: [],
       offlineSnapshotAt: undefined,
+      ...(priorProfileId !== credential.profileId
+        ? { automations: emptyMobileAutomationsState(this.#state.automations.open,
+            this.#state.automations.open ? "loading" : "idle") }
+        : {}),
       error: preferenceError
     });
     this.#beginStream(epoch, credential, owner.snapshot);
     await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
     await this.reconcile(epoch);
+    if (this.#current(epoch) && this.#state.automations.open) await this.refreshAutomations();
     if (this.#current(epoch)) this.#schedule();
   }
 
@@ -1436,6 +1514,33 @@ export class MobileClient {
       this.#discoveryExpiryTimer = undefined;
       this.#cancelCatalogAttempt();
       this.#mutationOwner = undefined;
+      let backgroundAutomations: MobileAutomationsState | undefined;
+      if (this.#state.automations.open) {
+        try {
+          const schedules = projectMobileAutomationCatalog(this.#state.owner?.schedules ?? []);
+          const selectedScheduleId = schedules.some((schedule) => schedule.scheduleId === this.#state.automations.selectedScheduleId)
+            ? this.#state.automations.selectedScheduleId : schedules[0]?.scheduleId;
+          backgroundAutomations = {
+            ...this.#state.automations,
+            status: "offline",
+            schedules,
+            ...(selectedScheduleId === undefined ? { selectedScheduleId: undefined } : { selectedScheduleId }),
+            detail: undefined,
+            history: [],
+            historyStatus: "idle",
+            historyNextPageToken: undefined,
+            historyTotalSize: 0,
+            runtime: undefined,
+            error: "Return Joko to the foreground to inspect or control Automations."
+          };
+        } catch (error) {
+          backgroundAutomations = {
+            ...emptyMobileAutomationsState(true, "offline"),
+            filter: this.#state.automations.filter,
+            error: message(error)
+          };
+        }
+      }
       this.#set({
         ...(!this.#hasActiveConnection() && this.#state.status === "connecting"
           ? { status: this.#hasOfflineProjection() ? "offline" as const : "unpaired" as const }
@@ -1453,7 +1558,8 @@ export class MobileClient {
         historyEnd: false,
         ...(this.#state.files.open
           ? { files: { ...this.#state.files, status: "offline" as const } }
-          : {})
+          : {}),
+        ...(backgroundAutomations === undefined ? {} : { automations: backgroundAutomations })
       });
     }
     if (active) {
@@ -1507,6 +1613,7 @@ export class MobileClient {
       this.#beginStream(epoch, credential, owner.snapshot);
       await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
       await this.reconcile(epoch);
+      if (this.#current(epoch) && this.#state.automations.open) await this.refreshAutomations();
       if (this.#current(epoch)) this.#schedule();
     } catch (error) {
       if (!this.#current(epoch)) return;
@@ -1728,11 +1835,14 @@ export class MobileClient {
       }
       this.#projectionMisses = 0;
       const durable = detail?.resumeCursor?.sequence ?? owner.snapshot.resumeCursor.sequence;
+      const automationChanged = automationCatalogAuthorityKey(this.#state.owner?.schedules ?? [])
+        !== automationCatalogAuthorityKey(owner.snapshot.schedules);
       this.#lastAuthenticatedAt = this.now();
       this.#set({ owner: owner.snapshot, detail,
         offlineSnapshotAt: undefined,
         live: this.#state.live.filter((item) => item.cursor && item.cursor.sequence > durable) });
       await this.#persistOfflineProjection(epoch, credential, this.#state.node!, owner.snapshot, detail);
+      if (automationChanged && this.#state.automations.open) void this.refreshAutomations();
       if ((this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
     } catch (error) {
       if (!this.#current(epoch)) return;
@@ -1870,6 +1980,419 @@ export class MobileClient {
     } finally {
       if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;
     }
+  }
+
+  async openAutomations(): Promise<void> {
+    this.#cancelAutomationRequests();
+    if (this.#state.status !== "connected" || !this.#foreground) {
+      let schedules: readonly MobileAutomationSchedule[] = [];
+      let error = "Reconnect to inspect or control Automations.";
+      try { schedules = projectMobileAutomationCatalog(this.#state.owner?.schedules ?? []); }
+      catch (cause) { error = message(cause); }
+      this.#set({
+        automations: {
+          ...emptyMobileAutomationsState(true, "offline"),
+          schedules,
+          ...(schedules[0] === undefined ? {} : { selectedScheduleId: schedules[0].scheduleId }),
+          error
+        }
+      });
+      return;
+    }
+    this.#set({ automations: { ...this.#state.automations, open: true, status: "loading", error: undefined } });
+    await this.refreshAutomations();
+  }
+
+  closeAutomations(): void {
+    this.#cancelAutomationRequests();
+    this.#set({ automations: emptyMobileAutomationsState() });
+  }
+
+  setAutomationFilter(filter: MobileAutomationFilter): void {
+    if (!this.#state.automations.open) return;
+    this.#set({ automations: { ...this.#state.automations, filter } });
+  }
+
+  async selectAutomation(scheduleId: string): Promise<void> {
+    if (!this.#state.automations.open
+      || this.#state.automations.schedules.filter((schedule) => schedule.scheduleId === scheduleId).length !== 1) {
+      throw new Error("Select an Automation from the current catalog.");
+    }
+    this.#automationHistoryPageTokens.clear();
+    this.#set({
+      automations: {
+        ...this.#state.automations,
+        selectedScheduleId: scheduleId,
+        detail: undefined,
+        history: [],
+        historyStatus: this.#state.status === "connected" ? "loading" : "idle",
+        historyNextPageToken: undefined,
+        historyTotalSize: 0,
+        error: this.#state.status === "connected" ? undefined : "Reconnect to inspect Automation history."
+      }
+    });
+    if (this.#state.status === "connected") await this.refreshAutomations(scheduleId);
+  }
+
+  async refreshAutomations(preferredScheduleId = this.#state.automations.selectedScheduleId): Promise<void> {
+    if (!this.#state.automations.open) return;
+    const credential = this.#credential;
+    const authorityKey = this.#automationOwnerKey();
+    if (!credential || !authorityKey) {
+      let schedules: readonly MobileAutomationSchedule[] = [];
+      let error = "Reconnect to refresh Automations.";
+      try { schedules = projectMobileAutomationCatalog(this.#state.owner?.schedules ?? []); }
+      catch (cause) { error = message(cause); }
+      const selectedScheduleId = schedules.some((schedule) => schedule.scheduleId === preferredScheduleId)
+        ? preferredScheduleId : schedules[0]?.scheduleId;
+      this.#set({ automations: {
+        ...this.#state.automations,
+        status: "offline",
+        schedules,
+        ...(selectedScheduleId === undefined ? { selectedScheduleId: undefined } : { selectedScheduleId }),
+        detail: undefined,
+        history: [],
+        historyStatus: "idle",
+        historyNextPageToken: undefined,
+        historyTotalSize: 0,
+        runtime: undefined,
+        error
+      } });
+      return;
+    }
+    this.#cancelAutomationRequests();
+    const generation = this.#automationEpoch;
+    const controller = new AbortController();
+    this.#automationAbort = controller;
+    this.#set({ automations: {
+      ...this.#state.automations,
+      status: "loading",
+      historyStatus: this.#state.automations.history.length === 0 ? "loading" : this.#state.automations.historyStatus,
+      error: undefined
+    } });
+    try {
+      const [rawCatalog, rawRuntime] = await Promise.all([
+        this.network.listSchedules(credential, controller.signal),
+        this.network.readSchedulerRuntime(credential, controller.signal)
+      ]);
+      const schedules = projectMobileAutomationCatalog(rawCatalog);
+      const runtime = projectMobileSchedulerRuntime(rawRuntime, new Set(schedules.map((schedule) => schedule.scheduleId)));
+      if (!this.#automationRequestCurrent(generation, controller, authorityKey)) return;
+      const selectedScheduleId = schedules.some((schedule) => schedule.scheduleId === preferredScheduleId)
+        ? preferredScheduleId : schedules[0]?.scheduleId;
+      if (selectedScheduleId === undefined) {
+        this.#automationHistoryPageTokens = new Set([""]);
+        this.#set({ automations: {
+          ...this.#state.automations,
+          status: "ready",
+          schedules,
+          selectedScheduleId: undefined,
+          detail: undefined,
+          history: [],
+          historyStatus: "ready",
+          historyNextPageToken: undefined,
+          historyTotalSize: 0,
+          runtime,
+          lastSyncedAt: this.now(),
+          error: undefined
+        } });
+        return;
+      }
+      const [rawDetail, rawHistory] = await Promise.all([
+        this.network.readSchedule(credential, selectedScheduleId, controller.signal),
+        this.network.listScheduleHistory(credential, selectedScheduleId, "", controller.signal)
+      ]);
+      const detail = projectMobileAutomationSchedule(rawDetail, selectedScheduleId);
+      const catalogSchedule = schedules.find((schedule) => schedule.scheduleId === selectedScheduleId)!;
+      this.#assertSameAutomationRevision(catalogSchedule, detail);
+      const history = projectMobileAutomationHistory(selectedScheduleId, rawHistory.history);
+      if (history.length > rawHistory.totalSize
+        || rawHistory.nextPageToken === "" && history.length !== rawHistory.totalSize) {
+        throw new Error("The Joko node returned an incomplete Automation history.");
+      }
+      if (!this.#automationRequestCurrent(generation, controller, authorityKey)
+        || this.#state.automations.selectedScheduleId !== preferredScheduleId
+          && preferredScheduleId !== undefined
+          && schedules.some((schedule) => schedule.scheduleId === preferredScheduleId)) return;
+      this.#automationHistoryPageTokens = new Set([
+        "",
+        ...(rawHistory.nextPageToken === "" ? [] : [rawHistory.nextPageToken])
+      ]);
+      this.#set({ automations: {
+        ...this.#state.automations,
+        status: "ready",
+        schedules,
+        selectedScheduleId,
+        detail,
+        history,
+        historyStatus: "ready",
+        ...(rawHistory.nextPageToken === "" ? { historyNextPageToken: undefined } : { historyNextPageToken: rawHistory.nextPageToken }),
+        historyTotalSize: rawHistory.totalSize,
+        runtime,
+        lastSyncedAt: this.now(),
+        error: undefined
+      } });
+    } catch (error) {
+      if (!this.#automationRequestCurrent(generation, controller, authorityKey)) return;
+      this.#set({ automations: {
+        ...this.#state.automations,
+        status: "error",
+        historyStatus: "error",
+        error: message(error)
+      } });
+    } finally {
+      if (this.#automationAbort === controller) this.#automationAbort = undefined;
+    }
+  }
+
+  async loadMoreAutomationHistory(): Promise<void> {
+    const state = this.#state.automations;
+    const scheduleId = state.selectedScheduleId;
+    const pageToken = state.historyNextPageToken;
+    const credential = this.#credential;
+    const authorityKey = this.#automationOwnerKey();
+    if (!state.open || state.status !== "ready" || state.historyStatus !== "ready"
+      || !scheduleId || !pageToken || !credential || !authorityKey) return;
+    this.#automationHistoryAbort?.abort();
+    const controller = new AbortController();
+    this.#automationHistoryAbort = controller;
+    const generation = this.#automationEpoch;
+    const expectedTotal = state.historyTotalSize;
+    const existing = state.history;
+    if (!this.#automationHistoryPageTokens.has(pageToken)) {
+      throw new Error("The Automation history cursor is no longer current.");
+    }
+    this.#set({ automations: { ...state, historyStatus: "loading-more", error: undefined } });
+    try {
+      const raw = await this.network.listScheduleHistory(credential, scheduleId, pageToken, controller.signal);
+      const page = projectMobileAutomationHistory(scheduleId, raw.history);
+      const identities = new Set(existing.map((run) => run.triggerId));
+      if (raw.totalSize !== expectedTotal || page.some((run) => identities.has(run.triggerId))
+        || existing.length + page.length > expectedTotal
+        || raw.nextPageToken === "" && existing.length + page.length !== expectedTotal
+        || raw.nextPageToken !== "" && this.#automationHistoryPageTokens.has(raw.nextPageToken)) {
+        throw new Error("The Automation history changed while paging.");
+      }
+      if (!this.#automationHistoryRequestCurrent(generation, controller, authorityKey, scheduleId, pageToken)) return;
+      if (raw.nextPageToken !== "") this.#automationHistoryPageTokens.add(raw.nextPageToken);
+      this.#set({ automations: {
+        ...this.#state.automations,
+        history: [...existing, ...page],
+        historyStatus: "ready",
+        ...(raw.nextPageToken === "" ? { historyNextPageToken: undefined } : { historyNextPageToken: raw.nextPageToken }),
+        error: undefined
+      } });
+    } catch (error) {
+      if (!this.#automationHistoryRequestCurrent(generation, controller, authorityKey, scheduleId, pageToken)) return;
+      this.#set({ automations: { ...this.#state.automations, historyStatus: "error", error: message(error) } });
+    } finally {
+      if (this.#automationHistoryAbort === controller) this.#automationHistoryAbort = undefined;
+    }
+  }
+
+  async runAutomation(scheduleId: string): Promise<boolean> {
+    return this.#submitAutomationMutation(scheduleId, undefined, "schedule-run", (schedule) => create(OperationMutationSchema, {
+      preconditions: [this.#automationSchedulePrecondition(schedule)],
+      payload: { case: "triggerSchedule", value: create(TriggerScheduleMutationSchema, { scheduleId }) }
+    }));
+  }
+
+  async setAutomationEnabled(scheduleId: string, enabled: boolean): Promise<boolean> {
+    return this.#submitAutomationMutation(scheduleId, undefined, "schedule-enable", (schedule) => create(OperationMutationSchema, {
+      preconditions: [this.#automationSchedulePrecondition(schedule)],
+      payload: { case: "setScheduleEnabled", value: create(SetScheduleEnabledMutationSchema, { scheduleId, enabled }) }
+    }));
+  }
+
+  async restartAutomationRun(scheduleId: string, triggerId: string): Promise<boolean> {
+    this.#automationRun(scheduleId, triggerId, canRestartMobileAutomationRun, "This Automation run cannot be restarted.");
+    return this.#submitAutomationMutation(scheduleId, triggerId, "schedule-run-restart", (schedule) => create(OperationMutationSchema, {
+      preconditions: [this.#automationSchedulePrecondition(schedule)],
+      payload: { case: "restartScheduleRun", value: create(RestartScheduleRunMutationSchema, { scheduleId, triggerId }) }
+    }));
+  }
+
+  async markAutomationRunRead(scheduleId: string, triggerId: string): Promise<boolean> {
+    this.#automationRun(scheduleId, triggerId, isMobileAutomationRunUnread, "This Automation run is not unread.");
+    return this.#submitAutomationMutation(scheduleId, triggerId, "schedule-run-read", (schedule) => create(OperationMutationSchema, {
+      preconditions: [this.#automationSchedulePrecondition(schedule)],
+      payload: { case: "markScheduleRunRead", value: create(MarkScheduleRunReadMutationSchema, { scheduleId, triggerId }) }
+    }));
+  }
+
+  async markAutomationRunsRead(scheduleId: string): Promise<boolean> {
+    return this.#submitAutomationMutation(scheduleId, undefined, "schedule-runs-read", (schedule) => create(OperationMutationSchema, {
+      preconditions: [this.#automationSchedulePrecondition(schedule)],
+      payload: { case: "markScheduleRunsRead", value: create(MarkScheduleRunsReadMutationSchema, { scheduleId }) }
+    }));
+  }
+
+  async markAllAutomationRunsRead(): Promise<boolean> {
+    const state = this.#state.automations;
+    if (!state.open || state.status !== "ready" || state.schedules.length === 0) return false;
+    this.#assertNoPendingAutomation("schedule-all-read");
+    const action = this.#claimMutation();
+    try {
+      const schedules = await this.#revalidateAutomationCatalog();
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: schedules.map((schedule) => this.#automationSchedulePrecondition(schedule)),
+        payload: { case: "markAllScheduleRunsRead", value: create(MarkAllScheduleRunsReadMutationSchema) }
+      }), { kind: "schedule-all-read" }, undefined, true, false);
+      if (result.definitive) await this.refreshAutomations();
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async deleteAutomationRun(scheduleId: string, triggerId: string): Promise<boolean> {
+    this.#automationRun(scheduleId, triggerId, isMobileAutomationRunTerminal, "Only a terminal Automation run can be deleted.");
+    return this.#submitAutomationMutation(scheduleId, triggerId, "schedule-run-delete", (schedule) => create(OperationMutationSchema, {
+      preconditions: [this.#automationSchedulePrecondition(schedule)],
+      payload: { case: "deleteScheduleRun", value: create(DeleteScheduleRunMutationSchema, { scheduleId, triggerId }) }
+    }));
+  }
+
+  async openAutomationRunTask(scheduleId: string, triggerId: string): Promise<void> {
+    const run = this.#automationRun(scheduleId, triggerId, (candidate) => candidate.sessionId !== undefined,
+      "This Automation run has no task to open.");
+    const sessionId = run.sessionId!;
+    if (this.#state.owner?.sessions.filter((session) => session.sessionId === sessionId).length !== 1) {
+      throw new Error("The Automation run task is no longer available on this Joko node.");
+    }
+    this.closeAutomations();
+    await this.select(sessionId);
+  }
+
+  #automationOwnerKey(): string | undefined {
+    const credential = this.#credential;
+    const owner = this.#state.owner;
+    if (!credential || !owner || !this.#foreground || this.#state.status !== "connected"
+      || this.#state.activeProfileId !== credential.profileId || this.#state.node?.serverId !== credential.serverId
+      || owner.server?.serverId !== credential.serverId || owner.generation < 1n) return undefined;
+    const connections = owner.connections.filter((connection) => connection.connectionId === credential.connectionId);
+    const devices = owner.devices.filter((device) => device.deviceId === credential.deviceId);
+    const connection = connections.length === 1 ? connections[0] : undefined;
+    const device = devices.length === 1 ? devices[0] : undefined;
+    if (!connection || !device || connection.connectionProfileId !== credential.profileId
+      || connection.deviceId !== credential.deviceId || connection.state !== ConnectionState.CONNECTED
+      || device.kind !== DeviceKind.MOBILE || device.revoked || !device.connectionIds.includes(credential.connectionId)) return undefined;
+    return [
+      mobileCredentialKey(credential),
+      entityVersionKey(connection.version),
+      entityVersionKey(device.version),
+      owner.generation.toString(10)
+    ].join("\u001f");
+  }
+
+  #automationRequestCurrent(generation: number, controller: AbortController, authorityKey: string): boolean {
+    return !this.#disposed && this.#foreground && !controller.signal.aborted
+      && this.#automationEpoch === generation && this.#automationAbort === controller
+      && this.#state.automations.open && this.#automationOwnerKey() === authorityKey;
+  }
+
+  #automationHistoryRequestCurrent(
+    generation: number,
+    controller: AbortController,
+    authorityKey: string,
+    scheduleId: string,
+    pageToken: string
+  ): boolean {
+    return !this.#disposed && this.#foreground && !controller.signal.aborted
+      && this.#automationEpoch === generation && this.#automationHistoryAbort === controller
+      && this.#state.automations.open && this.#state.automations.selectedScheduleId === scheduleId
+      && this.#state.automations.historyNextPageToken === pageToken && this.#automationOwnerKey() === authorityKey;
+  }
+
+  #assertSameAutomationRevision(left: MobileAutomationSchedule, right: MobileAutomationSchedule): void {
+    if (left.scheduleId !== right.scheduleId || left.revision.value !== right.revision.value
+      || left.revision.etag !== right.revision.etag || left.generation !== right.generation) {
+      throw new Error("The Automation Schedule changed while it was loading.");
+    }
+  }
+
+  #automationRun(
+    scheduleId: string,
+    triggerId: string,
+    predicate: (run: MobileAutomationRun) => boolean,
+    failure: string
+  ): MobileAutomationRun {
+    const state = this.#state.automations;
+    if (!state.open || state.status !== "ready" || state.selectedScheduleId !== scheduleId) throw new Error(failure);
+    const matches = state.history.filter((run) => run.triggerId === triggerId);
+    const run = matches.length === 1 ? matches[0] : undefined;
+    if (!run || !predicate(run)) throw new Error(failure);
+    return run;
+  }
+
+  #assertNoPendingAutomation(kind: PendingOperation["kind"], scheduleId?: string, triggerId?: string): void {
+    if (this.#state.pending.some((pending) => pending.kind === kind
+      && pending.scheduleId === scheduleId && pending.triggerId === triggerId)) {
+      throw new Error("This exact Automation operation still has an unknown durable result. Check its receipt before retrying.");
+    }
+  }
+
+  async #revalidateAutomationSchedule(scheduleId: string): Promise<MobileAutomationSchedule> {
+    const credential = this.#ready();
+    const authorityKey = this.#automationOwnerKey();
+    const state = this.#state.automations;
+    const matches = state.schedules.filter((schedule) => schedule.scheduleId === scheduleId);
+    const observed = matches.length === 1 ? matches[0] : undefined;
+    if (!authorityKey || !state.open || state.status !== "ready" || !observed) {
+      throw new Error("Reopen this Automation from the current Joko catalog.");
+    }
+    const current = projectMobileAutomationSchedule(
+      await this.network.readSchedule(credential, scheduleId, this.#abort?.signal),
+      scheduleId
+    );
+    if (this.#automationOwnerKey() !== authorityKey || !this.#state.automations.open) {
+      throw new Error("The Automation owner changed before the operation could be dispatched.");
+    }
+    this.#assertSameAutomationRevision(observed, current);
+    return current;
+  }
+
+  async #revalidateAutomationCatalog(): Promise<readonly MobileAutomationSchedule[]> {
+    const credential = this.#ready();
+    const authorityKey = this.#automationOwnerKey();
+    const observed = this.#state.automations.schedules;
+    if (!authorityKey || !this.#state.automations.open || this.#state.automations.status !== "ready") {
+      throw new Error("Reopen Automations from the current Joko catalog.");
+    }
+    const current = projectMobileAutomationCatalog(await this.network.listSchedules(credential, this.#abort?.signal));
+    if (this.#automationOwnerKey() !== authorityKey || current.length !== observed.length) {
+      throw new Error("The Automation catalog changed before the operation could be dispatched.");
+    }
+    for (let index = 0; index < current.length; index += 1) this.#assertSameAutomationRevision(observed[index]!, current[index]!);
+    return current;
+  }
+
+  #automationSchedulePrecondition(schedule: MobileAutomationSchedule) {
+    return create(OperationPreconditionSchema, {
+      entity: create(EntityRefSchema, { kind: EntityKind.SCHEDULE, id: schedule.scheduleId }),
+      expectedRevision: create(RevisionSchema, schedule.revision)
+    });
+  }
+
+  async #submitAutomationMutation(
+    scheduleId: string,
+    triggerId: string | undefined,
+    kind: Extract<PendingOperation["kind"], "schedule-run" | "schedule-enable" | "schedule-run-restart"
+      | "schedule-run-read" | "schedule-runs-read" | "schedule-run-delete">,
+    mutation: (schedule: MobileAutomationSchedule) => OperationMutation
+  ): Promise<boolean> {
+    this.#assertNoPendingAutomation(kind, scheduleId, triggerId);
+    const action = this.#claimMutation();
+    try {
+      const schedule = await this.#revalidateAutomationSchedule(scheduleId);
+      const result = await this.#submitTerminal(
+        mutation(schedule),
+        { kind, scheduleId, ...(triggerId === undefined ? {} : { triggerId }) },
+        undefined,
+        true,
+        false
+      );
+      if (result.definitive) await this.refreshAutomations(scheduleId);
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
   }
 
   canOpenFiles(): boolean { return this.filesAuthorityKey() !== undefined; }
@@ -7540,14 +8063,14 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId">
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false)).accepted;
   }
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId">,
     operationId?: string,
     markBusy = true,
     refreshAfter = true
@@ -7557,7 +8080,7 @@ export class MobileClient {
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId">,
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
@@ -7678,6 +8201,17 @@ export class MobileClient {
         if (!this.#current(epoch)) return;
         if (operation) {
           await this.#receipt(operation, pending, epoch);
+          const scheduleMutation = ["schedule-run", "schedule-enable", "schedule-run-restart",
+            "schedule-run-read", "schedule-runs-read", "schedule-all-read", "schedule-run-delete"]
+            .includes(pending.kind);
+          if (scheduleMutation && isTerminal(operation.state) && this.#current(epoch)) {
+            const rejection = operation.state === OperationState.SUCCEEDED
+              ? undefined
+              : operation.error?.message || "The Automation operation was rejected.";
+            await this.refresh();
+            if (rejection && this.#state.status === "connected") this.#set({ error: rejection });
+            return;
+          }
           if (operation.state === OperationState.SUCCEEDED
             && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
