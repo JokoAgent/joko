@@ -142,6 +142,46 @@ describe("mobile composer draft store", () => {
     expect(store.readSync(first)).toBeNull();
   });
 
+  it("round-trips v3 local and uploaded attachment identities without persisting picker URIs", async () => {
+    const memory = memoryDriver();
+    const store = new MobileComposerDraftStore(memory.driver);
+    const attached = {
+      ...plainTextMobileComposerDraft("Review these"),
+      attachments: [
+        {
+          state: "local" as const,
+          attachmentId: "image-one",
+          kind: "image" as const,
+          fileName: "pixel.png",
+          mediaType: "image/png",
+          byteSize: 4,
+          sha256Hex: "a".repeat(64),
+          capturedAtUnixMs: 100
+        },
+        {
+          state: "uploaded" as const,
+          attachmentId: "file-one",
+          kind: "file" as const,
+          fileName: "proof.pdf",
+          mediaType: "application/pdf",
+          byteSize: 7,
+          sha256Hex: "b".repeat(64),
+          capturedAtUnixMs: 101,
+          blobId: "blob-file-one"
+        }
+      ]
+    };
+
+    store.save(first, attached);
+    await store.flush(first);
+
+    await expect(new MobileComposerDraftStore(memory.driver).read(first)).resolves.toEqual(attached);
+    const raw = memory.values.get(mobileComposerDraftTesting.storageKey(first))!;
+    expect(raw).toContain('"version":3');
+    expect(raw).not.toContain("content://");
+    expect(raw).not.toContain("file://");
+  });
+
   it("fences recovery writes and clears with the exact in-memory draft revision", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);

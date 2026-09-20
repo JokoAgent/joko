@@ -21,9 +21,9 @@ export interface MobileComposerDraftSnapshot {
   readonly draft?: MobileComposerDraft;
 }
 
-const storagePrefix = "joko.mobile.composer-draft.v2";
+const storagePrefix = "joko.mobile.composer-draft.v3";
 const persistDebounceMilliseconds = 400;
-const maximumStoredCharacters = 1_008_192;
+const maximumStoredCharacters = 1_032_768;
 
 export class MobileComposerDraftStore {
   readonly #memory = new Map<string, MobileComposerDraft>();
@@ -88,7 +88,7 @@ export class MobileComposerDraftStore {
     this.#bumpRevision(key);
     this.#identities.set(key, exact);
     this.#dirty.add(key);
-    if (value.text.length === 0 && value.mentions.length === 0) {
+    if (value.text.length === 0 && value.mentions.length === 0 && value.attachments.length === 0) {
       this.#memory.delete(key);
       this.#cleared.add(key);
       void this.#removeIfCurrent(exact).catch(() => undefined);
@@ -258,7 +258,7 @@ function storageKey(identity: MobileComposerDraftIdentity): string {
 }
 
 function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): string {
-  const serialized = JSON.stringify({ version: 2, identity: normalizeIdentity(identity), draft: normalizeMobileComposerDraft(draft) });
+  const serialized = JSON.stringify({ version: 3, identity: normalizeIdentity(identity), draft: normalizeMobileComposerDraft(draft) });
   if (serialized.length > maximumStoredCharacters) throw new Error("The local Joko structured task draft is too large.");
   return serialized;
 }
@@ -266,10 +266,10 @@ function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileCom
 function readRecord(serialized: string, identity: MobileComposerDraftIdentity): MobileComposerDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 2 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 3 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId || value["identity"]["sessionId"] !== identity.sessionId
     || !isRecord(value["draft"]) || typeof value["draft"]["text"] !== "string"
-    || !Array.isArray(value["draft"]["mentions"])) {
+    || !Array.isArray(value["draft"]["mentions"]) || !Array.isArray(value["draft"]["attachments"])) {
     throw new Error("structured task draft identity or envelope mismatch");
   }
   return normalizeMobileComposerDraft(value["draft"] as unknown as MobileComposerDraft);

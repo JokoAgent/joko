@@ -31,8 +31,8 @@ describe("mobile composer draft and queue edit separation", () => {
       addition: "quoted completion"
     })).toEqual({
       visibleDraft: plainTextMobileComposerDraft("queued body"),
-      normalDraft: { text: "Ask @Task\n\nquoted completion", mentions: normal.mentions },
-      queueStashedDraft: { text: "Ask @Task\n\nquoted completion", mentions: normal.mentions }
+      normalDraft: { text: "Ask @Task\n\nquoted completion", mentions: normal.mentions, attachments: [] },
+      queueStashedDraft: { text: "Ask @Task\n\nquoted completion", mentions: normal.mentions, attachments: [] }
     });
   });
 });

@@ -28,7 +28,13 @@ import {
 } from "./connection-artwork";
 import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
-import { mobileComposerDrafts, mobileInteractionDrafts, mobileNewTaskDrafts, mobileStorage } from "./storage";
+import {
+  mobileAttachmentFiles,
+  mobileComposerDrafts,
+  mobileInteractionDrafts,
+  mobileNewTaskDrafts,
+  mobileStorage
+} from "./storage";
 import {
   mobileComposerDraftIdentityKey,
   type MobileComposerDraftIdentity
@@ -48,6 +54,12 @@ import {
   type MobileComposerSelection,
   type MobileWorkspaceLineRange
 } from "./mobile-composer-document";
+import {
+  appendMobileComposerAttachments,
+  formatMobileAttachmentBytes,
+  removeMobileComposerAttachment,
+  type MobileComposerAttachment
+} from "./mobile-attachments";
 import {
   accessibleComposerHeight,
   buildComposerResizeGestureConfig,
@@ -102,7 +114,8 @@ const client = new MobileClient(
   Date.now,
   (identity) => mobileInteractionDrafts.clear(identity),
   mobileNewTaskDrafts,
-  mobileComposerDrafts
+  mobileComposerDrafts,
+  mobileAttachmentFiles
 );
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
 
@@ -756,6 +769,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [sessionMentionError, setSessionMentionError] = useState("");
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [mentionBusy, setMentionBusy] = useState(false);
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
   const mountedRef = useRef(true);
   const composerInputRef = useRef<TextInput>(null);
   const profileId = state.activeProfileId;
@@ -770,8 +784,11 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const targetAvailable = targets.some((target) => target.targetId === draft.targetId);
   const sessionMentionControls = client.newTaskSessionMentionControls(draft.targetId);
   const workspaceMentionControls = client.newTaskWorkspaceMentionControls(draft.targetId);
+  const attachmentControls = client.newTaskAttachmentControls(draft.targetId);
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
+  const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
+  const attachmentGenerationRef = useRef(0);
   const draftRef = useRef(draft);
   const selectionRef = useRef(composerSelection);
   draftRef.current = draft;
@@ -851,8 +868,18 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setMentionBusy(false);
     }
   }, [workspaceMentionControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const next = attachmentControls?.surfaceOwnerKey;
+    const changed = attachmentOwnerRef.current !== next;
+    attachmentOwnerRef.current = next;
+    if (changed || next === undefined) {
+      attachmentGenerationRef.current += 1;
+      setAttachmentBusy(false);
+    }
+  }, [attachmentControls?.surfaceOwnerKey]);
   const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
-  const referencesEditable = ownerReady && !state.busy && !mentionBusy && retained === undefined;
+  const referencesEditable = ownerReady && !state.busy && !mentionBusy && !attachmentBusy
+    && retained === undefined;
   const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
     const controls = sessionMentionControls;
     const targetId = draft.targetId;
@@ -925,6 +952,76 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setError(errorText(failure));
     }
   };
+  const addAttachments = async (): Promise<void> => {
+    const controls = attachmentControls;
+    const ownerProfileId = profileIdRef.current;
+    const targetId = draftRef.current.targetId;
+    if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable) {
+      setError("Attachment authority changed. Reopen the picker from the current project.");
+      return;
+    }
+    const generation = ++attachmentGenerationRef.current;
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setAttachmentBusy(true);
+    setError("");
+    let staged: readonly MobileComposerAttachment[] = [];
+    try {
+      staged = await mobileAttachmentFiles.pickAndStage(
+        ownerProfileId,
+        draftRef.current.input.attachments,
+        controls.policy,
+        randomUUID
+      );
+      if (staged.length === 0) return;
+      const latest = client.newTaskAttachmentControls(targetId);
+      if (!mountedRef.current || attachmentGenerationRef.current !== generation
+        || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+        || !latest || latest.profileId !== ownerProfileId
+        || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
+        || attachmentOwnerRef.current !== controls.surfaceOwnerKey) {
+        throw new Error("Attachment authority changed while the selected files were being staged.");
+      }
+      const input = {
+        ...draftRef.current.input,
+        attachments: appendMobileComposerAttachments(
+          draftRef.current.input.attachments,
+          staged,
+          latest.policy
+        )
+      };
+      replaceInput(input, selectionRef.current);
+      staged = [];
+      await mobileNewTaskDrafts.flush(identity);
+    } catch (failure) {
+      await Promise.all(staged.map((attachment) => mobileAttachmentFiles.remove(ownerProfileId, attachment)
+        .catch(() => undefined)));
+      if (mountedRef.current && attachmentGenerationRef.current === generation) setError(errorText(failure));
+    } finally {
+      if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+    }
+  };
+  const removeAttachment = async (attachmentId: string): Promise<void> => {
+    const ownerProfileId = profileIdRef.current;
+    if (!identity || !ownerProfileId || !referencesEditable) return;
+    const generation = ++attachmentGenerationRef.current;
+    setAttachmentBusy(true);
+    try {
+      const result = removeMobileComposerAttachment(draftRef.current.input.attachments, attachmentId);
+      replaceInput({ ...draftRef.current.input, attachments: result.attachments }, selectionRef.current);
+      await mobileNewTaskDrafts.flush(identity);
+      const retainedDraft = mobileNewTaskDrafts.readSync(identity);
+      if (retainedDraft?.input.attachments.some((attachment) => attachment.attachmentId === attachmentId)) {
+        throw new Error("The attachment removal could not be confirmed in the retained new-task draft.");
+      }
+      await mobileAttachmentFiles.remove(ownerProfileId, result.removed);
+    } catch (failure) {
+      if (mountedRef.current && attachmentGenerationRef.current === generation) setError(errorText(failure));
+    } finally {
+      if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+    }
+  };
   const submit = (): void => {
     if (!identity) return;
     setError("");
@@ -940,24 +1037,25 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     <Text style={[styles.section, { color: colors.muted }]}>Project</Text>
     {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No project currently supports text tasks. Create one on a connected Joko client, then refresh.</Text>}
     {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}
-      accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || retained !== undefined}
+      accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || attachmentBusy || retained !== undefined}
       onPress={() => {
         setSessionMentionsVisible(false);
         setWorkspaceMentionsVisible(false);
         setSessionMentionError("");
         patchDraft({ targetId: target.targetId });
       }}
-      style={[styles.row, !ownerReady || state.busy || retained !== undefined ? styles.disabled : undefined,
+      style={[styles.row, !ownerReady || state.busy || attachmentBusy || retained !== undefined ? styles.disabled : undefined,
         { backgroundColor: colors.surface, borderColor: draft.targetId === target.targetId ? colors.accent : colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{target.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{state.owner?.backends.find((backend) => backend.backendId === target.backendId)?.displayName}</Text>
     </Pressable>)}
     {draft.targetId && !targetAvailable && <Banner text="The retained project is no longer an active text target. Choose a current project; your name and first message were kept." colors={colors} />}
     <Field label="Task name" value={draft.name} onChange={(name) => patchDraft({ name })} placeholder="New task" colors={colors}
-      editable={ownerReady && !state.busy && retained === undefined} maxLength={256} />
+      editable={ownerReady && !state.busy && !attachmentBusy && retained === undefined} maxLength={256} />
     <View style={styles.field}>
       <Text style={[styles.caption, { color: colors.muted }]}>First message</Text>
-      {(sessionMentionControls || workspaceMentionControls || draft.input.mentions.length > 0) && <View style={styles.composerTools}>
+      {(sessionMentionControls || workspaceMentionControls || attachmentControls
+        || draft.input.mentions.length > 0 || draft.input.attachments.length > 0) && <View style={styles.composerTools}>
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
           disabled={!referencesEditable || draft.input.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
@@ -972,6 +1070,9 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
             setSessionMentionError("");
             setWorkspaceMentionsVisible(true);
           }} />}
+        {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"} colors={colors} compact
+          disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
+          onPress={() => void addAttachments()} />}
         {draft.input.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.input.mentions.map((mention) => <Pressable key={mention.mentionId}
@@ -987,6 +1088,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
           </Pressable>)}
         </ScrollView>}
       </View>}
+      <MobileAttachmentTray attachments={draft.input.attachments} colors={colors}
+        disabled={!referencesEditable} busy={attachmentBusy || state.busy} onRemove={removeAttachment} />
       <TextInput ref={composerInputRef} accessibilityLabel="First message" accessibilityHint="This structured message is sent after the task is created"
         multiline textAlignVertical="top" maxLength={1_000_000} editable={referencesEditable}
         placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={ownerReady ? draft.input.text : ""}
@@ -1011,7 +1114,9 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         : "The task exists. If delivery failed or is unknown, the exact structured input is retained in its composer without automatic replay."}</Text>
     </View>}
     <Action label={state.busy ? "Creating and sending…" : "Create and send"}
-      disabled={!ownerReady || !draft.targetId || !targetAvailable || !draft.input.text.trim() || state.busy || mentionBusy
+      disabled={!ownerReady || !draft.targetId || !targetAvailable
+        || (!draft.input.text.trim() && draft.input.attachments.length === 0)
+        || state.busy || mentionBusy || attachmentBusy
         || state.status !== "connected" || retained !== undefined || pendingCreate}
       colors={colors} onPress={submit} />
     {retained?.phase === "sending" && state.selectedId === retained.sessionId
@@ -1086,6 +1191,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [sessionMentionError, setSessionMentionError] = useState("");
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [catalogMentionsVisible, setCatalogMentionsVisible] = useState(false);
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -1094,6 +1200,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   });
   const queueEditRef = useRef(queueEdit);
   const composerInputRef = useRef<TextInput>(null);
+  const composerDraftRef = useRef(draft);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
   const keyboard = useMobileKeyboardState();
@@ -1181,6 +1288,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
   const catalogMentionControls = client.taskCatalogMentionControls();
   const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
+  const attachmentControls = client.taskAttachmentControls();
+  const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
+  const attachmentGenerationRef = useRef(0);
+  composerDraftRef.current = draft;
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -1279,6 +1390,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     catalogMentionOwnerRef.current = next;
     if (changed || next === undefined) setCatalogMentionsVisible(false);
   }, [catalogMentionControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const next = attachmentControls?.surfaceOwnerKey;
+    const changed = attachmentOwnerRef.current !== next;
+    attachmentOwnerRef.current = next;
+    if (changed || next === undefined) {
+      attachmentGenerationRef.current += 1;
+      setAttachmentBusy(false);
+    }
+  }, [attachmentControls?.surfaceOwnerKey]);
   useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
@@ -1395,8 +1515,81 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   };
   const saveNormalDraft = (value: MobileComposerDraft, identity = draftIdentityRef.current): void => {
     setDraft(value);
+    composerDraftRef.current = value;
     setComposerSelection({ start: value.text.length, end: value.text.length });
     if (identity) mobileComposerDrafts.save(identity, value);
+  };
+  const addAttachments = async (): Promise<void> => {
+    const controls = attachmentControls;
+    const identity = draftIdentityRef.current;
+    if (!controls || !identity || controls.profileId !== identity.profileId
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerOwnerReady
+      || queueEditRef.current || state.busy) {
+      setLocalError("Attachment authority changed. Reopen the picker from the current task.");
+      return;
+    }
+    const identityKey = mobileComposerDraftIdentityKey(identity);
+    const generation = ++attachmentGenerationRef.current;
+    setRuntimeControlsVisible(false);
+    setAttachmentBusy(true);
+    setLocalError("");
+    let staged: readonly MobileComposerAttachment[] = [];
+    try {
+      staged = await mobileAttachmentFiles.pickAndStage(
+        identity.profileId,
+        composerDraftRef.current.attachments,
+        controls.policy,
+        randomUUID
+      );
+      if (staged.length === 0) return;
+      const latestIdentity = draftIdentityRef.current;
+      const latest = client.taskAttachmentControls();
+      if (!taskMountedRef.current || attachmentGenerationRef.current !== generation
+        || !latestIdentity || mobileComposerDraftIdentityKey(latestIdentity) !== identityKey
+        || !latest || latest.profileId !== identity.profileId
+        || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
+        || attachmentOwnerRef.current !== controls.surfaceOwnerKey || queueEditRef.current) {
+        throw new Error("Attachment authority changed while the selected files were being staged.");
+      }
+      const next = {
+        ...composerDraftRef.current,
+        attachments: appendMobileComposerAttachments(
+          composerDraftRef.current.attachments,
+          staged,
+          latest.policy
+        )
+      };
+      saveNormalDraft(next, identity);
+      staged = [];
+      await mobileComposerDrafts.flush(identity);
+    } catch (error) {
+      await Promise.all(staged.map((attachment) => mobileAttachmentFiles.remove(identity.profileId, attachment)
+        .catch(() => undefined)));
+      if (taskMountedRef.current && attachmentGenerationRef.current === generation) setLocalError(errorText(error));
+    } finally {
+      if (taskMountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+    }
+  };
+  const removeAttachment = async (attachmentId: string): Promise<void> => {
+    const identity = draftIdentityRef.current;
+    if (!identity || !composerOwnerReady || queueEditRef.current || state.busy || attachmentBusy) return;
+    const generation = ++attachmentGenerationRef.current;
+    setAttachmentBusy(true);
+    try {
+      const result = removeMobileComposerAttachment(composerDraftRef.current.attachments, attachmentId);
+      saveNormalDraft({ ...composerDraftRef.current, attachments: result.attachments }, identity);
+      await mobileComposerDrafts.flush(identity);
+      if (mobileComposerDrafts.readSync(identity)?.attachments.some(
+        (attachment) => attachment.attachmentId === attachmentId
+      )) {
+        throw new Error("The attachment removal could not be confirmed in the retained task draft.");
+      }
+      await mobileAttachmentFiles.remove(identity.profileId, result.removed);
+    } catch (error) {
+      if (taskMountedRef.current && attachmentGenerationRef.current === generation) setLocalError(errorText(error));
+    } finally {
+      if (taskMountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+    }
   };
   const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
     const controls = sessionMentionControls;
@@ -1597,7 +1790,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     try {
       if (!active) {
         const identity = draftIdentityRef.current;
-        if (!await client.send(draft)) return;
+        if (!await client.send(composerDraftRef.current)) {
+          if (identity && draftIdentityRef.current
+            && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity)) {
+            const retainedDraft = mobileComposerDrafts.readSync(identity);
+            if (retainedDraft) saveNormalDraft(retainedDraft, identity);
+          }
+          return;
+        }
         if (!identity) {
           setDraft(emptyMobileComposerDraft());
           setComposerSelection({ start: 0, end: 0 });
@@ -1618,7 +1818,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       setDraft(active.stashedDraft);
       setComposerSelection({ start: active.stashedDraft.text.length, end: active.stashedDraft.text.length });
     } catch (error) {
-      if (taskMountedRef.current) setLocalError(errorText(error));
+      if (taskMountedRef.current) {
+        const identity = draftIdentityRef.current;
+        if (identity && !queueEditRef.current) {
+          const retainedDraft = mobileComposerDrafts.readSync(identity);
+          if (retainedDraft) saveNormalDraft(retainedDraft, identity);
+        }
+        setLocalError(errorText(error));
+      }
     }
   };
   const mutateQueue = (action: () => Promise<unknown>): void => {
@@ -1654,7 +1861,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
           disabled={contextControls === undefined || state.busy || interactions.length > 0} />
         <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
-          disabled={!runtimeControlsAvailable || state.busy || interactions.length > 0} />
+          disabled={!runtimeControlsAvailable || state.busy || attachmentBusy || interactions.length > 0} />
         {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
       </View>
@@ -1762,7 +1969,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         style={styles.composerResizeHandle} {...composerResizeResponder.panHandlers}>
         <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
       </View>
-      {!queueEdit && (sessionMentionControls || workspaceMentionControls || catalogMentionControls || draft.mentions.length > 0) && <View style={styles.composerTools}>
+      {!queueEdit && (sessionMentionControls || workspaceMentionControls || catalogMentionControls
+        || attachmentControls || draft.mentions.length > 0 || draft.attachments.length > 0) && <View style={styles.composerTools}>
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
           disabled={state.busy || !composerOwnerReady || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
@@ -1799,6 +2007,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             setWorkspaceMentionsVisible(false);
             setCatalogMentionsVisible(true);
           }} />}
+        {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"}
+          colors={colors} compact
+          disabled={state.busy || attachmentBusy || !composerOwnerReady
+            || draft.attachments.length >= attachmentControls.policy.maximumItems}
+          onPress={() => void addAttachments()} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.mentions.map((mention) => <Pressable key={mention.mentionId}
@@ -1812,6 +2025,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           </Pressable>)}
         </ScrollView>}
       </View>}
+      {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
+        disabled={state.busy || attachmentBusy || !composerOwnerReady}
+        busy={state.busy || attachmentBusy} onRemove={removeAttachment} />}
       <View style={styles.composerRow}>
         <TextInput ref={composerInputRef} accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection} maxLength={1_000_000}
@@ -1824,6 +2040,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
               }
               const change = reconcileMobileComposerText(draft, value);
               setDraft(change.draft);
+              composerDraftRef.current = change.draft;
               setComposerSelection(change.selection);
               if (draftIdentityRef.current) {
                 mobileComposerDrafts.save(draftIdentityRef.current, change.draft);
@@ -1837,11 +2054,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             Math.ceil(event.nativeEvent.contentSize.height)
           ))}
           scrollEnabled={composerHeight.scrollEnabled}
-          editable={!state.busy && composerOwnerReady} placeholder={!composerOwnerReady ? "Restoring saved draft…" : queueEdit ? "Edit queued input…" : "Message Joko…"}
+          editable={!state.busy && !attachmentBusy && composerOwnerReady} placeholder={!composerOwnerReady ? "Restoring saved draft…" : queueEdit ? "Edit queued input…" : "Message Joko…"}
           placeholderTextColor={colors.muted}
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
         <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
-          disabled={!composerOwnerReady || !draft.text.trim() || (!queueEdit && unknown) || state.busy || state.status !== "connected"}
+          disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
+            || (!queueEdit && unknown) || attachmentBusy || state.busy || state.status !== "connected"}
           onPress={() => void submitComposer()} />
       </View>
     </View>}
@@ -1864,7 +2082,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       }}
       onError={setLocalError} />
     <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined}
-      controls={runtimeControls} busy={state.busy || runtimeControlPending} colors={colors}
+      controls={runtimeControls} busy={state.busy || runtimeControlPending || attachmentBusy} colors={colors}
       onClose={() => setRuntimeControlsVisible(false)}
       onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}
       onSetPermission={(authorityKey, mode) => client.setTaskPermission(authorityKey, mode)}
@@ -2207,6 +2425,34 @@ function ModeTab({ label, selected, onPress, colors }: {
   </Pressable>;
 }
 
+function MobileAttachmentTray({ attachments, colors, disabled, busy, onRemove }: {
+  attachments: readonly MobileComposerAttachment[];
+  colors: Colors;
+  disabled: boolean;
+  busy: boolean;
+  onRemove: (attachmentId: string) => void;
+}) {
+  if (attachments.length === 0) return null;
+  return <View accessibilityLabel="Attachments" style={styles.attachmentTray}>
+    {attachments.map((attachment) => <View key={attachment.attachmentId}
+      style={[styles.attachmentChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
+      <View style={styles.fill}>
+        <Text style={[styles.attachmentName, { color: colors.ink }]} numberOfLines={1}>{attachment.fileName}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
+          {attachment.kind === "image" ? "Image" : "File"} · {formatMobileAttachmentBytes(attachment.byteSize)}
+          {attachment.state === "uploaded" ? " · Uploaded" : " · Ready"}
+        </Text>
+      </View>
+      {busy && attachment.state === "local" && <ActivityIndicator color={colors.accent} size="small" />}
+      <Pressable accessibilityRole="button" accessibilityLabel={`Remove attachment ${attachment.fileName}`}
+        accessibilityHint="Removes this exact attachment from the draft" disabled={disabled}
+        onPress={() => onRemove(attachment.attachmentId)} style={[styles.attachmentRemove, disabled && styles.disabled]}>
+        <Text style={[styles.attachmentRemoveText, { color: colors.muted }]}>×</Text>
+      </Pressable>
+    </View>)}
+  </View>;
+}
+
 function Action({ label, onPress, colors, disabled, compact, danger }: {
   label: string; onPress: () => void; colors: Colors; disabled?: boolean; compact?: boolean; danger?: boolean;
 }) {
@@ -2428,6 +2674,13 @@ const styles = StyleSheet.create({
   mentionChips: { alignItems: "center", gap: 6, paddingRight: 8 },
   mentionChip: { minHeight: 44, maxWidth: 220, borderWidth: 1, borderRadius: 18, paddingHorizontal: 12, justifyContent: "center" },
   mentionChipText: { fontSize: 13, lineHeight: 18, fontWeight: "700" },
+  attachmentTray: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingBottom: 8 },
+  attachmentChip: { minHeight: 54, minWidth: 190, maxWidth: "100%", flexGrow: 1, flexBasis: 220,
+    borderWidth: 1, borderRadius: 12, paddingLeft: 12, paddingRight: 6, paddingVertical: 7,
+    flexDirection: "row", alignItems: "center", gap: 8 },
+  attachmentName: { fontSize: 13, lineHeight: 18, fontWeight: "700" },
+  attachmentRemove: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
+  attachmentRemoveText: { fontSize: 24, lineHeight: 26, fontWeight: "500" },
   composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 10 },
   composerInput: { flex: 1, minHeight: 44, fontSize: 16, lineHeight: 22, paddingVertical: 8 },
   sheetRoot: { flex: 1, justifyContent: "flex-end" },

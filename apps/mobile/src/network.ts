@@ -1,14 +1,14 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
-  ArtifactKind, ArtifactService, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
+  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
   ResourceKind, SessionService, TargetService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
-  type NativeSessionTree, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
+  type NativeSessionTree, type PendingBlobUpload, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
   type WorkspaceEntry, type WorkspaceFileChange,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
@@ -59,6 +59,7 @@ export interface MobileNetwork {
   listSessionResources(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly SessionResource[]>;
   listArtifactReferenceCatalog(credential: PairedCredential, sessionId: string, generation: bigint, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
+  uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   prepareTarget(credential: PairedCredential, target: Target, signal?: AbortSignal): Promise<void>;
   submit(credential: PairedCredential, operationId: string, mutation: OperationMutation, signal?: AbortSignal): Promise<Operation>;
   waitOperation(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation>;
@@ -92,6 +93,21 @@ export interface VerifiedBlobDownload {
   readonly bytes: Uint8Array;
   readonly mediaType: string;
 }
+
+export interface MobileBlobUploadSource {
+  readonly uri: string;
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+}
+
+export type MobileNativeBlobUploader = (
+  endpoint: string,
+  sourceUri: string,
+  headers: Readonly<Record<string, string>>,
+  signal?: AbortSignal
+) => Promise<{ readonly status: number; readonly body?: string }>;
 
 interface SessionMessageSearchPage {
   readonly matches: readonly SessionMessageSearchMatch[];
@@ -378,6 +394,49 @@ export async function downloadVerifiedBlob(
   return { bytes, mediaType: normalizeMediaType(blob.mediaType) };
 }
 
+export async function uploadVerifiedBlob(
+  credential: Pick<PairedCredential, "origin" | "authKey">,
+  source: MobileBlobUploadSource,
+  pending: PendingBlobUpload | undefined,
+  complete: (uploadId: string, signal?: AbortSignal) => Promise<BlobRef | undefined>,
+  signal?: AbortSignal,
+  uploader: MobileNativeBlobUploader = uploadNativeBlobFile
+): Promise<BlobRef> {
+  signal?.throwIfAborted();
+  const exact = assertBlobUploadSource(source);
+  const ticket = pending?.ticket;
+  if (!validBlobTransferIdentity(pending?.uploadId) || !validBlobTransferIdentity(ticket?.ticketId)
+    || ticket.blobId !== ""
+    || ticket.direction !== TransferDirection.UPLOAD
+    || pending.expectedSha256Hex !== exact.sha256Hex
+    || pending.expectedByteSize !== BigInt(exact.byteSize)
+    || ticket.maximumBytes !== BigInt(exact.byteSize)
+    || normalizeMediaType(ticket.requiredMediaType) !== exact.mediaType) {
+    throw new Error("The Joko node returned a mismatched Blob upload ticket.");
+  }
+  if (ticket.expiresAt && Number(ticket.expiresAt.seconds) * 1_000 <= Date.now()) {
+    throw new Error("The Joko node returned an expired Blob upload ticket.");
+  }
+  const endpoint = authorizedBlobEndpoint(credential.origin, ticket.relativeEndpoint);
+  const response = await uploader(endpoint, exact.uri, {
+    authorization: `Bearer ${credential.authKey}`,
+    "content-type": "application/octet-stream"
+  }, signal);
+  signal?.throwIfAborted();
+  if (!Number.isSafeInteger(response.status) || response.status < 200 || response.status >= 300) {
+    throw new Error(`Attachment upload failed (${response.status || "unknown"}).`);
+  }
+  const blob = await complete(pending.uploadId, signal);
+  signal?.throwIfAborted();
+  if (!blob?.blobId || blob.fileName !== exact.fileName
+    || normalizeMediaType(blob.mediaType) !== exact.mediaType
+    || blob.byteSize !== BigInt(exact.byteSize) || blob.sha256Hex !== exact.sha256Hex
+    || blob.disposition !== BlobDisposition.ATTACHMENT) {
+    throw new Error("The Joko node committed a mismatched attachment Blob.");
+  }
+  return blob;
+}
+
 function authorizedBlobEndpoint(origin: string, relativeEndpoint: string): string {
   if (!relativeEndpoint.startsWith("/") || relativeEndpoint.startsWith("//") || relativeEndpoint.includes("\\")
     || relativeEndpoint.includes("?") || relativeEndpoint.includes("#")) {
@@ -396,6 +455,41 @@ function assertDownloadBlob(blob: BlobRef): void {
     || blob.byteSize < 0n || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
     throw new Error("The Blob is missing valid bounded download metadata.");
   }
+}
+
+function assertBlobUploadSource(source: MobileBlobUploadSource): MobileBlobUploadSource & { readonly mediaType: string } {
+  const mediaType = normalizeMediaType(source.mediaType);
+  if (!source || typeof source !== "object" || typeof source.uri !== "string" || !source.uri
+    || typeof source.fileName !== "string" || !source.fileName.trim() || source.fileName.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(source.fileName) || !mediaType
+    || !Number.isSafeInteger(source.byteSize) || source.byteSize <= 0
+    || !/^[0-9a-f]{64}$/u.test(source.sha256Hex)) {
+    throw new Error("The staged attachment upload metadata is invalid.");
+  }
+  return { ...source, mediaType };
+}
+
+function validBlobTransferIdentity(value: string | undefined): value is string {
+  return value !== undefined && value.length > 0 && value.length <= 512 && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+async function uploadNativeBlobFile(
+  endpoint: string,
+  sourceUri: string,
+  headers: Readonly<Record<string, string>>,
+  signal?: AbortSignal
+): Promise<{ readonly status: number; readonly body?: string }> {
+  const { File, UploadType } = await import("expo-file-system");
+  signal?.throwIfAborted();
+  const result = await new File(sourceUri).upload(endpoint, {
+    httpMethod: "PUT",
+    uploadType: UploadType.BINARY_CONTENT,
+    headers: { ...headers },
+    sessionType: "foreground",
+    signal
+  });
+  return { status: result.status, body: result.body };
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -760,6 +854,27 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
     return downloadVerifiedBlob(credential, blob, response.ticket, signal);
+  },
+  async uploadBlob(credential, source, signal) {
+    const exact = assertBlobUploadSource(source);
+    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    const response = await client.beginBlobUpload({
+      fileName: exact.fileName,
+      mediaType: exact.mediaType,
+      byteSize: BigInt(exact.byteSize),
+      sha256Hex: exact.sha256Hex,
+      disposition: BlobDisposition.ATTACHMENT
+    }, options(signal));
+    return uploadVerifiedBlob(
+      credential,
+      exact,
+      response.upload,
+      async (uploadId, completeSignal) => (await client.completeBlobUpload(
+        { uploadId },
+        options(completeSignal)
+      )).blob,
+      signal
+    );
   },
   async *streamOwner(credential, after, signal) {
     const client = createClient(EventService, transport(credential.origin, credential.authKey));

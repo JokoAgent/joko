@@ -10,7 +10,10 @@ import {
   DeviceSchema,
   EntityVersionSchema,
   ModelDescriptorSchema,
+  ModelInputModality,
+  ModelKeySchema,
   ModelOutputModality,
+  ModelSelectionSchema,
   PermissionMode,
   ProviderDescriptorSchema,
   ProviderConfigurationSchema,
@@ -32,7 +35,9 @@ import {
   defaultMobileModelSelection,
   filterMobileModelRoutes,
   formatMobileTokenLimit,
-  resolveMobileRuntimeControls
+  resolveMobileNewTaskDefaultModelAuthority,
+  resolveMobileRuntimeControls,
+  resolveMobileSessionModelAuthority
 } from "./mobile-runtime-controls";
 
 const identity = {
@@ -180,6 +185,47 @@ describe("mobile runtime controls", () => {
     expect(() => assertMobileModelSelection(noFast, {
       providerId: "beta", modelId: "b", effortId: "high", fastMode: true
     })).toThrow(/Fast Mode/u);
+  });
+
+  it("trusts image input only from one exact current or frozen default model route", () => {
+    const vision = model("alpha", "a", "Alpha Vision", {
+      inputs: [ModelInputModality.TEXT, ModelInputModality.IMAGE]
+    });
+    const { owner, detail } = snapshots({ models: [vision] });
+    const configured = create(SnapshotSchema, {
+      ...owner,
+      settings: {
+        ...owner.settings!,
+        backends: [{
+          ...owner.settings!.backends[0]!,
+          defaultModel: create(ModelSelectionSchema, {
+            model: create(ModelKeySchema, { providerId: "alpha", modelId: "a" }),
+            effortId: "low",
+            fastMode: false
+          })
+        }]
+      }
+    });
+
+    expect(resolveMobileSessionModelAuthority(configured, detail.sessions[0])).toMatchObject({
+      selection: { providerId: "alpha", modelId: "a", effortId: "low", fastMode: false },
+      supportsImages: true
+    });
+    expect(resolveMobileNewTaskDefaultModelAuthority(configured, "backend")).toMatchObject({
+      selection: { providerId: "alpha", modelId: "a", effortId: "low", fastMode: false },
+      supportsImages: true
+    });
+
+    const duplicate = create(SnapshotSchema, { ...configured, models: [vision, vision] });
+    expect(resolveMobileSessionModelAuthority(duplicate, detail.sessions[0])).toBeUndefined();
+    expect(resolveMobileNewTaskDefaultModelAuthority(duplicate, "backend")).toBeUndefined();
+
+    const textOnly = create(SnapshotSchema, {
+      ...configured,
+      models: [model("alpha", "a", "Alpha Text")]
+    });
+    expect(resolveMobileSessionModelAuthority(textOnly, detail.sessions[0])?.supportsImages).toBe(false);
+    expect(resolveMobileNewTaskDefaultModelAuthority(textOnly, "backend")?.supportsImages).toBe(false);
   });
 });
 
@@ -334,6 +380,7 @@ function model(
   input: {
     readonly fast?: boolean;
     readonly context?: bigint;
+    readonly inputs?: readonly ModelInputModality[];
     readonly outputs?: readonly ModelOutputModality[];
     readonly efforts?: readonly { readonly effortId: string; readonly displayName: string;
       readonly order: number; readonly defaultLevel?: boolean }[];
@@ -346,6 +393,7 @@ function model(
     family: "family",
     contextWindowTokens: input.context ?? 64_000n,
     maximumOutputTokens: 8_000n,
+    inputModalities: [...(input.inputs ?? [ModelInputModality.TEXT])],
     outputModalities: [...(input.outputs ?? [ModelOutputModality.TEXT])],
     effortLevels: [...(input.efforts ?? [
       { effortId: "low", displayName: "Low", order: 0, defaultLevel: true },

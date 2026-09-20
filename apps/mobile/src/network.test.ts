@@ -1,12 +1,15 @@
 import { create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
   ArtifactKind,
   ArtifactSchema,
+  BlobDisposition,
   BlobRefSchema,
   BlobTransferTicketSchema,
   FileKind,
   FilePreviewSchema,
   FileRevisionSchema,
+  PendingBlobUploadSchema,
   ResourceKind,
   SessionMessageSearchMatchSchema,
   SessionResourceSchema,
@@ -24,7 +27,8 @@ import {
   collectSessionMessageSearchPages,
   collectWorkspaceDirectoryPages,
   collectWorkspaceSearchPages,
-  downloadVerifiedBlob
+  downloadVerifiedBlob,
+  uploadVerifiedBlob
 } from "./network";
 
 function matches(count: number, offset = 0) {
@@ -295,5 +299,135 @@ describe("authenticated mobile Blob downloads", () => {
       create(BlobTransferTicketSchema, { ...ticket, maximumBytes: oversized.byteSize }), undefined,
       fetcher as unknown as typeof fetch, async () => hash)).rejects.toThrow(/bounded download metadata/);
     expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
+describe("authenticated mobile Blob uploads", () => {
+  const hash = "c".repeat(64);
+  const source = {
+    uri: "file:///durable/profile/attachment-one",
+    fileName: "proof.pdf",
+    mediaType: "application/pdf",
+    byteSize: 4,
+    sha256Hex: hash
+  };
+  const pending = create(PendingBlobUploadSchema, {
+    uploadId: "upload-one",
+    expectedSha256Hex: hash,
+    expectedByteSize: 4n,
+    ticket: create(BlobTransferTicketSchema, {
+      ticketId: "ticket-one",
+      blobId: "",
+      direction: TransferDirection.UPLOAD,
+      relativeEndpoint: "/v1/blob-uploads/ticket-one",
+      maximumBytes: 4n,
+      requiredMediaType: "application/pdf",
+      expiresAt: { seconds: 4_102_444_800n }
+    })
+  });
+  const committed = create(BlobRefSchema, {
+    blobId: "blob-one",
+    fileName: source.fileName,
+    mediaType: source.mediaType,
+    byteSize: 4n,
+    sha256Hex: hash,
+    disposition: BlobDisposition.ATTACHMENT
+  });
+
+  it("uses the authenticated root-relative ticket, then completes the exact upload identity", async () => {
+    const calls: string[] = [];
+    const uploader = vi.fn(async () => { calls.push("put"); return { status: 204 }; });
+    const complete = vi.fn(async () => { calls.push("complete"); return committed; });
+
+    await expect(uploadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" },
+      source,
+      pending,
+      complete,
+      undefined,
+      uploader
+    )).resolves.toEqual(committed);
+
+    expect(calls).toEqual(["put", "complete"]);
+    expect(uploader).toHaveBeenCalledWith(
+      "https://node.example/v1/blob-uploads/ticket-one",
+      source.uri,
+      { authorization: "Bearer secret", "content-type": "application/octet-stream" },
+      undefined
+    );
+    expect(complete).toHaveBeenCalledWith("upload-one", undefined);
+  });
+
+  it("fails closed before PUT for mismatched ticket metadata, expiry, and unsafe endpoints", async () => {
+    const uploader = vi.fn(async () => ({ status: 204 }));
+    const complete = vi.fn(async () => committed);
+    const verify = async (candidate: typeof pending, pattern: RegExp) => {
+      await expect(uploadVerifiedBlob(
+        { origin: "https://node.example", authKey: "secret" }, source, candidate, complete, undefined, uploader
+      )).rejects.toThrow(pattern);
+    };
+
+    await verify(create(PendingBlobUploadSchema, { ...pending, expectedSha256Hex: "d".repeat(64) }), /mismatched/u);
+    await verify(create(PendingBlobUploadSchema, { ...pending, uploadId: "upload\nwrong" }), /mismatched/u);
+    await verify(create(PendingBlobUploadSchema, {
+      ...pending,
+      ticket: create(BlobTransferTicketSchema, { ...pending.ticket!, ticketId: " ticket-one" })
+    }), /mismatched/u);
+    await verify(create(PendingBlobUploadSchema, {
+      ...pending,
+      ticket: create(BlobTransferTicketSchema, { ...pending.ticket!, maximumBytes: 5n })
+    }), /mismatched/u);
+    await verify(create(PendingBlobUploadSchema, {
+      ...pending,
+      ticket: create(BlobTransferTicketSchema, { ...pending.ticket!, direction: TransferDirection.DOWNLOAD })
+    }), /mismatched/u);
+    await verify(create(PendingBlobUploadSchema, {
+      ...pending,
+      ticket: create(BlobTransferTicketSchema, { ...pending.ticket!, blobId: "existing-blob" })
+    }), /mismatched/u);
+    await verify(create(PendingBlobUploadSchema, {
+      ...pending,
+      ticket: create(BlobTransferTicketSchema, { ...pending.ticket!, relativeEndpoint: "//evil.example/upload" })
+    }), /non-root-relative/u);
+    await verify(create(PendingBlobUploadSchema, {
+      ...pending,
+      ticket: create(BlobTransferTicketSchema, { ...pending.ticket!, expiresAt: create(TimestampSchema, { seconds: 1n }) })
+    }), /expired/u);
+    expect(uploader).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it("never completes a failed PUT and rejects a mismatched committed Blob", async () => {
+    const complete = vi.fn(async () => committed);
+    await expect(uploadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" }, source, pending, complete, undefined,
+      vi.fn(async () => ({ status: 413 }))
+    )).rejects.toThrow(/upload failed \(413\)/u);
+    expect(complete).not.toHaveBeenCalled();
+
+    const mismatched = create(BlobRefSchema, { ...committed, sha256Hex: "d".repeat(64) });
+    await expect(uploadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" }, source, pending,
+      vi.fn(async () => mismatched), undefined, vi.fn(async () => ({ status: 204 }))
+    )).rejects.toThrow(/committed a mismatched attachment Blob/u);
+  });
+
+  it("honors cancellation before PUT and between PUT and completion", async () => {
+    const before = new AbortController();
+    before.abort();
+    const uploader = vi.fn(async () => ({ status: 204 }));
+    await expect(uploadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" }, source, pending,
+      vi.fn(async () => committed), before.signal, uploader
+    )).rejects.toMatchObject({ name: "AbortError" });
+    expect(uploader).not.toHaveBeenCalled();
+
+    const during = new AbortController();
+    const complete = vi.fn(async () => committed);
+    await expect(uploadVerifiedBlob(
+      { origin: "https://node.example", authKey: "secret" }, source, pending, complete, during.signal,
+      vi.fn(async () => { during.abort(); return { status: 204 }; })
+    )).rejects.toMatchObject({ name: "AbortError" });
+    expect(complete).not.toHaveBeenCalled();
   });
 });

@@ -1,6 +1,9 @@
 import { create } from "@bufbuild/protobuf";
 import {
   ArtifactMentionSchema,
+  BlobDisposition,
+  BlobRefSchema,
+  ImageRefSchema,
   InputContentSchema,
   InputMentionRangeSchema,
   InputPartSchema,
@@ -10,6 +13,13 @@ import {
   WorkspaceMentionSchema,
   type InputContent
 } from "@joko/contracts";
+import {
+  cloneMobileComposerAttachment,
+  mobileComposerAttachmentsEqual,
+  normalizeMobileComposerAttachment,
+  type MobileComposerAttachment,
+  type MobileUploadedComposerAttachment
+} from "./mobile-attachments";
 import { canonicalWorkspacePath } from "./workspace-files";
 
 export interface MobileComposerSessionMention {
@@ -68,6 +78,7 @@ export type MobileComposerMention = MobileComposerSessionMention
 export interface MobileComposerDraft {
   readonly text: string;
   readonly mentions: readonly MobileComposerMention[];
+  readonly attachments: readonly MobileComposerAttachment[];
 }
 
 export interface MobileComposerSelection {
@@ -87,15 +98,16 @@ const maximumLineNumber = 0xffff_ffff;
 const maximumUint64 = 18_446_744_073_709_551_615n;
 
 export function emptyMobileComposerDraft(): MobileComposerDraft {
-  return { text: "", mentions: [] };
+  return { text: "", mentions: [], attachments: [] };
 }
 
 export function plainTextMobileComposerDraft(text: string): MobileComposerDraft {
-  return normalizeMobileComposerDraft({ text, mentions: [] });
+  return normalizeMobileComposerDraft({ text, mentions: [], attachments: [] });
 }
 
 export function normalizeMobileComposerDraft(value: MobileComposerDraft): MobileComposerDraft {
-  if (!value || typeof value !== "object" || typeof value.text !== "string" || !Array.isArray(value.mentions)) {
+  if (!value || typeof value !== "object" || typeof value.text !== "string"
+    || !Array.isArray(value.mentions) || !Array.isArray(value.attachments)) {
     throw new Error("The local Joko structured task draft is invalid.");
   }
   if (value.text.length > maximumDraftCharacters) {
@@ -137,7 +149,16 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
       end: candidate.end
     };
   });
-  return { text: value.text, mentions };
+  const attachmentIds = new Set<string>();
+  const attachments = value.attachments.map((candidate) => {
+    const attachment = normalizeMobileComposerAttachment(candidate);
+    if (attachmentIds.has(attachment.attachmentId)) {
+      throw new Error("The local Joko attachment identity is duplicated.");
+    }
+    attachmentIds.add(attachment.attachmentId);
+    return attachment;
+  });
+  return { text: value.text, mentions, attachments };
 }
 
 export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComposerDraft {
@@ -146,7 +167,8 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
     text: exact.text,
     mentions: exact.mentions.map((mention) => mention.kind === "workspace" && mention.lineRange !== undefined
       ? { ...mention, lineRange: { ...mention.lineRange } }
-      : { ...mention })
+      : { ...mention }),
+    attachments: exact.attachments.map(cloneMobileComposerAttachment)
   };
 }
 
@@ -154,6 +176,11 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
   const first = normalizeMobileComposerDraft(left);
   const second = normalizeMobileComposerDraft(right);
   return first.text === second.text && first.mentions.length === second.mentions.length
+    && first.attachments.length === second.attachments.length
+    && first.attachments.every((attachment, index) => {
+      const candidate = second.attachments[index];
+      return candidate !== undefined && mobileComposerAttachmentsEqual(attachment, candidate);
+    })
     && first.mentions.every((mention, index) => {
       const candidate = second.mentions[index];
       return candidate !== undefined && mention.kind === candidate.kind && mention.mentionId === candidate.mentionId
@@ -300,7 +327,8 @@ export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addi
   const separator = current.text.length > 0 ? "\n\n" : "";
   return normalizeMobileComposerDraft({
     text: `${current.text}${separator}${addition}`,
-    mentions: current.mentions
+    mentions: current.mentions,
+    attachments: current.attachments
   });
 }
 
@@ -310,8 +338,9 @@ export function prependMobileComposerDraft(
 ): MobileComposerDraft {
   const source = normalizeMobileComposerDraft(prefix);
   const existing = normalizeMobileComposerDraft(current);
-  if (!source.text) return cloneMobileComposerDraft(existing);
-  if (!existing.text) return cloneMobileComposerDraft(source);
+  const attachments = mergeRecoveredAttachments(source.attachments, existing.attachments);
+  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), attachments });
+  if (!existing.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(source), attachments });
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   const usedMentionIds = new Set(source.mentions.map((mention) => mention.mentionId));
@@ -324,7 +353,7 @@ export function prependMobileComposerDraft(
       end: mention.end + offset
     }))
   ];
-  return normalizeMobileComposerDraft({ text: `${source.text}${separator}${existing.text}`, mentions });
+  return normalizeMobileComposerDraft({ text: `${source.text}${separator}${existing.text}`, mentions, attachments });
 }
 
 export function mobileComposerDraftWithoutPrefix(
@@ -333,19 +362,37 @@ export function mobileComposerDraftWithoutPrefix(
 ): MobileComposerDraft | undefined {
   const source = normalizeMobileComposerDraft(prefix);
   const existing = normalizeMobileComposerDraft(current);
-  if (!source.text) return cloneMobileComposerDraft(existing);
-  if (mobileComposerDraftsEqual(source, existing)) return emptyMobileComposerDraft();
+  if (existing.attachments.length < source.attachments.length
+    || !source.attachments.every((attachment, index) => mobileComposerAttachmentsEqual(
+      attachment,
+      existing.attachments[index]!
+    ))) return undefined;
+  const remainingAttachments = existing.attachments.slice(source.attachments.length).map(cloneMobileComposerAttachment);
+  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), attachments: remainingAttachments });
+  if (existing.text === source.text) {
+    if (!mobileComposerDraftsEqual(source, {
+      text: existing.text,
+      mentions: existing.mentions,
+      attachments: existing.attachments.slice(0, source.attachments.length)
+    })) return undefined;
+    return normalizeMobileComposerDraft({ text: "", mentions: [], attachments: remainingAttachments });
+  }
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   if (!existing.text.startsWith(`${source.text}${separator}`)) return undefined;
   const sourceMentions = existing.mentions.filter((mention) => mention.end <= source.text.length);
-  if (!mobileComposerDraftsEqual(source, { text: source.text, mentions: sourceMentions })) return undefined;
+  if (!mobileComposerDraftsEqual(source, {
+    text: source.text,
+    mentions: sourceMentions,
+    attachments: existing.attachments.slice(0, source.attachments.length)
+  })) return undefined;
   if (existing.mentions.some((mention) => mention.start < offset && mention.end > source.text.length)) return undefined;
   return normalizeMobileComposerDraft({
     text: existing.text.slice(offset),
     mentions: existing.mentions
       .filter((mention) => mention.start >= offset)
-      .map((mention) => ({ ...cloneMention(mention), start: mention.start - offset, end: mention.end - offset }))
+      .map((mention) => ({ ...cloneMention(mention), start: mention.start - offset, end: mention.end - offset })),
+    attachments: remainingAttachments
   });
 }
 
@@ -373,10 +420,18 @@ export function removeMobileComposerMention(
 
 export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   const exact = normalizeMobileComposerDraft(draft);
-  if (!exact.text.trim()) throw new Error("Enter a task message before sending.");
+  if (!exact.text.trim() && exact.attachments.length === 0) {
+    throw new Error("Enter a task message or attach a file before sending.");
+  }
+  if (exact.attachments.some((attachment) => attachment.state !== "uploaded")) {
+    throw new Error("Finish uploading every attachment before sending.");
+  }
   return create(InputContentSchema, {
     parts: [
-      create(InputPartSchema, { content: { case: "text", value: exact.text } }),
+      ...(exact.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: exact.text } })]),
+      ...exact.attachments.map((attachment) => mobileComposerAttachmentInputPart(
+        attachment as MobileUploadedComposerAttachment
+      )),
       ...exact.mentions.map(mobileComposerInputPart)
     ],
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
@@ -443,7 +498,7 @@ function replaceMobileComposerRange(
     if (mention.start >= range.end) return [{ ...mention, start: mention.start + delta, end: mention.end + delta }];
     return [];
   });
-  const next = normalizeMobileComposerDraft({ text, mentions });
+  const next = normalizeMobileComposerDraft({ text, mentions, attachments: exact.attachments });
   const caret = range.start + replacement.length;
   return { draft: next, selection: { start: caret, end: caret } };
 }
@@ -461,7 +516,11 @@ function insertMobileComposerMention(
   const occurrence = { ...mention, start, end: start + token.length };
   const mentions = [...result.draft.mentions, occurrence]
     .sort((left, right) => left.start - right.start || left.end - right.end);
-  const next = normalizeMobileComposerDraft({ text: result.draft.text, mentions });
+  const next = normalizeMobileComposerDraft({
+    text: result.draft.text,
+    mentions,
+    attachments: result.draft.attachments
+  });
   const caret = range.start + prefix.length + token.length + suffix.length;
   return { draft: next, selection: { start: caret, end: caret } };
 }
@@ -481,6 +540,27 @@ function cloneMention(mention: MobileComposerMention): MobileComposerMention {
   return mention.kind === "workspace" && mention.lineRange !== undefined
     ? { ...mention, lineRange: { ...mention.lineRange } }
     : { ...mention };
+}
+
+function mergeRecoveredAttachments(
+  preferred: readonly MobileComposerAttachment[],
+  existing: readonly MobileComposerAttachment[]
+): readonly MobileComposerAttachment[] {
+  const merged = preferred.map(cloneMobileComposerAttachment);
+  const byId = new Map(merged.map((attachment) => [attachment.attachmentId, attachment] as const));
+  for (const candidate of existing) {
+    const attachment = normalizeMobileComposerAttachment(candidate);
+    const duplicate = byId.get(attachment.attachmentId);
+    if (duplicate !== undefined) {
+      if (!mobileComposerAttachmentsEqual(duplicate, attachment)) {
+        throw new Error("Recovered Joko attachments have conflicting local identities.");
+      }
+      continue;
+    }
+    merged.push(cloneMobileComposerAttachment(attachment));
+    byId.set(attachment.attachmentId, attachment);
+  }
+  return merged;
 }
 
 function uniqueRecoveredMentionId(value: string, used: Set<string>): string {
@@ -631,6 +711,27 @@ function mobileComposerInputPart(mention: MobileComposerMention) {
       displayText: mention.displayText
     }) }
   });
+}
+
+function mobileComposerAttachmentInputPart(attachment: MobileUploadedComposerAttachment) {
+  const blob = create(BlobRefSchema, {
+    blobId: attachment.blobId,
+    fileName: attachment.fileName,
+    mediaType: attachment.mediaType,
+    byteSize: BigInt(attachment.byteSize),
+    sha256Hex: attachment.sha256Hex,
+    disposition: BlobDisposition.ATTACHMENT
+  });
+  return attachment.kind === "image"
+    ? create(InputPartSchema, {
+        content: { case: "image", value: create(ImageRefSchema, {
+          blob,
+          widthPixels: 0,
+          heightPixels: 0,
+          altText: attachment.fileName
+        }) }
+      })
+    : create(InputPartSchema, { content: { case: "file", value: blob } });
 }
 
 function validInputWorkspaceMention(mention: {

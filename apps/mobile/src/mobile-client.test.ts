@@ -1,12 +1,12 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
-  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobRefSchema,
+  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
-  EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
@@ -24,6 +24,8 @@ import type { Event, Operation, SessionMessageSearchMatch, Snapshot, WorkspaceEn
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
+import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
+import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import { timelineRows } from "./timeline";
 import {
@@ -32,7 +34,8 @@ import {
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   mobileComposerInput,
-  plainTextMobileComposerDraft
+  plainTextMobileComposerDraft,
+  type MobileComposerDraft
 } from "./mobile-composer-document";
 
 const credential: PairedCredential = {
@@ -168,6 +171,70 @@ const newTaskMentionSnapshot = create(SnapshotSchema, {
     })
   })],
   sessions: [snapshot.sessions[0]!, relatedSession]
+});
+const attachmentSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    version: "backend-attachments-v1",
+    capabilities: create(CapabilityManifestSchema, {
+      schemaVersion: "1",
+      revision: create(RevisionSchema, { value: 5n, etag: "capabilities-r5" }),
+      capabilities: [
+        create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, {
+          name: capabilityNames.inputImage,
+          support: CapabilitySupport.SUPPORTED,
+          options: create(CapabilityOptionsSchema, {
+            kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+              mediaTypes: ["image/png"], maximumBytes: 1_024n, maximumItems: 4
+            }) }
+          })
+        }),
+        create(CapabilitySchema, {
+          name: capabilityNames.inputFile,
+          support: CapabilitySupport.SUPPORTED,
+          options: create(CapabilityOptionsSchema, {
+            kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+              mediaTypes: ["application/pdf"], maximumBytes: 1_024n, maximumItems: 4
+            }) }
+          })
+        })
+      ]
+    })
+  })],
+  sessions: [create(SessionSchema, {
+    ...snapshot.sessions[0]!,
+    model: create(ModelSelectionSchema, {
+      model: create(ModelKeySchema, { providerId: "vision-provider", modelId: "vision-model" })
+    })
+  })],
+  providers: [create(ProviderDescriptorSchema, {
+    backendId: "backend",
+    providerId: "vision-provider",
+    displayName: "Vision Provider",
+    kind: ProviderKind.SUBSCRIPTION
+  })],
+  models: [create(ModelDescriptorSchema, {
+    backendId: "backend",
+    key: create(ModelKeySchema, { providerId: "vision-provider", modelId: "vision-model" }),
+    displayName: "Vision model",
+    family: "vision",
+    inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE],
+    outputModalities: [ModelOutputModality.TEXT],
+    available: true
+  })],
+  settings: create(SettingsSnapshotSchema, {
+    revision: create(RevisionSchema, { value: 7n, etag: "settings-r7" }),
+    backends: [create(BackendSettingsSchema, {
+      backendId: "backend",
+      enabled: true,
+      defaultModel: create(ModelSelectionSchema, {
+        model: create(ModelKeySchema, { providerId: "vision-provider", modelId: "vision-model" })
+      }),
+      modelAccess: create(BackendModelAccessSettingsSchema, {})
+    })]
+  })
 });
 const workspaceMentionDirectory = create(WorkspaceEntrySchema, {
   workspaceId: "workspace", relativePath: "src", displayName: "src", kind: FileKind.DIRECTORY
@@ -588,6 +655,7 @@ function fakeNetwork(): MobileNetwork {
     listSessionResources: vi.fn(async () => []),
     listArtifactReferenceCatalog: vi.fn(async () => ({ artifacts: [], revision: "artifact-references-1" })),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
+    uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     prepareTarget: vi.fn(async () => undefined),
     submit: vi.fn(async (_credential, operationId, mutation) => {
       toBinary(OperationMutationSchema, mutation);
@@ -646,6 +714,80 @@ function memoryDraftStores() {
   };
 }
 
+function localAttachmentDraft(text = ""): MobileComposerDraft {
+  return {
+    ...plainTextMobileComposerDraft(text),
+    attachments: [
+      {
+        state: "local",
+        attachmentId: "image-one",
+        kind: "image",
+        fileName: "pixel.png",
+        mediaType: "image/png",
+        byteSize: 4,
+        sha256Hex: "a".repeat(64),
+        capturedAtUnixMs: 100
+      },
+      {
+        state: "local",
+        attachmentId: "file-one",
+        kind: "file",
+        fileName: "proof.pdf",
+        mediaType: "application/pdf",
+        byteSize: 7,
+        sha256Hex: "b".repeat(64),
+        capturedAtUnixMs: 101
+      }
+    ]
+  };
+}
+
+function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
+  const removed: string[] = [];
+  const bytes = new Map<string, Uint8Array>([
+    ["image-one", new Uint8Array([1, 1, 1, 1])],
+    ["file-one", new Uint8Array([2, 2, 2, 2, 2, 2, 2])]
+  ]);
+  const driver: MobileAttachmentFileDriver = {
+    pick: vi.fn(async () => ({ canceled: true, files: [] })),
+    stage: vi.fn(async () => { throw new Error("not used"); }),
+    read: vi.fn(async (profileId, attachmentId) => {
+      const value = bytes.get(attachmentId);
+      if (!value) throw new Error("staged bytes missing");
+      return {
+        uri: `file:///durable/${profileId}/${attachmentId}`,
+        byteSize: value.byteLength,
+        bytes: Uint8Array.from(value)
+      };
+    }),
+    remove: vi.fn(async (_profileId, attachmentId) => {
+      removed.push(attachmentId);
+      bytes.delete(attachmentId);
+      onRemove?.(attachmentId);
+    }),
+    clearProfile: vi.fn(async () => { bytes.clear(); })
+  };
+  return {
+    files: new MobileAttachmentFiles(
+      driver,
+      async (value) => value[0] === 1 ? "a".repeat(64) : "b".repeat(64)
+    ),
+    driver,
+    removed
+  };
+}
+
+function committedAttachment(attachment: MobileLocalComposerAttachment) {
+  return create(BlobRefSchema, {
+    blobId: `blob-${attachment.attachmentId}`,
+    fileName: attachment.fileName,
+    mediaType: attachment.mediaType,
+    byteSize: BigInt(attachment.byteSize),
+    sha256Hex: attachment.sha256Hex,
+    disposition: BlobDisposition.ATTACHMENT
+  });
+}
+
 const clients: MobileClient[] = [];
 function client(
   network: MobileNetwork,
@@ -654,10 +796,11 @@ function client(
   now: () => number = () => 2_000,
   newId: () => string = () => "operation-1",
   clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
-  drafts = memoryDraftStores()
+  drafts = memoryDraftStores(),
+  attachmentFiles?: MobileAttachmentFiles
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
-    clearInteractionDraft, drafts.newTask, drafts.composer);
+    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles);
   clients.push(instance);
   return instance;
 }
@@ -1308,6 +1451,138 @@ describe("native mobile connection and operation ownership", () => {
     expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
   });
 
+  it("uploads a retained attachment-only first input after creation and sends canonical image/file parts", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const persistedBeforeRemove: boolean[] = [];
+    const fixture = attachmentFileFixture((attachmentId) => {
+      const current = drafts.newTask.readSync({ profileId: credential.profileId })?.submission?.input.attachments
+        .find((attachment) => attachment.attachmentId === attachmentId);
+      persistedBeforeRemove.push(current?.state === "uploaded");
+    });
+    const input = localAttachmentDraft();
+    vi.mocked(network.uploadBlob).mockImplementation(async (_credential, source) => {
+      const attachment = input.attachments.find((candidate) => candidate.fileName === source.fileName)!;
+      return committedAttachment(attachment as MobileLocalComposerAttachment);
+    });
+    let operation = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => mutation.payload.case === "createSession"
+      ? create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: attachmentSnapshot.sessions[0]! } }
+        })
+      : create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.SUCCEEDED,
+          result: { payload: { case: "queueItem", value: create(QueueItemSchema, {
+            queueItemId: "attachment-first-input",
+            backendId: "backend",
+            targetId: "target",
+            sessionId: "session",
+            state: QueueItemState.ACCEPTED
+          }) } }
+        }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => `operation-${++operation}`, undefined, drafts, fixture.files);
+    await app.start();
+
+    expect(app.newTaskAttachmentControls("target")).toMatchObject({
+      profileId: credential.profileId,
+      policy: { images: true, files: true, maximumItems: 4, maximumBytes: 1_024 }
+    });
+    await expect(app.create("target", "Attachments", input)).resolves.toEqual({
+      sessionId: "session", created: true, sent: true, definitive: true
+    });
+
+    expect(vi.mocked(network.uploadBlob).mock.calls.map((call) => call[1].fileName))
+      .toEqual(["pixel.png", "proof.pdf"]);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      payload: { case: "createSession", value: { model: {
+        model: { providerId: "vision-provider", modelId: "vision-model" },
+        effortId: "",
+        fastMode: false
+      } } }
+    });
+    expect(persistedBeforeRemove).toEqual([true, true]);
+    expect(fixture.removed).toEqual(["image-one", "file-one"]);
+    const send = vi.mocked(network.submit).mock.calls[1]?.[2];
+    expect(send).toMatchObject({
+      preconditions: [{ expectedGeneration: 8n }],
+      payload: { case: "sendInput", value: { input: { parts: [
+        { content: { case: "image", value: { blob: { blobId: "blob-image-one" } } } },
+        { content: { case: "file", value: { blobId: "blob-file-one" } } }
+      ] } } }
+    });
+    expect(vi.mocked(network.uploadBlob).mock.invocationCallOrder[1])
+      .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[1]!);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it("keeps file input but fails image input closed when the exact receiving model is text-only", async () => {
+    const textOnly = create(SnapshotSchema, {
+      ...attachmentSnapshot,
+      models: [create(ModelDescriptorSchema, {
+        ...attachmentSnapshot.models[0]!,
+        inputModalities: [ModelInputModality.TEXT]
+      })]
+    });
+    const network = projectedNetwork(textOnly);
+    const drafts = memoryDraftStores();
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "unused-operation", undefined, drafts, fixture.files);
+    await app.start();
+
+    expect(app.newTaskAttachmentControls("target")?.policy).toMatchObject({ images: false, files: true });
+    expect(app.taskAttachmentControls()?.policy).toMatchObject({ images: false, files: true });
+    await expect(app.create("target", "Text-only model", localAttachmentDraft()))
+      .rejects.toThrow(/image type is not supported/u);
+    await expect(app.send(localAttachmentDraft())).rejects.toThrow(/image type is not supported/u);
+    expect(network.uploadBlob).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("recovers the exact partially committed attachment first input when a later upload fails", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const fixture = attachmentFileFixture();
+    const input = localAttachmentDraft("Keep context");
+    vi.mocked(network.uploadBlob).mockImplementation(async (_credential, source) => {
+      if (source.fileName === "proof.pdf") throw new Error("upload unavailable");
+      return committedAttachment(input.attachments[0] as MobileLocalComposerAttachment);
+    });
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case !== "createSession") throw new Error("first input must not dispatch");
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "session", value: attachmentSnapshot.sessions[0]! } }
+      });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "operation-create", undefined, drafts, fixture.files);
+    await app.start();
+
+    await expect(app.create("target", "Attachment recovery", input)).rejects.toThrow("upload unavailable");
+
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(fixture.removed).toEqual(["image-one"]);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" }))
+      .toMatchObject({
+        text: "Keep context",
+        attachments: [
+          { attachmentId: "image-one", state: "uploaded", blobId: "blob-image-one" },
+          { attachmentId: "file-one", state: "local" }
+        ]
+      });
+  });
+
   it("re-reads pre-creation Session and Workspace authority and sends their exact typed ranges", async () => {
     const network = projectedNetwork(newTaskMentionSnapshot);
     const drafts = memoryDraftStores();
@@ -1547,6 +1822,7 @@ describe("native mobile connection and operation ownership", () => {
       serverId: credential.serverId,
       backendId: "backend",
       targetRevision: "3",
+      model: null,
       createOperationId: "operation-never-dispatched"
     });
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
@@ -1777,7 +2053,8 @@ describe("native mobile connection and operation ownership", () => {
     const recovered = drafts.composer.readSync(identity)!;
     drafts.composer.save(identity, {
       text: `${recovered.text}\n\nKeep this newer draft`,
-      mentions: recovered.mentions
+      mentions: recovered.mentions,
+      attachments: recovered.attachments
     });
     vi.mocked(network.getOperation).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
       operationId,
@@ -2222,6 +2499,93 @@ describe("native current-task message and Queue actions", () => {
       artifacts: [catalogMentionArtifact], revision: "artifact-references-r1"
     });
   }
+
+  it("uploads current-task attachments in order, persists each Blob before local deletion, and sends attachment-only input", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const persistedBeforeRemove: boolean[] = [];
+    const fixture = attachmentFileFixture((attachmentId) => {
+      const attachment = drafts.composer.readSync(identity)?.attachments
+        .find((candidate) => candidate.attachmentId === attachmentId);
+      persistedBeforeRemove.push(attachment?.state === "uploaded");
+    });
+    const draft = localAttachmentDraft();
+    vi.mocked(network.uploadBlob).mockImplementation(async (_credential, source) => committedAttachment(
+      draft.attachments.find((attachment) => attachment.fileName === source.fileName) as MobileLocalComposerAttachment
+    ));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      ids(), undefined, drafts, fixture.files);
+    await app.start();
+
+    expect(app.taskAttachmentControls()).toMatchObject({
+      profileId: credential.profileId,
+      policy: { images: true, files: true, maximumItems: 4, maximumBytes: 1_024 }
+    });
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(vi.mocked(network.uploadBlob).mock.calls.map((call) => call[1].fileName))
+      .toEqual(["pixel.png", "proof.pdf"]);
+    expect(persistedBeforeRemove).toEqual([true, true]);
+    expect(fixture.removed).toEqual(["image-one", "file-one"]);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ expectedGeneration: 8n }],
+      payload: { case: "sendInput", value: { input: { parts: [
+        { content: { case: "image", value: { blob: { blobId: "blob-image-one" } } } },
+        { content: { case: "file", value: { blobId: "blob-file-one" } } }
+      ] } } }
+    });
+    expect(vi.mocked(network.uploadBlob).mock.invocationCallOrder[1])
+      .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[0]!);
+    expect(drafts.composer.readSync(identity)).toBeNull();
+  });
+
+  it("retains canonical uploaded attachment identities and body-free receipt when current send is unknown", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    const fixture = attachmentFileFixture();
+    const draft = localAttachmentDraft("Review");
+    vi.mocked(network.uploadBlob).mockImplementation(async (_credential, source) => committedAttachment(
+      draft.attachments.find((attachment) => attachment.fileName === source.fileName) as MobileLocalComposerAttachment
+    ));
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts, fixture.files);
+    await app.start();
+
+    await expect(app.send(draft)).resolves.toBe(false);
+
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" }))
+      .toMatchObject({ attachments: [
+        { attachmentId: "image-one", state: "uploaded", blobId: "blob-image-one" },
+        { attachmentId: "file-one", state: "uploaded", blobId: "blob-file-one" }
+      ] });
+    expect(fixture.removed).toEqual(["image-one", "file-one"]);
+    expect(saved.pending()).toMatchObject([{ kind: "send", sessionId: "session", state: "unknown" }]);
+    expect(JSON.stringify(saved.pending())).not.toContain("pixel.png");
+    expect(JSON.stringify(saved.pending())).not.toContain("blob-image-one");
+  });
+
+  it("does not overwrite a newer current-task draft or delete staged bytes after an upload CAS conflict", async () => {
+    const network = projectedNetwork(attachmentSnapshot);
+    const drafts = memoryDraftStores();
+    const fixture = attachmentFileFixture();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const draft = localAttachmentDraft("Original");
+    vi.mocked(network.uploadBlob).mockImplementationOnce(async () => {
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer navigation draft"));
+      return committedAttachment(draft.attachments[0] as MobileLocalComposerAttachment);
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      ids(), undefined, drafts, fixture.files);
+    await app.start();
+
+    await expect(app.send(draft)).rejects.toThrow(/changed while an attachment was uploading/u);
+
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(fixture.removed).toEqual([]);
+    expect(drafts.composer.readSync(identity)).toEqual(plainTextMobileComposerDraft("Newer navigation draft"));
+  });
 
   it("sends a retained Session reference with exact UTF-16 range and body-free receipt", async () => {
     const network = projectedNetwork(sessionMentionSnapshot);

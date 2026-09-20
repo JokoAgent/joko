@@ -16,6 +16,13 @@ export interface MobileNewTaskEditableDraft {
   readonly input: MobileComposerDraft;
 }
 
+export interface MobileNewTaskModelSelection {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly effortId?: string;
+  readonly fastMode: boolean;
+}
+
 interface MobileNewTaskSubmissionBase {
   readonly connectionId: string;
   readonly serverId: string;
@@ -25,6 +32,7 @@ interface MobileNewTaskSubmissionBase {
   readonly targetRevisionEtag?: string;
   readonly createOperationId: string;
   readonly displayName: string;
+  readonly model: MobileNewTaskModelSelection | null;
   readonly input: MobileComposerDraft;
 }
 
@@ -50,9 +58,9 @@ export type MobileNewTaskDraftErrorListener = (
   error: Error
 ) => void;
 
-const storagePrefix = "joko.mobile.new-task-draft.v2";
+const storagePrefix = "joko.mobile.new-task-draft.v3";
 const persistDebounceMilliseconds = 400;
-const maximumStoredCharacters = 1_016_384;
+const maximumStoredCharacters = 1_040_960;
 
 export class MobileNewTaskDraftStore {
   readonly #memory = new Map<string, MobileNewTaskDraft>();
@@ -137,7 +145,9 @@ export class MobileNewTaskDraftStore {
     }
     const editable = normalizeEditableDraft(draft);
     const displayName = editable.name.trim() || "New task";
-    if (!editable.targetId || !editable.input.text.trim()) throw new Error("Choose a project and enter the first message.");
+    if (!editable.targetId || !hasComposerInput(editable.input)) {
+      throw new Error("Choose a project and enter a first message or attachment.");
+    }
     const submission = normalizeSubmission({
       phase: "creating",
       ...authority,
@@ -191,6 +201,27 @@ export class MobileNewTaskDraftStore {
     const next = normalizeSubmission({ ...submission, sendOperationId }) as MobileNewTaskSendSubmission;
     await this.#replace(exact, { ...current, submission: next });
     return cloneSubmission(next) as MobileNewTaskSendSubmission;
+  }
+
+  async replaceSubmissionInput(
+    identity: MobileNewTaskDraftIdentity,
+    createOperationId: string,
+    expected: MobileComposerDraft,
+    replacement: MobileComposerDraft
+  ): Promise<MobileNewTaskSubmission> {
+    const exact = normalizeIdentity(identity);
+    const current = this.#required(exact);
+    const submission = current.submission;
+    if (submission === undefined || submission.createOperationId !== createOperationId
+      || !mobileComposerDraftsEqual(current.input, expected)
+      || !mobileComposerDraftsEqual(submission.input, expected)) {
+      throw new Error("The retained new-task attachment input changed while it was being committed.");
+    }
+    const input = normalizeNewTaskInput(replacement);
+    if (!hasComposerInput(input)) throw new Error("The retained Joko first input is invalid.");
+    const next = normalizeSubmission({ ...submission, input });
+    await this.#replace(exact, { ...current, input, submission: next });
+    return cloneSubmission(next);
   }
 
   async clearSubmission(
@@ -364,7 +395,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
   assertIdentity(value.createOperationId, "creation operation");
   if (!value.displayName.trim() || value.displayName.length > 256) throw new Error("The retained Joko task name is invalid.");
   const input = normalizeNewTaskInput(value.input);
-  if (!input.text.trim()) {
+  if (!hasComposerInput(input)) {
     throw new Error("The retained Joko first message is invalid.");
   }
   const base: MobileNewTaskSubmissionBase = {
@@ -376,6 +407,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
     ...(value.targetRevisionEtag === undefined ? {} : { targetRevisionEtag: value.targetRevisionEtag }),
     createOperationId: value.createOperationId,
     displayName: value.displayName,
+    model: normalizeNewTaskModelSelection(value.model),
     input
   };
   if (value.phase === "creating") return { phase: "creating", ...base };
@@ -394,7 +426,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
 function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): string {
   const exact = normalizeDraft(draft);
   const serialized = JSON.stringify({
-    version: 2,
+    version: 3,
     identity: normalizeIdentity(identity),
     draft: exact.submission === undefined
       ? exact
@@ -407,7 +439,7 @@ function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewT
 function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved new-task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 2 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 3 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId) {
     throw new Error("new-task draft identity mismatch");
   }
@@ -435,7 +467,11 @@ function cloneDraft(draft: MobileNewTaskDraft): MobileNewTaskDraft {
 }
 
 function cloneSubmission(submission: MobileNewTaskSubmission): MobileNewTaskSubmission {
-  return { ...submission, input: cloneMobileComposerDraft(submission.input) };
+  return {
+    ...submission,
+    model: submission.model === null ? null : { ...submission.model },
+    input: cloneMobileComposerDraft(submission.input)
+  };
 }
 
 function persistedSubmission(submission: MobileNewTaskSubmission): Omit<MobileNewTaskSubmission, "input"> {
@@ -468,11 +504,43 @@ function sameSubmission(left: MobileNewTaskSubmission, right: MobileNewTaskSubmi
     || left.backendId !== right.backendId || left.targetId !== right.targetId
     || left.targetRevision !== right.targetRevision || left.targetRevisionEtag !== right.targetRevisionEtag
     || left.createOperationId !== right.createOperationId || left.displayName !== right.displayName
+    || !sameNewTaskModelSelection(left.model, right.model)
     || !mobileComposerDraftsEqual(left.input, right.input)) return false;
   return left.phase === "creating" && right.phase === "creating"
     || left.phase === "sending" && right.phase === "sending"
       && left.sessionId === right.sessionId && left.runtimeGeneration === right.runtimeGeneration
       && left.sendOperationId === right.sendOperationId;
+}
+
+function normalizeNewTaskModelSelection(
+  value: MobileNewTaskModelSelection | null
+): MobileNewTaskModelSelection | null {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") {
+    throw new Error("The retained Joko new-task model selection is invalid.");
+  }
+  assertIdentity(value.providerId, "model Provider");
+  assertIdentity(value.modelId, "model");
+  if (value.effortId !== undefined) assertIdentity(value.effortId, "model effort");
+  if (typeof value.fastMode !== "boolean") {
+    throw new Error("The retained Joko new-task model selection is invalid.");
+  }
+  return {
+    providerId: value.providerId,
+    modelId: value.modelId,
+    ...(value.effortId === undefined ? {} : { effortId: value.effortId }),
+    fastMode: value.fastMode
+  };
+}
+
+function sameNewTaskModelSelection(
+  left: MobileNewTaskModelSelection | null,
+  right: MobileNewTaskModelSelection | null
+): boolean {
+  return left === null && right === null
+    || left !== null && right !== null
+      && left.providerId === right.providerId && left.modelId === right.modelId
+      && left.effortId === right.effortId && left.fastMode === right.fastMode;
 }
 
 function assertIdentity(value: string, label: string): void {
@@ -483,6 +551,10 @@ function assertIdentity(value: string, label: string): void {
 
 function positiveDecimal(value: string, label: string): void {
   if (!/^[1-9][0-9]*$/u.test(value)) throw new Error(`The retained Joko ${label} is invalid.`);
+}
+
+function hasComposerInput(input: MobileComposerDraft): boolean {
+  return input.text.trim().length > 0 || input.attachments.length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

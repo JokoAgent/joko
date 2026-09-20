@@ -9,7 +9,8 @@ import {
   insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
-  plainTextMobileComposerDraft
+  plainTextMobileComposerDraft,
+  type MobileComposerDraft
 } from "./mobile-composer-document";
 
 const first = { profileId: "profile-one" } satisfies MobileNewTaskDraftIdentity;
@@ -21,6 +22,7 @@ const authority = {
   backendId: "backend-one",
   targetRevision: "7",
   targetRevisionEtag: "target-r7",
+  model: { providerId: "provider-one", modelId: "vision-one", effortId: "high", fastMode: false },
   createOperationId: "operation-create"
 };
 
@@ -52,6 +54,21 @@ function structuredInput() {
     { workspaceId: "workspace-one", relativePath: "src", displayText: "src", directory: true },
     "mention-workspace"
   ).draft;
+}
+
+function attachedInput(state: "local" | "uploaded" = "local"): MobileComposerDraft {
+  const attachment = {
+    attachmentId: "attachment-one",
+    kind: "image" as const,
+    fileName: "pixel.png",
+    mediaType: "image/png",
+    byteSize: 4,
+    sha256Hex: "a".repeat(64),
+    capturedAtUnixMs: 100
+  };
+  return state === "local"
+    ? { ...input(""), attachments: [{ ...attachment, state: "local" }] }
+    : { ...input(""), attachments: [{ ...attachment, state: "uploaded", blobId: "blob-one" }] };
 }
 
 describe("mobile new-task retained draft store", () => {
@@ -121,7 +138,8 @@ describe("mobile new-task retained draft store", () => {
       displayName: "Release task",
       input: structuredInput(),
       targetRevision: "7",
-      targetRevisionEtag: "target-r7"
+      targetRevisionEtag: "target-r7",
+      model: { providerId: "provider-one", modelId: "vision-one", effortId: "high", fastMode: false }
     });
     store.save(first, { targetId: "target-two", name: "Changed", input: input("changed after submit") });
     expect(store.readSync(first)).toMatchObject({
@@ -143,6 +161,28 @@ describe("mobile new-task retained draft store", () => {
       runtimeGeneration: "11",
       input: structuredInput()
     });
+  });
+
+  it("atomically replaces a v3 attachment identity in both editable and frozen submission input", async () => {
+    const memory = memoryDriver();
+    const store = new MobileNewTaskDraftStore(memory.driver);
+    const local = attachedInput("local");
+    const uploaded = attachedInput("uploaded");
+    await store.beginSubmission(first, { targetId: "target-one", name: "Attachment", input: local }, authority);
+    await store.advanceToSending(first, authority.createOperationId, "session-one", 11n);
+
+    await expect(store.replaceSubmissionInput(
+      first, authority.createOperationId, local, uploaded
+    )).resolves.toMatchObject({ phase: "sending", input: uploaded });
+
+    expect(store.readSync(first)).toMatchObject({ input: uploaded, submission: { input: uploaded } });
+    await expect(store.replaceSubmissionInput(
+      first, authority.createOperationId, local, attachedInput("uploaded")
+    )).rejects.toThrow(/changed while it was being committed/u);
+    const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
+    expect(raw).toContain('"version":3');
+    expect(raw).not.toContain("content://");
+    expect(raw).not.toContain("file://");
   });
 
   it("releases only the matching operation while retaining the editable creation draft", async () => {
@@ -177,6 +217,27 @@ describe("mobile new-task retained draft store", () => {
       draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
     await expect(crossProfile.read(first)).rejects.toThrow(/could not be read/);
+
+    memory.values.set(key, JSON.stringify({
+      version: 3,
+      identity: first,
+      draft: {
+        targetId: "target-one",
+        name: "",
+        input: input("missing frozen model"),
+        submission: {
+          phase: "creating",
+          connectionId: "connection-one",
+          serverId: "server-one",
+          backendId: "backend-one",
+          targetId: "target-one",
+          targetRevision: "7",
+          createOperationId: "operation-create",
+          displayName: "New task"
+        }
+      }
+    }));
+    await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     const oversized = new MobileNewTaskDraftStore(memory.driver);
     expect(() => oversized.save(first, { targetId: "target-one", name: "", input: input("x".repeat(1_000_001)) }))

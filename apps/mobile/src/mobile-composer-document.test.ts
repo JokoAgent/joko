@@ -27,6 +27,60 @@ import {
 } from "./mobile-composer-document";
 
 describe("mobile structured composer document", () => {
+  it("serializes attachment-only image/file drafts in stable order and requires canonical uploaded identities", () => {
+    const draft = normalizeMobileComposerDraft({
+      text: "",
+      mentions: [],
+      attachments: [
+        {
+          state: "uploaded",
+          attachmentId: "image-one",
+          kind: "image",
+          fileName: "pixel.png",
+          mediaType: "image/png",
+          byteSize: 4,
+          sha256Hex: "a".repeat(64),
+          capturedAtUnixMs: 100,
+          blobId: "blob-image-one"
+        },
+        {
+          state: "uploaded",
+          attachmentId: "file-one",
+          kind: "file",
+          fileName: "proof.pdf",
+          mediaType: "application/pdf",
+          byteSize: 7,
+          sha256Hex: "b".repeat(64),
+          capturedAtUnixMs: 101,
+          blobId: "blob-file-one"
+        }
+      ]
+    });
+
+    expect(mobileComposerInput(draft)).toMatchObject({
+      parts: [
+        { content: { case: "image", value: {
+          altText: "pixel.png",
+          blob: {
+            blobId: "blob-image-one", fileName: "pixel.png", mediaType: "image/png",
+            byteSize: 4n, sha256Hex: "a".repeat(64)
+          }
+        } } },
+        { content: { case: "file", value: {
+          blobId: "blob-file-one", fileName: "proof.pdf", mediaType: "application/pdf",
+          byteSize: 7n, sha256Hex: "b".repeat(64)
+        } } }
+      ],
+      mentionRanges: []
+    });
+    expect(mobileInputSummary(mobileComposerInput(draft))).toBe("[Image]\n[File]");
+
+    expect(() => mobileComposerInput({
+      ...draft,
+      attachments: [{ ...draft.attachments[0]!, state: "local" }]
+    })).toThrow(/Finish uploading every attachment/u);
+  });
+
   it("recovers a rejected structured prefix without flattening newer references and removes only that exact prefix", () => {
     const first = insertMobileSessionMention(
       plainTextMobileComposerDraft("Review"),
@@ -51,9 +105,49 @@ describe("mobile structured composer document", () => {
     expect(recoverMobileComposerDraft(first, recovered)).toEqual(recovered);
     expect(mobileComposerDraftWithoutPrefix(first, recovered)).toEqual({
       text: later.text,
-      mentions: [{ ...later.mentions[0]!, mentionId: "shared-occurrence-recovered-1" }]
+      mentions: [{ ...later.mentions[0]!, mentionId: "shared-occurrence-recovered-1" }],
+      attachments: []
     });
     expect(mobileComposerDraftWithoutPrefix(first, plainTextMobileComposerDraft("Newer unrelated draft"))).toBeUndefined();
+  });
+
+  it("keeps a newer attachment while recognizing and removing an exact submitted attachment prefix", () => {
+    const submitted = normalizeMobileComposerDraft({
+      text: "Send the proof",
+      mentions: [],
+      attachments: [{
+        state: "uploaded",
+        attachmentId: "submitted-file",
+        kind: "file",
+        fileName: "submitted.pdf",
+        mediaType: "application/pdf",
+        byteSize: 7,
+        sha256Hex: "a".repeat(64),
+        capturedAtUnixMs: 100,
+        blobId: "blob-submitted"
+      }]
+    });
+    const newer = normalizeMobileComposerDraft({
+      ...submitted,
+      attachments: [...submitted.attachments, {
+        state: "uploaded",
+        attachmentId: "newer-file",
+        kind: "file",
+        fileName: "newer.txt",
+        mediaType: "text/plain",
+        byteSize: 5,
+        sha256Hex: "b".repeat(64),
+        capturedAtUnixMs: 101,
+        blobId: "blob-newer"
+      }]
+    });
+
+    expect(recoverMobileComposerDraft(submitted, newer)).toEqual(newer);
+    expect(mobileComposerDraftWithoutPrefix(submitted, newer)).toEqual({
+      text: "",
+      mentions: [],
+      attachments: [newer.attachments[1]]
+    });
   });
 
   it("inserts repeated equal labels as independent occurrences and serializes exact UTF-16 ranges", () => {
@@ -166,7 +260,8 @@ describe("mobile structured composer document", () => {
         kind: "workspace", mentionId: "workspace", workspaceId: "workspace", relativePath: "src",
         displayText: "src", directory: true, start: 0, end: 5,
         ...overrides
-      }]
+      }],
+      attachments: []
     });
 
     expect(() => invalid({ relativePath: "src/../secret" })).toThrow(/path/u);
@@ -233,14 +328,16 @@ describe("mobile structured composer document", () => {
         kind: "resource", mentionId: "mention", resourceId: "resource", displayText: "Resource",
         discoveredRevision: "revision", resourceVersion: "1", runtimeGeneration: "2", start: 0, end: 9,
         ...overrides
-      }]
+      }],
+      attachments: []
     });
     const artifact = (overrides: Record<string, unknown> = {}) => normalizeMobileComposerDraft({
       text: "@Artifact",
       mentions: [{
         kind: "artifact", mentionId: "mention", artifactId: "artifact", sourceSessionId: "source",
         displayText: "Artifact", start: 0, end: 9, ...overrides
-      }]
+      }],
+      attachments: []
     });
 
     expect(() => resource({ discoveredRevision: "" })).toThrow(/resource revision/u);
@@ -272,14 +369,16 @@ describe("mobile structured composer document", () => {
     });
     expect(() => normalizeMobileComposerDraft({
       text: "😀 @Task",
-      mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 8 }]
+      mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 8 }],
+      attachments: []
     })).toThrow(/range/);
     expect(() => normalizeMobileComposerDraft({
       text: "@Task @Task",
       mentions: [
         { kind: "session", mentionId: "same", sessionId: "one", displayText: "Task", start: 0, end: 5 },
         { kind: "session", mentionId: "same", sessionId: "two", displayText: "Task", start: 6, end: 11 }
-      ]
+      ],
+      attachments: []
     })).toThrow(/duplicated/);
   });
 

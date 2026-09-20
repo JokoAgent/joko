@@ -2,6 +2,7 @@ import {
   CapabilitySupport,
   ConnectionState,
   DeviceKind,
+  ModelInputModality,
   ModelOutputModality,
   PermissionMode,
   capabilityNames,
@@ -73,6 +74,12 @@ export interface MobileModelControlSelection {
   readonly modelId: string;
   readonly effortId?: string;
   readonly fastMode: boolean;
+}
+
+export interface MobileTrustedModelAuthority {
+  readonly selection: MobileModelControlSelection;
+  readonly supportsImages: boolean;
+  readonly authorityKey: string;
 }
 
 const permissionModeOrder = [
@@ -242,6 +249,47 @@ export function resolveMobileRuntimeControls(
     canSetPermission,
     canSetPlanMode
   };
+}
+
+export function resolveMobileSessionModelAuthority(
+  owner: Snapshot | undefined,
+  session: Session | undefined
+): MobileTrustedModelAuthority | undefined {
+  const model = session?.model?.model;
+  if (!owner || !session || !model) return undefined;
+  return resolveTrustedMobileModel(owner, session.backendId, {
+    providerId: model.providerId,
+    modelId: model.modelId,
+    ...(strictText(session.model?.effortId) ? { effortId: session.model.effortId } : {}),
+    fastMode: session.model?.fastMode === true
+  }, false);
+}
+
+export function resolveMobileNewTaskDefaultModelAuthority(
+  owner: Snapshot | undefined,
+  backendId: string | undefined
+): MobileTrustedModelAuthority | undefined {
+  if (!owner?.settings || !strictText(backendId)) return undefined;
+  const settings = owner.settings.backends.filter((candidate) => candidate.backendId === backendId);
+  if (settings.length !== 1) return undefined;
+  const selection = settings[0]!.defaultModel;
+  const model = selection?.model;
+  if (!selection || !model) return undefined;
+  return resolveTrustedMobileModel(owner, backendId, {
+    providerId: model.providerId,
+    modelId: model.modelId,
+    ...(strictText(selection.effortId) ? { effortId: selection.effortId } : {}),
+    fastMode: selection.fastMode
+  }, true);
+}
+
+export function resolveMobileExplicitNewTaskModelAuthority(
+  owner: Snapshot | undefined,
+  backendId: string | undefined,
+  selection: MobileModelControlSelection | undefined
+): MobileTrustedModelAuthority | undefined {
+  if (!owner || !strictText(backendId) || !selection) return undefined;
+  return resolveTrustedMobileModel(owner, backendId, selection, true);
 }
 
 export function filterMobileModelRoutes(
@@ -456,6 +504,53 @@ function mobileModelRoute(
     maximumOutputTokens: model.maximumOutputTokens,
     efforts,
     supportsFastMode: model.supportsFastMode
+  };
+}
+
+function resolveTrustedMobileModel(
+  owner: Snapshot,
+  backendId: string,
+  selection: MobileModelControlSelection,
+  requireRoutingEnabled: boolean
+): MobileTrustedModelAuthority | undefined {
+  if (!strictText(backendId) || !strictText(selection.providerId) || !strictText(selection.modelId)
+    || (selection.effortId !== undefined && !strictText(selection.effortId))) return undefined;
+  const models = owner.models.filter((candidate) => candidate.backendId === backendId
+    && candidate.key?.providerId === selection.providerId
+    && candidate.key.modelId === selection.modelId);
+  if (models.length !== 1) return undefined;
+  const providers = owner.providers.filter((candidate) => candidate.backendId === backendId
+    && candidate.providerId === selection.providerId);
+  if (providers.length > 1) return undefined;
+  const model = models[0]!;
+  const route = mobileModelRoute(model, providers[0]);
+  if (!route) return undefined;
+  const settings = owner.settings?.backends.filter((candidate) => candidate.backendId === backendId) ?? [];
+  if (settings.length > 1 || requireRoutingEnabled && !modelRouteEnabled(owner, settings[0], providers[0], route)) {
+    return undefined;
+  }
+  if (selection.effortId !== undefined
+    && !route.efforts.some((candidate) => candidate.id === selection.effortId)) return undefined;
+  if (selection.fastMode && !route.supportsFastMode) return undefined;
+  const exactSelection: MobileModelControlSelection = {
+    providerId: selection.providerId,
+    modelId: selection.modelId,
+    ...(selection.effortId === undefined ? {} : { effortId: selection.effortId }),
+    fastMode: selection.fastMode
+  };
+  return {
+    selection: exactSelection,
+    supportsImages: model.inputModalities.includes(ModelInputModality.IMAGE),
+    authorityKey: JSON.stringify([
+      backendId,
+      exactSelection.providerId,
+      exactSelection.modelId,
+      exactSelection.effortId ?? "",
+      exactSelection.fastMode,
+      model.available,
+      [...model.inputModalities],
+      [...model.outputModalities]
+    ])
   };
 }
 

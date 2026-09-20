@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
-  ArchiveSessionMutationSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
+  ArchiveSessionMutationSchema, BlobDisposition, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateSessionMutationSchema,
   DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
@@ -13,7 +13,7 @@ import {
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   FileKind,
-  type Artifact, type BackendDescriptor, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
+  type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
@@ -73,6 +73,16 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import {
+  assertMobileAttachmentPolicy,
+  replaceMobileComposerAttachment,
+  resolveMobileAttachmentPolicy,
+  type MobileAttachmentControls,
+  type MobileComposerAttachment,
+  type MobileLocalComposerAttachment,
+  type MobileUploadedComposerAttachment
+} from "./mobile-attachments";
+import type { MobileAttachmentFiles } from "./mobile-attachment-files";
+import {
   assertMobileCatalogMentionCandidate,
   assertMobileCatalogMentionDraft,
   assertMobileCatalogMentionDraftCatalog,
@@ -114,7 +124,10 @@ import {
   assertMobileModelSelection,
   assertMobilePermissionMode,
   assertMobilePlanMode,
+  resolveMobileExplicitNewTaskModelAuthority,
+  resolveMobileNewTaskDefaultModelAuthority,
   resolveMobileRuntimeControls,
+  resolveMobileSessionModelAuthority,
   type MobileModelControlSelection,
   type MobileRuntimeControls
 } from "./mobile-runtime-controls";
@@ -303,7 +316,8 @@ export class MobileClient {
     private readonly now: () => number = Date.now,
     private readonly clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
     private readonly newTaskDrafts?: MobileNewTaskDraftStore,
-    private readonly composerDrafts?: MobileComposerDraftStore
+    private readonly composerDrafts?: MobileComposerDraftStore,
+    private readonly attachmentFiles?: MobileAttachmentFiles
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -896,6 +910,10 @@ export class MobileClient {
     if (this.newTaskDrafts) {
       try { await this.newTaskDrafts.clear({ profileId }); }
       catch (error) { cleanupFailures.push(`new-task draft: ${message(error)}`); }
+    }
+    if (this.attachmentFiles) {
+      try { await this.attachmentFiles.clearProfile(profileId); }
+      catch (error) { cleanupFailures.push(`staged attachment bytes: ${message(error)}`); }
     }
     const cleanupError = cleanupFailures.length === 0
       ? undefined
@@ -1710,7 +1728,9 @@ export class MobileClient {
 
   async create(targetId: string, name: string, firstInput: MobileComposerDraft): Promise<MobileNewTaskResult> {
     const input = normalizeMobileComposerDraft(firstInput);
-    if (!input.text.trim()) throw new Error("Enter the first message for this task.");
+    if (!input.text.trim() && input.attachments.length === 0) {
+      throw new Error("Enter a first message or attach a file for this task.");
+    }
     if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
       throw new Error("A new task cannot reference runtime Resources or Artifacts before its Session exists.");
     }
@@ -1736,6 +1756,12 @@ export class MobileClient {
     }
     const authorityKey = this.#newTaskAuthorityKey(targetId);
     if (!authorityKey) throw new Error("The selected project authority is unavailable.");
+    const receivingModel = resolveMobileNewTaskDefaultModelAuthority(owner, backend.backendId);
+    const attachmentControls = this.newTaskAttachmentControls(targetId);
+    if (input.attachments.length > 0) {
+      if (!attachmentControls) throw new Error("This Backend does not accept attachments for a new task.");
+      assertMobileAttachmentPolicy(input.attachments, attachmentControls.policy);
+    }
     assertMobileSessionMentionDraft(this.newTaskSessionMentionControls(targetId), input);
     assertMobileWorkspaceMentionDraft(this.newTaskWorkspaceMentionControls(targetId), input);
     const identity = { profileId: credential.profileId } satisfies MobileNewTaskDraftIdentity;
@@ -1749,6 +1775,7 @@ export class MobileClient {
         backendId: target.backendId,
         targetRevision: targetRevision.value.toString(10),
         ...(targetRevision.etag === "" ? {} : { targetRevisionEtag: targetRevision.etag }),
+        model: receivingModel?.selection ?? null,
         createOperationId
       });
       try {
@@ -1787,6 +1814,16 @@ export class MobileClient {
         nativeStart: create(NativeSessionStartSchema, {
           kind: { case: "newSession", value: create(NewNativeSessionSchema, { parentNativeReference: "" }) }
         }),
+        ...(submission.model === null ? {} : {
+          model: create(ModelSelectionSchema, {
+            model: create(ModelKeySchema, {
+              providerId: submission.model.providerId,
+              modelId: submission.model.modelId
+            }),
+            effortId: submission.model.effortId ?? "",
+            fastMode: submission.model.fastMode
+          })
+        }),
         permissionMode: PermissionMode.ASK,
         initialPlacement: NativeSessionPlacement.PROJECT
       }) }
@@ -1797,13 +1834,16 @@ export class MobileClient {
     const credential = this.#ready();
     const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === submission.targetId);
     const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === submission.backendId);
+    const model = submission.model === null
+      ? undefined
+      : resolveMobileExplicitNewTaskModelAuthority(owner, submission.backendId, submission.model);
     const revision = target?.version?.revision;
     if (credential.connectionId !== submission.connectionId || credential.serverId !== submission.serverId
       || this.#activeProfileId !== credential.profileId || this.#state.node?.serverId !== submission.serverId
       || !target || target.backendId !== submission.backendId || target.state !== TargetState.ACTIVE
       || !revision || revision.value.toString(10) !== submission.targetRevision
       || (revision.etag || undefined) !== submission.targetRevisionEtag
-      || !backend || !supportsText(backend)) {
+      || !backend || !supportsText(backend) || submission.model !== null && !model) {
       throw new Error("The project or Backend changed while this task was being prepared. Review the retained draft and try again.");
     }
   }
@@ -1842,7 +1882,8 @@ export class MobileClient {
     const generation = session?.nativeBinding?.runtimeGeneration;
     if (operation.operationId !== submission.createOperationId || operation.connectionId !== submission.connectionId
       || !session || !session.sessionId || session.backendId !== submission.backendId || session.targetId !== submission.targetId
-      || !generation || generation < 1n) return undefined;
+      || !generation || generation < 1n
+      || submission.model !== null && !sameMobileModelSelection(submission.model, session.model)) return undefined;
     return session;
   }
 
@@ -1881,6 +1922,7 @@ export class MobileClient {
       const remainder = mobileComposerDraftWithoutPrefix(input, snapshot.draft);
       if (remainder === undefined) return;
       const updated = remainder.text.length === 0 && remainder.mentions.length === 0
+        && remainder.attachments.length === 0
         ? await this.composerDrafts.clearIfRevision(composerIdentity, snapshot.revision)
         : this.composerDrafts.saveIfRevision(composerIdentity, remainder, snapshot.revision);
       if (updated) {
@@ -1932,8 +1974,22 @@ export class MobileClient {
       || !target
       || target.backendId !== submission.backendId || !backend || !supportsText(backend)
       || !generation || !detailGeneration || generation !== detailGeneration
-      || generation.toString(10) !== submission.runtimeGeneration) {
+      || generation.toString(10) !== submission.runtimeGeneration
+      || submission.model !== null && (
+        !sameMobileModelSelection(submission.model, session.model)
+        || !sameMobileModelSelection(submission.model, detailSession.model)
+      )) {
       return { status: "blocked", message: "The created task runtime changed before its first message could be sent. The text remains in the task composer for review." };
+    }
+    if (submission.input.attachments.length > 0) {
+      const controls = this.taskAttachmentControls();
+      if (!controls) {
+        return { status: "blocked", message: "The created task Backend no longer accepts the retained attachments. They remain in the task composer for review." };
+      }
+      try { assertMobileAttachmentPolicy(submission.input.attachments, controls.policy); }
+      catch {
+        return { status: "blocked", message: "The created task attachment capability changed. The retained input remains in the task composer for review." };
+      }
     }
     return { status: "ready", session };
   }
@@ -1955,17 +2011,23 @@ export class MobileClient {
       this.#set({ error: authority.message });
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: true };
     }
+    let prepared = initial;
     try {
       await this.#validateNewTaskSubmissionInput(initial);
+      prepared = await this.#uploadNewTaskAttachments(identity, initial);
     } catch (error) {
-      await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, initial.input);
+      const retained = this.newTaskDrafts.readSync(identity)?.submission;
+      const recovery = retained?.phase === "sending" && retained.createOperationId === initial.createOperationId
+        ? retained
+        : prepared;
+      await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, recovery.input);
       await this.newTaskDrafts.clear(identity);
       throw error;
     }
-    const sendOperationId = initial.sendOperationId ?? this.newId();
-    const submission = initial.sendOperationId === undefined
-      ? await this.newTaskDrafts.setSendOperation(identity, initial.createOperationId, sendOperationId)
-      : initial;
+    const sendOperationId = prepared.sendOperationId ?? this.newId();
+    const submission = prepared.sendOperationId === undefined
+      ? await this.newTaskDrafts.setSendOperation(identity, prepared.createOperationId, sendOperationId)
+      : prepared;
     const result = await this.#submitTerminal(create(OperationMutationSchema, {
       preconditions: [create(OperationPreconditionSchema, {
         entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: submission.sessionId }),
@@ -1978,6 +2040,60 @@ export class MobileClient {
       }) }
     }), { kind: "send", sessionId: submission.sessionId }, sendOperationId);
     return this.#finishNewTaskFirstInput(identity, submission, result);
+  }
+
+  async #uploadNewTaskAttachments(
+    identity: MobileNewTaskDraftIdentity,
+    initial: MobileNewTaskSendSubmission
+  ): Promise<MobileNewTaskSendSubmission> {
+    if (!this.newTaskDrafts) throw new Error("Retained new-task drafts are unavailable.");
+    if (initial.input.attachments.every((attachment) => attachment.state === "uploaded")) return initial;
+    if (!this.attachmentFiles) throw new Error("Staged mobile attachment bytes are unavailable.");
+    let submission = initial;
+    const initialControls = this.taskAttachmentControls();
+    if (!initialControls || initialControls.profileId !== identity.profileId) {
+      throw new Error("The created task attachment authority is unavailable.");
+    }
+    assertMobileAttachmentPolicy(submission.input.attachments, initialControls.policy);
+    for (const candidate of submission.input.attachments) {
+      if (candidate.state === "uploaded") continue;
+      const attachment = candidate as MobileLocalComposerAttachment;
+      const authority = this.#newTaskSendAuthority(submission);
+      const controls = this.taskAttachmentControls();
+      if (authority.status !== "ready" || !controls
+        || controls.surfaceOwnerKey !== initialControls.surfaceOwnerKey
+        || controls.profileId !== identity.profileId) {
+        throw new Error("The created task changed while an attachment was being prepared.");
+      }
+      assertMobileAttachmentPolicy(submission.input.attachments, controls.policy);
+      const source = await this.attachmentFiles.verifyForUpload(identity.profileId, attachment, this.#abort?.signal);
+      const blob = await this.network.uploadBlob(this.#ready(), source, this.#abort?.signal);
+      const currentControls = this.taskAttachmentControls();
+      if (this.#newTaskSendAuthority(submission).status !== "ready" || !currentControls
+        || currentControls.surfaceOwnerKey !== initialControls.surfaceOwnerKey
+        || currentControls.profileId !== identity.profileId) {
+        throw new Error("The created task changed while an attachment was uploading.");
+      }
+      const uploaded = this.#uploadedAttachment(attachment, blob);
+      const input = normalizeMobileComposerDraft({
+        ...submission.input,
+        attachments: replaceMobileComposerAttachment(
+          submission.input.attachments,
+          attachment.attachmentId,
+          uploaded
+        )
+      });
+      const next = await this.newTaskDrafts.replaceSubmissionInput(
+        identity,
+        submission.createOperationId,
+        submission.input,
+        input
+      );
+      if (next.phase !== "sending") throw new Error("The retained new-task send phase changed.");
+      submission = next;
+      await this.#removeCommittedAttachmentFile(identity.profileId, attachment);
+    }
+    return submission;
   }
 
   async #finishNewTaskFirstInput(
@@ -2019,8 +2135,9 @@ export class MobileClient {
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
     const backend = this.#state.owner?.backends.find((item) => item.backendId === session?.backendId);
     const generation = session?.nativeBinding?.runtimeGeneration;
-    if (!exactDraft.text.trim() || !sessionId || !session || !backend || !supportsText(backend) || !generation || generation < 1n) {
-      throw new Error("A current task generation and non-empty text are required.");
+    if ((!exactDraft.text.trim() && exactDraft.attachments.length === 0)
+      || !sessionId || !session || !backend || !supportsText(backend) || !generation || generation < 1n) {
+      throw new Error("A current task generation and a message or attachment are required.");
     }
     if (this.#state.pending.some((item) => item.kind === "send" && item.sessionId === sessionId && item.state === "unknown")) {
       throw new Error("The previous input has an unknown result. Check its operation before sending another message.");
@@ -2033,13 +2150,19 @@ export class MobileClient {
     const workspaceMentionOwnerKey = workspaceMentionControls?.surfaceOwnerKey;
     const catalogMentionControls = this.taskCatalogMentionControls();
     const catalogMentionOwnerKey = catalogMentionControls?.surfaceOwnerKey;
-    const sendDraft = assertMobileCatalogMentionDraft(
+    const attachmentControls = this.taskAttachmentControls();
+    const attachmentOwnerKey = attachmentControls?.surfaceOwnerKey;
+    let sendDraft = assertMobileCatalogMentionDraft(
       catalogMentionControls,
       assertMobileWorkspaceMentionDraft(
         workspaceMentionControls,
         assertMobileSessionMentionDraft(mentionControls, exactDraft)
       )
     );
+    if (sendDraft.attachments.length > 0) {
+      if (!attachmentControls) throw new Error("This task Backend does not accept attachments.");
+      assertMobileAttachmentPolicy(sendDraft.attachments, attachmentControls.policy);
+    }
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
     const draftIdentity = { profileId: credential.profileId, sessionId };
     this.composerDrafts.save(draftIdentity, sendDraft);
@@ -2055,6 +2178,13 @@ export class MobileClient {
     assertMobileWorkspaceMentionDraft(currentWorkspaceMentionControls, sendDraft);
     const currentCatalogMentionControls = this.taskCatalogMentionControls();
     assertMobileCatalogMentionDraft(currentCatalogMentionControls, sendDraft);
+    const currentAttachmentControls = this.taskAttachmentControls();
+    if (sendDraft.attachments.length > 0) {
+      if (!currentAttachmentControls || currentAttachmentControls.surfaceOwnerKey !== attachmentOwnerKey) {
+        throw new Error("The attachment owner changed while the structured draft was being saved. Review the retained draft before sending.");
+      }
+      assertMobileAttachmentPolicy(sendDraft.attachments, currentAttachmentControls.policy);
+    }
     if (sendDraft.mentions.some((mention) => mention.kind === "workspace")) {
       if (!currentWorkspaceMentionControls || currentWorkspaceMentionControls.surfaceOwnerKey !== workspaceMentionOwnerKey) {
         throw new Error("The Workspace reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
@@ -2079,6 +2209,14 @@ export class MobileClient {
     }
     const action = this.#claimMutation();
     try {
+      sendDraft = await this.#uploadTaskAttachments(
+        draftIdentity,
+        sendDraft,
+        authorityKey,
+        attachmentOwnerKey,
+        credential,
+        generation
+      );
       const accepted = await this.#submit(create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
           entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
@@ -2097,6 +2235,122 @@ export class MobileClient {
       }
       return accepted;
     } finally { this.#releaseMutation(action); }
+  }
+
+  async #uploadTaskAttachments(
+    identity: { readonly profileId: string; readonly sessionId: string },
+    initial: MobileComposerDraft,
+    authorityKey: string,
+    attachmentOwnerKey: string | undefined,
+    credential: PairedCredential,
+    generation: bigint
+  ): Promise<MobileComposerDraft> {
+    if (initial.attachments.every((attachment) => attachment.state === "uploaded")) return initial;
+    if (!this.composerDrafts || !this.attachmentFiles) {
+      throw new Error("Staged mobile attachment bytes are unavailable.");
+    }
+    if (!attachmentOwnerKey) throw new Error("The current task attachment authority is unavailable.");
+    let current = initial;
+    let snapshot = await this.composerDrafts.readSnapshot(identity);
+    if (snapshot.draft === undefined || !mobileComposerDraftsEqual(snapshot.draft, current)) {
+      throw new Error("The retained task draft changed before its attachments could upload.");
+    }
+    for (const candidate of current.attachments) {
+      if (candidate.state === "uploaded") continue;
+      const attachment = candidate as MobileLocalComposerAttachment;
+      this.#assertTaskAttachmentUploadOwner(
+        identity.sessionId,
+        authorityKey,
+        attachmentOwnerKey,
+        credential,
+        generation,
+        current.attachments
+      );
+      const source = await this.attachmentFiles.verifyForUpload(
+        identity.profileId,
+        attachment,
+        this.#abort?.signal
+      );
+      const blob = await this.network.uploadBlob(credential, source, this.#abort?.signal);
+      this.#assertTaskAttachmentUploadOwner(
+        identity.sessionId,
+        authorityKey,
+        attachmentOwnerKey,
+        credential,
+        generation,
+        current.attachments
+      );
+      const uploaded = this.#uploadedAttachment(attachment, blob);
+      const next = normalizeMobileComposerDraft({
+        ...current,
+        attachments: replaceMobileComposerAttachment(
+          current.attachments,
+          attachment.attachmentId,
+          uploaded
+        )
+      });
+      if (!this.composerDrafts.saveIfRevision(identity, next, snapshot.revision)) {
+        throw new Error("The retained task draft changed while an attachment was uploading.");
+      }
+      await this.composerDrafts.flush(identity);
+      snapshot = await this.composerDrafts.readSnapshot(identity);
+      if (snapshot.draft === undefined || !mobileComposerDraftsEqual(snapshot.draft, next)) {
+        throw new Error("The committed attachment could not be confirmed in the retained task draft.");
+      }
+      current = next;
+      await this.#removeCommittedAttachmentFile(identity.profileId, attachment);
+    }
+    return current;
+  }
+
+  #assertTaskAttachmentUploadOwner(
+    sessionId: string,
+    authorityKey: string,
+    attachmentOwnerKey: string,
+    credential: PairedCredential,
+    generation: bigint,
+    attachments: readonly MobileComposerAttachment[]
+  ): void {
+    const session = this.#selectedSession();
+    const controls = this.taskAttachmentControls();
+    if (this.#taskAuthorityKey() !== authorityKey || session?.sessionId !== sessionId
+      || session.nativeBinding?.runtimeGeneration !== generation || !controls
+      || controls.surfaceOwnerKey !== attachmentOwnerKey
+      || controls.profileId !== credential.profileId
+      || this.#credential?.profileId !== credential.profileId
+      || this.#credential.connectionId !== credential.connectionId) {
+      throw new Error("The task changed while its attachments were uploading.");
+    }
+    assertMobileAttachmentPolicy(attachments, controls.policy);
+  }
+
+  #uploadedAttachment(
+    attachment: MobileLocalComposerAttachment,
+    blob: BlobRef
+  ): MobileUploadedComposerAttachment {
+    if (!blob.blobId || blob.fileName !== attachment.fileName
+      || normalizeMediaType(blob.mediaType) !== attachment.mediaType
+      || blob.byteSize !== BigInt(attachment.byteSize)
+      || blob.sha256Hex !== attachment.sha256Hex
+      || blob.disposition !== BlobDisposition.ATTACHMENT) {
+      throw new Error("The committed Joko attachment does not match its staged bytes.");
+    }
+    return {
+      ...attachment,
+      state: "uploaded",
+      blobId: blob.blobId
+    };
+  }
+
+  async #removeCommittedAttachmentFile(
+    profileId: string,
+    attachment: MobileLocalComposerAttachment
+  ): Promise<void> {
+    if (!this.attachmentFiles) return;
+    try { await this.attachmentFiles.remove(profileId, attachment); }
+    catch (error) {
+      this.#set({ error: `${message(error)} The committed attachment will not be uploaded again.` });
+    }
   }
 
   leaveTask(): void {
@@ -2158,6 +2412,22 @@ export class MobileClient {
       deviceId: credential.deviceId,
       serverId: credential.serverId
     }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  newTaskAttachmentControls(targetId: string): MobileAttachmentControls | undefined {
+    const owner = this.#state.owner;
+    const authorityKey = this.#newTaskAuthorityKey(targetId);
+    const credential = this.#credential;
+    const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === targetId);
+    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === target?.backendId);
+    const model = resolveMobileNewTaskDefaultModelAuthority(owner, backend?.backendId);
+    const policy = resolveMobileAttachmentPolicy(backend, model?.supportsImages === true);
+    if (!authorityKey || !credential || !policy) return undefined;
+    return {
+      profileId: credential.profileId,
+      surfaceOwnerKey: `${authorityKey}\u001fattachments\u001f${model?.authorityKey ?? "native-default"}`,
+      policy
+    };
   }
 
   newTaskSessionMentionControls(targetId: string): MobileSessionMentionControls | undefined {
@@ -2307,6 +2577,20 @@ export class MobileClient {
       this.#state.detail,
       this.#state.selectedId
     );
+  }
+
+  taskAttachmentControls(): MobileAttachmentControls | undefined {
+    const authorityKey = this.#taskAuthorityKey();
+    const credential = this.#credential;
+    const session = this.#selectedSession();
+    const model = resolveMobileSessionModelAuthority(this.#state.owner, session);
+    const policy = resolveMobileAttachmentPolicy(this.#selectedBackend(session), model?.supportsImages === true);
+    if (!authorityKey || !credential || !policy) return undefined;
+    return {
+      profileId: credential.profileId,
+      surfaceOwnerKey: `${authorityKey}\u001fattachments\u001f${model?.authorityKey ?? "native-default"}`,
+      policy
+    };
   }
 
   async listTaskCatalogMentionCatalog(
@@ -2992,6 +3276,11 @@ export class MobileClient {
     }
     const hasSessionMentions = input.mentions.some((mention) => mention.kind === "session");
     const hasWorkspaceMentions = input.mentions.some((mention) => mention.kind === "workspace");
+    const initialAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission);
+    if (input.attachments.length > 0) {
+      if (!initialAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
+      assertMobileAttachmentPolicy(input.attachments, initialAttachmentPolicy);
+    }
     const initialSessionControls = this.newTaskSessionMentionControls(submission.targetId);
     const initialWorkspaceControls = this.newTaskWorkspaceMentionControls(submission.targetId);
     const fresh = await this.#readNewTaskOwner();
@@ -3006,6 +3295,11 @@ export class MobileClient {
       fresh.snapshot,
       submission.targetId
     );
+    const freshAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, fresh.snapshot);
+    if (input.attachments.length > 0) {
+      if (!freshAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
+      assertMobileAttachmentPolicy(input.attachments, freshAttachmentPolicy);
+    }
     if (hasSessionMentions && sessionControls?.surfaceOwnerKey !== initialSessionControls?.surfaceOwnerKey) {
       throw new Error("Referenced-task authority changed while the structured first message was being checked.");
     }
@@ -3025,6 +3319,7 @@ export class MobileClient {
       finalOwner.snapshot,
       submission.targetId
     );
+    const finalAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, finalOwner.snapshot);
     if (finalAuthorityKey !== freshAuthorityKey
       || hasSessionMentions && finalSessionControls?.surfaceOwnerKey !== sessionControls?.surfaceOwnerKey
       || finalWorkspaceControls?.surfaceOwnerKey !== workspaceControls?.surfaceOwnerKey) {
@@ -3032,6 +3327,24 @@ export class MobileClient {
     }
     assertMobileSessionMentionDraft(finalSessionControls, input);
     assertMobileWorkspaceMentionDraft(finalWorkspaceControls, input);
+    if (input.attachments.length > 0) {
+      if (!finalAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
+      assertMobileAttachmentPolicy(input.attachments, finalAttachmentPolicy);
+    }
+  }
+
+  #newTaskSubmissionAttachmentPolicy(
+    submission: MobileNewTaskSubmission,
+    owner = this.#state.owner
+  ) {
+    const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === submission.targetId);
+    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === submission.backendId);
+    if (!target || target.backendId !== submission.backendId || !backend) return undefined;
+    const model = submission.model === null
+      ? undefined
+      : resolveMobileExplicitNewTaskModelAuthority(owner, submission.backendId, submission.model);
+    if (submission.model !== null && !model) return undefined;
+    return resolveMobileAttachmentPolicy(backend, model?.supportsImages === true);
   }
 
   async #revalidateNewTaskWorkspaceMentionPaths(
@@ -3820,6 +4133,7 @@ export class MobileClient {
         if (wasAutomatic) this.#automaticProfileId = undefined;
         await this.storage.saveSelection(profile.profileId).catch(() => undefined);
         await this.newTaskDrafts?.clear({ profileId: profile.profileId }).catch(() => undefined);
+        await this.attachmentFiles?.clearProfile(profile.profileId).catch(() => undefined);
         removed.add(profile.profileId);
       } catch (error) {
         failed.set(profile.profileId, [message(error), automaticFailure].filter(Boolean).join(" "));
@@ -4217,6 +4531,16 @@ export class MobileClient {
 
 function supportsText(backend: Snapshot["backends"][number]): boolean {
   return backend.capabilities?.capabilities.some((item) => item.name === capabilityNames.inputText && item.support === CapabilitySupport.SUPPORTED) === true;
+}
+
+function sameMobileModelSelection(
+  expected: MobileModelControlSelection,
+  actual: Session["model"]
+): boolean {
+  return actual?.model?.providerId === expected.providerId
+    && actual.model.modelId === expected.modelId
+    && actual.effortId === (expected.effortId ?? "")
+    && actual.fastMode === expected.fastMode;
 }
 
 function uniqueValue<T>(values: readonly T[], predicate: (value: T) => boolean): T | undefined {

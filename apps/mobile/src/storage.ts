@@ -4,6 +4,7 @@ import { createMobileStorage } from "./connection-storage";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileInteractionDraftStore } from "./interaction-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
+import { MobileAttachmentFiles } from "./mobile-attachment-files";
 
 const plainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
@@ -14,6 +15,7 @@ const plainStorage = {
 export const mobileComposerDrafts = new MobileComposerDraftStore(plainStorage);
 export const mobileInteractionDrafts = new MobileInteractionDraftStore(plainStorage);
 export const mobileNewTaskDrafts = new MobileNewTaskDraftStore(plainStorage);
+export const mobileAttachmentFiles = new MobileAttachmentFiles();
 
 export const mobileStorage = createMobileStorage(
   plainStorage,

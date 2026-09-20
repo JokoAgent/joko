@@ -1,12 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import {
-  CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
+  BlobDisposition, CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
-  EventCursorSchema, InputMentionRangeSchema, InputPartSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
+  EventCursorSchema, ImageRefSchema, InputMentionRangeSchema, InputPartSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
   NavigateSessionBranchMutationSchema, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
   PermissionMode,
@@ -252,6 +252,132 @@ describe("native mobile device through the durable product chain", () => {
     }));
     expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
+  });
+
+  it("uploads mobile image/file Blobs and preserves canonical typed parts through Queue, Timeline, and Adapter dispatch", async () => {
+    const attachmentProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-attachments",
+      displayName: "Mobile attachments",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== capabilityNames.inputImage
+          && capability.key !== capabilityNames.inputFile),
+        { key: capabilityNames.inputImage, supported: true as const, options: ["image/png"] },
+        { key: capabilityNames.inputFile, supported: true as const, options: ["application/pdf"] }
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [attachmentProfile],
+      createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
+    });
+    const begunPairing = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko attachment phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begunPairing.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile attachment fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko attachment phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection?.connectionId) throw new Error("The mobile attachment fixture did not pair.");
+    const clients = fixture.clients(paired.authKey);
+    const connectionId = paired.connection.connectionId;
+    const owner = (await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot;
+    const backend = owner?.backends.find((candidate) => candidate.backendId === attachmentProfile.id);
+    expect(backend?.capabilities?.capabilities.find((capability) => capability.name === capabilityNames.inputImage))
+      .toMatchObject({ support: CapabilitySupport.SUPPORTED, options: { kind: { case: "input", value: { mediaTypes: ["image/png"] } } } });
+    expect(backend?.capabilities?.capabilities.find((capability) => capability.name === capabilityNames.inputFile))
+      .toMatchObject({ support: CapabilitySupport.SUPPORTED, options: { kind: { case: "input", value: { mediaTypes: ["application/pdf"] } } } });
+
+    const upload = async (fileName: string, mediaType: string, bytes: Buffer) => {
+      const sha256Hex = createHash("sha256").update(bytes).digest("hex");
+      const pending = await clients.artifact.beginBlobUpload({
+        fileName,
+        mediaType,
+        byteSize: BigInt(bytes.byteLength),
+        sha256Hex,
+        disposition: BlobDisposition.ATTACHMENT
+      });
+      expect(pending.upload).toMatchObject({
+        expectedSha256Hex: sha256Hex,
+        expectedByteSize: BigInt(bytes.byteLength),
+        ticket: {
+          blobId: "",
+          maximumBytes: BigInt(bytes.byteLength),
+          requiredMediaType: mediaType
+        }
+      });
+      const response = await fetch(`${fixture!.baseUrl}${pending.upload!.ticket!.relativeEndpoint}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${paired.authKey}`, "content-type": "application/octet-stream" },
+        body: bytes.toString("utf8")
+      });
+      expect(response.status).toBe(201);
+      const completed = (await clients.artifact.completeBlobUpload({ uploadId: pending.upload!.uploadId })).blob;
+      expect(completed).toMatchObject({
+        fileName,
+        mediaType,
+        byteSize: BigInt(bytes.byteLength),
+        sha256Hex,
+        disposition: BlobDisposition.ATTACHMENT
+      });
+      if (!completed?.blobId) throw new Error("The mobile attachment Blob was not committed.");
+      return completed;
+    };
+    const image = await upload("pixel.png", "image/png", Buffer.from("PNG-MOBILE", "utf8"));
+    const file = await upload("proof.pdf", "application/pdf", Buffer.from("%PDF-MOBILE", "utf8"));
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: attachmentProfile.id,
+      targetId: fixture.targetId(attachmentProfile.id),
+      displayName: "Mobile attachment task"
+    })));
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const mutation = sendInputMutation(sessionId, generation, "");
+    if (mutation.payload.case !== "sendInput" || mutation.payload.value.input === undefined) {
+      throw new Error("The mobile attachment mutation has no InputContent.");
+    }
+    mutation.payload.value.input.parts.splice(0);
+    mutation.payload.value.input.parts.push(
+      create(InputPartSchema, {
+        content: { case: "image", value: create(ImageRefSchema, { blob: image, altText: image.fileName }) }
+      }),
+      create(InputPartSchema, { content: { case: "file", value: file } })
+    );
+
+    const sent = await submit(clients.operation, connectionId, mutation);
+    const queued = queueItemFrom(sent);
+    expect(queued.input?.parts).toMatchObject([
+      { content: { case: "image", value: { blob: { blobId: image.blobId }, altText: "pixel.png" } } },
+      { content: { case: "file", value: { blobId: file.blobId } } }
+    ]);
+    await waitFor(
+      () => clients.run.getRun({ runId: queueRunIdFrom(sent) }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      "mobile attachment dispatch"
+    );
+    const timeline = await waitFor(
+      () => clients.session.listSessionTimeline({ sessionId, limit: 120 }),
+      (value) => value.events.some((event) => event.payload?.kind.case === "messageStarted"
+        && event.payload.kind.value.role === MessageRole.USER),
+      "accepted mobile attachment input"
+    );
+    const accepted = timeline.events.find((event) => event.identity?.runId === queued.runId
+      && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER);
+    if (accepted?.payload?.kind.case !== "messageStarted") throw new Error("The accepted attachment input was not projected.");
+    expect(accepted.payload.kind.value.userInput).toMatchObject(queued.input!);
+    const dispatched = fixture.adapter(attachmentProfile.id).sendCalls.at(-1);
+    expect(dispatched).toMatchObject({
+      text: "",
+      images: [{ blob: { id: image.blobId, fileName: "pixel.png", mimeType: "image/png" }, alt: "pixel.png" }],
+      files: [{ blob: { id: file.blobId, fileName: "proof.pdf", mimeType: "application/pdf" } }]
+    });
   });
 
   it("admits a mobile typed Session reference and preserves its public input ranges through dispatch", async () => {
