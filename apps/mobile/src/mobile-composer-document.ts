@@ -145,10 +145,18 @@ export type MobileComposerAtom = MobileComposerQuoteAtom
   | MobileComposerPastedTextAtom
   | MobileComposerRouteReferenceAtom;
 
+export interface MobileComposerSlashCommandMark {
+  /** Exact local presentation text selected from the current-task command palette. */
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+}
+
 export interface MobileComposerDraft {
   readonly text: string;
   readonly mentions: readonly MobileComposerMention[];
   readonly atoms: readonly MobileComposerAtom[];
+  readonly slashCommands: readonly MobileComposerSlashCommandMark[];
   readonly attachments: readonly MobileComposerAttachment[];
 }
 
@@ -190,6 +198,8 @@ export const mobileSelectionQuoteMaximumCharacters = 4_000;
 export const mobileSelectionQuoteMarker = "<!-- joko-selection-quote -->";
 export const mobileSelectionQuoteMarkerLine = `> ${mobileSelectionQuoteMarker}`;
 const maximumComposerAtoms = 1_024;
+const maximumSlashCommandMarks = 1_024;
+const maximumSlashCommandCharacters = 257;
 const maximumSelectionQuotes = 32;
 const maximumSerializedCharacters = 2_000_000;
 const maximumSessionMentions = 8;
@@ -198,16 +208,17 @@ const maximumLineNumber = 0xffff_ffff;
 const maximumUint64 = 18_446_744_073_709_551_615n;
 
 export function emptyMobileComposerDraft(): MobileComposerDraft {
-  return { text: "", mentions: [], atoms: [], attachments: [] };
+  return { text: "", mentions: [], atoms: [], slashCommands: [], attachments: [] };
 }
 
 export function plainTextMobileComposerDraft(text: string): MobileComposerDraft {
-  return normalizeMobileComposerDraft({ text, mentions: [], atoms: [], attachments: [] });
+  return normalizeMobileComposerDraft({ text, mentions: [], atoms: [], slashCommands: [], attachments: [] });
 }
 
 export function normalizeMobileComposerDraft(value: MobileComposerDraft): MobileComposerDraft {
   if (!value || typeof value !== "object" || typeof value.text !== "string"
-    || !Array.isArray(value.mentions) || !Array.isArray(value.atoms) || !Array.isArray(value.attachments)) {
+    || !Array.isArray(value.mentions) || !Array.isArray(value.atoms)
+    || !Array.isArray(value.slashCommands) || !Array.isArray(value.attachments)) {
     throw new Error("The local Joko structured task draft is invalid.");
   }
   if (value.text.length > maximumDraftCharacters) {
@@ -218,6 +229,9 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   }
   if (value.atoms.length > maximumComposerAtoms) {
     throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
+  }
+  if (value.slashCommands.length > maximumSlashCommandMarks) {
+    throw new Error(`A task message can contain at most ${maximumSlashCommandMarks} selected slash commands.`);
   }
   if (value.atoms.filter((atom) => atom?.kind === "quote").length > maximumSelectionQuotes) {
     throw new Error(`A task message can contain at most ${maximumSelectionQuotes} selected-text quotes.`);
@@ -293,8 +307,27 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
       throw new Error("A Joko reference cannot overlap a structured composer item.");
     }
   }
+  previousEnd = 0;
+  const slashCommands = value.slashCommands.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || typeof candidate.text !== "string"
+      || candidate.text.length < 2 || candidate.text.length > maximumSlashCommandCharacters
+      || !/^\/[^\s/\u0000-\u001f\u007f\u2028\u2029]+$/u.test(candidate.text)
+      || !Number.isSafeInteger(candidate.start) || !Number.isSafeInteger(candidate.end)
+      || candidate.start < previousEnd || candidate.start < 0 || candidate.end <= candidate.start
+      || candidate.end > value.text.length || candidate.end - candidate.start !== candidate.text.length
+      || !isUtf16Boundary(value.text, candidate.start) || !isUtf16Boundary(value.text, candidate.end)
+      || value.text.slice(candidate.start, candidate.end) !== candidate.text) {
+      throw new Error("The local Joko selected slash-command mark is invalid.");
+    }
+    if (mentions.some((mention) => candidate.start < mention.end && candidate.end > mention.start)
+      || atoms.some((atom) => candidate.start < atom.end && candidate.end > atom.start)) {
+      throw new Error("A selected slash command cannot overlap a structured composer item.");
+    }
+    previousEnd = candidate.end;
+    return { text: candidate.text, start: candidate.start, end: candidate.end };
+  });
   const attachments = normalizeMobileComposerAttachmentSet(value.attachments);
-  const draft = { text: value.text, mentions, atoms, attachments };
+  const draft = { text: value.text, mentions, atoms, slashCommands, attachments };
   serializeMobileComposerText(draft);
   return draft;
 }
@@ -307,6 +340,7 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
       ? { ...mention, lineRange: { ...mention.lineRange } }
       : { ...mention }),
     atoms: exact.atoms.map((atom) => ({ ...atom })),
+    slashCommands: exact.slashCommands.map((mark) => ({ ...mark })),
     attachments: exact.attachments.map(cloneMobileComposerAttachment)
   };
 }
@@ -316,6 +350,7 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
   const second = normalizeMobileComposerDraft(right);
   return first.text === second.text && first.mentions.length === second.mentions.length
     && first.atoms.length === second.atoms.length
+    && first.slashCommands.length === second.slashCommands.length
     && first.attachments.length === second.attachments.length
     && first.attachments.every((attachment, index) => {
       const candidate = second.attachments[index];
@@ -332,6 +367,11 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
       return candidate !== undefined && atom.kind === candidate.kind && atom.atomId === candidate.atomId
         && atom.start === candidate.start && atom.end === candidate.end
         && sameComposerAtomAuthority(atom, candidate);
+    })
+    && first.slashCommands.every((mark, index) => {
+      const candidate = second.slashCommands[index];
+      return candidate !== undefined && mark.text === candidate.text
+        && mark.start === candidate.start && mark.end === candidate.end;
     });
 }
 
@@ -753,6 +793,7 @@ export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addi
     text: `${current.text}${separator}${addition}`,
     mentions: current.mentions,
     atoms: current.atoms,
+    slashCommands: current.slashCommands,
     attachments: current.attachments
   });
 }
@@ -788,7 +829,21 @@ export function prependMobileComposerDraft(
       end: atom.end + offset
     }))
   ];
-  return normalizeMobileComposerDraft({ text: `${source.text}${separator}${existing.text}`, mentions, atoms, attachments });
+  const slashCommands = [
+    ...source.slashCommands.map((mark) => ({ ...mark })),
+    ...existing.slashCommands.map((mark) => ({
+      ...mark,
+      start: mark.start + offset,
+      end: mark.end + offset
+    }))
+  ];
+  return normalizeMobileComposerDraft({
+    text: `${source.text}${separator}${existing.text}`,
+    mentions,
+    atoms,
+    slashCommands,
+    attachments
+  });
 }
 
 export function mobileComposerDraftWithoutPrefix(
@@ -809,23 +864,33 @@ export function mobileComposerDraftWithoutPrefix(
       text: existing.text,
       mentions: existing.mentions,
       atoms: existing.atoms,
+      slashCommands: existing.slashCommands,
       attachments: existing.attachments.slice(0, source.attachments.length)
     })) return undefined;
-    return normalizeMobileComposerDraft({ text: "", mentions: [], atoms: [], attachments: remainingAttachments });
+    return normalizeMobileComposerDraft({
+      text: "",
+      mentions: [],
+      atoms: [],
+      slashCommands: [],
+      attachments: remainingAttachments
+    });
   }
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   if (!existing.text.startsWith(`${source.text}${separator}`)) return undefined;
   const sourceMentions = existing.mentions.filter((mention) => mention.end <= source.text.length);
   const sourceAtoms = existing.atoms.filter((atom) => atom.end <= source.text.length);
+  const sourceSlashCommands = existing.slashCommands.filter((mark) => mark.end <= source.text.length);
   if (!mobileComposerDraftsEqual(source, {
     text: source.text,
     mentions: sourceMentions,
     atoms: sourceAtoms,
+    slashCommands: sourceSlashCommands,
     attachments: existing.attachments.slice(0, source.attachments.length)
   })) return undefined;
   if (existing.mentions.some((mention) => mention.start < offset && mention.end > source.text.length)) return undefined;
   if (existing.atoms.some((atom) => atom.start < offset && atom.end > source.text.length)) return undefined;
+  if (existing.slashCommands.some((mark) => mark.start < offset && mark.end > source.text.length)) return undefined;
   return normalizeMobileComposerDraft({
     text: existing.text.slice(offset),
     mentions: existing.mentions
@@ -834,6 +899,9 @@ export function mobileComposerDraftWithoutPrefix(
     atoms: existing.atoms
       .filter((atom) => atom.start >= offset)
       .map((atom) => ({ ...atom, start: atom.start - offset, end: atom.end - offset })),
+    slashCommands: existing.slashCommands
+      .filter((mark) => mark.start >= offset)
+      .map((mark) => ({ ...mark, start: mark.start - offset, end: mark.end - offset })),
     attachments: remainingAttachments
   });
 }
@@ -960,9 +1028,33 @@ export function replaceMobileComposerRange(
     if (atom.start >= range.end) return [{ ...atom, start: atom.start + delta, end: atom.end + delta }];
     return [];
   });
-  const next = normalizeMobileComposerDraft({ text, mentions, atoms, attachments: exact.attachments });
+  const slashCommands = remapSlashCommandMarks(exact.slashCommands, range, replacement.length);
+  const next = normalizeMobileComposerDraft({
+    text,
+    mentions,
+    atoms,
+    slashCommands,
+    attachments: exact.attachments
+  });
   const caret = range.start + replacement.length;
   return { draft: next, selection: { start: caret, end: caret } };
+}
+
+export function markMobileComposerSlashCommand(
+  draft: MobileComposerDraft,
+  start: number,
+  text: string
+): MobileComposerDraft {
+  const exact = normalizeMobileComposerDraft(draft);
+  if (!Number.isSafeInteger(start) || start < 0 || typeof text !== "string") {
+    throw new Error("The selected slash command could not be marked.");
+  }
+  const mark = { text, start, end: start + text.length };
+  return normalizeMobileComposerDraft({
+    ...exact,
+    slashCommands: [...exact.slashCommands, mark]
+      .sort((left, right) => left.start - right.start || left.end - right.end)
+  });
 }
 
 function insertMobileComposerMention(
@@ -988,6 +1080,7 @@ function insertMobileComposerMention(
     text: result.draft.text,
     mentions,
     atoms: result.draft.atoms,
+    slashCommands: result.draft.slashCommands,
     attachments: result.draft.attachments
   });
   const caret = range.start + prefix.length + token.length + suffix.length;
@@ -1016,6 +1109,7 @@ function insertMobileComposerAtom(
     text: result.draft.text,
     mentions: result.draft.mentions,
     atoms,
+    slashCommands: result.draft.slashCommands,
     attachments: result.draft.attachments
   });
   const caret = range.start + prefix.length + token.length + suffix.length;
@@ -1225,6 +1319,21 @@ function cloneMention(mention: MobileComposerMention): MobileComposerMention {
   return mention.kind === "workspace" && mention.lineRange !== undefined
     ? { ...mention, lineRange: { ...mention.lineRange } }
     : { ...mention };
+}
+
+function remapSlashCommandMarks(
+  marks: readonly MobileComposerSlashCommandMark[],
+  range: MobileComposerSelection,
+  replacementLength: number
+): readonly MobileComposerSlashCommandMark[] {
+  const delta = replacementLength - (range.end - range.start);
+  return marks.flatMap((mark) => {
+    if (mark.end <= range.start) return [{ ...mark }];
+    if (mark.start >= range.end) {
+      return [{ ...mark, start: mark.start + delta, end: mark.end + delta }];
+    }
+    return [];
+  });
 }
 
 function mergeRecoveredAttachments(

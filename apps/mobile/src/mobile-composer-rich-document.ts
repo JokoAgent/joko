@@ -5,7 +5,8 @@ import {
   type MobileComposerDraft,
   type MobileComposerEditResult,
   type MobileComposerMention,
-  type MobileComposerSelection
+  type MobileComposerSelection,
+  type MobileComposerSlashCommandMark
 } from "./mobile-composer-document";
 
 export type MobileComposerRichOccurrenceKind = MobileComposerMention["kind"] | MobileComposerAtom["kind"];
@@ -13,6 +14,8 @@ export type MobileComposerRichOccurrenceKind = MobileComposerMention["kind"] | M
 export interface MobileComposerRichTextSegment {
   readonly type: "text";
   readonly text: string;
+  /** Present only while an exact palette-selected command remains unchanged. */
+  readonly slashCommand?: string;
 }
 
 export interface MobileComposerRichOccurrenceSegment {
@@ -62,7 +65,7 @@ export function mobileComposerRichDocument(draft: MobileComposerDraft): MobileCo
   const nodes: MobileComposerRichRenderNode[] = [];
   let offset = 0;
   for (const occurrence of occurrences) {
-    pushText(nodes, exact.text.slice(offset, occurrence.start));
+    pushDraftText(nodes, exact, offset, occurrence.start);
     const token = exact.text.slice(occurrence.start, occurrence.end);
     if (occurrence.mention) {
       const mention = occurrence.mention;
@@ -94,7 +97,7 @@ export function mobileComposerRichDocument(draft: MobileComposerDraft): MobileCo
     }
     offset = occurrence.end;
   }
-  pushText(nodes, exact.text.slice(offset));
+  pushDraftText(nodes, exact, offset, exact.text.length);
   return { version: 1, nodes };
 }
 
@@ -106,7 +109,7 @@ export function reconcileMobileComposerRichDocument(
   const exact = normalizeMobileComposerDraft(draft);
   if (!Array.isArray(segments)) throw new Error("The Joko rich composer document is invalid.");
   const occurrences = orderedOccurrences(exact);
-  if (segments.length > occurrences.length * 2 + 1) {
+  if (segments.length > occurrences.length * 2 + exact.slashCommands.length * 2 + 1) {
     throw new Error("The Joko rich composer document has too many segments.");
   }
   const byKey = new Map(occurrences.map((occurrence, index) => [occurrence.occurrenceKey, {
@@ -117,8 +120,10 @@ export function reconcileMobileComposerRichDocument(
   const text: string[] = [];
   const mentions: MobileComposerMention[] = [];
   const atoms: MobileComposerAtom[] = [];
+  const reportedSlashCommands: MobileComposerSlashCommandMark[] = [];
   let length = 0;
   let lastOccurrenceIndex = -1;
+  let previousTextMark: string | undefined;
   let previousWasText = false;
 
   for (const segment of segments) {
@@ -126,12 +131,19 @@ export function reconcileMobileComposerRichDocument(
       throw new Error("The Joko rich composer document contains an invalid segment.");
     }
     if (segment.type === "text") {
-      if (typeof segment.text !== "string" || segment.text.length === 0 || previousWasText) {
+      const slashCommand = segment.slashCommand;
+      if (typeof segment.text !== "string" || segment.text.length === 0
+        || slashCommand !== undefined && (typeof slashCommand !== "string" || slashCommand !== segment.text
+          || slashCommand.length > 257 || !/^\/[^\s/\u0000-\u001f\u007f\u2028\u2029]+$/u.test(slashCommand))
+        || previousWasText && previousTextMark === slashCommand) {
         throw new Error("The Joko rich composer text segment is invalid.");
       }
+      const start = length;
       length = boundedLength(length, segment.text.length);
       text.push(segment.text);
+      if (slashCommand !== undefined) reportedSlashCommands.push({ text: slashCommand, start, end: length });
       previousWasText = true;
+      previousTextMark = slashCommand;
       continue;
     }
     if (segment.type !== "occurrence" || typeof segment.occurrenceKey !== "string"
@@ -154,12 +166,19 @@ export function reconcileMobileComposerRichDocument(
       atoms.push({ ...owned.occurrence.atom, start, end: length });
     }
     previousWasText = false;
+    previousTextMark = undefined;
   }
 
+  const nextText = text.join("");
+  const mappedSlashCommands = remapRichSlashCommandMarks(exact, nextText);
+  const slashCommands = mappedSlashCommands.filter((mark) => reportedSlashCommands.some((reported) => (
+    reported.text === mark.text && reported.start === mark.start && reported.end === mark.end
+  )));
   const next = normalizeMobileComposerDraft({
-    text: text.join(""),
+    text: nextText,
     mentions,
     atoms,
+    slashCommands,
     attachments: exact.attachments
   });
   const normalizedSelection = validateMobileComposerRichSelection(next, selection);
@@ -182,7 +201,9 @@ export function mobileComposerRichDocumentsEqual(
   return left.nodes.every((node, index) => {
     const candidate = right.nodes[index];
     if (!candidate || node.type !== candidate.type) return false;
-    if (node.type === "text" && candidate.type === "text") return node.text === candidate.text;
+    if (node.type === "text" && candidate.type === "text") {
+      return node.text === candidate.text && node.slashCommand === candidate.slashCommand;
+    }
     return node.type === "occurrence" && candidate.type === "occurrence"
       && node.occurrenceKey === candidate.occurrenceKey && node.kind === candidate.kind
       && node.token === candidate.token && node.label === candidate.label
@@ -215,11 +236,58 @@ function orderedOccurrences(draft: MobileComposerDraft): OwnedOccurrence[] {
   return occurrences;
 }
 
-function pushText(nodes: MobileComposerRichRenderNode[], text: string): void {
+function pushDraftText(
+  nodes: MobileComposerRichRenderNode[],
+  draft: MobileComposerDraft,
+  start: number,
+  end: number
+): void {
+  let offset = start;
+  for (const mark of draft.slashCommands) {
+    if (mark.end <= start) continue;
+    if (mark.start >= end) break;
+    pushText(nodes, draft.text.slice(offset, mark.start));
+    pushText(nodes, draft.text.slice(mark.start, mark.end), mark.text);
+    offset = mark.end;
+  }
+  pushText(nodes, draft.text.slice(offset, end));
+}
+
+function pushText(nodes: MobileComposerRichRenderNode[], text: string, slashCommand?: string): void {
   if (!text) return;
   const previous = nodes.at(-1);
-  if (previous?.type === "text") nodes[nodes.length - 1] = { type: "text", text: previous.text + text };
-  else nodes.push({ type: "text", text });
+  if (previous?.type === "text" && previous.slashCommand === slashCommand) {
+    nodes[nodes.length - 1] = {
+      type: "text",
+      text: previous.text + text,
+      ...(slashCommand === undefined ? {} : { slashCommand })
+    };
+  } else {
+    nodes.push({ type: "text", text, ...(slashCommand === undefined ? {} : { slashCommand }) });
+  }
+}
+
+function remapRichSlashCommandMarks(
+  draft: MobileComposerDraft,
+  nextText: string
+): readonly MobileComposerSlashCommandMark[] {
+  if (draft.text === nextText) return draft.slashCommands.map((mark) => ({ ...mark }));
+  let prefix = 0;
+  while (prefix < draft.text.length && prefix < nextText.length && draft.text[prefix] === nextText[prefix]) prefix += 1;
+  while (prefix > 0 && (!isUtf16Boundary(draft.text, prefix) || !isUtf16Boundary(nextText, prefix))) prefix -= 1;
+  let suffix = 0;
+  while (suffix < draft.text.length - prefix && suffix < nextText.length - prefix
+    && draft.text[draft.text.length - suffix - 1] === nextText[nextText.length - suffix - 1]) suffix += 1;
+  while (suffix > 0 && (!isUtf16Boundary(draft.text, draft.text.length - suffix)
+    || !isUtf16Boundary(nextText, nextText.length - suffix))) suffix -= 1;
+  const oldEnd = draft.text.length - suffix;
+  const replacementLength = nextText.length - prefix - suffix;
+  const delta = replacementLength - (oldEnd - prefix);
+  return draft.slashCommands.flatMap((mark) => {
+    if (mark.end <= prefix) return [{ ...mark }];
+    if (mark.start >= oldEnd) return [{ ...mark, start: mark.start + delta, end: mark.end + delta }];
+    return [];
+  });
 }
 
 function boundedLength(current: number, addition: number): number {

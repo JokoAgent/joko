@@ -63,7 +63,7 @@ export interface MobileNewTaskDraftSnapshot {
   readonly draft?: MobileNewTaskDraft;
 }
 
-const storagePrefix = "joko.mobile.new-task-draft.v7";
+const storagePrefix = "joko.mobile.new-task-draft.v8";
 const persistDebounceMilliseconds = 400;
 const maximumStoredCharacters = 12_110_000;
 
@@ -465,7 +465,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
 function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): string {
   const exact = normalizeDraft(draft);
   const serialized = JSON.stringify({
-    version: 7,
+    version: 8,
     identity: normalizeIdentity(identity),
     draft: exact.submission === undefined
       ? exact
@@ -478,13 +478,15 @@ function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewT
 function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved new-task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 7 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 8 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId) {
     throw new Error("new-task draft identity mismatch");
   }
   const draft = value["draft"];
   if (!isRecord(draft) || typeof draft["targetId"] !== "string" || typeof draft["name"] !== "string"
-    || !isRecord(draft["input"]) || !Array.isArray(draft["input"]["atoms"])) {
+    || !isRecord(draft["input"]) || !Array.isArray(draft["input"]["mentions"])
+    || !Array.isArray(draft["input"]["atoms"]) || !Array.isArray(draft["input"]["slashCommands"])
+    || !Array.isArray(draft["input"]["attachments"])) {
     throw new Error("invalid new-task draft envelope");
   }
   const editable = normalizeEditableDraft({
@@ -534,6 +536,9 @@ function cloneEditableDraft(draft: MobileNewTaskEditableDraft): MobileNewTaskEdi
 
 function normalizeNewTaskInput(value: MobileComposerDraft): MobileComposerDraft {
   const input = normalizeMobileComposerDraft(value);
+  if (input.slashCommands.length > 0) {
+    throw new Error("A selected slash command requires an existing task runtime.");
+  }
   if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
     throw new Error("A new task can reference existing tasks and its selected Workspace, but not runtime Resources or Artifacts.");
   }

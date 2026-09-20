@@ -174,11 +174,19 @@ function parseSegments(value: unknown): readonly MobileComposerRichEditSegment[]
   let textCharacters = 0;
   for (const segment of value) {
     if (!isRecord(segment) || typeof segment.type !== "string") return undefined;
-    if (segment.type === "text" && exactKeys(segment, ["type", "text"])
-      && typeof segment.text === "string" && segment.text.length > 0) {
+    if (segment.type === "text"
+      && (exactKeys(segment, ["type", "text"]) || exactKeys(segment, ["type", "text", "slashCommand"]))
+      && typeof segment.text === "string" && segment.text.length > 0
+      && (segment.slashCommand === undefined || typeof segment.slashCommand === "string"
+        && segment.slashCommand === segment.text && segment.slashCommand.length <= 257
+        && /^\/[^\s/\u0000-\u001f\u007f\u2028\u2029]+$/u.test(segment.slashCommand))) {
       textCharacters += segment.text.length;
       if (!Number.isSafeInteger(textCharacters) || textCharacters > maximumDocumentCharacters) return undefined;
-      segments.push({ type: "text", text: segment.text });
+      segments.push({
+        type: "text",
+        text: segment.text,
+        ...(segment.slashCommand === undefined ? {} : { slashCommand: segment.slashCommand })
+      });
       continue;
     }
     if (segment.type === "occurrence" && exactKeys(segment, ["type", "occurrenceKey"])

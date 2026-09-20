@@ -20,6 +20,7 @@ describe("mobile composer rich input protocol", () => {
       documentId: 7,
       segments: [
         { type: "text", text: "hello " },
+        { type: "text", text: "/review", slashCommand: "/review" },
         { type: "occurrence", occurrenceKey: "mention:one" }
       ],
       start: 6,
@@ -30,6 +31,7 @@ describe("mobile composer rich input protocol", () => {
       documentId: 7,
       segments: [
         { type: "text", text: "hello " },
+        { type: "text", text: "/review", slashCommand: "/review" },
         { type: "occurrence", occurrenceKey: "mention:one" }
       ],
       start: 6,
@@ -107,6 +109,18 @@ describe("mobile composer rich input protocol", () => {
     expect(parseMobileComposerRichWebMessage(encode({
       ...base,
       segments: [{ type: "text", text: "x".repeat(mobileComposerRichProtocolLimits.maximumDocumentCharacters + 1) }]
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      ...base,
+      segments: [{ type: "text", text: "/review", slashCommand: "/clear" }]
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      ...base,
+      segments: [{ type: "text", text: "review", slashCommand: "review" }]
+    }))).toBeUndefined();
+    expect(parseMobileComposerRichWebMessage(encode({
+      ...base,
+      segments: [{ type: "text", text: "/review", slashCommand: "/review", commandId: "forged" }]
     }))).toBeUndefined();
   });
 

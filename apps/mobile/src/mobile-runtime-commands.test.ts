@@ -22,7 +22,9 @@ import { describe, expect, it } from "vitest";
 import {
   appendMobileSelectionQuote,
   insertMobileSessionMention,
-  plainTextMobileComposerDraft
+  mobileComposerInput,
+  plainTextMobileComposerDraft,
+  replaceMobileComposerRange
 } from "./mobile-composer-document";
 import {
   MobileRuntimeCommandCatalogCache,
@@ -255,6 +257,7 @@ describe("mobile runtime command activation and replacement", () => {
     });
     expect(result.draft.text).toContain("/review\n\n");
     expect(result.draft.text).not.toContain("Suffix");
+    expect(result.draft.slashCommands).toEqual([{ text: "/review", start: from, end: from + "/review".length }]);
     expect(result.selection).toEqual({ start: from + "/review".length, end: from + "/review".length });
     expect(result.draft.mentions).toMatchObject(withQuote.mentions);
     expect(result.draft.atoms[0]).toMatchObject({ atomId: "quote", text: "Quoted answer" });
@@ -262,9 +265,25 @@ describe("mobile runtime command activation and replacement", () => {
 
     const atEnd = plainTextMobileComposerDraft("/old");
     const endActivation = detectMobileRuntimeCommandActivation(atEnd, { start: 4, end: 4 }, false)!;
-    expect(replaceMobileRuntimeCommandRun(atEnd, endActivation, {
+    const selectedAtEnd = replaceMobileRuntimeCommandRun(atEnd, endActivation, {
       commandId: "review", name: "review", description: "Review", source: RuntimeCommandSource.PROMPT
-    }).draft.text).toBe("/review ");
+    });
+    expect(selectedAtEnd.draft.text).toBe("/review ");
+    expect(selectedAtEnd.draft.slashCommands).toEqual([{ text: "/review", start: 0, end: 7 }]);
+    expect(mobileComposerInput(selectedAtEnd.draft)).toMatchObject({
+      parts: [{ content: { case: "text", value: "/review " } }],
+      mentionRanges: [],
+      pastedTextRanges: [],
+      quotesEncoded: false
+    });
+    expect(JSON.stringify(mobileComposerInput(selectedAtEnd.draft))).not.toContain("slashCommand");
+
+    const shifted = replaceMobileComposerRange(selectedAtEnd.draft, { start: 0, end: 0 }, "😀 ");
+    expect(shifted.draft.slashCommands).toEqual([{ text: "/review", start: 3, end: 10 }]);
+    const demoted = replaceMobileComposerRange(shifted.draft, { start: 5, end: 6 }, "x");
+    expect(demoted.draft.text).toBe("😀 /rxview ");
+    expect(demoted.draft.slashCommands).toEqual([]);
+    expect(plainTextMobileComposerDraft("/review ").slashCommands).toEqual([]);
 
     const withSpace = plainTextMobileComposerDraft("/old next");
     const spaceActivation = detectMobileRuntimeCommandActivation(withSpace, { start: 4, end: 4 }, false)!;

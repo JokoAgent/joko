@@ -8,6 +8,7 @@ import {
   type Snapshot
 } from "@joko/contracts";
 import {
+  markMobileComposerSlashCommand,
   normalizeMobileComposerDraft,
   replaceMobileComposerRange,
   type MobileComposerDraft,
@@ -269,7 +270,12 @@ export function replaceMobileRuntimeCommandRun<Command extends { readonly name: 
     throw new Error("The typed runtime command changed before it could be inserted.");
   }
   const separator = to < exact.text.length && /\s/u.test(exact.text[to] ?? "") ? "" : " ";
-  return replaceMobileComposerRange(exact, { start: from, end: to }, `/${command.name}${separator}`);
+  const commandText = `/${command.name}`;
+  const result = replaceMobileComposerRange(exact, { start: from, end: to }, `${commandText}${separator}`);
+  return {
+    ...result,
+    draft: markMobileComposerSlashCommand(result.draft, from, commandText)
+  };
 }
 
 export class MobileRuntimeCommandCatalogCache {

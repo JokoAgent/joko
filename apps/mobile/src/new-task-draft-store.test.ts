@@ -10,6 +10,7 @@ import {
   insertMobileSessionMention,
   insertMobileStructuredClipboardText,
   insertMobileWorkspaceMention,
+  markMobileComposerSlashCommand,
   plainTextMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
@@ -212,13 +213,13 @@ describe("mobile new-task retained draft store", () => {
       input: structuredInput()
     });
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":7');
+    expect(raw).toContain('"version":8');
     expect(raw).toContain('"routeKind":"path"');
     expect(raw).toContain('"serialized":"@src/main.ts"');
     expect(raw).not.toContain("D:\\\\repo");
   });
 
-  it("atomically replaces a v7 attachment identity in both editable and frozen submission input", async () => {
+  it("atomically replaces a v8 attachment identity in both editable and frozen submission input", async () => {
     const memory = memoryDriver();
     const store = new MobileNewTaskDraftStore(memory.driver);
     const local = attachedInput("local");
@@ -235,7 +236,7 @@ describe("mobile new-task retained draft store", () => {
       first, authority.createOperationId, local, attachedInput("uploaded")
     )).rejects.toThrow(/changed while it was being committed/u);
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":7');
+    expect(raw).toContain('"version":8');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -267,7 +268,7 @@ describe("mobile new-task retained draft store", () => {
 
     const crossProfile = new MobileNewTaskDraftStore(memory.driver);
     memory.values.set(key, JSON.stringify({
-      version: 7,
+      version: 8,
       identity: second,
       draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
@@ -280,7 +281,7 @@ describe("mobile new-task retained draft store", () => {
     }));
     await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
-    for (const version of [1, 2, 3, 4, 5, 6]) {
+    for (const version of [1, 2, 3, 4, 5, 6, 7]) {
       memory.values.set(key, JSON.stringify({
         version,
         identity: first,
@@ -290,7 +291,7 @@ describe("mobile new-task retained draft store", () => {
     }
 
     memory.values.set(key, JSON.stringify({
-      version: 7,
+      version: 8,
       identity: first,
       draft: {
         targetId: "target-one",
@@ -328,6 +329,11 @@ describe("mobile new-task retained draft store", () => {
     ).draft;
     expect(() => oversized.save(first, { targetId: "target-one", name: "", input: runtimeResource }))
       .toThrow(/not runtime Resources or Artifacts/u);
+    expect(() => oversized.save(first, {
+      targetId: "target-one",
+      name: "",
+      input: markMobileComposerSlashCommand(input("/review"), 0, "/review")
+    })).toThrow(/existing task runtime/u);
   });
 
   it("reports write failures without discarding the in-memory workflow and can flush it later", async () => {

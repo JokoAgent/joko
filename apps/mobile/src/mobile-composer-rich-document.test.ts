@@ -6,6 +6,8 @@ import {
   insertMobileRouteReferencePaste,
   insertMobileSessionMention,
   insertMobileStructuredClipboardText,
+  markMobileComposerSlashCommand,
+  plainTextMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
@@ -141,6 +143,37 @@ describe("mobile composer rich document", () => {
     ], { start: 1, end: 1 })).toThrow(/selection/u);
   });
 
+  it("retains only exact native-owned editable slash marks across rich edits", () => {
+    const selected = markMobileComposerSlashCommand(
+      plainTextMobileComposerDraft("Before /review after"),
+      7,
+      "/review"
+    );
+    expect(mobileComposerRichDocument(selected).nodes).toEqual([
+      { type: "text", text: "Before " },
+      { type: "text", text: "/review", slashCommand: "/review" },
+      { type: "text", text: " after" }
+    ]);
+
+    const shifted = reconcileMobileComposerRichDocument(selected, [
+      { type: "text", text: "😀 Before " },
+      { type: "text", text: "/review", slashCommand: "/review" },
+      { type: "text", text: " after" }
+    ], { start: 3, end: 3 });
+    expect(shifted.draft.slashCommands).toEqual([{ text: "/review", start: 10, end: 17 }]);
+
+    const edited = reconcileMobileComposerRichDocument(selected, [
+      { type: "text", text: "Before /revise after" }
+    ], { start: 14, end: 14 });
+    expect(edited.draft.slashCommands).toEqual([]);
+
+    const manuallyTyped = plainTextMobileComposerDraft("/review");
+    const forgedPresentation = reconcileMobileComposerRichDocument(manuallyTyped, [
+      { type: "text", text: "/review", slashCommand: "/review" }
+    ], { start: 7, end: 7 });
+    expect(forgedPresentation.draft.slashCommands).toEqual([]);
+  });
+
   it("projects task links as atomic accessible occurrences and permits whole-node deletion", () => {
     const inserted = insertMobileRouteReferencePaste(
       emptyMobileComposerDraft(),
@@ -223,6 +256,8 @@ describe("mobile composer rich document", () => {
     const removed = reconcileMobileComposerRichDocument(inserted.draft, [
       { type: "text", text: "Open  now" }
     ], { start: 5, end: 5 });
-    expect(removed.draft).toEqual({ text: "Open  now", mentions: [], atoms: [], attachments: [] });
+    expect(removed.draft).toEqual({
+      text: "Open  now", mentions: [], atoms: [], slashCommands: [], attachments: []
+    });
   });
 });

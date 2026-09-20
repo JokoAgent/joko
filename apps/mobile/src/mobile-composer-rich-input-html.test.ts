@@ -23,6 +23,7 @@ describe("mobile composer rich input HTML", () => {
       version: 1,
       nodes: [
         { type: "text", text: "hello " },
+        { type: "text", text: "/review", slashCommand: "/review" },
         { type: "occurrence", occurrenceKey: "mention:one", kind: "session", token: "@Task",
           label: "@Task", accessibilityLabel: "Task reference Task", block: false }
       ]
@@ -51,6 +52,10 @@ describe("mobile composer rich input HTML", () => {
     expect(html).toContain("event.inputType === 'insertParagraph'");
     expect(html).toContain("event.preventDefault()");
     expect(html).toContain("removeOccurrenceAtCaret");
+    expect(html).toContain("className = 'slash-command'");
+    expect(html).toContain("Selected slash command ");
+    expect(html).toContain("text === child.dataset.slashCommand ? text : undefined");
+    expect(html).toContain("{ slashCommand }");
     expect(html).toContain("window.jokoComposer");
     expect(html).toContain("type: 'paste'");
     expect(html).not.toContain("fetch(");

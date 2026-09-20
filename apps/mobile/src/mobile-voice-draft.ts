@@ -5,7 +5,8 @@ import {
   type MobileComposerAtom,
   type MobileComposerDraft,
   type MobileComposerMention,
-  type MobileComposerSelection
+  type MobileComposerSelection,
+  type MobileComposerSlashCommandMark
 } from "./mobile-composer-document";
 import { isMobileVoiceInsertionIntact, type MobileVoiceDraftInsertion } from "./mobile-voice-input";
 
@@ -18,6 +19,10 @@ export interface MobileVoiceDraftInsertionContext {
     readonly relativeEnd: number;
   })[];
   readonly rollbackAtoms: readonly (MobileComposerAtom & {
+    readonly relativeStart: number;
+    readonly relativeEnd: number;
+  })[];
+  readonly rollbackSlashCommands: readonly (MobileComposerSlashCommandMark & {
     readonly relativeStart: number;
     readonly relativeEnd: number;
   })[];
@@ -86,6 +91,12 @@ export function applyMobileVoiceTranscript(
       relativeStart: atom.start - start,
       relativeEnd: atom.end - start
     }));
+  const rollbackSlashCommands = current.slashCommands.filter((mark) => mark.start < end && mark.end > start)
+    .map((mark) => ({
+      ...mark,
+      relativeStart: mark.start - start,
+      relativeEnd: mark.end - start
+    }));
   return {
     context: {
       insertion: { start, end: start + replacement.length, text: replacement },
@@ -93,6 +104,7 @@ export function applyMobileVoiceTranscript(
       rollbackText: current.text.slice(start, end),
       rollbackMentions,
       rollbackAtoms,
+      rollbackSlashCommands,
       transcriptPrefix,
       transcriptSuffix,
       persisted: persist
@@ -128,12 +140,22 @@ export function rollbackMobileVoiceTranscript(
       end: context.insertion.start + relativeEnd
     } as MobileComposerAtom;
   });
+  const restoredSlashCommands = context.rollbackSlashCommands.map((mark) => {
+    const { relativeStart, relativeEnd, ...value } = mark;
+    return {
+      ...value,
+      start: context.insertion.start + relativeStart,
+      end: context.insertion.start + relativeEnd
+    } as MobileComposerSlashCommandMark;
+  });
   return {
     draft: normalizeMobileComposerDraft({
       ...restored.draft,
       mentions: [...restored.draft.mentions, ...restoredMentions]
         .sort((left, right) => left.start - right.start || left.end - right.end),
       atoms: [...restored.draft.atoms, ...restoredAtoms]
+        .sort((left, right) => left.start - right.start || left.end - right.end),
+      slashCommands: [...restored.draft.slashCommands, ...restoredSlashCommands]
         .sort((left, right) => left.start - right.start || left.end - right.end)
     }),
     selection: restored.selection

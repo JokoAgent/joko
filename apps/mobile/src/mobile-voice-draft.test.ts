@@ -3,6 +3,7 @@ import {
   appendMobileSelectionQuote,
   insertMobilePastedText,
   insertMobileSessionMention,
+  markMobileComposerSlashCommand,
   mobileComposerDraftsEqual,
   plainTextMobileComposerDraft
 } from "./mobile-composer-document";
@@ -87,6 +88,23 @@ describe("mobile voice draft projection", () => {
     );
     expect(partial.draft?.atoms).toEqual([]);
     expect(partial.context?.rollbackAtoms).toHaveLength(1);
+    const restored = rollbackMobileVoiceTranscript(partial.draft!, partial.context!);
+    expect(restored).toBeDefined();
+    expect(mobileComposerDraftsEqual(restored!.draft, base)).toBe(true);
+  });
+
+  it("restores an exact selected slash mark when a cancellable transcript replaced its editable text", () => {
+    const base = markMobileComposerSlashCommand(plainTextMobileComposerDraft("/review next"), 0, "/review");
+    const partial = applyMobileVoiceTranscript(
+      base,
+      { start: 0, end: 7 },
+      undefined,
+      "dictated",
+      false,
+      "draft-one"
+    );
+    expect(partial.draft?.slashCommands).toEqual([]);
+    expect(partial.context?.rollbackSlashCommands).toHaveLength(1);
     const restored = rollbackMobileVoiceTranscript(partial.draft!, partial.context!);
     expect(restored).toBeDefined();
     expect(mobileComposerDraftsEqual(restored!.draft, base)).toBe(true);

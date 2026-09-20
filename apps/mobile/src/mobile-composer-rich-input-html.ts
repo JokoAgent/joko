@@ -66,6 +66,7 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
 .occurrence{display:inline-block;max-width:92%;margin:1px 2px;padding:2px 7px;border:1px solid var(--border);border-radius:9px;background:var(--chip);color:var(--text);font-size:13px;line-height:18px;font-weight:650;vertical-align:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;-webkit-user-select:all;user-select:all}
 .occurrence.quote{display:block;width:max-content;max-width:100%;margin:5px 0;padding:7px 9px;border-left:3px solid var(--focus);border-radius:8px;color:var(--text-secondary)}
 .occurrence:focus{outline:2px solid var(--focus);outline-offset:1px}
+.slash-command{display:inline;margin:0 1px;padding:1px 5px;border:1px solid var(--border);border-radius:6px;background:var(--chip);color:var(--text);box-decoration-break:clone;-webkit-box-decoration-break:clone}
 </style></head><body><div id="root" role="textbox" aria-multiline="true"></div>
 <script>
 (() => {
@@ -127,7 +128,20 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
   };
   const makeNodes = (node) => {
     if (!node || typeof node !== 'object') return [];
-    if (node.type === 'text') return node.text ? [document.createTextNode(String(node.text))] : [];
+    if (node.type === 'text') {
+      const text = String(node.text || '');
+      if (!text) return [];
+      if (node.slashCommand === text) {
+        const mark = document.createElement('span');
+        mark.className = 'slash-command';
+        mark.dataset.slashCommand = text;
+        mark.setAttribute('role', 'text');
+        mark.setAttribute('aria-label', 'Selected slash command ' + text);
+        mark.textContent = text;
+        return [mark];
+      }
+      return [document.createTextNode(text)];
+    }
     if (node.type !== 'occurrence') return [];
     return [makeOccurrence(node), document.createTextNode(CARET_ANCHOR)];
   };
@@ -150,11 +164,11 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
   const cleanText = (node) => {
     return String(node.nodeValue || '').split(CARET_ANCHOR).join('');
   };
-  const pushText = (segments, text) => {
+  const pushText = (segments, text, slashCommand) => {
     if (!text) return;
     const previous = segments[segments.length - 1];
-    if (previous && previous.type === 'text') previous.text += text;
-    else segments.push({ type: 'text', text });
+    if (previous && previous.type === 'text' && previous.slashCommand === slashCommand) previous.text += text;
+    else segments.push(Object.assign({ type: 'text', text }, slashCommand ? { slashCommand } : {}));
   };
   const walkSegments = (parent, segments) => {
     const children = Array.from(parent.childNodes);
@@ -167,6 +181,12 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
       if (child.classList.contains('occurrence')) {
         const occurrenceKey = child.dataset.occurrenceKey;
         if (occurrenceKey) segments.push({ type: 'occurrence', occurrenceKey });
+        return;
+      }
+      if (child.classList.contains('slash-command')) {
+        const text = String(child.textContent || '').split(CARET_ANCHOR).join('');
+        const slashCommand = text === child.dataset.slashCommand ? text : undefined;
+        pushText(segments, text, slashCommand);
         return;
       }
       if (child.tagName === 'BR') {

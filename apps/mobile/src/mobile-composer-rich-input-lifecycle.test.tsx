@@ -4,7 +4,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerRichInput } from "./MobileComposerRichInput";
-import { plainTextMobileComposerDraft, type MobileComposerDraft } from "./mobile-composer-document";
+import {
+  markMobileComposerSlashCommand,
+  plainTextMobileComposerDraft,
+  type MobileComposerDraft
+} from "./mobile-composer-document";
 
 const bridge = vi.hoisted((): {
   instanceId: string;
@@ -197,6 +201,30 @@ describe("mobile composer rich input lifecycle", () => {
       end: 10
     });
     expect(mounted.onEdit).not.toHaveBeenCalled();
+  });
+
+  it("restores an exact selected slash mark after process loss and demotes an edited mark", () => {
+    const draft = markMobileComposerSlashCommand(plainTextMobileComposerDraft("/review next"), 0, "/review");
+    const mounted = mount(draft);
+    mounted.ready();
+    act(() => bridge.onContentProcessDidTerminate());
+    mounted.ready();
+    expect(mounted.page.document).toEqual({
+      version: 1,
+      nodes: [
+        { type: "text", text: "/review", slashCommand: "/review" },
+        { type: "text", text: " next" }
+      ]
+    });
+    mounted.send({
+      type: "change",
+      documentId: mounted.page.documentId,
+      segments: [{ type: "text", text: "/revise next" }],
+      start: 7,
+      end: 7
+    });
+    expect(mounted.onEdit).toHaveBeenCalledTimes(1);
+    expect(mounted.onEdit.mock.calls[0]?.[0]).toMatchObject({ draft: { slashCommands: [] } });
   });
 
   it("forwards composition and consumed palette keys only from the active editor instance", () => {

@@ -45,6 +45,7 @@ describe("mobile structured composer document", () => {
       text: "",
       mentions: [],
       atoms: [],
+      slashCommands: [],
       attachments: [
         {
           state: "uploaded",
@@ -121,6 +122,7 @@ describe("mobile structured composer document", () => {
       text: later.text,
       mentions: [{ ...later.mentions[0]!, mentionId: "shared-occurrence-recovered-1" }],
       atoms: [],
+      slashCommands: [],
       attachments: []
     });
     expect(mobileComposerDraftWithoutPrefix(first, plainTextMobileComposerDraft("Newer unrelated draft"))).toBeUndefined();
@@ -131,6 +133,7 @@ describe("mobile structured composer document", () => {
       text: "Send the proof",
       mentions: [],
       atoms: [],
+      slashCommands: [],
       attachments: [{
         state: "uploaded",
         attachmentId: "submitted-file",
@@ -163,6 +166,7 @@ describe("mobile structured composer document", () => {
       text: "",
       mentions: [],
       atoms: [],
+      slashCommands: [],
       attachments: [newer.attachments[1]]
     });
   });
@@ -279,6 +283,7 @@ describe("mobile structured composer document", () => {
         ...overrides
       }],
       atoms: [],
+      slashCommands: [],
       attachments: []
     });
 
@@ -348,6 +353,7 @@ describe("mobile structured composer document", () => {
         ...overrides
       }],
       atoms: [],
+      slashCommands: [],
       attachments: []
     });
     const artifact = (overrides: Record<string, unknown> = {}) => normalizeMobileComposerDraft({
@@ -357,6 +363,7 @@ describe("mobile structured composer document", () => {
         displayText: "Artifact", start: 0, end: 9, ...overrides
       }],
       atoms: [],
+      slashCommands: [],
       attachments: []
     });
 
@@ -505,6 +512,7 @@ describe("mobile structured composer document", () => {
       text: "😀 @Task",
       mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 8 }],
       atoms: [],
+      slashCommands: [],
       attachments: []
     })).toThrow(/range/);
     expect(() => normalizeMobileComposerDraft({
@@ -514,6 +522,7 @@ describe("mobile structured composer document", () => {
         { kind: "session", mentionId: "same", sessionId: "two", displayText: "Task", start: 6, end: 11 }
       ],
       atoms: [],
+      slashCommands: [],
       attachments: []
     })).toThrow(/duplicated/);
   });
@@ -691,6 +700,7 @@ describe("mobile structured composer document", () => {
         start: 0,
         end: 16
       }],
+      slashCommands: [],
       attachments: []
     })).toThrow(/target|range/u);
   });
@@ -754,6 +764,7 @@ describe("mobile structured composer document", () => {
         start: 0,
         end: 23
       }],
+      slashCommands: [],
       attachments: []
     })).toThrow(/Workspace path|range/u);
   });
