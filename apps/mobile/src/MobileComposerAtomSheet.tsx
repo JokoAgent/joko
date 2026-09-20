@@ -47,7 +47,9 @@ export function MobileComposerAtomSheet({
         </View>
         {atom.kind === "quote" && <Text style={[styles.help, { color: colors.muted }]}>Quoted from the exact assistant message in task {atom.sourceSessionId}.</Text>}
         {atom.kind === "route-reference" && <Text style={[styles.help, { color: colors.muted }]}>
-          {atom.messageId || atom.eventId ? "Message link" : "Task link"} · task {atom.sessionId}. This link does not grant task access or navigate automatically.
+          {atom.routeKind === "project"
+            ? `Project link · project ${atom.projectId}.`
+            : `${atom.messageId || atom.eventId ? "Message link" : "Task link"} · task ${atom.sessionId}.`} This link does not grant access or navigate automatically.
         </Text>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           {atom.kind === "quote"
@@ -57,10 +59,12 @@ export function MobileComposerAtomSheet({
               ? <TextInput accessibilityLabel="Pasted text" multiline value={pasteText} editable={!busy}
                 maxLength={mobileLongPasteMaximumCharacters} onChangeText={setPasteText}
                 style={[styles.input, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
-              : <View accessibilityLabel="Task link details"
+              : <View accessibilityLabel={`${atom.routeKind === "project" ? "Project" : "Task"} link details`}
                   style={[styles.readText, { backgroundColor: colors.background, borderColor: colors.border }]}>
-                  <Text selectable accessibilityLabel="Task link label" style={[styles.routeLabel, { color: colors.ink }]}>{atom.displayText}</Text>
-                  <Text selectable accessibilityLabel="Task link address" style={[styles.routeHref, { color: colors.muted }]}>{atom.href}</Text>
+                  <Text selectable accessibilityLabel={`${atom.routeKind === "project" ? "Project" : "Task"} link label`}
+                    style={[styles.routeLabel, { color: colors.ink }]}>{atom.displayText}</Text>
+                  <Text selectable accessibilityLabel={`${atom.routeKind === "project" ? "Project" : "Task"} link address`}
+                    style={[styles.routeHref, { color: colors.muted }]}>{atom.href}</Text>
                 </View>}
         </ScrollView>
         {atom.kind === "pasted-text" && <Text accessibilityLiveRegion="polite"

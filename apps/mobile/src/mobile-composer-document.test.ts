@@ -604,9 +604,9 @@ describe("mobile structured composer document", () => {
     expect(mobileInputSummary(invalidArtifact)).toBe("Use @Artifact\n[Invalid reference metadata]");
   });
 
-  it("inserts, enriches, serializes, and removes multiple task-link atoms without typed authority", () => {
+  it("inserts, enriches, serializes, and removes mixed task/project link atoms without typed authority", () => {
     const segments = segmentMobileComposerRoutePaste(
-      "See #/tasks/session-one and [Second](#/tasks/session-two?message=message-two)."
+      "See #/tasks/session-one and [Second](#/tasks/session-two?message=message-two) in #/projects/project-one."
     )!;
     const inserted = insertMobileRouteReferencePaste(
       plainTextMobileComposerDraft("Before "),
@@ -614,11 +614,12 @@ describe("mobile structured composer document", () => {
       segments,
       (index) => `route-${index}`
     );
-    expect(inserted.insertedAtomIds).toEqual(["route-0", "route-1"]);
-    expect(inserted.draft.text).toBe("Before See #/tasks/session-one and #/tasks/session-two?message=message-two.");
+    expect(inserted.insertedAtomIds).toEqual(["route-0", "route-1", "route-2"]);
+    expect(inserted.draft.text).toBe("Before See #/tasks/session-one and #/tasks/session-two?message=message-two in #/projects/project-one.");
     expect(inserted.draft.atoms).toMatchObject([
       {
         kind: "route-reference",
+        routeKind: "session",
         atomId: "route-0",
         href: "#/tasks/session-one",
         serialized: "#/tasks/session-one",
@@ -627,12 +628,22 @@ describe("mobile structured composer document", () => {
       },
       {
         kind: "route-reference",
+        routeKind: "session",
         atomId: "route-1",
         href: "#/tasks/session-two?message=message-two",
         serialized: "#/tasks/session-two?message=message-two",
         sessionId: "session-two",
         messageId: "message-two",
         displayText: "message-two"
+      },
+      {
+        kind: "route-reference",
+        routeKind: "project",
+        atomId: "route-2",
+        href: "#/projects/project-one",
+        serialized: "#/projects/project-one",
+        projectId: "project-one",
+        displayText: "project-one"
       }
     ]);
     expect(mobileComposerInput(inserted.draft)).toMatchObject({
@@ -656,9 +667,13 @@ describe("mobile structured composer document", () => {
       displayText: "Message body",
       serialized: "#/tasks/session-two?message=message-two"
     });
+    const project = resolved.draft.atoms.find((atom) => atom.atomId === "route-2")!;
+    if (project.kind !== "route-reference") throw new Error("expected project link");
+    const projectTitled = updateMobileRouteReferenceAtom(resolved.draft, project, "Mobile Project")!;
+    expect(projectTitled.draft.text).toContain("[Mobile Project](#/projects/project-one)");
     expect(updateMobileRouteReferenceAtom(resolved.draft, second, "stale")).toBeUndefined();
-    expect(removeMobileComposerAtom(resolved.draft, "route-1").draft.atoms.map((atom) => atom.atomId))
-      .toEqual(["route-0"]);
+    expect(removeMobileComposerAtom(projectTitled.draft, "route-1").draft.atoms.map((atom) => atom.atomId))
+      .toEqual(["route-0", "route-2"]);
   });
 
   it("rejects forged task-link authority and never retains credential-bearing hrefs", () => {
@@ -667,6 +682,7 @@ describe("mobile structured composer document", () => {
       mentions: [],
       atoms: [{
         kind: "route-reference",
+        routeKind: "session",
         atomId: "route",
         href: "https://user:pass@example.test/?token=secret#/tasks/session",
         serialized: "#/tasks/session",

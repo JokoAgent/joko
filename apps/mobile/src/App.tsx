@@ -1398,6 +1398,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     const captured = request?.draft ?? draftRef.current.input;
     const selection = request?.selection ?? selectionRef.current;
     const targetId = draftRef.current.targetId;
+    const ownerSnapshot = client.state.owner;
     if (!ownerProfileId || !referencesEditableRef.current || AppState.currentState !== "active") {
       setError("Return to the active new-task composer before pasting text.");
       return;
@@ -1409,6 +1410,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         || draftRef.current.targetId !== targetId || draftRef.current.input !== captured
         || selectionRef.current.start !== selection.start || selectionRef.current.end !== selection.end
         || !referencesEditableRef.current || client.state.activeProfileId !== ownerProfileId
+        || client.state.owner !== ownerSnapshot
         || client.state.status === "unpaired" || client.state.status === "revoked"
         || AppState.currentState !== "active") {
         throw new Error("The new-task draft changed while clipboard text was being read. Paste it again.");
@@ -1434,6 +1436,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
             || selectionRef.current.start !== result.selection.start
             || selectionRef.current.end !== result.selection.end
             || !referencesEditableRef.current || client.state.activeProfileId !== ownerProfileId
+            || client.state.owner !== ownerSnapshot
             || client.state.status !== "connected" || AppState.currentState !== "active") return;
           replaceInput(resolved.draft, resolved.selection);
         }).catch(() => undefined);
@@ -3333,6 +3336,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     const identity = draftIdentityRef.current;
     const captured = request?.draft ?? composerDraftRef.current;
     const selection = request?.selection ?? composerSelectionRef.current;
+    const ownerSnapshot = client.state.owner;
     if (!identity || !composerPasteEditableRef.current || AppState.currentState !== "active") {
       setLocalError("Return to the active task composer before pasting text.");
       return;
@@ -3348,6 +3352,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         || composerSelectionRef.current.end !== selection.end
         || !composerPasteEditableRef.current || queueEditRef.current
         || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+        || client.state.owner !== ownerSnapshot
         || client.state.status === "unpaired" || client.state.status === "revoked"
         || AppState.currentState !== "active") {
         throw new Error("The task draft changed while clipboard text was being read. Paste it again.");
@@ -3380,6 +3385,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             || !composerPasteEditableRef.current || queueEditRef.current
             || client.state.activeProfileId !== identity.profileId
             || client.state.selectedId !== identity.sessionId
+            || client.state.owner !== ownerSnapshot
             || client.state.status !== "connected" || AppState.currentState !== "active") return;
           composerDraftRef.current = resolved.draft;
           composerSelectionRef.current = resolved.selection;
@@ -4593,7 +4599,7 @@ function MobileComposerAtomChips({ atoms, colors, disabled, onOpen }: {
     accessibilityLabel="Structured message items" contentContainerStyle={styles.mentionChips}
     showsHorizontalScrollIndicator={false}>
     {atoms.map((atom) => <Pressable key={atom.atomId} accessibilityRole="button"
-      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : atom.kind === "route-reference" ? "View task link" : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
+      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : atom.kind === "route-reference" ? `View ${atom.routeKind === "project" ? "project" : "task"} link` : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
       accessibilityHint="Opens this exact structured message item; it is removed as one unit if edited in the text field"
       accessibilityState={{ disabled }} disabled={disabled} onPress={() => onOpen(atom.atomId)}
       style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },

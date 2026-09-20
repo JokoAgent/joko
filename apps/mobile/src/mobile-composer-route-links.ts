@@ -6,25 +6,40 @@ export type MobileComposerRoutePasteSegment =
   | { readonly kind: "text"; readonly text: string }
   | {
       readonly kind: "route-reference";
+      readonly routeKind: "session";
       readonly href: string;
       readonly label: string | null;
       readonly sessionId: string;
       readonly messageId?: string;
       readonly eventId?: string;
+    }
+  | {
+      readonly kind: "route-reference";
+      readonly routeKind: "project";
+      readonly href: string;
+      readonly label: string | null;
+      readonly projectId: string;
     };
 
-export interface MobileComposerParsedRouteReference {
-  readonly href: string;
-  readonly sessionId: string;
-  readonly messageId?: string;
-  readonly eventId?: string;
-}
+export type MobileComposerParsedRouteReference =
+  | {
+      readonly routeKind: "session";
+      readonly href: string;
+      readonly sessionId: string;
+      readonly messageId?: string;
+      readonly eventId?: string;
+    }
+  | {
+      readonly routeKind: "project";
+      readonly href: string;
+      readonly projectId: string;
+    };
 
-export interface MobileComposerSeededRouteReference extends MobileComposerParsedRouteReference {
+export type MobileComposerSeededRouteReference = MobileComposerParsedRouteReference & {
   readonly serialized: string;
   readonly displayText: string;
   readonly pending: boolean;
-}
+};
 
 export type MobileComposerRouteResolutionTarget =
   | { readonly kind: "session"; readonly href: string; readonly sessionId: string }
@@ -34,15 +49,16 @@ export type MobileComposerRouteResolutionTarget =
       readonly sessionId: string;
       readonly messageId?: string;
       readonly eventId?: string;
-    };
+    }
+  | { readonly kind: "project"; readonly href: string; readonly projectId: string };
 
 const trailingLinkPunctuation = /[.,;:!?]+$/u;
-const routeLink = /(?:(?:joko:\/\/app[^\s"'<>]*?|https?:\/\/[^\s"'<>]*?)#\/(?:tasks)\/[^\s"'<>]+|#\/(?:tasks)\/[^\s"'<>]+)/giu;
+const routeLink = /(?:(?:joko:\/\/app[^\s"'<>]*?|https?:\/\/[^\s"'<>]*?)#\/(?:tasks|projects)\/[^\s"'<>]+|#\/(?:tasks|projects)\/[^\s"'<>]+)/giu;
 const sensitiveQueryKey = /(?:auth|credential|password|secret|token|api[-_]?key|code)/iu;
 const controls = /[\u0000-\u001f\u007f]/u;
 
 export function segmentMobileComposerRoutePaste(text: string): readonly MobileComposerRoutePasteSegment[] | null {
-  if (typeof text !== "string" || !text.includes("#/tasks/")) return null;
+  if (typeof text !== "string" || (!text.includes("#/tasks/") && !text.includes("#/projects/"))) return null;
   const candidates: Array<{
     readonly start: number;
     readonly end: number;
@@ -56,17 +72,27 @@ export function segmentMobileComposerRoutePaste(text: string): readonly MobileCo
     if (reference === undefined) continue;
     const rawEnd = match.index + rawHref.length;
     const markdown = markdownEnvelope(text, match.index, rawEnd);
+    const segment: Extract<MobileComposerRoutePasteSegment, { readonly kind: "route-reference" }> = reference.routeKind === "session"
+      ? {
+          kind: "route-reference",
+          routeKind: "session",
+          href: reference.href,
+          label: markdown?.label ?? null,
+          sessionId: reference.sessionId,
+          ...(reference.messageId === undefined ? {} : { messageId: reference.messageId }),
+          ...(reference.eventId === undefined ? {} : { eventId: reference.eventId })
+        }
+      : {
+          kind: "route-reference",
+          routeKind: "project",
+          href: reference.href,
+          label: markdown?.label ?? null,
+          projectId: reference.projectId
+        };
     candidates.push({
       start: markdown?.start ?? match.index,
       end: markdown?.end ?? rawEnd,
-      segment: {
-        kind: "route-reference",
-        href: reference.href,
-        label: markdown?.label ?? null,
-        sessionId: reference.sessionId,
-        ...(reference.messageId === undefined ? {} : { messageId: reference.messageId }),
-        ...(reference.eventId === undefined ? {} : { eventId: reference.eventId })
-      }
+      segment
     });
     routeLink.lastIndex = rawEnd;
   }
@@ -104,11 +130,12 @@ export function parseMobileComposerRouteHref(value: string): MobileComposerParse
     url.hash = "";
     base = url.toString().replace(/\(/gu, "%28").replace(/\)/gu, "%29");
   }
-  const match = /^#\/tasks\/([^/?#]+)(?:\?([^#]*))?$/u.exec(hash);
+  const match = /^#\/(tasks|projects)\/([^/?#]+)(?:\?([^#]*))?$/u.exec(hash);
   if (match === null) return undefined;
-  const sessionId = safeDecodeIdentity(match[1] ?? "");
-  if (sessionId === undefined) return undefined;
-  const query = new URLSearchParams(match[2] ?? "");
+  const identity = safeDecodeIdentity(match[2] ?? "");
+  if (identity === undefined) return undefined;
+  const query = new URLSearchParams(match[3] ?? "");
+  if (match[1] === "projects" && (query.has("message") || query.has("event"))) return undefined;
   const messageValues = query.getAll("message");
   const eventValues = query.getAll("event");
   if (messageValues.length > 1 || eventValues.length > 1) return undefined;
@@ -118,12 +145,15 @@ export function parseMobileComposerRouteHref(value: string): MobileComposerParse
     || eventValues.length === 1 && eventId === undefined) return undefined;
   const safeRouteQuery = safeQuery(query);
   if (safeRouteQuery === undefined) return undefined;
-  const route = `#/tasks/${encodeRouteIdentity(sessionId)}${safeRouteQuery === "" ? "" : `?${safeRouteQuery}`}`;
+  const routeKind = match[1] === "projects" ? "project" : "session";
+  const route = `#/${routeKind === "project" ? "projects" : "tasks"}/${encodeRouteIdentity(identity)}${safeRouteQuery === "" ? "" : `?${safeRouteQuery}`}`;
   const href = `${base}${route}`;
   if (href.length > mobileComposerRouteHrefMaximumCharacters) return undefined;
+  if (routeKind === "project") return { routeKind, href, projectId: identity };
   return {
+    routeKind,
     href,
-    sessionId,
+    sessionId: identity,
     ...(messageId === undefined ? {} : { messageId }),
     ...(eventId === undefined ? {} : { eventId })
   };
@@ -133,12 +163,26 @@ export function seedMobileComposerRouteReference(
   segment: Extract<MobileComposerRoutePasteSegment, { readonly kind: "route-reference" }>
 ): MobileComposerSeededRouteReference {
   const parsed = parseMobileComposerRouteHref(segment.href);
-  if (parsed === undefined || parsed.href !== segment.href || parsed.sessionId !== segment.sessionId
-    || parsed.messageId !== segment.messageId || parsed.eventId !== segment.eventId) {
-    throw new Error("The pasted Joko task link changed while it was being inserted.");
+  if (parsed === undefined || parsed.href !== segment.href || parsed.routeKind !== segment.routeKind
+    || (parsed.routeKind === "session" && segment.routeKind === "session"
+      ? parsed.sessionId !== segment.sessionId || parsed.messageId !== segment.messageId
+        || parsed.eventId !== segment.eventId
+      : parsed.routeKind === "project" && segment.routeKind === "project"
+        ? parsed.projectId !== segment.projectId
+        : true)) {
+    throw new Error("The pasted Joko link changed while it was being inserted.");
   }
   const explicit = segment.label === null ? "" : sanitizeMobileComposerReferenceLabel(segment.label);
-  const anchor = segment.messageId ?? segment.eventId;
+  if (parsed.routeKind === "project") {
+    const displayText = explicit || shortMobileComposerReferenceId(parsed.projectId);
+    return {
+      ...parsed,
+      displayText,
+      serialized: explicit === "" ? parsed.href : `[${displayText}](${parsed.href})`,
+      pending: explicit === ""
+    };
+  }
+  const anchor = parsed.messageId ?? parsed.eventId;
   if (anchor !== undefined) {
     return {
       ...parsed,
@@ -147,7 +191,7 @@ export function seedMobileComposerRouteReference(
       pending: true
     };
   }
-  const displayText = explicit || shortMobileComposerReferenceId(segment.sessionId);
+  const displayText = explicit || shortMobileComposerReferenceId(parsed.sessionId);
   return {
     ...parsed,
     displayText,
@@ -159,6 +203,9 @@ export function seedMobileComposerRouteReference(
 export function mobileComposerRouteResolutionTarget(
   reference: MobileComposerParsedRouteReference
 ): MobileComposerRouteResolutionTarget {
+  if (reference.routeKind === "project") {
+    return { kind: "project", href: reference.href, projectId: reference.projectId };
+  }
   return reference.messageId === undefined && reference.eventId === undefined
     ? { kind: "session", href: reference.href, sessionId: reference.sessionId }
     : {

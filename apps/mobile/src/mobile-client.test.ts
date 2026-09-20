@@ -5006,7 +5006,7 @@ describe("native composer task-link resolution", () => {
     return network;
   }
 
-  it("resolves an exact visible task title and cached message without a history read", async () => {
+  it("resolves exact visible task/project titles and a cached message without a history read", async () => {
     const network = routeNetwork([messageEvent]);
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
@@ -5016,6 +5016,16 @@ describe("native composer task-link resolution", () => {
       href: "#/tasks/session",
       sessionId: "session"
     })).resolves.toBe("Task");
+    await expect(app.resolveComposerRouteReference({
+      kind: "project",
+      href: "#/projects/target",
+      projectId: "target"
+    })).resolves.toBe("Project");
+    await expect(app.resolveComposerRouteReference({
+      kind: "project",
+      href: "#/projects/target",
+      projectId: "other-target"
+    })).resolves.toBeUndefined();
     await expect(app.resolveComposerRouteReference({
       kind: "message",
       href: "#/tasks/session?message=message-1",

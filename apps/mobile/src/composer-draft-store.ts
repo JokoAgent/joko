@@ -21,7 +21,7 @@ export interface MobileComposerDraftSnapshot {
   readonly draft?: MobileComposerDraft;
 }
 
-const storagePrefix = "joko.mobile.composer-draft.v5";
+const storagePrefix = "joko.mobile.composer-draft.v6";
 const persistDebounceMilliseconds = 400;
 const maximumStoredCharacters = 12_100_000;
 
@@ -260,7 +260,7 @@ function storageKey(identity: MobileComposerDraftIdentity): string {
 }
 
 function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileComposerDraft): string {
-  const serialized = JSON.stringify({ version: 5, identity: normalizeIdentity(identity), draft: normalizeMobileComposerDraft(draft) });
+  const serialized = JSON.stringify({ version: 6, identity: normalizeIdentity(identity), draft: normalizeMobileComposerDraft(draft) });
   if (serialized.length > maximumStoredCharacters) throw new Error("The local Joko structured task draft is too large.");
   return serialized;
 }
@@ -268,7 +268,7 @@ function serializeRecord(identity: MobileComposerDraftIdentity, draft: MobileCom
 function readRecord(serialized: string, identity: MobileComposerDraftIdentity): MobileComposerDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 5 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 6 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId || value["identity"]["sessionId"] !== identity.sessionId
     || !isRecord(value["draft"]) || typeof value["draft"]["text"] !== "string"
     || !Array.isArray(value["draft"]["mentions"]) || !Array.isArray(value["draft"]["atoms"])

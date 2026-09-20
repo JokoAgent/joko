@@ -145,7 +145,7 @@ describe("mobile composer draft store", () => {
     expect(store.readSync(first)).toBeNull();
   });
 
-  it("round-trips v5 atoms and local/uploaded attachment identities without persisting picker URIs", async () => {
+  it("round-trips v6 task/project atoms and local/uploaded attachment identities without persisting picker URIs", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);
     const atomized = appendMobileSelectionQuote(insertMobilePastedText(
@@ -163,8 +163,8 @@ describe("mobile composer draft store", () => {
     const routed = insertMobileStructuredClipboardText(
       atomized,
       { start: 0, end: 0 },
-      "#/tasks/related",
-      () => "route"
+      "#/tasks/related and #/projects/mobile",
+      (index) => `route-${index}`
     ).draft;
     const attached = {
       ...routed,
@@ -198,7 +198,7 @@ describe("mobile composer draft store", () => {
 
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).resolves.toEqual(attached);
     const raw = memory.values.get(mobileComposerDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":5');
+    expect(raw).toContain('"version":6');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -237,7 +237,7 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 5,
+      version: 6,
       identity: first,
       draft: {
         text: "@Task",
@@ -249,7 +249,7 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 5,
+      version: 6,
       identity: second,
       draft: plainTextMobileComposerDraft("cross owner")
     }));
@@ -262,7 +262,7 @@ describe("mobile composer draft store", () => {
     }));
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
-    for (const version of [1, 2, 3, 4]) {
+    for (const version of [1, 2, 3, 4, 5]) {
       memory.values.set(key, JSON.stringify({
         version,
         identity: first,

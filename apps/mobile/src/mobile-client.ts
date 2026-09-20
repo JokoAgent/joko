@@ -2354,9 +2354,16 @@ export class MobileClient {
       || owner.scope?.kind.case !== "owner" || owner.server?.serverId !== credential.serverId
       || owner.generation < 1n || !owner.snapshotId || !owner.revision || owner.revision.value < 1n) return undefined;
     const parsed = parseMobileComposerRouteHref(target.href);
-    if (parsed === undefined || parsed.href !== target.href || parsed.sessionId !== target.sessionId
+    if (parsed === undefined || parsed.href !== target.href) return undefined;
+    if (target.kind === "project") {
+      if (parsed.routeKind !== "project" || parsed.projectId !== target.projectId) return undefined;
+      const projects = owner.targets.filter((candidate) => candidate.targetId === target.projectId);
+      if (projects.length !== 1 || projects[0]!.state === TargetState.UNSPECIFIED) return undefined;
+      return projects[0]!.displayName.trim() || "Untitled project";
+    }
+    if (parsed.routeKind !== "session" || parsed.sessionId !== target.sessionId
       || (target.kind === "session" && (parsed.messageId !== undefined || parsed.eventId !== undefined))
-      || (target.kind === "message" && (parsed.messageId !== target.messageId || parsed.eventId !== target.eventId))) {
+      || target.kind === "message" && (parsed.messageId !== target.messageId || parsed.eventId !== target.eventId)) {
       return undefined;
     }
     const sessions = owner.sessions.filter((candidate) => candidate.sessionId === target.sessionId);

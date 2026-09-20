@@ -86,7 +86,9 @@ export function mobileComposerRichDocument(draft: MobileComposerDraft): MobileCo
         label,
         accessibilityLabel: atom.kind === "quote"
           ? "Quote from Assistant"
-          : atom.kind === "route-reference" ? `Task link ${label}` : label,
+          : atom.kind === "route-reference"
+            ? `${atom.routeKind === "project" ? "Project" : "Task"} link ${label}`
+            : label,
         block: atom.kind === "quote"
       });
     }

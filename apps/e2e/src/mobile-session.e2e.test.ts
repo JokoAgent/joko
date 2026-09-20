@@ -764,7 +764,7 @@ describe("native mobile device through the durable product chain", () => {
     });
   });
 
-  it("preserves mobile quote, long-paste, and task-link wire text through HTTP, SQLite, and dispatch", async () => {
+  it("preserves mobile quote, long-paste, and task/project-link wire text through HTTP, SQLite, and dispatch", async () => {
     fixture = await OrchestratorE2eFixture.start({
       createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
     });
@@ -789,9 +789,10 @@ describe("native mobile device through the durable product chain", () => {
     }
     const clients = fixture.clients(paired.authKey);
     const connectionId = paired.connection.connectionId;
+    const targetId = fixture.targetId();
     const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
       backendId: PI_LIKE_PROFILE.id,
-      targetId: fixture.targetId(),
+      targetId,
       displayName: "Mobile structured composer"
     })));
     const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
@@ -860,7 +861,7 @@ describe("native mobile device through the durable product chain", () => {
       pastedTextRanges: [pastedRange]
     });
 
-    const routeText = `Compare [Mobile structured composer](#/tasks/${encodeURIComponent(sessionId)}) and #/tasks/${encodeURIComponent(sessionId)}?message=message-two.`;
+    const routeText = `Compare [Mobile structured composer](#/tasks/${encodeURIComponent(sessionId)}), #/tasks/${encodeURIComponent(sessionId)}?message=message-two, and [Mobile project](#/projects/${encodeURIComponent(targetId)}).`;
     const routeSent = await submit(
       clients.operation,
       connectionId,
@@ -884,7 +885,7 @@ describe("native mobile device through the durable product chain", () => {
     await waitFor(
       () => clients.run.getRun({ runId: queueRunIdFrom(routeSent) }),
       (value) => value.run?.state === RunState.SUCCEEDED,
-      "mobile task-link wire dispatch"
+      "mobile task/project-link wire dispatch"
     );
     const routeAccepted = fixture.application.store.listEvents({ sessionId }).find((event) =>
       event.runId === routeQueued.runId && event.payload.type === "message_complete"
@@ -897,7 +898,7 @@ describe("native mobile device through the durable product chain", () => {
       }
     });
     if (routeAccepted?.payload.type !== "message_complete" || routeAccepted.payload.acceptedInput === undefined) {
-      throw new Error("The accepted mobile task-link input was not retained.");
+      throw new Error("The accepted mobile task/project-link input was not retained.");
     }
     expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("mentionRanges");
     expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("pastedTextRanges");

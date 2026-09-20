@@ -65,6 +65,7 @@ describe("MobileComposerAtomSheet", () => {
     act(() => root!.render(createElement(MobileComposerAtomSheet, {
       atom: {
         kind: "route-reference",
+        routeKind: "session",
         atomId: "route-one",
         href: "#/tasks/session?message=message",
         serialized: "#/tasks/session?message=message",
@@ -91,5 +92,34 @@ describe("MobileComposerAtomSheet", () => {
     act(() => container!.querySelector('button[aria-label="Remove Resolved message"]')
       ?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onRemove).toHaveBeenCalledWith("route-one");
+  });
+
+  it("labels a project link independently from task authority", () => {
+    container = document.createElement("div");
+    root = createRoot(container);
+    act(() => root!.render(createElement(MobileComposerAtomSheet, {
+      atom: {
+        kind: "route-reference",
+        routeKind: "project",
+        atomId: "project-one",
+        href: "#/projects/project-one",
+        serialized: "[Mobile](#/projects/project-one)",
+        projectId: "project-one",
+        displayText: "Mobile",
+        start: 0,
+        end: 39
+      },
+      colors,
+      busy: false,
+      onClose: vi.fn(),
+      onSavePaste: vi.fn(),
+      onRemove: vi.fn()
+    })));
+
+    expect(container.querySelector('[aria-label="Project link details"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Project link label"]')?.textContent).toBe("Mobile");
+    expect(container.querySelector('[aria-label="Project link address"]')?.textContent)
+      .toBe("#/projects/project-one");
+    expect(container.textContent).toContain("Project link · project project-one");
   });
 });

@@ -106,18 +106,30 @@ export interface MobileComposerPastedTextAtom {
   readonly end: number;
 }
 
-export interface MobileComposerRouteReferenceAtom {
+interface MobileComposerRouteReferenceAtomBase {
   readonly kind: "route-reference";
   readonly atomId: string;
   readonly href: string;
   readonly serialized: string;
-  readonly sessionId: string;
-  readonly messageId?: string;
-  readonly eventId?: string;
   readonly displayText: string;
   readonly start: number;
   readonly end: number;
 }
+
+export interface MobileComposerSessionRouteReferenceAtom extends MobileComposerRouteReferenceAtomBase {
+  readonly routeKind: "session";
+  readonly sessionId: string;
+  readonly messageId?: string;
+  readonly eventId?: string;
+}
+
+export interface MobileComposerProjectRouteReferenceAtom extends MobileComposerRouteReferenceAtomBase {
+  readonly routeKind: "project";
+  readonly projectId: string;
+}
+
+export type MobileComposerRouteReferenceAtom = MobileComposerSessionRouteReferenceAtom
+  | MobileComposerProjectRouteReferenceAtom;
 
 export type MobileComposerAtom = MobileComposerQuoteAtom
   | MobileComposerPastedTextAtom
@@ -149,10 +161,14 @@ type MobileComposerAtomPresentation =
   | Pick<MobileComposerPastedTextAtom, "kind" | "text">
   | Pick<MobileComposerRouteReferenceAtom, "kind" | "serialized" | "displayText">;
 
+type MobileComposerRouteReferenceAtomSeed =
+  | Omit<MobileComposerSessionRouteReferenceAtom, "atomId" | "start" | "end">
+  | Omit<MobileComposerProjectRouteReferenceAtom, "atomId" | "start" | "end">;
+
 type MobileComposerAtomSeed =
   | Omit<MobileComposerQuoteAtom, "atomId" | "start" | "end">
   | Omit<MobileComposerPastedTextAtom, "atomId" | "start" | "end">
-  | Omit<MobileComposerRouteReferenceAtom, "atomId" | "start" | "end">;
+  | MobileComposerRouteReferenceAtomSeed;
 
 const maximumDraftCharacters = 1_000_000;
 export const mobileLongPasteLineThreshold = 24;
@@ -567,7 +583,7 @@ export function insertMobileRouteReferencePaste(
 ): MobileComposerRoutePasteResult {
   const current = normalizeMobileComposerDraft(draft);
   if (!Array.isArray(segments) || !segments.some((segment) => segment?.kind === "route-reference")) {
-    throw new Error("The clipboard does not contain a Joko task link.");
+    throw new Error("The clipboard does not contain a Joko task or project link.");
   }
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
   const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
@@ -579,29 +595,43 @@ export function insertMobileRouteReferencePaste(
   let offset = range.start + prefix.length;
   let routeIndex = 0;
   for (const segment of segments) {
-    if (!segment || typeof segment !== "object") throw new Error("The pasted Joko task link is invalid.");
+    if (!segment || typeof segment !== "object") throw new Error("The pasted Joko link is invalid.");
     if (segment.kind === "text") {
-      if (typeof segment.text !== "string") throw new Error("The pasted Joko task link text is invalid.");
+      if (typeof segment.text !== "string") throw new Error("The pasted Joko link text is invalid.");
       replacement.push(segment.text);
       offset += segment.text.length;
       continue;
     }
-    if (segment.kind !== "route-reference") throw new Error("The pasted Joko task link is invalid.");
+    if (segment.kind !== "route-reference") throw new Error("The pasted Joko link is invalid.");
     const seeded = seedMobileComposerRouteReference(segment);
     const atomId = atomIdFactory(routeIndex++);
     assertIdentity(atomId, "composer atom occurrence");
-    const atom = normalizeRouteReferenceAtom({
-      kind: "route-reference",
-      atomId,
-      href: seeded.href,
-      serialized: seeded.serialized,
-      sessionId: seeded.sessionId,
-      ...(seeded.messageId === undefined ? {} : { messageId: seeded.messageId }),
-      ...(seeded.eventId === undefined ? {} : { eventId: seeded.eventId }),
-      displayText: seeded.displayText,
-      start: offset,
-      end: offset + seeded.serialized.length
-    });
+    const candidate: MobileComposerRouteReferenceAtom = seeded.routeKind === "session"
+      ? {
+          kind: "route-reference",
+          routeKind: "session",
+          atomId,
+          href: seeded.href,
+          serialized: seeded.serialized,
+          sessionId: seeded.sessionId,
+          ...(seeded.messageId === undefined ? {} : { messageId: seeded.messageId }),
+          ...(seeded.eventId === undefined ? {} : { eventId: seeded.eventId }),
+          displayText: seeded.displayText,
+          start: offset,
+          end: offset + seeded.serialized.length
+        }
+      : {
+          kind: "route-reference",
+          routeKind: "project",
+          atomId,
+          href: seeded.href,
+          serialized: seeded.serialized,
+          projectId: seeded.projectId,
+          displayText: seeded.displayText,
+          start: offset,
+          end: offset + seeded.serialized.length
+        };
+    const atom = normalizeRouteReferenceAtom(candidate);
     occurrences.push({ ...atom, atomId, start: offset, end: offset + seeded.serialized.length });
     replacement.push(seeded.serialized);
     offset += seeded.serialized.length;
@@ -630,13 +660,13 @@ export function updateMobileRouteReferenceAtom(
   const current = normalizeMobileComposerDraft(draft);
   const atom = current.atoms.find((candidate) => candidate.atomId === expected.atomId);
   if (atom?.kind !== "route-reference" || !sameComposerAtomAuthority(atom, expected)) return undefined;
-  const displayText = atom.messageId !== undefined || atom.eventId !== undefined
+  const anchored = atom.routeKind === "session"
+    && (atom.messageId !== undefined || atom.eventId !== undefined);
+  const displayText = anchored
     ? summarizeMobileComposerMessageReference(resolvedText.slice(0, mobileComposerMessageReferenceTextMaximumCharacters))
     : sanitizeMobileComposerReferenceLabel(resolvedText);
   if (displayText === "") return undefined;
-  const serialized = atom.messageId !== undefined || atom.eventId !== undefined
-    ? atom.href
-    : `[${displayText}](${atom.href})`;
+  const serialized = anchored ? atom.href : `[${displayText}](${atom.href})`;
   return replaceMobileComposerAtom(current, atom, normalizeRouteReferenceAtom({
     ...atom,
     displayText,
@@ -1010,33 +1040,49 @@ function normalizePastedTextAtom(
 
 function normalizeRouteReferenceAtom(
   atom: MobileComposerRouteReferenceAtom
-): Omit<MobileComposerRouteReferenceAtom, "atomId" | "start" | "end"> {
+): MobileComposerRouteReferenceAtomSeed {
   const parsed = parseMobileComposerRouteHref(atom.href);
-  if (parsed === undefined || parsed.href !== atom.href || parsed.sessionId !== atom.sessionId
-    || parsed.messageId !== atom.messageId || parsed.eventId !== atom.eventId) {
-    throw new Error("The local Joko task link target is invalid.");
+  if (parsed === undefined || parsed.href !== atom.href || parsed.routeKind !== atom.routeKind
+    || (parsed.routeKind === "session" && atom.routeKind === "session"
+      ? parsed.sessionId !== atom.sessionId || parsed.messageId !== atom.messageId
+        || parsed.eventId !== atom.eventId
+      : parsed.routeKind === "project" && atom.routeKind === "project"
+        ? parsed.projectId !== atom.projectId
+        : true)) {
+    throw new Error("The local Joko link target is invalid.");
   }
   const displayText = sanitizeMobileComposerReferenceLabel(atom.displayText);
   if (displayText === "" || displayText !== atom.displayText) {
-    throw new Error("The local Joko task link label is invalid.");
+    throw new Error("The local Joko link label is invalid.");
   }
-  const anchored = parsed.messageId !== undefined || parsed.eventId !== undefined;
+  const anchored = parsed.routeKind === "session"
+    && (parsed.messageId !== undefined || parsed.eventId !== undefined);
   const expectedSerialized = anchored ? parsed.href : `[${displayText}](${parsed.href})`;
   if (atom.serialized !== parsed.href && atom.serialized !== expectedSerialized) {
-    throw new Error("The local Joko task link wire text is invalid.");
+    throw new Error("The local Joko link wire text is invalid.");
   }
   if (anchored && atom.serialized !== parsed.href) {
     throw new Error("A Joko message link must retain its exact deep-link wire text.");
   }
-  return {
-    kind: "route-reference",
-    href: parsed.href,
-    serialized: atom.serialized,
-    sessionId: parsed.sessionId,
-    ...(parsed.messageId === undefined ? {} : { messageId: parsed.messageId }),
-    ...(parsed.eventId === undefined ? {} : { eventId: parsed.eventId }),
-    displayText
-  };
+  return parsed.routeKind === "session"
+    ? {
+        kind: "route-reference",
+        routeKind: "session",
+        href: parsed.href,
+        serialized: atom.serialized,
+        sessionId: parsed.sessionId,
+        ...(parsed.messageId === undefined ? {} : { messageId: parsed.messageId }),
+        ...(parsed.eventId === undefined ? {} : { eventId: parsed.eventId }),
+        displayText
+      }
+    : {
+        kind: "route-reference",
+        routeKind: "project",
+        href: parsed.href,
+        serialized: atom.serialized,
+        projectId: parsed.projectId,
+        displayText
+      };
 }
 
 function normalizedSelectionQuoteText(value: string): string | undefined {
@@ -1293,10 +1339,14 @@ function sameComposerAtomAuthority(left: MobileComposerAtom, right: MobileCompos
       && left.sourceEventId === right.sourceEventId
       && left.sourceRole === right.sourceRole;
   }
-  return right.kind === "route-reference" && left.href === right.href
-    && left.serialized === right.serialized && left.sessionId === right.sessionId
-    && left.messageId === right.messageId && left.eventId === right.eventId
-    && left.displayText === right.displayText;
+  if (right.kind !== "route-reference" || left.routeKind !== right.routeKind
+    || left.href !== right.href || left.serialized !== right.serialized
+    || left.displayText !== right.displayText) return false;
+  return left.routeKind === "session" && right.routeKind === "session"
+    ? left.sessionId === right.sessionId && left.messageId === right.messageId
+      && left.eventId === right.eventId
+    : left.routeKind === "project" && right.routeKind === "project"
+      && left.projectId === right.projectId;
 }
 
 function mobileComposerInputPart(mention: MobileComposerMention) {

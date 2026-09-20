@@ -171,4 +171,22 @@ describe("mobile composer rich document", () => {
       { type: "text", text: " now" }
     ], { start: 6, end: 6 })).toThrow(/splits a structured occurrence/u);
   });
+
+  it("projects project links with distinct accessible semantics", () => {
+    const inserted = insertMobileRouteReferencePaste(
+      emptyMobileComposerDraft(),
+      { start: 0, end: 0 },
+      segmentMobileComposerRoutePaste("#/projects/project-one")!,
+      () => "project-route"
+    );
+    expect(mobileComposerRichDocument(inserted.draft).nodes).toEqual([{
+      type: "occurrence",
+      occurrenceKey: "atom:project-route",
+      kind: "route-reference",
+      token: "#/projects/project-one",
+      label: "project-one",
+      accessibilityLabel: "Project link project-one",
+      block: false
+    }]);
+  });
 });

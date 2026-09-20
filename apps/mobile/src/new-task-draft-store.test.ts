@@ -204,7 +204,7 @@ describe("mobile new-task retained draft store", () => {
     });
   });
 
-  it("atomically replaces a v5 attachment identity in both editable and frozen submission input", async () => {
+  it("atomically replaces a v6 attachment identity in both editable and frozen submission input", async () => {
     const memory = memoryDriver();
     const store = new MobileNewTaskDraftStore(memory.driver);
     const local = attachedInput("local");
@@ -221,7 +221,7 @@ describe("mobile new-task retained draft store", () => {
       first, authority.createOperationId, local, attachedInput("uploaded")
     )).rejects.toThrow(/changed while it was being committed/u);
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":5');
+    expect(raw).toContain('"version":6');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -253,7 +253,7 @@ describe("mobile new-task retained draft store", () => {
 
     const crossProfile = new MobileNewTaskDraftStore(memory.driver);
     memory.values.set(key, JSON.stringify({
-      version: 5,
+      version: 6,
       identity: second,
       draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
@@ -266,7 +266,7 @@ describe("mobile new-task retained draft store", () => {
     }));
     await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
-    for (const version of [1, 2, 3, 4]) {
+    for (const version of [1, 2, 3, 4, 5]) {
       memory.values.set(key, JSON.stringify({
         version,
         identity: first,
@@ -276,7 +276,7 @@ describe("mobile new-task retained draft store", () => {
     }
 
     memory.values.set(key, JSON.stringify({
-      version: 5,
+      version: 6,
       identity: first,
       draft: {
         targetId: "target-one",
