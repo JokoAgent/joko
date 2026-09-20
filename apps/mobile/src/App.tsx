@@ -31,6 +31,7 @@ import { mobileDiscovery } from "./native-lan-discovery";
 import {
   mobileAttachmentCamera,
   mobileAttachmentFiles,
+  mobilePhotoLibrary,
   mobileComposerDrafts,
   mobileInteractionDrafts,
   mobileNewTaskDrafts,
@@ -59,10 +60,17 @@ import {
   appendMobileComposerAttachments,
   formatMobileAttachmentBytes,
   removeMobileComposerAttachment,
+  type MobileAttachmentControls,
   type MobileComposerAttachment
 } from "./mobile-attachments";
 import { mobileCameraCaptureSupported } from "./mobile-attachment-camera";
 import { observeMobileAttachmentAuthority, waitForMobileAttachmentAuthority } from "./mobile-attachment-authority";
+import {
+  canBrowseMobilePhotoLibraryDirectly,
+  mobilePhotoLibrarySupported,
+  type MobilePhotoLibraryAsset
+} from "./mobile-photo-library";
+import { MobilePhotoLibrarySheet } from "./MobilePhotoLibrarySheet";
 import {
   accessibleComposerHeight,
   buildComposerResizeGestureConfig,
@@ -121,6 +129,13 @@ const client = new MobileClient(
   mobileAttachmentFiles
 );
 type Page = "home" | "connection" | "new" | "task" | "files" | "connections" | "devices" | "device";
+
+interface MobilePhotoLibraryLease {
+  readonly controls: MobileAttachmentControls;
+  readonly scopeKey: string;
+  readonly generation: number;
+  readonly controller: AbortController;
+}
 
 export function App() {
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
@@ -773,6 +788,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [mentionBusy, setMentionBusy] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const mountedRef = useRef(true);
   const composerInputRef = useRef<TextInput>(null);
   const profileId = state.activeProfileId;
@@ -794,6 +810,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
+  const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
   const draftRef = useRef(draft);
   const selectionRef = useRef(composerSelection);
   draftRef.current = draft;
@@ -852,6 +869,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       current = false;
       mountedRef.current = false;
       attachmentAbortRef.current?.abort();
+      attachmentNativeActivityRef.current = false;
+      photoLibraryLeaseRef.current = undefined;
       void mobileNewTaskDrafts.flush(identity).catch(() => undefined);
     };
   }, [profileId]);
@@ -884,10 +903,27 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     attachmentOwnerRef.current = observed.surfaceOwnerKey;
     if (observed.retired) {
       attachmentAbortRef.current?.abort();
+      attachmentAbortRef.current = undefined;
+      attachmentNativeActivityRef.current = false;
+      photoLibraryLeaseRef.current = undefined;
+      setPhotoLibraryLease(undefined);
       attachmentGenerationRef.current += 1;
       setAttachmentBusy(false);
     }
   }, [attachmentControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const lease = photoLibraryLeaseRef.current;
+    if (!lease) return;
+    const scopeKey = profileId && draft.targetId ? `${profileId}\u001f${draft.targetId}` : "";
+    if (scopeKey === lease.scopeKey && state.status !== "revoked" && state.status !== "unpaired") return;
+    lease.controller.abort();
+    attachmentAbortRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    photoLibraryLeaseRef.current = undefined;
+    setPhotoLibraryLease(undefined);
+    attachmentGenerationRef.current += 1;
+    setAttachmentBusy(false);
+  }, [draft.targetId, profileId, state.status]);
   const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
   const referencesEditable = ownerReady && !state.busy && !mentionBusy && !attachmentBusy
     && retained === undefined;
@@ -963,14 +999,15 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setError(errorText(failure));
     }
   };
-  const addAttachments = async (source: "picker" | "camera"): Promise<void> => {
+  const addAttachments = async (source: "picker" | "camera" | "photos"): Promise<void> => {
     const controls = attachmentControls;
     const ownerProfileId = profileIdRef.current;
     const targetId = draftRef.current.targetId;
     if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable
       || attachmentNativeActivityRef.current) {
-      setError(`Attachment authority changed. Reopen the ${source === "camera" ? "camera" : "picker"} from the current project.`);
+      const sourceName = source === "camera" ? "camera" : source === "photos" ? "photo library" : "picker";
+      setError(`Attachment authority changed. Reopen the ${sourceName} from the current project.`);
       return;
     }
     const generation = ++attachmentGenerationRef.current;
@@ -991,7 +1028,15 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
             randomUUID,
             controller.signal
           )
-        : await mobileAttachmentFiles.pickAndStage(
+        : source === "photos"
+          ? await mobilePhotoLibrary.pickSystemAndStage(
+              ownerProfileId,
+              draftRef.current.input.attachments,
+              controls.policy,
+              randomUUID,
+              controller.signal
+            )
+          : await mobileAttachmentFiles.pickAndStage(
             ownerProfileId,
             draftRef.current.input.attachments,
             controls.policy,
@@ -1042,6 +1087,109 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         attachmentNativeActivityRef.current = false;
         if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
       }
+    }
+  };
+  const openPhotoLibrary = (): void => {
+    if (!canBrowseMobilePhotoLibraryDirectly(Platform.OS)) {
+      void addAttachments("photos");
+      return;
+    }
+    const controls = attachmentControls;
+    const ownerProfileId = profileIdRef.current;
+    const targetId = draftRef.current.targetId;
+    if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable
+      || attachmentNativeActivityRef.current || !mobilePhotoLibrarySupported(controls.policy)) {
+      setError("Photo-library authority changed. Reopen Photos from the current project.");
+      return;
+    }
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    const lease: MobilePhotoLibraryLease = {
+      controls,
+      scopeKey: `${ownerProfileId}\u001f${targetId}`,
+      generation,
+      controller
+    };
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    photoLibraryLeaseRef.current = lease;
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setAttachmentBusy(true);
+    setError("");
+    setPhotoLibraryLease(lease);
+  };
+  const closePhotoLibrary = (): void => {
+    const lease = photoLibraryLeaseRef.current;
+    if (!lease) return;
+    lease.controller.abort();
+    if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    photoLibraryLeaseRef.current = undefined;
+    setPhotoLibraryLease(undefined);
+    attachmentGenerationRef.current += 1;
+    attachmentOwnerRef.current = client.newTaskAttachmentControls(draftRef.current.targetId)?.surfaceOwnerKey;
+    setAttachmentBusy(false);
+  };
+  const addPhotoLibraryAssets = async (assets: readonly MobilePhotoLibraryAsset[]): Promise<void> => {
+    const lease = photoLibraryLeaseRef.current;
+    const ownerProfileId = profileIdRef.current;
+    const targetId = draftRef.current.targetId;
+    if (!lease || !ownerProfileId || lease.controls.profileId !== ownerProfileId
+      || lease.scopeKey !== `${ownerProfileId}\u001f${targetId}`
+      || attachmentGenerationRef.current !== lease.generation) {
+      throw new Error("Photo-library authority changed. Reopen Photos from the current project.");
+    }
+    let staged: readonly MobileComposerAttachment[] = [];
+    try {
+      staged = await mobilePhotoLibrary.stageSelectedAssets(
+        ownerProfileId,
+        draftRef.current.input.attachments,
+        lease.controls.policy,
+        assets,
+        randomUUID,
+        lease.controller.signal
+      );
+      const latest = await waitForMobileAttachmentAuthority(
+        { profileId: ownerProfileId, surfaceOwnerKey: lease.controls.surfaceOwnerKey },
+        () => client.newTaskAttachmentControls(targetId),
+        (listener) => client.subscribe(() => listener()),
+        {
+          signal: lease.controller.signal,
+          retired: () => {
+            const current = client.state;
+            return profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+              || current.activeProfileId !== ownerProfileId
+              || current.status === "revoked" || current.status === "unpaired"
+              || AppState.currentState === "active" && current.status === "connected"
+                && client.newTaskAttachmentControls(targetId) === undefined;
+          }
+        }
+      );
+      if (!mountedRef.current || photoLibraryLeaseRef.current !== lease
+        || attachmentGenerationRef.current !== lease.generation
+        || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+        || latest.profileId !== ownerProfileId
+        || latest.surfaceOwnerKey !== lease.controls.surfaceOwnerKey
+        || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey) {
+        throw new Error("Attachment authority changed while the selected photos were being staged.");
+      }
+      const input = {
+        ...draftRef.current.input,
+        attachments: appendMobileComposerAttachments(
+          draftRef.current.input.attachments,
+          staged,
+          latest.policy
+        )
+      };
+      replaceInput(input, selectionRef.current);
+      staged = [];
+      await mobileNewTaskDrafts.flush({ profileId: ownerProfileId });
+    } catch (failure) {
+      await Promise.all(staged.map((attachment) => mobileAttachmentFiles.remove(ownerProfileId, attachment)
+        .catch(() => undefined)));
+      throw failure instanceof Error ? failure : new Error(errorText(failure));
     }
   };
   const removeAttachment = async (attachmentId: string): Promise<void> => {
@@ -1115,6 +1263,10 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"} colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
+        {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
+          colors={colors} compact
+          disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
+          onPress={openPhotoLibrary} />}
         {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
           colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
@@ -1195,6 +1347,12 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         signal
       )}
       onSelect={insertWorkspaceMention} />
+    <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined}
+      ownerKey={photoLibraryLease?.controls.surfaceOwnerKey}
+      maximumSelection={Math.max(0, (photoLibraryLease?.controls.policy.maximumItems ?? 0)
+        - draft.input.attachments.length)}
+      colors={colors} library={mobilePhotoLibrary}
+      onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
   </ScrollView>;
 }
 
@@ -1238,6 +1396,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [catalogMentionsVisible, setCatalogMentionsVisible] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -1339,6 +1498,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
+  const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
   composerDraftRef.current = draft;
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
@@ -1448,10 +1608,27 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     attachmentOwnerRef.current = observed.surfaceOwnerKey;
     if (observed.retired) {
       attachmentAbortRef.current?.abort();
+      attachmentAbortRef.current = undefined;
+      attachmentNativeActivityRef.current = false;
+      photoLibraryLeaseRef.current = undefined;
+      setPhotoLibraryLease(undefined);
       attachmentGenerationRef.current += 1;
       setAttachmentBusy(false);
     }
   }, [attachmentControls?.surfaceOwnerKey]);
+  useEffect(() => {
+    const lease = photoLibraryLeaseRef.current;
+    if (!lease) return;
+    const scopeKey = draftIdentityKey ?? "";
+    if (scopeKey === lease.scopeKey && state.status !== "revoked" && state.status !== "unpaired") return;
+    lease.controller.abort();
+    attachmentAbortRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    photoLibraryLeaseRef.current = undefined;
+    setPhotoLibraryLease(undefined);
+    attachmentGenerationRef.current += 1;
+    setAttachmentBusy(false);
+  }, [draftIdentityKey, state.status]);
   useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
@@ -1557,6 +1734,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     return () => {
       taskMountedRef.current = false;
       attachmentAbortRef.current?.abort();
+      attachmentNativeActivityRef.current = false;
+      photoLibraryLeaseRef.current = undefined;
       queueEditRef.current = undefined;
       client.leaveTask();
     };
@@ -1573,13 +1752,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setComposerSelection({ start: value.text.length, end: value.text.length });
     if (identity) mobileComposerDrafts.save(identity, value);
   };
-  const addAttachments = async (source: "picker" | "camera"): Promise<void> => {
+  const addAttachments = async (source: "picker" | "camera" | "photos"): Promise<void> => {
     const controls = attachmentControls;
     const identity = draftIdentityRef.current;
     if (!controls || !identity || controls.profileId !== identity.profileId
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerOwnerReady
       || queueEditRef.current || state.busy || attachmentNativeActivityRef.current) {
-      setLocalError(`Attachment authority changed. Reopen the ${source === "camera" ? "camera" : "picker"} from the current task.`);
+      const sourceName = source === "camera" ? "camera" : source === "photos" ? "photo library" : "picker";
+      setLocalError(`Attachment authority changed. Reopen the ${sourceName} from the current task.`);
       return;
     }
     const identityKey = mobileComposerDraftIdentityKey(identity);
@@ -1600,7 +1780,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             randomUUID,
             controller.signal
           )
-        : await mobileAttachmentFiles.pickAndStage(
+        : source === "photos"
+          ? await mobilePhotoLibrary.pickSystemAndStage(
+              identity.profileId,
+              composerDraftRef.current.attachments,
+              controls.policy,
+              randomUUID,
+              controller.signal
+            )
+          : await mobileAttachmentFiles.pickAndStage(
             identity.profileId,
             composerDraftRef.current.attachments,
             controls.policy,
@@ -1653,6 +1841,114 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         attachmentNativeActivityRef.current = false;
         if (taskMountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
       }
+    }
+  };
+  const openPhotoLibrary = (): void => {
+    if (!canBrowseMobilePhotoLibraryDirectly(Platform.OS)) {
+      void addAttachments("photos");
+      return;
+    }
+    const controls = attachmentControls;
+    const identity = draftIdentityRef.current;
+    if (!controls || !identity || controls.profileId !== identity.profileId
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerOwnerReady
+      || queueEditRef.current || state.busy || attachmentNativeActivityRef.current
+      || !mobilePhotoLibrarySupported(controls.policy)) {
+      setLocalError("Photo-library authority changed. Reopen Photos from the current task.");
+      return;
+    }
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    const lease: MobilePhotoLibraryLease = {
+      controls,
+      scopeKey: mobileComposerDraftIdentityKey(identity),
+      generation,
+      controller
+    };
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    photoLibraryLeaseRef.current = lease;
+    setRuntimeControlsVisible(false);
+    setContextVisible(false);
+    setNativeTreeVisible(false);
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
+    setAttachmentBusy(true);
+    setLocalError("");
+    setPhotoLibraryLease(lease);
+  };
+  const closePhotoLibrary = (): void => {
+    const lease = photoLibraryLeaseRef.current;
+    if (!lease) return;
+    lease.controller.abort();
+    if (attachmentAbortRef.current === lease.controller) attachmentAbortRef.current = undefined;
+    attachmentNativeActivityRef.current = false;
+    photoLibraryLeaseRef.current = undefined;
+    setPhotoLibraryLease(undefined);
+    attachmentGenerationRef.current += 1;
+    attachmentOwnerRef.current = client.taskAttachmentControls()?.surfaceOwnerKey;
+    setAttachmentBusy(false);
+  };
+  const addPhotoLibraryAssets = async (assets: readonly MobilePhotoLibraryAsset[]): Promise<void> => {
+    const lease = photoLibraryLeaseRef.current;
+    const identity = draftIdentityRef.current;
+    if (!lease || !identity || lease.controls.profileId !== identity.profileId
+      || lease.scopeKey !== mobileComposerDraftIdentityKey(identity)
+      || attachmentGenerationRef.current !== lease.generation || queueEditRef.current) {
+      throw new Error("Photo-library authority changed. Reopen Photos from the current task.");
+    }
+    let staged: readonly MobileComposerAttachment[] = [];
+    try {
+      staged = await mobilePhotoLibrary.stageSelectedAssets(
+        identity.profileId,
+        composerDraftRef.current.attachments,
+        lease.controls.policy,
+        assets,
+        randomUUID,
+        lease.controller.signal
+      );
+      const latest = await waitForMobileAttachmentAuthority(
+        { profileId: identity.profileId, surfaceOwnerKey: lease.controls.surfaceOwnerKey },
+        () => client.taskAttachmentControls(),
+        (listener) => client.subscribe(() => listener()),
+        {
+          signal: lease.controller.signal,
+          retired: () => {
+            const currentIdentity = draftIdentityRef.current;
+            const current = client.state;
+            return !currentIdentity || mobileComposerDraftIdentityKey(currentIdentity) !== lease.scopeKey
+              || current.activeProfileId !== identity.profileId || current.selectedId !== identity.sessionId
+              || current.status === "revoked" || current.status === "unpaired"
+              || AppState.currentState === "active" && current.status === "connected"
+                && client.taskAttachmentControls() === undefined;
+          }
+        }
+      );
+      const latestIdentity = draftIdentityRef.current;
+      if (!taskMountedRef.current || photoLibraryLeaseRef.current !== lease
+        || attachmentGenerationRef.current !== lease.generation
+        || !latestIdentity || mobileComposerDraftIdentityKey(latestIdentity) !== lease.scopeKey
+        || latest.profileId !== identity.profileId
+        || latest.surfaceOwnerKey !== lease.controls.surfaceOwnerKey
+        || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey || queueEditRef.current) {
+        throw new Error("Attachment authority changed while the selected photos were being staged.");
+      }
+      const next = {
+        ...composerDraftRef.current,
+        attachments: appendMobileComposerAttachments(
+          composerDraftRef.current.attachments,
+          staged,
+          latest.policy
+        )
+      };
+      saveNormalDraft(next, identity);
+      staged = [];
+      await mobileComposerDrafts.flush(identity);
+    } catch (failure) {
+      await Promise.all(staged.map((attachment) => mobileAttachmentFiles.remove(identity.profileId, attachment)
+        .catch(() => undefined)));
+      throw failure instanceof Error ? failure : new Error(errorText(failure));
     }
   };
   const removeAttachment = async (attachmentId: string): Promise<void> => {
@@ -2097,6 +2393,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           disabled={state.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
+        {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
+          colors={colors} compact
+          disabled={state.busy || attachmentBusy || !composerOwnerReady
+            || draft.attachments.length >= attachmentControls.policy.maximumItems}
+          onPress={openPhotoLibrary} />}
         {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
           colors={colors} compact
           disabled={state.busy || attachmentBusy || !composerOwnerReady
@@ -2154,6 +2455,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       </View>
     </View>}
     </MobileKeyboardAvoidingView>
+    <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined}
+      ownerKey={photoLibraryLease?.controls.surfaceOwnerKey}
+      maximumSelection={Math.max(0, (photoLibraryLease?.controls.policy.maximumItems ?? 0)
+        - draft.attachments.length)}
+      colors={colors} library={mobilePhotoLibrary}
+      onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}

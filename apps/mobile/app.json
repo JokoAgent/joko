@@ -14,11 +14,22 @@
       },
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Connect to a Joko node on your local network.",
+        "NSPhotoLibraryUsageDescription": "Allow Joko to show photos you explicitly choose for a task attachment.",
+        "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
         "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
       }
     },
     "android": {
       "package": "app.joko.mobile",
+      "blockedPermissions": [
+        "android.permission.ACCESS_MEDIA_LOCATION",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
       "permissions": [
         "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.ACCESS_WIFI_STATE",
@@ -28,12 +39,20 @@
       ]
     },
     "plugins": [
+      "./with-joko-photo-library-boundary.cjs",
       "./with-joko-native-brand.cjs",
       "expo-secure-store",
       ["expo-image-picker", {
         "photosPermission": false,
         "cameraPermission": "Allow Joko to use your camera only when you choose Take photo for a task attachment.",
         "microphonePermission": false
+      }],
+      ["expo-media-library", {
+        "photosPermission": "Allow Joko to show photos you explicitly choose for a task attachment.",
+        "savePhotosPermission": false,
+        "isAccessMediaLocationEnabled": false,
+        "preventAutomaticLimitedAccessAlert": true,
+        "granularPermissions": []
       }],
       ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
     ]

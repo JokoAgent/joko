@@ -6,6 +6,7 @@ import { MobileInteractionDraftStore } from "./interaction-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { MobileAttachmentFiles } from "./mobile-attachment-files";
 import { MobileAttachmentCamera } from "./mobile-attachment-camera";
+import { MobilePhotoLibrary } from "./mobile-photo-library";
 
 const plainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
@@ -18,6 +19,7 @@ export const mobileInteractionDrafts = new MobileInteractionDraftStore(plainStor
 export const mobileNewTaskDrafts = new MobileNewTaskDraftStore(plainStorage);
 export const mobileAttachmentFiles = new MobileAttachmentFiles();
 export const mobileAttachmentCamera = new MobileAttachmentCamera(mobileAttachmentFiles);
+export const mobilePhotoLibrary = new MobilePhotoLibrary(mobileAttachmentFiles);
 
 export const mobileStorage = createMobileStorage(
   plainStorage,
