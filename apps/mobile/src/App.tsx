@@ -1712,7 +1712,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
           disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
       </> : <>
         <Text style={[styles.description, { color: colors.muted }]}>
-          {incomingShareBatch.items.length + incomingShareBatch.overflowCount} external {incomingShareBatch.items.length + incomingShareBatch.overflowCount === 1 ? "item is" : "items are"} waiting in the protected iOS inbox. Nothing is sent automatically.
+          {incomingShareBatch.items.length + incomingShareBatch.overflowCount} external {incomingShareBatch.items.length + incomingShareBatch.overflowCount === 1 ? "item is" : "items are"} waiting in the protected device inbox. Nothing is sent automatically.
         </Text>
         {incomingShareBatch.boundProfileId === undefined ? <>
           <Text style={[styles.caption, { color: colors.muted }]}>Choose this active connection explicitly before Joko copies any file into its new-task draft.</Text>

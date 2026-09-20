@@ -721,7 +721,7 @@ function appleNativeModule(): NativeIncomingShareModule {
 }
 
 const nativeIncomingShareDriver: MobileIncomingShareNativeDriver = {
-  supported: Platform.OS === "ios",
+  supported: Platform.OS === "ios" || Platform.OS === "android",
   getNextBatch: () => appleNativeModule().getNextBatch(),
   bindBatch: (batchId, profileId) => appleNativeModule().bindBatch(batchId, profileId),
   claimBatch: (batchId, profileId, targetId, surfaceOwnerKey, policyKey, acceptedItemIds) =>

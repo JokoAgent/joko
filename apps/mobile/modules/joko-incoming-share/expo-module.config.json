@@ -1,7 +1,10 @@
 {
-  "platforms": ["apple"],
+  "platforms": ["apple", "android"],
   "apple": {
     "podspecPath": "./ios/JokoIncomingShare.podspec",
     "modules": ["JokoIncomingShareModule"]
+  },
+  "android": {
+    "modules": ["app.joko.incomingshare.JokoIncomingShareModule"]
   }
 }

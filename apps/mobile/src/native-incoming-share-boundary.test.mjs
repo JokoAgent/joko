@@ -127,12 +127,15 @@ describe("iOS incoming-share native boundary", () => {
     expect(extension).toContain("try? FileManager.default.removeItem(at: itemDirectory)");
   });
 
-  it("autolinks an Apple-only module that revalidates App Group containment, file identity, MIME, and SHA", () => {
+  it("autolinks the Apple implementation that revalidates App Group containment, file identity, MIME, and SHA", () => {
     expect(moduleConfig).toEqual({
-      platforms: ["apple"],
+      platforms: ["apple", "android"],
       apple: {
         podspecPath: "./ios/JokoIncomingShare.podspec",
         modules: ["JokoIncomingShareModule"]
+      },
+      android: {
+        modules: ["app.joko.incomingshare.JokoIncomingShareModule"]
       }
     });
     expect(moduleSource).toContain('Name("JokoIncomingShare")');
