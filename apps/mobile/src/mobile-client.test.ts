@@ -26,6 +26,11 @@ import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
+import {
+  MobileMediaPreviewFiles,
+  type MobileMediaPreviewFileDriver,
+  type MobileMediaPreviewFileSnapshot
+} from "./mobile-media-preview";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
@@ -933,12 +938,52 @@ function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
   };
 }
 
+function mediaPreviewFixture(
+  sha256Hex = "c".repeat(64),
+  write?: (fileName: string, bytes: Uint8Array) => Promise<MobileMediaPreviewFileSnapshot>
+) {
+  const stored = new Map<string, Uint8Array>();
+  const removed: string[] = [];
+  const driver: MobileMediaPreviewFileDriver = {
+    prepare: vi.fn(async () => { stored.clear(); }),
+    write: vi.fn(async (fileName, bytes) => {
+      if (write) return write(fileName, bytes);
+      const exact = Uint8Array.from(bytes);
+      stored.set(fileName, exact);
+      return { uri: `file:///media/${fileName}`, fileName, byteSize: exact.byteLength, bytes: exact };
+    }),
+    remove: vi.fn(async (snapshot) => {
+      removed.push(snapshot.fileName);
+      stored.delete(snapshot.fileName);
+    })
+  };
+  return {
+    files: new MobileMediaPreviewFiles(driver, async () => sha256Hex),
+    driver,
+    removed,
+    stored
+  };
+}
+
 function fixedIds(...values: readonly string[]): () => string {
   let index = 0;
   return () => values[index++] ?? `fallback-${index}`;
 }
 
 const renderedPngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function previewMp4Bytes(handler: "soun" | "vide" = "vide"): Uint8Array {
+  const bytes = new Uint8Array(48);
+  bytes.set([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d], 0);
+  bytes.set([0x69, 0x73, 0x6f, 0x6d], 16);
+  bytes.set([0, 0, 0, 24, 0x68, 0x64, 0x6c, 0x72], 24);
+  bytes.set([...handler].map((value) => value.charCodeAt(0)), 40);
+  return bytes;
+}
+
+const previewWavBytes = new Uint8Array([
+  0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45
+]);
 
 function galleryPngBytes(width: number, height: number): Uint8Array {
   const bytes = new Uint8Array(45);
@@ -1041,10 +1086,11 @@ function client(
   newId: () => string = () => "operation-1",
   clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
   drafts = memoryDraftStores(),
-  attachmentFiles?: MobileAttachmentFiles
+  attachmentFiles?: MobileAttachmentFiles,
+  mediaPreviewFiles?: MobileMediaPreviewFiles
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
-    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles);
+    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles);
   clients.push(instance);
   return instance;
 }
@@ -5511,6 +5557,150 @@ describe("native current-task Files ownership", () => {
       kind: "text", text: "# Joko", languageId: "markdown", startByte: 0n, endByte: 6n,
       totalLines: 1, truncated: false
     });
+  });
+
+  it("materializes an authenticated Generated video into one app-owned preview lease and cleans it on background", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewMp4Bytes();
+    const video = create(ArtifactSchema, {
+      artifactId: "video-1",
+      sessionId: "session",
+      kind: ArtifactKind.FILE,
+      title: "Demo video",
+      blob: {
+        blobId: "video-blob",
+        fileName: "demo.mp4",
+        mediaType: "video/mp4",
+        byteSize: BigInt(bytes.byteLength),
+        sha256Hex: "c".repeat(64),
+        disposition: BlobDisposition.INLINE
+      }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [video], revision: "artifacts-video" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
+    const media = mediaPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "media-lease-1", undefined, undefined, undefined, media.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+
+    expect(app.state.files.preview).toMatchObject({
+      kind: "media",
+      mediaKind: "video",
+      mediaType: "video/mp4",
+      leaseId: "media-lease-1",
+      uri: "file:///media/preview-media-lease-1.mp4",
+      sha256Hex: "c".repeat(64)
+    });
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, video.blob, expect.any(AbortSignal));
+    expect(media.driver.write).toHaveBeenCalledWith("preview-media-lease-1.mp4", bytes);
+
+    app.setForeground(false);
+    await vi.waitFor(() => expect(media.removed).toEqual(["preview-media-lease-1.mp4"]));
+    expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("previews an exact Workspace audio Blob and rejects a mismatched container before cache write", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const audioRevision = create(FileRevisionSchema, {
+      opaqueRevision: "audio-1",
+      sha256Hex: "d".repeat(64),
+      byteSize: BigInt(previewWavBytes.byteLength)
+    });
+    const audioEntry = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace",
+      relativePath: "audio/voice.wav",
+      displayName: "voice.wav",
+      kind: FileKind.REGULAR,
+      mediaType: "audio/wav",
+      revision: audioRevision
+    });
+    const audioBlob = create(BlobRefSchema, {
+      blobId: "audio-blob",
+      fileName: "voice.wav",
+      mediaType: "audio/wav",
+      byteSize: BigInt(previewWavBytes.byteLength),
+      sha256Hex: "d".repeat(64),
+      disposition: BlobDisposition.INLINE
+    });
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+      entries: parentPath === "audio" ? [audioEntry] : [audioEntry],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
+      paths: [audioEntry.relativePath], revision: "index-audio", truncated: false
+    });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry: audioEntry,
+      content: { case: "blob", value: audioBlob }
+    }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: previewWavBytes, mediaType: "audio/wav" });
+    const media = mediaPreviewFixture("d".repeat(64));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "audio-lease", undefined, undefined, undefined, media.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewWorkspaceEntry(app.state.files.entries[0]!);
+    expect(app.state.files.preview).toMatchObject({
+      kind: "media", mediaKind: "audio", leaseId: "audio-lease", mediaType: "audio/wav"
+    });
+
+    app.closeFilesPreview();
+    vi.mocked(network.downloadBlob).mockResolvedValue({
+      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x64]),
+      mediaType: "audio/wav"
+    });
+    await app.previewWorkspaceEntry(app.state.files.entries[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/container/u) });
+    expect(media.driver.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes a late media file staged after Files closes and never adopts it into a later owner", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewMp4Bytes();
+    const video = create(ArtifactSchema, {
+      artifactId: "video-late",
+      sessionId: "session",
+      kind: ArtifactKind.FILE,
+      title: "Late video",
+      blob: {
+        blobId: "video-late-blob",
+        fileName: "late.mp4",
+        mediaType: "video/mp4",
+        byteSize: BigInt(bytes.byteLength),
+        sha256Hex: "e".repeat(64),
+        disposition: BlobDisposition.INLINE
+      }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [video], revision: "artifacts-video-late" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "video/mp4" });
+    let resolveWrite!: (snapshot: MobileMediaPreviewFileSnapshot) => void;
+    const media = mediaPreviewFixture("e".repeat(64), async () => new Promise((resolve) => { resolveWrite = resolve; }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "late-media-lease", undefined, undefined, undefined, media.files);
+    await app.start();
+    await app.openFiles();
+
+    const preview = app.previewArtifact(app.state.files.artifacts[0]!);
+    await vi.waitFor(() => expect(media.driver.write).toHaveBeenCalled());
+    app.closeFiles();
+    resolveWrite({
+      uri: "file:///media/preview-late-media-lease.mp4",
+      fileName: "preview-late-media-lease.mp4",
+      byteSize: bytes.byteLength,
+      bytes
+    });
+    await preview;
+
+    expect(app.state.files.open).toBe(false);
+    expect(app.state.files.preview).toBeUndefined();
+    expect(media.removed).toEqual(["preview-late-media-lease.mp4"]);
   });
 
   it("adds an authenticated Workspace Blob as an exact-profile attachment without replacing structured draft state", async () => {

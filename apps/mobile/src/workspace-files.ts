@@ -67,6 +67,16 @@ export type MobileFilePreview =
       readonly heightPixels: number;
     })
   | (MobilePreviewBase & {
+      readonly kind: "media";
+      readonly leaseId: string;
+      readonly profileId: string;
+      readonly uri: string;
+      readonly fileName: string;
+      readonly mediaKind: "audio" | "video";
+      readonly localByteSize: number;
+      readonly sha256Hex: string;
+    })
+  | (MobilePreviewBase & {
       readonly kind: "unsupported";
       readonly reason: string;
     })

@@ -175,6 +175,9 @@ import { buildMobileMessageActions, queueItemText, type MobileMessageActionId } 
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
 import type { MobileVoiceRunError } from "./mobile-voice-input";
 import { MobileImageLightbox } from "./MobileImageLightbox";
+import { MobileMediaPlayer } from "./MobileMediaPlayer";
+import type { MobileMediaPlayerStatus } from "./mobile-media-player";
+import { mobileMediaPreviewFiles } from "./mobile-media-preview";
 import type { MobileBurnedImage, MobileComposerImageEditorSession } from "./mobile-composer-image-editor";
 import type { MobileImageAnnotationStroke } from "./mobile-image-annotation";
 import {
@@ -208,7 +211,8 @@ const client = new MobileClient(
   (identity) => mobileInteractionDrafts.clear(identity),
   mobileNewTaskDrafts,
   mobileComposerDrafts,
-  mobileAttachmentFiles
+  mobileAttachmentFiles,
+  mobileMediaPreviewFiles
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
@@ -4860,6 +4864,9 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
   onOpenImage: (source: MobileFilesComposerSource) => void;
   onClose: () => void;
 }) {
+  const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
+  const mediaLeaseId = preview?.kind === "media" ? preview.leaseId : undefined;
+  useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
   return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={busy ? () => undefined : onClose}>
     <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       {preview && <>
@@ -4883,6 +4890,9 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
           {preview.kind === "text" && <Text style={[styles.caption, { color: colors.muted }]}>
             {preview.languageId || "plain text"} · lines {preview.totalLines} · bytes {preview.startByte.toString(10)}–{preview.endByte.toString(10)}
           </Text>}
+          {preview.kind === "media" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: mediaStatus?.state === "error" ? colors.negative : colors.muted }]}>
+            {formatMobileMediaPlayerStatus(mediaStatus, preview.mediaKind)}
+          </Text>}
         </View>
         {preview.kind === "loading" ? <Centered label="Loading the exact observed file revision…" colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
@@ -4891,6 +4901,21 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
               {preview.widthPixels} × {preview.heightPixels} pixels
             </Text>}
           </ScrollView>
+          : preview.kind === "media" ? <View style={styles.mediaPreviewContainer}>
+            <MobileMediaPlayer
+              key={preview.leaseId}
+              background={colors.background}
+              ink={colors.ink}
+              instanceId={preview.leaseId}
+              kind={preview.mediaKind}
+              mediaType={preview.mediaType}
+              onStatusChange={setMediaStatus}
+              style={styles.mediaPreview}
+              surface={colors.surface}
+              title={preview.title}
+              uri={preview.uri}
+            />
+          </View>
           : preview.kind === "text" ? <ScrollView style={styles.fill} contentContainerStyle={styles.textPreviewContainer}>
             {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>Preview is truncated to the authenticated byte window shown above.</Text>}
             <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || "(empty file)"}</Text>
@@ -4904,6 +4929,27 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
       </>}
     </SafeAreaView>
   </Modal>;
+}
+
+function formatMobileMediaPlayerStatus(
+  status: MobileMediaPlayerStatus | undefined,
+  kind: "audio" | "video"
+): string {
+  if (!status) return `Verified ${kind} · ready to load`;
+  if (status.state === "error") return status.error || `${kind === "video" ? "Video" : "Audio"} playback failed`;
+  const current = status.currentTime === null ? undefined : formatMediaTime(status.currentTime);
+  const duration = status.duration === null ? undefined : formatMediaTime(status.duration);
+  const progress = current && duration ? ` · ${current} / ${duration}` : current ? ` · ${current}` : "";
+  const label = status.state === "ready" ? "Ready" : status.state === "playing" ? "Playing"
+    : status.state === "paused" ? "Paused" : status.state === "waiting" ? "Buffering"
+      : status.state === "ended" ? "Finished" : "Unavailable";
+  return `${label}${progress}`;
+}
+
+function formatMediaTime(value: number): string {
+  const seconds = Math.max(0, Math.floor(value));
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 function fileSearchResultKey(result: MobileFileSearchResult, index: number): string {
@@ -5456,6 +5502,8 @@ const styles = StyleSheet.create({
   previewMessage: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 28 },
   imagePreviewContainer: { flexGrow: 1, alignItems: "center", justifyContent: "center", gap: 12, padding: 16 },
   imagePreview: { width: "100%", minHeight: 320, flex: 1 },
+  mediaPreviewContainer: { flex: 1, minHeight: 280, paddingHorizontal: 12, paddingBottom: 12 },
+  mediaPreview: { flex: 1, minHeight: 240, overflow: "hidden", borderRadius: 16 },
   textPreviewContainer: { paddingHorizontal: 16, paddingBottom: 36 },
   textPreview: { fontSize: 13, lineHeight: 20, fontFamily: Platform.select({ ios: "Menlo", android: "monospace" }) }
 });

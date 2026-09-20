@@ -53,6 +53,11 @@ import {
   type MobileWorkspaceAuthority
 } from "./workspace-files";
 import {
+  mobileMediaPreviewKind,
+  type MobileMediaPreviewFiles,
+  type MobileMediaPreviewLease
+} from "./mobile-media-preview";
+import {
   acceptedQueueItems,
   backendSupports,
   editQueueItemText,
@@ -463,6 +468,7 @@ export class MobileClient {
   #filesListAbort?: AbortController;
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
+  #filesMediaPreview?: MobileMediaPreviewLease;
   #filesWatchAbort?: AbortController;
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
   #queueEditLease?: MobileQueueEditLease;
@@ -481,7 +487,8 @@ export class MobileClient {
     private readonly clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
     private readonly newTaskDrafts?: MobileNewTaskDraftStore,
     private readonly composerDrafts?: MobileComposerDraftStore,
-    private readonly attachmentFiles?: MobileAttachmentFiles
+    private readonly attachmentFiles?: MobileAttachmentFiles,
+    private readonly mediaPreviewFiles?: MobileMediaPreviewFiles
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -535,7 +542,15 @@ export class MobileClient {
     this.#projectionMisses = 0;
     this.#streamSequence = undefined;
     this.#streamGeneration = undefined;
-    this.#state = { ...this.#state, homeSearchStatus: "idle", homeSearchSessionIds: [], homeSearchError: undefined };
+    this.#state = {
+      ...this.#state,
+      homeSearchStatus: "idle",
+      homeSearchSessionIds: [],
+      homeSearchError: undefined,
+      ...(this.#state.files.preview?.kind === "media"
+        ? { files: { ...this.#state.files, preview: undefined } }
+        : {})
+    };
     this.#abort = new AbortController();
     return ++this.#epoch;
   }
@@ -1563,6 +1578,8 @@ export class MobileClient {
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
+    await this.#releaseFilesMediaPreview().catch(() => undefined);
+    if (!this.#currentFiles(this.#filesEpoch, context.key)) return;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = undefined;
     const epoch = this.#filesEpoch;
@@ -1588,6 +1605,7 @@ export class MobileClient {
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
+    void this.#releaseFilesMediaPreview().catch(() => undefined);
     const epoch = this.#filesEpoch;
     const location = { kind: "workspace" as const, path };
     this.#set({ files: {
@@ -1614,6 +1632,7 @@ export class MobileClient {
     }
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
+    void this.#releaseFilesMediaPreview().catch(() => undefined);
     this.#set({ files: {
       ...this.#state.files,
       location: { kind: "generated" },
@@ -1749,7 +1768,11 @@ export class MobileClient {
       revisionKey: [current.artifactId, blob?.blobId ?? "", blob?.sha256Hex ?? "", byteSize.toString(10)].join(":")
     };
     this.#set({ files: { ...this.#state.files, preview: { ...base, kind: "loading" } } });
+    let stagedMedia: MobileMediaPreviewLease | undefined;
     try {
+      await this.#releaseFilesMediaPreview();
+      if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+        || !this.#currentFiles(epoch, context.key)) return;
       let preview: MobileFilePreview;
       if (!blob) {
         preview = { ...base, kind: "unsupported", reason: "This Generated file has no canonical Blob payload." };
@@ -1770,14 +1793,39 @@ export class MobileClient {
           preview = { ...base, kind: "text", text, languageId: "", startByte: 0n,
             endByte: blob.byteSize, totalLines: text === "" ? 0 : text.split(/\r?\n/gu).length, truncated: false };
         }
+      } else if (mobileMediaPreviewKind(mediaType)) {
+        if (!this.mediaPreviewFiles) {
+          preview = { ...base, kind: "unsupported", reason: "Audio/video preview is unavailable on this mobile runtime." };
+        } else {
+          const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
+          if (normalizeMediaType(download.mediaType) !== mediaType) {
+            throw new Error("The downloaded media type did not match the canonical Generated Blob.");
+          }
+          stagedMedia = await this.mediaPreviewFiles.stage(
+            context.credential.profileId,
+            this.newId(),
+            blob.fileName || artifactTitle(current),
+            mediaType,
+            blob.sha256Hex,
+            download.bytes,
+            controller.signal
+          );
+          preview = { ...base, kind: "media", ...stagedMedia };
+        }
       } else {
         preview = { ...base, kind: "unsupported",
           reason: `No safe in-app preview is available for ${mediaType} (${blob.byteSize.toString(10)} bytes).` };
       }
       if (controller.signal.aborted || this.#filesPreviewAbort !== controller
-        || !this.#currentFiles(epoch, context.key)) return;
+        || !this.#currentFiles(epoch, context.key)) {
+        if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
+        return;
+      }
+      this.#filesMediaPreview = stagedMedia;
+      stagedMedia = undefined;
       this.#set({ files: { ...this.#state.files, preview } });
     } catch (error) {
+      if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
       if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
       this.#set({ files: { ...this.#state.files,
         preview: { ...base, kind: "error", reason: message(error) } } });
@@ -1789,6 +1837,7 @@ export class MobileClient {
   closeFilesPreview(): void {
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
+    void this.#releaseFilesMediaPreview().catch(() => undefined);
     if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
   }
 
@@ -6110,6 +6159,7 @@ export class MobileClient {
 
   #cancelFilesRequests(): void {
     if (this.#imageGallery?.source.kind === "files") this.#imageGallery = undefined;
+    void this.#releaseFilesMediaPreview().catch(() => undefined);
     this.#filesEpoch += 1;
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
@@ -6121,6 +6171,12 @@ export class MobileClient {
     this.#filesWatchAbort = undefined;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = undefined;
+  }
+
+  async #releaseFilesMediaPreview(): Promise<void> {
+    const lease = this.#filesMediaPreview;
+    this.#filesMediaPreview = undefined;
+    if (lease && this.mediaPreviewFiles) await this.mediaPreviewFiles.remove(lease);
   }
 
   async #loadFiles(
@@ -6210,6 +6266,7 @@ export class MobileClient {
   #scheduleFilesRefresh(context: MobileFilesContext, epoch: number): void {
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
+    void this.#releaseFilesMediaPreview().catch(() => undefined);
     if (this.#state.files.preview) {
       this.#set({ files: { ...this.#state.files, preview: undefined } });
     }
@@ -6237,6 +6294,9 @@ export class MobileClient {
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
     try {
+      await this.#releaseFilesMediaPreview();
+      if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+        || !this.#currentFiles(epoch, context.key)) return;
       const directory = await this.network.listWorkspaceDirectory(
         context.credential,
         context.authority.workspace.workspaceId,
@@ -6274,6 +6334,9 @@ export class MobileClient {
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
     try {
+      await this.#releaseFilesMediaPreview();
+      if (controller.signal.aborted || this.#filesPreviewAbort !== controller
+        || !this.#currentFiles(epoch, context.key)) return;
       await this.#finishWorkspacePreview(context, path, revision, title, controller, epoch);
     } catch (error) {
       if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
@@ -6303,7 +6366,11 @@ export class MobileClient {
       || !this.#currentFiles(epoch, context.key)) return;
     const preview = await this.#workspacePreview(context, result, title, controller.signal);
     if (controller.signal.aborted || this.#filesPreviewAbort !== controller
-      || !this.#currentFiles(epoch, context.key)) return;
+      || !this.#currentFiles(epoch, context.key)) {
+      if (preview.kind === "media") await this.mediaPreviewFiles?.remove(preview).catch(() => undefined);
+      return;
+    }
+    this.#filesMediaPreview = preview.kind === "media" ? preview : undefined;
     this.#set({ files: { ...this.#state.files, preview } });
   }
 
@@ -6358,6 +6425,29 @@ export class MobileClient {
       const blobType = normalizeMediaType(blob.mediaType) || "application/octet-stream";
       if (blob.byteSize !== revision.byteSize || blob.sha256Hex !== revision.sha256Hex || blobType !== mediaType) {
         throw new Error("The Joko node returned mismatched binary Blob metadata.");
+      }
+      if (mobileMediaPreviewKind(blobType)) {
+        if (blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
+          return { ...base, kind: "unsupported",
+            reason: `This ${blobType} file is ${blob.byteSize.toString(10)} bytes and exceeds the mobile preview limit.` };
+        }
+        if (!this.mediaPreviewFiles) {
+          return { ...base, kind: "unsupported", reason: "Audio/video preview is unavailable on this mobile runtime." };
+        }
+        const download = await this.network.downloadBlob(context.credential, blob, signal);
+        if (normalizeMediaType(download.mediaType) !== blobType) {
+          throw new Error("The downloaded media type did not match the canonical Workspace Blob.");
+        }
+        const lease = await this.mediaPreviewFiles.stage(
+          context.credential.profileId,
+          this.newId(),
+          entry.relativePath,
+          blobType,
+          blob.sha256Hex,
+          download.bytes,
+          signal
+        );
+        return { ...base, kind: "media", ...lease };
       }
       return { ...base, kind: "unsupported",
         reason: `No safe in-app preview is available for ${blobType} (${blob.byteSize.toString(10)} bytes).` };
