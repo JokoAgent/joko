@@ -53,6 +53,7 @@ function cameraFixture(
       stored.set(`${profileId}/${attachmentId}`, snapshot);
       return snapshot;
     }),
+    stageBytes: vi.fn(async () => { throw new Error("not used"); }),
     read: vi.fn(async (profileId, attachmentId) => {
       const snapshot = stored.get(`${profileId}/${attachmentId}`);
       if (!snapshot) throw new Error("missing staged file");

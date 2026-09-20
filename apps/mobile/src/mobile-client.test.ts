@@ -4,6 +4,7 @@ import {
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
+  WorkspaceSearchMatchSchema,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
   EventCursorSchema, EventSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
@@ -758,6 +759,15 @@ function attachmentFileFixture(onRemove?: (attachmentId: string) => void) {
   const driver: MobileAttachmentFileDriver = {
     pick: vi.fn(async () => ({ canceled: true, files: [] })),
     stage: vi.fn(async () => { throw new Error("not used"); }),
+    stageBytes: vi.fn(async (profileId, attachmentId, value) => {
+      const stored = Uint8Array.from(value);
+      bytes.set(attachmentId, stored);
+      return {
+        uri: `file:///durable/${profileId}/${attachmentId}`,
+        byteSize: stored.byteLength,
+        bytes: Uint8Array.from(stored)
+      };
+    }),
     read: vi.fn(async (profileId, attachmentId) => {
       const value = bytes.get(attachmentId);
       if (!value) throw new Error("staged bytes missing");
@@ -4198,9 +4208,43 @@ describe("native current-task Files ownership", () => {
       sha256Hex: "b".repeat(64) }
   });
 
-  function configureFiles(network: MobileNetwork): void {
-    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: filesSnapshot });
-    vi.mocked(network.readSession).mockResolvedValue(filesSnapshot);
+  const handoffSnapshot = create(SnapshotSchema, {
+    ...attachmentSnapshot,
+    snapshotId: "files-handoff-snapshot",
+    backends: [create(BackendDescriptorSchema, {
+      ...attachmentSnapshot.backends[0]!,
+      capabilities: create(CapabilityManifestSchema, {
+        schemaVersion: attachmentSnapshot.backends[0]!.capabilities?.schemaVersion ?? "1",
+        revision: attachmentSnapshot.backends[0]!.capabilities?.revision,
+        capabilities: [
+          ...(attachmentSnapshot.backends[0]!.capabilities?.capabilities ?? []),
+          create(CapabilitySchema, { name: capabilityNames.workspaceFiles, support: CapabilitySupport.SUPPORTED }),
+          create(CapabilitySchema, { name: capabilityNames.workspaceFilesWatch, support: CapabilitySupport.SUPPORTED }),
+          create(CapabilitySchema, {
+            name: capabilityNames.inputMention,
+            support: CapabilitySupport.SUPPORTED,
+            options: create(CapabilityOptionsSchema, {
+              kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+                mediaTypes: ["workspace_file", "workspace_directory", "artifact"]
+              }) }
+            })
+          })
+        ]
+      })
+    })],
+    targets: [create(TargetSchema, { ...attachmentSnapshot.targets[0]!, workspaceId: "workspace" })],
+    sessions: [create(SessionSchema, {
+      ...attachmentSnapshot.sessions[0]!,
+      version: create(EntityVersionSchema, {
+        generation: 8n,
+        revision: create(RevisionSchema, { value: 9n, etag: "session-r9" })
+      })
+    })]
+  });
+
+  function configureFiles(network: MobileNetwork, projected: Snapshot = filesSnapshot): void {
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: projected });
+    vi.mocked(network.readSession).mockResolvedValue(projected);
     vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
       entries: parentPath === "" ? [sourceDirectory, readme] : [], revision: `directory:${parentPath || "root"}`
     }));
@@ -4249,6 +4293,340 @@ describe("native current-task Files ownership", () => {
       kind: "text", text: "# Joko", languageId: "markdown", startByte: 0n, endByte: 6n,
       totalLines: 1, truncated: false
     });
+  });
+
+  it("adds an authenticated Workspace Blob as an exact-profile attachment without replacing structured draft state", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const imageRevision = create(FileRevisionSchema, {
+      opaqueRevision: "image-1", sha256Hex: "a".repeat(64), byteSize: 4n
+    });
+    const imageEntry = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace", relativePath: "images/pixel.png", displayName: "pixel.png",
+      kind: FileKind.REGULAR, mediaType: "image/png", revision: imageRevision
+    });
+    const imageBlob = create(BlobRefSchema, {
+      blobId: "workspace-image", fileName: "pixel.png", mediaType: "image/png", byteSize: 4n,
+      sha256Hex: "a".repeat(64), disposition: BlobDisposition.INLINE
+    });
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parentPath) => ({
+      entries: parentPath === "" ? [sourceDirectory, readme]
+        : parentPath === "images" ? [imageEntry] : [],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
+      paths: ["README.md", "images/pixel.png"], revision: "index-image", truncated: false
+    });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry: imageEntry,
+      content: { case: "image", value: { blob: imageBlob, altText: "Pixel" } }
+    }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({
+      bytes: new Uint8Array([1, 1, 1, 1]), mediaType: "image/png"
+    });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const structured = insertMobileWorkspaceMention(
+      plainTextMobileComposerDraft("Keep this"),
+      { start: 9, end: 9 },
+      { workspaceId: "workspace", relativePath: "README.md", displayText: "README.md", directory: false },
+      "existing-reference"
+    ).draft;
+    const original: MobileComposerDraft = {
+      ...structured,
+      attachments: [{
+        state: "local", attachmentId: "existing-file", kind: "file", fileName: "keep.pdf",
+        mediaType: "application/pdf", byteSize: 1, sha256Hex: "b".repeat(64), capturedAtUnixMs: 1
+      }]
+    };
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    let sequence = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => `files-handoff-${++sequence}`, undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+    await app.openFilesDirectory("images");
+
+    await expect(app.addFilesItemToComposer({
+      kind: "workspace-entry",
+      entry: app.state.files.entries[0]!
+    })).resolves.toBe("attachment");
+
+    const retained = await drafts.composer.read(identity);
+    expect(retained?.text).toBe(original.text);
+    expect(retained?.mentions).toEqual(original.mentions);
+    expect(retained?.attachments).toEqual([
+      original.attachments[0],
+      expect.objectContaining({
+        state: "local", attachmentId: "files-handoff-1", kind: "image", fileName: "pixel.png",
+        mediaType: "image/png", byteSize: 4, sha256Hex: "a".repeat(64)
+      })
+    ]);
+    expect(fixture.driver.stageBytes).toHaveBeenCalledWith(
+      credential.profileId, "files-handoff-1", new Uint8Array([1, 1, 1, 1])
+    );
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
+  it("falls back to validated Workspace and Artifact mentions without auto-sending", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listArtifactReferenceCatalog).mockResolvedValue({
+      artifacts: [artifact], revision: "artifact-references-1"
+    });
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep"));
+    await drafts.composer.flush(identity);
+    let sequence = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => `files-reference-${++sequence}`, undefined, drafts, attachmentFileFixture().files);
+    await app.start();
+    await app.openFiles();
+
+    await expect(app.addFilesItemToComposer({
+      kind: "workspace-entry",
+      entry: app.state.files.entries.find((entry) => entry.relativePath === "src")!
+    })).resolves.toBe("reference");
+    await app.searchFiles("readme", "name", false);
+    await expect(app.addFilesItemToComposer({
+      kind: "search-result",
+      result: app.state.files.searchResults[0]!
+    })).resolves.toBe("reference");
+    vi.mocked(network.searchWorkspace).mockResolvedValueOnce({
+      matches: [create(WorkspaceSearchMatchSchema, {
+        relativePath: "README.md", revision, linePreview: "# Joko"
+      })],
+      revision: "search-content-1",
+      truncated: false,
+      totalFiles: 1
+    });
+    await app.searchFiles("Joko", "content", false);
+    await expect(app.addFilesItemToComposer({
+      kind: "search-result",
+      result: app.state.files.searchResults[0]!
+    })).resolves.toBe("reference");
+    await app.searchFiles("report", "name", false);
+    await expect(app.addFilesItemToComposer({
+      kind: "search-result",
+      result: app.state.files.searchResults[0]!
+    })).resolves.toBe("reference");
+
+    const retained = await drafts.composer.read(identity);
+    expect(retained?.text.startsWith("Keep")).toBe(true);
+    expect(retained?.mentions.map((mention) => ({ kind: mention.kind, id: mention.mentionId }))).toEqual([
+      { kind: "workspace", id: "files-reference-1" },
+      { kind: "workspace", id: "files-reference-2" },
+      { kind: "workspace", id: "files-reference-3" },
+      { kind: "artifact", id: "files-reference-4" }
+    ]);
+    expect(retained?.attachments).toEqual([]);
+    expect(network.downloadBlob).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("removes staged bytes and retains a concurrently changed draft when the Files CAS loses", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const pdfArtifact = create(ArtifactSchema, {
+      ...artifact,
+      artifactId: "artifact-pdf",
+      title: "Proof",
+      blob: create(BlobRefSchema, {
+        blobId: "blob-pdf", fileName: "proof.pdf", mediaType: "application/pdf", byteSize: 6n,
+        sha256Hex: "b".repeat(64), disposition: BlobDisposition.ARTIFACT
+      })
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [pdfArtifact], revision: "artifacts-pdf" });
+    let resolveDownload!: (value: Awaited<ReturnType<MobileNetwork["downloadBlob"]>>) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(async () => new Promise((resolve) => {
+      resolveDownload = resolve;
+    }));
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Original"));
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "files-cas-attachment", undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+
+    const adding = app.addFilesItemToComposer({ kind: "artifact", artifact: app.state.files.artifacts[0]! });
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalled());
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Concurrent change"));
+    await drafts.composer.flush(identity);
+    resolveDownload({ bytes: new Uint8Array([2, 2, 2, 2, 2, 2]), mediaType: "application/pdf" });
+
+    await expect(adding).rejects.toThrow(/composer changed/u);
+    expect(await drafts.composer.read(identity)).toEqual(plainTextMobileComposerDraft("Concurrent change"));
+    expect(fixture.removed).toEqual(["files-cas-attachment"]);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the draft and removes staged bytes when durable draft storage fails", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const pdfArtifact = create(ArtifactSchema, {
+      ...artifact,
+      artifactId: "artifact-storage",
+      blob: create(BlobRefSchema, {
+        blobId: "blob-storage", fileName: "storage.pdf", mediaType: "application/pdf", byteSize: 6n,
+        sha256Hex: "b".repeat(64), disposition: BlobDisposition.ARTIFACT
+      })
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [pdfArtifact], revision: "artifacts-storage" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({
+      bytes: new Uint8Array([2, 2, 2, 2, 2, 2]), mediaType: "application/pdf"
+    });
+    const values = new Map<string, string>();
+    let failNextWrite = false;
+    const driver: MobilePlainStorageDriver = {
+      async getItem(key) { return values.get(key) ?? null; },
+      async setItem(key, value) {
+        if (failNextWrite) {
+          failNextWrite = false;
+          throw new Error("forced draft storage failure");
+        }
+        values.set(key, value);
+      },
+      async removeItem(key) { values.delete(key); }
+    };
+    const drafts = {
+      values,
+      newTask: new MobileNewTaskDraftStore(driver),
+      composer: new MobileComposerDraftStore(driver)
+    };
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const original = plainTextMobileComposerDraft("Original durable draft");
+    drafts.composer.save(identity, original);
+    await drafts.composer.flush(identity);
+    failNextWrite = true;
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "files-storage-attachment", undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+
+    await expect(app.addFilesItemToComposer({
+      kind: "artifact", artifact: app.state.files.artifacts[0]!
+    })).rejects.toThrow(/could not be written/u);
+
+    expect(await drafts.composer.read(identity)).toEqual(original);
+    expect(fixture.removed).toEqual(["files-storage-attachment"]);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects Workspace revision, Generated catalog, and Blob-owner drift before changing the draft", async () => {
+    const workspaceNetwork = fakeNetwork();
+    configureFiles(workspaceNetwork, handoffSnapshot);
+    vi.mocked(workspaceNetwork.searchWorkspace).mockResolvedValue({
+      matches: [create(WorkspaceSearchMatchSchema, {
+        relativePath: "README.md", revision, linePreview: "# Joko"
+      })],
+      revision: "search-before-drift",
+      truncated: false,
+      totalFiles: 1
+    });
+    const changedReadme = create(WorkspaceEntrySchema, {
+      ...readme,
+      revision: create(FileRevisionSchema, {
+        ...revision,
+        opaqueRevision: "readme-2",
+        sha256Hex: "c".repeat(64)
+      })
+    });
+    const workspaceDrafts = memoryDraftStores();
+    const workspaceApp = client(workspaceNetwork, memoryStorage(credential).storage, undefined, undefined,
+      () => "workspace-drift", undefined, workspaceDrafts, attachmentFileFixture().files);
+    await workspaceApp.start();
+    await workspaceApp.openFiles();
+    await workspaceApp.searchFiles("Joko", "content", false);
+    vi.mocked(workspaceNetwork.listWorkspaceDirectory).mockResolvedValue({
+      entries: [sourceDirectory, changedReadme], revision: "directory-changed"
+    });
+    await expect(workspaceApp.addFilesItemToComposer({
+      kind: "search-result", result: workspaceApp.state.files.searchResults[0]!
+    })).rejects.toThrow(/search result changed/u);
+    expect(await workspaceDrafts.composer.read({
+      profileId: credential.profileId, sessionId: "session"
+    })).toBeNull();
+
+    const catalogNetwork = fakeNetwork();
+    configureFiles(catalogNetwork, handoffSnapshot);
+    const pdfArtifact = create(ArtifactSchema, {
+      ...artifact,
+      artifactId: "artifact-drift",
+      blob: create(BlobRefSchema, {
+        blobId: "blob-before", fileName: "drift.pdf", mediaType: "application/pdf", byteSize: 6n,
+        sha256Hex: "b".repeat(64), disposition: BlobDisposition.ARTIFACT
+      })
+    });
+    vi.mocked(catalogNetwork.listSessionArtifacts)
+      .mockResolvedValueOnce({ artifacts: [pdfArtifact], revision: "artifacts-before" })
+      .mockResolvedValueOnce({ artifacts: [pdfArtifact], revision: "artifacts-after" });
+    const catalogApp = client(catalogNetwork, memoryStorage(credential).storage, undefined, undefined,
+      () => "catalog-drift", undefined, memoryDraftStores(), attachmentFileFixture().files);
+    await catalogApp.start();
+    await catalogApp.openFiles();
+    await expect(catalogApp.addFilesItemToComposer({
+      kind: "artifact", artifact: catalogApp.state.files.artifacts[0]!
+    })).rejects.toThrow(/Generated catalog changed/u);
+    expect(catalogNetwork.downloadBlob).not.toHaveBeenCalled();
+
+    const blobNetwork = fakeNetwork();
+    configureFiles(blobNetwork, handoffSnapshot);
+    const replacedArtifact = create(ArtifactSchema, {
+      ...pdfArtifact,
+      blob: create(BlobRefSchema, { ...pdfArtifact.blob!, blobId: "blob-after" })
+    });
+    vi.mocked(blobNetwork.listSessionArtifacts)
+      .mockResolvedValueOnce({ artifacts: [pdfArtifact], revision: "artifacts-stable" })
+      .mockResolvedValueOnce({ artifacts: [replacedArtifact], revision: "artifacts-stable" });
+    const blobApp = client(blobNetwork, memoryStorage(credential).storage, undefined, undefined,
+      () => "blob-drift", undefined, memoryDraftStores(), attachmentFileFixture().files);
+    await blobApp.start();
+    await blobApp.openFiles();
+    await expect(blobApp.addFilesItemToComposer({
+      kind: "artifact", artifact: blobApp.state.files.artifacts[0]!
+    })).rejects.toThrow(/Generated file changed/u);
+    expect(blobNetwork.downloadBlob).not.toHaveBeenCalled();
+  });
+
+  it("rejects a late Blob result after the selected task retires without staging or mutating a later draft", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const pdfArtifact = create(ArtifactSchema, {
+      ...artifact,
+      artifactId: "artifact-late",
+      blob: create(BlobRefSchema, {
+        blobId: "blob-late", fileName: "late.pdf", mediaType: "application/pdf", byteSize: 6n,
+        sha256Hex: "b".repeat(64), disposition: BlobDisposition.ARTIFACT
+      })
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [pdfArtifact], revision: "artifacts-late" });
+    let resolveDownload!: (value: Awaited<ReturnType<MobileNetwork["downloadBlob"]>>) => void;
+    vi.mocked(network.downloadBlob).mockImplementation(async () => new Promise((resolve) => {
+      resolveDownload = resolve;
+    }));
+    const drafts = memoryDraftStores();
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "files-late-attachment", undefined, drafts, fixture.files);
+    await app.start();
+    await app.openFiles();
+
+    const adding = app.addFilesItemToComposer({ kind: "artifact", artifact: app.state.files.artifacts[0]! });
+    await vi.waitFor(() => expect(network.downloadBlob).toHaveBeenCalled());
+    await app.select(undefined);
+    resolveDownload({ bytes: new Uint8Array([2, 2, 2, 2, 2, 2]), mediaType: "application/pdf" });
+
+    await expect(adding).rejects.toThrow(/authority changed/u);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+    expect(await drafts.composer.read({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
   });
 
   it("retires late directory and content-search results after foreground or Session ownership changes", async () => {

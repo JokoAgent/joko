@@ -15,6 +15,11 @@ export interface MobileAttachmentFileDriver {
     readonly files: readonly MobilePickedAttachmentCandidate[];
   }>;
   stage(profileId: string, attachmentId: string, sourceUri: string): Promise<MobileAttachmentFileSnapshot>;
+  stageBytes(
+    profileId: string,
+    attachmentId: string,
+    bytes: Uint8Array
+  ): Promise<MobileAttachmentFileSnapshot>;
   read(profileId: string, attachmentId: string): Promise<MobileAttachmentFileSnapshot>;
   remove(profileId: string, attachmentId: string): Promise<void>;
   clearProfile(profileId: string): Promise<void>;
@@ -28,6 +33,14 @@ export interface MobileAttachmentFileSnapshot {
 
 export interface MobileVerifiedAttachmentUpload {
   readonly uri: string;
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+}
+
+export interface MobileVerifiedAttachmentBytes {
+  readonly bytes: Uint8Array;
   readonly fileName: string;
   readonly mediaType: string;
   readonly byteSize: number;
@@ -144,6 +157,67 @@ export class MobileAttachmentFiles {
     };
   }
 
+  async stageVerifiedBytes(
+    profileId: string,
+    current: readonly MobileComposerAttachment[],
+    policy: MobileAttachmentPolicy,
+    candidate: MobileVerifiedAttachmentBytes,
+    newId: () => string,
+    signal?: AbortSignal
+  ): Promise<MobileLocalComposerAttachment> {
+    assertProfileId(profileId);
+    signal?.throwIfAborted();
+    if (!(candidate.bytes instanceof Uint8Array) || candidate.bytes.byteLength !== candidate.byteSize) {
+      throw new Error("The authenticated attachment bytes do not match their declared size.");
+    }
+    if (!/^[0-9a-f]{64}$/u.test(candidate.sha256Hex)) {
+      throw new Error("The authenticated attachment SHA-256 identity is invalid.");
+    }
+    if (current.length + 1 > policy.maximumItems) {
+      throw new Error(`A task message can include at most ${policy.maximumItems} attachments.`);
+    }
+    const metadata = assertMobileAttachmentCandidate(candidate, policy);
+    const sourceSha256Hex = await this.digestBytes(candidate.bytes);
+    signal?.throwIfAborted();
+    if (sourceSha256Hex !== candidate.sha256Hex) {
+      throw new Error(`${metadata.fileName} failed its authenticated SHA-256 check before staging.`);
+    }
+    const existingIds = new Set(current.map((attachment) => normalizeMobileComposerAttachment(attachment).attachmentId));
+    const attachmentId = newId();
+    assertAttachmentId(attachmentId);
+    if (existingIds.has(attachmentId)) throw new Error("The new attachment identity is already in use.");
+    let staged = false;
+    try {
+      const snapshot = await this.driver.stageBytes(profileId, attachmentId, candidate.bytes);
+      staged = true;
+      signal?.throwIfAborted();
+      assertSnapshot(snapshot);
+      if (snapshot.byteSize !== candidate.byteSize || snapshot.bytes.byteLength !== candidate.byteSize) {
+        throw new Error(`${metadata.fileName} changed while it was being copied into Joko.`);
+      }
+      const stagedSha256Hex = await this.digestBytes(snapshot.bytes);
+      signal?.throwIfAborted();
+      if (stagedSha256Hex !== candidate.sha256Hex) {
+        throw new Error(`${metadata.fileName} failed its staged SHA-256 check.`);
+      }
+      const attachment = normalizeMobileComposerAttachment({
+        state: "local",
+        attachmentId,
+        kind: metadata.kind,
+        fileName: metadata.fileName,
+        mediaType: metadata.mediaType,
+        byteSize: snapshot.byteSize,
+        sha256Hex: stagedSha256Hex,
+        capturedAtUnixMs: this.now()
+      }) as MobileLocalComposerAttachment;
+      appendMobileComposerAttachments(current, [attachment], policy);
+      return { ...attachment };
+    } catch (error) {
+      if (staged) await this.driver.remove(profileId, attachmentId).catch(() => undefined);
+      throw error;
+    }
+  }
+
   async remove(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
     assertProfileId(profileId);
     const exact = normalizeMobileComposerAttachment(attachment);
@@ -182,6 +256,21 @@ const expoMobileAttachmentFileDriver: MobileAttachmentFileDriver = {
     if (destination.exists) throw new Error("The new attachment file identity is already in use.");
     try {
       await new File(sourceUri).copy(destination);
+      return await expoFileSnapshot(destination);
+    } catch (error) {
+      if (destination.exists) destination.delete();
+      throw error;
+    }
+  },
+  async stageBytes(profileId, attachmentId, bytes) {
+    const { Directory, File, Paths } = await import("expo-file-system");
+    const directory = new Directory(Paths.document, attachmentRootDirectory, profileId);
+    directory.create({ idempotent: true, intermediates: true });
+    const destination = new File(directory, attachmentId);
+    if (destination.exists) throw new Error("The new attachment file identity is already in use.");
+    try {
+      destination.create();
+      destination.write(bytes);
       return await expoFileSnapshot(destination);
     } catch (error) {
       if (destination.exists) destination.delete();

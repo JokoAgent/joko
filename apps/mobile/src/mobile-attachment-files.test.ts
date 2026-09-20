@@ -32,6 +32,12 @@ function fileFixture(files: readonly MobilePickedAttachmentCandidate[], sources:
       stored.set(key(profileId, attachmentId), snapshot);
       return snapshot;
     }),
+    stageBytes: vi.fn(async (profileId, attachmentId, bytes) => {
+      const snapshot = { uri: `file:///durable/${profileId}/${attachmentId}`, byteSize: bytes.byteLength,
+        bytes: Uint8Array.from(bytes) };
+      stored.set(key(profileId, attachmentId), snapshot);
+      return snapshot;
+    }),
     read: vi.fn(async (profileId, attachmentId) => {
       const value = stored.get(key(profileId, attachmentId));
       if (!value) throw new Error("staged bytes missing");
@@ -97,6 +103,56 @@ describe("mobile durable attachment files", () => {
       byteSize: 2,
       sha256Hex: "a".repeat(64)
     });
+  });
+
+  it("copies authenticated bytes into exact-profile storage and removes a mismatched durable copy", async () => {
+    const fixture = fileFixture([], {});
+    const files = new MobileAttachmentFiles(fixture.driver, digest, () => 6_000);
+    const candidate = {
+      bytes: new Uint8Array([1, 2]),
+      fileName: "workspace.png",
+      mediaType: "image/png",
+      byteSize: 2,
+      sha256Hex: "a".repeat(64)
+    };
+
+    await expect(files.stageVerifiedBytes(
+      "profile-one", [], policy, candidate, () => "download-one"
+    )).resolves.toEqual({
+      state: "local",
+      attachmentId: "download-one",
+      kind: "image",
+      fileName: "workspace.png",
+      mediaType: "image/png",
+      byteSize: 2,
+      sha256Hex: "a".repeat(64),
+      capturedAtUnixMs: 6_000
+    });
+    expect(fixture.driver.stageBytes).toHaveBeenCalledWith(
+      "profile-one", "download-one", candidate.bytes
+    );
+
+    vi.mocked(fixture.driver.stageBytes).mockImplementationOnce(async (profileId, attachmentId) => {
+      const value = {
+        uri: `file:///durable/${profileId}/${attachmentId}`,
+        byteSize: 2,
+        bytes: new Uint8Array([2, 2])
+      };
+      fixture.stored.set(fixture.key(profileId, attachmentId), value);
+      return value;
+    });
+    await expect(files.stageVerifiedBytes(
+      "profile-one", [], policy, candidate, () => "download-tampered"
+    )).rejects.toThrow(/staged SHA-256/u);
+    expect(fixture.driver.remove).toHaveBeenCalledWith("profile-one", "download-tampered");
+    expect(fixture.stored.has(fixture.key("profile-one", "download-tampered"))).toBe(false);
+
+    await expect(files.stageVerifiedBytes(
+      "profile-one", [], policy, { ...candidate, sha256Hex: "b".repeat(64) }, () => "download-unverified"
+    )).rejects.toThrow(/before staging/u);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalledWith(
+      "profile-one", "download-unverified", candidate.bytes
+    );
   });
 
   it("cleans every copied item when a later picker result changes during staging", async () => {

@@ -58,6 +58,7 @@ function fixture(input: {
       stored.set(key(profileId, attachmentId), value);
       return value;
     }),
+    stageBytes: vi.fn(async () => { throw new Error("not used"); }),
     read: vi.fn(async (profileId, attachmentId) => {
       const value = stored.get(key(profileId, attachmentId));
       if (!value) throw new Error("missing staged file");

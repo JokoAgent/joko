@@ -44,6 +44,8 @@ import {
   workspaceParentPath,
   type MobileFileSearchResult,
   type MobileFilePreview,
+  type MobileFilesComposerResult,
+  type MobileFilesComposerSource,
   type MobileFilesSearchMode,
   type MobileFilesState,
   type MobileWorkspaceAuthority
@@ -63,8 +65,14 @@ import {
   type MobileInteractionSubmission
 } from "./mobile-interactions";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
-import type { MobileComposerDraftStore } from "./composer-draft-store";
+import type {
+  MobileComposerDraftIdentity,
+  MobileComposerDraftSnapshot,
+  MobileComposerDraftStore
+} from "./composer-draft-store";
 import {
+  insertMobileArtifactMention,
+  insertMobileWorkspaceMention,
   mobileComposerDraftWithoutPrefix,
   mobileComposerDraftsEqual,
   mobileComposerInput,
@@ -73,6 +81,8 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import {
+  appendMobileComposerAttachments,
+  assertMobileAttachmentCandidate,
   assertMobileAttachmentPolicy,
   replaceMobileComposerAttachment,
   resolveMobileAttachmentPolicy,
@@ -89,6 +99,7 @@ import {
   createMobileCatalogMentionControls,
   projectMobileArtifactMentionCatalog,
   projectMobileResourceMentionCatalog,
+  type MobileArtifactMentionCandidate,
   type MobileCatalogMentionCandidate,
   type MobileCatalogMentionCatalog,
   type MobileCatalogMentionControls
@@ -1625,6 +1636,106 @@ export class MobileClient {
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
     if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
+  }
+
+  async addFilesItemToComposer(
+    source: MobileFilesComposerSource,
+    signal?: AbortSignal
+  ): Promise<MobileFilesComposerResult> {
+    signal?.throwIfAborted();
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    const context = this.#filesContext();
+    const epoch = this.#filesEpoch;
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    if (!taskAuthorityKey || !this.#state.files.open || this.#state.files.authorityKey !== context.key) {
+      throw new Error("Open Files for the current task before adding an item to its composer.");
+    }
+    const identity: MobileComposerDraftIdentity = {
+      profileId: context.credential.profileId,
+      sessionId: context.authority.sessionId
+    };
+    const attachmentControls = this.taskAttachmentControls();
+    const workspaceControls = this.taskWorkspaceMentionControls();
+    const catalogControls = this.taskCatalogMentionControls();
+    const attachmentOwnerKey = attachmentControls?.surfaceOwnerKey;
+    const workspaceOwnerKey = workspaceControls?.surfaceOwnerKey;
+    const catalogOwnerKey = catalogControls?.surfaceOwnerKey;
+    this.#assertFilesComposerLease(
+      context, epoch, taskAuthorityKey, identity, source,
+      attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
+    );
+    const snapshot = await this.composerDrafts.readSnapshot(identity);
+    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+    this.#assertFilesComposerLease(
+      context, epoch, taskAuthorityKey, identity, source,
+      attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
+    );
+
+    let staged: MobileLocalComposerAttachment | undefined;
+    let nextDraft: MobileComposerDraft;
+    let result: MobileFilesComposerResult;
+    let committed = false;
+    try {
+      const artifact = filesComposerArtifact(source);
+      if (artifact) {
+        const planned = await this.#artifactFilesComposerDraft(
+          context,
+          epoch,
+          taskAuthorityKey,
+          identity,
+          source,
+          artifact,
+          draft,
+          attachmentControls,
+          workspaceOwnerKey,
+          catalogControls,
+          signal
+        );
+        nextDraft = planned.draft;
+        staged = planned.staged;
+        result = planned.result;
+      } else {
+        const planned = await this.#workspaceFilesComposerDraft(
+          context,
+          epoch,
+          taskAuthorityKey,
+          identity,
+          source,
+          draft,
+          attachmentControls,
+          workspaceControls,
+          catalogOwnerKey,
+          signal
+        );
+        nextDraft = planned.draft;
+        staged = planned.staged;
+        result = planned.result;
+      }
+      this.#assertFilesComposerLease(
+        context, epoch, taskAuthorityKey, identity, source,
+        attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
+      );
+      if (!this.composerDrafts.saveIfRevision(identity, nextDraft, snapshot.revision)) {
+        throw new Error("The task composer changed while the file was being added. The original draft was retained.");
+      }
+      committed = true;
+      await this.composerDrafts.flush(identity);
+      this.#assertFilesComposerLease(
+        context, epoch, taskAuthorityKey, identity, source,
+        attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
+      );
+      staged = undefined;
+      return result;
+    } catch (error) {
+      if (committed) {
+        const restored = await this.#restoreFilesComposerDraft(identity, snapshot, nextDraft!);
+        if (restored) committed = false;
+      }
+      if (staged && !committed && this.attachmentFiles) {
+        await this.attachmentFiles.remove(identity.profileId, staged).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   async older(): Promise<void> {
@@ -3908,6 +4019,354 @@ export class MobileClient {
       && this.#state.files.authorityKey === key && this.#filesAuthorityKey(this.#state) === key;
   }
 
+  #assertFilesComposerLease(
+    context: MobileFilesContext,
+    epoch: number,
+    taskAuthorityKey: string,
+    identity: MobileComposerDraftIdentity,
+    source: MobileFilesComposerSource,
+    attachmentOwnerKey: string | undefined,
+    workspaceOwnerKey: string | undefined,
+    catalogOwnerKey: string | undefined,
+    signal?: AbortSignal
+  ): void {
+    signal?.throwIfAborted();
+    if (!this.#currentFiles(epoch, context.key)
+      || this.#taskAuthorityKey() !== taskAuthorityKey
+      || this.#state.activeProfileId !== identity.profileId
+      || this.#state.selectedId !== identity.sessionId
+      || this.taskAttachmentControls()?.surfaceOwnerKey !== attachmentOwnerKey
+      || this.taskWorkspaceMentionControls()?.surfaceOwnerKey !== workspaceOwnerKey
+      || this.taskCatalogMentionControls()?.surfaceOwnerKey !== catalogOwnerKey
+      || !filesComposerSourceIsCurrent(this.#state.files, source)) {
+      throw new Error("Files-to-composer authority changed before the item could be added. The original draft was retained.");
+    }
+  }
+
+  async #workspaceFilesComposerDraft(
+    context: MobileFilesContext,
+    epoch: number,
+    taskAuthorityKey: string,
+    identity: MobileComposerDraftIdentity,
+    source: MobileFilesComposerSource,
+    draft: MobileComposerDraft,
+    attachmentControls: MobileAttachmentControls | undefined,
+    workspaceControls: MobileWorkspaceMentionControls | undefined,
+    catalogOwnerKey: string | undefined,
+    signal?: AbortSignal
+  ): Promise<{
+    readonly draft: MobileComposerDraft;
+    readonly result: MobileFilesComposerResult;
+    readonly staged?: MobileLocalComposerAttachment;
+  }> {
+    const attachmentOwnerKey = attachmentControls?.surfaceOwnerKey;
+    const workspaceOwnerKey = workspaceControls?.surfaceOwnerKey;
+    const assertCurrent = (): void => this.#assertFilesComposerLease(
+      context, epoch, taskAuthorityKey, identity, source,
+      attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
+    );
+    const entry = await this.#resolveFilesComposerWorkspaceEntry(context, source, signal);
+    assertCurrent();
+    const path = canonicalWorkspacePath(entry.relativePath);
+    if (entry.workspaceId !== context.authority.workspace.workspaceId
+      || entry.kind !== FileKind.REGULAR && entry.kind !== FileKind.DIRECTORY) {
+      throw new Error("The selected Workspace item is outside the current Files owner.");
+    }
+
+    if (entry.kind === FileKind.REGULAR && entry.revision && attachmentControls && this.attachmentFiles
+      && filesAttachmentMetadata(
+        entry.displayName || workspaceBasename(path),
+        entry.mediaType,
+        entry.revision.byteSize,
+        draft.attachments,
+        attachmentControls
+      )) {
+      const preview = await this.network.readWorkspaceFile(
+        context.credential,
+        context.authority.workspace.workspaceId,
+        path,
+        entry.revision,
+        signal
+      );
+      assertCurrent();
+      const blob = workspaceComposerBlob(context.authority.workspace.workspaceId, entry, preview);
+      if (blob) {
+        const metadata = filesAttachmentMetadata(
+          blob.fileName || entry.displayName || workspaceBasename(path),
+          blob.mediaType,
+          blob.byteSize,
+          draft.attachments,
+          attachmentControls
+        );
+        if (metadata) {
+          const download = await this.network.downloadBlob(context.credential, blob, signal);
+          assertCurrent();
+          if (normalizeMediaType(download.mediaType) !== metadata.mediaType) {
+            throw new Error("The authenticated Workspace Blob download changed media type.");
+          }
+          const staged = await this.attachmentFiles.stageVerifiedBytes(
+            identity.profileId,
+            draft.attachments,
+            attachmentControls.policy,
+            {
+              ...metadata,
+              bytes: download.bytes,
+              sha256Hex: blob.sha256Hex
+            },
+            this.newId,
+            signal
+          );
+          return {
+            draft: {
+              ...draft,
+              attachments: appendMobileComposerAttachments(draft.attachments, [staged], attachmentControls.policy)
+            },
+            result: "attachment",
+            staged
+          };
+        }
+      }
+    }
+
+    if (!workspaceControls) {
+      throw new Error("This Backend cannot add the selected Workspace item as an attachment or typed reference.");
+    }
+    const candidate = await this.#validateFilesWorkspaceReference(
+      context,
+      workspaceControls,
+      entry,
+      signal
+    );
+    assertCurrent();
+    const insertion = insertMobileWorkspaceMention(
+      draft,
+      { start: draft.text.length, end: draft.text.length },
+      candidate,
+      this.newId()
+    );
+    return { draft: insertion.draft, result: "reference" };
+  }
+
+  async #artifactFilesComposerDraft(
+    context: MobileFilesContext,
+    epoch: number,
+    taskAuthorityKey: string,
+    identity: MobileComposerDraftIdentity,
+    source: MobileFilesComposerSource,
+    artifact: Artifact,
+    draft: MobileComposerDraft,
+    attachmentControls: MobileAttachmentControls | undefined,
+    workspaceOwnerKey: string | undefined,
+    catalogControls: MobileCatalogMentionControls | undefined,
+    signal?: AbortSignal
+  ): Promise<{
+    readonly draft: MobileComposerDraft;
+    readonly result: MobileFilesComposerResult;
+    readonly staged?: MobileLocalComposerAttachment;
+  }> {
+    const attachmentOwnerKey = attachmentControls?.surfaceOwnerKey;
+    const catalogOwnerKey = catalogControls?.surfaceOwnerKey;
+    const assertCurrent = (): void => this.#assertFilesComposerLease(
+      context, epoch, taskAuthorityKey, identity, source,
+      attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
+    );
+    if (artifact.sessionId !== context.authority.sessionId) {
+      throw new Error("The selected Generated file is outside the current task.");
+    }
+    const blob = artifact.blob;
+    if (blob && attachmentControls && this.attachmentFiles
+      && filesAttachmentMetadata(
+        blob.fileName || artifactTitle(artifact),
+        blob.mediaType,
+        blob.byteSize,
+        draft.attachments,
+        attachmentControls
+      )) {
+      const observedRevision = this.#state.files.artifactsRevision;
+      if (!observedRevision) throw new Error("The current Generated catalog is not revision-fenced.");
+      const refreshed = await this.network.listSessionArtifacts(
+        context.credential,
+        context.authority.sessionId,
+        signal
+      );
+      assertCurrent();
+      if (refreshed.revision !== observedRevision) {
+        throw new Error("The Generated catalog changed while the file was being added. Refresh Files and try again.");
+      }
+      const matches = refreshed.artifacts.filter((candidate) => candidate.artifactId === artifact.artifactId
+        && candidate.sessionId === artifact.sessionId);
+      const current = matches.length === 1 ? matches[0] : undefined;
+      if (!current || !sameFilesComposerArtifact(current, artifact) || !current.blob) {
+        throw new Error("The selected Generated file changed while it was being added.");
+      }
+      const metadata = filesAttachmentMetadata(
+        current.blob.fileName || artifactTitle(current),
+        current.blob.mediaType,
+        current.blob.byteSize,
+        draft.attachments,
+        attachmentControls
+      );
+      if (!metadata) {
+        throw new Error("The selected Generated file no longer matches the current attachment capability.");
+      }
+      const download = await this.network.downloadBlob(context.credential, current.blob, signal);
+      assertCurrent();
+      if (normalizeMediaType(download.mediaType) !== metadata.mediaType) {
+        throw new Error("The authenticated Generated Blob download changed media type.");
+      }
+      const staged = await this.attachmentFiles.stageVerifiedBytes(
+        identity.profileId,
+        draft.attachments,
+        attachmentControls.policy,
+        {
+          ...metadata,
+          bytes: download.bytes,
+          sha256Hex: current.blob.sha256Hex
+        },
+        this.newId,
+        signal
+      );
+      return {
+        draft: {
+          ...draft,
+          attachments: appendMobileComposerAttachments(draft.attachments, [staged], attachmentControls.policy)
+        },
+        result: "attachment",
+        staged
+      };
+    }
+
+    if (!catalogControls?.policy.artifacts) {
+      throw new Error("This Backend cannot add the selected Generated file as an attachment or typed reference.");
+    }
+    const catalog = await this.listTaskCatalogMentionCatalog(catalogControls.surfaceOwnerKey, signal);
+    assertCurrent();
+    const matches = (catalog.artifacts?.items ?? []).filter((candidate) => candidate.artifactId === artifact.artifactId
+      && candidate.sourceSessionId === artifact.sessionId);
+    if (matches.length !== 1) {
+      throw new Error("The selected Generated file is no longer available in the current Artifact reference catalog.");
+    }
+    const expected = projectMobileArtifactMentionCatalog(
+      catalogControls,
+      [artifact],
+      catalog.artifacts!.revision
+    ).items[0];
+    if (!expected || !sameFilesComposerArtifactCandidate(matches[0]!, expected)) {
+      throw new Error("The selected Generated file changed before its typed reference could be added.");
+    }
+    const candidate = assertMobileCatalogMentionCandidate(catalogControls, catalog, matches[0]!);
+    if (candidate.kind !== "artifact") {
+      throw new Error("The selected Generated file resolved to a non-Artifact reference.");
+    }
+    const insertion = insertMobileArtifactMention(
+      draft,
+      { start: draft.text.length, end: draft.text.length },
+      candidate,
+      this.newId()
+    );
+    return { draft: insertion.draft, result: "reference" };
+  }
+
+  async #resolveFilesComposerWorkspaceEntry(
+    context: MobileFilesContext,
+    source: MobileFilesComposerSource,
+    signal?: AbortSignal
+  ): Promise<WorkspaceEntry> {
+    if (source.kind === "workspace-entry") {
+      const entry = source.entry;
+      canonicalWorkspacePath(entry.relativePath);
+      if (entry.kind === FileKind.REGULAR) workspaceEntryRevisionKey(entry.revision);
+      return entry;
+    }
+    if (source.kind !== "search-result" || source.result.kind === "artifact") {
+      throw new Error("Select a current Workspace item before adding it to the composer.");
+    }
+    const path = canonicalWorkspacePath(
+      source.result.kind === "workspace-content" ? source.result.match.relativePath : source.result.relativePath
+    );
+    if (source.result.kind === "workspace-name" && !this.#state.files.fileIndex.includes(path)) {
+      throw new Error("The selected file is no longer in the current Workspace index.");
+    }
+    const directory = await this.network.listWorkspaceDirectory(
+      context.credential,
+      context.authority.workspace.workspaceId,
+      workspaceParentPath(path),
+      signal
+    );
+    if (!directory.revision) throw new Error("The Joko node returned an unfenced Workspace directory.");
+    const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+    const entry = matches.length === 1 ? matches[0] : undefined;
+    if (!entry?.revision || entry.kind !== FileKind.REGULAR
+      || entry.workspaceId !== context.authority.workspace.workspaceId) {
+      throw new Error("The selected Workspace file is no longer available at its observed path.");
+    }
+    workspaceEntryRevisionKey(entry.revision);
+    if (source.result.kind === "workspace-content") {
+      const observed = source.result.match.revision;
+      if (!observed || workspaceEntryRevisionKey(observed) !== workspaceEntryRevisionKey(entry.revision)) {
+        throw new Error("The Workspace search result changed before it could be added.");
+      }
+    }
+    return entry;
+  }
+
+  async #validateFilesWorkspaceReference(
+    context: MobileFilesContext,
+    controls: MobileWorkspaceMentionControls,
+    observed: WorkspaceEntry,
+    signal?: AbortSignal
+  ): Promise<MobileWorkspaceMentionCandidate> {
+    const path = canonicalWorkspacePath(observed.relativePath);
+    const directory = await this.network.listWorkspaceDirectory(
+      context.credential,
+      controls.workspaceId,
+      workspaceParentPath(path),
+      signal
+    );
+    const rawMatches = directory.entries.filter((entry) => entry.relativePath === path);
+    const current = rawMatches.length === 1 ? rawMatches[0] : undefined;
+    if (!current || current.workspaceId !== observed.workspaceId || current.kind !== observed.kind) {
+      throw new Error("The selected Workspace item is no longer available with the same file type.");
+    }
+    if (observed.kind === FileKind.REGULAR) {
+      if (!observed.revision || !current.revision
+        || workspaceEntryRevisionKey(observed.revision) !== workspaceEntryRevisionKey(current.revision)) {
+        throw new Error("The selected Workspace file changed before its typed reference could be added.");
+      }
+    }
+    const projected = projectMobileWorkspaceMentionDirectory(
+      controls,
+      workspaceParentPath(path),
+      directory.entries,
+      directory.revision
+    );
+    const matches = projected.entries.filter((entry) => entry.relativePath === path);
+    if (matches.length !== 1) {
+      throw new Error("The selected Workspace item is no longer available as a typed reference.");
+    }
+    return assertMobileWorkspaceMentionCandidate(controls, matches[0]!);
+  }
+
+  async #restoreFilesComposerDraft(
+    identity: MobileComposerDraftIdentity,
+    snapshot: MobileComposerDraftSnapshot,
+    committed: MobileComposerDraft
+  ): Promise<boolean> {
+    if (!this.composerDrafts) return false;
+    try {
+      const current = await this.composerDrafts.readSnapshot(identity);
+      if (!current.draft || !mobileComposerDraftsEqual(current.draft, committed)) return false;
+      const restored = snapshot.draft
+        ? this.composerDrafts.saveIfRevision(identity, snapshot.draft, current.revision)
+        : await this.composerDrafts.clearIfRevision(identity, current.revision);
+      if (!restored) return false;
+      await this.composerDrafts.flush(identity);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   #cancelFilesRequests(): void {
     this.#filesEpoch += 1;
     this.#filesListAbort?.abort();
@@ -4595,6 +5054,118 @@ export class MobileClient {
     this.#retire();
     this.#listeners.clear();
   }
+}
+
+function filesComposerArtifact(source: MobileFilesComposerSource): Artifact | undefined {
+  if (source.kind === "artifact") return source.artifact;
+  return source.kind === "search-result" && source.result.kind === "artifact"
+    ? source.result.artifact
+    : undefined;
+}
+
+function filesComposerSourceIsCurrent(files: MobileFilesState, source: MobileFilesComposerSource): boolean {
+  if (source.kind === "workspace-entry") return files.entries.includes(source.entry);
+  if (source.kind === "artifact") return files.artifacts.includes(source.artifact);
+  return files.searchResults.includes(source.result);
+}
+
+function filesAttachmentMetadata(
+  fileName: string,
+  mediaType: string,
+  byteSize: bigint,
+  current: readonly MobileComposerAttachment[],
+  controls: MobileAttachmentControls
+): { readonly fileName: string; readonly mediaType: string; readonly byteSize: number } | undefined {
+  if (byteSize > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  try {
+    assertMobileAttachmentPolicy(current, controls.policy);
+    if (current.length >= controls.policy.maximumItems) return undefined;
+    const exact = assertMobileAttachmentCandidate({ fileName, mediaType, byteSize: Number(byteSize) }, controls.policy);
+    return { fileName: exact.fileName, mediaType: exact.mediaType, byteSize: Number(byteSize) };
+  } catch {
+    return undefined;
+  }
+}
+
+function workspaceComposerBlob(
+  workspaceId: string,
+  expected: WorkspaceEntry,
+  preview: FilePreview
+): BlobRef | undefined {
+  const entry = preview.entry;
+  const revision = entry?.revision;
+  if (!entry || !revision || entry.workspaceId !== workspaceId
+    || entry.relativePath !== expected.relativePath || entry.kind !== FileKind.REGULAR
+    || expected.kind !== FileKind.REGULAR || !expected.revision
+    || !workspaceComposerRevisionMatches(expected.revision, revision)) {
+    throw new Error("The Joko node returned a mismatched Workspace file while preparing the composer item.");
+  }
+  const mediaType = normalizeMediaType(entry.mediaType) || "application/octet-stream";
+  const expectedMediaType = normalizeMediaType(expected.mediaType) || "application/octet-stream";
+  if (mediaType !== expectedMediaType) {
+    throw new Error("The Workspace file media type changed while preparing the composer item.");
+  }
+  const blob = preview.content.case === "image"
+    ? preview.content.value.blob
+    : preview.content.case === "blob"
+      ? preview.content.value
+      : undefined;
+  if (preview.content.case === "image" && !blob) {
+    throw new Error("The Joko node returned an image preview without its canonical Blob.");
+  }
+  if (!blob) return undefined;
+  if (!blob.blobId || !/^[0-9a-f]{64}$/u.test(blob.sha256Hex)
+    || normalizeMediaType(blob.mediaType) !== mediaType
+    || blob.byteSize !== revision.byteSize || blob.sha256Hex !== revision.sha256Hex) {
+    throw new Error("The Joko node returned mismatched Workspace Blob metadata.");
+  }
+  return blob;
+}
+
+function workspaceComposerRevisionMatches(expected: FileRevision, actual: FileRevision): boolean {
+  workspaceEntryRevisionKey(actual);
+  if (workspaceEntryRevisionKey(expected) === workspaceEntryRevisionKey(actual)) return true;
+  if (expected.opaqueRevision.startsWith("sha256:") || !actual.opaqueRevision.startsWith("sha256:")
+    || !/^[0-9a-f]{64}$/u.test(actual.sha256Hex)
+    || actual.opaqueRevision !== `sha256:${actual.sha256Hex}:${actual.byteSize.toString(10)}`) return false;
+  if (expected.sha256Hex !== "" && expected.sha256Hex !== actual.sha256Hex) return false;
+  if (expected.byteSize !== 0n && expected.byteSize !== actual.byteSize) return false;
+  if (expected.modifiedAt !== undefined && (actual.modifiedAt === undefined
+    || expected.modifiedAt.seconds !== actual.modifiedAt.seconds
+    || expected.modifiedAt.nanos !== actual.modifiedAt.nanos)) return false;
+  return true;
+}
+
+function sameFilesComposerArtifact(left: Artifact, right: Artifact): boolean {
+  return left.artifactId === right.artifactId
+    && left.sessionId === right.sessionId
+    && left.runId === right.runId
+    && left.kind === right.kind
+    && sameFilesComposerBlob(left.blob, right.blob);
+}
+
+function sameFilesComposerArtifactCandidate(
+  left: MobileArtifactMentionCandidate,
+  right: MobileArtifactMentionCandidate
+): boolean {
+  return left.artifactId === right.artifactId
+    && left.sourceSessionId === right.sourceSessionId
+    && left.displayText === right.displayText
+    && left.sourceDisplayText === right.sourceDisplayText
+    && left.artifactKind === right.artifactKind
+    && left.fileName === right.fileName
+    && normalizeMediaType(left.mediaType) === normalizeMediaType(right.mediaType)
+    && left.byteSize === right.byteSize;
+}
+
+function sameFilesComposerBlob(left: BlobRef | undefined, right: BlobRef | undefined): boolean {
+  if (!left || !right) return left === right;
+  return left.blobId === right.blobId
+    && left.fileName === right.fileName
+    && normalizeMediaType(left.mediaType) === normalizeMediaType(right.mediaType)
+    && left.byteSize === right.byteSize
+    && left.sha256Hex === right.sha256Hex
+    && left.disposition === right.disposition;
 }
 
 function supportsText(backend: Snapshot["backends"][number]): boolean {

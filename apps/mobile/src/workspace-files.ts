@@ -31,6 +31,13 @@ export type MobileFileSearchResult =
   | { readonly kind: "workspace-content"; readonly match: WorkspaceSearchMatch }
   | { readonly kind: "artifact"; readonly artifact: Artifact };
 
+export type MobileFilesComposerSource =
+  | { readonly kind: "workspace-entry"; readonly entry: WorkspaceEntry }
+  | { readonly kind: "search-result"; readonly result: MobileFileSearchResult }
+  | { readonly kind: "artifact"; readonly artifact: Artifact };
+
+export type MobileFilesComposerResult = "attachment" | "reference";
+
 interface MobilePreviewBase {
   readonly title: string;
   readonly sourceLabel: string;
