@@ -180,6 +180,7 @@ import {
   type MobileComposerImageEditorSession
 } from "./mobile-composer-image-editor";
 import {
+  assertMobileImageGalleryDimensions,
   inspectMobileImageGalleryBytes,
   mobileImageGalleryMediaType,
   mobileImageGalleryPage,
@@ -190,9 +191,16 @@ import {
   sameMobileImageGalleryPage,
   type MobileImageGalleryDecodedImage,
   type MobileImageGalleryDescriptor,
+  type MobileImageGalleryNativeDecode,
   type MobileImageGalleryPage,
   type MobileImageGalleryPageSession
 } from "./mobile-image-gallery";
+import type { MobileImageOutputSource } from "./mobile-image-output";
+import {
+  inspectMobileImageOutputBytes,
+  mobileImageOutputExtension,
+  mobileImageOutputMediaType
+} from "./mobile-image-output-format";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -2163,6 +2171,75 @@ export class MobileClient {
     }
     if (loaded.confirmed) return;
     loaded.confirmed = true;
+  }
+
+  async prepareImageOutput(
+    leaseId: string,
+    decoded: MobileImageGalleryNativeDecode,
+    signal?: AbortSignal
+  ): Promise<MobileImageOutputSource> {
+    signal?.throwIfAborted();
+    if (!this.attachmentFiles) throw new Error("Verified image bytes are unavailable on this mobile client.");
+
+    const editLease = this.#composerImageEdit;
+    if (editLease?.leaseId === leaseId) {
+      if (editLease.commitInFlight) throw new Error("The image attachment is already being changed.");
+      const parsed = inspectMobileImageOutputBytes(editLease.sourceBytes, editLease.source.mediaType, decoded);
+      const exactDecoded = assertMobileImageOutputDecode(
+        decoded,
+        parsed.mediaType,
+        parsed.width,
+        parsed.height
+      );
+      await this.#assertComposerImageEditCurrent(editLease, undefined, signal);
+      if (editLease.sourceBytes.byteLength !== editLease.source.byteSize
+        || await this.attachmentFiles.digestOwnedBytes(editLease.sourceBytes, signal) !== editLease.source.sha256Hex) {
+        throw new Error("The verified image attachment bytes changed before output.");
+      }
+      await this.#assertComposerImageEditCurrent(editLease, undefined, signal);
+      return {
+        leaseId,
+        fileName: editLease.source.fileName,
+        mediaType: parsed.mediaType,
+        byteSize: editLease.source.byteSize,
+        sha256Hex: editLease.source.sha256Hex,
+        bytes: Uint8Array.from(editLease.sourceBytes),
+        width: exactDecoded.width,
+        height: exactDecoded.height
+      };
+    }
+
+    const galleryLease = this.#imageGallery;
+    const loaded = galleryLease?.loaded;
+    if (!galleryLease || !loaded || loaded.loadId !== leaseId || !loaded.confirmed || galleryLease.operationInFlight) {
+      throw new Error("The decoded image no longer owns this output action.");
+    }
+    const parsed = inspectMobileImageOutputBytes(loaded.bytes, loaded.page.mediaType, decoded);
+    const exactDecoded = assertMobileImageOutputDecode(
+      decoded,
+      parsed.mediaType,
+      parsed.width,
+      parsed.height
+    );
+    await this.#assertImageGalleryCurrent(galleryLease, undefined, signal);
+    if (loaded.bytes.byteLength !== loaded.page.byteSize
+      || await this.attachmentFiles.digestOwnedBytes(loaded.bytes, signal) !== loaded.page.sha256Hex) {
+      throw new Error("The verified gallery image bytes changed before output.");
+    }
+    await this.#assertImageGalleryCurrent(galleryLease, undefined, signal);
+    if (galleryLease.loaded !== loaded || !loaded.confirmed) {
+      throw new Error("The decoded gallery image changed before output.");
+    }
+    return {
+      leaseId,
+      fileName: mobileImageOutputFileName(loaded.page.blob.fileName || loaded.page.title, loaded.page.mediaType),
+      mediaType: loaded.page.mediaType,
+      byteSize: loaded.page.byteSize,
+      sha256Hex: loaded.page.sha256Hex,
+      bytes: Uint8Array.from(loaded.bytes),
+      width: exactDecoded.width,
+      height: exactDecoded.height
+    };
   }
 
   cancelImageGallery(leaseId: string): void {
@@ -6159,6 +6236,36 @@ function distinctAttachmentStorageId(newId: () => string, ...excluded: readonly 
     if (/^[a-zA-Z0-9_-]{1,128}$/u.test(candidate) && !reserved.has(candidate)) return candidate;
   }
   throw new Error("A distinct local image identity could not be created.");
+}
+
+function assertMobileImageOutputDecode(
+  decoded: MobileImageGalleryNativeDecode,
+  expectedMediaType: string,
+  expectedWidth?: number,
+  expectedHeight?: number
+): { readonly width: number; readonly height: number } {
+  const mediaType = normalizeMediaType(expectedMediaType);
+  const decodedMediaType = normalizeMediaType(decoded?.mediaType ?? "");
+  if (!mobileImageOutputMediaType(mediaType)
+    || (decodedMediaType !== "" && decodedMediaType !== mediaType)
+    || (decodedMediaType === "" && expectedWidth === undefined)
+    || decoded.isAnimated !== false) {
+    throw new Error("The native decoder did not confirm a matching static raster image.");
+  }
+  assertMobileImageGalleryDimensions(decoded.width, decoded.height);
+  if (expectedWidth !== undefined && (decoded.width !== expectedWidth || decoded.height !== expectedHeight)) {
+    throw new Error("The native decoder dimensions no longer match the verified image.");
+  }
+  return { width: decoded.width, height: decoded.height };
+}
+
+function mobileImageOutputFileName(value: string, mediaType: string): string {
+  const leaf = value.split(/[\\/]/u).at(-1)?.trim() ?? "";
+  if (leaf.length > 0 && leaf.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(leaf)) return leaf;
+  const exact = mobileImageOutputMediaType(mediaType);
+  if (!exact) throw new Error("This image format has no safe native output file name.");
+  const extension = mobileImageOutputExtension(exact);
+  return `Image.${extension}`;
 }
 
 function mobileCredentialKey(credential: PairedCredential): string {

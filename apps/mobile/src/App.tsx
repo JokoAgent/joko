@@ -128,6 +128,11 @@ import {
   type MobileImageGalleryPageSession,
   type MobileImageGalleryPageSummary
 } from "./mobile-image-gallery";
+import {
+  mobileImageOutput,
+  type MobileImageOutputAction,
+  type MobileImageOutputRenderedImage
+} from "./mobile-image-output";
 
 const client = new MobileClient(
   mobileNetwork,
@@ -279,6 +284,20 @@ function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void
   return { view, open, close, navigate, decoded, addOriginal, save };
 }
 
+async function performMobileImageOutput(
+  session: MobileComposerImageEditorSession,
+  action: MobileImageOutputAction,
+  decoded: MobileImageGalleryNativeDecode,
+  rendered: MobileImageOutputRenderedImage | undefined,
+  signal: AbortSignal
+): Promise<string> {
+  const source = await client.prepareImageOutput(session.leaseId, decoded, signal);
+  await mobileImageOutput.perform(action, source, rendered, signal);
+  return action === "copy" ? "Image copied to the system clipboard."
+    : action === "save" ? "Image saved to the photo library."
+      : "System image sharing completed.";
+}
+
 export function App() {
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
   const [page, setPage] = useState<Page>("home");
@@ -299,6 +318,7 @@ export function App() {
   }), [dark]);
 
   useEffect(() => {
+    void mobileImageOutput.maintain().catch(() => undefined);
     client.setForeground(AppState.currentState === "active");
     void client.start();
     const subscription = AppState.addEventListener("change", (status) => {
@@ -932,6 +952,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [loadedProfileId, setLoadedProfileId] = useState<string | undefined>();
   const [draftReady, setDraftReady] = useState(false);
   const [error, setError] = useState("");
+  const [imageOutputNotice, setImageOutputNotice] = useState("");
   const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
   const [sessionMentionError, setSessionMentionError] = useState("");
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
@@ -1594,6 +1615,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     {retained?.phase === "sending" && state.selectedId === retained.sessionId
       && <Action label="Open created task" onPress={onCreated} colors={colors} />}
     {(error || state.error) && <Banner text={error || state.error || ""} colors={colors} />}
+    {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors}
+      onDismiss={() => setImageOutputNotice("")} />}
     <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors} onError={setError} />
     {(pendingCreate || retained !== undefined) && <Action label="Check retained status" onPress={() => {
       setError("");
@@ -1628,6 +1651,21 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
     {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
+      onOutputAction={async (action, decoded, rendered, signal) => {
+        setImageOutputNotice("");
+        setError("");
+        try {
+          const message = await performMobileImageOutput(imageEditorLease.session, action, decoded, rendered, signal);
+          if (!signal.aborted && mountedRef.current && imageEditorLeaseRef.current === imageEditorLease) {
+            setImageOutputNotice(message);
+          }
+          return message;
+        } catch (failure) {
+          if (!signal.aborted && mountedRef.current) setError(errorText(failure));
+          throw failure;
+        }
+      }}
+      onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={closeImageEditor} onSave={saveImageEditor} />}
   </ScrollView>;
 }
@@ -2950,6 +2988,21 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
     {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
+      onOutputAction={async (action, decoded, rendered, signal) => {
+        setComposerNotice("");
+        setLocalError("");
+        try {
+          const message = await performMobileImageOutput(imageEditorLease.session, action, decoded, rendered, signal);
+          if (!signal.aborted && taskMountedRef.current && imageEditorLeaseRef.current === imageEditorLease) {
+            setComposerNotice(message);
+          }
+          return message;
+        } catch (failure) {
+          if (!signal.aborted && taskMountedRef.current) setLocalError(errorText(failure));
+          throw failure;
+        }
+      }}
+      onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={closeImageEditor} onSave={saveImageEditor} />}
     {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
       session={imageGallery.view.session}
@@ -2961,6 +3014,21 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         onAddOriginal: imageGallery.addOriginal,
         onDecoded: imageGallery.decoded
       }}
+      onOutputAction={async (action, decoded, rendered, signal) => {
+        setComposerNotice("");
+        setLocalError("");
+        try {
+          const view = imageGallery.view;
+          if (!view) throw new Error("The image gallery closed before output started.");
+          const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal);
+          if (!signal.aborted && taskMountedRef.current) setComposerNotice(message);
+          return message;
+        } catch (failure) {
+          if (!signal.aborted && taskMountedRef.current) setLocalError(errorText(failure));
+          throw failure;
+        }
+      }}
+      onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={imageGallery.close} onSave={imageGallery.save} />}
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
@@ -3042,6 +3110,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   const [mode, setMode] = useState<MobileFilesSearchMode>("name");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [localError, setLocalError] = useState("");
+  const [imageOutputNotice, setImageOutputNotice] = useState("");
   const [handoffBusy, setHandoffBusy] = useState(false);
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource>();
@@ -3151,6 +3220,8 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Offline · showing only the in-memory view already loaded for this task. New reads are paused.</Text>
     </View>}
     {(localError || files.error) && <Banner text={localError || files.error || ""} colors={colors} />}
+    {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors}
+      onDismiss={() => setImageOutputNotice("")} />}
     {handoffBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Adding the verified item to this task’s composer…</Text>
@@ -3292,6 +3363,20 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
         onNavigate: imageGallery.navigate,
         onAddOriginal: imageGallery.addOriginal,
         onDecoded: imageGallery.decoded
+      }}
+      onOutputAction={async (action, decoded, rendered, signal) => {
+        setImageOutputNotice("");
+        setLocalError("");
+        try {
+          const view = imageGallery.view;
+          if (!view) throw new Error("The image gallery closed before output started.");
+          const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal);
+          if (!signal.aborted) setImageOutputNotice(message);
+          return message;
+        } catch (failure) {
+          if (!signal.aborted) setLocalError(errorText(failure));
+          throw failure;
+        }
       }}
       onClose={imageGallery.close} onSave={imageGallery.save} />}
   </View>;
@@ -3617,6 +3702,14 @@ function AutomaticEntryChoice({ checked, disabled, onPress, colors }: {
 
 function Banner({ text, colors }: { text: string; colors: Colors }) {
   return <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{text}</Text>;
+}
+function Notice({ text, colors, onDismiss }: { text: string; colors: Colors; onDismiss: () => void }) {
+  return <View accessibilityLiveRegion="polite"
+    style={[styles.connectionNotice, { backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>
+    <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>{text}</Text>
+    <Pressable accessibilityRole="button" accessibilityLabel="Dismiss image output notice" onPress={onDismiss}
+      style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>Dismiss</Text></Pressable>
+  </View>;
 }
 function Centered({ label, colors }: { label: string; colors: Colors }) {
   return <View style={styles.center}><ActivityIndicator color={colors.accent} /><Text style={[styles.description, { color: colors.muted }]}>{label}</Text></View>;

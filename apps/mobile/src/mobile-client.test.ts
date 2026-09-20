@@ -2912,6 +2912,51 @@ describe("native current-task message and Queue actions", () => {
     expect(fixture.removed).toEqual(["image-one", "rendered-image", "image-source"]);
   });
 
+  it("revalidates the exact editor source and native static decode before image output", async () => {
+    const bytes = galleryPngBytes(6, 4);
+    const original = localAttachmentDraft("Keep the draft untouched");
+    const image = original.attachments[0]!;
+    const draft = {
+      ...original,
+      attachments: [{ ...image, byteSize: bytes.byteLength, sha256Hex: "b".repeat(64) }, original.attachments[1]!]
+    };
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, draft);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    fixture.bytes.set("image-one", bytes);
+    const network = projectedNetwork(attachmentSnapshot);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("output-source", "output-editor"), undefined, drafts, fixture.files);
+    await app.start();
+    const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: "image-one" });
+
+    await expect(app.prepareImageOutput(editor.leaseId, {
+      width: 6, height: 4, mediaType: "image/png"
+    })).rejects.toThrow(/matching static raster/u);
+    await expect(app.prepareImageOutput(editor.leaseId, {
+      width: 5, height: 4, mediaType: "image/png", isAnimated: false
+    })).rejects.toThrow(/native decoder dimensions/u);
+    const output = await app.prepareImageOutput(editor.leaseId, {
+      width: 6, height: 4, mediaType: null, isAnimated: false
+    });
+
+    expect(output).toMatchObject({
+      leaseId: editor.leaseId,
+      fileName: "pixel.png",
+      mediaType: "image/png",
+      byteSize: bytes.byteLength,
+      sha256Hex: "b".repeat(64),
+      width: 6,
+      height: 4
+    });
+    expect(output.bytes).toEqual(bytes);
+    expect(await drafts.composer.read(identity)).toEqual(draft);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(network.uploadBlob).not.toHaveBeenCalled();
+  });
+
   it("single-flights duplicate image saves while keeping the exact editor lease retryable", async () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
@@ -4876,6 +4921,19 @@ describe("native current-task Files ownership", () => {
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 3, height: 2, mediaType: "image/png", isAnimated: false
     });
+    const output = await app.prepareImageOutput(page.leaseId, {
+      width: 3, height: 2, mediaType: "image/png", isAnimated: false
+    });
+    expect(output).toMatchObject({
+      leaseId: page.leaseId,
+      fileName: "b.png",
+      mediaType: "image/png",
+      byteSize: bytes.byteLength,
+      sha256Hex: "b".repeat(64),
+      width: 3,
+      height: 2
+    });
+    expect(output.bytes).toEqual(bytes);
     const committed = await app.addImageGalleryPageToComposer(descriptor.leaseId, page.leaseId);
 
     expect(committed.text).toBe("Keep this text");

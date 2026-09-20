@@ -55,6 +55,9 @@ import {
 } from "./mobile-image-lightbox";
 import { useMobileAnnotationBurn } from "./use-mobile-annotation-burn";
 import type { MobileImageGalleryNativeDecode, MobileImageGalleryPageSession } from "./mobile-image-gallery";
+import type { MobileImageOutputAction, MobileImageOutputRenderedImage } from "./mobile-image-output";
+import { mobileImageOutputMediaType } from "./mobile-image-output-format";
+import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
 
 interface MobileImageLightboxGalleryControls {
   readonly session: MobileImageGalleryPageSession;
@@ -76,6 +79,13 @@ interface MobileImageLightboxProps {
     burned: MobileBurnedImage | undefined,
     signal: AbortSignal
   ) => Promise<void>;
+  readonly onOutputAction?: (
+    action: MobileImageOutputAction,
+    decoded: MobileImageGalleryNativeDecode,
+    rendered: MobileImageOutputRenderedImage | undefined,
+    signal: AbortSignal
+  ) => Promise<string | void>;
+  readonly onNativeActivityChange?: (active: boolean) => void;
 }
 
 interface ActiveGesture {
@@ -91,7 +101,14 @@ interface ActiveGesture {
 const initialTransform: MobileImageTransform = { scale: 1, translateX: 0, translateY: 0 };
 const emptySize: MobileImageSize = { width: 0, height: 0 };
 
-export function MobileImageLightbox({ session, gallery, onClose, onSave }: MobileImageLightboxProps) {
+export function MobileImageLightbox({
+  session,
+  gallery,
+  onClose,
+  onSave,
+  onOutputAction,
+  onNativeActivityChange
+}: MobileImageLightboxProps) {
   const initialStrokes = useMemo(() => cloneStrokes(session.initialStrokes), [session.leaseId]);
   const [strokes, setStrokes] = useState<readonly MobileImageAnnotationStroke[]>(initialStrokes);
   const [draftStroke, setDraftStroke] = useState<MobileImageAnnotationStroke>();
@@ -99,8 +116,10 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
   const [transform, setTransform] = useState<MobileImageTransform>(initialTransform);
   const [container, setContainer] = useState<MobileImageSize>(emptySize);
   const [natural, setNatural] = useState<MobileImageSize>(emptySize);
-  const [decoded, setDecoded] = useState(false);
+  const [decoded, setDecoded] = useState<MobileImageGalleryNativeDecode>();
   const [busy, setBusy] = useState(false);
+  const [outputAction, setOutputAction] = useState<MobileImageOutputAction>();
+  const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const { burnIn, host } = useMobileAnnotationBurn();
   const strokesRef = useRef(strokes);
@@ -109,10 +128,14 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
   const transformRef = useRef(transform);
   const containerRef = useRef(container);
   const naturalRef = useRef(natural);
+  const decodedRef = useRef(decoded);
   const gestureRef = useRef<ActiveGesture | undefined>(undefined);
   const lastTapRef = useRef<{ readonly at: number; readonly point: MobileTouchPoint } | undefined>(undefined);
   const saveControllerRef = useRef<AbortController | undefined>(undefined);
   const closedRef = useRef(false);
+  const nativeActivityRef = useRef(false);
+  const sawExpectedInactiveRef = useRef(false);
+  const nativeActivityCallbackRef = useRef(onNativeActivityChange);
   const galleryRef = useRef(gallery);
   strokesRef.current = strokes;
   draftStrokeRef.current = draftStroke;
@@ -120,7 +143,9 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
   transformRef.current = transform;
   containerRef.current = container;
   naturalRef.current = natural;
+  decodedRef.current = decoded;
   galleryRef.current = gallery;
+  nativeActivityCallbackRef.current = onNativeActivityChange;
 
   useEffect(() => {
     const nextStrokes = cloneStrokes(session.initialStrokes);
@@ -137,8 +162,14 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
     setAnnotating(false);
     setTransform(initialTransform);
     setNatural(emptySize);
-    setDecoded(false);
+    decodedRef.current = undefined;
+    nativeActivityRef.current = false;
+    sawExpectedInactiveRef.current = false;
+    nativeActivityCallbackRef.current?.(false);
+    setDecoded(undefined);
     setBusy(false);
+    setOutputAction(undefined);
+    setNotice("");
     setError("");
   }, [session.leaseId]);
 
@@ -146,16 +177,29 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
     if (closedRef.current) return;
     closedRef.current = true;
     saveControllerRef.current?.abort();
+    if (nativeActivityRef.current) {
+      nativeActivityRef.current = false;
+      nativeActivityCallbackRef.current?.(false);
+    }
     onClose();
   }, [onClose]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (status) => {
-      if (status !== "active") close();
+      if (status === "active") return;
+      if (nativeActivityRef.current) {
+        sawExpectedInactiveRef.current = true;
+        return;
+      }
+      close();
     });
     return () => {
       subscription.remove();
       saveControllerRef.current?.abort();
+      if (nativeActivityRef.current) {
+        nativeActivityRef.current = false;
+        nativeActivityCallbackRef.current?.(false);
+      }
     };
   }, [close]);
 
@@ -354,8 +398,10 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
   const dirty = !annotationStrokesEqual(strokes, initialStrokes);
   const interactionBusy = busy || gallery?.busy === true;
   const visibleError = error || gallery?.error || "";
-  const drawingReady = decoded && natural.width > 0 && natural.height > 0
+  const drawingReady = decoded !== undefined && natural.width > 0 && natural.height > 0
     && container.width > 0 && container.height > 0;
+  const outputReady = drawingReady && decoded?.isAnimated === false
+    && mobileImageOutputMediaType(session.sourceMediaType) !== undefined;
   const updateContainer = (event: LayoutChangeEvent): void => {
     const next = {
       width: event.nativeEvent.layout.width,
@@ -476,6 +522,61 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
       }
     }
   };
+  const output = async (action: MobileImageOutputAction): Promise<void> => {
+    const exactDecoded = decodedRef.current;
+    if (!onOutputAction || saveControllerRef.current || !exactDecoded || !outputReady || gallery?.busy) return;
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setOutputAction(action);
+    setNotice("");
+    setError("");
+    const invokesNativeUi = action === "save" || action === "share";
+    try {
+      const exactStrokes = cloneStrokes(strokesRef.current);
+      const sourceMediaType = session.sourceMediaType.trim().toLowerCase();
+      const requiresRender = exactStrokes.length > 0
+        || action === "copy" && sourceMediaType !== "image/jpeg" && sourceMediaType !== "image/png";
+      let rendered: MobileImageOutputRenderedImage | undefined;
+      if (requiresRender) {
+        const result = await burnIn({
+          base64: session.sourceBase64,
+          mediaType: session.sourceMediaType,
+          strokes: exactStrokes
+        });
+        controller.signal.throwIfAborted();
+        rendered = {
+          bytes: decodeMobileBase64(result.base64, MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES),
+          mediaType: result.mediaType,
+          width: result.width,
+          height: result.height
+        };
+      }
+      if (invokesNativeUi) {
+        nativeActivityRef.current = true;
+        sawExpectedInactiveRef.current = false;
+        nativeActivityCallbackRef.current?.(true);
+      }
+      const message = await onOutputAction(action, exactDecoded, rendered, controller.signal);
+      controller.signal.throwIfAborted();
+      setNotice(message || imageOutputSuccessMessage(action));
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : "The image output action could not be completed.");
+      }
+    } finally {
+      if (invokesNativeUi && nativeActivityRef.current) {
+        nativeActivityRef.current = false;
+        nativeActivityCallbackRef.current?.(false);
+      }
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+        setOutputAction(undefined);
+      }
+      if (sawExpectedInactiveRef.current) close();
+    }
+  };
 
   return <Modal visible animationType="fade" presentationStyle="fullScreen" statusBarTranslucent
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
@@ -518,14 +619,21 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
                   const next = { width, height };
                   naturalRef.current = next;
                   setNatural(next);
-                  setDecoded(true);
+                  const exactDecoded = { width, height, mediaType, isAnimated };
+                  decodedRef.current = exactDecoded;
+                  setDecoded(exactDecoded);
                   setError("");
                 } catch (failure) {
-                  setDecoded(false);
+                  decodedRef.current = undefined;
+                  setDecoded(undefined);
                   setError(failure instanceof Error ? failure.message : "The image preview could not be verified.");
                 }
               }}
-              onError={() => { setDecoded(false); setError("The image preview could not be displayed."); }} />
+              onError={() => {
+                decodedRef.current = undefined;
+                setDecoded(undefined);
+                setError("The image preview could not be displayed.");
+              }} />
             {natural.width > 0 && natural.height > 0 && paths.length > 0 && <View
               pointerEvents="none" style={styles.annotation}>
               <SvgXml xml={annotationSvgXml(paths, natural)} width="100%" height="100%" />
@@ -537,6 +645,7 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
         </View>}
       </View>
       {visibleError !== "" && <Text accessibilityRole="alert" style={styles.error}>{visibleError}</Text>}
+      {notice !== "" && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
       <View style={styles.toolbar}>
         {gallery && <ToolButton label="Previous image" onPress={() => navigate(gallery.session.pageIndex - 1)}
           disabled={interactionBusy || gallery.session.pageIndex === 0} />}
@@ -545,6 +654,12 @@ export function MobileImageLightbox({ session, gallery, onClose, onSave }: Mobil
         </Text>}
         {gallery && <ToolButton label="Next image" onPress={() => navigate(gallery.session.pageIndex + 1)}
           disabled={interactionBusy || gallery.session.pageIndex + 1 >= gallery.session.pageCount} />}
+        {onOutputAction && <ToolButton label={outputAction === "copy" ? "Copying…" : "Copy image"}
+          onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
+        {onOutputAction && <ToolButton label={outputAction === "save" ? "Saving image…" : "Save image"}
+          onPress={() => void output("save")} disabled={interactionBusy || !outputReady} />}
+        {onOutputAction && <ToolButton label={outputAction === "share" ? "Sharing…" : "Share image"}
+          onPress={() => void output("share")} disabled={interactionBusy || !outputReady} />}
         <ToolButton label="Zoom out" onPress={() => zoom(-0.5)}
           disabled={interactionBusy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />
         <ToolButton label="Zoom in" onPress={() => zoom(0.5)}
@@ -612,6 +727,12 @@ function strokePointCount(strokes: readonly MobileImageAnnotationStroke[]): numb
   return strokes.reduce((count, stroke) => count + stroke.points.length, 0);
 }
 
+function imageOutputSuccessMessage(action: MobileImageOutputAction): string {
+  return action === "copy" ? "Image copied to the system clipboard."
+    : action === "save" ? "Image saved to the photo library."
+      : "System image sharing completed.";
+}
+
 function cloneStrokes(strokes: readonly MobileImageAnnotationStroke[]): MobileImageAnnotationStroke[] {
   return strokes.map((stroke) => ({ points: stroke.points.map((point) => ({ ...point })) }));
 }
@@ -656,6 +777,7 @@ const styles = StyleSheet.create({
   annotation: { position: "absolute", inset: 0 },
   loading: { position: "absolute", inset: 0, alignItems: "center", justifyContent: "center" },
   error: { color: "#ff9c87", paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
+  notice: { color: "#9ed7ad", paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
   toolbar: { minHeight: 64, paddingHorizontal: 10, paddingVertical: 8, flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 8 },
   pageCount: { color: "#f7f6f3", minHeight: 44, minWidth: 52, textAlign: "center", textAlignVertical: "center",
     paddingHorizontal: 6, paddingVertical: 12, fontSize: 14, lineHeight: 18, fontWeight: "700" },

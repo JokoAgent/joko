@@ -16,6 +16,7 @@
         "NSLocalNetworkUsageDescription": "Connect to a Joko node on your local network.",
         "NSMicrophoneUsageDescription": "Allow Joko to use your microphone only while you are recording voice input for a task.",
         "NSPhotoLibraryUsageDescription": "Allow Joko to show photos you explicitly choose for a task attachment.",
+        "NSPhotoLibraryAddUsageDescription": "Allow Joko to save an image only when you choose Save image.",
         "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
         "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
       }
@@ -28,8 +29,7 @@
         "android.permission.READ_MEDIA_AUDIO",
         "android.permission.READ_MEDIA_IMAGES",
         "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
-        "android.permission.READ_MEDIA_VIDEO",
-        "android.permission.WRITE_EXTERNAL_STORAGE"
+        "android.permission.READ_MEDIA_VIDEO"
       ],
       "permissions": [
         "android.permission.ACCESS_NETWORK_STATE",
