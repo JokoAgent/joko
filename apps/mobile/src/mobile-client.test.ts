@@ -12,7 +12,7 @@ import {
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
-  RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
+  ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
   TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
@@ -271,6 +271,45 @@ const attachmentSnapshot = create(SnapshotSchema, {
       modelAccess: create(BackendModelAccessSettingsSchema, {})
     })]
   })
+});
+const appCommandSnapshot = create(SnapshotSchema, {
+  ...attachmentSnapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...attachmentSnapshot.backends[0]!,
+    version: "backend-app-commands-v1",
+    entityVersion: create(EntityVersionSchema, {
+      generation: 1n,
+      revision: create(RevisionSchema, { value: 6n, etag: "backend-r6" })
+    }),
+    capabilities: create(CapabilityManifestSchema, {
+      ...attachmentSnapshot.backends[0]!.capabilities!,
+      revision: create(RevisionSchema, { value: 7n, etag: "capabilities-r7" }),
+      capabilities: [
+        ...attachmentSnapshot.backends[0]!.capabilities!.capabilities,
+        create(CapabilitySchema, { name: capabilityNames.runtimeUserShell, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, { name: capabilityNames.sessionReset, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, { name: capabilityNames.reviewIsolated, support: CapabilitySupport.SUPPORTED })
+      ]
+    })
+  })],
+  targets: [create(TargetSchema, {
+    ...attachmentSnapshot.targets[0]!,
+    version: create(EntityVersionSchema, {
+      generation: 1n,
+      revision: create(RevisionSchema, { value: 3n, etag: "target-r3" })
+    })
+  })],
+  sessions: [
+    create(SessionSchema, {
+      ...attachmentSnapshot.sessions[0]!,
+      nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 8n }),
+      version: create(EntityVersionSchema, {
+        generation: 8n,
+        revision: create(RevisionSchema, { value: 9n, etag: "session-r9" })
+      })
+    }),
+    relatedSession
+  ]
 });
 const workspaceMentionDirectory = create(WorkspaceEntrySchema, {
   workspaceId: "workspace", relativePath: "src", displayName: "src", kind: FileKind.DIRECTORY
@@ -4149,6 +4188,298 @@ describe("native current-task message and Queue actions", () => {
     await vi.waitFor(() => expect(saved.pending()).toMatchObject([{
       operationId: "mobile-id-2", kind: "queue-edit-lock", queueItemId: "queue-1", state: "unknown"
     }]));
+  });
+});
+
+describe("native current-task app commands", () => {
+  const ids = () => {
+    let value = 0;
+    return () => `app-command-${++value}`;
+  };
+
+  it("consumes local help and exact task navigation without dispatching a service mutation", async () => {
+    const network = projectedNetwork(appCommandSnapshot);
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const controls = app.taskAppCommandControls()!;
+    expect(controls.policy).toEqual({
+      help: true, jumpSession: true, userShell: true, sessionReset: true, review: true
+    });
+
+    await expect(app.executeTaskAppCommand(
+      controls.surfaceOwnerKey,
+      { kind: "help" },
+      plainTextMobileComposerDraft("/help")
+    )).resolves.toEqual({ kind: "help", status: "succeeded" });
+    expect(drafts.composer.readSync(identity)).toBeNull();
+
+    const jumpControls = app.taskAppCommandControls()!;
+    await expect(app.executeTaskAppCommand(
+      jumpControls.surfaceOwnerKey,
+      { kind: "jumpSession", sessionId: "related" },
+      plainTextMobileComposerDraft("/jump-session related")
+    )).resolves.toEqual({ kind: "jumpSession", status: "succeeded", sessionId: "related" });
+    expect(app.state.selectedId).toBe("related");
+    expect(drafts.composer.readSync(identity)).toBeNull();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("dispatches typed shell, reset, and Review mutations with body-free receipts and conditional draft cleanup", async () => {
+    const network = projectedNetwork(appCommandSnapshot);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    const fixture = attachmentFileFixture();
+    vi.mocked(network.uploadBlob).mockImplementation(async () => committedAttachment(
+      localAttachmentDraft().attachments[1] as MobileLocalComposerAttachment
+    ));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      toBinary(OperationMutationSchema, mutation);
+      const payload = mutation.payload.case === "executeUserShell"
+        ? { case: "acknowledgement" as const, value: { accepted: true } }
+        : mutation.payload.case === "resetSession"
+          ? { case: "session" as const, value: create(SessionSchema, {
+              ...appCommandSnapshot.sessions[0]!,
+              nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 9n }),
+              version: create(EntityVersionSchema, {
+                generation: 9n,
+                revision: create(RevisionSchema, { value: 10n, etag: "session-r10" })
+              })
+            }) }
+          : mutation.payload.case === "startReview"
+            ? { case: "reviewRun" as const, value: create(ReviewRunSchema, {
+                reviewRunId: "review-one",
+                sourceSessionId: "session",
+                reviewerSessionId: "reviewer-session",
+                state: ReviewRunState.RUNNING
+              }) }
+            : undefined;
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        ...(payload === undefined ? {} : { result: { payload } })
+      });
+    });
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts, fixture.files);
+    await app.start();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "userShell", command: "pwd" },
+      plainTextMobileComposerDraft("/cmd pwd")
+    )).resolves.toEqual({ kind: "userShell", status: "succeeded" });
+    expect(drafts.composer.readSync(identity)).toBeNull();
+
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "sessionReset" },
+      plainTextMobileComposerDraft("/clear")
+    )).resolves.toEqual({ kind: "sessionReset", status: "succeeded" });
+    expect(drafts.composer.readSync(identity)).toBeNull();
+
+    const reviewAttachment = localAttachmentDraft().attachments[1]!;
+    const reviewDraft = { ...plainTextMobileComposerDraft("/review security"), attachments: [reviewAttachment] };
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "review", focus: "security" },
+      reviewDraft
+    )).resolves.toEqual({ kind: "review", status: "succeeded", reviewRunId: "review-one" });
+
+    expect(vi.mocked(network.submit).mock.calls.map((call) => call[2])).toMatchObject([
+      {
+        preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: 8n }],
+        payload: { case: "executeUserShell", value: {
+          sessionId: "session", command: "pwd", excludeFromContext: false
+        } }
+      },
+      {
+        preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: 8n }],
+        payload: { case: "resetSession", value: { sessionId: "session" } }
+      },
+      {
+        preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: 8n }],
+        payload: { case: "startReview", value: {
+          sourceSessionId: "session",
+          focus: "security",
+          attachments: [{ displayName: "proof.pdf", blob: { blobId: "blob-file-one" } }]
+        } }
+      }
+    ]);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(JSON.stringify(vi.mocked(saved.storage.savePending).mock.calls)).not.toMatch(/pwd|security|proof\.pdf|blob-file-one/u);
+    expect(saved.pending()).toEqual([]);
+    expect(drafts.composer.readSync(identity)).toBeNull();
+    expect(network.uploadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({ fileName: "proof.pdf" }), expect.any(AbortSignal));
+    expect(vi.mocked(network.uploadBlob).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[2]!);
+    expect(fixture.removed).toEqual(["file-one"]);
+  });
+
+  it("retains rejected commands and fails closed on malformed shell, reset, and Review terminal results", async () => {
+    const network = projectedNetwork(appCommandSnapshot);
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "app-command-1",
+      connectionId: credential.connectionId,
+      state: OperationState.FAILED
+    }));
+    const rejected = plainTextMobileComposerDraft("/cmd rejected");
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "userShell", command: "rejected" },
+      rejected
+    )).resolves.toEqual({ kind: "userShell", status: "rejected" });
+    expect(drafts.composer.readSync(identity)).toEqual(rejected);
+
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      const payload = mutation.payload.case === "executeUserShell"
+        ? { case: "acknowledgement" as const, value: { accepted: false } }
+        : mutation.payload.case === "resetSession"
+          ? { case: "session" as const, value: appCommandSnapshot.sessions[0]! }
+          : { case: "reviewRun" as const, value: create(ReviewRunSchema, {
+              reviewRunId: "review-invalid",
+              sourceSessionId: "session",
+              reviewerSessionId: "session",
+              state: ReviewRunState.RUNNING
+            }) };
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload }
+      });
+    });
+
+    const invalidShell = plainTextMobileComposerDraft("/cmd pwd");
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "userShell", command: "pwd" },
+      invalidShell
+    )).rejects.toThrow(/typed acknowledgement/u);
+    expect(drafts.composer.readSync(identity)).toEqual(invalidShell);
+
+    const invalidReset = plainTextMobileComposerDraft("/clear");
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "sessionReset" },
+      invalidReset
+    )).rejects.toThrow(/same product task/u);
+    expect(drafts.composer.readSync(identity)).toEqual(invalidReset);
+
+    const invalidReview = plainTextMobileComposerDraft("/review isolation");
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "review", focus: "isolation" },
+      invalidReview
+    )).rejects.toThrow(/valid isolated review task/u);
+    expect(drafts.composer.readSync(identity)).toEqual(invalidReview);
+  });
+
+  it("retains an unknown shell receipt and exact draft without replaying the command", async () => {
+    const network = projectedNetwork(appCommandSnapshot);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "app-command-1",
+      connectionId: credential.connectionId,
+      state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockRejectedValueOnce(new Error("operation watch disconnected"));
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const controls = app.taskAppCommandControls()!;
+    const draft = plainTextMobileComposerDraft("/cmd npm test");
+
+    await expect(app.executeTaskAppCommand(
+      controls.surfaceOwnerKey,
+      { kind: "userShell", command: "npm test" },
+      draft
+    )).resolves.toEqual({ kind: "userShell", status: "unknown" });
+
+    expect(saved.pending()).toMatchObject([{
+      operationId: "app-command-1", kind: "session-shell", sessionId: "session", state: "accepted"
+    }]);
+    expect(JSON.stringify(saved.pending())).not.toContain("npm test");
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+    await expect(app.executeTaskAppCommand(
+      app.taskAppCommandControls()!.surfaceOwnerKey,
+      { kind: "userShell", command: "npm test" },
+      draft
+    )).rejects.toThrow(/still pending/u);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows the exact shell permission Interaction to resolve while the shell operation is waiting", async () => {
+    const network = projectedNetwork(appCommandSnapshot);
+    let current = appCommandSnapshot;
+    let finishShell!: (operation: Operation) => void;
+    let shellOperationId = "";
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: current }));
+    network.readSession = vi.fn(async () => current);
+    const push = eventFeed(network);
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "executeUserShell") {
+        shellOperationId = operationId;
+        return create(OperationSchema, {
+          operationId,
+          connectionId: credential.connectionId,
+          state: OperationState.RUNNING
+        });
+      }
+      return create(OperationSchema, {
+        operationId,
+        connectionId: credential.connectionId,
+        state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+      });
+    });
+    vi.mocked(network.waitOperation).mockImplementationOnce((_credential, operationId) => new Promise((resolve) => {
+      finishShell = (operation) => {
+        expect(operation.operationId).toBe(operationId);
+        resolve(operation);
+      };
+    }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, memoryDraftStores());
+    await app.start();
+    const controls = app.taskAppCommandControls()!;
+    const running = app.executeTaskAppCommand(
+      controls.surfaceOwnerKey,
+      { kind: "userShell", command: "git status" },
+      plainTextMobileComposerDraft("/cmd git status")
+    );
+    await vi.waitFor(() => expect(network.waitOperation).toHaveBeenCalledOnce());
+
+    current = create(SnapshotSchema, {
+      ...appCommandSnapshot,
+      resumeCursor: create(EventCursorSchema, { opaqueToken: "cursor-11", sequence: 11n, generation: 1n }),
+      interactions: [permissionInteraction]
+    });
+    push(event("permission-projection", 11n));
+    await vi.waitFor(() => expect(app.taskInteractions()).toHaveLength(1));
+    await expect(app.resolveInteraction("interaction-permission", {
+      kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE
+    })).resolves.toBe(true);
+
+    current = create(SnapshotSchema, {
+      ...appCommandSnapshot,
+      resumeCursor: create(EventCursorSchema, { opaqueToken: "cursor-11", sequence: 11n, generation: 1n })
+    });
+    finishShell(create(OperationSchema, {
+      operationId: shellOperationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+    }));
+    await expect(running).resolves.toEqual({ kind: "userShell", status: "succeeded" });
+    expect(vi.mocked(network.submit).mock.calls.map((call) => call[2].payload.case))
+      .toEqual(["executeUserShell", "resolveInteraction"]);
   });
 });
 

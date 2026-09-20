@@ -4,14 +4,16 @@ import {
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateSessionMutationSchema,
   DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
-  EditQueueItemMutationSchema, EntityKind, EntityRefSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, ExecuteUserShellMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   LogoutConnectionMutationSchema, NavigateSessionBranchMutationSchema, OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
-  ReorderQueueItemMutationSchema, ResolveInteractionMutationSchema, RevisionSchema, RevokeDeviceMutationSchema, SendInputMutationSchema, SessionMessageSearchSessionStatus,
+  ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
+  ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
+  StartReviewMutationSchema,
   FileKind,
   type Artifact, type BackendDescriptor, type BlobRef, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Session, type Snapshot,
@@ -71,6 +73,7 @@ import type {
   MobileComposerDraftStore
 } from "./composer-draft-store";
 import {
+  emptyMobileComposerDraft,
   insertMobileArtifactMention,
   insertMobileWorkspaceMention,
   mobileComposerDraftWithoutPrefix,
@@ -161,6 +164,14 @@ import {
   type MobileRuntimeCommandCatalog,
   type MobileRuntimeCommandControls
 } from "./mobile-runtime-commands";
+import {
+  assertMobileAppCommandInvocation,
+  createMobileAppCommandControls,
+  isMobileRemoteAppCommandInvocation,
+  type MobileAppCommandControls,
+  type MobileAppCommandInvocation,
+  type MobileRemoteAppCommandInvocation
+} from "./mobile-app-commands";
 import type { MobileVoiceTransport } from "./mobile-voice-input";
 import {
   assertMobileNativeTreeNavigation,
@@ -355,6 +366,12 @@ export interface MobileNewTaskResult {
   readonly definitive: boolean;
 }
 
+export type MobileAppCommandOutcome =
+  | { readonly kind: "help"; readonly status: "succeeded" }
+  | { readonly kind: "jumpSession"; readonly status: "succeeded"; readonly sessionId: string }
+  | { readonly kind: "userShell" | "sessionReset"; readonly status: "succeeded" | "rejected" | "unknown" }
+  | { readonly kind: "review"; readonly status: "succeeded" | "rejected" | "unknown"; readonly reviewRunId?: string };
+
 const isTerminal = (state: OperationState): boolean => [
   OperationState.SUCCEEDED, OperationState.FAILED, OperationState.CANCELLED, OperationState.CONFLICT
 ].includes(state);
@@ -415,6 +432,7 @@ export class MobileClient {
   #foreground = true;
   #disposed = false;
   #mutationOwner?: symbol;
+  #userShellFlight?: { readonly owner: symbol; readonly sessionId: string };
   #pendingWrite: Promise<void> = Promise.resolve();
   #catalogEpoch = 0;
   #catalogAbort?: AbortController;
@@ -3025,6 +3043,16 @@ export class MobileClient {
     }
   }
 
+  async #removeConsumedAppCommandAttachments(
+    profileId: string,
+    attachments: readonly MobileComposerAttachment[]
+  ): Promise<void> {
+    for (const attachment of attachments) {
+      if (attachment.state === "local") await this.#removeCommittedAttachmentFile(profileId, attachment);
+    }
+    await this.#removeCommittedAnnotationSources(profileId, attachments);
+  }
+
   leaveTask(): void {
     if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
@@ -3264,6 +3292,15 @@ export class MobileClient {
 
   taskRuntimeCommandControls(): MobileRuntimeCommandControls | undefined {
     return createMobileRuntimeCommandControls(
+      this.#taskAuthorityKey(),
+      this.#state.owner,
+      this.#state.detail,
+      this.#state.selectedId
+    );
+  }
+
+  taskAppCommandControls(): MobileAppCommandControls | undefined {
+    return createMobileAppCommandControls(
       this.#taskAuthorityKey(),
       this.#state.owner,
       this.#state.detail,
@@ -3745,6 +3782,198 @@ export class MobileClient {
     return projectMobileRuntimeCommandCatalog(refreshed, commands);
   }
 
+  async executeTaskAppCommand(
+    expectedSurfaceOwnerKey: string,
+    invocation: MobileAppCommandInvocation,
+    draft: MobileComposerDraft
+  ): Promise<MobileAppCommandOutcome> {
+    const initial = this.#appCommandContext(expectedSurfaceOwnerKey);
+    let command = assertMobileAppCommandInvocation(initial.controls, draft, invocation);
+    this.#assertNoPendingAppCommand(initial.controls.session.sessionId);
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    const identity = {
+      profileId: initial.credential.profileId,
+      sessionId: initial.controls.session.sessionId
+    };
+    let operationDraft = normalizeMobileComposerDraft(draft);
+    this.composerDrafts.save(identity, operationDraft);
+    await this.composerDrafts.flush(identity);
+    let snapshot = await this.composerDrafts.readSnapshot(identity);
+    if (!snapshot.draft || !mobileComposerDraftsEqual(snapshot.draft, operationDraft)) {
+      throw new Error("The retained task draft changed before its app command could run.");
+    }
+    const current = this.#appCommandContext(expectedSurfaceOwnerKey);
+    command = assertMobileAppCommandInvocation(current.controls, operationDraft, command);
+
+    if (command.kind === "help") {
+      const retained = normalizeMobileComposerDraft({
+        text: "",
+        mentions: [],
+        atoms: [],
+        attachments: operationDraft.attachments
+      });
+      if (!this.composerDrafts.saveIfRevision(identity, retained, snapshot.revision)) {
+        throw new Error("The task draft changed before command help could open.");
+      }
+      await this.composerDrafts.flush(identity);
+      return { kind: "help", status: "succeeded" };
+    }
+
+    if (command.kind === "jumpSession") {
+      if (!await this.composerDrafts.clearIfRevision(identity, snapshot.revision)) {
+        throw new Error("The task draft changed before task navigation could begin.");
+      }
+      await this.composerDrafts.flush(identity);
+      const cleared = await this.composerDrafts.readSnapshot(identity);
+      if (cleared.draft) throw new Error("The task draft could not be cleared before task navigation.");
+      try {
+        const latest = this.#appCommandContext(expectedSurfaceOwnerKey);
+        assertMobileAppCommandInvocation(latest.controls, operationDraft, command);
+        await this.select(command.sessionId);
+      } catch (error) {
+        const retained = await this.composerDrafts.readSnapshot(identity);
+        if (!retained.draft && retained.revision === cleared.revision
+          && this.composerDrafts.saveIfRevision(identity, operationDraft, retained.revision)) {
+          await this.composerDrafts.flush(identity);
+        }
+        throw error;
+      }
+      return { kind: "jumpSession", status: "succeeded", sessionId: command.sessionId };
+    }
+
+    if (!isMobileRemoteAppCommandInvocation(command)) {
+      throw new Error("The app command cannot be dispatched to the Joko node.");
+    }
+    let remoteCommand: MobileRemoteAppCommandInvocation = command;
+
+    const sessionId = current.controls.session.sessionId;
+    const generation = current.controls.session.nativeBinding!.runtimeGeneration;
+    const appKind = remoteCommand.kind;
+    const shellOwner = appKind === "userShell" ? Symbol("mobile user shell") : undefined;
+    if (shellOwner) {
+      if (this.#userShellFlight || this.#mutationOwner || this.#connectionAttemptAbort || this.#state.busy) {
+        throw new Error("Another task or connection operation is already in progress.");
+      }
+      this.#cancelCatalogAttempt();
+      this.#userShellFlight = { owner: shellOwner, sessionId };
+    }
+    const action = shellOwner === undefined ? this.#claimMutation() : undefined;
+    try {
+      if (remoteCommand.kind === "review" && operationDraft.attachments.length > 0) {
+        if (operationDraft.attachments.length > 20) throw new Error("Review accepts at most 20 attachments.");
+        const attachmentControls = this.taskAttachmentControls();
+        if (!attachmentControls) throw new Error("This task Backend does not accept Review attachments.");
+        assertMobileAttachmentPolicy(operationDraft.attachments, attachmentControls.policy);
+        operationDraft = await this.#uploadTaskAttachments(
+          identity,
+          operationDraft,
+          current.controls.authorityKey,
+          attachmentControls.surfaceOwnerKey,
+          current.credential,
+          generation
+        );
+        snapshot = await this.composerDrafts.readSnapshot(identity);
+        if (!snapshot.draft || !mobileComposerDraftsEqual(snapshot.draft, operationDraft)) {
+          throw new Error("The retained Review draft changed while its attachments were uploading.");
+        }
+      }
+      const dispatch = this.#appCommandContext(expectedSurfaceOwnerKey);
+      const currentCommand = assertMobileAppCommandInvocation(dispatch.controls, operationDraft, remoteCommand);
+      if (!isMobileRemoteAppCommandInvocation(currentCommand)) {
+        throw new Error("The app command changed before it could be dispatched.");
+      }
+      remoteCommand = currentCommand;
+      this.#assertNoPendingAppCommand(sessionId);
+      const preconditions = [this.#sessionRuntimePrecondition(dispatch.controls.session)];
+      const mutation = remoteCommand.kind === "userShell"
+        ? create(OperationMutationSchema, {
+            preconditions,
+            payload: { case: "executeUserShell", value: create(ExecuteUserShellMutationSchema, {
+              sessionId,
+              command: remoteCommand.command,
+              excludeFromContext: false
+            }) }
+          })
+          : remoteCommand.kind === "sessionReset"
+          ? create(OperationMutationSchema, {
+              preconditions,
+              payload: { case: "resetSession", value: create(ResetSessionMutationSchema, { sessionId }) }
+            })
+          : create(OperationMutationSchema, {
+              preconditions,
+              payload: { case: "startReview", value: create(StartReviewMutationSchema, {
+                sourceSessionId: sessionId,
+                focus: remoteCommand.focus,
+                attachments: operationDraft.attachments.map((attachment) => {
+                  if (attachment.state !== "uploaded") throw new Error("Finish uploading every Review attachment before starting.");
+                  return create(ReviewAttachmentInputSchema, {
+                    kind: attachment.kind === "image" ? ReviewAttachmentKind.IMAGE : ReviewAttachmentKind.FILE,
+                    displayName: attachment.fileName,
+                    blob: create(BlobRefSchema, {
+                      blobId: attachment.blobId,
+                      fileName: attachment.fileName,
+                      mediaType: attachment.mediaType,
+                      byteSize: BigInt(attachment.byteSize),
+                      sha256Hex: attachment.sha256Hex,
+                      disposition: BlobDisposition.ATTACHMENT
+                    })
+                  });
+                })
+              }) }
+            });
+      const kind = remoteCommand.kind === "userShell" ? "session-shell"
+        : remoteCommand.kind === "sessionReset" ? "session-reset" : "session-review";
+      const result = await this.#submitTerminal(
+        mutation,
+        { kind, sessionId },
+        undefined,
+        remoteCommand.kind !== "userShell"
+      );
+      if (!result.definitive) return remoteCommand.kind === "review"
+        ? { kind: "review", status: "unknown" }
+        : { kind: remoteCommand.kind, status: "unknown" };
+      if (!result.accepted) return remoteCommand.kind === "review"
+        ? { kind: "review", status: "rejected" }
+        : { kind: remoteCommand.kind, status: "rejected" };
+      const payload = result.operation?.result?.payload;
+      if (remoteCommand.kind === "userShell") {
+        if (result.operation?.state !== OperationState.SUCCEEDED || payload?.case !== "acknowledgement"
+          || payload.value.accepted !== true) {
+          throw new Error("The Joko node completed the shell command without a typed acknowledgement.");
+        }
+      } else if (remoteCommand.kind === "sessionReset") {
+        const resetGeneration = payload?.case === "session"
+          ? payload.value.nativeBinding?.runtimeGeneration : undefined;
+        if (result.operation?.state !== OperationState.SUCCEEDED || payload?.case !== "session"
+          || payload.value.sessionId !== sessionId
+          || payload.value.backendId !== dispatch.controls.backendId
+          || payload.value.targetId !== dispatch.controls.targetId
+          || !resetGeneration || resetGeneration <= generation
+          || payload.value.version?.generation !== resetGeneration
+          || !payload.value.version.revision || payload.value.version.revision.value < 1n) {
+          throw new Error("The Joko node completed task clearing without the same product task.");
+        }
+      } else {
+        if (result.operation?.state !== OperationState.SUCCEEDED || payload?.case !== "reviewRun"
+          || !payload.value.reviewRunId || !payload.value.reviewerSessionId
+          || payload.value.reviewerSessionId === sessionId
+          || payload.value.sourceSessionId !== sessionId || payload.value.state === ReviewRunState.UNSPECIFIED) {
+          throw new Error("The Joko node accepted Review without a valid isolated review task.");
+        }
+      }
+      const consumed = await this.composerDrafts.clearIfEqual(identity, operationDraft);
+      if (consumed) await this.#removeConsumedAppCommandAttachments(identity.profileId, operationDraft.attachments);
+      if (remoteCommand.kind === "review") {
+        return { kind: "review", status: "succeeded", reviewRunId: payload!.case === "reviewRun"
+          ? payload.value.reviewRunId : undefined };
+      }
+      return { kind: remoteCommand.kind, status: "succeeded" };
+    } finally {
+      if (action) this.#releaseMutation(action);
+      if (shellOwner && this.#userShellFlight?.owner === shellOwner) this.#userShellFlight = undefined;
+    }
+  }
+
   async validateTaskCatalogMentionCandidate(
     expectedSurfaceOwnerKey: string,
     value: MobileCatalogMentionCandidate,
@@ -3989,7 +4218,8 @@ export class MobileClient {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     const credential = this.#ready();
     const resolution = createMobileInteractionResolution(interaction, submission, credential.connectionId);
-    const action = this.#claimMutation();
+    const concurrentUserShell = this.#userShellFlight?.sessionId === interaction.sessionId;
+    const action = this.#claimMutation(concurrentUserShell);
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
         preconditions: [this.#interactionPrecondition(interaction)],
@@ -3999,7 +4229,7 @@ export class MobileClient {
           resolution
         }) }
       }), { kind: "interaction-resolve", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) });
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, !concurrentUserShell);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -4008,7 +4238,8 @@ export class MobileClient {
     const interaction = this.#interactionContext(interactionId);
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     this.#ready();
-    const action = this.#claimMutation();
+    const concurrentUserShell = this.#userShellFlight?.sessionId === interaction.sessionId;
+    const action = this.#claimMutation(concurrentUserShell);
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
         preconditions: [this.#interactionPrecondition(interaction)],
@@ -4018,7 +4249,7 @@ export class MobileClient {
           reason: "Dismissed by user on mobile"
         }) }
       }), { kind: "interaction-dismiss", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) });
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, !concurrentUserShell);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -4271,8 +4502,9 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  #claimMutation(): symbol {
-    if (this.#mutationOwner || this.#connectionAttemptAbort || this.#state.busy) {
+  #claimMutation(allowUserShellInteraction = false): symbol {
+    if (this.#mutationOwner || this.#connectionAttemptAbort || this.#state.busy
+      || this.#userShellFlight && !allowUserShellInteraction) {
       throw new Error("Another task or connection operation is already in progress.");
     }
     this.#cancelCatalogAttempt();
@@ -4306,6 +4538,18 @@ export class MobileClient {
       throw new Error("The task controls changed. Reopen them from the current task.");
     }
     return controls;
+  }
+
+  #appCommandContext(expectedSurfaceOwnerKey: string): {
+    readonly credential: PairedCredential;
+    readonly controls: MobileAppCommandControls;
+  } {
+    const credential = this.#ready();
+    const controls = this.taskAppCommandControls();
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("The task command owner changed. Type the slash command again.");
+    }
+    return { credential, controls };
   }
 
   #contextControlContext(expectedAuthorityKey: string): MobileContextControls {
@@ -4566,8 +4810,16 @@ export class MobileClient {
 
   #assertNoPendingRuntimeControl(sessionId: string): void {
     if (this.#state.pending.some((item) => item.sessionId === sessionId
-      && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind))) {
+      && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
+        "session-shell", "session-reset", "session-review"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
+    }
+  }
+
+  #assertNoPendingAppCommand(sessionId: string): void {
+    if (this.#state.pending.some((item) => item.sessionId === sessionId
+      && ["session-shell", "session-reset", "session-review"].includes(item.kind))) {
+      throw new Error("A previous app command is still pending. Check its operation before running another command.");
     }
   }
 
@@ -5918,39 +6170,43 @@ export class MobileClient {
   async #submitTerminal(
     mutation: OperationMutation,
     identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
-    operationId?: string
+    operationId?: string,
+    markBusy = true,
+    refreshAfter = true
   ): Promise<TrackedMutationResult> {
-    return this.#submitTracked(mutation, identity, true, operationId);
+    return this.#submitTracked(mutation, identity, true, operationId, markBusy, refreshAfter);
   }
 
   async #submitTracked(
     mutation: OperationMutation,
     identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId">,
     waitForTerminal: boolean,
-    operationId = this.newId()
+    operationId = this.newId(),
+    markBusy = true,
+    refreshAfter = true
   ): Promise<TrackedMutationResult> {
     const credential = this.#ready();
     const epoch = this.#epoch;
     const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId, state: "unknown" };
     const before = this.#state.pending;
     const next = [...before, pending];
-    this.#set({ pending: next, busy: true, error: undefined });
+    this.#set({ pending: next, ...(markBusy ? { busy: true } : {}), error: undefined });
     try {
       if (!await this.#persistPending(next, epoch)) return { accepted: false, definitive: false };
     } catch (error) {
-      if (this.#current(epoch)) this.#set({ pending: before, busy: false });
+      if (this.#current(epoch)) this.#set({ pending: before, ...(markBusy ? { busy: false } : {}) });
       throw error;
     }
     let operation: Operation;
     try {
       operation = await this.network.submit(credential, pending.operationId, mutation, this.#abort?.signal);
     } catch (error) {
-      if (this.#current(epoch)) this.#set({ busy: false, error: `Operation ${pending.operationId}: ${message(error)}. Check status; it was not resent.` });
+      if (this.#current(epoch)) this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId}: ${message(error)}. Check status; it was not resent.` });
       return { accepted: false, definitive: false };
     }
     if (!this.#current(epoch)) return { accepted: false, definitive: false };
     if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
-      this.#set({ busy: false, error: `Operation ${pending.operationId} returned with the wrong durable identity. Its receipt was retained and no input was resent.` });
+      this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} returned with the wrong durable identity. Its receipt was retained and no input was resent.` });
       return { accepted: false, definitive: false };
     }
     await this.#receipt(operation, pending, epoch);
@@ -5959,14 +6215,14 @@ export class MobileClient {
         operation = await this.network.waitOperation(credential, pending.operationId, this.#abort?.signal);
       } catch (error) {
         if (this.#current(epoch)) this.#set({
-          busy: false,
+          ...(markBusy ? { busy: false } : {}),
           error: `Operation ${pending.operationId}: ${message(error)}. Its durable result is unknown; it was not resent.`
         });
         return { accepted: false, definitive: false };
       }
       if (!this.#current(epoch)) return { accepted: false, definitive: false };
       if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
-        this.#set({ busy: false, error: `Operation ${pending.operationId} completed with the wrong durable identity. Its receipt was retained and no input was resent.` });
+        this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} completed with the wrong durable identity. Its receipt was retained and no input was resent.` });
         return { accepted: false, definitive: false };
       }
       await this.#receipt(operation, pending, epoch);
@@ -5976,8 +6232,8 @@ export class MobileClient {
       || operation.state === OperationState.CANCELLED;
     const rejectionMessage = rejected ? operation.error?.message || "The operation was rejected." : undefined;
     if (this.#current(epoch)) {
-      this.#set({ busy: false });
-      await this.refresh();
+      if (markBusy) this.#set({ busy: false });
+      if (refreshAfter) await this.refresh();
       if (rejectionMessage && this.#credential?.connectionId === pending.connectionId && this.#state.status === "connected") {
         this.#set({ error: rejectionMessage });
       }
@@ -6047,7 +6303,8 @@ export class MobileClient {
           if (operation.state === OperationState.SUCCEEDED
             && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
-              "session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(pending.kind)
+              "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
+              "session-shell", "session-reset", "session-review"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if (pending.kind === "message-delete" && this.#foreground

@@ -14618,6 +14618,7 @@ async function dispatchMutation(
         operationId,
         connection,
         operationBody: mutation,
+        precondition: (store) => validatePreconditions(store, mutation),
         request: {
           sourceSessionId: payload.value.sourceSessionId,
           ...(payload.value.focus.trim() === "" ? {} : { focus: payload.value.focus }),
@@ -18841,7 +18842,7 @@ async function dispatchMutation(
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.executeUserShell(payload.value.sessionId, {
         command: payload.value.command,
         excludeFromContext: payload.value.excludeFromContext
-      }, operationId).then(() => undefined));
+      }, operationId).then(() => undefined), (store) => validatePreconditions(store, mutation));
     case "abortUserShell":
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.abortUserShell(payload.value.sessionId));
     case "uploadBrowserFile": {

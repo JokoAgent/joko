@@ -57,10 +57,12 @@ export interface MobileRuntimeCommandResults {
 
 export type MobileRuntimeCommandPaletteKey = "ArrowUp" | "ArrowDown" | "Enter" | "Tab" | "Escape";
 
-export type MobileRuntimeCommandPaletteDecision =
+export type MobileRuntimeCommandPaletteDecision<
+  Candidate extends { readonly commandId: string; readonly name: string } = MobileRuntimeCommandCandidate
+> =
   | { readonly kind: "dismiss" }
   | { readonly kind: "move"; readonly selectedIndex: number }
-  | { readonly kind: "commit"; readonly candidate: MobileRuntimeCommandCandidate }
+  | { readonly kind: "commit"; readonly candidate: Candidate }
   | { readonly kind: "consume" };
 
 const maximumCatalogCommands = 4_096;
@@ -223,12 +225,14 @@ export function assertMobileRuntimeCommandCandidate(
   return matches[0]!;
 }
 
-export function resolveMobileRuntimeCommandPaletteKey(
+export function resolveMobileRuntimeCommandPaletteKey<
+  Candidate extends { readonly commandId: string; readonly name: string }
+>(
   key: MobileRuntimeCommandPaletteKey,
-  items: readonly MobileRuntimeCommandCandidate[],
+  items: readonly Candidate[],
   selectedIndex: number,
   selectable: boolean
-): MobileRuntimeCommandPaletteDecision {
+): MobileRuntimeCommandPaletteDecision<Candidate> {
   if (key === "Escape") return { kind: "dismiss" };
   if (key === "ArrowUp" || key === "ArrowDown") {
     if (items.length === 0) return { kind: "consume" };
@@ -247,10 +251,10 @@ export function resolveMobileRuntimeCommandPaletteKey(
   return selectable && candidate ? { kind: "commit", candidate } : { kind: "consume" };
 }
 
-export function replaceMobileRuntimeCommandRun(
+export function replaceMobileRuntimeCommandRun<Command extends { readonly name: string }>(
   draft: MobileComposerDraft,
   activation: MobileRuntimeCommandActivation,
-  command: MobileRuntimeCommandCandidate
+  command: Command
 ): MobileComposerEditResult {
   const exact = normalizeMobileComposerDraft(draft);
   const { from, to, caret, query } = activation;

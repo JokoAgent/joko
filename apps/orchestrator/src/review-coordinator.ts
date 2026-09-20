@@ -171,6 +171,7 @@ export class ReviewCoordinator {
     readonly connection: ConnectionRecord;
     readonly request: unknown;
     readonly operationBody?: unknown;
+    readonly precondition?: (store: OperationalStore) => void;
   }): Promise<ReviewExecutionResult> {
     this.#notifyActivityTransition();
     const request = readStartReviewRequest(input.request);
@@ -182,7 +183,10 @@ export class ReviewCoordinator {
         connection: input.connection,
         kind: "start_review",
         body: input.operationBody ?? request,
-        precondition: (store) => { store.getSession(request.sourceSessionId); },
+        precondition: (store) => {
+          input.precondition?.(store);
+          store.getSession(request.sourceSessionId);
+        },
         effect: async () => {
           await this.#startAccepted(request, reviewRunId, input.operationId);
         },

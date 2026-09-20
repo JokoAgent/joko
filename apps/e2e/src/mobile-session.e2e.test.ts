@@ -3,16 +3,19 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import {
   BlobDisposition, CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
+  ExecuteUserShellMutationSchema,
   EventCursorSchema, ImageRefSchema, InlineTextRangeSchema, InputMentionRangeSchema, InputPartSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
   NavigateSessionBranchMutationSchema, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
   PermissionMode,
   PlanReviewResolutionSchema, QueueItemState, QuestionAnswerSchema, QuestionMultipleChoiceAnswerSchema,
-  QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
-  MessageRole, QueueDeliveryMode, RunState, RuntimeCommandSource, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
+  QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
+  MessageRole, QueueDeliveryMode, ReviewRunState, RunState, RuntimeCommandSource, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
+  StartReviewMutationSchema,
   AppendVoiceAudioRequestSchema, GetVoiceInputCapabilitiesRequestSchema, GetVoiceInputSessionRequestSchema,
   StartVoiceInputRequestSchema, StopVoiceInputRequestSchema, VoiceInputState, VoiceInputTerminalOutcome,
   capabilityNames, nativeSessionTreeRoots, type Interaction, type OperationMutation
@@ -444,6 +447,157 @@ describe("native mobile device through the durable product chain", () => {
     const stored = fixture.application.store.getSession(sessionId);
     expect(stored.descriptor.binding.generation).toBe(Number(generation));
     expect(fixture.application.store.getQueueItem(queueItem.queueItemId).body.text).toBe(exactSlash);
+  });
+
+  it("executes mobile app-owned shell, clear, and review commands through HTTP, SQLite, and the Session Host", async () => {
+    const appCommandProfile = {
+      ...PI_LIKE_PROFILE,
+      id: "mobile-app-commands",
+      displayName: "Mobile app commands",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.filter((capability) => capability.key !== capabilityNames.reviewIsolated),
+        { key: capabilityNames.reviewIsolated, supported: true as const }
+      ]
+    };
+    fixture = await OrchestratorE2eFixture.start({ profiles: [appCommandProfile] });
+    const paired = await fixture.pair("Joko app-command phone");
+    const adapter = fixture.adapter(appCommandProfile.id);
+    const executeUserShell = vi.spyOn(adapter, "executeUserShell");
+    const resetContext = vi.spyOn(adapter, "resetContext");
+    const sessionId = sessionIdFrom(await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      createSessionMutation({
+        backendId: appCommandProfile.id,
+        targetId: fixture.targetId(appCommandProfile.id),
+        displayName: "Mobile app commands",
+        permissionMode: PermissionMode.BYPASS_PERMISSIONS
+      })
+    ));
+    const scope = { kind: { case: "session" as const, value: { sessionId, recentTimelineItems: 120 } } };
+    const authority = async () => {
+      const snapshot = (await paired.clients.event.getSnapshot({ scope })).snapshot;
+      const session = snapshot?.sessions.find((candidate) => candidate.sessionId === sessionId);
+      const revision = session?.version?.revision;
+      const generation = session?.nativeBinding?.runtimeGeneration;
+      if (!revision || !generation) throw new Error("The mobile app-command task has no exact Session authority.");
+      return { revision, generation, snapshot: snapshot! };
+    };
+    const submitWithAuthority = async (
+      mutation: OperationMutation,
+      exact?: Awaited<ReturnType<typeof authority>>
+    ) => {
+      const current = exact ?? await authority();
+      return submit(
+        paired.clients.operation,
+        paired.connectionId,
+        create(OperationMutationSchema, {
+          ...mutation,
+          preconditions: [create(OperationPreconditionSchema, {
+            entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+            expectedRevision: current.revision,
+            expectedGeneration: current.generation
+          })]
+        })
+      );
+    };
+
+    const initial = await authority();
+    const capabilities = initial.snapshot.backends.find((backend) => backend.backendId === appCommandProfile.id)
+      ?.capabilities?.capabilities ?? [];
+    for (const name of [capabilityNames.runtimeUserShell, capabilityNames.sessionReset, capabilityNames.reviewIsolated]) {
+      expect(capabilities).toContainEqual(expect.objectContaining({ name, support: CapabilitySupport.SUPPORTED }));
+    }
+
+    const shell = await submitWithAuthority(create(OperationMutationSchema, {
+      payload: { case: "executeUserShell", value: create(ExecuteUserShellMutationSchema, {
+        sessionId,
+        command: "git status",
+        excludeFromContext: false
+      }) }
+    }), initial);
+    expect(shell.state).toBe(OperationState.SUCCEEDED);
+    expect(shell.result?.payload).toMatchObject({ case: "acknowledgement", value: { accepted: true } });
+    expect(executeUserShell).toHaveBeenCalledWith(
+      { command: "git status", excludeFromContext: false },
+      expect.objectContaining({ sessionId })
+    );
+    expect(fixture.application.store.getOperation(shell.operationId).status).toBe("completed");
+
+    const beforeClear = await authority();
+    const clear = await submitWithAuthority(create(OperationMutationSchema, {
+      payload: { case: "resetSession", value: create(ResetSessionMutationSchema, { sessionId }) }
+    }), beforeClear);
+    expect(clear.state).toBe(OperationState.SUCCEEDED);
+    if (clear.result?.payload.case !== "session") throw new Error("Mobile clear did not return a typed Session result.");
+    expect(clear.result.payload.value.sessionId).toBe(sessionId);
+    expect(clear.result.payload.value.nativeBinding?.runtimeGeneration).toBeGreaterThan(beforeClear.generation);
+    expect(resetContext).toHaveBeenCalledWith(expect.objectContaining({ sessionId }));
+    expect(fixture.application.store.getOperation(clear.operationId).status).toBe("completed");
+
+    await expect(submitWithAuthority(create(OperationMutationSchema, {
+      payload: { case: "executeUserShell", value: create(ExecuteUserShellMutationSchema, {
+        sessionId,
+        command: "pwd",
+        excludeFromContext: false
+      }) }
+    }), beforeClear)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(executeUserShell).toHaveBeenCalledTimes(1);
+
+    await expect(submitWithAuthority(create(OperationMutationSchema, {
+      payload: { case: "startReview", value: create(StartReviewMutationSchema, {
+        sourceSessionId: sessionId,
+        focus: "Check the mobile command surface",
+        attachments: []
+      }) }
+    }), beforeClear)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(fixture.application.store.listReviewRunsBySource(sessionId)).toHaveLength(0);
+
+    const review = await submitWithAuthority(create(OperationMutationSchema, {
+      payload: { case: "startReview", value: create(StartReviewMutationSchema, {
+        sourceSessionId: sessionId,
+        focus: "Check the mobile command surface",
+        attachments: []
+      }) }
+    }));
+    expect(review.state).toBe(OperationState.SUCCEEDED);
+    if (review.result?.payload.case !== "reviewRun") throw new Error("Mobile review did not return a typed ReviewRun.");
+    expect(review.result.payload.value).toMatchObject({
+      sourceSessionId: sessionId,
+      state: ReviewRunState.RUNNING
+    });
+    const reviewRunId = review.result.payload.value.reviewRunId;
+    const reviewerSessionId = review.result.payload.value.reviewerSessionId;
+    expect(reviewRunId).not.toBe("");
+    expect(reviewerSessionId).not.toBe("");
+    expect(reviewerSessionId).not.toBe(sessionId);
+
+    const completed = await waitFor(
+      async () => fixture!.application.store.getReviewRun(reviewRunId),
+      (run) => run.state === "completed",
+      "mobile review to reach a durable terminal result"
+    );
+    expect(completed).toMatchObject({
+      sourceSessionId: sessionId,
+      reviewerSessionId,
+      state: "completed"
+    });
+    expect(completed.result).toContain("Reply from mobile-app-commands:");
+    expect(adapter.sendCalls).toHaveLength(1);
+    expect(adapter.sendCalls[0]?.text).toContain("Check the mobile command surface");
+    expect(fixture.application.store.getOperation(review.operationId).status).toBe("completed");
+
+    const refreshedReview = (await paired.clients.operation.getOperation({ operationId: review.operationId })).operation;
+    expect(refreshedReview?.state).toBe(OperationState.SUCCEEDED);
+    expect(refreshedReview?.result?.payload).toMatchObject({
+      case: "reviewRun",
+      value: {
+        reviewRunId,
+        sourceSessionId: sessionId,
+        reviewerSessionId,
+        state: ReviewRunState.COMPLETED
+      }
+    });
   });
 
   it("uploads mobile image/file Blobs and preserves canonical typed parts through Queue, Timeline, and Adapter dispatch", async () => {

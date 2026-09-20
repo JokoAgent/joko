@@ -2,7 +2,10 @@ import { useEffect, useRef } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { RuntimeCommandSource } from "@joko/contracts";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
-import type { MobileRuntimeCommandCandidate } from "./mobile-runtime-commands";
+import {
+  isMobileAppCommandCandidate,
+  type MobileCommandPaletteCandidate
+} from "./mobile-app-commands";
 
 export type MobileRuntimeCommandPaletteStatus = "loading" | "refreshing" | "ready" | "error";
 
@@ -13,6 +16,7 @@ export function MobileRuntimeCommandPalette({
   selectedIndex,
   status,
   error,
+  runtimeAvailable,
   disabled,
   checkingDraft,
   colors,
@@ -23,75 +27,78 @@ export function MobileRuntimeCommandPalette({
 }: {
   readonly visible: boolean;
   readonly query: string;
-  readonly items: readonly MobileRuntimeCommandCandidate[];
+  readonly items: readonly MobileCommandPaletteCandidate[];
   readonly selectedIndex: number;
   readonly status: MobileRuntimeCommandPaletteStatus;
   readonly error?: string;
+  readonly runtimeAvailable: boolean;
   readonly disabled: boolean;
   readonly checkingDraft: boolean;
   readonly colors: MobileInteractionSheetColors;
   readonly onClose: () => void;
   readonly onRefresh: () => void;
   readonly onRetry: () => void;
-  readonly onSelect: (candidate: MobileRuntimeCommandCandidate) => void;
+  readonly onSelect: (candidate: MobileCommandPaletteCandidate) => void;
 }) {
   const listRef = useRef<ScrollView>(null);
   const selectedPosition = items.length === 0 ? -1
     : Math.max(0, Math.min(Number.isSafeInteger(selectedIndex) ? selectedIndex : 0, items.length - 1));
   const selected = selectedPosition < 0 ? undefined : items[selectedPosition];
   useEffect(() => {
-    if (!visible || !selected || status === "loading" || status === "error") return;
+    if (!visible || !selected) return;
     listRef.current?.scrollTo?.({ animated: true, y: Math.max(0, selectedPosition * 64 - 6) });
   }, [selected?.commandId, selectedPosition, status, visible]);
   if (!visible) return null;
-  const unavailable = disabled || checkingDraft || status === "loading" || status === "refreshing" || status === "error";
-  return <View accessibilityLabel="Runtime commands" accessibilityRole="list"
+  const baseUnavailable = disabled || checkingDraft;
+  return <View accessibilityLabel="Commands" accessibilityRole="list"
     style={[styles.palette, { backgroundColor: colors.surface, borderColor: colors.border }]}>
     {selected && <Text accessibilityLiveRegion="polite" style={styles.screenReaderStatus}>
       Selected /{selected.name}
     </Text>}
     <View style={styles.header}>
       <View style={styles.headerText}>
-        <Text style={[styles.title, { color: colors.ink }]}>Runtime commands</Text>
+        <Text style={[styles.title, { color: colors.ink }]}>Commands</Text>
         <Text style={[styles.query, { color: colors.muted }]} numberOfLines={1}>/{query}</Text>
       </View>
       {status === "refreshing" && <Text accessibilityLiveRegion="polite"
         style={[styles.status, { color: colors.muted }]}>Refreshing…</Text>}
-      {status === "ready" && checkingDraft && <Text accessibilityLiveRegion="polite"
+      {checkingDraft && <Text accessibilityLiveRegion="polite"
         style={[styles.status, { color: colors.muted }]}>Checking draft…</Text>}
       <Pressable accessibilityRole="button" accessibilityLabel="Refresh runtime commands"
-        accessibilityState={{ disabled: disabled || status === "loading" || status === "refreshing" }}
-        disabled={disabled || status === "loading" || status === "refreshing"}
+        accessibilityState={{ disabled: !runtimeAvailable || disabled || status === "loading" || status === "refreshing" }}
+        disabled={!runtimeAvailable || disabled || status === "loading" || status === "refreshing"}
         onPress={onRefresh} style={styles.headerButton}>
         <Text style={[styles.headerAction, { color: colors.accent }]}>↻</Text>
       </Pressable>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close runtime commands"
+      <Pressable accessibilityRole="button" accessibilityLabel="Close commands"
         onPress={onClose} style={styles.headerButton}>
         <Text style={[styles.headerAction, { color: colors.ink }]}>×</Text>
       </Pressable>
     </View>
-    {status === "loading" ? <Text accessibilityLiveRegion="polite"
-      style={[styles.empty, { color: colors.muted }]}>Loading runtime commands…</Text>
-      : status === "error" ? <View accessibilityRole="alert" style={styles.errorRow}>
+    {status === "error" && <View accessibilityRole="alert" style={styles.errorRow}>
           <Text style={[styles.error, { color: colors.negative }]}>{error || "Runtime commands could not be loaded."}</Text>
-          <Pressable accessibilityRole="button" accessibilityLabel="Retry runtime commands" disabled={disabled}
-            accessibilityState={{ disabled }} onPress={onRetry}
-            style={[styles.retry, { borderColor: colors.border }, disabled && styles.disabled]}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Retry runtime commands" disabled={!runtimeAvailable || disabled}
+            accessibilityState={{ disabled: !runtimeAvailable || disabled }} onPress={onRetry}
+            style={[styles.retry, { borderColor: colors.border }, (!runtimeAvailable || disabled) && styles.disabled]}>
             <Text style={[styles.retryText, { color: colors.ink }]}>Retry</Text>
           </Pressable>
-        </View>
-        : items.length === 0 ? <Text accessibilityLiveRegion="polite"
+        </View>}
+    {status === "loading" && items.length === 0 ? <Text accessibilityLiveRegion="polite"
+      style={[styles.empty, { color: colors.muted }]}>Loading runtime commands…</Text>
+      : items.length === 0 ? <Text accessibilityLiveRegion="polite"
             style={[styles.empty, { color: colors.muted }]}>
-            {query ? "No matching runtime commands. Enter and Tab will keep this text unsent."
-              : "No loaded runtime commands are available."}
+            {query ? "No matching commands. Enter and Tab will keep this text unsent."
+              : "No commands are available."}
           </Text>
           : <ScrollView ref={listRef} keyboardShouldPersistTaps="always" nestedScrollEnabled style={styles.list}
               contentContainerStyle={styles.listContent}>
               {items.map((item, index) => {
                 const selected = index === selectedIndex;
+                const unavailable = baseUnavailable
+                  || !isMobileAppCommandCandidate(item) && status !== "ready";
                 return <Pressable key={item.commandId} accessibilityRole="button"
-                  accessibilityLabel={`Insert runtime command /${item.name}`}
-                  accessibilityHint={item.description || `${runtimeCommandSourceLabel(item.source)} command`}
+                  accessibilityLabel={`Insert ${isMobileAppCommandCandidate(item) ? "app" : "runtime"} command /${item.name}`}
+                  accessibilityHint={item.description || commandSourceLabel(item)}
                   accessibilityState={{ selected, disabled: unavailable }} disabled={unavailable}
                   onPress={() => onSelect(item)}
                   style={[styles.item, {
@@ -101,7 +108,7 @@ export function MobileRuntimeCommandPalette({
                   <View style={styles.itemText}>
                     <Text style={[styles.command, { color: colors.ink }]} numberOfLines={1}>/{item.name}</Text>
                     <Text style={[styles.description, { color: colors.muted }]} numberOfLines={2}>
-                      {item.description || runtimeCommandSourceLabel(item.source)}
+                      {item.description || commandSourceLabel(item)}
                     </Text>
                   </View>
                   {selected && <Text accessibilityElementsHidden style={[styles.selected, { color: colors.accent }]}>↵</Text>}
@@ -109,6 +116,10 @@ export function MobileRuntimeCommandPalette({
               })}
             </ScrollView>}
   </View>;
+}
+
+function commandSourceLabel(candidate: MobileCommandPaletteCandidate): string {
+  return isMobileAppCommandCandidate(candidate) ? "Joko command" : `${runtimeCommandSourceLabel(candidate.source)} command`;
 }
 
 export function runtimeCommandSourceLabel(source: RuntimeCommandSource): string {

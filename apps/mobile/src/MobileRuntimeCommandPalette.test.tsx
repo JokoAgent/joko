@@ -106,6 +106,7 @@ function render(overrides: Partial<Parameters<typeof MobileRuntimeCommandPalette
     items,
     selectedIndex: 1,
     status: "ready",
+    runtimeAvailable: true,
     disabled: false,
     checkingDraft: false,
     colors,
@@ -121,7 +122,7 @@ function render(overrides: Partial<Parameters<typeof MobileRuntimeCommandPalette
 describe("MobileRuntimeCommandPalette", () => {
   it("renders a native accessible selected list without taking the editor's semantic role", () => {
     const mounted = render();
-    expect(mounted.container.querySelector('[role="list"]')?.getAttribute("aria-label")).toBe("Runtime commands");
+    expect(mounted.container.querySelector('[role="list"]')?.getAttribute("aria-label")).toBe("Commands");
     const review = mounted.container.querySelector('button[aria-label="Insert runtime command /review"]');
     expect(review?.getAttribute("aria-selected")).toBe("true");
     expect(review?.getAttribute("aria-description")).toBe("Skill command");
@@ -149,12 +150,28 @@ describe("MobileRuntimeCommandPalette", () => {
     expect(mounted.container.querySelector('[role="alert"]')?.textContent).toContain("Catalog retired");
     const retry = mounted.container.querySelector('button[aria-label="Retry runtime commands"]');
     const refresh = mounted.container.querySelector('button[aria-label="Refresh runtime commands"]');
-    const close = mounted.container.querySelector('button[aria-label="Close runtime commands"]');
+    const close = mounted.container.querySelector('button[aria-label="Close commands"]');
     act(() => retry?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     act(() => refresh?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     act(() => close?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(mounted.onRetry).toHaveBeenCalledTimes(1);
     expect(mounted.onRefresh).toHaveBeenCalledTimes(1);
     expect(mounted.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps app commands selectable while the optional runtime catalog is loading or unavailable", () => {
+    const app = {
+      commandId: "builtin:help" as const,
+      name: "help" as const,
+      description: "Show every available command and skill",
+      appCommand: "help" as const
+    };
+    const mounted = render({ items: [app], selectedIndex: 0, status: "loading", runtimeAvailable: false });
+    const help = mounted.container.querySelector('button[aria-label="Insert app command /help"]');
+    expect(help?.hasAttribute("disabled")).toBe(false);
+    expect(mounted.container.querySelector('button[aria-label="Refresh runtime commands"]')?.hasAttribute("disabled"))
+      .toBe(true);
+    act(() => help?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(mounted.onSelect).toHaveBeenCalledWith(app);
   });
 });

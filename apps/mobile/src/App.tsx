@@ -100,15 +100,24 @@ import {
   type MobileComposerRichPasteRequest
 } from "./MobileComposerRichInput";
 import { MobileRuntimeCommandPalette, type MobileRuntimeCommandPaletteStatus } from "./MobileRuntimeCommandPalette";
+import { MobileCommandHelpSheet } from "./MobileCommandHelpSheet";
+import {
+  assertMobileAppCommandCandidate,
+  filterMobileCommandPaletteCandidates,
+  isMobileAppCommandCandidate,
+  mergeMobileCommandPaletteCandidates,
+  mobileAppCommandCandidates,
+  mobileAppCommandIntent,
+  parseMobileAppCommand,
+  type MobileCommandPaletteCandidate
+} from "./mobile-app-commands";
 import {
   MobileRuntimeCommandCatalogCache,
   assertMobileRuntimeCommandCandidate,
   detectMobileRuntimeCommandActivation,
-  filterMobileRuntimeCommands,
   replaceMobileRuntimeCommandRun,
   resolveMobileRuntimeCommandPaletteKey,
   type MobileRuntimeCommandActivation,
-  type MobileRuntimeCommandCandidate,
   type MobileRuntimeCommandCatalog
 } from "./mobile-runtime-commands";
 import type { MobileComposerCommandPaletteKey } from "./mobile-composer-rich-input-protocol";
@@ -222,15 +231,15 @@ interface MobileRuntimeCommandDraftLease {
   readonly sourceDraft: MobileComposerDraft;
   readonly selection: MobileComposerSelection;
   readonly activation: MobileRuntimeCommandActivation;
-  readonly catalog: MobileRuntimeCommandCatalog;
+  readonly runtimeCatalog?: MobileRuntimeCommandCatalog;
 }
 
 interface MobileRuntimeCommandPaletteSnapshot {
   readonly visible: boolean;
   readonly ownerKey?: string;
   readonly activation?: MobileRuntimeCommandActivation;
-  readonly catalog?: MobileRuntimeCommandCatalog;
-  readonly items: readonly MobileRuntimeCommandCandidate[];
+  readonly runtimeCatalog?: MobileRuntimeCommandCatalog;
+  readonly items: readonly MobileCommandPaletteCandidate[];
   readonly selectedIndex: number;
   readonly status: MobileRuntimeCommandPaletteStatus;
   readonly draftLease?: MobileRuntimeCommandDraftLease;
@@ -2121,6 +2130,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [runtimeCommandDismissal, setRuntimeCommandDismissal] = useState<MobileRuntimeCommandDismissal>();
   const [runtimeCommandDraftLease, setRuntimeCommandDraftLease] = useState<MobileRuntimeCommandDraftLease>();
   const [runtimeCommandCommitting, setRuntimeCommandCommitting] = useState(false);
+  const [appCommandRunning, setAppCommandRunning] = useState(false);
+  const [commandHelpItems, setCommandHelpItems] = useState<readonly MobileCommandPaletteCandidate[]>();
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [composerNotice, setComposerNotice] = useState("");
@@ -2247,6 +2258,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
   const catalogMentionControls = client.taskCatalogMentionControls();
   const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
+  const appCommandControls = client.taskAppCommandControls();
   const runtimeCommandControls = client.taskRuntimeCommandControls();
   runtimeCommandControlsRef.current = runtimeCommandControls;
   const runtimeCommandObservationKey = JSON.stringify([
@@ -2302,6 +2314,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const interactionMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && item.interactionId === activeInteractionId
     && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
+  const appCommandReceiptPending = state.pending.some((item) => item.sessionId === state.selectedId
+    && ["session-shell", "session-reset", "session-review"].includes(item.kind));
+  const composerOperationPending = appCommandRunning || appCommandReceiptPending;
   const runtimeControlPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind));
   const contextPending = runtimeControlPending;
@@ -2338,6 +2353,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     setComposerFocused(false);
     setRuntimeCommandDismissal(undefined);
     setRuntimeCommandDraftLease(undefined);
+    setCommandHelpItems(undefined);
     setQuoteSelection(undefined);
     setComposerAtomId(undefined);
     if (ownerChanged) {
@@ -2350,6 +2366,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     setSelectedInteractionId(interactions[0]!.interactionId);
     setInteractionVisible(true);
   }, [interactionIdsKey, interactionOwnerKey, selectedInteractionId]);
+  useEffect(() => {
+    setCommandHelpItems(undefined);
+  }, [appCommandControls?.surfaceOwnerKey]);
   useEffect(() => {
     const next = runtimeControls?.surfaceOwnerKey;
     const changed = runtimeControlsOwnerRef.current !== next;
@@ -2633,7 +2652,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     transport: voiceTransport,
     draftOwnerKey: draftIdentityKey,
     enabled: composerOwnerReady && queueEdit === undefined && interactions.length === 0
-      && state.status === "connected" && !state.busy && !attachmentBusy,
+      && state.status === "connected" && !state.busy && !composerOperationPending && !attachmentBusy,
     readDraft: () => composerDraftRef.current,
     readSelection: () => composerSelectionRef.current,
     writeDraft: (value, selection, persist) => {
@@ -2656,31 +2675,33 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   });
   useMobileVoicePermissionSettings(voice.error);
   const composerPasteEditable = composerOwnerReady && queueEdit === undefined && !state.busy
+    && !composerOperationPending
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
   const runtimeCommandEnabled = composerPasteEditable && composerFocused && interactions.length === 0
-    && state.status === "connected" && runtimeCommandControls !== undefined;
+    && state.status === "connected" && appCommandControls !== undefined;
   const runtimeCommandActivation = runtimeCommandEnabled
     ? detectMobileRuntimeCommandActivation(draft, composerSelection, composerComposing)
     : undefined;
-  const runtimeCommandDismissed = runtimeCommandActivation !== undefined && runtimeCommandControls !== undefined
-    && runtimeCommandDismissal?.ownerKey === runtimeCommandControls.surfaceOwnerKey
+  const runtimeCommandDismissed = runtimeCommandActivation !== undefined && appCommandControls !== undefined
+    && runtimeCommandDismissal?.ownerKey === appCommandControls.surfaceOwnerKey
     && runtimeCommandDismissal.sourceDraft === draft
     && sameComposerSelection(runtimeCommandDismissal.selection, composerSelection)
     && sameRuntimeCommandActivation(runtimeCommandDismissal.activation, runtimeCommandActivation);
-  const runtimeCommandPaletteVisible = runtimeCommandActivation !== undefined && runtimeCommandControls !== undefined
+  const runtimeCommandPaletteVisible = runtimeCommandActivation !== undefined && appCommandControls !== undefined
     && !runtimeCommandDismissed;
   const runtimeCommandLoadMatches = runtimeCommandControls !== undefined
     && runtimeCommandLoad.ownerKey === runtimeCommandControls.surfaceOwnerKey;
   const runtimeCommandCatalog = runtimeCommandLoadMatches ? runtimeCommandLoad.catalog : undefined;
-  const runtimeCommandPaletteStatus: MobileRuntimeCommandPaletteStatus = runtimeCommandLoadMatches
-    ? runtimeCommandLoad.status : "loading";
-  const runtimeCommandResults = useMemo(() => runtimeCommandCatalog === undefined || runtimeCommandActivation === undefined
-    ? { items: [] as readonly MobileRuntimeCommandCandidate[], truncated: false }
-    : filterMobileRuntimeCommands(runtimeCommandCatalog, runtimeCommandActivation.query), [
-      runtimeCommandActivation?.query,
-      runtimeCommandCatalog
-    ]);
+  const runtimeCommandPaletteStatus: MobileRuntimeCommandPaletteStatus = runtimeCommandControls === undefined
+    ? "ready"
+    : runtimeCommandLoadMatches ? runtimeCommandLoad.status : "loading";
+  const runtimeCommandCandidates = appCommandControls === undefined
+    ? []
+    : mergeMobileCommandPaletteCandidates(appCommandControls, runtimeCommandCatalog?.items);
+  const runtimeCommandResults = runtimeCommandActivation === undefined
+    ? { items: [] as readonly MobileCommandPaletteCandidate[], truncated: false }
+    : filterMobileCommandPaletteCandidates(runtimeCommandCandidates, runtimeCommandActivation.query);
   const runtimeCommandResultKey = runtimeCommandResults.items.map((item) => item.commandId).join("\u001f");
   useEffect(() => {
     setRuntimeCommandSelectedIndex(0);
@@ -2689,18 +2710,18 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     runtimeCommandActivation?.from,
     runtimeCommandActivation?.query,
     runtimeCommandActivation?.to,
-    runtimeCommandControls?.surfaceOwnerKey,
+    appCommandControls?.surfaceOwnerKey,
     runtimeCommandResultKey
   ]);
   useEffect(() => {
     let active = true;
     setRuntimeCommandDraftLease(undefined);
     const activation = runtimeCommandActivation;
-    const controls = runtimeCommandControls;
+    const controls = appCommandControls;
     const catalog = runtimeCommandCatalog;
     const identity = draftIdentity;
-    if (!runtimeCommandPaletteVisible || !activation || !controls || !catalog || !identity
-      || runtimeCommandPaletteStatus !== "ready" || runtimeCommandCommittingRef.current) return;
+    if (!runtimeCommandPaletteVisible || !activation || !controls || !identity
+      || runtimeCommandCommittingRef.current) return;
     const sourceDraft = draft;
     const selection = { ...composerSelection };
     const identityKey = mobileComposerDraftIdentityKey(identity);
@@ -2717,9 +2738,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         || !sameRuntimeCommandActivation(currentActivation, activation)
         || draftIdentityRef.current === undefined
         || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== identityKey
-        || runtimeCommandControlsRef.current?.surfaceOwnerKey !== controls.surfaceOwnerKey
-        || runtimeCommandPaletteRef.current.catalog !== catalog
-        || runtimeCommandPaletteRef.current.status !== "ready") return;
+        || client.taskAppCommandControls()?.surfaceOwnerKey !== controls.surfaceOwnerKey
+        || runtimeCommandPaletteRef.current.runtimeCatalog !== catalog) return;
       setRuntimeCommandDraftLease({
         ownerKey: controls.surfaceOwnerKey,
         draftIdentityKey: identityKey,
@@ -2727,7 +2747,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         sourceDraft,
         selection,
         activation,
-        catalog
+        ...(catalog === undefined ? {} : { runtimeCatalog: catalog })
       });
     }).catch((failure) => {
       if (active && taskMountedRef.current) setLocalError(errorText(failure));
@@ -2743,25 +2763,24 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     runtimeCommandActivation?.query,
     runtimeCommandActivation?.to,
     runtimeCommandCatalog,
-    runtimeCommandControls?.surfaceOwnerKey,
-    runtimeCommandPaletteStatus,
+    appCommandControls?.surfaceOwnerKey,
     runtimeCommandPaletteVisible
   ]);
   const selectedRuntimeCommandIndex = runtimeCommandResults.items.length === 0 ? 0
     : Math.min(runtimeCommandSelectedIndex, runtimeCommandResults.items.length - 1);
   const currentRuntimeCommandDraftLease = runtimeCommandDraftLease
-    && runtimeCommandControls && runtimeCommandActivation && runtimeCommandCatalog
-    && runtimeCommandDraftLease.ownerKey === runtimeCommandControls.surfaceOwnerKey
+    && appCommandControls && runtimeCommandActivation
+    && runtimeCommandDraftLease.ownerKey === appCommandControls.surfaceOwnerKey
     && runtimeCommandDraftLease.sourceDraft === draft
-    && runtimeCommandDraftLease.catalog === runtimeCommandCatalog
+    && runtimeCommandDraftLease.runtimeCatalog === runtimeCommandCatalog
     && sameComposerSelection(runtimeCommandDraftLease.selection, composerSelection)
     && sameRuntimeCommandActivation(runtimeCommandDraftLease.activation, runtimeCommandActivation)
     ? runtimeCommandDraftLease : undefined;
   runtimeCommandPaletteRef.current = {
     visible: runtimeCommandPaletteVisible,
-    ...(runtimeCommandControls === undefined ? {} : { ownerKey: runtimeCommandControls.surfaceOwnerKey }),
+    ...(appCommandControls === undefined ? {} : { ownerKey: appCommandControls.surfaceOwnerKey }),
     ...(runtimeCommandActivation === undefined ? {} : { activation: runtimeCommandActivation }),
-    ...(runtimeCommandCatalog === undefined ? {} : { catalog: runtimeCommandCatalog }),
+    ...(runtimeCommandCatalog === undefined ? {} : { runtimeCatalog: runtimeCommandCatalog }),
     items: runtimeCommandResults.items,
     selectedIndex: selectedRuntimeCommandIndex,
     status: runtimeCommandPaletteStatus,
@@ -2778,18 +2797,18 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     });
     setRuntimeCommandDraftLease(undefined);
   }, []);
-  const commitRuntimeCommand = useCallback(async (candidate: MobileRuntimeCommandCandidate): Promise<void> => {
+  const commitRuntimeCommand = useCallback(async (candidate: MobileCommandPaletteCandidate): Promise<void> => {
     const palette = runtimeCommandPaletteRef.current;
     const lease = palette.draftLease;
     const identity = draftIdentityRef.current;
-    if (runtimeCommandCommittingRef.current || !palette.visible || palette.status !== "ready"
-      || !lease || !identity || !palette.catalog || palette.catalog !== lease.catalog
+    if (runtimeCommandCommittingRef.current || !palette.visible
+      || !lease || !identity || palette.runtimeCatalog !== lease.runtimeCatalog
       || palette.ownerKey !== lease.ownerKey || mobileComposerDraftIdentityKey(identity) !== lease.draftIdentityKey) return;
     runtimeCommandCommittingRef.current = true;
     setRuntimeCommandCommitting(true);
     setLocalError("");
     try {
-      const controls = client.taskRuntimeCommandControls();
+      const controls = client.taskAppCommandControls();
       const currentActivation = detectMobileRuntimeCommandActivation(
         composerDraftRef.current,
         composerSelectionRef.current,
@@ -2799,9 +2818,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         || composerDraftRef.current !== lease.sourceDraft
         || !sameComposerSelection(composerSelectionRef.current, lease.selection)
         || !sameRuntimeCommandActivation(currentActivation, lease.activation)) {
-        throw new Error("The task draft or runtime command owner changed. Type the slash command again.");
+        throw new Error("The task draft or command owner changed. Type the slash command again.");
       }
-      const exact = assertMobileRuntimeCommandCandidate(controls, lease.catalog, candidate);
+      const exact = isMobileAppCommandCandidate(candidate)
+        ? assertMobileAppCommandCandidate(controls, candidate)
+        : assertMobileRuntimeCommandCandidate(
+            palette.status === "ready" ? client.taskRuntimeCommandControls() : undefined,
+            palette.status === "ready" ? lease.runtimeCatalog : undefined,
+            candidate
+          );
       const result = replaceMobileRuntimeCommandRun(lease.sourceDraft, lease.activation, exact);
       if (!mobileComposerDrafts.saveIfRevision(identity, result.draft, lease.revision)) {
         throw new Error("The task draft changed before the runtime command could be inserted.");
@@ -2852,11 +2877,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const handleRuntimeCommandPaletteKey = useCallback((key: MobileComposerCommandPaletteKey) => {
     const palette = runtimeCommandPaletteRef.current;
     if (!palette.visible) return;
+    const selected = palette.items[Math.max(0, Math.min(palette.selectedIndex, palette.items.length - 1))];
     const decision = resolveMobileRuntimeCommandPaletteKey(
       key,
       palette.items,
       palette.selectedIndex,
-      palette.status === "ready" && palette.draftLease !== undefined
+      palette.draftLease !== undefined && selected !== undefined
+        && (isMobileAppCommandCandidate(selected) || palette.status === "ready")
     );
     if (decision.kind === "dismiss") {
       dismissRuntimeCommandPalette();
@@ -3509,9 +3536,56 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     if (voice.busy) return;
     setLocalError("");
     const active = queueEditRef.current;
+    let appCommandStarted = false;
     try {
       if (!active) {
         const identity = draftIdentityRef.current;
+        const sourceDraft = composerDraftRef.current;
+        const intent = mobileAppCommandIntent(sourceDraft);
+        if (intent !== undefined) {
+          const controls = client.taskAppCommandControls();
+          const invocation = parseMobileAppCommand(sourceDraft, controls);
+          if (!identity || !controls || !invocation) {
+            throw new Error("This app command is unavailable here or its syntax is invalid. The draft was retained.");
+          }
+          if (composerOperationPending) return;
+          const helpItems = controls.surfaceOwnerKey === appCommandControls?.surfaceOwnerKey
+            ? [...mergeMobileCommandPaletteCandidates(
+                controls,
+                runtimeCommandPaletteStatus === "ready" ? runtimeCommandCatalog?.items : undefined
+              )]
+            : [...mobileAppCommandCandidates(controls)];
+          appCommandStarted = true;
+          setAppCommandRunning(true);
+          setRuntimeCommandDraftLease(undefined);
+          const outcome = await client.executeTaskAppCommand(controls.surfaceOwnerKey, invocation, sourceDraft);
+          const currentIdentity = draftIdentityRef.current;
+          if (taskMountedRef.current && currentIdentity
+            && mobileComposerDraftIdentityKey(currentIdentity) === mobileComposerDraftIdentityKey(identity)) {
+            const retained = mobileComposerDrafts.readSync(identity);
+            const next = retained ?? emptyMobileComposerDraft();
+            composerDraftRef.current = next;
+            setDraft(next);
+            const selection = { start: next.text.length, end: next.text.length };
+            composerSelectionRef.current = selection;
+            setComposerSelection(selection);
+          }
+          if (!taskMountedRef.current) return;
+          if (outcome.kind === "help") {
+            setCommandHelpItems(helpItems);
+          } else if (outcome.status === "unknown") {
+            setComposerNotice("The command result is unknown. Check its durable operation; Joko will not run it again automatically.");
+          } else if (outcome.status === "rejected") {
+            setLocalError("The command was rejected. Its draft was retained.");
+          } else if (outcome.kind === "userShell") {
+            setComposerNotice("Shell command completed with a typed acknowledgement.");
+          } else if (outcome.kind === "sessionReset") {
+            setComposerNotice("Task context cleared.");
+          } else if (outcome.kind === "review") {
+            setComposerNotice("Independent Review started.");
+          }
+          return;
+        }
         if (!await client.send(composerDraftRef.current)) {
           if (identity && draftIdentityRef.current
             && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity)) {
@@ -3548,6 +3622,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         }
         setLocalError(errorText(error));
       }
+    } finally {
+      if (appCommandStarted && taskMountedRef.current) setAppCommandRunning(false);
     }
   };
   const mutateQueue = (action: () => Promise<unknown>): void => {
@@ -3722,9 +3798,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         || attachmentControls || composerOwnerReady || draft.mentions.length > 0 || draft.atoms.length > 0
         || draft.attachments.length > 0) && <View style={styles.composerTools}>
         {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
-          disabled={!composerOwnerReady || state.busy || attachmentBusy || state.status !== "connected"} />}
+          disabled={!composerOwnerReady || state.busy || composerOperationPending || attachmentBusy
+            || state.status !== "connected"} />}
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
-          disabled={state.busy || voice.busy || !composerOwnerReady || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
+          disabled={state.busy || composerOperationPending || voice.busy || !composerOwnerReady
+            || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -3735,7 +3813,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             setSessionMentionsVisible(true);
           }} />}
         {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
-          disabled={state.busy || voice.busy || !composerOwnerReady}
+          disabled={state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -3749,7 +3827,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           label={catalogMentionControls.policy.resources && catalogMentionControls.policy.artifacts
             ? "Reference Resource / Artifact"
             : catalogMentionControls.policy.resources ? "Reference Resource" : "Reference Artifact"}
-          colors={colors} compact disabled={state.busy || voice.busy || !composerOwnerReady}
+          colors={colors} compact disabled={state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -3764,17 +3842,17 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           onPress={() => void pasteClipboardText()} />
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"}
           colors={colors} compact
-          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
         {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
           colors={colors} compact
-          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={openPhotoLibrary} />}
         {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
           colors={colors} compact
-          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("camera")} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
@@ -3784,25 +3862,27 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
               : mention.kind === "workspace" ? mention.directory ? "directory" : "file"
                 : mention.kind === "resource" ? "resource" : "Artifact"} reference ${mention.displayText}`}
             accessibilityHint="Removes this exact reference occurrence from the message"
-            disabled={state.busy || voice.busy} onPress={() => removeComposerMention(mention.mentionId)}
-            style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }, (state.busy || voice.busy) && styles.disabled]}>
+            disabled={state.busy || composerOperationPending || voice.busy} onPress={() => removeComposerMention(mention.mentionId)}
+            style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
+              (state.busy || composerOperationPending || voice.busy) && styles.disabled]}>
             <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>{draft.text.slice(mention.start, mention.end)} ×</Text>
           </Pressable>)}
         </ScrollView>}
         <MobileComposerAtomChips atoms={draft.atoms} colors={colors}
-          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
+          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
           onOpen={setComposerAtomId} />
       </View>}
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
-        disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
-        busy={state.busy || voice.busy || attachmentBusy}
+        disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
+        busy={state.busy || composerOperationPending || voice.busy || attachmentBusy}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
       <MobileRuntimeCommandPalette visible={runtimeCommandPaletteVisible}
         query={runtimeCommandActivation?.query ?? ""} items={runtimeCommandResults.items}
         selectedIndex={selectedRuntimeCommandIndex} status={runtimeCommandPaletteStatus}
         error={runtimeCommandLoadMatches ? runtimeCommandLoad.error : undefined}
+        runtimeAvailable={runtimeCommandControls !== undefined}
         disabled={runtimeCommandCommitting}
-        checkingDraft={runtimeCommandPaletteStatus === "ready" && currentRuntimeCommandDraftLease === undefined}
+        checkingDraft={currentRuntimeCommandDraftLease === undefined}
         colors={colors} onClose={dismissRuntimeCommandPalette}
         onRefresh={loadRuntimeCommandCatalog} onRetry={loadRuntimeCommandCatalog}
         onSelect={(candidate) => { void commitRuntimeCommand(candidate); }} />
@@ -3821,7 +3901,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             Math.ceil(event.nativeEvent.contentSize.height)
           ))}
           scrollEnabled={composerHeight.scrollEnabled}
-          editable={!state.busy && composerOwnerReady} placeholder="Edit queued input…"
+          editable={!state.busy && !composerOperationPending && composerOwnerReady} placeholder="Edit queued input…"
           placeholderTextColor={colors.muted}
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
           : <MobileComposerRichInput key={`task-rich-${draftIdentityKey ?? "none"}`}
@@ -3871,9 +3951,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
               composerSelectionRef.current = nextSelection;
               setComposerSelection(nextSelection);
             }} />}
-        <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
+        <Action label={state.busy || appCommandRunning ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
           disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
-            || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || state.status !== "connected"}
+            || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || composerOperationPending
+            || state.status !== "connected"}
           onPress={() => void submitComposer()} />
       </View>
     </View>}
@@ -3929,6 +4010,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       onClose={imageGallery.close} onSave={imageGallery.save} />}
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
+    <MobileCommandHelpSheet visible={commandHelpItems !== undefined} items={commandHelpItems ?? []}
+      colors={colors} onClose={() => setCommandHelpItems(undefined)} />
     <MobileQuoteSelectionSheet lease={quoteSelection?.lease} colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
     <MobileComposerAtomSheet atom={draft.atoms.find((atom) => atom.atomId === composerAtomId)}

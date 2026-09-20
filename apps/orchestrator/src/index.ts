@@ -40,6 +40,8 @@ export * from "./pi-provider-auth-supervisor.js";
 export * from "./pi-package-compatibility.js";
 export * from "./proto-mapper.js";
 export * from "./resource-manager.js";
+export * from "./review-coordinator.js";
+export * from "./review-evidence-provider.js";
 export * from "./skill-manager.js";
 export * from "./skill-market-manager.js";
 export * from "./skill-market-sync-manager.js";
