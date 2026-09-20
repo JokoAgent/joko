@@ -34,6 +34,7 @@ import {
   insertMobileArtifactMention,
   insertMobileResourceMention,
   insertMobileSessionMention,
+  insertMobileStructuredClipboardText,
   insertMobileWorkspaceMention,
   mobileComposerInput,
   plainTextMobileComposerDraft,
@@ -173,6 +174,30 @@ const newTaskMentionSnapshot = create(SnapshotSchema, {
     })
   })],
   sessions: [snapshot.sessions[0]!, relatedSession]
+});
+const workspacePathSnapshot = create(SnapshotSchema, {
+  ...newTaskMentionSnapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...newTaskMentionSnapshot.backends[0]!,
+    capabilities: create(CapabilityManifestSchema, {
+      ...newTaskMentionSnapshot.backends[0]!.capabilities!,
+      capabilities: [
+        ...(newTaskMentionSnapshot.backends[0]!.capabilities?.capabilities ?? []),
+        create(CapabilitySchema, {
+          name: capabilityNames.workspaceFiles,
+          support: CapabilitySupport.SUPPORTED
+        })
+      ]
+    })
+  })],
+  workspaces: [create(WorkspaceDescriptorSchema, {
+    ...newTaskMentionSnapshot.workspaces[0]!,
+    serverPathDisplay: "D:\\repo",
+    version: create(EntityVersionSchema, {
+      generation: 8n,
+      revision: create(RevisionSchema, { value: 9n, etag: "workspace-r9" })
+    })
+  })]
 });
 const runtimeCommandSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -336,6 +361,24 @@ function newTaskStructuredInput() {
       lineRange: { startLine: 2, endLine: 4 }
     },
     "new-task-workspace"
+  ).draft;
+}
+
+function workspacePathDraft(): MobileComposerDraft {
+  return insertMobileStructuredClipboardText(
+    plainTextMobileComposerDraft("Open "),
+    { start: 5, end: 5 },
+    "D:\\repo\\src\\main.ts",
+    () => "workspace-path",
+    { workspacePath: {
+      workspaceId: "workspace",
+      serverPathDisplay: "D:\\repo",
+      resolutions: [{
+        candidateRelativePath: "src/main.ts",
+        relativePath: "src/main.ts",
+        directory: false
+      }]
+    } }
   ).draft;
 }
 const catalogMentionSession = create(SessionSchema, {
@@ -1936,6 +1979,62 @@ describe("native mobile connection and operation ownership", () => {
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toMatchObject({ input: sessionInput });
   });
 
+  it("revalidates a new-task absolute Workspace path and sends only its relative wire text", async () => {
+    const network = projectedNetwork(workspacePathSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, workspaceId, parentPath) => ({
+      entries: workspaceId === "workspace" && parentPath === "src" ? [workspaceMentionFile] : [],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    let operation = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) =>
+      mutation.payload.case === "createSession"
+        ? create(OperationSchema, {
+            operationId,
+            connectionId: credential.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "session", value: workspacePathSnapshot.sessions[0]! } }
+          })
+        : create(OperationSchema, {
+            operationId,
+            connectionId: credential.connectionId,
+            state: OperationState.SUCCEEDED,
+            result: { payload: { case: "queueItem", value: create(QueueItemSchema, {
+              queueItemId: "path-first-input",
+              backendId: "backend",
+              targetId: "target",
+              sessionId: "session",
+              state: QueueItemState.ACCEPTED
+            }) } }
+          }));
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => `path-operation-${++operation}`, undefined, drafts);
+    await app.start();
+    const controls = app.newTaskWorkspacePathPasteControls("target")!;
+    await expect(app.validateNewTaskWorkspacePathPasteCandidates(
+      "target",
+      controls.surfaceOwnerKey,
+      ["src/main.ts", "src/missing.ts"]
+    )).resolves.toEqual([{
+      candidateRelativePath: "src/main.ts",
+      relativePath: "src/main.ts",
+      directory: false
+    }]);
+
+    await expect(app.create("target", "Path", workspacePathDraft())).resolves.toEqual({
+      sessionId: "session", created: true, sent: true, definitive: true
+    });
+    const send = vi.mocked(network.submit).mock.calls.find((call) => call[2].payload.case === "sendInput")?.[2];
+    expect(send?.payload.case).toBe("sendInput");
+    if (send?.payload.case !== "sendInput") throw new Error("Expected the first input mutation.");
+    expect(send.payload.value.input).toMatchObject({
+      parts: [{ content: { case: "text", value: "Open @src/main.ts" } }],
+      mentionRanges: [],
+      pastedTextRanges: []
+    });
+    expect(JSON.stringify(send.payload.value.input)).not.toContain("D:\\\\repo");
+  });
+
   it("retires an in-flight new-task Workspace selection after Target or Workspace drift", async () => {
     const network = projectedNetwork(newTaskMentionSnapshot);
     const changed = create(SnapshotSchema, {
@@ -3477,6 +3576,60 @@ describe("native current-task message and Queue actions", () => {
       if (outcome === "unknown") expect(saved.pending()).toMatchObject([{ kind: "send", state: "unknown" }]);
       else expect(saved.pending()).toEqual([]);
     }
+  });
+
+  it("revalidates a current-task path atom and dispatches no absolute path or typed metadata", async () => {
+    const network = projectedNetwork(workspacePathSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, workspaceId, parentPath) => ({
+      entries: workspaceId === "workspace" && parentPath === "src" ? [workspaceMentionFile] : [],
+      revision: `directory:${parentPath || "root"}`
+    }));
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const controls = app.taskWorkspacePathPasteControls()!;
+    await expect(app.validateTaskWorkspacePathPasteCandidates(
+      controls.surfaceOwnerKey,
+      ["src/main.ts", "src/missing.ts"]
+    )).resolves.toEqual([{
+      candidateRelativePath: "src/main.ts",
+      relativePath: "src/main.ts",
+      directory: false
+    }]);
+    const draft = workspacePathDraft();
+
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(network.listWorkspaceDirectory).toHaveBeenCalledWith(
+      credential, "workspace", "src", expect.any(AbortSignal)
+    );
+    const mutation = vi.mocked(network.submit).mock.calls[0]?.[2];
+    expect(mutation).toMatchObject({
+      payload: { case: "sendInput", value: {
+        sessionId: "session",
+        input: {
+          parts: [{ content: { case: "text", value: "Open @src/main.ts" } }],
+          mentionRanges: [],
+          pastedTextRanges: []
+        }
+      } }
+    });
+    expect(JSON.stringify(mutation, (_key, value) => typeof value === "bigint" ? value.toString() : value))
+      .not.toContain("D:\\\\repo");
+  });
+
+  it("retains a current-task path atom when its directory entry disappears before dispatch", async () => {
+    const network = projectedNetwork(workspacePathSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [], revision: "directory:src" });
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = workspacePathDraft();
+
+    await expect(app.send(draft)).rejects.toThrow(/disappeared/u);
+
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
   });
 
   it("retains the Workspace draft when a referenced path disappears or changes kind before dispatch", async () => {

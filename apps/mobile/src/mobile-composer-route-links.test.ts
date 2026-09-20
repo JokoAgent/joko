@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  findMobileComposerWorkspacePathCandidates,
+  mobileComposerWorkspacePathComparisonKey,
   parseMobileComposerRouteHref,
   sanitizeMobileComposerReferenceLabel,
   seedMobileComposerRouteReference,
@@ -7,7 +9,7 @@ import {
   summarizeMobileComposerMessageReference
 } from "./mobile-composer-route-links";
 
-describe("mobile composer task and project links", () => {
+describe("mobile composer task, project, and Workspace path links", () => {
   it("segments mixed bare and Markdown links while retaining adjacent text and punctuation", () => {
     const segments = segmentMobileComposerRoutePaste(
       "See https://user:pass@example.test/view?token=secret&theme=dark#/tasks/session%20one?message=message-1&auth=bad, then [Other @ task](#/tasks/session-2) in #/projects/project%2Fone?token=bad."
@@ -109,5 +111,94 @@ describe("mobile composer task and project links", () => {
     });
     expect(sanitizeMobileComposerReferenceLabel("  A   [task] @me  ")).toBe("A task ＠me");
     expect(summarizeMobileComposerMessageReference("a\n" + "b".repeat(300))).toHaveLength(240);
+  });
+
+  it("finds only strict Windows and POSIX Workspace descendants outside route links", () => {
+    expect(findMobileComposerWorkspacePathCandidates(
+      "D:\\REPO\\src\\known.ts:12:3, D:/repo D:/repo-two/no.ts D:/repo/src/../secret #/tasks/D:%5Crepo%5Cignored",
+      "D:\\repo\\"
+    )).toEqual([{
+      sourcePath: "D:\\REPO\\src\\known.ts",
+      relativePath: "src/known.ts",
+      comparisonKey: "src/known.ts"
+    }]);
+    expect(findMobileComposerWorkspacePathCandidates(
+      "/srv/joko/src/known.ts) /srv/Joko/src/wrong.ts /srv/joko /srv/joko-two/no.ts",
+      "/srv/joko/"
+    )).toEqual([{
+      sourcePath: "/srv/joko/src/known.ts",
+      relativePath: "src/known.ts",
+      comparisonKey: "src/known.ts"
+    }]);
+    expect(findMobileComposerWorkspacePathCandidates(
+      "D:\\Repoİ\\src\\known.ts",
+      "D:\\Repoİ"
+    )).toEqual([{
+      sourcePath: "D:\\Repoİ\\src\\known.ts",
+      relativePath: "src/known.ts",
+      comparisonKey: "src/known.ts"
+    }]);
+    expect(findMobileComposerWorkspacePathCandidates("\\\\server\\share\\file.ts", "\\\\server\\share")).toEqual([]);
+    expect(mobileComposerWorkspacePathComparisonKey("Src/File.ts", "D:\\repo")).toBe("src/file.ts");
+    expect(mobileComposerWorkspacePathComparisonKey("Src/File.ts", "/repo")).toBe("Src/File.ts");
+  });
+
+  it("upgrades only directory-validated Workspace paths alongside route links", () => {
+    const segments = segmentMobileComposerRoutePaste(
+      "Open D:\\repo\\SRC\\Known.ts:12, keep D:\\repo\\src\\missing.ts and #/projects/mobile.",
+      { workspacePath: {
+        workspaceId: "workspace-one",
+        serverPathDisplay: "D:\\repo",
+        resolutions: [{
+          candidateRelativePath: "SRC/Known.ts",
+          relativePath: "src/Known.ts",
+          directory: false
+        }]
+      } }
+    );
+    expect(segments).toEqual([
+      { kind: "text", text: "Open " },
+      {
+        kind: "route-reference",
+        routeKind: "path",
+        workspaceId: "workspace-one",
+        relativePath: "src/Known.ts",
+        directory: false,
+        serialized: "@src/Known.ts",
+        displayText: "src/Known.ts"
+      },
+      { kind: "text", text: ":12, keep D:\\repo\\src\\missing.ts and " },
+      {
+        kind: "route-reference",
+        routeKind: "project",
+        href: "#/projects/mobile",
+        label: null,
+        projectId: "mobile"
+      },
+      { kind: "text", text: "." }
+    ]);
+    expect(segmentMobileComposerRoutePaste("D:\\repo\\src\\missing.ts", {
+      workspacePath: { workspaceId: "workspace-one", serverPathDisplay: "D:\\repo", resolutions: [] }
+    })).toBeNull();
+  });
+
+  it("seeds path atoms without retaining an absolute server path", () => {
+    expect(seedMobileComposerRouteReference({
+      kind: "route-reference",
+      routeKind: "path",
+      workspaceId: "workspace-one",
+      relativePath: "src/main.ts",
+      directory: false,
+      serialized: "@src/main.ts",
+      displayText: "src/main.ts"
+    })).toEqual({
+      routeKind: "path",
+      workspaceId: "workspace-one",
+      relativePath: "src/main.ts",
+      directory: false,
+      serialized: "@src/main.ts",
+      displayText: "src/main.ts",
+      pending: false
+    });
   });
 });

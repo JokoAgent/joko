@@ -5,6 +5,7 @@ import {
   insertMobileClipboardText,
   insertMobileRouteReferencePaste,
   insertMobileSessionMention,
+  insertMobileStructuredClipboardText,
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
@@ -188,5 +189,40 @@ describe("mobile composer rich document", () => {
       accessibilityLabel: "Project link project-one",
       block: false
     }]);
+  });
+
+  it("projects and atomically removes a validated Workspace path", () => {
+    const inserted = insertMobileStructuredClipboardText(
+      emptyMobileComposerDraft(),
+      { start: 0, end: 0 },
+      "Open D:\\repo\\src\\main.ts now",
+      () => "path-route",
+      { workspacePath: {
+        workspaceId: "workspace-one",
+        serverPathDisplay: "D:\\repo",
+        resolutions: [{
+          candidateRelativePath: "src/main.ts",
+          relativePath: "src/main.ts",
+          directory: false
+        }]
+      } }
+    );
+    expect(mobileComposerRichDocument(inserted.draft).nodes).toEqual([
+      { type: "text", text: "Open " },
+      {
+        type: "occurrence",
+        occurrenceKey: "atom:path-route",
+        kind: "route-reference",
+        token: "@src/main.ts",
+        label: "src/main.ts",
+        accessibilityLabel: "Workspace path src/main.ts",
+        block: false
+      },
+      { type: "text", text: " now" }
+    ]);
+    const removed = reconcileMobileComposerRichDocument(inserted.draft, [
+      { type: "text", text: "Open  now" }
+    ], { start: 5, end: 5 });
+    expect(removed.draft).toEqual({ text: "Open  now", mentions: [], atoms: [], attachments: [] });
   });
 });

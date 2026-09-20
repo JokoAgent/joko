@@ -764,7 +764,7 @@ describe("native mobile device through the durable product chain", () => {
     });
   });
 
-  it("preserves mobile quote, long-paste, and task/project-link wire text through HTTP, SQLite, and dispatch", async () => {
+  it("preserves mobile quote, long-paste, and task/project/path wire text through HTTP, SQLite, and dispatch", async () => {
     fixture = await OrchestratorE2eFixture.start({
       createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
     });
@@ -861,7 +861,7 @@ describe("native mobile device through the durable product chain", () => {
       pastedTextRanges: [pastedRange]
     });
 
-    const routeText = `Compare [Mobile structured composer](#/tasks/${encodeURIComponent(sessionId)}), #/tasks/${encodeURIComponent(sessionId)}?message=message-two, and [Mobile project](#/projects/${encodeURIComponent(targetId)}).`;
+    const routeText = `Compare [Mobile structured composer](#/tasks/${encodeURIComponent(sessionId)}), #/tasks/${encodeURIComponent(sessionId)}?message=message-two, [Mobile project](#/projects/${encodeURIComponent(targetId)}), and @src/main.ts.`;
     const routeSent = await submit(
       clients.operation,
       connectionId,
@@ -885,7 +885,7 @@ describe("native mobile device through the durable product chain", () => {
     await waitFor(
       () => clients.run.getRun({ runId: queueRunIdFrom(routeSent) }),
       (value) => value.run?.state === RunState.SUCCEEDED,
-      "mobile task/project-link wire dispatch"
+      "mobile task/project/path wire dispatch"
     );
     const routeAccepted = fixture.application.store.listEvents({ sessionId }).find((event) =>
       event.runId === routeQueued.runId && event.payload.type === "message_complete"
@@ -898,7 +898,7 @@ describe("native mobile device through the durable product chain", () => {
       }
     });
     if (routeAccepted?.payload.type !== "message_complete" || routeAccepted.payload.acceptedInput === undefined) {
-      throw new Error("The accepted mobile task/project-link input was not retained.");
+      throw new Error("The accepted mobile task/project/path input was not retained.");
     }
     expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("mentionRanges");
     expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("pastedTextRanges");

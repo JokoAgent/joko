@@ -30,6 +30,7 @@ import {
   seedMobileComposerRouteReference,
   segmentMobileComposerRoutePaste,
   summarizeMobileComposerMessageReference,
+  type MobileComposerRoutePasteOptions,
   type MobileComposerRoutePasteSegment
 } from "./mobile-composer-route-links";
 
@@ -109,7 +110,6 @@ export interface MobileComposerPastedTextAtom {
 interface MobileComposerRouteReferenceAtomBase {
   readonly kind: "route-reference";
   readonly atomId: string;
-  readonly href: string;
   readonly serialized: string;
   readonly displayText: string;
   readonly start: number;
@@ -118,6 +118,7 @@ interface MobileComposerRouteReferenceAtomBase {
 
 export interface MobileComposerSessionRouteReferenceAtom extends MobileComposerRouteReferenceAtomBase {
   readonly routeKind: "session";
+  readonly href: string;
   readonly sessionId: string;
   readonly messageId?: string;
   readonly eventId?: string;
@@ -125,11 +126,20 @@ export interface MobileComposerSessionRouteReferenceAtom extends MobileComposerR
 
 export interface MobileComposerProjectRouteReferenceAtom extends MobileComposerRouteReferenceAtomBase {
   readonly routeKind: "project";
+  readonly href: string;
   readonly projectId: string;
 }
 
+export interface MobileComposerPathRouteReferenceAtom extends MobileComposerRouteReferenceAtomBase {
+  readonly routeKind: "path";
+  readonly workspaceId: string;
+  readonly relativePath: string;
+  readonly directory: boolean;
+}
+
 export type MobileComposerRouteReferenceAtom = MobileComposerSessionRouteReferenceAtom
-  | MobileComposerProjectRouteReferenceAtom;
+  | MobileComposerProjectRouteReferenceAtom
+  | MobileComposerPathRouteReferenceAtom;
 
 export type MobileComposerAtom = MobileComposerQuoteAtom
   | MobileComposerPastedTextAtom
@@ -163,7 +173,8 @@ type MobileComposerAtomPresentation =
 
 type MobileComposerRouteReferenceAtomSeed =
   | Omit<MobileComposerSessionRouteReferenceAtom, "atomId" | "start" | "end">
-  | Omit<MobileComposerProjectRouteReferenceAtom, "atomId" | "start" | "end">;
+  | Omit<MobileComposerProjectRouteReferenceAtom, "atomId" | "start" | "end">
+  | Omit<MobileComposerPathRouteReferenceAtom, "atomId" | "start" | "end">;
 
 type MobileComposerAtomSeed =
   | Omit<MobileComposerQuoteAtom, "atomId" | "start" | "end">
@@ -565,12 +576,13 @@ export function insertMobileStructuredClipboardText(
   draft: MobileComposerDraft,
   selection: MobileComposerSelection,
   text: string,
-  atomIdFactory: (index: number) => string
+  atomIdFactory: (index: number) => string,
+  options: MobileComposerRoutePasteOptions = {}
 ): MobileComposerRoutePasteResult {
   if (isLongMobileComposerPaste(text)) {
     return { ...insertMobileClipboardText(draft, selection, text, atomIdFactory(0)), insertedAtomIds: [] };
   }
-  const segments = segmentMobileComposerRoutePaste(text);
+  const segments = segmentMobileComposerRoutePaste(text, options);
   if (segments !== null) return insertMobileRouteReferencePaste(draft, selection, segments, atomIdFactory);
   return { ...insertMobileClipboardText(draft, selection, text, atomIdFactory(0)), insertedAtomIds: [] };
 }
@@ -583,7 +595,7 @@ export function insertMobileRouteReferencePaste(
 ): MobileComposerRoutePasteResult {
   const current = normalizeMobileComposerDraft(draft);
   if (!Array.isArray(segments) || !segments.some((segment) => segment?.kind === "route-reference")) {
-    throw new Error("The clipboard does not contain a Joko task or project link.");
+    throw new Error("The clipboard does not contain a Joko link or validated Workspace path.");
   }
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
   const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
@@ -620,13 +632,25 @@ export function insertMobileRouteReferencePaste(
           start: offset,
           end: offset + seeded.serialized.length
         }
-      : {
+      : seeded.routeKind === "project" ? {
           kind: "route-reference",
           routeKind: "project",
           atomId,
           href: seeded.href,
           serialized: seeded.serialized,
           projectId: seeded.projectId,
+          displayText: seeded.displayText,
+          start: offset,
+          end: offset + seeded.serialized.length
+        }
+      : {
+          kind: "route-reference",
+          routeKind: "path",
+          atomId,
+          serialized: seeded.serialized,
+          workspaceId: seeded.workspaceId,
+          relativePath: seeded.relativePath,
+          directory: seeded.directory,
           displayText: seeded.displayText,
           start: offset,
           end: offset + seeded.serialized.length
@@ -657,9 +681,11 @@ export function updateMobileRouteReferenceAtom(
   expected: MobileComposerRouteReferenceAtom,
   resolvedText: string
 ): MobileComposerEditResult | undefined {
+  if (expected.routeKind === "path") return undefined;
   const current = normalizeMobileComposerDraft(draft);
   const atom = current.atoms.find((candidate) => candidate.atomId === expected.atomId);
-  if (atom?.kind !== "route-reference" || !sameComposerAtomAuthority(atom, expected)) return undefined;
+  if (atom?.kind !== "route-reference" || atom.routeKind === "path"
+    || !sameComposerAtomAuthority(atom, expected)) return undefined;
   const anchored = atom.routeKind === "session"
     && (atom.messageId !== undefined || atom.eventId !== undefined);
   const displayText = anchored
@@ -1041,6 +1067,23 @@ function normalizePastedTextAtom(
 function normalizeRouteReferenceAtom(
   atom: MobileComposerRouteReferenceAtom
 ): MobileComposerRouteReferenceAtomSeed {
+  if (atom.routeKind === "path") {
+    const workspaceId = normalizeExactIdentity(atom.workspaceId, "Workspace path owner", 1_024);
+    const relativePath = canonicalWorkspacePath(atom.relativePath);
+    if (relativePath !== atom.relativePath || typeof atom.directory !== "boolean"
+      || atom.serialized !== `@${relativePath}` || atom.displayText !== relativePath) {
+      throw new Error("The local Joko Workspace path is invalid.");
+    }
+    return {
+      kind: "route-reference",
+      routeKind: "path",
+      workspaceId,
+      relativePath,
+      directory: atom.directory,
+      serialized: atom.serialized,
+      displayText: atom.displayText
+    };
+  }
   const parsed = parseMobileComposerRouteHref(atom.href);
   if (parsed === undefined || parsed.href !== atom.href || parsed.routeKind !== atom.routeKind
     || (parsed.routeKind === "session" && atom.routeKind === "session"
@@ -1340,13 +1383,16 @@ function sameComposerAtomAuthority(left: MobileComposerAtom, right: MobileCompos
       && left.sourceRole === right.sourceRole;
   }
   if (right.kind !== "route-reference" || left.routeKind !== right.routeKind
-    || left.href !== right.href || left.serialized !== right.serialized
+    || left.serialized !== right.serialized
     || left.displayText !== right.displayText) return false;
   return left.routeKind === "session" && right.routeKind === "session"
-    ? left.sessionId === right.sessionId && left.messageId === right.messageId
+    ? left.href === right.href && left.sessionId === right.sessionId && left.messageId === right.messageId
       && left.eventId === right.eventId
     : left.routeKind === "project" && right.routeKind === "project"
-      && left.projectId === right.projectId;
+      ? left.href === right.href && left.projectId === right.projectId
+      : left.routeKind === "path" && right.routeKind === "path"
+        && left.workspaceId === right.workspaceId && left.relativePath === right.relativePath
+        && left.directory === right.directory;
 }
 
 function mobileComposerInputPart(mention: MobileComposerMention) {

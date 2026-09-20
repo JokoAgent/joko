@@ -122,4 +122,39 @@ describe("MobileComposerAtomSheet", () => {
       .toBe("#/projects/project-one");
     expect(container.textContent).toContain("Project link · project project-one");
   });
+
+  it("presents a Workspace path as relative wire text without an absolute server path", () => {
+    const onRemove = vi.fn();
+    container = document.createElement("div");
+    root = createRoot(container);
+    act(() => root!.render(createElement(MobileComposerAtomSheet, {
+      atom: {
+        kind: "route-reference",
+        routeKind: "path",
+        atomId: "path-one",
+        serialized: "@src/main.ts",
+        workspaceId: "workspace-one",
+        relativePath: "src/main.ts",
+        directory: false,
+        displayText: "src/main.ts",
+        start: 0,
+        end: 12
+      },
+      colors,
+      busy: false,
+      onClose: vi.fn(),
+      onSavePaste: vi.fn(),
+      onRemove
+    })));
+
+    expect(container.querySelector('[aria-label="Workspace path details"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Workspace path label"]')?.textContent).toBe("src/main.ts");
+    expect(container.querySelector('[aria-label="Workspace path wire text"]')?.textContent).toBe("@src/main.ts");
+    expect(container.textContent).toContain("Workspace file · src/main.ts");
+    expect(container.textContent).not.toContain("D:\\repo");
+
+    act(() => container!.querySelector('button[aria-label="Remove src/main.ts"]')
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(onRemove).toHaveBeenCalledWith("path-one");
+  });
 });

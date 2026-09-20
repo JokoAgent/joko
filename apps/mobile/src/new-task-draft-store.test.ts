@@ -58,8 +58,17 @@ function structuredInput() {
   return insertMobileStructuredClipboardText(
     workspace,
     { start: workspace.text.length, end: workspace.text.length },
-    " #/tasks/session-related",
-    () => "route-related"
+    " D:\\repo\\src\\main.ts and #/tasks/session-related",
+    (index) => `route-related-${index}`,
+    { workspacePath: {
+      workspaceId: "workspace-one",
+      serverPathDisplay: "D:\\repo",
+      resolutions: [{
+        candidateRelativePath: "src/main.ts",
+        relativePath: "src/main.ts",
+        directory: false
+      }]
+    } }
   ).draft;
 }
 
@@ -202,9 +211,14 @@ describe("mobile new-task retained draft store", () => {
       runtimeGeneration: "11",
       input: structuredInput()
     });
+    const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
+    expect(raw).toContain('"version":7');
+    expect(raw).toContain('"routeKind":"path"');
+    expect(raw).toContain('"serialized":"@src/main.ts"');
+    expect(raw).not.toContain("D:\\\\repo");
   });
 
-  it("atomically replaces a v6 attachment identity in both editable and frozen submission input", async () => {
+  it("atomically replaces a v7 attachment identity in both editable and frozen submission input", async () => {
     const memory = memoryDriver();
     const store = new MobileNewTaskDraftStore(memory.driver);
     const local = attachedInput("local");
@@ -221,7 +235,7 @@ describe("mobile new-task retained draft store", () => {
       first, authority.createOperationId, local, attachedInput("uploaded")
     )).rejects.toThrow(/changed while it was being committed/u);
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":6');
+    expect(raw).toContain('"version":7');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -253,7 +267,7 @@ describe("mobile new-task retained draft store", () => {
 
     const crossProfile = new MobileNewTaskDraftStore(memory.driver);
     memory.values.set(key, JSON.stringify({
-      version: 6,
+      version: 7,
       identity: second,
       draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
@@ -266,7 +280,7 @@ describe("mobile new-task retained draft store", () => {
     }));
     await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
-    for (const version of [1, 2, 3, 4, 5]) {
+    for (const version of [1, 2, 3, 4, 5, 6]) {
       memory.values.set(key, JSON.stringify({
         version,
         identity: first,
@@ -276,7 +290,7 @@ describe("mobile new-task retained draft store", () => {
     }
 
     memory.values.set(key, JSON.stringify({
-      version: 6,
+      version: 7,
       identity: first,
       draft: {
         targetId: "target-one",

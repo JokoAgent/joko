@@ -141,6 +141,16 @@ import {
   type MobileWorkspaceMentionFileIndex
 } from "./mobile-workspace-mentions";
 import {
+  assertMobileWorkspacePathPasteDraft,
+  assertMobileWorkspacePathPasteResolutions,
+  createMobileNewTaskWorkspacePathPasteControls,
+  createMobileWorkspacePathPasteControls,
+  mobileComposerWorkspacePathAtoms,
+  projectMobileWorkspacePathPasteDirectory,
+  type MobileWorkspacePathPasteControls,
+  type MobileWorkspacePathPasteResolution
+} from "./mobile-workspace-path-paste";
+import {
   type MobileNewTaskCreateSubmission,
   type MobileNewTaskDraft,
   type MobileNewTaskDraftIdentity,
@@ -2512,6 +2522,7 @@ export class MobileClient {
     }
     assertMobileSessionMentionDraft(this.newTaskSessionMentionControls(targetId), input);
     assertMobileWorkspaceMentionDraft(this.newTaskWorkspaceMentionControls(targetId), input);
+    assertMobileWorkspacePathPasteDraft(this.newTaskWorkspacePathPasteControls(targetId), input);
     const identity = { profileId: credential.profileId } satisfies MobileNewTaskDraftIdentity;
     const createOperationId = this.newId();
     const action = this.#claimMutation();
@@ -2903,15 +2914,20 @@ export class MobileClient {
     const mentionControls = this.taskSessionMentionControls();
     const workspaceMentionControls = this.taskWorkspaceMentionControls();
     const workspaceMentionOwnerKey = workspaceMentionControls?.surfaceOwnerKey;
+    const workspacePathPasteControls = this.taskWorkspacePathPasteControls();
+    const workspacePathPasteOwnerKey = workspacePathPasteControls?.surfaceOwnerKey;
     const catalogMentionControls = this.taskCatalogMentionControls();
     const catalogMentionOwnerKey = catalogMentionControls?.surfaceOwnerKey;
     const attachmentControls = this.taskAttachmentControls();
     const attachmentOwnerKey = attachmentControls?.surfaceOwnerKey;
-    let sendDraft = assertMobileCatalogMentionDraft(
-      catalogMentionControls,
-      assertMobileWorkspaceMentionDraft(
-        workspaceMentionControls,
-        assertMobileSessionMentionDraft(mentionControls, exactDraft)
+    let sendDraft = assertMobileWorkspacePathPasteDraft(
+      workspacePathPasteControls,
+      assertMobileCatalogMentionDraft(
+        catalogMentionControls,
+        assertMobileWorkspaceMentionDraft(
+          workspaceMentionControls,
+          assertMobileSessionMentionDraft(mentionControls, exactDraft)
+        )
       )
     );
     if (sendDraft.attachments.length > 0) {
@@ -2931,6 +2947,8 @@ export class MobileClient {
     assertMobileSessionMentionDraft(this.taskSessionMentionControls(), sendDraft);
     const currentWorkspaceMentionControls = this.taskWorkspaceMentionControls();
     assertMobileWorkspaceMentionDraft(currentWorkspaceMentionControls, sendDraft);
+    const currentWorkspacePathPasteControls = this.taskWorkspacePathPasteControls();
+    assertMobileWorkspacePathPasteDraft(currentWorkspacePathPasteControls, sendDraft);
     const currentCatalogMentionControls = this.taskCatalogMentionControls();
     assertMobileCatalogMentionDraft(currentCatalogMentionControls, sendDraft);
     const currentAttachmentControls = this.taskAttachmentControls();
@@ -2950,6 +2968,24 @@ export class MobileClient {
         throw new Error("The Workspace reference owner changed while its paths were being checked. Review the retained draft before sending.");
       }
       assertMobileWorkspaceMentionDraft(this.taskWorkspaceMentionControls(), sendDraft);
+    }
+    const workspacePathAtoms = mobileComposerWorkspacePathAtoms(sendDraft);
+    if (workspacePathAtoms.length > 0) {
+      if (!currentWorkspacePathPasteControls
+        || currentWorkspacePathPasteControls.surfaceOwnerKey !== workspacePathPasteOwnerKey) {
+        throw new Error("The Workspace path owner changed while the structured draft was being saved. Review the retained draft before sending.");
+      }
+      const resolutions = await this.validateTaskWorkspacePathPasteCandidates(
+        currentWorkspacePathPasteControls.surfaceOwnerKey,
+        workspacePathAtoms.map((atom) => atom.relativePath)
+      );
+      const latestPathControls = this.taskWorkspacePathPasteControls();
+      if (!latestPathControls
+        || latestPathControls.surfaceOwnerKey !== currentWorkspacePathPasteControls.surfaceOwnerKey
+        || this.#taskAuthorityKey() !== authorityKey) {
+        throw new Error("The Workspace path owner changed while its paths were being checked. Review the retained draft before sending.");
+      }
+      assertMobileWorkspacePathPasteResolutions(latestPathControls, sendDraft, resolutions);
     }
     if (sendDraft.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
       if (!currentCatalogMentionControls || currentCatalogMentionControls.surfaceOwnerKey !== catalogMentionOwnerKey) {
@@ -3243,6 +3279,60 @@ export class MobileClient {
     );
   }
 
+  newTaskWorkspacePathPasteControls(targetId: string): MobileWorkspacePathPasteControls | undefined {
+    return createMobileNewTaskWorkspacePathPasteControls(
+      this.#newTaskAuthorityKey(targetId),
+      this.#state.owner,
+      targetId
+    );
+  }
+
+  async validateNewTaskWorkspacePathPasteCandidates(
+    targetId: string,
+    expectedSurfaceOwnerKey: string,
+    candidateRelativePaths: readonly string[],
+    signal?: AbortSignal
+  ): Promise<readonly MobileWorkspacePathPasteResolution[]> {
+    this.#newTaskWorkspacePathPasteContext(targetId, expectedSurfaceOwnerKey);
+    const fresh = await this.#readNewTaskOwner(signal);
+    const controls = createMobileNewTaskWorkspacePathPasteControls(
+      this.#newTaskAuthorityKey(targetId, fresh.snapshot),
+      fresh.snapshot,
+      targetId
+    );
+    if (!controls || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace path authority changed while clipboard paths were being checked.");
+    }
+    const resolutions: MobileWorkspacePathPasteResolution[] = [];
+    for (const [parent, candidates] of groupWorkspacePathPasteCandidates(candidateRelativePaths)) {
+      const result = await this.network.listWorkspaceDirectory(
+        fresh.credential,
+        controls.workspaceId,
+        parent,
+        signal ?? this.#abort?.signal
+      );
+      resolutions.push(...projectMobileWorkspacePathPasteDirectory(
+        controls,
+        parent,
+        result.entries,
+        result.revision,
+        candidates
+      ));
+      this.#newTaskWorkspacePathPasteContext(targetId, expectedSurfaceOwnerKey);
+    }
+    const after = await this.#readNewTaskOwner(signal);
+    const latest = createMobileNewTaskWorkspacePathPasteControls(
+      this.#newTaskAuthorityKey(targetId, after.snapshot),
+      after.snapshot,
+      targetId
+    );
+    if (!latest || latest.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace path authority changed while clipboard paths were being checked.");
+    }
+    this.#newTaskWorkspacePathPasteContext(targetId, expectedSurfaceOwnerKey);
+    return resolutions;
+  }
+
   async validateNewTaskSessionMentionCandidate(
     targetId: string,
     expectedSurfaceOwnerKey: string,
@@ -3365,6 +3455,41 @@ export class MobileClient {
       this.#state.detail,
       this.#state.selectedId
     );
+  }
+
+  taskWorkspacePathPasteControls(): MobileWorkspacePathPasteControls | undefined {
+    return createMobileWorkspacePathPasteControls(
+      this.#taskAuthorityKey(),
+      this.#state.owner,
+      this.#state.detail,
+      this.#state.selectedId
+    );
+  }
+
+  async validateTaskWorkspacePathPasteCandidates(
+    expectedSurfaceOwnerKey: string,
+    candidateRelativePaths: readonly string[],
+    signal?: AbortSignal
+  ): Promise<readonly MobileWorkspacePathPasteResolution[]> {
+    const context = this.#workspacePathPasteContext(expectedSurfaceOwnerKey);
+    const resolutions: MobileWorkspacePathPasteResolution[] = [];
+    for (const [parent, candidates] of groupWorkspacePathPasteCandidates(candidateRelativePaths)) {
+      const result = await this.network.listWorkspaceDirectory(
+        context.credential,
+        context.controls.workspaceId,
+        parent,
+        signal ?? this.#abort?.signal
+      );
+      resolutions.push(...projectMobileWorkspacePathPasteDirectory(
+        context.controls,
+        parent,
+        result.entries,
+        result.revision,
+        candidates
+      ));
+      this.#workspacePathPasteContext(expectedSurfaceOwnerKey);
+    }
+    return resolutions;
   }
 
   taskCatalogMentionControls(): MobileCatalogMentionControls | undefined {
@@ -4693,6 +4818,18 @@ export class MobileClient {
     return { credential, controls };
   }
 
+  #newTaskWorkspacePathPasteContext(
+    targetId: string,
+    expectedSurfaceOwnerKey: string
+  ): { readonly credential: PairedCredential; readonly controls: MobileWorkspacePathPasteControls } {
+    const credential = this.#ready();
+    const controls = this.newTaskWorkspacePathPasteControls(targetId);
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace path authority changed. Paste again from this new task.");
+    }
+    return { credential, controls };
+  }
+
   async #readNewTaskOwner(signal?: AbortSignal): Promise<{
     readonly credential: PairedCredential;
     readonly snapshot: Snapshot;
@@ -4722,6 +4859,7 @@ export class MobileClient {
     }
     const hasSessionMentions = input.mentions.some((mention) => mention.kind === "session");
     const hasWorkspaceMentions = input.mentions.some((mention) => mention.kind === "workspace");
+    const workspacePathAtoms = mobileComposerWorkspacePathAtoms(input);
     const initialAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission);
     if (input.attachments.length > 0) {
       if (!initialAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
@@ -4729,6 +4867,8 @@ export class MobileClient {
     }
     const initialSessionControls = this.newTaskSessionMentionControls(submission.targetId);
     const initialWorkspaceControls = this.newTaskWorkspaceMentionControls(submission.targetId);
+    const initialWorkspacePathControls = this.newTaskWorkspacePathPasteControls(submission.targetId);
+    assertMobileWorkspacePathPasteDraft(initialWorkspacePathControls, input);
     const fresh = await this.#readNewTaskOwner();
     this.#assertNewTaskCreateAuthority(submission, fresh.snapshot);
     const freshAuthorityKey = this.#newTaskAuthorityKey(submission.targetId, fresh.snapshot);
@@ -4737,6 +4877,11 @@ export class MobileClient {
     }
     const sessionControls = this.#newTaskSessionMentionControlsFromOwner(submission.targetId, fresh.snapshot);
     const workspaceControls = createMobileNewTaskWorkspaceMentionControls(
+      freshAuthorityKey,
+      fresh.snapshot,
+      submission.targetId
+    );
+    const workspacePathControls = createMobileNewTaskWorkspacePathPasteControls(
       freshAuthorityKey,
       fresh.snapshot,
       submission.targetId
@@ -4752,10 +4897,26 @@ export class MobileClient {
     if (hasWorkspaceMentions && workspaceControls?.surfaceOwnerKey !== initialWorkspaceControls?.surfaceOwnerKey) {
       throw new Error("Workspace reference authority changed while the structured first message was being checked.");
     }
+    if (workspacePathAtoms.length > 0
+      && workspacePathControls?.surfaceOwnerKey !== initialWorkspacePathControls?.surfaceOwnerKey) {
+      throw new Error("Workspace path authority changed while the structured first message was being checked.");
+    }
     assertMobileSessionMentionDraft(sessionControls, input);
     assertMobileWorkspaceMentionDraft(workspaceControls, input);
-    if (!hasWorkspaceMentions) return;
-    await this.#revalidateNewTaskWorkspaceMentionPaths(fresh.credential, workspaceControls!, input);
+    assertMobileWorkspacePathPasteDraft(workspacePathControls, input);
+    let workspacePathResolutions: readonly MobileWorkspacePathPasteResolution[] = [];
+    if (workspacePathAtoms.length > 0) {
+      workspacePathResolutions = await this.validateNewTaskWorkspacePathPasteCandidates(
+        submission.targetId,
+        workspacePathControls!.surfaceOwnerKey,
+        workspacePathAtoms.map((atom) => atom.relativePath)
+      );
+      assertMobileWorkspacePathPasteResolutions(workspacePathControls!, input, workspacePathResolutions);
+    }
+    if (hasWorkspaceMentions) {
+      await this.#revalidateNewTaskWorkspaceMentionPaths(fresh.credential, workspaceControls!, input);
+    }
+    if (!hasWorkspaceMentions && workspacePathAtoms.length === 0) return;
     const finalOwner = await this.#readNewTaskOwner();
     this.#assertNewTaskCreateAuthority(submission, finalOwner.snapshot);
     const finalAuthorityKey = this.#newTaskAuthorityKey(submission.targetId, finalOwner.snapshot);
@@ -4765,14 +4926,25 @@ export class MobileClient {
       finalOwner.snapshot,
       submission.targetId
     );
+    const finalWorkspacePathControls = createMobileNewTaskWorkspacePathPasteControls(
+      finalAuthorityKey,
+      finalOwner.snapshot,
+      submission.targetId
+    );
     const finalAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, finalOwner.snapshot);
     if (finalAuthorityKey !== freshAuthorityKey
       || hasSessionMentions && finalSessionControls?.surfaceOwnerKey !== sessionControls?.surfaceOwnerKey
-      || finalWorkspaceControls?.surfaceOwnerKey !== workspaceControls?.surfaceOwnerKey) {
+      || hasWorkspaceMentions && finalWorkspaceControls?.surfaceOwnerKey !== workspaceControls?.surfaceOwnerKey
+      || workspacePathAtoms.length > 0
+        && finalWorkspacePathControls?.surfaceOwnerKey !== workspacePathControls?.surfaceOwnerKey) {
       throw new Error("New-task reference authority changed while Workspace paths were being checked.");
     }
     assertMobileSessionMentionDraft(finalSessionControls, input);
     assertMobileWorkspaceMentionDraft(finalWorkspaceControls, input);
+    assertMobileWorkspacePathPasteDraft(finalWorkspacePathControls, input);
+    if (workspacePathAtoms.length > 0) {
+      assertMobileWorkspacePathPasteResolutions(finalWorkspacePathControls!, input, workspacePathResolutions);
+    }
     if (input.attachments.length > 0) {
       if (!finalAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
       assertMobileAttachmentPolicy(input.attachments, finalAttachmentPolicy);
@@ -4830,6 +5002,18 @@ export class MobileClient {
     const controls = this.taskWorkspaceMentionControls();
     if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
       throw new Error("The Workspace reference owner changed. Reopen the reference list from the current task.");
+    }
+    return { credential, controls };
+  }
+
+  #workspacePathPasteContext(expectedSurfaceOwnerKey: string): {
+    readonly credential: PairedCredential;
+    readonly controls: MobileWorkspacePathPasteControls;
+  } {
+    const credential = this.#ready();
+    const controls = this.taskWorkspacePathPasteControls();
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("Workspace path authority changed. Paste again from the current task.");
     }
     return { credential, controls };
   }
@@ -6852,6 +7036,19 @@ function mobileFilesGalleryWindowKey(files: MobileFilesState): string {
 
 function supportsText(backend: Snapshot["backends"][number]): boolean {
   return backend.capabilities?.capabilities.some((item) => item.name === capabilityNames.inputText && item.support === CapabilitySupport.SUPPORTED) === true;
+}
+
+function groupWorkspacePathPasteCandidates(
+  values: readonly string[]
+): ReadonlyMap<string, readonly string[]> {
+  const grouped = new Map<string, string[]>();
+  for (const value of values) {
+    const path = canonicalWorkspacePath(value);
+    const parent = workspaceParentPath(path);
+    const current = grouped.get(parent) ?? [];
+    if (!current.includes(path)) grouped.set(parent, [...current, path]);
+  }
+  return grouped;
 }
 
 function sameMobileModelSelection(

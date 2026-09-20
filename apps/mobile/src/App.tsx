@@ -45,6 +45,7 @@ import {
 import { addToMobileComposer } from "./composer-draft-behavior";
 import {
   emptyMobileComposerDraft,
+  isLongMobileComposerPaste,
   insertMobileArtifactMention,
   insertMobileStructuredClipboardText,
   insertMobileResourceMention,
@@ -64,6 +65,7 @@ import {
   type MobileWorkspaceLineRange
 } from "./mobile-composer-document";
 import { enrichMobileComposerRouteReferences } from "./mobile-composer-route-enrichment";
+import { findMobileComposerWorkspacePathCandidates } from "./mobile-composer-route-links";
 import {
   appendMobileComposerAttachments,
   formatMobileAttachmentBytes,
@@ -1399,6 +1401,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     const selection = request?.selection ?? selectionRef.current;
     const targetId = draftRef.current.targetId;
     const ownerSnapshot = client.state.owner;
+    const workspacePathControls = client.newTaskWorkspacePathPasteControls(targetId);
     if (!ownerProfileId || !referencesEditableRef.current || AppState.currentState !== "active") {
       setError("Return to the active new-task composer before pasting text.");
       return;
@@ -1415,11 +1418,45 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         || AppState.currentState !== "active") {
         throw new Error("The new-task draft changed while clipboard text was being read. Paste it again.");
       }
+      const pathCandidates = workspacePathControls !== undefined && !isLongMobileComposerPaste(text)
+        ? findMobileComposerWorkspacePathCandidates(text, workspacePathControls.serverPathDisplay)
+        : [];
+      let pathResolutions = [] as Awaited<ReturnType<typeof client.validateNewTaskWorkspacePathPasteCandidates>>;
+      if (workspacePathControls !== undefined && pathCandidates.length > 0) {
+        try {
+          pathResolutions = await client.validateNewTaskWorkspacePathPasteCandidates(
+            targetId,
+            workspacePathControls.surfaceOwnerKey,
+            pathCandidates.map((candidate) => candidate.relativePath)
+          );
+        } catch (failure) {
+          if (client.newTaskWorkspacePathPasteControls(targetId)?.surfaceOwnerKey
+            !== workspacePathControls.surfaceOwnerKey) throw failure;
+          pathResolutions = [];
+        }
+        if (!mountedRef.current || profileIdRef.current !== ownerProfileId
+          || draftRef.current.targetId !== targetId || draftRef.current.input !== captured
+          || selectionRef.current.start !== selection.start || selectionRef.current.end !== selection.end
+          || !referencesEditableRef.current || client.state.activeProfileId !== ownerProfileId
+          || client.state.owner !== ownerSnapshot
+          || client.newTaskWorkspacePathPasteControls(targetId)?.surfaceOwnerKey
+            !== workspacePathControls.surfaceOwnerKey
+          || client.state.status !== "connected" || AppState.currentState !== "active") {
+          throw new Error("The new-task Workspace changed while clipboard paths were being checked. Paste them again.");
+        }
+      }
       const result = insertMobileStructuredClipboardText(
         captured,
         selection,
         text,
-        () => randomUUID()
+        () => randomUUID(),
+        workspacePathControls === undefined ? {} : {
+          workspacePath: {
+            workspaceId: workspacePathControls.workspaceId,
+            serverPathDisplay: workspacePathControls.serverPathDisplay,
+            resolutions: pathResolutions
+          }
+        }
       );
       replaceInput(result.draft, result.selection);
       setTimeout(() => composerInputRef.current?.focus(), 0);
@@ -3337,6 +3374,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     const captured = request?.draft ?? composerDraftRef.current;
     const selection = request?.selection ?? composerSelectionRef.current;
     const ownerSnapshot = client.state.owner;
+    const workspacePathControls = client.taskWorkspacePathPasteControls();
     if (!identity || !composerPasteEditableRef.current || AppState.currentState !== "active") {
       setLocalError("Return to the active task composer before pasting text.");
       return;
@@ -3357,11 +3395,47 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         || AppState.currentState !== "active") {
         throw new Error("The task draft changed while clipboard text was being read. Paste it again.");
       }
+      const pathCandidates = workspacePathControls !== undefined && !isLongMobileComposerPaste(text)
+        ? findMobileComposerWorkspacePathCandidates(text, workspacePathControls.serverPathDisplay)
+        : [];
+      let pathResolutions = [] as Awaited<ReturnType<typeof client.validateTaskWorkspacePathPasteCandidates>>;
+      if (workspacePathControls !== undefined && pathCandidates.length > 0) {
+        try {
+          pathResolutions = await client.validateTaskWorkspacePathPasteCandidates(
+            workspacePathControls.surfaceOwnerKey,
+            pathCandidates.map((candidate) => candidate.relativePath)
+          );
+        } catch (failure) {
+          if (client.taskWorkspacePathPasteControls()?.surfaceOwnerKey
+            !== workspacePathControls.surfaceOwnerKey) throw failure;
+          pathResolutions = [];
+        }
+        if (!taskMountedRef.current || draftIdentityRef.current === undefined
+          || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== identityKey
+          || composerDraftRef.current !== captured
+          || composerSelectionRef.current.start !== selection.start
+          || composerSelectionRef.current.end !== selection.end
+          || !composerPasteEditableRef.current || queueEditRef.current
+          || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+          || client.state.owner !== ownerSnapshot
+          || client.taskWorkspacePathPasteControls()?.surfaceOwnerKey
+            !== workspacePathControls.surfaceOwnerKey
+          || client.state.status !== "connected" || AppState.currentState !== "active") {
+          throw new Error("The task Workspace changed while clipboard paths were being checked. Paste them again.");
+        }
+      }
       const result = insertMobileStructuredClipboardText(
         captured,
         selection,
         text,
-        () => randomUUID()
+        () => randomUUID(),
+        workspacePathControls === undefined ? {} : {
+          workspacePath: {
+            workspaceId: workspacePathControls.workspaceId,
+            serverPathDisplay: workspacePathControls.serverPathDisplay,
+            resolutions: pathResolutions
+          }
+        }
       );
       composerDraftRef.current = result.draft;
       composerSelectionRef.current = result.selection;
@@ -4599,7 +4673,7 @@ function MobileComposerAtomChips({ atoms, colors, disabled, onOpen }: {
     accessibilityLabel="Structured message items" contentContainerStyle={styles.mentionChips}
     showsHorizontalScrollIndicator={false}>
     {atoms.map((atom) => <Pressable key={atom.atomId} accessibilityRole="button"
-      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : atom.kind === "route-reference" ? `View ${atom.routeKind === "project" ? "project" : "task"} link` : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
+      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : atom.kind === "route-reference" ? `View ${atom.routeKind === "project" ? "project link" : atom.routeKind === "path" ? "Workspace path" : "task link"}` : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
       accessibilityHint="Opens this exact structured message item; it is removed as one unit if edited in the text field"
       accessibilityState={{ disabled }} disabled={disabled} onPress={() => onOpen(atom.atomId)}
       style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },

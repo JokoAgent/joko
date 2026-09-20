@@ -695,13 +695,85 @@ describe("mobile structured composer document", () => {
     })).toThrow(/target|range/u);
   });
 
-  it("gives long-paste compaction precedence over task-link recognition", () => {
-    const text = `${"x".repeat(4_000)} #/tasks/session`;
+  it("stores a validated absolute Workspace path only as an atomic relative wire item", () => {
+    const result = insertMobileStructuredClipboardText(
+      emptyMobileComposerDraft(),
+      { start: 0, end: 0 },
+      "Open D:\\repo\\src\\main.ts and #/projects/mobile",
+      (index) => `route-${index}`,
+      { workspacePath: {
+        workspaceId: "workspace-one",
+        serverPathDisplay: "D:\\repo",
+        resolutions: [{
+          candidateRelativePath: "src/main.ts",
+          relativePath: "src/main.ts",
+          directory: false
+        }]
+      } }
+    );
+    expect(result.draft.text).toBe("Open @src/main.ts and #/projects/mobile");
+    expect(result.draft.atoms).toMatchObject([{
+      kind: "route-reference",
+      routeKind: "path",
+      atomId: "route-0",
+      workspaceId: "workspace-one",
+      relativePath: "src/main.ts",
+      directory: false,
+      serialized: "@src/main.ts",
+      displayText: "src/main.ts"
+    }, {
+      kind: "route-reference",
+      routeKind: "project",
+      atomId: "route-1"
+    }]);
+    expect(JSON.stringify(result.draft)).not.toContain("D:\\\\repo");
+    expect(mobileComposerInput(result.draft)).toMatchObject({
+      parts: [{ content: { case: "text", value: "Open @src/main.ts and #/projects/mobile" } }],
+      mentionRanges: [],
+      pastedTextRanges: []
+    });
+    const path = result.draft.atoms[0]!;
+    if (path.kind !== "route-reference") throw new Error("expected Workspace path");
+    expect(updateMobileRouteReferenceAtom(result.draft, path, "forged title")).toBeUndefined();
+    expect(removeMobileComposerAtom(result.draft, path.atomId).draft.text).toBe("Open  and #/projects/mobile");
+  });
+
+  it("rejects forged Workspace path atom identities and wire text", () => {
+    expect(() => normalizeMobileComposerDraft({
+      text: "D:\\repo\\src\\main.ts",
+      mentions: [],
+      atoms: [{
+        kind: "route-reference",
+        routeKind: "path",
+        atomId: "path",
+        workspaceId: "workspace-one",
+        relativePath: "src/main.ts",
+        directory: false,
+        serialized: "D:\\repo\\src\\main.ts",
+        displayText: "src/main.ts",
+        start: 0,
+        end: 23
+      }],
+      attachments: []
+    })).toThrow(/Workspace path|range/u);
+  });
+
+  it("gives long-paste compaction precedence over task-link and Workspace-path recognition", () => {
+    const text = `${"x".repeat(4_000)} #/tasks/session D:\\repo\\src\\main.ts`;
     const result = insertMobileStructuredClipboardText(
       emptyMobileComposerDraft(),
       { start: 0, end: 0 },
       text,
-      (index) => `atom-${index}`
+      (index) => `atom-${index}`,
+      { workspacePath: {
+        workspaceId: "workspace-one",
+        serverPathDisplay: "D:\\repo",
+        resolutions: [{
+          candidateRelativePath: "src/main.ts",
+          relativePath: "src/main.ts",
+          directory: false
+        }]
+      } }
     );
     expect(result.insertedAtomIds).toEqual([]);
     expect(result.draft.atoms).toMatchObject([{ kind: "pasted-text", atomId: "atom-0", text }]);

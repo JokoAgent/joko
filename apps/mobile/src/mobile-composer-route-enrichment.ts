@@ -21,6 +21,7 @@ export async function enrichMobileComposerRouteReferences(
   const expected = insertedAtomIds.flatMap((atomId) => {
     const atom = draft.atoms.find((candidate) => candidate.atomId === atomId);
     return atom?.kind === "route-reference"
+      && atom.routeKind !== "path"
       && (atom.serialized === atom.href || atom.routeKind === "session"
         && (atom.messageId !== undefined || atom.eventId !== undefined))
       ? [atom]
