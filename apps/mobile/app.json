@@ -22,6 +22,7 @@
       "permissions": [
         "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CAMERA",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE",
         "android.permission.INTERNET"
       ]
@@ -29,6 +30,11 @@
     "plugins": [
       "./with-joko-native-brand.cjs",
       "expo-secure-store",
+      ["expo-image-picker", {
+        "photosPermission": false,
+        "cameraPermission": "Allow Joko to use your camera only when you choose Take photo for a task attachment.",
+        "microphonePermission": false
+      }],
       ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
     ]
   }

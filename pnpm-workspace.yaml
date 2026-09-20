@@ -18,6 +18,9 @@ minimumReleaseAgeExclude:
   - '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.259'
   - '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.259'
 
+patchedDependencies:
+  expo-image-manipulator@57.0.14: dependency-patches/expo-image-manipulator@57.0.14.patch
+
 allowBuilds:
   '@bufbuild/buf': true
   '@earendil-works/pi-coding-agent': true

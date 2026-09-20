@@ -56,14 +56,28 @@ export class MobileAttachmentFiles {
     signal?.throwIfAborted();
     if (picked.canceled) return [];
     if (picked.files.length === 0) throw new Error("The system picker returned no attachment.");
-    if (current.length + picked.files.length > policy.maximumItems) {
+    return this.stageCandidates(profileId, current, policy, picked.files, newId, signal);
+  }
+
+  async stageCandidates(
+    profileId: string,
+    current: readonly MobileComposerAttachment[],
+    policy: MobileAttachmentPolicy,
+    candidates: readonly MobilePickedAttachmentCandidate[],
+    newId: () => string,
+    signal?: AbortSignal
+  ): Promise<readonly MobileLocalComposerAttachment[]> {
+    assertProfileId(profileId);
+    signal?.throwIfAborted();
+    if (candidates.length === 0) throw new Error("No attachment was provided for durable staging.");
+    if (current.length + candidates.length > policy.maximumItems) {
       throw new Error(`A task message can include at most ${policy.maximumItems} attachments.`);
     }
     const existingIds = new Set(current.map((attachment) => normalizeMobileComposerAttachment(attachment).attachmentId));
     const staged: MobileLocalComposerAttachment[] = [];
     const stagedIds: string[] = [];
     try {
-      for (const candidate of picked.files) {
+      for (const candidate of candidates) {
         signal?.throwIfAborted();
         if (!candidate.uri || typeof candidate.uri !== "string") {
           throw new Error("The system picker returned an unreadable attachment.");

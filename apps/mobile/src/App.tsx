@@ -29,6 +29,7 @@ import {
 import { mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
 import {
+  mobileAttachmentCamera,
   mobileAttachmentFiles,
   mobileComposerDrafts,
   mobileInteractionDrafts,
@@ -60,6 +61,8 @@ import {
   removeMobileComposerAttachment,
   type MobileComposerAttachment
 } from "./mobile-attachments";
+import { mobileCameraCaptureSupported } from "./mobile-attachment-camera";
+import { observeMobileAttachmentAuthority, waitForMobileAttachmentAuthority } from "./mobile-attachment-authority";
 import {
   accessibleComposerHeight,
   buildComposerResizeGestureConfig,
@@ -789,6 +792,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
   const attachmentGenerationRef = useRef(0);
+  const attachmentNativeActivityRef = useRef(false);
+  const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
   const draftRef = useRef(draft);
   const selectionRef = useRef(composerSelection);
   draftRef.current = draft;
@@ -846,6 +851,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     return () => {
       current = false;
       mountedRef.current = false;
+      attachmentAbortRef.current?.abort();
       void mobileNewTaskDrafts.flush(identity).catch(() => undefined);
     };
   }, [profileId]);
@@ -870,9 +876,14 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   }, [workspaceMentionControls?.surfaceOwnerKey]);
   useEffect(() => {
     const next = attachmentControls?.surfaceOwnerKey;
-    const changed = attachmentOwnerRef.current !== next;
-    attachmentOwnerRef.current = next;
-    if (changed || next === undefined) {
+    const observed = observeMobileAttachmentAuthority(
+      attachmentOwnerRef.current,
+      next,
+      attachmentNativeActivityRef.current
+    );
+    attachmentOwnerRef.current = observed.surfaceOwnerKey;
+    if (observed.retired) {
+      attachmentAbortRef.current?.abort();
       attachmentGenerationRef.current += 1;
       setAttachmentBusy(false);
     }
@@ -952,36 +963,63 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setError(errorText(failure));
     }
   };
-  const addAttachments = async (): Promise<void> => {
+  const addAttachments = async (source: "picker" | "camera"): Promise<void> => {
     const controls = attachmentControls;
     const ownerProfileId = profileIdRef.current;
     const targetId = draftRef.current.targetId;
     if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
-      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable) {
-      setError("Attachment authority changed. Reopen the picker from the current project.");
+      || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable
+      || attachmentNativeActivityRef.current) {
+      setError(`Attachment authority changed. Reopen the ${source === "camera" ? "camera" : "picker"} from the current project.`);
       return;
     }
     const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
     setAttachmentBusy(true);
     setError("");
     let staged: readonly MobileComposerAttachment[] = [];
     try {
-      staged = await mobileAttachmentFiles.pickAndStage(
-        ownerProfileId,
-        draftRef.current.input.attachments,
-        controls.policy,
-        randomUUID
-      );
+      staged = source === "camera"
+        ? await mobileAttachmentCamera.captureAndStage(
+            ownerProfileId,
+            draftRef.current.input.attachments,
+            controls.policy,
+            randomUUID,
+            controller.signal
+          )
+        : await mobileAttachmentFiles.pickAndStage(
+            ownerProfileId,
+            draftRef.current.input.attachments,
+            controls.policy,
+            randomUUID,
+            controller.signal
+          );
       if (staged.length === 0) return;
-      const latest = client.newTaskAttachmentControls(targetId);
+      const latest = await waitForMobileAttachmentAuthority(
+        { profileId: ownerProfileId, surfaceOwnerKey: controls.surfaceOwnerKey },
+        () => client.newTaskAttachmentControls(targetId),
+        (listener) => client.subscribe(() => listener()),
+        {
+          signal: controller.signal,
+          retired: () => {
+            const current = client.state;
+            return profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+              || current.activeProfileId !== ownerProfileId
+              || current.status === "revoked" || current.status === "unpaired"
+              || AppState.currentState === "active" && current.status === "connected"
+                && client.newTaskAttachmentControls(targetId) === undefined;
+          }
+        }
+      );
       if (!mountedRef.current || attachmentGenerationRef.current !== generation
         || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
-        || !latest || latest.profileId !== ownerProfileId
-        || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
+        || latest.profileId !== ownerProfileId || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
         || attachmentOwnerRef.current !== controls.surfaceOwnerKey) {
-        throw new Error("Attachment authority changed while the selected files were being staged.");
+        throw new Error("Attachment authority changed while the selected media was being staged.");
       }
       const input = {
         ...draftRef.current.input,
@@ -999,7 +1037,11 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         .catch(() => undefined)));
       if (mountedRef.current && attachmentGenerationRef.current === generation) setError(errorText(failure));
     } finally {
-      if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+      if (attachmentAbortRef.current === controller) {
+        attachmentAbortRef.current = undefined;
+        attachmentNativeActivityRef.current = false;
+        if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+      }
     }
   };
   const removeAttachment = async (attachmentId: string): Promise<void> => {
@@ -1072,7 +1114,11 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
           }} />}
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"} colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
-          onPress={() => void addAttachments()} />}
+          onPress={() => void addAttachments("picker")} />}
+        {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
+          colors={colors} compact
+          disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
+          onPress={() => void addAttachments("camera")} />}
         {draft.input.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.input.mentions.map((mention) => <Pressable key={mention.mentionId}
@@ -1291,6 +1337,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const attachmentControls = client.taskAttachmentControls();
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
   const attachmentGenerationRef = useRef(0);
+  const attachmentNativeActivityRef = useRef(false);
+  const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
   composerDraftRef.current = draft;
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
@@ -1392,9 +1440,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   }, [catalogMentionControls?.surfaceOwnerKey]);
   useEffect(() => {
     const next = attachmentControls?.surfaceOwnerKey;
-    const changed = attachmentOwnerRef.current !== next;
-    attachmentOwnerRef.current = next;
-    if (changed || next === undefined) {
+    const observed = observeMobileAttachmentAuthority(
+      attachmentOwnerRef.current,
+      next,
+      attachmentNativeActivityRef.current
+    );
+    attachmentOwnerRef.current = observed.surfaceOwnerKey;
+    if (observed.retired) {
+      attachmentAbortRef.current?.abort();
       attachmentGenerationRef.current += 1;
       setAttachmentBusy(false);
     }
@@ -1503,6 +1556,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     taskMountedRef.current = true;
     return () => {
       taskMountedRef.current = false;
+      attachmentAbortRef.current?.abort();
       queueEditRef.current = undefined;
       client.leaveTask();
     };
@@ -1519,37 +1573,64 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setComposerSelection({ start: value.text.length, end: value.text.length });
     if (identity) mobileComposerDrafts.save(identity, value);
   };
-  const addAttachments = async (): Promise<void> => {
+  const addAttachments = async (source: "picker" | "camera"): Promise<void> => {
     const controls = attachmentControls;
     const identity = draftIdentityRef.current;
     if (!controls || !identity || controls.profileId !== identity.profileId
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerOwnerReady
-      || queueEditRef.current || state.busy) {
-      setLocalError("Attachment authority changed. Reopen the picker from the current task.");
+      || queueEditRef.current || state.busy || attachmentNativeActivityRef.current) {
+      setLocalError(`Attachment authority changed. Reopen the ${source === "camera" ? "camera" : "picker"} from the current task.`);
       return;
     }
     const identityKey = mobileComposerDraftIdentityKey(identity);
     const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
     setRuntimeControlsVisible(false);
     setAttachmentBusy(true);
     setLocalError("");
     let staged: readonly MobileComposerAttachment[] = [];
     try {
-      staged = await mobileAttachmentFiles.pickAndStage(
-        identity.profileId,
-        composerDraftRef.current.attachments,
-        controls.policy,
-        randomUUID
-      );
+      staged = source === "camera"
+        ? await mobileAttachmentCamera.captureAndStage(
+            identity.profileId,
+            composerDraftRef.current.attachments,
+            controls.policy,
+            randomUUID,
+            controller.signal
+          )
+        : await mobileAttachmentFiles.pickAndStage(
+            identity.profileId,
+            composerDraftRef.current.attachments,
+            controls.policy,
+            randomUUID,
+            controller.signal
+          );
       if (staged.length === 0) return;
+      const latest = await waitForMobileAttachmentAuthority(
+        { profileId: identity.profileId, surfaceOwnerKey: controls.surfaceOwnerKey },
+        () => client.taskAttachmentControls(),
+        (listener) => client.subscribe(() => listener()),
+        {
+          signal: controller.signal,
+          retired: () => {
+            const currentIdentity = draftIdentityRef.current;
+            const current = client.state;
+            return !currentIdentity || mobileComposerDraftIdentityKey(currentIdentity) !== identityKey
+              || current.activeProfileId !== identity.profileId || current.selectedId !== identity.sessionId
+              || current.status === "revoked" || current.status === "unpaired"
+              || AppState.currentState === "active" && current.status === "connected"
+                && client.taskAttachmentControls() === undefined;
+          }
+        }
+      );
       const latestIdentity = draftIdentityRef.current;
-      const latest = client.taskAttachmentControls();
       if (!taskMountedRef.current || attachmentGenerationRef.current !== generation
         || !latestIdentity || mobileComposerDraftIdentityKey(latestIdentity) !== identityKey
-        || !latest || latest.profileId !== identity.profileId
-        || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
+        || latest.profileId !== identity.profileId || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
         || attachmentOwnerRef.current !== controls.surfaceOwnerKey || queueEditRef.current) {
-        throw new Error("Attachment authority changed while the selected files were being staged.");
+        throw new Error("Attachment authority changed while the selected media was being staged.");
       }
       const next = {
         ...composerDraftRef.current,
@@ -1567,7 +1648,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         .catch(() => undefined)));
       if (taskMountedRef.current && attachmentGenerationRef.current === generation) setLocalError(errorText(error));
     } finally {
-      if (taskMountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+      if (attachmentAbortRef.current === controller) {
+        attachmentAbortRef.current = undefined;
+        attachmentNativeActivityRef.current = false;
+        if (taskMountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+      }
     }
   };
   const removeAttachment = async (attachmentId: string): Promise<void> => {
@@ -2011,7 +2096,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           colors={colors} compact
           disabled={state.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
-          onPress={() => void addAttachments()} />}
+          onPress={() => void addAttachments("picker")} />}
+        {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
+          colors={colors} compact
+          disabled={state.busy || attachmentBusy || !composerOwnerReady
+            || draft.attachments.length >= attachmentControls.policy.maximumItems}
+          onPress={() => void addAttachments("camera")} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.mentions.map((mention) => <Pressable key={mention.mentionId}
