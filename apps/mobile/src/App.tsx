@@ -36,6 +36,7 @@ import {
   mobileComposerDrafts,
   mobileInteractionDrafts,
   mobileNewTaskDrafts,
+  mobileOfflineCache,
   mobileStorage
 } from "./storage";
 import {
@@ -201,6 +202,8 @@ import {
   type MobileImageOutputRenderedImage
 } from "./mobile-image-output";
 import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-share";
+import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
+import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import {
   commitMobileIncomingShare,
   mobileIncomingShare,
@@ -224,7 +227,8 @@ const client = new MobileClient(
   mobileMediaPreviewFiles,
   mobilePdfPreviewFiles,
   mobileModelPreviewFiles,
-  mobileFileShare
+  mobileFileShare,
+  mobileOfflineCache
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
@@ -791,12 +795,14 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
   }, [normalizedSearch, state.activeProfileId, state.owner?.snapshotId, state.owner?.revision?.value, statusFilter]);
 
   const runMutation = (action: () => Promise<boolean>): void => {
+    if (state.status !== "connected") return;
     setLocalError("");
     void action().catch((error) => setLocalError(errorText(error)));
   };
   const togglePin = (session: Session): void => runMutation(() => client.setSessionPinned(session.sessionId, !session.pinned));
   const toggleArchive = (session: Session): void => runMutation(() => client.setSessionArchived(session.sessionId, !session.archived));
   const openOptions = (session: Session): void => {
+    if (state.status !== "connected") return;
     optionsGenerationRef.current += 1;
     optionsSessionRef.current = session;
     setOptionsSession(session);
@@ -819,6 +825,10 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
     );
   };
   const scheduleOption = (action: SessionOption): void => {
+    if (state.status !== "connected") {
+      closeOptions();
+      return;
+    }
     const session = optionsSessionRef.current;
     if (!session) return;
     const generation = ++optionsGenerationRef.current;
@@ -828,6 +838,14 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
       if (optionsGenerationRef.current === generation && optionsSessionRef.current === undefined) applyOption(session, action);
     }));
   };
+  useEffect(() => {
+    if (state.status === "connected") return;
+    swipeRegistry.closeOpenRow();
+    optionsGenerationRef.current += 1;
+    optionsSessionRef.current = undefined;
+    setOptionsSession(undefined);
+    setRenameSession(undefined);
+  }, [state.status, swipeRegistry]);
 
   return <View style={styles.fill}>
     <View style={styles.homeHeader}>
@@ -848,6 +866,9 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
       <View style={[styles.statusDot, { backgroundColor: state.status === "connecting" ? colors.accent : colors.negative }]} />
       <View style={styles.fill}>
         <Text style={[styles.label, { color: colors.ink }]}>{state.status === "connecting" ? "Reconnecting to this Joko node" : "This Joko node is offline"}</Text>
+        {state.offlineSnapshotAt !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>
+          {mobileOfflineAgeLabel(state.offlineSnapshotAt, Date.now())} · read-only
+        </Text>}
         {state.error && <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>{state.error}</Text>}
       </View>
       {state.status === "offline" && <Action label="Retry" onPress={() => void client.refresh()} colors={colors} compact />}
@@ -870,12 +891,13 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
     {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
     {localError && <Banner text={localError} colors={colors} />}
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
-      colors={colors} onError={setLocalError} />
+      colors={colors} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
       renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
-      ListEmptyComponent={<Centered label={state.status !== "connected" ? "Reconnect to load tasks" : normalizedSearch ? "No matching tasks or messages" : statusFilter === "archived" ? "No archived tasks" : "No tasks yet"} colors={colors} />}
+      ListEmptyComponent={<Centered label={state.offlineSnapshotAt !== undefined ? "No tasks in the saved offline copy" : state.status !== "connected" ? "Reconnect to load tasks" : normalizedSearch ? "No matching tasks or messages" : statusFilter === "archived" ? "No archived tasks" : "No tasks yet"} colors={colors} />}
       renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors}
-        onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}>
+        onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
+        disabled={state.status !== "connected"}>
         <View style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={`Open task ${item.session.displayName || "Untitled"}`}
             onPress={() => {
@@ -890,6 +912,7 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
               <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state)}</Text></View>
           </Pressable>
           <Pressable accessibilityRole="button" accessibilityLabel={`Options for ${item.session.displayName || "task"}`}
+            accessibilityState={{ disabled: state.status !== "connected" }} disabled={state.status !== "connected"}
             onPress={() => { swipeRegistry.closeOpenRow(); openOptions(item.session); }} style={styles.rowOptions}>
             <Text style={[styles.rowOptionsText, { color: colors.muted }]}>•••</Text>
           </Pressable>
@@ -898,7 +921,8 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
       onScrollBeginDrag={() => { swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
-    <Modal visible={optionsSession !== undefined} transparent animationType="none" onRequestClose={closeOptions} statusBarTranslucent>
+    <Modal visible={state.status === "connected" && optionsSession !== undefined} transparent animationType="none"
+      onRequestClose={closeOptions} statusBarTranslucent>
       <View style={styles.sheetRoot}>
         <Pressable accessibilityRole="button" accessibilityLabel="Close task options" onPress={closeOptions} style={styles.modalBackdrop} />
         <SafeAreaView accessibilityViewIsModal style={[styles.optionSheet, { backgroundColor: colors.surface, borderColor: colors.border }]} edges={["bottom", "left", "right"]}>
@@ -911,14 +935,15 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
         </SafeAreaView>
       </View>
     </Modal>
-    <Modal visible={renameSession !== undefined} transparent animationType="fade" onRequestClose={() => setRenameSession(undefined)} statusBarTranslucent>
+    <Modal visible={state.status === "connected" && renameSession !== undefined} transparent animationType="fade"
+      onRequestClose={() => setRenameSession(undefined)} statusBarTranslucent>
       <View style={styles.dialogRoot}>
         <View accessibilityViewIsModal style={[styles.renameDialog, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <Text style={[styles.title, { color: colors.ink }]}>Rename task</Text>
           <Field label="Task name" value={renameDraft} onChange={setRenameDraft} placeholder="Task name" colors={colors} />
           <View style={styles.actionRow}>
             <Action label="Cancel" onPress={() => setRenameSession(undefined)} colors={colors} />
-            <Action label="Rename" disabled={!renameDraft.trim() || state.busy} onPress={() => {
+            <Action label="Rename" disabled={state.status !== "connected" || !renameDraft.trim() || state.busy} onPress={() => {
               const target = renameSession;
               if (!target) return;
               setRenameSession(undefined);
@@ -1035,7 +1060,8 @@ function ConnectionsScreen({ colors, state, onBack, onSwitch }: ScreenProps & { 
           onPress={() => logout(connection.connectionId, name)} />}
       </View>;
     })}
-    <PendingReceipts items={state.pending.filter((item) => item.kind === "logout")} colors={colors} onError={setLocalError} />
+    <PendingReceipts items={state.pending.filter((item) => item.kind === "logout")} colors={colors}
+      disabled={state.status !== "connected"} onError={setLocalError} />
     {(localError || state.error) && <Banner text={localError || state.error || ""} colors={colors} />}
   </ScrollView>;
 }
@@ -1100,21 +1126,23 @@ function DeviceScreen({ colors, state, deviceId, onBack }: ScreenProps & { devic
     {device.deviceId === activeDeviceId
       ? <Text style={[styles.description, { color: colors.muted }]}>This is the device authorizing the current connection. Log out its exact connection instead of revoking it from itself.</Text>
       : !device.revoked && <Action label="Revoke device" colors={colors} danger disabled={state.busy || state.status !== "connected"} onPress={revoke} />}
-    <PendingReceipts items={state.pending.filter((item) => item.kind === "revoke" && item.targetDeviceId === device.deviceId)} colors={colors} onError={setLocalError} />
+    <PendingReceipts items={state.pending.filter((item) => item.kind === "revoke" && item.targetDeviceId === device.deviceId)}
+      colors={colors} disabled={state.status !== "connected"} onError={setLocalError} />
     {(localError || state.error) && <Banner text={localError || state.error || ""} colors={colors} />}
   </ScrollView>;
 }
 
-function PendingReceipts({ items, colors, onError }: {
-  items: MobileClient["state"]["pending"]; colors: Colors; onError: (message: string) => void;
+function PendingReceipts({ items, colors, disabled = false, onError }: {
+  items: MobileClient["state"]["pending"]; colors: Colors; disabled?: boolean; onError: (message: string) => void;
 }) {
   return <>{items.map((item) => <View key={item.operationId} style={styles.pendingReceipt}>
     <Text style={[styles.warning, { color: colors.negative }]}>
       {item.state === "unknown" ? "Server result unknown" : "Awaiting durable server result"} · {item.operationId}
     </Text>
     <View style={styles.actionRow}>
-      <Action label="Check status" compact colors={colors} onPress={() => void client.reconcile().catch((error) => onError(errorText(error)))} />
-      {item.state === "unknown" && <Action label="Verify and clear" compact colors={colors} onPress={() => Alert.alert(
+      <Action label="Check status" compact colors={colors} disabled={disabled}
+        onPress={() => void client.reconcile().catch((error) => onError(errorText(error)))} />
+      {item.state === "unknown" && <Action label="Verify and clear" compact colors={colors} disabled={disabled} onPress={() => Alert.alert(
         "Clear this receipt?",
         "Joko will first verify that the current node has no operation with this ID. It will never repeat the destructive action automatically.",
         [{ text: "Keep checking", style: "cancel" }, { text: "Verify and clear", onPress: () => {
@@ -2281,7 +2309,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     {(error || state.error) && <Banner text={error || state.error || ""} colors={colors} />}
     {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors}
       onDismiss={() => setImageOutputNotice("")} />}
-    <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors} onError={setError} />
+    <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors}
+      disabled={state.status !== "connected"} onError={setError} />
     {(pendingCreate || retained !== undefined) && <Action label="Check retained status" onPress={() => {
       setError("");
       void client.reconcile().then(() => {
@@ -2374,7 +2403,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   }>();
   const [composerContentHeight, setComposerContentHeight] = useState(composerMinimumInputHeight);
   const [composerManualHeight, setComposerManualHeight] = useState<number | null>(null);
-  const initialInteractions = client.taskInteractions();
+  const initialInteractions = state.status === "connected" ? client.taskInteractions() : [];
   const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
@@ -2510,21 +2539,21 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
   const queueCapabilities = client.taskQueueCapabilities();
-  const interactions = client.taskInteractions();
-  const runtimeControls = client.taskRuntimeControls();
+  const interactions = state.status === "connected" ? client.taskInteractions() : [];
+  const runtimeControls = state.status === "connected" ? client.taskRuntimeControls() : undefined;
   const runtimeControlsOwnerRef = useRef(runtimeControls?.surfaceOwnerKey);
-  const contextControls = client.taskContextControls();
+  const contextControls = state.status === "connected" ? client.taskContextControls() : undefined;
   const contextOwnerRef = useRef(contextControls?.surfaceOwnerKey);
-  const nativeTreeControls = client.taskNativeTreeControls();
+  const nativeTreeControls = state.status === "connected" ? client.taskNativeTreeControls() : undefined;
   const nativeTreeOwnerRef = useRef(nativeTreeControls?.surfaceOwnerKey);
-  const sessionMentionControls = client.taskSessionMentionControls();
+  const sessionMentionControls = state.status === "connected" ? client.taskSessionMentionControls() : undefined;
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
-  const workspaceMentionControls = client.taskWorkspaceMentionControls();
+  const workspaceMentionControls = state.status === "connected" ? client.taskWorkspaceMentionControls() : undefined;
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
-  const catalogMentionControls = client.taskCatalogMentionControls();
+  const catalogMentionControls = state.status === "connected" ? client.taskCatalogMentionControls() : undefined;
   const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
-  const appCommandControls = client.taskAppCommandControls();
-  const runtimeCommandControls = client.taskRuntimeCommandControls();
+  const appCommandControls = state.status === "connected" ? client.taskAppCommandControls() : undefined;
+  const runtimeCommandControls = state.status === "connected" ? client.taskRuntimeCommandControls() : undefined;
   runtimeCommandControlsRef.current = runtimeCommandControls;
   const runtimeCommandObservationKey = JSON.stringify([
     ...(state.owner?.runtimeCommands ?? []),
@@ -2537,8 +2566,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     command.resourceId,
     command.loaded
   ]));
-  const voiceTransport = client.taskVoiceTransport();
-  const attachmentControls = client.taskAttachmentControls();
+  const voiceTransport = state.status === "connected" ? client.taskVoiceTransport() : undefined;
+  const attachmentControls = state.status === "connected" ? client.taskAttachmentControls() : undefined;
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
@@ -2885,12 +2914,29 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     }
   }, [messageAction, rows, state.selectedId]);
   useEffect(() => {
+    if (state.status === "connected") return;
+    setInteractionVisible(false);
+    setRuntimeControlsVisible(false);
+    setContextVisible(false);
+    setNativeTreeVisible(false);
+    setSessionMentionsVisible(false);
+    setSessionMentionError("");
+    setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
+    setMessageActionsVisible(false);
+    setMessageAction(undefined);
+    setQuoteSelection(undefined);
+    setComposerAtomId(undefined);
+    setCommandHelpItems(undefined);
+    setRuntimeCommandDismissal(undefined);
+    setRuntimeCommandDraftLease(undefined);
+  }, [state.status]);
+  useEffect(() => {
     const active = queueEditRef.current;
     if (!active) return;
     const itemStillAccepted = state.detail?.queueItems.some((item) => item.queueItemId === active.lease.queueItemId
       && item.sessionId === active.lease.sessionId && item.state === QueueItemState.ACCEPTED) === true;
-    const authorityRetired = state.selectedId !== active.lease.sessionId
-      || state.status === "offline" || state.status === "unpaired" || state.status === "revoked";
+    const authorityRetired = state.selectedId !== active.lease.sessionId || state.status !== "connected";
     if (!authorityRetired && itemStillAccepted) return;
     queueEditRef.current = undefined;
     setQueueEdit(undefined);
@@ -2925,7 +2971,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   }, []);
 
   const openMessageActions = (row: TimelineRow): void => {
-    if (!state.selectedId || voice.busy) return;
+    if (!state.selectedId || state.status !== "connected" || voice.busy) return;
     setMessageAction({ sessionId: state.selectedId, row });
     setMessageActionsVisible(true);
   };
@@ -2963,7 +3009,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error);
-  const composerPasteEditable = composerOwnerReady && queueEdit === undefined && !state.busy
+  const composerPasteEditable = state.status === "connected" && composerOwnerReady && queueEdit === undefined && !state.busy
     && !composerOperationPending
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
@@ -3951,7 +3997,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     mobileComposerDrafts.save({ profileId: active.profileId, sessionId: active.lease.sessionId }, result.normalDraft);
   };
   const runMessageAction = (action: MobileMessageActionId): void => {
-    if (voice.busy) return;
+    if (state.status !== "connected" || voice.busy) return;
     const selected = messageAction;
     setMessageAction(undefined);
     if (!selected || client.state.selectedId !== selected.sessionId) return;
@@ -4001,7 +4047,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   };
   const beginQueueEdit = async (item: QueueItem): Promise<void> => {
     const profileId = state.activeProfileId;
-    if (!profileId || !composerOwnerReady || interactions.length > 0 || voice.busy) return;
+    if (!profileId || state.status !== "connected" || !composerOwnerReady || interactions.length > 0 || voice.busy) return;
     const stashedDraft = draft;
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
@@ -4175,13 +4221,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       <View style={styles.headerActions}>
         <Action label="Branches"
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
-          disabled={nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
+          disabled={state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
         <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
-          disabled={contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
+          disabled={state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
         <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
-          disabled={!runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact disabled={attachmentBusy} />}
+          disabled={state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
+        {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact
+          disabled={state.status !== "connected" || attachmentBusy} />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
       </View>
     </View>
@@ -4189,6 +4236,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       {state.liveStatus === "streaming" ? "Live events" : state.liveStatus === "verifying" ? "Checking live updates…"
         : state.liveStatus === "polling" ? "Snapshot updates · live stream unavailable" : "Updates paused"}
     </Text>
+    {state.status === "offline" && state.offlineSnapshotAt !== undefined
+      && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} colors={colors} />}
     {state.error && <Banner text={state.error} colors={colors} />}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
@@ -4201,7 +4250,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           disabled={state.historyBusy || state.status !== "connected"}
           onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
       </View>}
-      ListEmptyComponent={<Centered label={state.status === "offline" ? "Offline. Reconnect to restore this task." : "No messages yet"} colors={colors} />}
+      ListEmptyComponent={<Centered label={state.status === "offline"
+        ? state.detail ? "No messages in the saved offline copy." : "No saved offline messages for this task. Reconnect to load it."
+        : "No messages yet"} colors={colors} />}
       renderItem={({ item }) => <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
         <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
@@ -4270,9 +4321,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           </Pressable>
            {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId) }).length > 0
             && <Pressable accessibilityRole="button" accessibilityLabel={`More actions for ${item.label}`}
-              disabled={voice.busy} onPress={() => openMessageActions(item)}
-              style={[styles.inlineTouchAction, voice.busy && styles.disabled]}>
-              <Text style={[styles.caption, { color: voice.busy ? colors.muted : colors.accent }]}>More</Text>
+              disabled={state.status !== "connected" || voice.busy} onPress={() => openMessageActions(item)}
+              style={[styles.inlineTouchAction, (state.status !== "connected" || voice.busy) && styles.disabled]}>
+              <Text style={[styles.caption, { color: state.status !== "connected" || voice.busy ? colors.muted : colors.accent }]}>More</Text>
             </Pressable>}
         </View>
       </View>} />
@@ -4307,13 +4358,14 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     </View>}
     {state.pending.filter((item) => item.sessionId === state.selectedId).map((item) => <View key={item.operationId} style={styles.pending}>
       <Text style={[styles.warning, { color: colors.negative }]}>{item.state === "unknown" ? "Operation result unknown" : "Awaiting durable result"} · {item.operationId}</Text>
-      <Action label="Check status" onPress={() => void client.reconcile()} colors={colors} compact />
+      <Action label="Check status" onPress={() => void client.reconcile()} colors={colors} compact
+        disabled={state.status !== "connected"} />
       {item.state === "unknown" && <Action label="Clear unconfirmed receipt" onPress={() => Alert.alert(
         "Clear this receipt?", "Only continue if you have checked the task. Joko will verify the operation is absent before clearing this local warning; it will not repeat the operation.",
         [{ text: "Keep checking", style: "cancel" }, { text: "Verify and clear", onPress: () => {
           void client.dismissUnconfirmed(item.operationId).catch((error) => setLocalError(errorText(error)));
         } }]
-      )} colors={colors} compact />}
+      )} colors={colors} compact disabled={state.status !== "connected"} />}
     </View>)}
     {localError && <Banner text={localError} colors={colors} />}
     {composerNotice && <View accessibilityLiveRegion="polite"
@@ -4328,7 +4380,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           ? "Editing queued input · changing its text removes structured reference and quote authority"
           : "Editing queued input"}
       </Text>
-      <Action label="Cancel edit" colors={colors} compact disabled={state.busy} onPress={cancelQueueEdit} />
+      <Action label="Cancel edit" colors={colors} compact disabled={state.status !== "connected" || state.busy}
+        onPress={cancelQueueEdit} />
     </View>}
     {interactions.length > 0 ? <View style={[styles.interactionAwaiting, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <View style={styles.fill}>
@@ -4362,7 +4415,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           disabled={!composerOwnerReady || state.busy || composerOperationPending || attachmentBusy
             || state.status !== "connected"} />}
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
-          disabled={state.busy || composerOperationPending || voice.busy || !composerOwnerReady
+          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || !composerOwnerReady
             || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
             setNativeTreeVisible(false);
@@ -4374,7 +4427,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             setSessionMentionsVisible(true);
           }} />}
         {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
-          disabled={state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
+          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -4388,7 +4441,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           label={catalogMentionControls.policy.resources && catalogMentionControls.policy.artifacts
             ? "Reference Resource / Artifact"
             : catalogMentionControls.policy.resources ? "Reference Resource" : "Reference Artifact"}
-          colors={colors} compact disabled={state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
+          colors={colors} compact disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -4403,17 +4456,17 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
           onPress={() => void pasteClipboardText()} />
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"}
           colors={colors} compact
-          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
         {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
           colors={colors} compact
-          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={openPhotoLibrary} />}
         {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
           colors={colors} compact
-          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("camera")} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
@@ -4423,18 +4476,19 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
               : mention.kind === "workspace" ? mention.directory ? "directory" : "file"
                 : mention.kind === "resource" ? "resource" : "Artifact"} reference ${mention.displayText}`}
             accessibilityHint="Removes this exact reference occurrence from the message"
-            disabled={state.busy || composerOperationPending || voice.busy} onPress={() => removeComposerMention(mention.mentionId)}
+            disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy}
+            onPress={() => removeComposerMention(mention.mentionId)}
             style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
-              (state.busy || composerOperationPending || voice.busy) && styles.disabled]}>
+              (state.status !== "connected" || state.busy || composerOperationPending || voice.busy) && styles.disabled]}>
             <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>{draft.text.slice(mention.start, mention.end)} ×</Text>
           </Pressable>)}
         </ScrollView>}
         <MobileComposerAtomChips atoms={draft.atoms} colors={colors}
-          disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
+          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
           onOpen={setComposerAtomId} />
       </View>}
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
-        disabled={state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
+        disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
         busy={state.busy || composerOperationPending || voice.busy || attachmentBusy}
         pendingCount={pastedImageCount}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
@@ -4463,7 +4517,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             Math.ceil(event.nativeEvent.contentSize.height)
           ))}
           scrollEnabled={composerHeight.scrollEnabled}
-          editable={!state.busy && !composerOperationPending && composerOwnerReady} placeholder="Edit queued input…"
+          editable={state.status === "connected" && !state.busy && !composerOperationPending && composerOwnerReady} placeholder="Edit queued input…"
           placeholderTextColor={colors.muted}
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
           : <MobileComposerRichInput key={`task-rich-${draftIdentityKey ?? "none"}`}
@@ -4581,13 +4635,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         setTimelinePreviewSource(undefined);
         client.closeTimelinePreview();
       }} />
-    <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
+    <MobileActionSheet visible={state.status === "connected" && messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
-    <MobileCommandHelpSheet visible={commandHelpItems !== undefined} items={commandHelpItems ?? []}
+    <MobileCommandHelpSheet visible={state.status === "connected" && commandHelpItems !== undefined} items={commandHelpItems ?? []}
       colors={colors} onClose={() => setCommandHelpItems(undefined)} />
-    <MobileQuoteSelectionSheet lease={quoteSelection?.lease} colors={colors} busy={state.busy || voice.busy}
+    <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined}
+      colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
-    <MobileComposerAtomSheet atom={draft.atoms.find((atom) => atom.atomId === composerAtomId)}
+    <MobileComposerAtomSheet atom={state.status === "connected"
+      ? draft.atoms.find((atom) => atom.atomId === composerAtomId) : undefined}
       colors={colors} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}

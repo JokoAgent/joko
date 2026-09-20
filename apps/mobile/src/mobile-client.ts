@@ -266,6 +266,7 @@ import {
   type MobileTimelinePreviewArtifact
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
+import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -315,6 +316,7 @@ export interface MobileState {
   readonly homeSearchError?: string;
   readonly timelinePreview?: MobileFilePreview;
   readonly files: MobileFilesState;
+  readonly offlineSnapshotAt?: number;
   readonly error?: string;
 }
 
@@ -514,6 +516,8 @@ export class MobileClient {
   #streamGeneration?: bigint;
   #foreground = true;
   #disposed = false;
+  #lastAuthenticatedAt?: number;
+  #durableSnapshotAt?: number;
   #mutationOwner?: symbol;
   #userShellFlight?: { readonly owner: symbol; readonly sessionId: string };
   #pendingWrite: Promise<void> = Promise.resolve();
@@ -555,7 +559,8 @@ export class MobileClient {
     private readonly mediaPreviewFiles?: MobileMediaPreviewFiles,
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
-    private readonly fileShare?: Pick<MobileFileShare, "perform">
+    private readonly fileShare?: Pick<MobileFileShare, "perform">,
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -654,6 +659,135 @@ export class MobileClient {
 
   #hasActiveConnection(): boolean {
     return this.#credential !== undefined && this.#activeProfileId !== undefined;
+  }
+
+  #hasOfflineProjection(profileId = this.#activeProfileId): boolean {
+    return profileId !== undefined && this.#activeProfileId === profileId
+      && this.#state.activeProfileId === profileId && this.#state.offlineSnapshotAt !== undefined
+      && this.#state.owner !== undefined;
+  }
+
+  #showOfflineProjection(
+    profile: MobileConnectionProfile,
+    cached: MobileOfflineCacheSnapshot,
+    selectedId: string | undefined,
+    status: "connecting" | "offline",
+    error?: string
+  ): void {
+    const selected = selectedId !== undefined
+      && cached.owner.sessions.some((session) => session.sessionId === selectedId)
+      ? selectedId
+      : undefined;
+    const visibleCachedAt = selected !== undefined && cached.detail !== undefined
+      ? cached.detailCachedAt ?? cached.cachedAt
+      : cached.cachedAt;
+    this.#activeProfileId = profile.profileId;
+    this.#lastAuthenticatedAt = visibleCachedAt;
+    this.#durableSnapshotAt = visibleCachedAt;
+    this.#set({
+      status,
+      busy: status === "connecting",
+      node: cached.node,
+      origin: profile.origin,
+      owner: cached.owner,
+      detail: selected === undefined ? undefined : cached.detail,
+      selectedId: selected,
+      activeProfileId: profile.profileId,
+      automaticProfileId: this.#automaticProfileId,
+      pending: this.#allPending.filter((item) => item.connectionId === profile.connectionId),
+      older: [],
+      window: undefined,
+      before: undefined,
+      historyEnd: false,
+      historyBusy: false,
+      live: [],
+      liveStatus: "paused",
+      offlineSnapshotAt: visibleCachedAt,
+      error: [cached.warning, error].filter(Boolean).join(" ") || undefined
+    });
+  }
+
+  #adoptOfflineFallback(
+    generation: number,
+    controller: AbortController,
+    profile: MobileConnectionProfile,
+    cached: MobileOfflineCacheSnapshot,
+    selectedId: string | undefined,
+    detail: string,
+    credential?: PairedCredential
+  ): boolean {
+    if (!this.#connectionAttemptCurrent(generation, controller)) return false;
+    this.#connectionAttemptAbort = undefined;
+    if (credential !== undefined) this.#credential = credential;
+    this.#showOfflineProjection(profile, cached, selectedId, "offline", detail);
+    this.#set({
+      busy: false,
+      saved: this.#savedViews(profile.profileId, "offline", detail),
+      candidate: undefined,
+      challenge: undefined,
+      connectionAttemptError: detail
+    });
+    if (credential !== undefined) this.#schedule();
+    return true;
+  }
+
+  async #clearOfflineCache(profileId: string): Promise<string | undefined> {
+    if (!this.offlineCache) return undefined;
+    try {
+      await this.offlineCache.clear(profileId);
+      return undefined;
+    } catch (error) {
+      return `The saved offline content could not be cleared: ${message(error)}`;
+    }
+  }
+
+  #dropOfflineProjection(profileId: string): void {
+    if (!this.#hasOfflineProjection(profileId) || this.#credential !== undefined) return;
+    this.#activeProfileId = undefined;
+    this.#lastAuthenticatedAt = undefined;
+    this.#durableSnapshotAt = undefined;
+    this.#set({
+      activeProfileId: undefined,
+      node: undefined,
+      origin: undefined,
+      owner: undefined,
+      detail: undefined,
+      selectedId: undefined,
+      older: [],
+      window: undefined,
+      before: undefined,
+      historyEnd: false,
+      historyBusy: false,
+      live: [],
+      liveStatus: "paused",
+      pending: [],
+      offlineSnapshotAt: undefined
+    });
+  }
+
+  async #persistOfflineProjection(
+    epoch: number,
+    credential: PairedCredential,
+    node: NodeIdentity,
+    owner: Snapshot,
+    detail?: Snapshot
+  ): Promise<void> {
+    if (!this.offlineCache || !this.#current(epoch) || this.#credential !== credential
+      || this.#activeProfileId !== credential.profileId) return;
+    const profile = this.#profiles.find((candidate) => candidate.profileId === credential.profileId)
+      ?? profileFromCredential(credential);
+    try {
+      await this.offlineCache.save(profile, node, owner, detail);
+      if (this.#current(epoch) && this.#credential === credential
+        && this.#activeProfileId === credential.profileId) {
+        this.#durableSnapshotAt = this.#lastAuthenticatedAt;
+      }
+    } catch (error) {
+      if (this.#current(epoch) && this.#credential === credential && this.#state.status === "connected") {
+        const warning = `Connected, but Joko could not save the offline copy: ${message(error)}`;
+        this.#set({ error: [this.#state.error, warning].filter(Boolean).join(" ") });
+      }
+    }
   }
 
   async start(): Promise<void> {
@@ -780,7 +914,9 @@ export class MobileClient {
       challenge: undefined,
       candidate: undefined,
       connectionAttemptError: undefined,
-      ...(!this.#hasActiveConnection() && this.#state.status === "connecting" ? { status: "unpaired" as const } : {})
+      ...(!this.#hasActiveConnection() && this.#state.status === "connecting"
+        ? { status: this.#hasOfflineProjection() ? "offline" as const : "unpaired" as const }
+        : {})
     });
   }
 
@@ -795,6 +931,7 @@ export class MobileClient {
       return;
     }
     await this.#releaseQueueEditBeforeTransition();
+    const preserveActiveConnection = this.#hasActiveConnection();
     const { generation, controller } = this.#beginConnectionAttempt();
     this.#set({
       ...(!this.#hasActiveConnection() ? { status: "connecting" as const } : {}),
@@ -802,39 +939,73 @@ export class MobileClient {
       challenge: undefined,
       saved: this.#savedViews(profileId, "checking")
     });
+    let selection: string | undefined;
+    let cached: MobileOfflineCacheSnapshot | undefined;
+    let cacheLoadWarning: string | undefined;
+    let credential: PairedCredential | undefined;
+    let offlineEligible = true;
     try {
+      selection = await this.storage.loadSelection(profileId);
+      if (!this.#connectionAttemptCurrent(generation, controller)) return;
+      if (!preserveActiveConnection && this.offlineCache) {
+        try {
+          cached = await this.offlineCache.load(profile, selection);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          if (cached) this.#showOfflineProjection(profile, cached, selection, "connecting");
+        } catch (error) {
+          cacheLoadWarning = message(error);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        }
+      }
       // Public identity proof must precede the protected credential read.
       const node = await this.network.inspect(profile.origin, controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
+      if (cached) cached = { ...cached, node };
       this.#set({ candidate: { origin: profile.origin, node } });
       if (node.serverId !== profile.serverId) {
-        const detail = "The saved Joko node identity changed. Its credential was not read; forget it or inspect and pair this node again.";
+        offlineEligible = false;
+        this.#dropOfflineProjection(profileId);
+        const cleanup = await this.#clearOfflineCache(profileId);
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        const detail = [
+          "The saved Joko node identity changed. Its credential was not read; forget it or inspect and pair this node again.",
+          cleanup
+        ].filter(Boolean).join(" ");
         this.#failConnectionAttempt(generation, controller, detail, {
           saved: this.#savedViews(profileId, "identity-conflict", detail)
         });
         throw new Error(detail);
       }
-      let credential: PairedCredential | undefined;
       try { credential = await this.storage.loadCredential(profileId); }
       catch (error) {
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         const failure = credentialFailure(error);
-        this.#failConnectionAttempt(generation, controller, message(error), {
-          saved: this.#savedViews(profileId, failure, message(error))
-        });
+        offlineEligible = failure === "unavailable";
+        if (!offlineEligible || !cached) {
+          if (!offlineEligible) this.#dropOfflineProjection(profileId);
+          const cleanup = offlineEligible ? undefined : await this.#clearOfflineCache(profileId);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          const detail = [message(error), cleanup].filter(Boolean).join(" ");
+          this.#failConnectionAttempt(generation, controller, detail, {
+            saved: this.#savedViews(profileId, failure, detail)
+          });
+        }
         throw error;
       }
       if (!credential || !credentialMatchesProfile(credential, profile)) {
-        const detail = credential
+        offlineEligible = false;
+        this.#dropOfflineProjection(profileId);
+        const cleanup = await this.#clearOfflineCache(profileId);
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        const detail = [credential
           ? "The protected credential does not match this saved Joko connection. Forget it and pair again."
-          : "The protected credential for this saved Joko connection is missing. Forget it and pair again.";
+          : "The protected credential for this saved Joko connection is missing. Forget it and pair again.", cleanup]
+          .filter(Boolean).join(" ");
         this.#failConnectionAttempt(generation, controller, detail, {
           saved: this.#savedViews(profileId, credential ? "unreadable" : "missing", detail)
         });
         throw new Error(detail);
       }
-      const selection = await this.storage.loadSelection(profileId);
-      if (!this.#connectionAttemptCurrent(generation, controller)) return;
       const owner = await this.network.readOwner(credential, controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       this.#assertOwner(credential, owner, node);
@@ -852,6 +1023,7 @@ export class MobileClient {
           preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
         }
       }
+      preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
       await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
     } catch (error) {
       if (!this.#connectionAttemptCurrent(generation, controller)) {
@@ -866,11 +1038,19 @@ export class MobileClient {
           "This mobile connection was revoked. Forget it or pair this device again."
         );
       } else if (error instanceof CredentialIdentityError) {
-        this.#failConnectionAttempt(generation, controller, error.message, {
-          saved: this.#savedViews(profileId, "identity-conflict", error.message)
+        this.#dropOfflineProjection(profileId);
+        const cleanup = await this.#clearOfflineCache(profileId);
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        const detail = [error.message, cleanup].filter(Boolean).join(" ");
+        this.#failConnectionAttempt(generation, controller, detail, {
+          saved: this.#savedViews(profileId, "identity-conflict", detail)
         });
+      } else if (cached && offlineEligible
+        && this.#adoptOfflineFallback(generation, controller, profile, cached, selection, message(error), credential)) {
+        return;
       } else if (this.#state.saved.find((item) => item.profileId === profileId)?.credentialState === "checking") {
-        const detail = message(error);
+        this.#dropOfflineProjection(profileId);
+        const detail = [message(error), cacheLoadWarning].filter(Boolean).join(" ");
         this.#failConnectionAttempt(generation, controller, detail, {
           saved: this.#savedViews(profileId, "offline", detail)
         });
@@ -895,8 +1075,11 @@ export class MobileClient {
     this.#connectionAttemptAbort = undefined;
     const epoch = this.#retire();
     if (!this.#current(epoch)) return;
+    const priorProfileId = this.#activeProfileId;
     this.#credential = credential;
     this.#activeProfileId = credential.profileId;
+    this.#lastAuthenticatedAt = this.now();
+    if (priorProfileId !== credential.profileId) this.#durableSnapshotAt = undefined;
     const ownedPending = this.#allPending.filter((item) => item.connectionId === credential.connectionId);
     this.#set({
       status: "connected",
@@ -919,9 +1102,11 @@ export class MobileClient {
       historyEnd: false,
       historyBusy: false,
       live: [],
+      offlineSnapshotAt: undefined,
       error: preferenceError
     });
     this.#beginStream(epoch, credential, owner.snapshot);
+    await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
     await this.reconcile(epoch);
     if (this.#current(epoch)) this.#schedule();
   }
@@ -949,6 +1134,9 @@ export class MobileClient {
     detail: string
   ): Promise<void> {
     if (!this.#connectionAttemptCurrent(generation, controller)) return;
+    this.#dropOfflineProjection(profileId);
+    const offlineCacheFailure = await this.#clearOfflineCache(profileId);
+    if (!this.#connectionAttemptCurrent(generation, controller)) return;
     let automaticFailure: string | undefined;
     const wasAutomatic = this.#automaticProfileId === profileId;
     if (wasAutomatic) {
@@ -965,7 +1153,8 @@ export class MobileClient {
     }
     catch (error) { credentialFailure = message(error); }
     if (!this.#connectionAttemptCurrent(generation, controller)) return;
-    const cleanup = [credentialFailure, this.#automaticProfileId === profileId ? automaticFailure : undefined]
+    const cleanup = [credentialFailure, this.#automaticProfileId === profileId ? automaticFailure : undefined,
+      offlineCacheFailure]
       .filter(Boolean).join(" ");
     const error = cleanup ? `${detail} ${cleanup}` : detail;
     this.#connectionAttemptAbort = undefined;
@@ -1147,13 +1336,15 @@ export class MobileClient {
         this.#retire();
         this.#credential = undefined;
         this.#activeProfileId = undefined;
+        this.#lastAuthenticatedAt = undefined;
+        this.#durableSnapshotAt = undefined;
         this.#set({ status: "unpaired", busy: false, activeProfileId: undefined,
           automaticProfileId: this.#automaticProfileId, node: undefined, origin: undefined,
           saved: this.#savedViews(profileId, credentialFailure(error), detail), candidate: undefined,
           connectionAttemptError: undefined, challenge: undefined,
           owner: undefined, detail: undefined, selectedId: undefined, older: [], window: undefined,
           live: [], liveStatus: "paused", historyBusy: false, historyEnd: false, before: undefined,
-          pending: [], error: detail });
+          pending: [], offlineSnapshotAt: undefined, error: detail });
       } else {
         this.#set({ busy: false, automaticProfileId: this.#automaticProfileId,
           saved: this.#savedViews(profileId, credentialFailure(error), detail), error: detail });
@@ -1167,6 +1358,8 @@ export class MobileClient {
     catch (error) { cleanupFailures.push(`task selection: ${message(error)}`); }
     try { await this.#dropPendingConnections([profile.connectionId]); }
     catch (error) { cleanupFailures.push(`operation receipts: ${message(error)}`); }
+    const offlineCacheFailure = await this.#clearOfflineCache(profileId);
+    if (offlineCacheFailure) cleanupFailures.push(`offline content: ${offlineCacheFailure}`);
     if (this.newTaskDrafts) {
       try { await this.newTaskDrafts.clear({ profileId }); }
       catch (error) { cleanupFailures.push(`new-task draft: ${message(error)}`); }
@@ -1185,12 +1378,14 @@ export class MobileClient {
     this.#retire();
     this.#credential = undefined;
     this.#activeProfileId = undefined;
+    this.#lastAuthenticatedAt = undefined;
+    this.#durableSnapshotAt = undefined;
     this.#set({ status: "unpaired", busy: false, node: undefined, origin: undefined,
       activeProfileId: undefined, automaticProfileId: this.#automaticProfileId, saved: this.#savedViews(),
       candidate: undefined, connectionAttemptError: undefined, challenge: undefined,
       owner: undefined, detail: undefined, selectedId: undefined,
       older: [], window: undefined, live: [], liveStatus: "paused", historyBusy: false,
-      historyEnd: false, before: undefined, pending: [], error: cleanupError });
+      historyEnd: false, before: undefined, pending: [], offlineSnapshotAt: undefined, error: cleanupError });
   }
 
   #beginCatalogAttempt(): { readonly generation: number; readonly controller: AbortController } {
@@ -1242,7 +1437,9 @@ export class MobileClient {
       this.#cancelCatalogAttempt();
       this.#mutationOwner = undefined;
       this.#set({
-        ...(!this.#hasActiveConnection() && this.#state.status === "connecting" ? { status: "unpaired" as const } : {}),
+        ...(!this.#hasActiveConnection() && this.#state.status === "connecting"
+          ? { status: this.#hasOfflineProjection() ? "offline" as const : "unpaired" as const }
+          : {}),
         busy: false,
         candidate: undefined,
         challenge: undefined,
@@ -1266,13 +1463,18 @@ export class MobileClient {
     }
     if (active) {
       if (this.#credential) void this.refresh();
+      else if (this.#hasOfflineProjection()) void this.connectSaved(this.#activeProfileId!);
       else void this.start();
     }
   }
 
   async refresh(): Promise<void> {
     const credential = this.#credential;
-    if (!credential || !this.#foreground) return;
+    if (!this.#foreground) return;
+    if (!credential) {
+      if (this.#hasOfflineProjection()) await this.connectSaved(this.#activeProfileId!);
+      return;
+    }
     const epoch = this.#retire();
     this.#set({ status: "connecting", error: undefined });
     try {
@@ -1280,7 +1482,7 @@ export class MobileClient {
       const node = await this.network.inspect(credential.origin, this.#abort?.signal);
       if (!this.#current(epoch)) return;
       if (node.serverId !== credential.serverId) {
-        this.#identityConflict(epoch, credential.profileId,
+        await this.#identityConflict(epoch, credential.profileId,
           "The saved Joko node identity changed. Its credential was not read again; forget it or pair this node explicitly.");
         return;
       }
@@ -1295,12 +1497,15 @@ export class MobileClient {
       if (selected !== selectedId) await this.storage.saveSelection(credential.profileId, selected);
       if (!this.#current(epoch)) return;
       const sameWindow = selected === selectedId && this.#state.owner?.generation === owner.snapshot.generation;
+      this.#lastAuthenticatedAt = this.now();
       this.#set({ node, origin: credential.origin, owner: owner.snapshot, detail, selectedId: selected,
         older: sameWindow ? this.#state.older : [], window: sameWindow ? this.#state.window : undefined,
         before: sameWindow ? this.#state.before : undefined, historyEnd: sameWindow ? this.#state.historyEnd : false,
         historyBusy: false, live: [], status: "connected", error: undefined,
+        offlineSnapshotAt: undefined,
         saved: this.#savedViews(credential.profileId, "available") });
       this.#beginStream(epoch, credential, owner.snapshot);
+      await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
       await this.reconcile(epoch);
       if (this.#current(epoch)) this.#schedule();
     } catch (error) {
@@ -1311,10 +1516,11 @@ export class MobileClient {
         "This mobile connection was revoked. Forget it or pair this device again."
       );
       else if (error instanceof CredentialIdentityError) {
-        this.#identityConflict(epoch, credential.profileId, error.message);
+        await this.#identityConflict(epoch, credential.profileId, error.message);
       }
       else {
-        this.#set({ status: "offline", liveStatus: "paused", live: [], error: message(error) });
+        this.#set({ status: "offline", liveStatus: "paused", live: [],
+          offlineSnapshotAt: this.#durableSnapshotAt, error: message(error) });
         this.#schedule();
       }
     }
@@ -1342,19 +1548,26 @@ export class MobileClient {
     if (projectedConnection.state !== ConnectionState.CONNECTED || projectedDevice.revoked) throw new RevokedError();
   }
 
-  #identityConflict(epoch: number, profileId: string, error: string): void {
+  async #identityConflict(epoch: number, profileId: string, error: string): Promise<void> {
     if (!this.#current(epoch)) return;
     this.#connectionAttemptAbort?.abort();
     this.#connectionAttemptAbort = undefined;
     this.#connectionAttemptEpoch += 1;
-    this.#retire();
+    const retirementEpoch = this.#retire();
     this.#credential = undefined;
     this.#activeProfileId = undefined;
-    this.#set({ status: "unpaired", busy: false, activeProfileId: undefined, node: undefined,
+    this.#lastAuthenticatedAt = undefined;
+    this.#durableSnapshotAt = undefined;
+    this.#set({ status: "unpaired", busy: true, activeProfileId: undefined, node: undefined,
       saved: this.#savedViews(profileId, "identity-conflict", error), candidate: undefined,
       connectionAttemptError: undefined, challenge: undefined, owner: undefined, detail: undefined,
       selectedId: undefined, older: [], window: undefined, live: [], liveStatus: "paused",
-      historyBusy: false, historyEnd: false, before: undefined, pending: [], error });
+      historyBusy: false, historyEnd: false, before: undefined, pending: [], offlineSnapshotAt: undefined,
+      error });
+    const cleanup = await this.#clearOfflineCache(profileId);
+    if (!this.#current(retirementEpoch)) return;
+    const detail = [error, cleanup].filter(Boolean).join(" ");
+    this.#set({ busy: false, saved: this.#savedViews(profileId, "identity-conflict", detail), error: detail });
   }
 
   async #invalidateCredential(epoch: number, profileId: string, error: string): Promise<void> {
@@ -1362,9 +1575,20 @@ export class MobileClient {
     this.#connectionAttemptAbort?.abort();
     this.#connectionAttemptAbort = undefined;
     this.#connectionAttemptEpoch += 1;
-    this.#retire();
+    const retirementEpoch = this.#retire();
     this.#credential = undefined;
     this.#activeProfileId = undefined;
+    this.#lastAuthenticatedAt = undefined;
+    this.#durableSnapshotAt = undefined;
+    this.#set({ status: "revoked", busy: true, activeProfileId: undefined,
+      automaticProfileId: this.#automaticProfileId, node: undefined,
+      saved: this.#savedViews(profileId, "unavailable", error), candidate: undefined,
+      connectionAttemptError: undefined, challenge: undefined, owner: undefined, detail: undefined,
+      selectedId: undefined, older: [], window: undefined, live: [], liveStatus: "paused",
+      historyBusy: false, historyEnd: false, before: undefined, pending: [], offlineSnapshotAt: undefined,
+      error });
+    const offlineCacheFailure = await this.#clearOfflineCache(profileId);
+    if (!this.#current(retirementEpoch)) return;
     let automaticFailure: string | undefined;
     const wasAutomatic = this.#automaticProfileId === profileId;
     if (wasAutomatic) {
@@ -1374,22 +1598,23 @@ export class MobileClient {
       }
       catch (failure) { automaticFailure = message(failure); }
     }
+    if (!this.#current(retirementEpoch)) return;
     let credentialFailureMessage: string | undefined;
     try {
       await this.storage.deleteCredential(profileId);
       if (wasAutomatic) this.#automaticProfileId = undefined;
     }
     catch (failure) { credentialFailureMessage = message(failure); }
-    const cleanupFailure = credentialFailureMessage === undefined
-      ? undefined
-      : [credentialFailureMessage, automaticFailure].filter(Boolean).join(" ");
+    if (!this.#current(retirementEpoch)) return;
+    const cleanupFailure = [credentialFailureMessage, automaticFailure, offlineCacheFailure].filter(Boolean).join(" ") || undefined;
     const cleanupError = cleanupFailure === undefined ? undefined : ` ${cleanupFailure}`;
     this.#set({ status: "revoked", busy: false, activeProfileId: undefined,
       automaticProfileId: this.#automaticProfileId, node: undefined,
       saved: this.#savedViews(profileId, cleanupError ? "unavailable" : "missing", `${error}${cleanupError ?? ""}`),
       candidate: undefined, connectionAttemptError: undefined, challenge: undefined, owner: undefined, detail: undefined,
       selectedId: undefined, older: [], window: undefined, live: [], liveStatus: "paused",
-      historyBusy: false, historyEnd: false, before: undefined, pending: [], error: `${error}${cleanupError ?? ""}` });
+      historyBusy: false, historyEnd: false, before: undefined, pending: [], offlineSnapshotAt: undefined,
+      error: `${error}${cleanupError ?? ""}` });
   }
 
   #schedule(): void {
@@ -1503,8 +1728,11 @@ export class MobileClient {
       }
       this.#projectionMisses = 0;
       const durable = detail?.resumeCursor?.sequence ?? owner.snapshot.resumeCursor.sequence;
+      this.#lastAuthenticatedAt = this.now();
       this.#set({ owner: owner.snapshot, detail,
+        offlineSnapshotAt: undefined,
         live: this.#state.live.filter((item) => item.cursor && item.cursor.sequence > durable) });
+      await this.#persistOfflineProjection(epoch, credential, this.#state.node!, owner.snapshot, detail);
       if ((this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
     } catch (error) {
       if (!this.#current(epoch)) return;
@@ -1559,11 +1787,42 @@ export class MobileClient {
     await this.#releaseQueueEditBeforeTransition();
     const profileId = this.#activeProfileId;
     if (!profileId) throw new Error("Reconnect to a saved Joko node before selecting a task.");
+    const offline = this.#state.status === "offline" && this.#hasOfflineProjection(profileId);
+    const profile = offline ? this.#profiles.find((candidate) => candidate.profileId === profileId) : undefined;
     const epoch = this.#retire();
     await this.storage.saveSelection(profileId, sessionId);
     if (!this.#current(epoch)) return;
     this.#set({ selectedId: sessionId, detail: undefined, older: [], window: undefined, live: [],
       historyBusy: false, historyEnd: false, before: undefined, error: undefined });
+    if (offline) {
+      if (!profile || !this.offlineCache) {
+        this.#set({ error: "This task is not available offline. Reconnect to load it." });
+        return;
+      }
+      try {
+        const cached = await this.offlineCache.load(profile, sessionId);
+        if (!this.#current(epoch) || this.#activeProfileId !== profileId || this.#state.status !== "offline") return;
+        if (!cached) {
+          this.#set({ error: "The saved offline content is no longer available. Reconnect to load this task." });
+          return;
+        }
+        this.#showOfflineProjection(
+          profile,
+          cached,
+          sessionId,
+          "offline",
+          sessionId !== undefined && cached.detail === undefined
+            ? "This task has no saved offline messages. Reconnect to load it."
+            : undefined
+        );
+        if (this.#credential) this.#schedule();
+      } catch (error) {
+        if (this.#current(epoch) && this.#activeProfileId === profileId) {
+          this.#set({ detail: undefined, error: message(error) });
+        }
+      }
+      return;
+    }
     await this.refresh();
   }
 
@@ -7209,8 +7468,23 @@ export class MobileClient {
     confirmation: string
   ): Promise<void> {
     const targets = this.#profiles.filter(matches);
+    const activeRemoved = this.#activeProfileId !== undefined
+      && targets.some((profile) => profile.profileId === this.#activeProfileId);
+    if (activeRemoved) {
+      this.#retire();
+      this.#credential = undefined;
+      this.#activeProfileId = undefined;
+      this.#lastAuthenticatedAt = undefined;
+      this.#durableSnapshotAt = undefined;
+      this.#set({ status: "unpaired", busy: true, activeProfileId: undefined,
+        node: undefined, origin: undefined, candidate: undefined, connectionAttemptError: undefined,
+        challenge: undefined, owner: undefined, detail: undefined, selectedId: undefined,
+        older: [], window: undefined, live: [], liveStatus: "paused", historyBusy: false,
+        historyEnd: false, before: undefined, pending: [], offlineSnapshotAt: undefined });
+    }
     const failed = new Map<string, string>();
     const removed = new Set<string>();
+    const localCleanupFailures: string[] = [];
     for (const profile of targets) {
       let automaticFailure: string | undefined;
       const wasAutomatic = this.#automaticProfileId === profile.profileId;
@@ -7227,6 +7501,8 @@ export class MobileClient {
         await this.storage.saveSelection(profile.profileId).catch(() => undefined);
         await this.newTaskDrafts?.clear({ profileId: profile.profileId }).catch(() => undefined);
         await this.attachmentFiles?.clearProfile(profile.profileId).catch(() => undefined);
+        const offlineCacheFailure = await this.#clearOfflineCache(profile.profileId);
+        if (offlineCacheFailure) localCleanupFailures.push(`${profile.displayName}: ${offlineCacheFailure}`);
         removed.add(profile.profileId);
       } catch (error) {
         failed.set(profile.profileId, [message(error), automaticFailure].filter(Boolean).join(" "));
@@ -7236,7 +7512,6 @@ export class MobileClient {
     try { await this.#dropPendingConnections(targets.map((profile) => profile.connectionId)); }
     catch (error) { receiptCleanupError = message(error); }
     this.#profiles = this.#profiles.filter((profile) => !removed.has(profile.profileId));
-    const activeRemoved = this.#activeProfileId !== undefined && targets.some((profile) => profile.profileId === this.#activeProfileId);
     const saved = this.#profiles.map((profile) => {
       const failure = failed.get(profile.profileId);
       return this.#savedConnection(
@@ -7246,23 +7521,21 @@ export class MobileClient {
         failure
       );
     });
-    const cleanupError = failed.size === 0 && receiptCleanupError === undefined
+    const cleanupError = failed.size === 0 && receiptCleanupError === undefined && localCleanupFailures.length === 0
       ? undefined
       : `${confirmation}${failed.size === 0 ? "" : ` Joko could not finish removing ${failed.size === 1 ? "its local credential" : "some local credentials"}; retry Forget.`}`
-        + `${receiptCleanupError === undefined ? "" : ` Local operation receipts could not be cleared: ${receiptCleanupError}`}`;
+        + `${receiptCleanupError === undefined ? "" : ` Local operation receipts could not be cleared: ${receiptCleanupError}`}`
+        + `${localCleanupFailures.length === 0 ? "" : ` Saved offline content could not be cleared: ${localCleanupFailures.join("; ")}`}`;
     if (!activeRemoved) {
       this.#set({ automaticProfileId: this.#automaticProfileId, saved, error: cleanupError });
       return;
     }
-    this.#retire();
-    this.#credential = undefined;
-    this.#activeProfileId = undefined;
     this.#set({ status: "unpaired", busy: false, activeProfileId: undefined,
       automaticProfileId: this.#automaticProfileId, node: undefined, origin: undefined, saved,
       candidate: undefined, connectionAttemptError: undefined, challenge: undefined,
       owner: undefined, detail: undefined, selectedId: undefined,
       older: [], window: undefined, live: [], liveStatus: "paused", historyBusy: false,
-      historyEnd: false, before: undefined, pending: [], error: cleanupError });
+      historyEnd: false, before: undefined, pending: [], offlineSnapshotAt: undefined, error: cleanupError });
   }
 
   async #submit(

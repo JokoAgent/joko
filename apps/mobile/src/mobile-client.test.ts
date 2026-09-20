@@ -50,6 +50,7 @@ import {
   type MobileModelPreviewFileSnapshot
 } from "./mobile-model-preview";
 import type { MobileFileShare } from "./mobile-file-share";
+import { MobileOfflineCache, type MobileOfflineCacheStorage } from "./mobile-offline-cache";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
@@ -673,6 +674,41 @@ function runtimeControlProjection(currentSession = runtimeSession, detail = fals
   });
 }
 
+function offlineOwnerProjection(sessions: readonly Snapshot["sessions"][number][] = [runtimeSession]): Snapshot {
+  const base = runtimeControlProjection(sessions[0] ?? runtimeSession, false);
+  return create(SnapshotSchema, {
+    ...base,
+    generation: 0n,
+    resumeCursor: create(EventCursorSchema, {
+      opaqueToken: base.resumeCursor?.opaqueToken ?? "owner-cursor",
+      sequence: base.resumeCursor?.sequence ?? 0n,
+      generation: 0n
+    }),
+    sessions: [...sessions]
+  });
+}
+
+function offlineDetailProjection(currentSession = runtimeSession): Snapshot {
+  const generation = currentSession.nativeBinding?.runtimeGeneration ?? 0n;
+  const base = runtimeControlProjection(currentSession, true);
+  return create(SnapshotSchema, {
+    ...base,
+    scope: create(SnapshotScopeSchema, {
+      kind: { case: "session", value: create(SessionSnapshotScopeSchema, {
+        sessionId: currentSession.sessionId,
+        recentTimelineItems: 120
+      }) }
+    }),
+    generation,
+    resumeCursor: create(EventCursorSchema, {
+      opaqueToken: base.resumeCursor?.opaqueToken ?? "detail-cursor",
+      sequence: base.resumeCursor?.sequence ?? 0n,
+      generation
+    }),
+    sessions: [currentSession]
+  });
+}
+
 function branchTree(revision: bigint, etag: string, activeEntryId: "native-current" | "native-alternate") {
   return create(NativeSessionTreeSchema, {
     sessionId: "session",
@@ -748,6 +784,22 @@ function memoryStorage(saved?: PairedCredential | readonly PairedCredential[], a
     automaticProfile: () => automaticProfileId,
     profiles: () => profiles,
     pending: () => pending
+  };
+}
+
+function memoryOfflineCache(now: () => number = () => 1_500) {
+  const values = new Map<string, string>();
+  const driver: MobileOfflineCacheStorage = {
+    async getItem(key) { return values.get(key) ?? null; },
+    async setItem(key, value) { values.set(key, value); },
+    async removeItem(key) { values.delete(key); },
+    async getAllKeys() { return [...values.keys()]; },
+    async multiRemove(keys) { for (const key of keys) values.delete(key); }
+  };
+  let sequence = 0;
+  return {
+    cache: new MobileOfflineCache(driver, now, () => `cache-${++sequence}`),
+    values
   };
 }
 
@@ -1234,13 +1286,24 @@ function client(
   mediaPreviewFiles?: MobileMediaPreviewFiles,
   pdfPreviewFiles?: MobilePdfPreviewFiles,
   modelPreviewFiles?: MobileModelPreviewFiles,
-  fileShare?: Pick<MobileFileShare, "perform">
+  fileShare?: Pick<MobileFileShare, "perform">,
+  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare);
+    modelPreviewFiles, fileShare, offlineCache);
   clients.push(instance);
   return instance;
+}
+
+function clientWithOfflineCache(
+  network: MobileNetwork,
+  storage: MobileStorage,
+  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+  now: () => number = () => 2_000
+) {
+  return client(network, storage, undefined, now, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, undefined, offlineCache);
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); });
 
@@ -1467,6 +1530,203 @@ describe("native mobile connection and operation ownership", () => {
     expect(saved.storage.loadCredential).toHaveBeenCalledWith(otherCredential.profileId);
     expect(saved.storage.loadCredential).not.toHaveBeenCalledWith(credential.profileId);
     expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.any(AbortSignal));
+  });
+
+  it("restores a current-v1 task copy before anonymous inspection and retries into authoritative online state", async () => {
+    const cachedOwner = offlineOwnerProjection();
+    const cachedDetail = offlineDetailProjection();
+    const offline = memoryOfflineCache();
+    await offline.cache.save(profileFromCredential(credential), node, cachedOwner, cachedDetail);
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: cachedOwner }));
+    network.readSession = vi.fn(async () => cachedDetail);
+    let rejectInspect!: (error: Error) => void;
+    network.inspect = vi.fn(() => new Promise<NodeIdentity>((_resolve, reject) => { rejectInspect = reject; }));
+    const saved = memoryStorage(credential);
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+
+    const starting = app.start();
+    await vi.waitFor(() => expect(network.inspect).toHaveBeenCalledOnce());
+    expect(app.state).toMatchObject({
+      status: "connecting",
+      activeProfileId: credential.profileId,
+      selectedId: "session",
+      offlineSnapshotAt: 1_500,
+      owner: { snapshotId: "runtime-owner" },
+      detail: { snapshotId: "runtime-detail" }
+    });
+    expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+
+    rejectInspect(new Error("Wi-Fi unavailable"));
+    await starting;
+    expect(app.state).toMatchObject({ status: "offline", offlineSnapshotAt: 1_500 });
+    expect(app.state.error).toContain("Wi-Fi unavailable");
+    expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+
+    vi.mocked(network.inspect).mockResolvedValueOnce(node);
+    await app.refresh();
+    expect(network.inspect).toHaveBeenCalledBefore(saved.storage.loadCredential as ReturnType<typeof vi.fn>);
+    expect(app.state).toMatchObject({ status: "connected", activeProfileId: credential.profileId });
+    expect(app.state.offlineSnapshotAt).toBeUndefined();
+    expect(app.state.owner?.snapshotId).toBe("runtime-owner");
+    expect(app.state.detail?.snapshotId).toBe("runtime-detail");
+
+    vi.mocked(network.inspect).mockRejectedValueOnce(new Error("radio slept"));
+    await app.refresh();
+    expect(app.state.status).toBe("offline");
+    app.setForeground(false);
+    vi.mocked(network.inspect).mockResolvedValueOnce(node);
+    app.setForeground(true);
+    await vi.waitFor(() => expect(app.state.status).toBe("connected"));
+  });
+
+  it("switches between previously cached regular tasks while offline without a credentialed read", async () => {
+    const ownerProjection = offlineOwnerProjection([runtimeSession, relatedSession]);
+    const firstDetail = offlineDetailProjection();
+    const relatedDetail = create(SnapshotSchema, {
+      ...offlineDetailProjection(relatedSession),
+      snapshotId: "related-detail",
+    });
+    let clock = 1_500;
+    const offline = memoryOfflineCache(() => clock);
+    await offline.cache.save(profileFromCredential(credential), node, ownerProjection, firstDetail);
+    clock += 1;
+    await offline.cache.save(profileFromCredential(credential), node, ownerProjection, relatedDetail);
+    const network = fakeNetwork();
+    network.inspect = vi.fn(async () => { throw new Error("offline"); });
+    const saved = memoryStorage(credential);
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+
+    await app.start();
+    expect(app.state).toMatchObject({ status: "offline", selectedId: "session" });
+    expect(app.state.detail?.snapshotId).toBe("runtime-detail");
+    await app.select(relatedSession.sessionId);
+
+    expect(app.state).toMatchObject({ status: "offline", selectedId: relatedSession.sessionId });
+    expect(app.state.detail?.snapshotId).toBe("related-detail");
+    expect(network.readSession).not.toHaveBeenCalled();
+    expect(saved.storage.saveSelection).toHaveBeenCalledWith(credential.profileId, relatedSession.sessionId);
+  });
+
+  it("uses a valid cached view when protected storage is temporarily unavailable", async () => {
+    const cachedOwner = offlineOwnerProjection();
+    const cachedDetail = offlineDetailProjection();
+    const offline = memoryOfflineCache();
+    await offline.cache.save(profileFromCredential(credential), node, cachedOwner, cachedDetail);
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    vi.mocked(saved.storage.loadCredential).mockRejectedValueOnce(new MobileCredentialStorageError(
+      "unavailable",
+      "Protected credential storage is unavailable."
+    ));
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+
+    await app.start();
+
+    expect(network.inspect).toHaveBeenCalledOnce();
+    expect(network.readOwner).not.toHaveBeenCalled();
+    expect(app.state).toMatchObject({
+      status: "offline",
+      activeProfileId: credential.profileId,
+      offlineSnapshotAt: 1_500
+    });
+    expect(app.state.saved[0]).toMatchObject({ credentialState: "offline" });
+    expect(offline.values.size).toBeGreaterThan(0);
+  });
+
+  it("does not label a switched profile with another profile's durable cache age", async () => {
+    const offlineCache = {
+      load: vi.fn(async () => undefined),
+      save: vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("offline storage full")),
+      clear: vi.fn(async () => undefined)
+    };
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async (current) => current.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: extendedSnapshot }
+      : { connection, device, snapshot });
+    const saved = memoryStorage([credential, otherCredential], credential.profileId);
+    const app = clientWithOfflineCache(network, saved.storage, offlineCache);
+    await app.start();
+    expect(offlineCache.save).toHaveBeenCalledTimes(1);
+
+    await app.connectSaved(otherCredential.profileId);
+    expect(app.state).toMatchObject({ status: "connected", activeProfileId: otherCredential.profileId });
+    expect(app.state.error).toContain("offline storage full");
+    vi.mocked(network.inspect).mockRejectedValueOnce(new Error("radio unavailable"));
+
+    await app.refresh();
+
+    expect(app.state.status).toBe("offline");
+    expect(app.state.offlineSnapshotAt).toBeUndefined();
+  });
+
+  it("hides authenticated content before identity-conflict cache cleanup finishes", async () => {
+    let releaseClear!: () => void;
+    const offlineCache = {
+      load: vi.fn(async () => undefined),
+      save: vi.fn(async () => undefined),
+      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; }))
+    };
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = clientWithOfflineCache(network, saved.storage, offlineCache);
+    await app.start();
+    vi.mocked(network.inspect).mockResolvedValueOnce({ ...node, serverId: "other-node" });
+
+    const refreshing = app.refresh();
+    await vi.waitFor(() => expect(offlineCache.clear).toHaveBeenCalledWith(credential.profileId));
+    expect(app.state).toMatchObject({
+      status: "unpaired",
+      busy: true,
+      activeProfileId: undefined,
+      owner: undefined,
+      detail: undefined,
+      offlineSnapshotAt: undefined
+    });
+
+    releaseClear();
+    await refreshing;
+    expect(app.state).toMatchObject({ status: "unpaired", busy: false, owner: undefined });
+  });
+
+  it("clears durable offline content on identity conflict, revocation, and local forget", async () => {
+    const cache = {
+      load: vi.fn(async () => undefined),
+      save: vi.fn(async () => undefined),
+      clear: vi.fn(async () => undefined)
+    };
+    const firstNetwork = fakeNetwork();
+    const firstSaved = memoryStorage(credential);
+    const first = clientWithOfflineCache(firstNetwork, firstSaved.storage, cache);
+    await first.start();
+    vi.mocked(firstNetwork.inspect).mockResolvedValueOnce({ ...node, serverId: "other-node" });
+    await first.refresh();
+    expect(cache.clear).toHaveBeenCalledWith(credential.profileId);
+    expect(first.state).toMatchObject({ status: "unpaired", activeProfileId: undefined, owner: undefined });
+
+    cache.clear.mockClear();
+    const secondNetwork = fakeNetwork();
+    const secondSaved = memoryStorage(credential);
+    const second = clientWithOfflineCache(secondNetwork, secondSaved.storage, cache);
+    await second.start();
+    vi.mocked(secondNetwork.readOwner).mockResolvedValueOnce({
+      connection: create(ConnectionSchema, { ...connection, state: ConnectionState.DISCONNECTED }),
+      device,
+      snapshot
+    });
+    await second.refresh();
+    expect(cache.clear).toHaveBeenCalledWith(credential.profileId);
+    expect(second.state.status).toBe("revoked");
+
+    cache.clear.mockClear();
+    const thirdSaved = memoryStorage(credential);
+    const third = clientWithOfflineCache(fakeNetwork(), thirdSaved.storage, cache);
+    await third.start();
+    await third.forgetConnection(credential.profileId);
+    expect(cache.clear).toHaveBeenCalledWith(credential.profileId);
+    expect(third.state).toMatchObject({ status: "unpaired", activeProfileId: undefined, owner: undefined });
   });
 
   it("keeps the active mobile home authority while a candidate is inspected or a saved switch fails", async () => {
@@ -1811,7 +2071,10 @@ describe("native mobile connection and operation ownership", () => {
   it("logs out one exact server connection with its current revision before local cleanup", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
-    const app = client(network, saved.storage);
+    const offlineCache = {
+      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined)
+    };
+    const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
 
     expect(await app.logoutConnection(credential.connectionId)).toBe(true);
@@ -1822,6 +2085,7 @@ describe("native mobile connection and operation ownership", () => {
     });
     expect(saved.storage.deleteConnection).toHaveBeenCalledWith(credential.profileId);
     expect(saved.key()).toBeUndefined();
+    expect(offlineCache.clear).toHaveBeenCalledWith(credential.profileId);
     expect(app.state.status).toBe("unpaired");
     expect(app.state.saved).toEqual([]);
   });
@@ -1829,7 +2093,10 @@ describe("native mobile connection and operation ownership", () => {
   it("preserves the exact credential and unknown receipt when logout acknowledgement is lost", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
-    const app = client(network, saved.storage);
+    const offlineCache = {
+      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined)
+    };
+    const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
     vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
 
@@ -1848,13 +2115,17 @@ describe("native mobile connection and operation ownership", () => {
       targetConnectionId: credential.connectionId,
       state: "unknown"
     }]);
+    expect(offlineCache.clear).not.toHaveBeenCalled();
   });
 
   it("revokes another exact device but requires logout for the current mobile device", async () => {
     const network = fakeNetwork();
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: extendedSnapshot });
     const saved = memoryStorage([credential, otherCredential], credential.profileId);
-    const app = client(network, saved.storage);
+    const offlineCache = {
+      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined)
+    };
+    const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
 
     await expect(app.revokeDevice(credential.deviceId)).rejects.toThrow(/Log out/);
@@ -1866,6 +2137,7 @@ describe("native mobile connection and operation ownership", () => {
     });
     expect(saved.storage.deleteConnection).toHaveBeenCalledWith(otherCredential.profileId);
     expect(saved.key(otherCredential.profileId)).toBeUndefined();
+    expect(offlineCache.clear).toHaveBeenCalledWith(otherCredential.profileId);
     expect(saved.key(credential.profileId)).toEqual(credential);
     expect(app.state.status).toBe("connected");
   });

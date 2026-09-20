@@ -11,6 +11,7 @@ export interface SwipeableSessionRowProps {
   readonly onTogglePin: (session: Session) => void;
   readonly onArchive: (session: Session) => void;
   readonly onShowOptions: (session: Session) => void;
+  readonly disabled?: boolean;
   readonly children: ReactNode;
 }
 
@@ -24,6 +25,7 @@ export function SwipeableSessionRow({
   onTogglePin,
   onArchive,
   onShowOptions,
+  disabled = false,
   children
 }: SwipeableSessionRowProps) {
   const { width } = useWindowDimensions();
@@ -52,9 +54,15 @@ export function SwipeableSessionRow({
     translateX.stopAnimation();
     registry.onRowClose(rowKey);
   }, [registry, rowKey, translateX]);
+  useEffect(() => {
+    if (!disabled) return;
+    translateX.stopAnimation();
+    translateX.setValue(0);
+    registry.onRowClose(rowKey);
+  }, [disabled, registry, rowKey, translateX]);
 
   const panResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_event, gesture) => shouldClaimHorizontalSwipe(gesture.dx, gesture.dy),
+    onMoveShouldSetPanResponder: (_event, gesture) => !disabled && shouldClaimHorizontalSwipe(gesture.dx, gesture.dy),
     onPanResponderGrant: () => registry.onRowOpen(rowKey, close),
     onPanResponderMove: (_event, gesture) => translateX.setValue(Math.max(-width, Math.min(width, gesture.dx))),
     onPanResponderRelease: (_event, gesture) => {
@@ -76,11 +84,12 @@ export function SwipeableSessionRow({
       }
     },
     onPanResponderTerminate: close
-  }), [onArchive, onTogglePin, reducedMotion, registry, rowKey, session, translateX, width]);
+  }), [disabled, onArchive, onTogglePin, reducedMotion, registry, rowKey, session, translateX, width]);
 
   return <View style={styles.shell}>
     <View style={styles.leftActions}>
       <Pressable accessibilityRole="button" accessibilityLabel={session.pinned ? "Unpin task" : "Pin task"}
+        accessibilityState={{ disabled }} disabled={disabled}
         onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onTogglePin(session); })}
         style={[styles.roundAction, { backgroundColor: colors.accent }]}>
         <Text style={[styles.actionText, styles.darkText]}>{session.pinned ? "Unpin" : "Pin"}</Text>
@@ -88,11 +97,13 @@ export function SwipeableSessionRow({
     </View>
     <View style={styles.rightActions}>
       <Pressable accessibilityRole="button" accessibilityLabel="Task options"
+        accessibilityState={{ disabled }} disabled={disabled}
         onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onShowOptions(session); })}
         style={[styles.roundAction, { backgroundColor: colors.surface }]}>
         <Text style={[styles.actionText, { color: colors.ink }]}>More</Text>
       </Pressable>
       <Pressable accessibilityRole="button" accessibilityLabel={session.archived ? "Restore task" : "Archive task"}
+        accessibilityState={{ disabled }} disabled={disabled}
         onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onArchive(session); })}
         style={[styles.roundAction, { backgroundColor: colors.negative }]}>
         <Text style={[styles.actionText, styles.lightText]}>{session.archived ? "Restore" : "Archive"}</Text>
