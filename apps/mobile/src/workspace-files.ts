@@ -77,6 +77,16 @@ export type MobileFilePreview =
       readonly sha256Hex: string;
     })
   | (MobilePreviewBase & {
+      readonly kind: "pdf";
+      readonly mediaType: "application/pdf";
+      readonly leaseId: string;
+      readonly profileId: string;
+      readonly uri: string;
+      readonly fileName: string;
+      readonly localByteSize: number;
+      readonly sha256Hex: string;
+    })
+  | (MobilePreviewBase & {
       readonly kind: "unsupported";
       readonly reason: string;
     })

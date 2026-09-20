@@ -178,6 +178,9 @@ import { MobileImageLightbox } from "./MobileImageLightbox";
 import { MobileMediaPlayer } from "./MobileMediaPlayer";
 import type { MobileMediaPlayerStatus } from "./mobile-media-player";
 import { mobileMediaPreviewFiles } from "./mobile-media-preview";
+import { MobilePdfViewer } from "./MobilePdfViewer";
+import type { MobilePdfViewerStatus } from "./mobile-pdf-viewer";
+import { mobilePdfPreviewFiles } from "./mobile-pdf-preview";
 import type { MobileBurnedImage, MobileComposerImageEditorSession } from "./mobile-composer-image-editor";
 import type { MobileImageAnnotationStroke } from "./mobile-image-annotation";
 import {
@@ -212,7 +215,8 @@ const client = new MobileClient(
   mobileNewTaskDrafts,
   mobileComposerDrafts,
   mobileAttachmentFiles,
-  mobileMediaPreviewFiles
+  mobileMediaPreviewFiles,
+  mobilePdfPreviewFiles
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
@@ -4865,8 +4869,11 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
   onClose: () => void;
 }) {
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
+  const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
   const mediaLeaseId = preview?.kind === "media" ? preview.leaseId : undefined;
+  const pdfLeaseId = preview?.kind === "pdf" ? preview.leaseId : undefined;
   useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
+  useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
   return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={busy ? () => undefined : onClose}>
     <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       {preview && <>
@@ -4893,6 +4900,9 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
           {preview.kind === "media" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: mediaStatus?.state === "error" ? colors.negative : colors.muted }]}>
             {formatMobileMediaPlayerStatus(mediaStatus, preview.mediaKind)}
           </Text>}
+          {preview.kind === "pdf" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: pdfStatus?.state === "error" ? colors.negative : colors.muted }]}>
+            {formatMobilePdfViewerStatus(pdfStatus)}
+          </Text>}
         </View>
         {preview.kind === "loading" ? <Centered label="Loading the exact observed file revision…" colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
@@ -4916,6 +4926,25 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
               uri={preview.uri}
             />
           </View>
+          : preview.kind === "pdf" ? <View style={styles.pdfPreviewContainer}>
+            <MobilePdfViewer
+              key={preview.leaseId}
+              accent={colors.accent}
+              background={colors.background}
+              border={colors.border}
+              byteSize={preview.localByteSize}
+              fileName={preview.fileName}
+              ink={colors.ink}
+              instanceId={preview.leaseId}
+              muted={colors.muted}
+              onStatusChange={setPdfStatus}
+              sha256Hex={preview.sha256Hex}
+              style={styles.pdfPreview}
+              surface={colors.surface}
+              title={preview.title}
+              uri={preview.uri}
+            />
+          </View>
           : preview.kind === "text" ? <ScrollView style={styles.fill} contentContainerStyle={styles.textPreviewContainer}>
             {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>Preview is truncated to the authenticated byte window shown above.</Text>}
             <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || "(empty file)"}</Text>
@@ -4929,6 +4958,16 @@ function FilePreviewModal({ colors, preview, source, busy, onAdd, onOpenImage, o
       </>}
     </SafeAreaView>
   </Modal>;
+}
+
+function formatMobilePdfViewerStatus(status: MobilePdfViewerStatus | undefined): string {
+  if (!status) return "Verified PDF · preparing offline renderer";
+  if (status.state === "error") return status.error || "PDF preview failed";
+  if (status.state === "ready") return "Offline renderer ready";
+  if (status.state === "receiving") return "Transferring verified PDF";
+  if (status.state === "document") return `${status.pageCount} ${status.pageCount === 1 ? "page" : "pages"} · ${status.zoomPercent}%`;
+  if (status.state === "complete") return `All ${status.pageCount} pages rendered · ${status.zoomPercent}%`;
+  return `${status.renderedPages} of ${status.pageCount} pages rendered · ${status.zoomPercent}%`;
 }
 
 function formatMobileMediaPlayerStatus(
@@ -5504,6 +5543,8 @@ const styles = StyleSheet.create({
   imagePreview: { width: "100%", minHeight: 320, flex: 1 },
   mediaPreviewContainer: { flex: 1, minHeight: 280, paddingHorizontal: 12, paddingBottom: 12 },
   mediaPreview: { flex: 1, minHeight: 240, overflow: "hidden", borderRadius: 16 },
+  pdfPreviewContainer: { flex: 1, minHeight: 320, paddingHorizontal: 12, paddingBottom: 12 },
+  pdfPreview: { flex: 1, minHeight: 280, overflow: "hidden", borderRadius: 16 },
   textPreviewContainer: { paddingHorizontal: 16, paddingBottom: 36 },
   textPreview: { fontSize: 13, lineHeight: 20, fontFamily: Platform.select({ ios: "Menlo", android: "monospace" }) }
 });

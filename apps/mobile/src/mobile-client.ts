@@ -58,6 +58,11 @@ import {
   type MobileMediaPreviewLease
 } from "./mobile-media-preview";
 import {
+  isMobilePdfPreviewMediaType,
+  type MobilePdfPreviewFiles,
+  type MobilePdfPreviewLease
+} from "./mobile-pdf-preview";
+import {
   acceptedQueueItems,
   backendSupports,
   editQueueItemText,
@@ -469,6 +474,7 @@ export class MobileClient {
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
   #filesMediaPreview?: MobileMediaPreviewLease;
+  #filesPdfPreview?: MobilePdfPreviewLease;
   #filesWatchAbort?: AbortController;
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
   #queueEditLease?: MobileQueueEditLease;
@@ -488,7 +494,8 @@ export class MobileClient {
     private readonly newTaskDrafts?: MobileNewTaskDraftStore,
     private readonly composerDrafts?: MobileComposerDraftStore,
     private readonly attachmentFiles?: MobileAttachmentFiles,
-    private readonly mediaPreviewFiles?: MobileMediaPreviewFiles
+    private readonly mediaPreviewFiles?: MobileMediaPreviewFiles,
+    private readonly pdfPreviewFiles?: MobilePdfPreviewFiles
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -547,7 +554,7 @@ export class MobileClient {
       homeSearchStatus: "idle",
       homeSearchSessionIds: [],
       homeSearchError: undefined,
-      ...(this.#state.files.preview?.kind === "media"
+      ...(this.#state.files.preview?.kind === "media" || this.#state.files.preview?.kind === "pdf"
         ? { files: { ...this.#state.files, preview: undefined } }
         : {})
     };
@@ -1578,7 +1585,7 @@ export class MobileClient {
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
-    await this.#releaseFilesMediaPreview().catch(() => undefined);
+    await this.#releaseFilesBinaryPreviews().catch(() => undefined);
     if (!this.#currentFiles(this.#filesEpoch, context.key)) return;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = undefined;
@@ -1605,7 +1612,7 @@ export class MobileClient {
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
-    void this.#releaseFilesMediaPreview().catch(() => undefined);
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     const epoch = this.#filesEpoch;
     const location = { kind: "workspace" as const, path };
     this.#set({ files: {
@@ -1632,7 +1639,7 @@ export class MobileClient {
     }
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
-    void this.#releaseFilesMediaPreview().catch(() => undefined);
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     this.#set({ files: {
       ...this.#state.files,
       location: { kind: "generated" },
@@ -1769,8 +1776,9 @@ export class MobileClient {
     };
     this.#set({ files: { ...this.#state.files, preview: { ...base, kind: "loading" } } });
     let stagedMedia: MobileMediaPreviewLease | undefined;
+    let stagedPdf: MobilePdfPreviewLease | undefined;
     try {
-      await this.#releaseFilesMediaPreview();
+      await this.#releaseFilesBinaryPreviews();
       if (controller.signal.aborted || this.#filesPreviewAbort !== controller
         || !this.#currentFiles(epoch, context.key)) return;
       let preview: MobileFilePreview;
@@ -1812,6 +1820,25 @@ export class MobileClient {
           );
           preview = { ...base, kind: "media", ...stagedMedia };
         }
+      } else if (isMobilePdfPreviewMediaType(mediaType)) {
+        if (!this.pdfPreviewFiles) {
+          preview = { ...base, kind: "unsupported", reason: "PDF preview is unavailable on this mobile runtime." };
+        } else {
+          const download = await this.network.downloadBlob(context.credential, blob, controller.signal);
+          if (normalizeMediaType(download.mediaType) !== mediaType) {
+            throw new Error("The downloaded media type did not match the canonical Generated PDF Blob.");
+          }
+          stagedPdf = await this.pdfPreviewFiles.stage(
+            context.credential.profileId,
+            this.newId(),
+            blob.fileName || artifactTitle(current),
+            mediaType,
+            blob.sha256Hex,
+            download.bytes,
+            controller.signal
+          );
+          preview = { ...base, kind: "pdf", ...stagedPdf };
+        }
       } else {
         preview = { ...base, kind: "unsupported",
           reason: `No safe in-app preview is available for ${mediaType} (${blob.byteSize.toString(10)} bytes).` };
@@ -1819,13 +1846,17 @@ export class MobileClient {
       if (controller.signal.aborted || this.#filesPreviewAbort !== controller
         || !this.#currentFiles(epoch, context.key)) {
         if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
+        if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
         return;
       }
       this.#filesMediaPreview = stagedMedia;
+      this.#filesPdfPreview = stagedPdf;
       stagedMedia = undefined;
+      stagedPdf = undefined;
       this.#set({ files: { ...this.#state.files, preview } });
     } catch (error) {
       if (stagedMedia) await this.mediaPreviewFiles?.remove(stagedMedia).catch(() => undefined);
+      if (stagedPdf) await this.pdfPreviewFiles?.remove(stagedPdf).catch(() => undefined);
       if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
       this.#set({ files: { ...this.#state.files,
         preview: { ...base, kind: "error", reason: message(error) } } });
@@ -1837,7 +1868,7 @@ export class MobileClient {
   closeFilesPreview(): void {
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
-    void this.#releaseFilesMediaPreview().catch(() => undefined);
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
   }
 
@@ -6159,7 +6190,7 @@ export class MobileClient {
 
   #cancelFilesRequests(): void {
     if (this.#imageGallery?.source.kind === "files") this.#imageGallery = undefined;
-    void this.#releaseFilesMediaPreview().catch(() => undefined);
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     this.#filesEpoch += 1;
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
@@ -6173,10 +6204,15 @@ export class MobileClient {
     this.#filesRefreshTimer = undefined;
   }
 
-  async #releaseFilesMediaPreview(): Promise<void> {
-    const lease = this.#filesMediaPreview;
+  async #releaseFilesBinaryPreviews(): Promise<void> {
+    const mediaLease = this.#filesMediaPreview;
+    const pdfLease = this.#filesPdfPreview;
     this.#filesMediaPreview = undefined;
-    if (lease && this.mediaPreviewFiles) await this.mediaPreviewFiles.remove(lease);
+    this.#filesPdfPreview = undefined;
+    await Promise.all([
+      mediaLease && this.mediaPreviewFiles ? this.mediaPreviewFiles.remove(mediaLease) : Promise.resolve(),
+      pdfLease && this.pdfPreviewFiles ? this.pdfPreviewFiles.remove(pdfLease) : Promise.resolve()
+    ]);
   }
 
   async #loadFiles(
@@ -6266,7 +6302,7 @@ export class MobileClient {
   #scheduleFilesRefresh(context: MobileFilesContext, epoch: number): void {
     this.#filesPreviewAbort?.abort();
     this.#filesPreviewAbort = undefined;
-    void this.#releaseFilesMediaPreview().catch(() => undefined);
+    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     if (this.#state.files.preview) {
       this.#set({ files: { ...this.#state.files, preview: undefined } });
     }
@@ -6294,7 +6330,7 @@ export class MobileClient {
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
     try {
-      await this.#releaseFilesMediaPreview();
+      await this.#releaseFilesBinaryPreviews();
       if (controller.signal.aborted || this.#filesPreviewAbort !== controller
         || !this.#currentFiles(epoch, context.key)) return;
       const directory = await this.network.listWorkspaceDirectory(
@@ -6334,7 +6370,7 @@ export class MobileClient {
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
     try {
-      await this.#releaseFilesMediaPreview();
+      await this.#releaseFilesBinaryPreviews();
       if (controller.signal.aborted || this.#filesPreviewAbort !== controller
         || !this.#currentFiles(epoch, context.key)) return;
       await this.#finishWorkspacePreview(context, path, revision, title, controller, epoch);
@@ -6368,9 +6404,11 @@ export class MobileClient {
     if (controller.signal.aborted || this.#filesPreviewAbort !== controller
       || !this.#currentFiles(epoch, context.key)) {
       if (preview.kind === "media") await this.mediaPreviewFiles?.remove(preview).catch(() => undefined);
+      if (preview.kind === "pdf") await this.pdfPreviewFiles?.remove(preview).catch(() => undefined);
       return;
     }
     this.#filesMediaPreview = preview.kind === "media" ? preview : undefined;
+    this.#filesPdfPreview = preview.kind === "pdf" ? preview : undefined;
     this.#set({ files: { ...this.#state.files, preview } });
   }
 
@@ -6448,6 +6486,29 @@ export class MobileClient {
           signal
         );
         return { ...base, kind: "media", ...lease };
+      }
+      if (isMobilePdfPreviewMediaType(blobType)) {
+        if (blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
+          return { ...base, kind: "unsupported",
+            reason: `This PDF is ${blob.byteSize.toString(10)} bytes and exceeds the mobile preview limit.` };
+        }
+        if (!this.pdfPreviewFiles) {
+          return { ...base, kind: "unsupported", reason: "PDF preview is unavailable on this mobile runtime." };
+        }
+        const download = await this.network.downloadBlob(context.credential, blob, signal);
+        if (normalizeMediaType(download.mediaType) !== blobType) {
+          throw new Error("The downloaded media type did not match the canonical Workspace PDF Blob.");
+        }
+        const lease = await this.pdfPreviewFiles.stage(
+          context.credential.profileId,
+          this.newId(),
+          entry.relativePath,
+          blobType,
+          blob.sha256Hex,
+          download.bytes,
+          signal
+        );
+        return { ...base, kind: "pdf", ...lease };
       }
       return { ...base, kind: "unsupported",
         reason: `No safe in-app preview is available for ${blobType} (${blob.byteSize.toString(10)} bytes).` };

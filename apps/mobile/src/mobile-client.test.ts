@@ -31,6 +31,11 @@ import {
   type MobileMediaPreviewFileDriver,
   type MobileMediaPreviewFileSnapshot
 } from "./mobile-media-preview";
+import {
+  MobilePdfPreviewFiles,
+  type MobilePdfPreviewFileDriver,
+  type MobilePdfPreviewFileSnapshot
+} from "./mobile-pdf-preview";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
@@ -965,6 +970,33 @@ function mediaPreviewFixture(
   };
 }
 
+function pdfPreviewFixture(
+  sha256Hex = "f".repeat(64),
+  write?: (fileName: string, bytes: Uint8Array) => Promise<MobilePdfPreviewFileSnapshot>
+) {
+  const stored = new Map<string, Uint8Array>();
+  const removed: string[] = [];
+  const driver: MobilePdfPreviewFileDriver = {
+    prepare: vi.fn(async () => { stored.clear(); }),
+    write: vi.fn(async (fileName, bytes) => {
+      if (write) return write(fileName, bytes);
+      const exact = Uint8Array.from(bytes);
+      stored.set(fileName, exact);
+      return { uri: `file:///pdf/${fileName}`, fileName, byteSize: exact.byteLength, bytes: exact };
+    }),
+    remove: vi.fn(async (snapshot) => {
+      removed.push(snapshot.fileName);
+      stored.delete(snapshot.fileName);
+    })
+  };
+  return {
+    files: new MobilePdfPreviewFiles(driver, async () => sha256Hex),
+    driver,
+    removed,
+    stored
+  };
+}
+
 function fixedIds(...values: readonly string[]): () => string {
   let index = 0;
   return () => values[index++] ?? `fallback-${index}`;
@@ -984,6 +1016,12 @@ function previewMp4Bytes(handler: "soun" | "vide" = "vide"): Uint8Array {
 const previewWavBytes = new Uint8Array([
   0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45
 ]);
+
+function previewPdfBytes(): Uint8Array {
+  const body = "%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n";
+  const xref = new TextEncoder().encode(body).byteLength;
+  return new TextEncoder().encode(`${body}xref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000060 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+}
 
 function galleryPngBytes(width: number, height: number): Uint8Array {
   const bytes = new Uint8Array(45);
@@ -1087,10 +1125,11 @@ function client(
   clearInteractionDraft?: (identity: MobileInteractionDraftIdentity) => Promise<void>,
   drafts = memoryDraftStores(),
   attachmentFiles?: MobileAttachmentFiles,
-  mediaPreviewFiles?: MobileMediaPreviewFiles
+  mediaPreviewFiles?: MobileMediaPreviewFiles,
+  pdfPreviewFiles?: MobilePdfPreviewFiles
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
-    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles);
+    clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles);
   clients.push(instance);
   return instance;
 }
@@ -5701,6 +5740,134 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.open).toBe(false);
     expect(app.state.files.preview).toBeUndefined();
     expect(media.removed).toEqual(["preview-late-media-lease.mp4"]);
+  });
+
+  it("materializes an authenticated Generated PDF into an app-owned renderer lease and cleans it on background", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewPdfBytes();
+    const artifact = create(ArtifactSchema, {
+      artifactId: "pdf-1",
+      sessionId: "session",
+      kind: ArtifactKind.FILE,
+      title: "Proof",
+      blob: {
+        blobId: "pdf-blob",
+        fileName: "proof.pdf",
+        mediaType: "application/pdf",
+        byteSize: BigInt(bytes.byteLength),
+        sha256Hex: "f".repeat(64),
+        disposition: BlobDisposition.INLINE
+      }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "artifacts-pdf" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/pdf" });
+    const pdf = pdfPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "pdf-lease-1", undefined, undefined, undefined, undefined, pdf.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewArtifact(app.state.files.artifacts[0]!);
+
+    expect(app.state.files.preview).toMatchObject({
+      kind: "pdf",
+      mediaType: "application/pdf",
+      leaseId: "pdf-lease-1",
+      uri: "file:///pdf/preview-pdf-lease-1.pdf",
+      fileName: "preview-pdf-lease-1.pdf",
+      sha256Hex: "f".repeat(64)
+    });
+    expect(network.downloadBlob).toHaveBeenCalledWith(credential, artifact.blob, expect.any(AbortSignal));
+    expect(pdf.driver.write).toHaveBeenCalledWith("preview-pdf-lease-1.pdf", bytes);
+
+    app.setForeground(false);
+    await vi.waitFor(() => expect(pdf.removed).toEqual(["preview-pdf-lease-1.pdf"]));
+    expect(app.state.files.preview).toBeUndefined();
+  });
+
+  it("previews an exact Workspace PDF Blob and rejects malformed structure before cache write", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewPdfBytes();
+    const pdfRevision = create(FileRevisionSchema, {
+      opaqueRevision: "pdf-revision",
+      sha256Hex: "f".repeat(64),
+      byteSize: BigInt(bytes.byteLength)
+    });
+    const pdfEntry = create(WorkspaceEntrySchema, {
+      workspaceId: "workspace",
+      relativePath: "docs/proof.pdf",
+      displayName: "proof.pdf",
+      kind: FileKind.REGULAR,
+      mediaType: "application/pdf",
+      revision: pdfRevision
+    });
+    const pdfBlob = create(BlobRefSchema, {
+      blobId: "workspace-pdf",
+      fileName: "proof.pdf",
+      mediaType: "application/pdf",
+      byteSize: BigInt(bytes.byteLength),
+      sha256Hex: "f".repeat(64),
+      disposition: BlobDisposition.INLINE
+    });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [pdfEntry], revision: "directory-pdf" });
+    vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [pdfEntry.relativePath], revision: "index-pdf", truncated: false });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+      entry: pdfEntry,
+      content: { case: "blob", value: pdfBlob }
+    }));
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/pdf" });
+    const pdf = pdfPreviewFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "workspace-pdf-lease", undefined, undefined, undefined, undefined, pdf.files);
+    await app.start();
+    await app.openFiles();
+
+    await app.previewWorkspaceEntry(app.state.files.entries[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "pdf", leaseId: "workspace-pdf-lease" });
+
+    app.closeFilesPreview();
+    vi.mocked(network.downloadBlob).mockResolvedValue({
+      bytes: Uint8Array.from(bytes, (value, index) => index === 1 ? 0x58 : value),
+      mediaType: "application/pdf"
+    });
+    await app.previewWorkspaceEntry(app.state.files.entries[0]!);
+    expect(app.state.files.preview).toMatchObject({ kind: "error", reason: expect.stringMatching(/header/u) });
+    expect(pdf.driver.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes a late PDF staged after Files closes without adopting it", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const bytes = previewPdfBytes();
+    const artifact = create(ArtifactSchema, {
+      artifactId: "pdf-late",
+      sessionId: "session",
+      kind: ArtifactKind.FILE,
+      title: "Late proof",
+      blob: { blobId: "pdf-late-blob", fileName: "late.pdf", mediaType: "application/pdf",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: "f".repeat(64), disposition: BlobDisposition.INLINE }
+    });
+    vi.mocked(network.listSessionArtifacts).mockResolvedValue({ artifacts: [artifact], revision: "artifacts-pdf-late" });
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "application/pdf" });
+    let resolveWrite!: (snapshot: MobilePdfPreviewFileSnapshot) => void;
+    const pdf = pdfPreviewFixture("f".repeat(64), async () => new Promise((resolve) => { resolveWrite = resolve; }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "late-pdf-lease", undefined, undefined, undefined, undefined, pdf.files);
+    await app.start();
+    await app.openFiles();
+
+    const preview = app.previewArtifact(app.state.files.artifacts[0]!);
+    await vi.waitFor(() => expect(pdf.driver.write).toHaveBeenCalled());
+    app.closeFiles();
+    resolveWrite({ uri: "file:///pdf/preview-late-pdf-lease.pdf", fileName: "preview-late-pdf-lease.pdf",
+      byteSize: bytes.byteLength, bytes });
+    await preview;
+
+    expect(app.state.files.open).toBe(false);
+    expect(app.state.files.preview).toBeUndefined();
+    expect(pdf.removed).toEqual(["preview-late-pdf-lease.pdf"]);
   });
 
   it("adds an authenticated Workspace Blob as an exact-profile attachment without replacing structured draft state", async () => {

@@ -202,6 +202,9 @@ importers:
       expo-status-bar:
         specifier: 57.0.1
         version: 57.0.1(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(react@19.2.3)(supports-color@8.1.1))(react@19.2.3)
+      pdfjs-dist:
+        specifier: 5.7.284
+        version: 5.7.284
       react:
         specifier: 19.2.3
         version: 19.2.3
@@ -224,6 +227,12 @@ importers:
       '@types/react-dom':
         specifier: 19.2.2
         version: 19.2.2(@types/react@19.2.2)
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
+      jsdom:
+        specifier: 26.1.0
+        version: 26.1.0(supports-color@8.1.1)
       react-dom:
         specifier: 19.2.3
         version: 19.2.3(react@19.2.3)
