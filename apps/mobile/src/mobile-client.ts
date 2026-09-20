@@ -1777,7 +1777,7 @@ export class MobileClient {
       attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
     );
     const snapshot = await this.composerDrafts.readSnapshot(identity);
-    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], atoms: [], attachments: [] });
     this.#assertFilesComposerLease(
       context, epoch, taskAuthorityKey, identity, source,
       attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
@@ -1983,7 +1983,7 @@ export class MobileClient {
       throw new Error("The selected file is not available in this canonical image gallery.");
     }
     const snapshot = await this.composerDrafts.readSnapshot(identity);
-    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], atoms: [], attachments: [] });
     assertCurrent();
     const leaseId = distinctAttachmentStorageId(this.newId, ...mobileComposerAttachmentStorageIds(draft.attachments));
     const descriptor: MobileImageGalleryDescriptor = {
@@ -2043,7 +2043,7 @@ export class MobileClient {
     }
     const identity = { profileId: credential.profileId, sessionId };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
-    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+    const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], atoms: [], attachments: [] });
     signal?.throwIfAborted();
     if (this.#taskAuthorityKey() !== taskAuthorityKey) throw new Error("The task changed while the image gallery was opening.");
     const attachmentOwnerKey = this.taskAttachmentControls()?.surfaceOwnerKey;
@@ -3293,7 +3293,7 @@ export class MobileClient {
       }
       const identity = { profileId: credential.profileId, sessionId };
       const snapshot = await this.composerDrafts.readSnapshot(identity);
-      const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+      const draft = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], atoms: [], attachments: [] });
       owner = { kind: "task", authorityKey, identity, snapshot, draft };
     } else {
       controls = this.newTaskAttachmentControls(request.targetId);
@@ -4998,7 +4998,7 @@ export class MobileClient {
     const snapshot = await this.composerDrafts!.readSnapshot(lease.identity);
     signal?.throwIfAborted();
     if (this.#imageGallery !== lease) throw new Error("The image gallery was closed before the operation completed.");
-    const current = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], attachments: [] });
+    const current = normalizeMobileComposerDraft(snapshot.draft ?? { text: "", mentions: [], atoms: [], attachments: [] });
     if (expectedCommitted === undefined) {
       if (snapshot.revision !== lease.snapshot.revision || !mobileComposerDraftsEqual(current, lease.draft)) {
         throw new Error("The task composer changed while the image gallery was open.");

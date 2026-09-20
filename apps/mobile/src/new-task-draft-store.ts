@@ -63,9 +63,9 @@ export interface MobileNewTaskDraftSnapshot {
   readonly draft?: MobileNewTaskDraft;
 }
 
-const storagePrefix = "joko.mobile.new-task-draft.v3";
+const storagePrefix = "joko.mobile.new-task-draft.v4";
 const persistDebounceMilliseconds = 400;
-const maximumStoredCharacters = 1_040_960;
+const maximumStoredCharacters = 12_110_000;
 
 export class MobileNewTaskDraftStore {
   readonly #memory = new Map<string, MobileNewTaskDraft>();
@@ -465,7 +465,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
 function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskDraft): string {
   const exact = normalizeDraft(draft);
   const serialized = JSON.stringify({
-    version: 3,
+    version: 4,
     identity: normalizeIdentity(identity),
     draft: exact.submission === undefined
       ? exact
@@ -478,13 +478,15 @@ function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewT
 function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
   if (serialized.length > maximumStoredCharacters) throw new Error("saved new-task draft is too large");
   const value: unknown = JSON.parse(serialized);
-  if (!isRecord(value) || value["version"] !== 3 || !isRecord(value["identity"])
+  if (!isRecord(value) || value["version"] !== 4 || !isRecord(value["identity"])
     || value["identity"]["profileId"] !== identity.profileId) {
     throw new Error("new-task draft identity mismatch");
   }
   const draft = value["draft"];
   if (!isRecord(draft) || typeof draft["targetId"] !== "string" || typeof draft["name"] !== "string"
-    || !isRecord(draft["input"])) throw new Error("invalid new-task draft envelope");
+    || !isRecord(draft["input"]) || !Array.isArray(draft["input"]["atoms"])) {
+    throw new Error("invalid new-task draft envelope");
+  }
   const editable = normalizeEditableDraft({
     targetId: draft["targetId"],
     name: draft["name"],

@@ -34,6 +34,16 @@ describe("mobile message action sheet", () => {
     ]);
     expect(buildMobileMessageActions({ ...row, completed: false }, { canDelete: true })).toEqual([]);
     expect(buildMobileMessageActions({ ...row, kind: "status" }, { canDelete: true })).toEqual([]);
+    expect(buildMobileMessageActions({
+      ...row,
+      kind: "assistant",
+      label: "Assistant",
+      quoteSource: { sourceMessageId: row.id, sourceEventId: row.eventId, text: row.text }
+    }, { canDelete: true })).toEqual([
+      { id: "add-to-composer", label: "Add to composer" },
+      { id: "quote-selection", label: "Quote selection" },
+      { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
+    ]);
   });
 
   it("runs a choice only after its matching close and cancels an old choice on reopen", () => {
@@ -91,6 +101,28 @@ describe("mobile accepted Queue actions", () => {
     expect(queueItemHasStructuredInput(create(InputContentSchema, {
       parts: [create(InputPartSchema, { content: { case: "text", value: "plain" } })]
     }))).toBe(false);
+  });
+
+  it("opens quote-bearing Queue input markerless and replaces the exact raw body only after a real edit", () => {
+    const raw = "> <!-- joko-selection-quote -->\n> quoted\n\nKeep this";
+    const structured = create(InputContentSchema, {
+      parts: [create(InputPartSchema, { content: { case: "text", value: raw } })],
+      quotesEncoded: true
+    });
+    expect(queueItemText(structured)).toBe("> quoted\n\nKeep this");
+    expect(editQueueItemText(structured, "> quoted\n\nKeep this")).toBeUndefined();
+    const edited = editQueueItemText(structured, "> quoted\n\nKeep that");
+    expect(edited?.input).toMatchObject({
+      quotesEncoded: false,
+      pastedTextRanges: [],
+      mentionRanges: [],
+      parts: [{ content: { case: "text", value: "> quoted\n\nKeep that" } }]
+    });
+    expect(edited?.textSplices).toMatchObject([{
+      start: 0,
+      end: raw.length,
+      replacementText: "> quoted\n\nKeep that"
+    }]);
   });
 
   it("branches only on public capabilities", () => {

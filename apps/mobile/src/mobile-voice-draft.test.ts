@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  appendMobileSelectionQuote,
+  insertMobilePastedText,
   insertMobileSessionMention,
   mobileComposerDraftsEqual,
   plainTextMobileComposerDraft
@@ -65,5 +67,60 @@ describe("mobile voice draft projection", () => {
     );
     expect(late).toEqual({});
     expect(rollbackMobileVoiceTranscript(externallyChanged, partial.context!)).toBeUndefined();
+  });
+
+  it("restores an exact pasted-text atom when a cancellable transcript replaced its token", () => {
+    const base = insertMobilePastedText(
+      plainTextMobileComposerDraft("Before "),
+      { start: 7, end: 7 },
+      "line\n".repeat(24),
+      "paste"
+    ).draft;
+    const atom = base.atoms[0]!;
+    const partial = applyMobileVoiceTranscript(
+      base,
+      { start: atom.start, end: atom.end },
+      undefined,
+      "dictated",
+      false,
+      "draft-one"
+    );
+    expect(partial.draft?.atoms).toEqual([]);
+    expect(partial.context?.rollbackAtoms).toHaveLength(1);
+    const restored = rollbackMobileVoiceTranscript(partial.draft!, partial.context!);
+    expect(restored).toBeDefined();
+    expect(mobileComposerDraftsEqual(restored!.draft, base)).toBe(true);
+  });
+
+  it("keeps a quote block isolated while dictating after it and removes the boundary on rollback", () => {
+    const base = appendMobileSelectionQuote(plainTextMobileComposerDraft(""), {
+      sourceSessionId: "task",
+      sourceMessageId: "message",
+      sourceEventId: "event",
+      sourceRole: "assistant",
+      text: "quoted"
+    }, "quote").draft;
+    const partial = applyMobileVoiceTranscript(
+      base,
+      { start: base.text.length, end: base.text.length },
+      undefined,
+      "answer",
+      false,
+      "draft-one"
+    );
+    expect(partial.draft?.text).toBe("⟦Quote from Assistant⟧\n\nanswer");
+    expect(partial.context?.insertion.text).toBe("\n\nanswer");
+    const updated = applyMobileVoiceTranscript(
+      partial.draft!,
+      partial.selection!,
+      partial.context,
+      "better answer",
+      true,
+      "draft-one"
+    );
+    expect(updated.draft?.text).toBe("⟦Quote from Assistant⟧\n\nbetter answer");
+    const restored = rollbackMobileVoiceTranscript(updated.draft!, updated.context!);
+    expect(restored).toBeDefined();
+    expect(mobileComposerDraftsEqual(restored!.draft, base)).toBe(true);
   });
 });

@@ -6,7 +6,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   BlobDisposition, CapabilitySupport, CompactSessionOutcome, CompactionState, ConnectionState, DeviceKind,
   DismissInteractionMutationSchema, EntityKind, EntityRefSchema,
-  EventCursorSchema, ImageRefSchema, InputMentionRangeSchema, InputPartSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
+  EventCursorSchema, ImageRefSchema, InlineTextRangeSchema, InputMentionRangeSchema, InputPartSchema, InteractionResolutionSchema, InteractionState, NativeNavigationTargetSchema,
   NavigateSessionBranchMutationSchema, OperationMutationSchema,
   LogoutConnectionMutationSchema, OperationPreconditionSchema, OperationState, PlanReviewDecisionKind,
   PermissionMode,
@@ -504,6 +504,103 @@ describe("native mobile device through the durable product chain", () => {
       text: "",
       images: [{ blob: { id: image.blobId, fileName: "pixel.png", mimeType: "image/png" }, alt: "pixel.png" }],
       files: [{ blob: { id: file.blobId, fileName: "proof.pdf", mimeType: "application/pdf" } }]
+    });
+  });
+
+  it("preserves mobile selection quotes and long-paste ranges through HTTP, SQLite, and dispatch", async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
+    });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko structured-composer phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge?.challengeId;
+    if (!challengeId) throw new Error("The mobile structured-composer fixture did not return a pairing challenge.");
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko structured-composer phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result;
+    if (!paired?.authKey || !paired.connection?.connectionId) {
+      throw new Error("The mobile structured-composer fixture did not pair.");
+    }
+    const clients = fixture.clients(paired.authKey);
+    const connectionId = paired.connection.connectionId;
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: PI_LIKE_PROFILE.id,
+      targetId: fixture.targetId(),
+      displayName: "Mobile structured composer"
+    })));
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const pastedText = Array.from({ length: 25 }, (_, index) => `pasted line ${index + 1}`).join("\n");
+    const prefix = "> <!-- joko-selection-quote -->\n> Exact assistant selection\n\nReview this material:\n";
+    const suffix = "\nThen summarize it.";
+    const text = `${prefix}${pastedText}${suffix}`;
+    const pastedRange = {
+      start: prefix.length,
+      end: prefix.length + pastedText.length,
+      display: "Pasted text (25 lines)"
+    };
+    const mutation = sendInputMutation(sessionId, generation, text);
+    if (mutation.payload.case !== "sendInput" || mutation.payload.value.input === undefined) {
+      throw new Error("The mobile structured-composer mutation has no InputContent.");
+    }
+    mutation.payload.value.input.quotesEncoded = true;
+    mutation.payload.value.input.pastedTextRanges.push(create(InlineTextRangeSchema, pastedRange));
+
+    const sent = await submit(clients.operation, connectionId, mutation);
+    const queued = queueItemFrom(sent);
+    expect(queued.input).toMatchObject({
+      quotesEncoded: true,
+      pastedTextRanges: [pastedRange],
+      parts: [{ content: { case: "text", value: text } }]
+    });
+    expect(fixture.application.store.getQueueItem(queued.queueItemId).body).toMatchObject({
+      text,
+      quotesEncoded: true,
+      pastedTextRanges: [pastedRange]
+    });
+
+    await waitFor(
+      () => clients.run.getRun({ runId: queueRunIdFrom(sent) }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      "mobile selection-quote and long-paste dispatch"
+    );
+    const acceptedEvent = fixture.application.store.listEvents({ sessionId }).find((event) =>
+      event.runId === queued.runId && event.payload.type === "message_complete"
+      && event.payload.role === "user" && event.payload.acceptedInput !== undefined);
+    expect(acceptedEvent?.payload).toMatchObject({
+      type: "message_complete",
+      acceptedInput: { text, quotesEncoded: true, pastedTextRanges: [pastedRange] }
+    });
+    const timeline = await waitFor(
+      () => clients.session.listSessionTimeline({ sessionId, limit: 120 }),
+      (value) => value.events.some((event) => event.identity?.runId === queued.runId
+        && event.payload?.kind.case === "messageStarted"
+        && event.payload.kind.value.role === MessageRole.USER
+        && event.payload.kind.value.userInputAccepted),
+      "accepted mobile selection-quote and long-paste input"
+    );
+    const accepted = timeline.events.find((event) => event.identity?.runId === queued.runId
+      && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.role === MessageRole.USER);
+    if (accepted?.payload?.kind.case !== "messageStarted") {
+      throw new Error("The mobile structured-composer input was not projected.");
+    }
+    expect(accepted.payload.kind.value.userInput).toMatchObject({
+      quotesEncoded: true,
+      pastedTextRanges: [pastedRange],
+      parts: [{ content: { case: "text", value: text } }]
+    });
+    expect(fixture.adapter().sendCalls.at(-1)).toMatchObject({
+      text,
+      quotesEncoded: true,
+      pastedTextRanges: [pastedRange]
     });
   });
 

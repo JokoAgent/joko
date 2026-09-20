@@ -4,6 +4,7 @@ import {
   BlobDisposition,
   BlobRefSchema,
   ImageRefSchema,
+  InlineTextRangeSchema,
   InputContentSchema,
   InputMentionRangeSchema,
   InputPartSchema,
@@ -76,9 +77,32 @@ export type MobileComposerMention = MobileComposerSessionMention
   | MobileComposerResourceMention
   | MobileComposerArtifactMention;
 
+export interface MobileComposerQuoteAtom {
+  readonly kind: "quote";
+  readonly atomId: string;
+  readonly sourceSessionId: string;
+  readonly sourceMessageId: string;
+  readonly sourceEventId: string;
+  readonly sourceRole: "assistant";
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+export interface MobileComposerPastedTextAtom {
+  readonly kind: "pasted-text";
+  readonly atomId: string;
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+export type MobileComposerAtom = MobileComposerQuoteAtom | MobileComposerPastedTextAtom;
+
 export interface MobileComposerDraft {
   readonly text: string;
   readonly mentions: readonly MobileComposerMention[];
+  readonly atoms: readonly MobileComposerAtom[];
   readonly attachments: readonly MobileComposerAttachment[];
 }
 
@@ -93,22 +117,32 @@ export interface MobileComposerEditResult {
 }
 
 const maximumDraftCharacters = 1_000_000;
+export const mobileLongPasteLineThreshold = 24;
+export const mobileLongPasteCharacterThreshold = 4_000;
+export const mobileLongPasteMaximumCharacters = 2_000_000;
+export const mobileComposerNativeInputMaximumCharacters = maximumDraftCharacters + mobileLongPasteMaximumCharacters;
+export const mobileSelectionQuoteMaximumCharacters = 4_000;
+export const mobileSelectionQuoteMarker = "<!-- joko-selection-quote -->";
+export const mobileSelectionQuoteMarkerLine = `> ${mobileSelectionQuoteMarker}`;
+const maximumComposerAtoms = 1_024;
+const maximumSelectionQuotes = 32;
+const maximumSerializedCharacters = 2_000_000;
 const maximumSessionMentions = 8;
 const maximumDisplayCharacters = 256;
 const maximumLineNumber = 0xffff_ffff;
 const maximumUint64 = 18_446_744_073_709_551_615n;
 
 export function emptyMobileComposerDraft(): MobileComposerDraft {
-  return { text: "", mentions: [], attachments: [] };
+  return { text: "", mentions: [], atoms: [], attachments: [] };
 }
 
 export function plainTextMobileComposerDraft(text: string): MobileComposerDraft {
-  return normalizeMobileComposerDraft({ text, mentions: [], attachments: [] });
+  return normalizeMobileComposerDraft({ text, mentions: [], atoms: [], attachments: [] });
 }
 
 export function normalizeMobileComposerDraft(value: MobileComposerDraft): MobileComposerDraft {
   if (!value || typeof value !== "object" || typeof value.text !== "string"
-    || !Array.isArray(value.mentions) || !Array.isArray(value.attachments)) {
+    || !Array.isArray(value.mentions) || !Array.isArray(value.atoms) || !Array.isArray(value.attachments)) {
     throw new Error("The local Joko structured task draft is invalid.");
   }
   if (value.text.length > maximumDraftCharacters) {
@@ -116,6 +150,12 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   }
   if (value.mentions.filter((mention) => mention?.kind === "session").length > maximumSessionMentions) {
     throw new Error("A task message can reference at most 8 other tasks.");
+  }
+  if (value.atoms.length > maximumComposerAtoms) {
+    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured quote or paste items.`);
+  }
+  if (value.atoms.filter((atom) => atom?.kind === "quote").length > maximumSelectionQuotes) {
+    throw new Error(`A task message can contain at most ${maximumSelectionQuotes} selected-text quotes.`);
   }
   const mentionIds = new Set<string>();
   let previousEnd = 0;
@@ -150,8 +190,46 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
       end: candidate.end
     };
   });
+  const atomIds = new Set<string>();
+  previousEnd = 0;
+  const atoms = value.atoms.map((candidate) => {
+    if (!candidate || typeof candidate !== "object"
+      || (candidate.kind !== "quote" && candidate.kind !== "pasted-text")) {
+      throw new Error("The local Joko composer atom is invalid.");
+    }
+    assertIdentity(candidate.atomId, "composer atom occurrence");
+    if (atomIds.has(candidate.atomId)) throw new Error("The local Joko composer atom occurrence is duplicated.");
+    atomIds.add(candidate.atomId);
+    const normalized = candidate.kind === "quote"
+      ? normalizeQuoteAtom(candidate)
+      : normalizePastedTextAtom(candidate);
+    if (!Number.isSafeInteger(candidate.start) || !Number.isSafeInteger(candidate.end)
+      || candidate.start < previousEnd || candidate.start < 0 || candidate.end <= candidate.start
+      || candidate.end > value.text.length || !isUtf16Boundary(value.text, candidate.start)
+      || !isUtf16Boundary(value.text, candidate.end)
+      || value.text.slice(candidate.start, candidate.end) !== mobileComposerAtomToken(normalized)) {
+      throw new Error("The local Joko composer atom range is invalid.");
+    }
+    previousEnd = candidate.end;
+    return { ...normalized, atomId: candidate.atomId, start: candidate.start, end: candidate.end };
+  });
+  for (const atom of atoms) {
+    if (atom.kind !== "quote") continue;
+    const separatedBefore = atom.start === 0 || value.text.slice(atom.start - 2, atom.start) === "\n\n";
+    const separatedAfter = atom.end === value.text.length || value.text.slice(atom.end, atom.end + 2) === "\n\n";
+    if (!separatedBefore || !separatedAfter) {
+      throw new Error("A Joko message quote must remain a separate composer block.");
+    }
+  }
+  for (const mention of mentions) {
+    if (atoms.some((atom) => mention.start < atom.end && mention.end > atom.start)) {
+      throw new Error("A Joko reference cannot overlap a quote or pasted-text atom.");
+    }
+  }
   const attachments = normalizeMobileComposerAttachmentSet(value.attachments);
-  return { text: value.text, mentions, attachments };
+  const draft = { text: value.text, mentions, atoms, attachments };
+  serializeMobileComposerText(draft);
+  return draft;
 }
 
 export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComposerDraft {
@@ -161,6 +239,7 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
     mentions: exact.mentions.map((mention) => mention.kind === "workspace" && mention.lineRange !== undefined
       ? { ...mention, lineRange: { ...mention.lineRange } }
       : { ...mention }),
+    atoms: exact.atoms.map((atom) => ({ ...atom })),
     attachments: exact.attachments.map(cloneMobileComposerAttachment)
   };
 }
@@ -169,6 +248,7 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
   const first = normalizeMobileComposerDraft(left);
   const second = normalizeMobileComposerDraft(right);
   return first.text === second.text && first.mentions.length === second.mentions.length
+    && first.atoms.length === second.atoms.length
     && first.attachments.length === second.attachments.length
     && first.attachments.every((attachment, index) => {
       const candidate = second.attachments[index];
@@ -179,6 +259,16 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
       return candidate !== undefined && mention.kind === candidate.kind && mention.mentionId === candidate.mentionId
         && mention.displayText === candidate.displayText && mention.start === candidate.start && mention.end === candidate.end
         && sameMentionAuthority(mention, candidate);
+    })
+    && first.atoms.every((atom, index) => {
+      const candidate = second.atoms[index];
+      return candidate !== undefined && atom.kind === candidate.kind && atom.atomId === candidate.atomId
+        && atom.text === candidate.text && atom.start === candidate.start && atom.end === candidate.end
+        && (atom.kind === "pasted-text" || candidate.kind === "quote"
+          && atom.sourceSessionId === candidate.sourceSessionId
+          && atom.sourceMessageId === candidate.sourceMessageId
+          && atom.sourceEventId === candidate.sourceEventId
+          && atom.sourceRole === candidate.sourceRole);
     });
 }
 
@@ -196,12 +286,35 @@ export function mobileWorkspaceMentionToken(input: {
   return range === undefined ? label : `${label}:${range.startLine}–${range.endLine}`;
 }
 
+export function mobileComposerAtomToken(atom: Pick<MobileComposerAtom, "kind" | "text">): string {
+  if (atom.kind === "quote") return "⟦Quote from Assistant⟧";
+  const lines = mobilePastedTextLineCount(atom.text);
+  return `⟦Pasted text (${lines} ${lines === 1 ? "line" : "lines"})⟧`;
+}
+
+export function mobileComposerAtomLabel(atom: Pick<MobileComposerAtom, "kind" | "text">): string {
+  return atom.kind === "quote"
+    ? "Quote from Assistant"
+    : mobileComposerAtomToken(atom).slice(1, -1);
+}
+
+export function isLongMobileComposerPaste(text: string): boolean {
+  if (typeof text !== "string") return false;
+  if (text.length >= mobileLongPasteCharacterThreshold) return true;
+  let lines = 1;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) === 10 && ++lines >= mobileLongPasteLineThreshold) return true;
+  }
+  return false;
+}
+
 export function reconcileMobileComposerText(
   draft: MobileComposerDraft,
-  nextText: string
+  nextText: string,
+  atomId?: string
 ): MobileComposerEditResult {
   const current = normalizeMobileComposerDraft(draft);
-  if (typeof nextText !== "string" || nextText.length > maximumDraftCharacters) {
+  if (typeof nextText !== "string" || nextText.length > mobileComposerNativeInputMaximumCharacters) {
     throw new Error("The local Joko structured task draft is too large.");
   }
   if (current.text === nextText) {
@@ -217,6 +330,25 @@ export function reconcileMobileComposerText(
     || !isUtf16Boundary(nextText, nextText.length - suffix))) suffix -= 1;
   const oldEnd = current.text.length - suffix;
   const inserted = nextText.slice(prefix, nextText.length - suffix);
+  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === prefix);
+  if (inserted && oldEnd === prefix && quoteBefore && quoteBefore.end === current.text.length) {
+    if (atomId !== undefined && isLongMobileComposerPaste(inserted)) {
+      const separated = replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, "\n\n");
+      return insertMobilePastedText(separated.draft, separated.selection, inserted, atomId);
+    }
+    return replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, `\n\n${inserted}`);
+  }
+  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === prefix);
+  if (inserted && oldEnd === prefix && quoteAfter && quoteAfter.start === 0) {
+    if (atomId !== undefined && isLongMobileComposerPaste(inserted)) {
+      const separated = replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, "\n\n");
+      return insertMobilePastedText(separated.draft, { start: 0, end: 0 }, inserted, atomId);
+    }
+    return replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, `${inserted}\n\n`);
+  }
+  if (atomId !== undefined && isLongMobileComposerPaste(inserted)) {
+    return insertMobilePastedText(current, { start: prefix, end: oldEnd }, inserted, atomId);
+  }
   return replaceMobileComposerRange(current, { start: prefix, end: oldEnd }, inserted);
 }
 
@@ -314,6 +446,114 @@ export function insertMobileArtifactMention(
   return insertMobileComposerMention(current, range, { ...mention, mentionId, start: 0, end: 0 });
 }
 
+export function appendMobileSelectionQuote(
+  draft: MobileComposerDraft,
+  quote: {
+    readonly sourceSessionId: string;
+    readonly sourceMessageId: string;
+    readonly sourceEventId: string;
+    readonly sourceRole: "assistant";
+    readonly text: string;
+  },
+  atomId: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  assertIdentity(atomId, "composer atom occurrence");
+  const normalizedText = normalizedSelectionQuoteText(quote.text);
+  if (normalizedText === undefined) throw new Error("Select non-empty assistant text before adding a quote.");
+  if (normalizedText.length > mobileSelectionQuoteMaximumCharacters) {
+    throw new Error(`A selected quote can contain at most ${mobileSelectionQuoteMaximumCharacters.toLocaleString("en-US")} characters.`);
+  }
+  const atom = normalizeQuoteAtom({
+    kind: "quote",
+    atomId,
+    sourceSessionId: quote.sourceSessionId,
+    sourceMessageId: quote.sourceMessageId,
+    sourceEventId: quote.sourceEventId,
+    sourceRole: quote.sourceRole,
+    text: normalizedText,
+    start: 0,
+    end: 0
+  });
+  const separator = current.text.length === 0 ? "" : "\n\n";
+  return insertMobileComposerAtom(
+    current,
+    { start: current.text.length, end: current.text.length },
+    { ...atom, atomId },
+    separator,
+    ""
+  );
+}
+
+export function insertMobileClipboardText(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  text: string,
+  atomId: string
+): MobileComposerEditResult {
+  if (typeof text !== "string" || text.length === 0) throw new Error("The clipboard does not contain text.");
+  if (text.length > mobileLongPasteMaximumCharacters) {
+    throw new Error(`Pasted text can contain at most ${mobileLongPasteMaximumCharacters.toLocaleString("en-US")} characters.`);
+  }
+  if (isLongMobileComposerPaste(text)) return insertMobilePastedText(draft, selection, text, atomId);
+  const current = normalizeMobileComposerDraft(draft);
+  const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
+  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
+  if (range.start === range.end && quoteBefore?.end === current.text.length) {
+    return replaceMobileComposerRange(current, range, `\n\n${text}`);
+  }
+  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  if (range.start === range.end && quoteAfter?.start === 0) {
+    return replaceMobileComposerRange(current, range, `${text}\n\n`);
+  }
+  return replaceMobileComposerRange(current, range, text);
+}
+
+export function insertMobilePastedText(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  text: string,
+  atomId: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  assertIdentity(atomId, "composer atom occurrence");
+  const atom = normalizePastedTextAtom({ kind: "pasted-text", atomId, text, start: 0, end: 0 });
+  const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
+  const quoteBefore = current.atoms.find((candidate) => candidate.kind === "quote" && candidate.end === range.start);
+  const quoteAfter = current.atoms.find((candidate) => candidate.kind === "quote" && candidate.start === range.end);
+  const prefix = range.start === range.end && quoteBefore?.end === current.text.length ? "\n\n" : "";
+  const suffix = range.start === range.end && quoteAfter?.start === 0 ? "\n\n" : "";
+  return insertMobileComposerAtom(current, range, { ...atom, atomId }, prefix, suffix);
+}
+
+export function updateMobilePastedTextAtom(
+  draft: MobileComposerDraft,
+  atomId: string,
+  text: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  const atom = current.atoms.find((candidate) => candidate.atomId === atomId);
+  if (atom?.kind !== "pasted-text") throw new Error("The selected pasted-text item is no longer in this draft.");
+  const normalized = normalizePastedTextAtom({ ...atom, text });
+  return replaceMobileComposerAtom(current, atom, normalized);
+}
+
+export function removeMobileComposerAtom(
+  draft: MobileComposerDraft,
+  atomId: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  const atom = current.atoms.find((candidate) => candidate.atomId === atomId);
+  if (!atom) throw new Error("The selected quote or pasted-text item is no longer in this draft.");
+  if (atom.kind !== "quote") return replaceMobileComposerRange(current, { start: atom.start, end: atom.end }, "");
+  const range = atom.start >= 2 && current.text.slice(atom.start - 2, atom.start) === "\n\n"
+    ? { start: atom.start - 2, end: atom.end }
+    : atom.end + 2 <= current.text.length && current.text.slice(atom.end, atom.end + 2) === "\n\n"
+      ? { start: atom.start, end: atom.end + 2 }
+      : { start: atom.start, end: atom.end };
+  return replaceMobileComposerRange(current, range, "");
+}
+
 export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addition: string): MobileComposerDraft {
   const current = normalizeMobileComposerDraft(draft);
   if (!addition) return current;
@@ -321,6 +561,7 @@ export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addi
   return normalizeMobileComposerDraft({
     text: `${current.text}${separator}${addition}`,
     mentions: current.mentions,
+    atoms: current.atoms,
     attachments: current.attachments
   });
 }
@@ -337,6 +578,7 @@ export function prependMobileComposerDraft(
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   const usedMentionIds = new Set(source.mentions.map((mention) => mention.mentionId));
+  const usedAtomIds = new Set(source.atoms.map((atom) => atom.atomId));
   const mentions = [
     ...source.mentions.map((mention) => cloneMention(mention)),
     ...existing.mentions.map((mention) => ({
@@ -346,7 +588,16 @@ export function prependMobileComposerDraft(
       end: mention.end + offset
     }))
   ];
-  return normalizeMobileComposerDraft({ text: `${source.text}${separator}${existing.text}`, mentions, attachments });
+  const atoms = [
+    ...source.atoms.map((atom) => ({ ...atom })),
+    ...existing.atoms.map((atom) => ({
+      ...atom,
+      atomId: uniqueRecoveredAtomId(atom.atomId, usedAtomIds),
+      start: atom.start + offset,
+      end: atom.end + offset
+    }))
+  ];
+  return normalizeMobileComposerDraft({ text: `${source.text}${separator}${existing.text}`, mentions, atoms, attachments });
 }
 
 export function mobileComposerDraftWithoutPrefix(
@@ -366,25 +617,32 @@ export function mobileComposerDraftWithoutPrefix(
     if (!mobileComposerDraftsEqual(source, {
       text: existing.text,
       mentions: existing.mentions,
+      atoms: existing.atoms,
       attachments: existing.attachments.slice(0, source.attachments.length)
     })) return undefined;
-    return normalizeMobileComposerDraft({ text: "", mentions: [], attachments: remainingAttachments });
+    return normalizeMobileComposerDraft({ text: "", mentions: [], atoms: [], attachments: remainingAttachments });
   }
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   if (!existing.text.startsWith(`${source.text}${separator}`)) return undefined;
   const sourceMentions = existing.mentions.filter((mention) => mention.end <= source.text.length);
+  const sourceAtoms = existing.atoms.filter((atom) => atom.end <= source.text.length);
   if (!mobileComposerDraftsEqual(source, {
     text: source.text,
     mentions: sourceMentions,
+    atoms: sourceAtoms,
     attachments: existing.attachments.slice(0, source.attachments.length)
   })) return undefined;
   if (existing.mentions.some((mention) => mention.start < offset && mention.end > source.text.length)) return undefined;
+  if (existing.atoms.some((atom) => atom.start < offset && atom.end > source.text.length)) return undefined;
   return normalizeMobileComposerDraft({
     text: existing.text.slice(offset),
     mentions: existing.mentions
       .filter((mention) => mention.start >= offset)
       .map((mention) => ({ ...cloneMention(mention), start: mention.start - offset, end: mention.end - offset })),
+    atoms: existing.atoms
+      .filter((atom) => atom.start >= offset)
+      .map((atom) => ({ ...atom, start: atom.start - offset, end: atom.end - offset })),
     attachments: remainingAttachments
   });
 }
@@ -411,9 +669,18 @@ export function removeMobileComposerMention(
   return replaceMobileComposerRange(current, { start: mention.start, end: mention.end }, "");
 }
 
+export function expandedMobileComposerSelection(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection
+): MobileComposerSelection {
+  const current = normalizeMobileComposerDraft(draft);
+  return expandedAtomicRange(current, normalizeSelection(selection, current.text));
+}
+
 export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   const exact = normalizeMobileComposerDraft(draft);
-  if (!exact.text.trim() && exact.attachments.length === 0) {
+  const serialized = serializeMobileComposerText(exact);
+  if (!serialized.text.trim() && exact.attachments.length === 0) {
     throw new Error("Enter a task message or attach a file before sending.");
   }
   if (exact.attachments.some((attachment) => attachment.state !== "uploaded")) {
@@ -421,15 +688,17 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   }
   return create(InputContentSchema, {
     parts: [
-      ...(exact.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: exact.text } })]),
+      ...(serialized.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: serialized.text } })]),
       ...exact.attachments.map((attachment) => mobileComposerAttachmentInputPart(
         attachment as MobileUploadedComposerAttachment
       )),
       ...exact.mentions.map(mobileComposerInputPart)
     ],
+    quotesEncoded: exact.atoms.some((atom) => atom.kind === "quote"),
+    pastedTextRanges: serialized.pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
-      start: mention.start,
-      end: mention.end,
+      start: projectComposerOffset(mention.start, exact.atoms),
+      end: projectComposerOffset(mention.end, exact.atoms),
       mentionIndex
     }))
   });
@@ -437,7 +706,7 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
 
 export function mobileInputSummary(input: InputContent | undefined, typedMetadataTrusted = true): string {
   if (!input) return "";
-  const text = input.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : []).join("");
+  const wireText = input.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : []).join("");
   const media = input.parts.flatMap((part) => part.content.case === "image" ? ["[Image]"]
     : part.content.case === "file" ? ["[File]"] : []);
   if (!typedMetadataTrusted) {
@@ -445,7 +714,7 @@ export function mobileInputSummary(input: InputContent | undefined, typedMetadat
       || part.content.case === "workspaceMention" || part.content.case === "resourceMention"
       || part.content.case === "artifactMention")
       || input.mentionRanges.length > 0 || input.pastedTextRanges.length > 0 || input.quotesEncoded;
-    return [text, ...media, ...(untrustedStructuredMetadata ? ["[Untrusted structured metadata ignored]"] : [])]
+    return [wireText, ...media, ...(untrustedStructuredMetadata ? ["[Untrusted structured metadata ignored]"] : [])]
       .filter((value) => value.length > 0).join("\n");
   }
   const mentions = input.parts.flatMap((part) => {
@@ -465,7 +734,11 @@ export function mobileInputSummary(input: InputContent | undefined, typedMetadat
     return [];
   });
   const rangesValid = mentions.every((mention) => mention.valid)
-    && validMentionRanges(text, mentions.length, input.mentionRanges, input.pastedTextRanges);
+    && validMentionRanges(wireText, mentions.length, input.mentionRanges, input.pastedTextRanges);
+  const compactText = rangesValid ? compactMobilePastedText(wireText, input.pastedTextRanges) : wireText;
+  const text = input.quotesEncoded && rangesValid
+    ? mobileVisibleSelectionQuoteText(compactText, []) ?? compactText
+    : compactText;
   const inline = new Set(rangesValid ? input.mentionRanges.map((range) => range.mentionIndex) : []);
   const suffix: string[] = [...media];
   if (rangesValid) {
@@ -491,7 +764,12 @@ export function replaceMobileComposerRange(
     if (mention.start >= range.end) return [{ ...mention, start: mention.start + delta, end: mention.end + delta }];
     return [];
   });
-  const next = normalizeMobileComposerDraft({ text, mentions, attachments: exact.attachments });
+  const atoms = exact.atoms.flatMap((atom) => {
+    if (atom.end <= range.start) return [{ ...atom }];
+    if (atom.start >= range.end) return [{ ...atom, start: atom.start + delta, end: atom.end + delta }];
+    return [];
+  });
+  const next = normalizeMobileComposerDraft({ text, mentions, atoms, attachments: exact.attachments });
   const caret = range.start + replacement.length;
   return { draft: next, selection: { start: caret, end: caret } };
 }
@@ -502,8 +780,14 @@ function insertMobileComposerMention(
   mention: MobileComposerMention
 ): MobileComposerEditResult {
   const token = mobileComposerMentionToken(mention);
-  const prefix = range.start > 0 && !/\s/u.test(draft.text[range.start - 1] ?? "") ? " " : "";
-  const suffix = range.end < draft.text.length && !/\s/u.test(draft.text[range.end] ?? "") ? " " : "";
+  const quoteBefore = draft.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
+  const quoteAfter = draft.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const prefix = range.start === range.end && quoteBefore?.end === draft.text.length
+    ? "\n\n"
+    : range.start > 0 && !/\s/u.test(draft.text[range.start - 1] ?? "") ? " " : "";
+  const suffix = range.start === range.end && quoteAfter?.start === 0
+    ? "\n\n"
+    : range.end < draft.text.length && !/\s/u.test(draft.text[range.end] ?? "") ? " " : "";
   const result = replaceMobileComposerRange(draft, range, `${prefix}${token}${suffix}`);
   const start = range.start + prefix.length;
   const occurrence = { ...mention, start, end: start + token.length };
@@ -512,10 +796,159 @@ function insertMobileComposerMention(
   const next = normalizeMobileComposerDraft({
     text: result.draft.text,
     mentions,
+    atoms: result.draft.atoms,
     attachments: result.draft.attachments
   });
   const caret = range.start + prefix.length + token.length + suffix.length;
   return { draft: next, selection: { start: caret, end: caret } };
+}
+
+function insertMobileComposerAtom(
+  draft: MobileComposerDraft,
+  range: MobileComposerSelection,
+  atom: Omit<MobileComposerAtom, "atomId" | "start" | "end"> & { readonly atomId?: string },
+  prefix: string,
+  suffix: string
+): MobileComposerEditResult {
+  const atomId = atom.atomId;
+  if (atomId === undefined) throw new Error("The Joko composer atom occurrence is invalid.");
+  const token = mobileComposerAtomToken(atom);
+  const result = replaceMobileComposerRange(draft, range, `${prefix}${token}${suffix}`);
+  if (result.draft.atoms.length >= maximumComposerAtoms) {
+    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured quote or paste items.`);
+  }
+  const start = range.start + prefix.length;
+  const occurrence = { ...atom, atomId, start, end: start + token.length } as MobileComposerAtom;
+  const atoms = [...result.draft.atoms, occurrence]
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const next = normalizeMobileComposerDraft({
+    text: result.draft.text,
+    mentions: result.draft.mentions,
+    atoms,
+    attachments: result.draft.attachments
+  });
+  const caret = range.start + prefix.length + token.length + suffix.length;
+  return { draft: next, selection: { start: caret, end: caret } };
+}
+
+function replaceMobileComposerAtom(
+  draft: MobileComposerDraft,
+  previous: MobileComposerAtom,
+  replacement: Omit<MobileComposerAtom, "atomId" | "start" | "end">
+): MobileComposerEditResult {
+  const result = replaceMobileComposerRange(draft, { start: previous.start, end: previous.end }, mobileComposerAtomToken(replacement));
+  const token = mobileComposerAtomToken(replacement);
+  const atom = { ...replacement, atomId: previous.atomId, start: previous.start, end: previous.start + token.length } as MobileComposerAtom;
+  const atoms = [...result.draft.atoms, atom]
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const next = normalizeMobileComposerDraft({ ...result.draft, atoms });
+  return { draft: next, selection: { start: atom.end, end: atom.end } };
+}
+
+function normalizeQuoteAtom(
+  atom: MobileComposerQuoteAtom
+): Omit<MobileComposerQuoteAtom, "atomId" | "start" | "end"> {
+  if (atom.sourceRole !== "assistant") throw new Error("Only assistant text can be stored as a message quote.");
+  const text = normalizedSelectionQuoteText(atom.text);
+  if (text === undefined || text !== atom.text || text.length > mobileSelectionQuoteMaximumCharacters) {
+    throw new Error("The local Joko message quote is invalid.");
+  }
+  return {
+    kind: "quote",
+    sourceSessionId: normalizeExactIdentity(atom.sourceSessionId, "quote source task", 1_024),
+    sourceMessageId: normalizeExactIdentity(atom.sourceMessageId, "quote source message", 1_024),
+    sourceEventId: normalizeExactIdentity(atom.sourceEventId, "quote source Event", 1_024),
+    sourceRole: "assistant",
+    text
+  };
+}
+
+function normalizePastedTextAtom(
+  atom: MobileComposerPastedTextAtom
+): Omit<MobileComposerPastedTextAtom, "atomId" | "start" | "end"> {
+  if (typeof atom.text !== "string" || atom.text.length === 0
+    || atom.text.length > mobileLongPasteMaximumCharacters) {
+    throw new Error(`Pasted text must contain between 1 and ${mobileLongPasteMaximumCharacters.toLocaleString("en-US")} characters.`);
+  }
+  return { kind: "pasted-text", text: atom.text };
+}
+
+function normalizedSelectionQuoteText(value: string): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\r\n?/gu, "\n").replace(/^\n+|\n+$/gu, "");
+  return normalized.trim() === "" ? undefined : normalized;
+}
+
+function mobilePastedTextLineCount(text: string): number {
+  let lines = text.length === 0 ? 0 : 1;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) === 10) lines += 1;
+  }
+  return lines;
+}
+
+interface MobileSerializedComposerText {
+  readonly text: string;
+  readonly pastedTextRanges: readonly { readonly start: number; readonly end: number; readonly display: string }[];
+}
+
+function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializedComposerText {
+  let text = "";
+  let cursor = 0;
+  const pastedTextRanges: { start: number; end: number; display: string }[] = [];
+  for (const atom of draft.atoms) {
+    text += draft.text.slice(cursor, atom.start);
+    if (atom.kind === "quote") {
+      text += mobileSelectionQuoteText(atom.text);
+    } else {
+      const start = text.length;
+      text += atom.text;
+      pastedTextRanges.push({ start, end: text.length, display: mobileComposerAtomLabel(atom) });
+    }
+    cursor = atom.end;
+  }
+  text += draft.text.slice(cursor);
+  if (text.length > maximumSerializedCharacters) {
+    throw new Error(`A task message can contain at most ${maximumSerializedCharacters.toLocaleString("en-US")} serialized characters.`);
+  }
+  return { text, pastedTextRanges };
+}
+
+function mobileSelectionQuoteText(text: string): string {
+  return [
+    mobileSelectionQuoteMarkerLine,
+    ...text.split("\n").map((line) => line === "" ? ">" : `> ${line}`)
+  ].join("\n");
+}
+
+function projectComposerOffset(offset: number, atoms: readonly MobileComposerAtom[]): number {
+  let projected = offset;
+  for (const atom of atoms) {
+    if (offset <= atom.start) break;
+    if (offset < atom.end) throw new Error("A Joko reference offset cannot be inside a composer atom.");
+    const serializedLength = atom.kind === "quote" ? mobileSelectionQuoteText(atom.text).length : atom.text.length;
+    projected += serializedLength - (atom.end - atom.start);
+  }
+  return projected;
+}
+
+export function mobileVisibleSelectionQuoteText(
+  text: string,
+  pastedTextRanges: InputContent["pastedTextRanges"]
+): string | undefined {
+  if (!validOrderedTextRanges(text, pastedTextRanges)) return undefined;
+  const retained: string[] = [];
+  let lineStart = 0;
+  for (const lineWithNewline of text.match(/[^\n]*\n|[^\n]+$/gu) ?? []) {
+    const hasNewline = lineWithNewline.endsWith("\n");
+    const line = hasNewline ? lineWithNewline.slice(0, -1) : lineWithNewline;
+    const lineEnd = lineStart + line.length;
+    const isMarker = line.replace(/\r$/u, "").trimStart() === mobileSelectionQuoteMarkerLine;
+    const ownedByPaste = pastedTextRanges.some((range) => lineStart < range.end && lineEnd > range.start);
+    if (!isMarker || ownedByPaste) retained.push(lineWithNewline);
+    lineStart += lineWithNewline.length;
+  }
+  return retained.join("");
 }
 
 function mobileComposerMentionToken(mention: Pick<MobileComposerMention, "kind" | "displayText">
@@ -570,6 +1003,22 @@ function uniqueRecoveredMentionId(value: string, used: Set<string>): string {
     }
   }
   throw new Error("The recovered Joko task references could not be assigned unique occurrences.");
+}
+
+function uniqueRecoveredAtomId(value: string, used: Set<string>): string {
+  if (!used.has(value)) {
+    used.add(value);
+    return value;
+  }
+  for (let index = 1; index <= 10_000; index += 1) {
+    const suffix = `-recovered-${index}`;
+    const candidate = `${value.slice(0, 512 - suffix.length)}${suffix}`;
+    if (!used.has(candidate)) {
+      used.add(candidate);
+      return candidate;
+    }
+  }
+  throw new Error("The recovered Joko composer atoms could not be assigned unique occurrences.");
 }
 
 function normalizeSessionMention(
@@ -776,12 +1225,14 @@ function validInputArtifactMention(mention: {
 function expandedAtomicRange(draft: MobileComposerDraft, selection: MobileComposerSelection): MobileComposerSelection {
   let start = selection.start;
   let end = selection.end;
-  for (const mention of draft.mentions) {
-    const insertionInside = start === end && mention.start < start && start < mention.end;
-    const overlaps = start < mention.end && end > mention.start;
+  const ranges = [...draft.mentions, ...draft.atoms]
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  for (const atom of ranges) {
+    const insertionInside = start === end && atom.start < start && start < atom.end;
+    const overlaps = start < atom.end && end > atom.start;
     if (!insertionInside && !overlaps) continue;
-    start = Math.min(start, mention.start);
-    end = Math.max(end, mention.end);
+    start = Math.min(start, atom.start);
+    end = Math.max(end, atom.end);
   }
   return { start, end };
 }
@@ -859,10 +1310,21 @@ function validOrderedTextRanges(
   for (const range of ranges) {
     if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
       || range.start < previousEnd || range.start < 0 || range.end <= range.start || range.end > text.length
-      || !isUtf16Boundary(text, range.start) || !isUtf16Boundary(text, range.end)) return false;
+      || !isUtf16Boundary(text, range.start) || !isUtf16Boundary(text, range.end)
+      || typeof range.display !== "string" || !range.display || range.display.length > maximumDisplayCharacters
+      || /[\u0000-\u001f\u007f]/u.test(range.display)) return false;
     previousEnd = range.end;
   }
   return true;
+}
+
+function compactMobilePastedText(text: string, ranges: InputContent["pastedTextRanges"]): string {
+  let result = text;
+  for (let index = ranges.length - 1; index >= 0; index -= 1) {
+    const range = ranges[index]!;
+    result = `${result.slice(0, range.start)}${range.display}${result.slice(range.end)}`;
+  }
+  return result;
 }
 
 function isUtf16Boundary(text: string, offset: number): boolean {
@@ -874,6 +1336,9 @@ function isUtf16Boundary(text: string, offset: number): boolean {
 
 export const mobileComposerDocumentTesting = {
   maximumDraftCharacters,
+  maximumComposerAtoms,
+  maximumSelectionQuotes,
+  maximumSerializedCharacters,
   maximumSessionMentions,
   maximumLineNumber
 };

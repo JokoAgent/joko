@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
   ArtifactMentionSchema,
+  InlineTextRangeSchema,
   InputContentSchema,
   InputMentionRangeSchema,
   InputPartSchema,
@@ -11,7 +12,11 @@ import {
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  appendMobileSelectionQuote,
   appendPlainTextToMobileComposer,
+  emptyMobileComposerDraft,
+  insertMobileClipboardText,
+  insertMobilePastedText,
   insertMobileArtifactMention,
   insertMobileResourceMention,
   insertMobileSessionMention,
@@ -19,10 +24,14 @@ import {
   mobileComposerInput,
   mobileComposerDraftWithoutPrefix,
   mobileInputSummary,
+  mobileLongPasteMaximumCharacters,
+  mobileSelectionQuoteMarkerLine,
   normalizeMobileComposerDraft,
   plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
   reconcileMobileComposerText,
+  removeMobileComposerAtom,
+  updateMobilePastedTextAtom,
   removeMobileComposerMention
 } from "./mobile-composer-document";
 
@@ -31,6 +40,7 @@ describe("mobile structured composer document", () => {
     const draft = normalizeMobileComposerDraft({
       text: "",
       mentions: [],
+      atoms: [],
       attachments: [
         {
           state: "uploaded",
@@ -106,6 +116,7 @@ describe("mobile structured composer document", () => {
     expect(mobileComposerDraftWithoutPrefix(first, recovered)).toEqual({
       text: later.text,
       mentions: [{ ...later.mentions[0]!, mentionId: "shared-occurrence-recovered-1" }],
+      atoms: [],
       attachments: []
     });
     expect(mobileComposerDraftWithoutPrefix(first, plainTextMobileComposerDraft("Newer unrelated draft"))).toBeUndefined();
@@ -115,6 +126,7 @@ describe("mobile structured composer document", () => {
     const submitted = normalizeMobileComposerDraft({
       text: "Send the proof",
       mentions: [],
+      atoms: [],
       attachments: [{
         state: "uploaded",
         attachmentId: "submitted-file",
@@ -146,6 +158,7 @@ describe("mobile structured composer document", () => {
     expect(mobileComposerDraftWithoutPrefix(submitted, newer)).toEqual({
       text: "",
       mentions: [],
+      atoms: [],
       attachments: [newer.attachments[1]]
     });
   });
@@ -261,6 +274,7 @@ describe("mobile structured composer document", () => {
         displayText: "src", directory: true, start: 0, end: 5,
         ...overrides
       }],
+      atoms: [],
       attachments: []
     });
 
@@ -329,6 +343,7 @@ describe("mobile structured composer document", () => {
         discoveredRevision: "revision", resourceVersion: "1", runtimeGeneration: "2", start: 0, end: 9,
         ...overrides
       }],
+      atoms: [],
       attachments: []
     });
     const artifact = (overrides: Record<string, unknown> = {}) => normalizeMobileComposerDraft({
@@ -337,6 +352,7 @@ describe("mobile structured composer document", () => {
         kind: "artifact", mentionId: "mention", artifactId: "artifact", sourceSessionId: "source",
         displayText: "Artifact", start: 0, end: 9, ...overrides
       }],
+      atoms: [],
       attachments: []
     });
 
@@ -356,6 +372,120 @@ describe("mobile structured composer document", () => {
     expect(changed.selection).toEqual({ start: 4, end: 4 });
   });
 
+  it("stores quote and long-paste atoms compactly while serializing exact wire order and remapped ranges", () => {
+    const payload = "p".repeat(4_000);
+    const pasted = insertMobilePastedText(
+      plainTextMobileComposerDraft("Before "),
+      { start: 7, end: 7 },
+      payload,
+      "paste-one"
+    );
+    const mentioned = insertMobileSessionMention(
+      pasted.draft,
+      pasted.selection,
+      { sessionId: "other-task", displayText: "Task" },
+      "mention-one"
+    );
+    const quoted = appendMobileSelectionQuote(mentioned.draft, {
+      sourceSessionId: "current-task",
+      sourceMessageId: "assistant-message",
+      sourceEventId: "assistant-complete",
+      sourceRole: "assistant",
+      text: "quoted line\n\nnext"
+    }, "quote-one");
+
+    expect(quoted.draft.text).toBe("Before ⟦Pasted text (1 line)⟧ @Task\n\n⟦Quote from Assistant⟧");
+    const input = mobileComposerInput(quoted.draft);
+    const text = input.parts[0]?.content.case === "text" ? input.parts[0].content.value : "";
+    expect(text).toBe(`Before ${payload} @Task\n\n${mobileSelectionQuoteMarkerLine}\n> quoted line\n>\n> next`);
+    expect(input.quotesEncoded).toBe(true);
+    expect(input.pastedTextRanges).toEqual([{
+      start: 7,
+      end: 4_007,
+      display: "Pasted text (1 line)",
+      $typeName: "joko.v1.InlineTextRange"
+    }]);
+    expect(text.slice(input.pastedTextRanges[0]!.start, input.pastedTextRanges[0]!.end)).toBe(payload);
+    expect(input.mentionRanges).toMatchObject([{ start: 4_008, end: 4_013, mentionIndex: 0 }]);
+    expect(text.slice(input.mentionRanges[0]!.start, input.mentionRanges[0]!.end)).toBe("@Task");
+    expect(mobileInputSummary(input)).not.toContain(mobileSelectionQuoteMarkerLine);
+    expect(mobileInputSummary(input)).toContain("> quoted line");
+  });
+
+  it("edits and removes whole paste/quote atoms and atomizes native long insertions", () => {
+    const lines = Array.from({ length: 24 }, (_, index) => `line-${index + 1}`).join("\n");
+    const automatic = reconcileMobileComposerText(plainTextMobileComposerDraft("prefix "), `prefix ${lines}`, "auto-paste");
+    expect(automatic.draft.atoms).toMatchObject([{ kind: "pasted-text", atomId: "auto-paste", text: lines }]);
+    expect(automatic.draft.text).toBe("prefix ⟦Pasted text (24 lines)⟧");
+
+    const edited = updateMobilePastedTextAtom(automatic.draft, "auto-paste", "short\ntext");
+    expect(edited.draft.text).toBe("prefix ⟦Pasted text (2 lines)⟧");
+    expect(mobileComposerInput(edited.draft).pastedTextRanges).toMatchObject([{
+      start: 7,
+      end: 17,
+      display: "Pasted text (2 lines)"
+    }]);
+    const damaged = reconcileMobileComposerText(
+      edited.draft,
+      edited.draft.text.replace("text (2", "tex (2")
+    );
+    expect(damaged.draft).toEqual(plainTextMobileComposerDraft("prefix "));
+
+    const quoted = appendMobileSelectionQuote(plainTextMobileComposerDraft(""), {
+      sourceSessionId: "task",
+      sourceMessageId: "message",
+      sourceEventId: "event",
+      sourceRole: "assistant",
+      text: "answer"
+    }, "quote");
+    const afterQuote = reconcileMobileComposerText(quoted.draft, `${quoted.draft.text}Follow up`, "paste-after-quote");
+    expect(afterQuote.draft.text).toBe("⟦Quote from Assistant⟧\n\nFollow up");
+    expect(afterQuote.draft.atoms).toHaveLength(1);
+    expect(removeMobileComposerAtom(quoted.draft, "quote").draft).toEqual(emptyMobileComposerDraft());
+  });
+
+  it("folds a native paste above the editable projection limit before applying that limit", () => {
+    const pastedText = "x".repeat(1_000_001);
+    const automatic = reconcileMobileComposerText(
+      emptyMobileComposerDraft(),
+      pastedText,
+      "large-native-paste"
+    );
+
+    expect(automatic.draft.text).toBe("⟦Pasted text (1 line)⟧");
+    expect(automatic.draft.atoms).toMatchObject([{
+      kind: "pasted-text",
+      atomId: "large-native-paste",
+      text: pastedText
+    }]);
+    expect(mobileComposerInput(automatic.draft).pastedTextRanges).toMatchObject([{
+      start: 0,
+      end: pastedText.length,
+      display: "Pasted text (1 line)"
+    }]);
+  });
+
+  it("enforces paste budgets and preserves marker-like pasted text in normal summaries", () => {
+    expect(() => insertMobileClipboardText(
+      emptyMobileComposerDraft(),
+      { start: 0, end: 0 },
+      "x".repeat(mobileLongPasteMaximumCharacters + 1),
+      "too-large"
+    )).toThrow(/at most 2,000,000/u);
+
+    const wire = `${mobileSelectionQuoteMarkerLine}\nplain paste\n\n${mobileSelectionQuoteMarkerLine}\n> actual quote`;
+    const input = create(InputContentSchema, {
+      parts: [create(InputPartSchema, { content: { case: "text", value: wire } })],
+      quotesEncoded: true,
+      pastedTextRanges: [create(InlineTextRangeSchema, {
+        start: 0,
+        end: mobileSelectionQuoteMarkerLine.length + "\nplain paste".length,
+        display: "Pasted text (2 lines)"
+      })]
+    });
+    expect(mobileInputSummary(input)).toBe("Pasted text (2 lines)\n\n> actual quote");
+  });
+
   it("preserves occurrences while appending ordinary text and rejects damaged ranges, duplicates, and surrogate splits", () => {
     const inserted = insertMobileSessionMention(
       plainTextMobileComposerDraft("😀 "),
@@ -370,6 +500,7 @@ describe("mobile structured composer document", () => {
     expect(() => normalizeMobileComposerDraft({
       text: "😀 @Task",
       mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 8 }],
+      atoms: [],
       attachments: []
     })).toThrow(/range/);
     expect(() => normalizeMobileComposerDraft({
@@ -378,6 +509,7 @@ describe("mobile structured composer document", () => {
         { kind: "session", mentionId: "same", sessionId: "one", displayText: "Task", start: 0, end: 5 },
         { kind: "session", mentionId: "same", sessionId: "two", displayText: "Task", start: 6, end: 11 }
       ],
+      atoms: [],
       attachments: []
     })).toThrow(/duplicated/);
   });

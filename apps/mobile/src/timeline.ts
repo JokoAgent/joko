@@ -14,6 +14,11 @@ export interface TimelineRow {
   readonly eventId: string;
   readonly kind: "user" | "assistant" | "system" | "tool" | "status" | "error" | "activity";
   readonly completed: boolean;
+  readonly quoteSource?: {
+    readonly sourceMessageId: string;
+    readonly sourceEventId: string;
+    readonly text: string;
+  };
   readonly images?: readonly MobileImageGalleryPageSummary[];
 }
 
@@ -57,9 +62,18 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
         const acceptedInput = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
           ? previous?.text
           : undefined;
+        const quoteText = message.role === MessageRole.ASSISTANT && message.blocks.length > 0
+          && message.blocks.every((block) => block.content.case === "text")
+          ? message.blocks.map((block) => block.content.case === "text" ? block.content.value : "").join("\n")
+          : undefined;
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
           text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
           eventId: event.eventId, kind: roleKind(message.role), completed: true,
+          ...(quoteText?.trim() ? { quoteSource: {
+            sourceMessageId: message.messageId,
+            sourceEventId: event.eventId,
+            text: quoteText
+          } } : {}),
           ...(images.length === 0 ? {} : { images }) });
         break;
       }

@@ -8,6 +8,7 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
 import { randomUUID } from "expo-crypto";
+import * as Clipboard from "expo-clipboard";
 import {
   CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, TargetState, capabilityNames,
   type QueueItem, type Session
@@ -45,13 +46,19 @@ import { addToMobileComposer } from "./composer-draft-behavior";
 import {
   emptyMobileComposerDraft,
   insertMobileArtifactMention,
+  insertMobileClipboardText,
   insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
+  mobileComposerNativeInputMaximumCharacters,
   mobileInputSummary,
+  mobileComposerAtomLabel,
   plainTextMobileComposerDraft,
   reconcileMobileComposerText,
+  removeMobileComposerAtom,
   removeMobileComposerMention,
+  updateMobilePastedTextAtom,
+  type MobileComposerAtom,
   type MobileComposerDraft,
   type MobileComposerSelection,
   type MobileWorkspaceLineRange
@@ -86,6 +93,13 @@ import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyb
 import { timelineRows, type TimelineRow } from "./timeline";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
+import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
+import { MobileQuoteSelectionSheet } from "./MobileQuoteSelectionSheet";
+import {
+  captureMobileQuoteSelection,
+  commitMobileQuoteSelection,
+  type MobileQuoteSelectionLease
+} from "./mobile-composer-quote";
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
 import { MobileContextSheet } from "./MobileContextSheet";
@@ -1017,6 +1031,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
+  const [composerAtomId, setComposerAtomId] = useState<string>();
   const mountedRef = useRef(true);
   const composerInputRef = useRef<TextInput>(null);
   const profileId = state.activeProfileId;
@@ -1043,6 +1058,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
   const draftRef = useRef(draft);
   const selectionRef = useRef(composerSelection);
+  const referencesEditableRef = useRef(false);
   draftRef.current = draft;
   selectionRef.current = composerSelection;
   const closeImageEditor = useCallback(() => {
@@ -1082,6 +1098,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       setDraft({ targetId: "", name: "", input });
       setComposerSelection({ start: 0, end: 0 });
       setLoadedProfileId(undefined);
+      setComposerAtomId(undefined);
       setDraftReady(true);
       return () => { mountedRef.current = false; };
     }
@@ -1091,6 +1108,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     setDraft({ targetId: cached?.targetId ?? "", name: cached?.name ?? "", input: cachedInput });
     setComposerSelection({ start: cachedInput.text.length, end: cachedInput.text.length });
     setLoadedProfileId(profileId);
+    setComposerAtomId(undefined);
     setDraftReady(false);
     void mobileNewTaskDrafts.read(identity).then((stored) => {
       if (!current || !mountedRef.current || state.activeProfileId !== identity.profileId) return;
@@ -1215,6 +1233,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   }, [voice.busy]);
   const referencesEditable = ownerReady && !state.busy && !mentionBusy && !attachmentBusy && !voice.busy
     && retained === undefined;
+  referencesEditableRef.current = referencesEditable;
   const incomingShareBatch = incomingShareState.batch;
   const incomingSharePlan = useMemo(() => incomingShareBatch?.status === "ready"
     && incomingShareBatch.boundProfileId === profileId && attachmentControls
@@ -1292,6 +1311,51 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     try {
       const result = removeMobileComposerMention(draftRef.current.input, mentionId);
       replaceInput(result.draft, result.selection);
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  };
+  const pasteClipboardText = async (): Promise<void> => {
+    const ownerProfileId = profileIdRef.current;
+    const captured = draftRef.current.input;
+    const selection = selectionRef.current;
+    const targetId = draftRef.current.targetId;
+    if (!ownerProfileId || !referencesEditableRef.current || AppState.currentState !== "active") {
+      setError("Return to the active new-task composer before pasting text.");
+      return;
+    }
+    setError("");
+    try {
+      const text = await Clipboard.getStringAsync();
+      if (!mountedRef.current || profileIdRef.current !== ownerProfileId
+        || draftRef.current.targetId !== targetId || draftRef.current.input !== captured
+        || selectionRef.current.start !== selection.start || selectionRef.current.end !== selection.end
+        || !referencesEditableRef.current || client.state.activeProfileId !== ownerProfileId
+        || client.state.status === "unpaired" || client.state.status === "revoked"
+        || AppState.currentState !== "active") {
+        throw new Error("The new-task draft changed while clipboard text was being read. Paste it again.");
+      }
+      const result = insertMobileClipboardText(captured, selection, text, randomUUID());
+      replaceInput(result.draft, result.selection);
+      setTimeout(() => composerInputRef.current?.focus(), 0);
+    } catch (failure) {
+      if (mountedRef.current && profileIdRef.current === ownerProfileId) setError(errorText(failure));
+    }
+  };
+  const removeComposerAtom = (atomId: string): void => {
+    try {
+      const result = removeMobileComposerAtom(draftRef.current.input, atomId);
+      replaceInput(result.draft, result.selection);
+      setComposerAtomId(undefined);
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  };
+  const savePastedTextAtom = (atomId: string, text: string): void => {
+    try {
+      const result = updateMobilePastedTextAtom(draftRef.current.input, atomId, text);
+      replaceInput(result.draft, result.selection);
+      setComposerAtomId(undefined);
     } catch (failure) {
       setError(errorText(failure));
     }
@@ -1786,7 +1850,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     <View style={styles.field}>
       <Text style={[styles.caption, { color: colors.muted }]}>First message</Text>
       {(voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || attachmentControls
-        || draft.input.mentions.length > 0 || draft.input.attachments.length > 0) && <View style={styles.composerTools}>
+        || ownerReady || draft.input.mentions.length > 0 || draft.input.atoms.length > 0
+        || draft.input.attachments.length > 0) && <View style={styles.composerTools}>
         {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
           disabled={!ownerReady || !targetAvailable || state.busy || mentionBusy || attachmentBusy
             || state.status !== "connected" || retained !== undefined} />}
@@ -1804,6 +1869,8 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
             setSessionMentionError("");
             setWorkspaceMentionsVisible(true);
           }} />}
+        <Action label="Paste text" colors={colors} compact disabled={!referencesEditable}
+          onPress={() => void pasteClipboardText()} />
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"} colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
@@ -1829,20 +1896,23 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
             </Text>
           </Pressable>)}
         </ScrollView>}
+        <MobileComposerAtomChips atoms={draft.input.atoms} colors={colors}
+          disabled={!referencesEditable} onOpen={setComposerAtomId} />
       </View>}
       <MobileAttachmentTray attachments={draft.input.attachments} colors={colors}
         disabled={!referencesEditable} busy={attachmentBusy || state.busy}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />
       <TextInput ref={composerInputRef} accessibilityLabel="First message" accessibilityHint="This structured message is sent after the task is created"
-        multiline textAlignVertical="top" maxLength={1_000_000} editable={referencesEditable}
+        multiline textAlignVertical="top" maxLength={mobileComposerNativeInputMaximumCharacters} editable={referencesEditable}
         placeholder="What should Joko do?" placeholderTextColor={colors.muted} value={ownerReady ? draft.input.text : ""}
         selection={composerSelection} onSelectionChange={(event) => {
-          selectionRef.current = event.nativeEvent.selection;
-          setComposerSelection(event.nativeEvent.selection);
+          const selection = boundedComposerSelection(event.nativeEvent.selection, draftRef.current.input.text.length);
+          selectionRef.current = selection;
+          setComposerSelection(selection);
         }}
         onChangeText={(text) => {
           try {
-            const change = reconcileMobileComposerText(draftRef.current.input, text);
+            const change = reconcileMobileComposerText(draftRef.current.input, text, randomUUID());
             replaceInput(change.draft, change.selection);
           } catch (failure) {
             setError(errorText(failure));
@@ -1900,6 +1970,9 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         - draft.input.attachments.length)}
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
+    <MobileComposerAtomSheet atom={draft.input.atoms.find((atom) => atom.atomId === composerAtomId)}
+      colors={colors} busy={!referencesEditable} onClose={() => setComposerAtomId(undefined)}
+      onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
       onOutputAction={async (action, decoded, rendered, signal) => {
         setImageOutputNotice("");
@@ -1943,6 +2016,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [drawerMounted, setDrawerMounted] = useState(false);
   const [messageAction, setMessageAction] = useState<{ readonly sessionId: string; readonly row: TimelineRow }>();
   const [messageActionsVisible, setMessageActionsVisible] = useState(false);
+  const [quoteSelection, setQuoteSelection] = useState<{
+    readonly lease: MobileQuoteSelectionLease;
+    readonly draft: MobileComposerDraft;
+    readonly draftIdentityKey: string;
+    readonly queueLease?: MobileQueueEditLease;
+  }>();
+  const [composerAtomId, setComposerAtomId] = useState<string>();
   const [queueEdit, setQueueEdit] = useState<{
     readonly lease: MobileQueueEditLease;
     readonly profileId: string;
@@ -1977,6 +2057,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const composerSelectionRef = useRef(composerSelection);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
+  const composerPasteEditableRef = useRef(false);
   const keyboard = useMobileKeyboardState();
   const safeArea = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
@@ -2141,6 +2222,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
     setCatalogMentionsVisible(false);
+    setQuoteSelection(undefined);
+    setComposerAtomId(undefined);
     if (ownerChanged) {
       setSelectedInteractionId(interactions[0]!.interactionId);
       setInteractionVisible(true);
@@ -2403,6 +2486,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error);
+  const composerPasteEditable = composerOwnerReady && queueEdit === undefined && !state.busy
+    && !voice.busy && !attachmentBusy;
+  composerPasteEditableRef.current = composerPasteEditable;
   const openTimelineImage = (row: TimelineRow, image: MobileImageGalleryPageSummary): void => {
     if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
       || attachmentBusy || voice.busy || !row.completed) return;
@@ -2806,6 +2892,113 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       setLocalError(errorText(error));
     }
   };
+  const pasteClipboardText = async (): Promise<void> => {
+    const identity = draftIdentityRef.current;
+    const captured = composerDraftRef.current;
+    const selection = composerSelectionRef.current;
+    if (!identity || !composerPasteEditableRef.current || AppState.currentState !== "active") {
+      setLocalError("Return to the active task composer before pasting text.");
+      return;
+    }
+    const identityKey = mobileComposerDraftIdentityKey(identity);
+    setLocalError("");
+    try {
+      const text = await Clipboard.getStringAsync();
+      if (!taskMountedRef.current || draftIdentityRef.current === undefined
+        || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== identityKey
+        || composerDraftRef.current !== captured
+        || composerSelectionRef.current.start !== selection.start
+        || composerSelectionRef.current.end !== selection.end
+        || !composerPasteEditableRef.current || queueEditRef.current
+        || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+        || client.state.status === "unpaired" || client.state.status === "revoked"
+        || AppState.currentState !== "active") {
+        throw new Error("The task draft changed while clipboard text was being read. Paste it again.");
+      }
+      const result = insertMobileClipboardText(captured, selection, text, randomUUID());
+      composerDraftRef.current = result.draft;
+      composerSelectionRef.current = result.selection;
+      setDraft(result.draft);
+      setComposerSelection(result.selection);
+      mobileComposerDrafts.save(identity, result.draft);
+      setTimeout(() => composerInputRef.current?.focus(), 0);
+    } catch (failure) {
+      if (taskMountedRef.current && draftIdentityRef.current
+        && mobileComposerDraftIdentityKey(draftIdentityRef.current) === identityKey) {
+        setLocalError(errorText(failure));
+      }
+    }
+  };
+  const removeComposerAtom = (atomId: string): void => {
+    const identity = draftIdentityRef.current;
+    if (!identity || queueEditRef.current) return;
+    try {
+      const result = removeMobileComposerAtom(composerDraftRef.current, atomId);
+      composerDraftRef.current = result.draft;
+      composerSelectionRef.current = result.selection;
+      setDraft(result.draft);
+      setComposerSelection(result.selection);
+      mobileComposerDrafts.save(identity, result.draft);
+      setComposerAtomId(undefined);
+    } catch (failure) {
+      setLocalError(errorText(failure));
+    }
+  };
+  const savePastedTextAtom = (atomId: string, text: string): void => {
+    const identity = draftIdentityRef.current;
+    if (!identity || queueEditRef.current) return;
+    try {
+      const result = updateMobilePastedTextAtom(composerDraftRef.current, atomId, text);
+      composerDraftRef.current = result.draft;
+      composerSelectionRef.current = result.selection;
+      setDraft(result.draft);
+      setComposerSelection(result.selection);
+      mobileComposerDrafts.save(identity, result.draft);
+      setComposerAtomId(undefined);
+    } catch (failure) {
+      setLocalError(errorText(failure));
+    }
+  };
+  const addSelectedQuote = (selection: MobileComposerSelection): void => {
+    const captured = quoteSelection;
+    const identity = draftIdentityRef.current;
+    if (!captured || !identity) return;
+    const identityKey = mobileComposerDraftIdentityKey(identity);
+    const activeQueueEdit = queueEditRef.current;
+    const currentNormalDraft = activeQueueEdit?.stashedDraft ?? composerDraftRef.current;
+    const latest = timelineRows(client.state.window
+      ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
+      .find((row) => row.eventId === captured.lease.sourceEventId && row.id === captured.lease.sourceMessageId);
+    try {
+      if (captured.draftIdentityKey !== identityKey || currentNormalDraft !== captured.draft
+        || captured.queueLease !== activeQueueEdit?.lease || AppState.currentState !== "active") {
+        throw new Error("The task composer changed while the quote was being selected. Select it again.");
+      }
+      const result = commitMobileQuoteSelection({
+        lease: captured.lease,
+        currentSessionId: client.state.selectedId,
+        latestRow: latest,
+        selection,
+        draft: currentNormalDraft,
+        atomId: randomUUID()
+      });
+      if (activeQueueEdit === undefined) {
+        composerDraftRef.current = result.draft;
+        composerSelectionRef.current = result.selection;
+        setDraft(result.draft);
+        setComposerSelection(result.selection);
+      } else {
+        const updated = { ...activeQueueEdit, stashedDraft: result.draft };
+        queueEditRef.current = updated;
+        setQueueEdit(updated);
+      }
+      mobileComposerDrafts.save(identity, result.draft);
+      setQuoteSelection(undefined);
+    } catch (failure) {
+      setQuoteSelection(undefined);
+      setLocalError(errorText(failure));
+    }
+  };
   const appendToNormalDraft = (text: string): void => {
     const active = queueEditRef.current;
     const result = addToMobileComposer({
@@ -2831,6 +3024,24 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
       .find((row) => row.eventId === selected.row.eventId && row.completed);
     if (!latest) return;
+    if (action === "quote-selection") {
+      const identity = draftIdentityRef.current;
+      const lease = captureMobileQuoteSelection(selected.sessionId, latest);
+      if (!identity || !lease || queueEditRef.current?.lease.sessionId !== undefined
+        && queueEditRef.current.lease.sessionId !== selected.sessionId) {
+        setLocalError("Only a current completed assistant text message can be quoted.");
+        return;
+      }
+      const activeQueueEdit = queueEditRef.current;
+      const normalDraft = activeQueueEdit?.stashedDraft ?? composerDraftRef.current;
+      setQuoteSelection({
+        lease,
+        draft: normalDraft,
+        draftIdentityKey: mobileComposerDraftIdentityKey(identity),
+        ...(activeQueueEdit === undefined ? {} : { queueLease: activeQueueEdit.lease })
+      });
+      return;
+    }
     if (action === "add-to-composer") {
       appendToNormalDraft(latest.text);
       return;
@@ -3121,7 +3332,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
       </View>
       {!queueEdit && (voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || catalogMentionControls
-        || attachmentControls || draft.mentions.length > 0 || draft.attachments.length > 0) && <View style={styles.composerTools}>
+        || attachmentControls || composerOwnerReady || draft.mentions.length > 0 || draft.atoms.length > 0
+        || draft.attachments.length > 0) && <View style={styles.composerTools}>
         {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
           disabled={!composerOwnerReady || state.busy || attachmentBusy || state.status !== "connected"} />}
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
@@ -3160,6 +3372,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             setWorkspaceMentionsVisible(false);
             setCatalogMentionsVisible(true);
           }} />}
+        <Action label="Paste text" colors={colors} compact
+          disabled={!composerPasteEditable}
+          onPress={() => void pasteClipboardText()} />
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"}
           colors={colors} compact
           disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
@@ -3187,6 +3402,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
             <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>{draft.text.slice(mention.start, mention.end)} ×</Text>
           </Pressable>)}
         </ScrollView>}
+        <MobileComposerAtomChips atoms={draft.atoms} colors={colors}
+          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
+          onOpen={setComposerAtomId} />
       </View>}
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
         disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
@@ -3194,10 +3412,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
       <View style={styles.composerRow}>
         <TextInput ref={composerInputRef} accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline
-          value={composerOwnerReady ? draft.text : ""} selection={composerSelection} maxLength={1_000_000}
+          value={composerOwnerReady ? draft.text : ""} selection={composerSelection}
+          maxLength={mobileComposerNativeInputMaximumCharacters}
           onSelectionChange={(event) => {
-            composerSelectionRef.current = event.nativeEvent.selection;
-            setComposerSelection(event.nativeEvent.selection);
+            const selection = boundedComposerSelection(event.nativeEvent.selection, composerDraftRef.current.text.length);
+            composerSelectionRef.current = selection;
+            setComposerSelection(selection);
           }}
           onChangeText={(value) => {
             try {
@@ -3205,7 +3425,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
                 setDraft(plainTextMobileComposerDraft(value));
                 return;
               }
-              const change = reconcileMobileComposerText(draft, value);
+              const change = reconcileMobileComposerText(composerDraftRef.current, value, randomUUID());
               setDraft(change.draft);
               composerDraftRef.current = change.draft;
               setComposerSelection(change.selection);
@@ -3282,6 +3502,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       onClose={imageGallery.close} onSave={imageGallery.save} />}
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
+    <MobileQuoteSelectionSheet lease={quoteSelection?.lease} colors={colors} busy={state.busy || voice.busy}
+      onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
+    <MobileComposerAtomSheet atom={draft.atoms.find((atom) => atom.atomId === composerAtomId)}
+      colors={colors} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
+      onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}
       profileId={state.activeProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionMutationPending} colors={colors}
@@ -3795,6 +4020,29 @@ function ModeTab({ label, selected, onPress, colors, disabled }: {
   </Pressable>;
 }
 
+function MobileComposerAtomChips({ atoms, colors, disabled, onOpen }: {
+  readonly atoms: readonly MobileComposerAtom[];
+  readonly colors: Colors;
+  readonly disabled: boolean;
+  readonly onOpen: (atomId: string) => void;
+}) {
+  if (atoms.length === 0) return null;
+  return <ScrollView horizontal keyboardShouldPersistTaps="handled"
+    accessibilityLabel="Structured message items" contentContainerStyle={styles.mentionChips}
+    showsHorizontalScrollIndicator={false}>
+    {atoms.map((atom) => <Pressable key={atom.atomId} accessibilityRole="button"
+      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
+      accessibilityHint="Opens this exact structured message item; it is removed as one unit if edited in the text field"
+      accessibilityState={{ disabled }} disabled={disabled} onPress={() => onOpen(atom.atomId)}
+      style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
+        disabled && styles.disabled]}>
+      <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>
+        {mobileComposerAtomLabel(atom)} · {atom.kind === "quote" ? "View" : "Edit"}
+      </Text>
+    </Pressable>)}
+  </ScrollView>;
+}
+
 function MobileAttachmentTray({ attachments, colors, disabled, busy, onPreview, onRemove }: {
   attachments: readonly MobileComposerAttachment[];
   colors: Colors;
@@ -3977,6 +4225,15 @@ function focusNative(ref: RefObject<View | null>): void {
   if (node !== null) setTimeout(() => AccessibilityInfo.setAccessibilityFocus(node), 0);
 }
 function errorText(error: unknown): string { return error instanceof Error ? error.message : "The Joko node is unavailable."; }
+
+function boundedComposerSelection(
+  selection: MobileComposerSelection,
+  textLength: number
+): MobileComposerSelection {
+  const start = Math.max(0, Math.min(selection.start, selection.end, textLength));
+  const end = Math.max(start, Math.min(Math.max(selection.start, selection.end), textLength));
+  return { start, end };
+}
 function savedStatus(profile: SavedMobileConnection): string {
   switch (profile.credentialState) {
     case "checking": return "Checking identity and protected credential…";

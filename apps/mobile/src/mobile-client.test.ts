@@ -2247,6 +2247,7 @@ describe("native mobile connection and operation ownership", () => {
     drafts.composer.save(identity, {
       text: `${recovered.text}\n\nKeep this newer draft`,
       mentions: recovered.mentions,
+      atoms: recovered.atoms,
       attachments: recovered.attachments
     });
     vi.mocked(network.getOperation).mockImplementation(async (_credential, operationId) => create(OperationSchema, {

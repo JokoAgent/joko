@@ -6,10 +6,12 @@ import {
 } from "./composer-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import {
+  appendMobileSelectionQuote,
   insertMobileArtifactMention,
   insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
+  insertMobilePastedText,
   plainTextMobileComposerDraft
 } from "./mobile-composer-document";
 
@@ -142,11 +144,23 @@ describe("mobile composer draft store", () => {
     expect(store.readSync(first)).toBeNull();
   });
 
-  it("round-trips v3 local and uploaded attachment identities without persisting picker URIs", async () => {
+  it("round-trips v4 atoms and local/uploaded attachment identities without persisting picker URIs", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);
+    const atomized = appendMobileSelectionQuote(insertMobilePastedText(
+      plainTextMobileComposerDraft("Review "),
+      { start: 7, end: 7 },
+      "p".repeat(4_000),
+      "paste"
+    ).draft, {
+      sourceSessionId: "session-one",
+      sourceMessageId: "assistant-message",
+      sourceEventId: "assistant-event",
+      sourceRole: "assistant",
+      text: "quoted"
+    }, "quote").draft;
     const attached = {
-      ...plainTextMobileComposerDraft("Review these"),
+      ...atomized,
       attachments: [
         {
           state: "local" as const,
@@ -177,7 +191,7 @@ describe("mobile composer draft store", () => {
 
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).resolves.toEqual(attached);
     const raw = memory.values.get(mobileComposerDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":3');
+    expect(raw).toContain('"version":4');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -216,19 +230,28 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 2,
+      version: 4,
       identity: first,
       draft: {
         text: "@Task",
-        mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 5 }]
+        mentions: [{ kind: "session", mentionId: "mention", sessionId: "source", displayText: "Task", start: 1, end: 5 }],
+        atoms: [],
+        attachments: []
       }
     }));
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 2,
+      version: 4,
       identity: second,
       draft: plainTextMobileComposerDraft("cross owner")
+    }));
+    await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+
+    memory.values.set(key, JSON.stringify({
+      version: 3,
+      identity: first,
+      draft: { text: "old", mentions: [], attachments: [] }
     }));
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
   });

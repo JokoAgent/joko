@@ -1,6 +1,8 @@
 import {
+  expandedMobileComposerSelection,
   normalizeMobileComposerDraft,
   replaceMobileComposerRange,
+  type MobileComposerAtom,
   type MobileComposerDraft,
   type MobileComposerMention,
   type MobileComposerSelection
@@ -15,6 +17,12 @@ export interface MobileVoiceDraftInsertionContext {
     readonly relativeStart: number;
     readonly relativeEnd: number;
   })[];
+  readonly rollbackAtoms: readonly (MobileComposerAtom & {
+    readonly relativeStart: number;
+    readonly relativeEnd: number;
+  })[];
+  readonly transcriptPrefix: string;
+  readonly transcriptSuffix: string;
   readonly persisted: boolean;
 }
 
@@ -36,15 +44,20 @@ export function applyMobileVoiceTranscript(
   if (!text) return context === undefined ? {} : { context };
   if (context !== undefined) {
     if (context.draftOwnerKey !== draftOwnerKey || !isMobileVoiceInsertionIntact(current.text, context.insertion)) return {};
+    const replacement = `${context.transcriptPrefix}${text}${context.transcriptSuffix}`;
     const result = replaceMobileComposerRange(
       current,
       { start: context.insertion.start, end: context.insertion.end },
-      text
+      replacement
     );
     return {
       context: {
         ...context,
-        insertion: { start: context.insertion.start, end: context.insertion.start + text.length, text },
+        insertion: {
+          start: context.insertion.start,
+          end: context.insertion.start + replacement.length,
+          text: replacement
+        },
         persisted: context.persisted || persist
       },
       draft: result.draft,
@@ -52,22 +65,36 @@ export function applyMobileVoiceTranscript(
     };
   }
 
-  const result = replaceMobileComposerRange(current, selection, text);
-  const start = result.selection.start - text.length;
-  const removedLength = text.length - (result.draft.text.length - current.text.length);
-  const end = start + removedLength;
+  const range = expandedMobileComposerSelection(current, selection);
+  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
+  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const transcriptPrefix = range.start === range.end && quoteBefore?.end === current.text.length ? "\n\n" : "";
+  const transcriptSuffix = range.start === range.end && quoteAfter?.start === 0 ? "\n\n" : "";
+  const replacement = `${transcriptPrefix}${text}${transcriptSuffix}`;
+  const result = replaceMobileComposerRange(current, range, replacement);
+  const start = range.start;
+  const end = range.end;
   const rollbackMentions = current.mentions.filter((mention) => mention.start < end && mention.end > start)
     .map((mention) => ({
       ...mention,
       relativeStart: mention.start - start,
       relativeEnd: mention.end - start
     }));
+  const rollbackAtoms = current.atoms.filter((atom) => atom.start < end && atom.end > start)
+    .map((atom) => ({
+      ...atom,
+      relativeStart: atom.start - start,
+      relativeEnd: atom.end - start
+    }));
   return {
     context: {
-      insertion: { start, end: start + text.length, text },
+      insertion: { start, end: start + replacement.length, text: replacement },
       draftOwnerKey,
       rollbackText: current.text.slice(start, end),
       rollbackMentions,
+      rollbackAtoms,
+      transcriptPrefix,
+      transcriptSuffix,
       persisted: persist
     },
     draft: result.draft,
@@ -93,10 +120,20 @@ export function rollbackMobileVoiceTranscript(
       end: context.insertion.start + relativeEnd
     } as MobileComposerMention;
   });
+  const restoredAtoms = context.rollbackAtoms.map((atom) => {
+    const { relativeStart, relativeEnd, ...value } = atom;
+    return {
+      ...value,
+      start: context.insertion.start + relativeStart,
+      end: context.insertion.start + relativeEnd
+    } as MobileComposerAtom;
+  });
   return {
     draft: normalizeMobileComposerDraft({
       ...restored.draft,
       mentions: [...restored.draft.mentions, ...restoredMentions]
+        .sort((left, right) => left.start - right.start || left.end - right.end),
+      atoms: [...restored.draft.atoms, ...restoredAtoms]
         .sort((left, right) => left.start - right.start || left.end - right.end)
     }),
     selection: restored.selection

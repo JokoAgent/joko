@@ -12,8 +12,9 @@ import {
   type QueueTextEditSplice
 } from "@joko/contracts";
 import type { TimelineRow } from "./timeline";
+import { mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 
-export type MobileMessageActionId = "add-to-composer" | "delete";
+export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "delete";
 
 export interface MobileMessageActionItem {
   readonly id: MobileMessageActionId;
@@ -29,6 +30,7 @@ export function buildMobileMessageActions(
   if (!row.completed || (row.kind !== "user" && row.kind !== "assistant")) return [];
   const actions: MobileMessageActionItem[] = [];
   if (row.text.trim()) actions.push({ id: "add-to-composer", label: "Add to composer" });
+  if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: "Quote selection" });
   if (input.canDelete) actions.push({
     id: "delete",
     label: "Delete message",
@@ -101,6 +103,12 @@ export function acceptedQueueItems(
 }
 
 export function queueItemText(input: InputContent | undefined): string | undefined {
+  const text = queueItemWireText(input);
+  if (text === undefined || input === undefined || !input.quotesEncoded) return text;
+  return mobileVisibleSelectionQuoteText(text, input.pastedTextRanges);
+}
+
+function queueItemWireText(input: InputContent | undefined): string | undefined {
   if (!input) return undefined;
   if (input.parts.some((part) => part.content.case === "image" || part.content.case === "file")) return undefined;
   const text = input.parts.filter((part) => part.content.case === "text");
@@ -119,9 +127,10 @@ export function editQueueItemText(
   input: InputContent | undefined,
   replacementText: string
 ): { readonly input: InputContent; readonly textSplices: readonly QueueTextEditSplice[] } | undefined {
-  const originalText = queueItemText(input);
-  if (input === undefined || originalText === undefined || !replacementText.trim()) return undefined;
-  if (replacementText === originalText) return undefined;
+  const originalText = queueItemWireText(input);
+  const visibleText = queueItemText(input);
+  if (input === undefined || originalText === undefined || visibleText === undefined || !replacementText.trim()) return undefined;
+  if (replacementText === visibleText) return undefined;
   const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } })];
   return {
     input: create(InputContentSchema, { parts }),
