@@ -44,6 +44,18 @@
     "plugins": [
       "./with-joko-photo-library-boundary.cjs",
       "./with-joko-native-brand.cjs",
+      "./with-joko-incoming-share.cjs",
+      ["expo-sharing", {
+        "ios": {
+          "enabled": true,
+          "appGroupId": "group.app.joko.mobile",
+          "activationRule": {
+            "supportsImageWithMaxCount": 20,
+            "supportsFileWithMaxCount": 20
+          }
+        },
+        "android": { "enabled": false }
+      }],
       "expo-secure-store",
       ["expo-audio", {
         "microphonePermission": "Allow Joko to use your microphone only while you are recording voice input for a task.",

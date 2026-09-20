@@ -133,6 +133,14 @@ import {
   type MobileImageOutputAction,
   type MobileImageOutputRenderedImage
 } from "./mobile-image-output";
+import {
+  commitMobileIncomingShare,
+  mobileIncomingShare,
+  mobileIncomingShareClaimMatches,
+  mobileIncomingShareProfileRetired,
+  planMobileIncomingShare,
+  type MobileIncomingShareReadyBatch
+} from "./mobile-incoming-share";
 
 const client = new MobileClient(
   mobileNetwork,
@@ -300,6 +308,10 @@ async function performMobileImageOutput(
 
 export function App() {
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
+  const incomingShare = useSyncExternalStore(
+    (listener) => mobileIncomingShare.subscribe(listener),
+    () => mobileIncomingShare.snapshot
+  );
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -308,6 +320,8 @@ export function App() {
   const [deviceId, setDeviceId] = useState<string>();
   const homeMenuButtonRef = useRef<View>(null);
   const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
+  const openedIncomingShareRef = useRef<string | undefined>(undefined);
+  const retiredIncomingShareRef = useRef<string | undefined>(undefined);
   const scheme = useColorScheme();
   const dark = scheme === "dark";
   const colors = useMemo(() => ({
@@ -319,25 +333,63 @@ export function App() {
 
   useEffect(() => {
     void mobileImageOutput.maintain().catch(() => undefined);
+    void mobileIncomingShare.refresh().catch(() => undefined);
     client.setForeground(AppState.currentState === "active");
     void client.start();
     const subscription = AppState.addEventListener("change", (status) => {
       const foreground = status === "active";
       client.setForeground(foreground);
+      if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
       if (!foreground) {
         void mobileComposerDrafts.flush().catch(() => undefined);
         void mobileInteractionDrafts.flush().catch(() => undefined);
         void mobileNewTaskDrafts.flush().catch(() => undefined);
       }
     });
+    const linking = Linking.addEventListener("url", ({ url }) => {
+      if (/^joko:\/\/expo-sharing(?:[/?#]|$)/iu.test(url)) {
+        void mobileIncomingShare.refresh().catch(() => undefined);
+      }
+    });
+    void Linking.getInitialURL().then((url) => {
+      if (url && /^joko:\/\/expo-sharing(?:[/?#]|$)/iu.test(url)) {
+        void mobileIncomingShare.refresh().catch(() => undefined);
+      }
+    }).catch(() => undefined);
     return () => {
       subscription.remove();
+      linking.remove();
       client.setForeground(false);
       void mobileComposerDrafts.flush().catch(() => undefined);
       void mobileInteractionDrafts.flush().catch(() => undefined);
       void mobileNewTaskDrafts.flush().catch(() => undefined);
     };
   }, []);
+
+  useEffect(() => {
+    const batch = incomingShare.batch;
+    if (!batch || openedIncomingShareRef.current === batch.batchId || !state.activeProfileId) return;
+    openedIncomingShareRef.current = batch.batchId;
+    setPage("new");
+  }, [incomingShare.batch, state.activeProfileId]);
+
+  useEffect(() => {
+    const batch = incomingShare.batch;
+    if (!batch || !mobileIncomingShareProfileRetired(
+      batch,
+      state.activeProfileId,
+      state.status === "starting",
+      state.saved.map((profile) => profile.profileId)
+    )
+      || incomingShare.busy) return;
+    const retirement = `${batch.batchId}\u001f${state.activeProfileId ?? "forgotten"}`;
+    if (retiredIncomingShareRef.current === retirement) return;
+    retiredIncomingShareRef.current = retirement;
+    void mobileIncomingShare.discard(batch.batchId).catch(() => {
+      openedIncomingShareRef.current = undefined;
+      if (client.state.activeProfileId) setPage("new");
+    });
+  }, [incomingShare.batch, incomingShare.busy, state.activeProfileId, state.saved, state.status]);
 
   useEffect(() => {
     if (!state.activeProfileId && state.status !== "starting") {
@@ -938,6 +990,10 @@ function SavedPendingOperations({ profile, colors }: { profile: SavedMobileConne
 }
 
 function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onBack: () => void; onCreated: () => void }) {
+  const incomingShareState = useSyncExternalStore(
+    (listener) => mobileIncomingShare.subscribe(listener),
+    () => mobileIncomingShare.snapshot
+  );
   const initialIdentity = state.activeProfileId ? { profileId: state.activeProfileId } : undefined;
   const initialDraft = initialIdentity ? mobileNewTaskDrafts.readSync(initialIdentity) : null;
   const [draft, setDraft] = useState(() => ({
@@ -952,6 +1008,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   const [loadedProfileId, setLoadedProfileId] = useState<string | undefined>();
   const [draftReady, setDraftReady] = useState(false);
   const [error, setError] = useState("");
+  const [incomingShareNotice, setIncomingShareNotice] = useState("");
   const [imageOutputNotice, setImageOutputNotice] = useState("");
   const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
   const [sessionMentionError, setSessionMentionError] = useState("");
@@ -1158,6 +1215,15 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   }, [voice.busy]);
   const referencesEditable = ownerReady && !state.busy && !mentionBusy && !attachmentBusy && !voice.busy
     && retained === undefined;
+  const incomingShareBatch = incomingShareState.batch;
+  const incomingSharePlan = useMemo(() => incomingShareBatch?.status === "ready"
+    && incomingShareBatch.boundProfileId === profileId && attachmentControls
+    ? planMobileIncomingShare(incomingShareBatch, draft.input.attachments, attachmentControls.policy)
+    : undefined, [attachmentControls, draft.input.attachments, incomingShareBatch, profileId]);
+  const incomingShareClaimCurrent = incomingShareBatch?.status === "ready" && incomingShareBatch.claim
+    && incomingSharePlan && attachmentControls
+    ? mobileIncomingShareClaimMatches(incomingShareBatch, draft.targetId, attachmentControls, incomingSharePlan)
+    : undefined;
   const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
     const controls = sessionMentionControls;
     const targetId = draft.targetId;
@@ -1311,6 +1377,124 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     } catch (failure) {
       await Promise.all(staged.map((attachment) => mobileAttachmentFiles.remove(ownerProfileId, attachment)
         .catch(() => undefined)));
+      if (mountedRef.current && attachmentGenerationRef.current === generation) setError(errorText(failure));
+    } finally {
+      if (attachmentAbortRef.current === controller) {
+        attachmentAbortRef.current = undefined;
+        attachmentNativeActivityRef.current = false;
+        if (mountedRef.current && attachmentGenerationRef.current === generation) setAttachmentBusy(false);
+      }
+    }
+  };
+  const bindIncomingShare = async (batch: MobileIncomingShareReadyBatch): Promise<void> => {
+    const ownerProfileId = profileIdRef.current;
+    if (!ownerProfileId || !ownerReady || state.status !== "connected" || AppState.currentState !== "active") {
+      setError("Connect and return to the foreground before choosing where to keep these shared files.");
+      return;
+    }
+    setError("");
+    setIncomingShareNotice("");
+    try {
+      await mobileIncomingShare.bind(batch.batchId, ownerProfileId);
+    } catch (failure) {
+      if (mountedRef.current) setError(errorText(failure));
+    }
+  };
+  const discardIncomingShare = async (batchId: string): Promise<void> => {
+    setError("");
+    setIncomingShareNotice("");
+    try {
+      await mobileIncomingShare.discard(batchId);
+      if (mountedRef.current) setIncomingShareNotice("Shared files were discarded from the Joko inbox.");
+    } catch (failure) {
+      if (mountedRef.current) setError(errorText(failure));
+    }
+  };
+  const importIncomingShare = async (batch: MobileIncomingShareReadyBatch): Promise<void> => {
+    const controls = attachmentControls;
+    const ownerProfileId = profileIdRef.current;
+    const targetId = draftRef.current.targetId;
+    if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
+      || batch.boundProfileId !== ownerProfileId || attachmentOwnerRef.current !== controls.surfaceOwnerKey
+      || !referencesEditable || attachmentNativeActivityRef.current || AppState.currentState !== "active") {
+      setError("Shared-file authority changed. Reopen this inbox from the current project and try again.");
+      return;
+    }
+    const generation = ++attachmentGenerationRef.current;
+    const controller = new AbortController();
+    attachmentAbortRef.current = controller;
+    attachmentNativeActivityRef.current = true;
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setAttachmentBusy(true);
+    setError("");
+    setIncomingShareNotice("");
+    try {
+      const preview = planMobileIncomingShare(batch, draftRef.current.input.attachments, controls.policy);
+      const claimedBatch = await mobileIncomingShare.claim(
+        batch.batchId,
+        ownerProfileId,
+        targetId,
+        controls,
+        preview
+      );
+      const claimId = claimedBatch.claim?.claimId;
+      if (!claimId) throw new Error("The incoming share target claim is unavailable.");
+      const result = await commitMobileIncomingShare({
+        batch: claimedBatch,
+        profileId: ownerProfileId,
+        targetId,
+        controls,
+        draftStore: mobileNewTaskDrafts,
+        attachmentFiles: mobileAttachmentFiles,
+        signal: controller.signal,
+        validateAuthority: async () => {
+          const latest = await waitForMobileAttachmentAuthority(
+            { profileId: ownerProfileId, surfaceOwnerKey: controls.surfaceOwnerKey },
+            () => client.newTaskAttachmentControls(targetId),
+            (listener) => client.subscribe(() => listener()),
+            {
+              signal: controller.signal,
+              retired: () => {
+                const current = client.state;
+                return profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+                  || current.activeProfileId !== ownerProfileId
+                  || current.status === "revoked" || current.status === "unpaired"
+                  || AppState.currentState !== "active"
+                  || current.status === "connected" && client.newTaskAttachmentControls(targetId) === undefined;
+              }
+            }
+          );
+          if (!mountedRef.current || attachmentGenerationRef.current !== generation
+            || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
+            || attachmentOwnerRef.current !== controls.surfaceOwnerKey) {
+            throw new Error("Shared-file authority changed while the files were being added.");
+          }
+          return latest;
+        },
+        acknowledge: () => mobileIncomingShare.acknowledge(batch.batchId, ownerProfileId, claimId)
+      });
+      if (!mountedRef.current || profileIdRef.current !== ownerProfileId
+        || attachmentGenerationRef.current !== generation) return;
+      const next = { targetId: result.draft.targetId, name: result.draft.name, input: result.draft.input };
+      draftRef.current = next;
+      setDraft(next);
+      setIncomingShareNotice([
+        result.plan.accepted.length > 0
+          ? `${result.replayed ? "Confirmed" : "Added"} ${result.plan.accepted.length} shared ${result.plan.accepted.length === 1 ? "file" : "files"}.`
+          : "No shared files were added.",
+        result.plan.rejected.length > 0
+          ? `${result.plan.rejected.length} ${result.plan.rejected.length === 1 ? "item was" : "items were"} skipped as shown.`
+          : ""
+      ].filter(Boolean).join(" "));
+    } catch (failure) {
+      const retainedDraft = mobileNewTaskDrafts.readSync({ profileId: ownerProfileId });
+      if (mountedRef.current && profileIdRef.current === ownerProfileId && retainedDraft
+        && retainedDraft.submission === undefined) {
+        const next = { targetId: retainedDraft.targetId, name: retainedDraft.name, input: retainedDraft.input };
+        draftRef.current = next;
+        setDraft(next);
+      }
       if (mountedRef.current && attachmentGenerationRef.current === generation) setError(errorText(failure));
     } finally {
       if (attachmentAbortRef.current === controller) {
@@ -1515,6 +1699,72 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     <Back onPress={() => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); }} colors={colors} />
     <Text style={[styles.title, { color: colors.ink }]}>New task</Text>
     <Text style={[styles.description, { color: colors.muted }]}>Choose an active project and enter the first message. Joko retains this draft on this device until the first message is durably accepted.</Text>
+    {incomingShareNotice && <Banner text={incomingShareNotice} colors={colors} />}
+    {incomingShareState.error && !incomingShareBatch && <Banner text={incomingShareState.error} colors={colors} />}
+    {incomingShareBatch && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}
+      accessibilityRole="summary" accessibilityLabel="Files shared with Joko">
+      <Text style={[styles.label, { color: colors.ink }]}>Shared with Joko</Text>
+      {incomingShareBatch.status === "invalid" ? <>
+        <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
+          {incomingShareBatch.invalidReason} This batch was kept so you can retry cleanup or discard it explicitly.
+        </Text>
+        <Action label={incomingShareState.busy ? "Discarding…" : "Discard invalid share"} colors={colors} compact
+          disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+      </> : <>
+        <Text style={[styles.description, { color: colors.muted }]}>
+          {incomingShareBatch.items.length + incomingShareBatch.overflowCount} external {incomingShareBatch.items.length + incomingShareBatch.overflowCount === 1 ? "item is" : "items are"} waiting in the protected iOS inbox. Nothing is sent automatically.
+        </Text>
+        {incomingShareBatch.boundProfileId === undefined ? <>
+          <Text style={[styles.caption, { color: colors.muted }]}>Choose this active connection explicitly before Joko copies any file into its new-task draft.</Text>
+          <View style={styles.actionRow}>
+            <Action label={incomingShareState.busy ? "Binding…" : "Use with this connection"} colors={colors} compact
+              disabled={incomingShareState.busy || !ownerReady || state.status !== "connected"}
+              onPress={() => void bindIncomingShare(incomingShareBatch)} />
+            <Action label="Discard" colors={colors} compact disabled={incomingShareState.busy}
+              onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+          </View>
+        </> : incomingShareBatch.boundProfileId !== profileId ? <>
+          <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
+            This share belongs to a different connection profile and cannot enter the current draft.
+          </Text>
+          <Action label={incomingShareState.busy ? "Discarding…" : "Discard bound share"} colors={colors} compact
+            disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+        </> : incomingShareClaimCurrent === false ? <>
+          <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
+            This share was already claimed by a different project, model, or attachment policy. Return to that exact project state to retry, or discard it explicitly.
+          </Text>
+          <Action label="Discard claimed share" colors={colors} compact
+            disabled={incomingShareState.busy || attachmentBusy}
+            onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+        </> : !attachmentControls || !targetAvailable || !incomingSharePlan ? <>
+          <Text style={[styles.caption, { color: colors.muted }]}>Choose a current project whose model accepts these image or file attachments, or discard the share.</Text>
+          {incomingShareBatch.items.filter((item) => item.state === "rejected").map((rejection) => <Text
+            key={rejection.itemId} accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
+            {rejection.fileName ? `${rejection.fileName}: ` : ""}{rejection.reason}
+          </Text>)}
+          {incomingShareBatch.overflowCount > 0 && <Text accessibilityRole="alert"
+            style={[styles.caption, { color: colors.negative }]}>{incomingShareBatch.overflowCount} additional shared {incomingShareBatch.overflowCount === 1 ? "item was" : "items were"} rejected because one share can contain at most 20 items.</Text>}
+          <Action label="Discard" colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
+            onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+        </> : <>
+          <Text style={[styles.caption, { color: colors.muted }]}>Before you continue: {incomingSharePlan.accepted.length} {incomingSharePlan.accepted.length === 1 ? "file matches" : "files match"} this project; {incomingSharePlan.rejected.length} will be skipped.</Text>
+          {incomingSharePlan.rejected.map((rejection, index) => <Text key={`${rejection.itemId ?? "overflow"}-${index}`}
+            accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
+            {rejection.fileName ? `${rejection.fileName}: ` : ""}{rejection.reason}
+          </Text>)}
+          <View style={styles.actionRow}>
+            <Action label={attachmentBusy || incomingShareState.busy ? "Adding…"
+              : incomingSharePlan.accepted.length > 0 ? "Add shared files" : "Confirm and clear"}
+              colors={colors} compact disabled={!referencesEditable || incomingShareState.busy}
+              onPress={() => void importIncomingShare(incomingShareBatch)} />
+            <Action label="Discard" colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
+              onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+          </View>
+        </>}
+        {incomingShareState.error && <Text accessibilityRole="alert"
+          style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>{incomingShareState.error}</Text>}
+      </>}
+    </View>}
     <Text style={[styles.section, { color: colors.muted }]}>Project</Text>
     {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No project currently supports text tasks. Create one on a connected Joko client, then refresh.</Text>}
     {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}

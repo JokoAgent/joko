@@ -1,0 +1,10 @@
+{
+  "name": "@joko/incoming-share",
+  "version": "0.1.0",
+  "description": "Joko-owned Apple App Group inbox for external file and image shares.",
+  "license": "UNLICENSED",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}
