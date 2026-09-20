@@ -1,6 +1,7 @@
 const { withAndroidManifest, withInfoPlist } = require("expo/config-plugins");
 
 const photoLibraryUsage = "Allow Joko to show photos you explicitly choose for a task attachment.";
+const microphoneUsage = "Allow Joko to use your microphone only while you are recording voice input for a task.";
 
 // Keep this plugin before the Expo media plugins in app.json. Expo composes normal
 // mods inside-out, so the first registered boundary is the final manifest/plist pass.
@@ -14,6 +15,7 @@ function enforceAndroidSystemPhotoPickerBoundary(manifest) {
 
 function enforceIosReadOnlyPhotoLibraryBoundary(infoPlist) {
   infoPlist.NSPhotoLibraryUsageDescription = photoLibraryUsage;
+  infoPlist.NSMicrophoneUsageDescription = microphoneUsage;
   infoPlist.PHPhotoLibraryPreventAutomaticLimitedAccessAlert = true;
   delete infoPlist.NSPhotoLibraryAddUsageDescription;
   return infoPlist;
@@ -34,3 +36,4 @@ module.exports = withJokoPhotoLibraryBoundary;
 module.exports.enforceAndroidSystemPhotoPickerBoundary = enforceAndroidSystemPhotoPickerBoundary;
 module.exports.enforceIosReadOnlyPhotoLibraryBoundary = enforceIosReadOnlyPhotoLibraryBoundary;
 module.exports.photoLibraryUsage = photoLibraryUsage;
+module.exports.microphoneUsage = microphoneUsage;

@@ -137,6 +137,7 @@ import {
   type MobileCompactOutcome,
   type MobileContextControls
 } from "./mobile-context-controls";
+import type { MobileVoiceTransport } from "./mobile-voice-input";
 import {
   assertMobileNativeTreeNavigation,
   projectMobileNativeTree,
@@ -2414,6 +2415,17 @@ export class MobileClient {
     }, this.#state.owner, this.#state.detail, this.#state.selectedId);
   }
 
+  newTaskVoiceTransport(targetId: string): MobileVoiceTransport | undefined {
+    const authorityKey = this.#newTaskAuthorityKey(targetId);
+    const credential = this.#credential;
+    if (!authorityKey || !credential) return undefined;
+    const surfaceOwnerKey = `${authorityKey}\u001fvoice-input`;
+    return this.#voiceTransport(credential, surfaceOwnerKey, () => {
+      const current = this.#newTaskAuthorityKey(targetId);
+      return current === undefined ? undefined : `${current}\u001fvoice-input`;
+    });
+  }
+
   newTaskAttachmentControls(targetId: string): MobileAttachmentControls | undefined {
     const owner = this.#state.owner;
     const authorityKey = this.#newTaskAuthorityKey(targetId);
@@ -2591,6 +2603,17 @@ export class MobileClient {
       surfaceOwnerKey: `${authorityKey}\u001fattachments\u001f${model?.authorityKey ?? "native-default"}`,
       policy
     };
+  }
+
+  taskVoiceTransport(): MobileVoiceTransport | undefined {
+    const authorityKey = this.#taskAuthorityKey();
+    const credential = this.#credential;
+    if (!authorityKey || !credential) return undefined;
+    const surfaceOwnerKey = `${authorityKey}\u001fvoice-input`;
+    return this.#voiceTransport(credential, surfaceOwnerKey, () => {
+      const current = this.#taskAuthorityKey();
+      return current === undefined ? undefined : `${current}\u001fvoice-input`;
+    });
   }
 
   async listTaskCatalogMentionCatalog(
@@ -3441,6 +3464,51 @@ export class MobileClient {
       && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
     }
+  }
+
+  #voiceTransport(
+    credential: PairedCredential,
+    surfaceOwnerKey: string,
+    readCurrentOwnerKey: () => string | undefined
+  ): MobileVoiceTransport {
+    const isCurrent = (): boolean => readCurrentOwnerKey() === surfaceOwnerKey
+      && this.#credential?.profileId === credential.profileId
+      && this.#credential.connectionId === credential.connectionId
+      && this.#credential.deviceId === credential.deviceId
+      && this.#credential.serverId === credential.serverId;
+    const assertCurrent = (): void => {
+      if (!isCurrent()) throw new Error("Voice input authority changed while the microphone was active.");
+    };
+    const owned = async <T>(effect: () => Promise<T>): Promise<T> => {
+      assertCurrent();
+      const result = await effect();
+      assertCurrent();
+      return result;
+    };
+    return {
+      profileId: credential.profileId,
+      surfaceOwnerKey,
+      isCurrent,
+      getCapabilities: (signal) => owned(() => this.network.getVoiceInputCapabilities(credential, signal)),
+      start: (requestId, mimeType, locale, signal) => owned(() =>
+        this.network.startVoiceInput(credential, requestId, mimeType, locale, signal)),
+      append: (voiceInputId, chunkSequence, audio, durationMs, voiced, signal) => owned(() =>
+        this.network.appendVoiceAudio(
+          credential,
+          voiceInputId,
+          chunkSequence,
+          audio,
+          durationMs,
+          voiced,
+          signal
+        )),
+      stop: (voiceInputId, expectedNextChunkSequence, signal) => owned(() =>
+        this.network.stopVoiceInput(credential, voiceInputId, expectedNextChunkSequence, signal)),
+      // Cleanup must retain the initiating credential even after UI authority
+      // retires; it can only address this exact connection-owned voice id.
+      cancel: (voiceInputId, signal) => this.network.cancelVoiceInput(credential, voiceInputId, signal),
+      get: (voiceInputId, signal) => owned(() => this.network.getVoiceInputSession(credential, voiceInputId, signal))
+    };
   }
 
   #newTaskAuthorityKey(targetId: string, owner = this.#state.owner): string | undefined {

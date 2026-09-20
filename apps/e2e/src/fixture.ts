@@ -44,7 +44,7 @@ export interface FixtureOptions {
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
   readonly terminals?: OrchestratorApplication["terminals"];
-  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserSettings" | "browserState">>;
+  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserSettings" | "browserState" | "voiceInput">>;
 }
 
 export class InstrumentedFakeAdapter extends FakeBackendAdapter {
@@ -344,6 +344,7 @@ export class OrchestratorE2eFixture {
         auxiliaryServices?.sshKeys?.close();
         await auxiliaryServices?.remoteHosts?.close();
         await auxiliaryServices?.browser?.stop();
+        await auxiliaryServices?.voiceInput?.close();
         await lanDiscovery.stop();
         await options.terminals?.dispose();
         await sessionHost.dispose();

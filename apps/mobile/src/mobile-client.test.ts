@@ -27,6 +27,7 @@ import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { MobileAttachmentFiles, type MobileAttachmentFileDriver } from "./mobile-attachment-files";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
 import {
   insertMobileArtifactMention,
@@ -656,6 +657,12 @@ function fakeNetwork(): MobileNetwork {
     listArtifactReferenceCatalog: vi.fn(async () => ({ artifacts: [], revision: "artifact-references-1" })),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
+    getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
+    startVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
+    appendVoiceAudio: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
+    stopVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
+    cancelVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
+    getVoiceInputSession: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
     prepareTarget: vi.fn(async () => undefined),
     submit: vi.fn(async (_credential, operationId, mutation) => {
       toBinary(OperationMutationSchema, mutation);
@@ -807,6 +814,72 @@ function client(
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); });
 
 describe("native mobile connection and operation ownership", () => {
+  it("binds Voice Input RPCs to the exact live surface and retains only exact-session cleanup after retirement", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    const voiceCapability: MobileVoiceCapability = {
+      support: "supported",
+      limits: {
+        supportedMimeTypes: ["audio/pcm"],
+        maximumAudioChunkBytes: 8_192,
+        maximumAudioBytes: 1_048_576,
+        maximumAudioChunkDurationMs: 500,
+        maximumAudioDurationMs: 60_000,
+        maximumLocaleCharacters: 35,
+        stableWaitMs: 500,
+        maximumConcurrentSessions: 1
+      },
+      supportsLocale: true,
+      supportsLiveDrafts: true,
+      supportsRefinement: true
+    };
+    const voiceSession: MobileVoiceSession = {
+      id: "voice-one",
+      state: "listening",
+      nextChunkSequence: 1n,
+      acceptedAudioBytes: 0,
+      acceptedAudioDurationMs: 0,
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      recoveryAttempts: 0,
+      stallWarning: false
+    };
+    vi.mocked(network.getVoiceInputCapabilities).mockResolvedValue(voiceCapability);
+    vi.mocked(network.startVoiceInput).mockResolvedValue(voiceSession);
+    vi.mocked(network.cancelVoiceInput).mockResolvedValue({
+      ...voiceSession,
+      state: "done",
+      outcome: "cancelled",
+      updatedAt: 1_001
+    });
+    await app.start();
+
+    const newTaskVoice = app.newTaskVoiceTransport("target");
+    expect(newTaskVoice).toBeDefined();
+    expect(newTaskVoice?.isCurrent()).toBe(true);
+    await expect(newTaskVoice!.getCapabilities()).resolves.toBe(voiceCapability);
+    await expect(newTaskVoice!.start("request-one", "audio/pcm", "en-US")).resolves.toBe(voiceSession);
+    expect(network.startVoiceInput).toHaveBeenCalledWith(
+      credential,
+      "request-one",
+      "audio/pcm",
+      "en-US",
+      undefined
+    );
+
+    await app.select("session");
+    const taskVoice = app.taskVoiceTransport();
+    expect(taskVoice).toBeDefined();
+    expect(taskVoice?.surfaceOwnerKey).not.toBe(newTaskVoice?.surfaceOwnerKey);
+    app.setForeground(false);
+    expect(taskVoice?.isCurrent()).toBe(false);
+    await expect(taskVoice!.get("voice-one")).rejects.toThrow(/authority changed/i);
+    await expect(taskVoice!.cancel("voice-one")).resolves.toMatchObject({ outcome: "cancelled" });
+    expect(network.getVoiceInputSession).not.toHaveBeenCalled();
+    expect(network.cancelVoiceInput).toHaveBeenCalledWith(credential, "voice-one", undefined);
+  });
+
   it("accepts only the exact current Joko API identity before any authenticated work", () => {
     expect(parseNodeIdentity(node)).toEqual(node);
     expect(() => parseNodeIdentity({ ...node, apiVersion: "joko.v2" })).toThrow(/supports API joko\.v1/);

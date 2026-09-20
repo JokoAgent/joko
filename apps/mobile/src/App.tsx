@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import {
-  AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, Keyboard, Modal, PanResponder, Platform,
+  AccessibilityInfo, ActivityIndicator, Alert, AppState, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
   useWindowDimensions, View
 } from "react-native";
@@ -115,6 +115,8 @@ import {
   type MobileFilesSearchMode
 } from "./workspace-files";
 import { buildMobileMessageActions, queueItemText, type MobileMessageActionId } from "./task-actions";
+import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
+import type { MobileVoiceRunError } from "./mobile-voice-input";
 
 const client = new MobileClient(
   mobileNetwork,
@@ -801,6 +803,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     state.owner?.backends.some((backend) => backend.backendId === target.backendId
       && backend.capabilities?.capabilities.some((capability) => capability.name === capabilityNames.inputText && capability.support === CapabilitySupport.SUPPORTED))) ?? [];
   const targetAvailable = targets.some((target) => target.targetId === draft.targetId);
+  const voiceTransport = client.newTaskVoiceTransport(draft.targetId);
   const sessionMentionControls = client.newTaskSessionMentionControls(draft.targetId);
   const workspaceMentionControls = client.newTaskWorkspaceMentionControls(draft.targetId);
   const attachmentControls = client.newTaskAttachmentControls(draft.targetId);
@@ -925,7 +928,38 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     setAttachmentBusy(false);
   }, [draft.targetId, profileId, state.status]);
   const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
-  const referencesEditable = ownerReady && !state.busy && !mentionBusy && !attachmentBusy
+  const voice = useMobileVoiceInput({
+    transport: voiceTransport,
+    draftOwnerKey: profileId === undefined ? undefined : `new-task\u001f${profileId}`,
+    enabled: ownerReady && targetAvailable && state.status === "connected" && !state.busy
+      && !mentionBusy && !attachmentBusy && retained === undefined,
+    readDraft: () => draftRef.current.input,
+    readSelection: () => selectionRef.current,
+    writeDraft: (input, selection, persist) => {
+      const next = { ...draftRef.current, input };
+      draftRef.current = next;
+      selectionRef.current = selection;
+      setDraft(next);
+      setComposerSelection(selection);
+      const currentProfileId = profileIdRef.current;
+      if (!persist || !currentProfileId) return;
+      const currentIdentity = { profileId: currentProfileId };
+      mobileNewTaskDrafts.save(currentIdentity, next);
+      void mobileNewTaskDrafts.flush(currentIdentity).catch((failure) => {
+        if (mountedRef.current && profileIdRef.current === currentProfileId) setError(errorText(failure));
+      });
+    },
+    onError: setError,
+    requestId: randomUUID
+  });
+  useMobileVoicePermissionSettings(voice.error);
+  useEffect(() => {
+    if (!voice.busy) return;
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setSessionMentionError("");
+  }, [voice.busy]);
+  const referencesEditable = ownerReady && !state.busy && !mentionBusy && !attachmentBusy && !voice.busy
     && retained === undefined;
   const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
     const controls = sessionMentionControls;
@@ -1213,7 +1247,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     }
   };
   const submit = (): void => {
-    if (!identity) return;
+    if (!identity || voice.busy) return;
     setError("");
     mobileNewTaskDrafts.save(identity, draft);
     void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.input)).then((result) => {
@@ -1227,25 +1261,28 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     <Text style={[styles.section, { color: colors.muted }]}>Project</Text>
     {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No project currently supports text tasks. Create one on a connected Joko client, then refresh.</Text>}
     {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}
-      accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || attachmentBusy || retained !== undefined}
+      accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || attachmentBusy || voice.busy || retained !== undefined}
       onPress={() => {
         setSessionMentionsVisible(false);
         setWorkspaceMentionsVisible(false);
         setSessionMentionError("");
         patchDraft({ targetId: target.targetId });
       }}
-      style={[styles.row, !ownerReady || state.busy || attachmentBusy || retained !== undefined ? styles.disabled : undefined,
+      style={[styles.row, !ownerReady || state.busy || attachmentBusy || voice.busy || retained !== undefined ? styles.disabled : undefined,
         { backgroundColor: colors.surface, borderColor: draft.targetId === target.targetId ? colors.accent : colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{target.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{state.owner?.backends.find((backend) => backend.backendId === target.backendId)?.displayName}</Text>
     </Pressable>)}
     {draft.targetId && !targetAvailable && <Banner text="The retained project is no longer an active text target. Choose a current project; your name and first message were kept." colors={colors} />}
     <Field label="Task name" value={draft.name} onChange={(name) => patchDraft({ name })} placeholder="New task" colors={colors}
-      editable={ownerReady && !state.busy && !attachmentBusy && retained === undefined} maxLength={256} />
+      editable={ownerReady && !state.busy && !attachmentBusy && !voice.busy && retained === undefined} maxLength={256} />
     <View style={styles.field}>
       <Text style={[styles.caption, { color: colors.muted }]}>First message</Text>
-      {(sessionMentionControls || workspaceMentionControls || attachmentControls
+      {(voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || attachmentControls
         || draft.input.mentions.length > 0 || draft.input.attachments.length > 0) && <View style={styles.composerTools}>
+        {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
+          disabled={!ownerReady || !targetAvailable || state.busy || mentionBusy || attachmentBusy
+            || state.status !== "connected" || retained !== undefined} />}
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
           disabled={!referencesEditable || draft.input.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
@@ -1314,7 +1351,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     <Action label={state.busy ? "Creating and sending…" : "Create and send"}
       disabled={!ownerReady || !draft.targetId || !targetAvailable
         || (!draft.input.text.trim() && draft.input.attachments.length === 0)
-        || state.busy || mentionBusy || attachmentBusy
+        || state.busy || mentionBusy || attachmentBusy || voice.busy
         || state.status !== "connected" || retained !== undefined || pendingCreate}
       colors={colors} onPress={submit} />
     {retained?.phase === "sending" && state.selectedId === retained.sessionId
@@ -1406,6 +1443,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const queueEditRef = useRef(queueEdit);
   const composerInputRef = useRef<TextInput>(null);
   const composerDraftRef = useRef(draft);
+  const composerSelectionRef = useRef(composerSelection);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
   const keyboard = useMobileKeyboardState();
@@ -1493,6 +1531,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
   const catalogMentionControls = client.taskCatalogMentionControls();
   const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
+  const voiceTransport = client.taskVoiceTransport();
   const attachmentControls = client.taskAttachmentControls();
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
   const attachmentGenerationRef = useRef(0);
@@ -1500,6 +1539,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
   const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
   composerDraftRef.current = draft;
+  composerSelectionRef.current = composerSelection;
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -1742,16 +1782,54 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   }, []);
 
   const openMessageActions = (row: TimelineRow): void => {
-    if (!state.selectedId) return;
+    if (!state.selectedId || voice.busy) return;
     setMessageAction({ sessionId: state.selectedId, row });
     setMessageActionsVisible(true);
   };
   const saveNormalDraft = (value: MobileComposerDraft, identity = draftIdentityRef.current): void => {
     setDraft(value);
     composerDraftRef.current = value;
-    setComposerSelection({ start: value.text.length, end: value.text.length });
+    const selection = { start: value.text.length, end: value.text.length };
+    composerSelectionRef.current = selection;
+    setComposerSelection(selection);
     if (identity) mobileComposerDrafts.save(identity, value);
   };
+  const voice = useMobileVoiceInput({
+    transport: voiceTransport,
+    draftOwnerKey: draftIdentityKey,
+    enabled: composerOwnerReady && queueEdit === undefined && interactions.length === 0
+      && state.status === "connected" && !state.busy && !attachmentBusy,
+    readDraft: () => composerDraftRef.current,
+    readSelection: () => composerSelectionRef.current,
+    writeDraft: (value, selection, persist) => {
+      if (queueEditRef.current) return;
+      setDraft(value);
+      composerDraftRef.current = value;
+      composerSelectionRef.current = selection;
+      setComposerSelection(selection);
+      const identity = draftIdentityRef.current;
+      if (!persist || !identity) return;
+      mobileComposerDrafts.save(identity, value);
+      const identityKey = mobileComposerDraftIdentityKey(identity);
+      void mobileComposerDrafts.flush(identity).catch((failure) => {
+        if (taskMountedRef.current && draftIdentityRef.current
+          && mobileComposerDraftIdentityKey(draftIdentityRef.current) === identityKey) setLocalError(errorText(failure));
+      });
+    },
+    onError: setLocalError,
+    requestId: randomUUID
+  });
+  useMobileVoicePermissionSettings(voice.error);
+  useEffect(() => {
+    if (!voice.busy) return;
+    setRuntimeControlsVisible(false);
+    setContextVisible(false);
+    setNativeTreeVisible(false);
+    setSessionMentionsVisible(false);
+    setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
+    setSessionMentionError("");
+  }, [voice.busy]);
   const addAttachments = async (source: "picker" | "camera" | "photos"): Promise<void> => {
     const controls = attachmentControls;
     const identity = draftIdentityRef.current;
@@ -2082,6 +2160,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     mobileComposerDrafts.save({ profileId: active.profileId, sessionId: active.lease.sessionId }, result.normalDraft);
   };
   const runMessageAction = (action: MobileMessageActionId): void => {
+    if (voice.busy) return;
     const selected = messageAction;
     setMessageAction(undefined);
     if (!selected || client.state.selectedId !== selected.sessionId) return;
@@ -2113,7 +2192,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   };
   const beginQueueEdit = async (item: QueueItem): Promise<void> => {
     const profileId = state.activeProfileId;
-    if (!profileId || !composerOwnerReady || interactions.length > 0) return;
+    if (!profileId || !composerOwnerReady || interactions.length > 0 || voice.busy) return;
     const stashedDraft = draft;
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
@@ -2166,6 +2245,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     });
   }, [interactionIdsKey, state.activeProfileId, state.selectedId]);
   const submitComposer = async (): Promise<void> => {
+    if (voice.busy) return;
     setLocalError("");
     const active = queueEditRef.current;
     try {
@@ -2237,12 +2317,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       <View style={styles.headerActions}>
         <Action label="Branches"
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
-          disabled={nativeTreeControls === undefined || state.busy || interactions.length > 0} />
+          disabled={nativeTreeControls === undefined || state.busy || voice.busy || interactions.length > 0} />
         <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
-          disabled={contextControls === undefined || state.busy || interactions.length > 0} />
+          disabled={contextControls === undefined || state.busy || voice.busy || interactions.length > 0} />
         <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
-          disabled={!runtimeControlsAvailable || state.busy || attachmentBusy || interactions.length > 0} />
+          disabled={!runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
         {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
       </View>
@@ -2270,10 +2350,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             style={styles.inlineTouchAction}>
             <Text style={[styles.caption, { color: colors.accent }]}>View context</Text>
           </Pressable>
-          {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId) }).length > 0
+           {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId) }).length > 0
             && <Pressable accessibilityRole="button" accessibilityLabel={`More actions for ${item.label}`}
-              onPress={() => openMessageActions(item)} style={styles.inlineTouchAction}>
-              <Text style={[styles.caption, { color: colors.accent }]}>More</Text>
+              disabled={voice.busy} onPress={() => openMessageActions(item)}
+              style={[styles.inlineTouchAction, voice.busy && styles.disabled]}>
+              <Text style={[styles.caption, { color: voice.busy ? colors.muted : colors.accent }]}>More</Text>
             </Pressable>}
         </View>
       </View>} />
@@ -2283,7 +2364,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         keyboardShouldPersistTaps="handled">
       {queueItems.map((item, index) => {
         const editing = queueEdit?.lease.queueItemId === item.queueItemId;
-        const disabled = state.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
+        const disabled = state.busy || voice.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
         const editableText = queueItemText(item.input);
         return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
           <Text style={[styles.caption, { color: colors.muted }]}>Queued {index + 1} · {queueState(item.state)}{item.editLocked && !editing ? " · Editing elsewhere" : ""}</Text>
@@ -2350,10 +2431,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         style={styles.composerResizeHandle} {...composerResizeResponder.panHandlers}>
         <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
       </View>
-      {!queueEdit && (sessionMentionControls || workspaceMentionControls || catalogMentionControls
+      {!queueEdit && (voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || catalogMentionControls
         || attachmentControls || draft.mentions.length > 0 || draft.attachments.length > 0) && <View style={styles.composerTools}>
+        {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
+          disabled={!composerOwnerReady || state.busy || attachmentBusy || state.status !== "connected"} />}
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
-          disabled={state.busy || !composerOwnerReady || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
+          disabled={state.busy || voice.busy || !composerOwnerReady || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -2364,7 +2447,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             setSessionMentionsVisible(true);
           }} />}
         {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
-          disabled={state.busy || !composerOwnerReady}
+          disabled={state.busy || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -2378,7 +2461,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           label={catalogMentionControls.policy.resources && catalogMentionControls.policy.artifacts
             ? "Reference Resource / Artifact"
             : catalogMentionControls.policy.resources ? "Reference Resource" : "Reference Artifact"}
-          colors={colors} compact disabled={state.busy || !composerOwnerReady}
+          colors={colors} compact disabled={state.busy || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
             setContextVisible(false);
@@ -2390,17 +2473,17 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
           }} />}
         {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"}
           colors={colors} compact
-          disabled={state.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
         {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
           colors={colors} compact
-          disabled={state.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={openPhotoLibrary} />}
         {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
           colors={colors} compact
-          disabled={state.busy || attachmentBusy || !composerOwnerReady
+          disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("camera")} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
@@ -2410,19 +2493,22 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
               : mention.kind === "workspace" ? mention.directory ? "directory" : "file"
                 : mention.kind === "resource" ? "resource" : "Artifact"} reference ${mention.displayText}`}
             accessibilityHint="Removes this exact reference occurrence from the message"
-            disabled={state.busy} onPress={() => removeComposerMention(mention.mentionId)}
-            style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }, state.busy && styles.disabled]}>
+            disabled={state.busy || voice.busy} onPress={() => removeComposerMention(mention.mentionId)}
+            style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }, (state.busy || voice.busy) && styles.disabled]}>
             <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>{draft.text.slice(mention.start, mention.end)} ×</Text>
           </Pressable>)}
         </ScrollView>}
       </View>}
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
-        disabled={state.busy || attachmentBusy || !composerOwnerReady}
-        busy={state.busy || attachmentBusy} onRemove={removeAttachment} />}
+        disabled={state.busy || voice.busy || attachmentBusy || !composerOwnerReady}
+        busy={state.busy || voice.busy || attachmentBusy} onRemove={removeAttachment} />}
       <View style={styles.composerRow}>
         <TextInput ref={composerInputRef} accessibilityLabel={queueEdit ? "Queued input" : "Task message"} multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection} maxLength={1_000_000}
-          onSelectionChange={(event) => setComposerSelection(event.nativeEvent.selection)}
+          onSelectionChange={(event) => {
+            composerSelectionRef.current = event.nativeEvent.selection;
+            setComposerSelection(event.nativeEvent.selection);
+          }}
           onChangeText={(value) => {
             try {
               if (queueEditRef.current) {
@@ -2445,12 +2531,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             Math.ceil(event.nativeEvent.contentSize.height)
           ))}
           scrollEnabled={composerHeight.scrollEnabled}
-          editable={!state.busy && !attachmentBusy && composerOwnerReady} placeholder={!composerOwnerReady ? "Restoring saved draft…" : queueEdit ? "Edit queued input…" : "Message Joko…"}
+          editable={!state.busy && !voice.busy && !attachmentBusy && composerOwnerReady} placeholder={!composerOwnerReady ? "Restoring saved draft…" : queueEdit ? "Edit queued input…" : "Message Joko…"}
           placeholderTextColor={colors.muted}
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
         <Action label={state.busy ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
           disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
-            || (!queueEdit && unknown) || attachmentBusy || state.busy || state.status !== "connected"}
+            || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || state.status !== "connected"}
           onPress={() => void submitComposer()} />
       </View>
     </View>}
@@ -2850,6 +2936,70 @@ function MobileAttachmentTray({ attachments, colors, disabled, busy, onRemove }:
   </View>;
 }
 
+function useMobileVoicePermissionSettings(error?: MobileVoiceRunError): void {
+  useEffect(() => {
+    if (error?.code !== "permissionBlocked") return;
+    Alert.alert(
+      "Allow microphone access",
+      "Voice input needs microphone access. Open system settings and allow microphone access for Joko.",
+      [
+        { text: "Not now", style: "cancel" },
+        { text: "Open Settings", onPress: () => {
+          void Linking.openSettings().catch(() => {
+            Alert.alert("Settings unavailable", "Open your device settings and allow microphone access for Joko.");
+          });
+        } }
+      ]
+    );
+  }, [error]);
+}
+
+function MobileVoiceAction({ voice, colors, disabled }: {
+  voice: MobileVoiceInputBinding;
+  colors: Colors;
+  disabled?: boolean;
+}) {
+  const longPressRef = useRef(false);
+  const recording = voice.state === "starting" || voice.state === "listening";
+  const submitting = voice.state === "submitting";
+  const controlDisabled = voice.checking || submitting || !voice.busy && disabled === true;
+  const label = submitting ? "Transcribing…" : recording ? voice.elapsedLabel ?? "0:00" : voice.checking ? "Checking voice…" : "Voice";
+  return <View style={styles.voiceControls}>
+    <Pressable accessibilityRole="button" accessibilityLabel={recording ? `Stop voice input, recording ${label}` : label}
+      accessibilityHint="Tap to start or stop. Touch and hold to record until release."
+      accessibilityState={{ disabled: controlDisabled, busy: voice.busy }} disabled={controlDisabled}
+      onPressIn={() => {
+        longPressRef.current = false;
+        if (!voice.busy) voice.prewarm();
+      }}
+      onLongPress={() => {
+        if (voice.busy) return;
+        longPressRef.current = true;
+        void voice.start();
+      }}
+      onPressOut={() => {
+        if (longPressRef.current) void voice.stop();
+      }}
+      onPress={() => {
+        if (longPressRef.current) {
+          longPressRef.current = false;
+          return;
+        }
+        void voice.toggle();
+      }}
+      style={[styles.voiceButton, {
+        borderColor: recording ? colors.negative : colors.border,
+        backgroundColor: recording ? colors.brandBackground : controlDisabled ? colors.border : colors.accent
+      }, controlDisabled && styles.disabled]}>
+      {voice.checking ? <ActivityIndicator color={colors.muted} size="small" /> : <>
+        {recording && <View style={[styles.voiceDot, { backgroundColor: colors.negative }]} />}
+        <Text style={[styles.voiceLabel, { color: recording ? colors.ink : controlDisabled ? colors.muted : "#2b2316" }]}>{label}</Text>
+      </>}
+    </Pressable>
+    {voice.busy && <Action label="Cancel voice input" colors={colors} compact danger onPress={() => void voice.cancel()} />}
+  </View>;
+}
+
 function Action({ label, onPress, colors, disabled, compact, danger }: {
   label: string; onPress: () => void; colors: Colors; disabled?: boolean; compact?: boolean; danger?: boolean;
 }) {
@@ -3068,6 +3218,11 @@ const styles = StyleSheet.create({
   composerResizeHandle: { minHeight: 44, alignItems: "center", justifyContent: "center" },
   composerGrabber: { width: 88, height: 4, borderRadius: 2 },
   composerTools: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8, paddingBottom: 6 },
+  voiceControls: { flexDirection: "row", alignItems: "center", gap: 8 },
+  voiceButton: { minWidth: 72, minHeight: 44, borderWidth: 1, borderRadius: 22, paddingHorizontal: 13,
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7 },
+  voiceDot: { width: 8, height: 8, borderRadius: 4 },
+  voiceLabel: { fontSize: 14, lineHeight: 18, fontWeight: "700", fontVariant: ["tabular-nums"] },
   mentionChips: { alignItems: "center", gap: 6, paddingRight: 8 },
   mentionChip: { minHeight: 44, maxWidth: 220, borderWidth: 1, borderRadius: 18, paddingHorizontal: 12, justifyContent: "center" },
   mentionChipText: { fontSize: 13, lineHeight: 18, fontWeight: "700" },

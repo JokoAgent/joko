@@ -20,6 +20,7 @@ import {
   TargetService,
   TerminalService,
   ToolService,
+  VoiceInputService,
   WorktreeService,
   WorkspaceService as WorkspaceContractService
 } from "@joko/contracts";
@@ -42,6 +43,7 @@ export interface E2eClients {
   readonly workspace: Client<typeof WorkspaceContractService>;
   readonly artifact: Client<typeof ArtifactService>;
   readonly tool: Client<typeof ToolService>;
+  readonly voiceInput: Client<typeof VoiceInputService>;
   readonly browser: Client<typeof BrowserService>;
   readonly pi: Client<typeof PiService>;
   readonly terminal: Client<typeof TerminalService>;
@@ -87,6 +89,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     workspace: createClient(WorkspaceContractService, transport),
     artifact: createClient(ArtifactService, transport),
     tool: createClient(ToolService, transport),
+    voiceInput: createClient(VoiceInputService, transport),
     browser: createClient(BrowserService, transport),
     pi: createClient(PiService, transport),
     terminal: createClient(TerminalService, transport),

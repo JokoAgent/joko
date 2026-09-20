@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const {
   enforceAndroidSystemPhotoPickerBoundary,
   enforceIosReadOnlyPhotoLibraryBoundary,
+  microphoneUsage,
   photoLibraryUsage
 } = require("../with-joko-photo-library-boundary.cjs");
 
@@ -33,6 +34,7 @@ describe("native photo-library config boundary", () => {
 
     expect(enforceIosReadOnlyPhotoLibraryBoundary(infoPlist)).toBe(infoPlist);
     expect(infoPlist).toEqual({
+      NSMicrophoneUsageDescription: microphoneUsage,
       NSPhotoLibraryUsageDescription: photoLibraryUsage,
       PHPhotoLibraryPreventAutomaticLimitedAccessAlert: true
     });
@@ -53,6 +55,10 @@ describe("native photo-library config boundary", () => {
       preventAutomaticLimitedAccessAlert: true,
       granularPermissions: []
     });
+    expect(app.plugins[imagePickerIndex][1]).toMatchObject({
+      photosPermission: false,
+      microphonePermission: microphoneUsage
+    });
     expect(new Set(app.android.blockedPermissions)).toEqual(new Set([
       "android.permission.ACCESS_MEDIA_LOCATION",
       "android.permission.READ_EXTERNAL_STORAGE",
@@ -62,5 +68,18 @@ describe("native photo-library config boundary", () => {
       "android.permission.READ_MEDIA_VIDEO",
       "android.permission.WRITE_EXTERNAL_STORAGE"
     ]));
+    expect(app.android.permissions).toEqual(expect.arrayContaining([
+      "android.permission.MODIFY_AUDIO_SETTINGS",
+      "android.permission.RECORD_AUDIO"
+    ]));
+    const audioIndex = app.plugins.findIndex((plugin) => Array.isArray(plugin) && plugin[0] === "expo-audio");
+    expect(audioIndex).toBeGreaterThanOrEqual(0);
+    expect(audioIndex).toBeLessThan(imagePickerIndex);
+    expect(app.plugins[audioIndex][1]).toEqual({
+      microphonePermission: microphoneUsage,
+      recordAudioAndroid: true,
+      enableBackgroundPlayback: false,
+      enableBackgroundRecording: false
+    });
   });
 });

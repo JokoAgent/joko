@@ -14,6 +14,7 @@
       },
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Connect to a Joko node on your local network.",
+        "NSMicrophoneUsageDescription": "Allow Joko to use your microphone only while you are recording voice input for a task.",
         "NSPhotoLibraryUsageDescription": "Allow Joko to show photos you explicitly choose for a task attachment.",
         "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
         "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
@@ -35,17 +36,25 @@
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.CAMERA",
         "android.permission.CHANGE_WIFI_MULTICAST_STATE",
-        "android.permission.INTERNET"
+        "android.permission.INTERNET",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO"
       ]
     },
     "plugins": [
       "./with-joko-photo-library-boundary.cjs",
       "./with-joko-native-brand.cjs",
       "expo-secure-store",
+      ["expo-audio", {
+        "microphonePermission": "Allow Joko to use your microphone only while you are recording voice input for a task.",
+        "recordAudioAndroid": true,
+        "enableBackgroundPlayback": false,
+        "enableBackgroundRecording": false
+      }],
       ["expo-image-picker", {
         "photosPermission": false,
         "cameraPermission": "Allow Joko to use your camera only when you choose Take photo for a task attachment.",
-        "microphonePermission": false
+        "microphonePermission": "Allow Joko to use your microphone only while you are recording voice input for a task."
       }],
       ["expo-media-library", {
         "photosPermission": "Allow Joko to show photos you explicitly choose for a task attachment.",

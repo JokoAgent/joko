@@ -13,10 +13,13 @@ import {
   PlanReviewResolutionSchema, QueueItemState, QuestionAnswerSchema, QuestionMultipleChoiceAnswerSchema,
   QuestionResolutionSchema, QuestionSingleChoiceAnswerSchema, ResolveInteractionMutationSchema, RevokeDeviceMutationSchema,
   MessageRole, QueueDeliveryMode, RunState, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus, SessionState,
+  AppendVoiceAudioRequestSchema, GetVoiceInputCapabilitiesRequestSchema, GetVoiceInputSessionRequestSchema,
+  StartVoiceInputRequestSchema, StopVoiceInputRequestSchema, VoiceInputState, VoiceInputTerminalOutcome,
   capabilityNames, nativeSessionTreeRoots, type Interaction, type OperationMutation
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext, PromptInput } from "@joko/core";
+import { VoiceInputCoordinator, type VoiceInputProviderFactory } from "@joko/orchestrator";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
@@ -77,6 +80,92 @@ class MobileInteractionFixtureAdapter extends InstrumentedFakeAdapter {
 describe("native mobile device through the durable product chain", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   afterEach(async () => { await fixture?.close(); fixture = undefined; });
+
+  it("streams mobile PCM through the authenticated ephemeral Voice Input service without sending a task", async () => {
+    let voice!: ReturnType<typeof createMobileVoiceHarness>;
+    fixture = await OrchestratorE2eFixture.start({
+      createAuxiliaryServices: async () => {
+        voice = createMobileVoiceHarness();
+        return { voiceInput: voice.coordinator };
+      }
+    });
+    const begun = await fixture.anonymous.connection.beginPairing({
+      deviceDisplayName: "Joko voice phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    });
+    const challengeId = begun.challenge!.challengeId;
+    const paired = (await fixture.anonymous.connection.completePairing({
+      challengeId,
+      humanCode: fixture.pairingCode(challengeId),
+      deviceDisplayName: "Joko voice phone",
+      deviceKind: DeviceKind.MOBILE,
+      platform: "android",
+      appVersion: "0.1.0"
+    })).result!;
+    const clients = fixture.clients(paired.authKey);
+
+    const capabilities = await clients.voiceInput.getVoiceInputCapabilities(
+      create(GetVoiceInputCapabilitiesRequestSchema)
+    );
+    expect(capabilities.profile).toMatchObject({
+      capability: { support: CapabilitySupport.SUPPORTED },
+      limits: { supportedMimeTypes: ["audio/pcm"] },
+      supportsLocale: true,
+      supportsLiveDrafts: true
+    });
+    const started = await clients.voiceInput.startVoiceInput(create(StartVoiceInputRequestSchema, {
+      requestId: "mobile-voice-request",
+      mimeType: "audio/pcm",
+      locale: "en-US"
+    }));
+    expect(started.session).toMatchObject({
+      state: VoiceInputState.LISTENING,
+      nextChunkSequence: 1n,
+      acceptedAudioBytes: 0n
+    });
+    const voiceInputId = started.session!.voiceInputId;
+    const pcm = Uint8Array.from({ length: 320 }, (_, index) => index % 2);
+    const appended = await clients.voiceInput.appendVoiceAudio(create(AppendVoiceAudioRequestSchema, {
+      voiceInputId,
+      chunkSequence: 1n,
+      audio: pcm,
+      durationMs: 10,
+      voiced: true
+    }));
+    expect(appended.session).toMatchObject({
+      nextChunkSequence: 2n,
+      acceptedAudioBytes: 320n,
+      draft: { text: "mobile partial words" }
+    });
+    expect(voice.chunks).toHaveLength(1);
+    expect(voice.chunks[0]).toMatchObject({ durationMs: 10, voiced: true });
+
+    const stopped = await clients.voiceInput.stopVoiceInput(create(StopVoiceInputRequestSchema, {
+      voiceInputId,
+      expectedNextChunkSequence: 2n
+    }));
+    expect(stopped.session).toMatchObject({
+      state: VoiceInputState.DONE,
+      outcome: VoiceInputTerminalOutcome.SUCCESS,
+      result: { text: "mobile final words" }
+    });
+    const terminal = await clients.voiceInput.getVoiceInputSession(create(GetVoiceInputSessionRequestSchema, {
+      voiceInputId
+    }));
+    expect(terminal.session?.result?.text).toBe("mobile final words");
+
+    const other = await fixture.pair("Other voice owner");
+    await expect(other.clients.voiceInput.getVoiceInputSession(create(GetVoiceInputSessionRequestSchema, {
+      voiceInputId
+    }))).rejects.toBeDefined();
+    const owner = await clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } });
+    const serializedOwner = JSON.stringify(owner, (_key, value) => typeof value === "bigint" ? value.toString() : value);
+    expect(serializedOwner).not.toContain("mobile partial words");
+    expect(serializedOwner).not.toContain("mobile final words");
+    expect(fixture.adapter().sendCalls).toHaveLength(0);
+  });
 
   it("pairs a mobile device, creates a task, queues text once, resyncs history and revokes access", async () => {
     fixture = await OrchestratorE2eFixture.start();
@@ -1230,3 +1319,47 @@ describe("native mobile device through the durable product chain", () => {
     ]));
   });
 });
+
+type MobileVoiceE2eProvider = Awaited<ReturnType<VoiceInputProviderFactory["create"]>>;
+
+function createMobileVoiceHarness() {
+  type Listener = Parameters<MobileVoiceE2eProvider["onEvent"]>[0];
+  type Chunk = Parameters<MobileVoiceE2eProvider["appendAudio"]>[0];
+  let listener: Listener | undefined;
+  const chunks: Chunk[] = [];
+  const provider: MobileVoiceE2eProvider = {
+    async start() {},
+    appendAudio(chunk) {
+      chunks.push(chunk);
+      listener?.({ type: "partial", text: "mobile partial words" });
+    },
+    async flushAudio() {
+      listener?.({ type: "stable", text: "mobile final words" });
+    },
+    async stop() {},
+    async recover() {},
+    onEvent(next) {
+      listener = next;
+      return () => {
+        if (listener === next) listener = undefined;
+      };
+    }
+  };
+  const factory: VoiceInputProviderFactory = {
+    describe: () => ({
+      support: "supported",
+      mimeTypes: ["audio/pcm"],
+      supportsLocale: true,
+      supportsLiveDrafts: true,
+      supportsRefinement: false
+    }),
+    create: () => provider
+  };
+  return {
+    coordinator: new VoiceInputCoordinator({
+      provider: factory,
+      createId: () => "mobile-voice-e2e"
+    }),
+    chunks
+  };
+}

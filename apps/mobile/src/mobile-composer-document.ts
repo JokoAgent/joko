@@ -483,7 +483,7 @@ export function mobileInputSummary(input: InputContent | undefined, typedMetadat
   return [text, ...suffix].filter((value) => value.length > 0).join("\n");
 }
 
-function replaceMobileComposerRange(
+export function replaceMobileComposerRange(
   draft: MobileComposerDraft,
   selection: MobileComposerSelection,
   replacement: string

@@ -2,7 +2,7 @@ import { Code, ConnectError, createClient, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
-  ResourceKind, SessionService, TargetService,
+  ResourceKind, SessionService, TargetService, VoiceInputService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
@@ -18,6 +18,12 @@ import {
   workspaceEntryRevisionKey,
   workspaceParentPath
 } from "./workspace-files";
+import {
+  projectMobileVoiceCapability,
+  projectMobileVoiceSession,
+  type MobileVoiceCapability,
+  type MobileVoiceSession
+} from "./mobile-voice-input";
 
 export interface PairedCredential {
   readonly profileId: string;
@@ -60,6 +66,12 @@ export interface MobileNetwork {
   listArtifactReferenceCatalog(credential: PairedCredential, sessionId: string, generation: bigint, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
+  getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
+  startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
+  appendVoiceAudio(credential: PairedCredential, voiceInputId: string, chunkSequence: bigint, audio: Uint8Array, durationMs: number, voiced: boolean, signal?: AbortSignal): Promise<MobileVoiceSession>;
+  stopVoiceInput(credential: PairedCredential, voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<MobileVoiceSession>;
+  cancelVoiceInput(credential: PairedCredential, voiceInputId: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
+  getVoiceInputSession(credential: PairedCredential, voiceInputId: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
   prepareTarget(credential: PairedCredential, target: Target, signal?: AbortSignal): Promise<void>;
   submit(credential: PairedCredential, operationId: string, mutation: OperationMutation, signal?: AbortSignal): Promise<Operation>;
   waitOperation(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation>;
@@ -875,6 +887,36 @@ export const mobileNetwork: MobileNetwork = {
       )).blob,
       signal
     );
+  },
+  async getVoiceInputCapabilities(credential, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .getVoiceInputCapabilities({}, options(signal));
+    return projectMobileVoiceCapability(response.profile);
+  },
+  async startVoiceInput(credential, requestId, mimeType, locale, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .startVoiceInput({ requestId, mimeType, ...(locale === undefined ? {} : { locale }) }, options(signal));
+    return projectMobileVoiceSession(response.session);
+  },
+  async appendVoiceAudio(credential, voiceInputId, chunkSequence, audio, durationMs, voiced, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .appendVoiceAudio({ voiceInputId, chunkSequence, audio: Uint8Array.from(audio), durationMs, voiced }, options(signal));
+    return projectMobileVoiceSession(response.session);
+  },
+  async stopVoiceInput(credential, voiceInputId, expectedNextChunkSequence, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .stopVoiceInput({ voiceInputId, expectedNextChunkSequence }, options(signal));
+    return projectMobileVoiceSession(response.session);
+  },
+  async cancelVoiceInput(credential, voiceInputId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .cancelVoiceInput({ voiceInputId }, options(signal));
+    return projectMobileVoiceSession(response.session);
+  },
+  async getVoiceInputSession(credential, voiceInputId, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .getVoiceInputSession({ voiceInputId }, options(signal));
+    return projectMobileVoiceSession(response.session);
   },
   async *streamOwner(credential, after, signal) {
     const client = createClient(EventService, transport(credential.origin, credential.authKey));
