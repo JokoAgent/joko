@@ -84,6 +84,14 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import {
+  parseMobileComposerRouteHref,
+  type MobileComposerRouteResolutionTarget
+} from "./mobile-composer-route-links";
+import {
+  referencedMobileNativeTreeText,
+  referencedMobileTimelineText
+} from "./mobile-composer-route-resolution";
+import {
   appendMobileComposerAttachments,
   assertMobileAttachmentCandidate,
   assertMobileAttachmentPolicy,
@@ -2336,6 +2344,77 @@ export class MobileClient {
       throw error;
     } finally {
       if (this.#historyOwner === owner) { this.#historyOwner = undefined; this.#set({ historyBusy: false }); }
+    }
+  }
+
+  async resolveComposerRouteReference(target: MobileComposerRouteResolutionTarget): Promise<string | undefined> {
+    const credential = this.#credential;
+    const owner = this.#state.owner;
+    if (!credential || !owner || !this.#foreground || this.#state.status !== "connected"
+      || owner.scope?.kind.case !== "owner" || owner.server?.serverId !== credential.serverId
+      || owner.generation < 1n || !owner.snapshotId || !owner.revision || owner.revision.value < 1n) return undefined;
+    const parsed = parseMobileComposerRouteHref(target.href);
+    if (parsed === undefined || parsed.href !== target.href || parsed.sessionId !== target.sessionId
+      || (target.kind === "session" && (parsed.messageId !== undefined || parsed.eventId !== undefined))
+      || (target.kind === "message" && (parsed.messageId !== target.messageId || parsed.eventId !== target.eventId))) {
+      return undefined;
+    }
+    const sessions = owner.sessions.filter((candidate) => candidate.sessionId === target.sessionId);
+    if (sessions.length !== 1) return undefined;
+    const session = sessions[0]!;
+    const revision = session.version?.revision;
+    if (!session.backendId || !session.targetId || !revision || revision.value < 1n
+      || session.version?.generation === undefined || session.version.generation < 1n
+      || session.state === SessionState.UNSPECIFIED) return undefined;
+    const epoch = this.#epoch;
+    const ownerKey = composerRouteOwnerKey(credential, owner, session);
+    const current = (): boolean => this.#current(epoch)
+      && this.#credential === credential
+      && this.#state.status === "connected"
+      && this.#state.owner !== undefined
+      && composerRouteOwnerKey(credential, this.#state.owner, session) === ownerKey;
+    if (target.kind === "session") return session.displayName.trim() || "Untitled task";
+
+    if (this.#state.selectedId === target.sessionId) {
+      const cached = referencedMobileTimelineText([
+        ...this.#state.older,
+        ...(this.#state.window ?? this.#state.detail?.timeline ?? []),
+        ...this.#state.live
+      ], target);
+      if (cached !== undefined) return cached;
+    }
+    if (target.eventId !== undefined) {
+      try {
+        const events = await this.network.readAround(credential, target.sessionId, target.eventId, this.#abort?.signal);
+        if (!current()) return undefined;
+        validateHistory(events, target.sessionId, owner.generation);
+        if (!events.some((event) => event.eventId === target.eventId)) return undefined;
+        const text = referencedMobileTimelineText(events, target);
+        if (text !== undefined) return text;
+      } catch {
+        if (!current()) return undefined;
+      }
+    }
+    if (target.messageId === undefined) return undefined;
+    const backends = owner.backends.filter((candidate) => candidate.backendId === session.backendId);
+    if (backends.length !== 1 || backends[0]!.capabilities?.capabilities.filter(
+      (candidate) => candidate.name === capabilityNames.sessionTree
+        && candidate.support === CapabilitySupport.SUPPORTED
+    ).length !== 1) return undefined;
+    try {
+      const tree = await this.network.readNativeSessionTree(credential, target.sessionId, this.#abort?.signal);
+      if (!current()) return undefined;
+      const projected = projectMobileNativeTree({
+        authorityKey: ownerKey,
+        surfaceOwnerKey: ownerKey,
+        session,
+        backend: backends[0]!,
+        canNavigate: false,
+        navigationUnavailableReason: "Link enrichment is read-only."
+      }, tree);
+      return referencedMobileNativeTreeText(projected, target.messageId);
+    } catch {
+      return undefined;
     }
   }
 
@@ -6882,6 +6961,39 @@ function validateHistory(events: readonly Event[], sessionId: string, generation
     ids.add(event.eventId);
     last = cursor.sequence;
   }
+}
+
+function composerRouteOwnerKey(
+  credential: PairedCredential,
+  owner: Snapshot,
+  expected: Session
+): string {
+  const matches = owner.sessions.filter((candidate) => candidate.sessionId === expected.sessionId);
+  if (matches.length !== 1) return "";
+  const session = matches[0]!;
+  return JSON.stringify([
+    credential.profileId,
+    credential.connectionId,
+    credential.deviceId,
+    credential.serverId,
+    owner.scope?.kind.case,
+    owner.server?.serverId,
+    owner.generation.toString(10),
+    owner.snapshotId,
+    owner.revision?.value.toString(10) ?? "",
+    owner.revision?.etag ?? "",
+    session.sessionId,
+    session.displayName,
+    session.backendId,
+    session.targetId,
+    session.state,
+    session.version?.generation.toString(10) ?? "",
+    session.version?.revision?.value.toString(10) ?? "",
+    session.version?.revision?.etag ?? "",
+    session.nativeBinding?.backendId ?? "",
+    session.nativeBinding?.opaqueReference ?? "",
+    session.nativeBinding?.runtimeGeneration.toString(10) ?? ""
+  ]);
 }
 
 function historyInvalidated(event: Event): boolean {

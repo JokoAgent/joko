@@ -23,6 +23,15 @@ import {
   type MobileUploadedComposerAttachment
 } from "./mobile-attachments";
 import { canonicalWorkspacePath } from "./workspace-files";
+import {
+  mobileComposerMessageReferenceTextMaximumCharacters,
+  parseMobileComposerRouteHref,
+  sanitizeMobileComposerReferenceLabel,
+  seedMobileComposerRouteReference,
+  segmentMobileComposerRoutePaste,
+  summarizeMobileComposerMessageReference,
+  type MobileComposerRoutePasteSegment
+} from "./mobile-composer-route-links";
 
 export interface MobileComposerSessionMention {
   readonly kind: "session";
@@ -97,7 +106,22 @@ export interface MobileComposerPastedTextAtom {
   readonly end: number;
 }
 
-export type MobileComposerAtom = MobileComposerQuoteAtom | MobileComposerPastedTextAtom;
+export interface MobileComposerRouteReferenceAtom {
+  readonly kind: "route-reference";
+  readonly atomId: string;
+  readonly href: string;
+  readonly serialized: string;
+  readonly sessionId: string;
+  readonly messageId?: string;
+  readonly eventId?: string;
+  readonly displayText: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+export type MobileComposerAtom = MobileComposerQuoteAtom
+  | MobileComposerPastedTextAtom
+  | MobileComposerRouteReferenceAtom;
 
 export interface MobileComposerDraft {
   readonly text: string;
@@ -115,6 +139,20 @@ export interface MobileComposerEditResult {
   readonly draft: MobileComposerDraft;
   readonly selection: MobileComposerSelection;
 }
+
+export interface MobileComposerRoutePasteResult extends MobileComposerEditResult {
+  readonly insertedAtomIds: readonly string[];
+}
+
+type MobileComposerAtomPresentation =
+  | Pick<MobileComposerQuoteAtom, "kind" | "text">
+  | Pick<MobileComposerPastedTextAtom, "kind" | "text">
+  | Pick<MobileComposerRouteReferenceAtom, "kind" | "serialized" | "displayText">;
+
+type MobileComposerAtomSeed =
+  | Omit<MobileComposerQuoteAtom, "atomId" | "start" | "end">
+  | Omit<MobileComposerPastedTextAtom, "atomId" | "start" | "end">
+  | Omit<MobileComposerRouteReferenceAtom, "atomId" | "start" | "end">;
 
 const maximumDraftCharacters = 1_000_000;
 export const mobileLongPasteLineThreshold = 24;
@@ -152,7 +190,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     throw new Error("A task message can reference at most 8 other tasks.");
   }
   if (value.atoms.length > maximumComposerAtoms) {
-    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured quote or paste items.`);
+    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
   }
   if (value.atoms.filter((atom) => atom?.kind === "quote").length > maximumSelectionQuotes) {
     throw new Error(`A task message can contain at most ${maximumSelectionQuotes} selected-text quotes.`);
@@ -194,7 +232,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   previousEnd = 0;
   const atoms = value.atoms.map((candidate) => {
     if (!candidate || typeof candidate !== "object"
-      || (candidate.kind !== "quote" && candidate.kind !== "pasted-text")) {
+      || (candidate.kind !== "quote" && candidate.kind !== "pasted-text" && candidate.kind !== "route-reference")) {
       throw new Error("The local Joko composer atom is invalid.");
     }
     assertIdentity(candidate.atomId, "composer atom occurrence");
@@ -202,7 +240,9 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     atomIds.add(candidate.atomId);
     const normalized = candidate.kind === "quote"
       ? normalizeQuoteAtom(candidate)
-      : normalizePastedTextAtom(candidate);
+      : candidate.kind === "pasted-text"
+        ? normalizePastedTextAtom(candidate)
+        : normalizeRouteReferenceAtom(candidate);
     if (!Number.isSafeInteger(candidate.start) || !Number.isSafeInteger(candidate.end)
       || candidate.start < previousEnd || candidate.start < 0 || candidate.end <= candidate.start
       || candidate.end > value.text.length || !isUtf16Boundary(value.text, candidate.start)
@@ -223,7 +263,7 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   }
   for (const mention of mentions) {
     if (atoms.some((atom) => mention.start < atom.end && mention.end > atom.start)) {
-      throw new Error("A Joko reference cannot overlap a quote or pasted-text atom.");
+      throw new Error("A Joko reference cannot overlap a structured composer item.");
     }
   }
   const attachments = normalizeMobileComposerAttachmentSet(value.attachments);
@@ -263,12 +303,8 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
     && first.atoms.every((atom, index) => {
       const candidate = second.atoms[index];
       return candidate !== undefined && atom.kind === candidate.kind && atom.atomId === candidate.atomId
-        && atom.text === candidate.text && atom.start === candidate.start && atom.end === candidate.end
-        && (atom.kind === "pasted-text" || candidate.kind === "quote"
-          && atom.sourceSessionId === candidate.sourceSessionId
-          && atom.sourceMessageId === candidate.sourceMessageId
-          && atom.sourceEventId === candidate.sourceEventId
-          && atom.sourceRole === candidate.sourceRole);
+        && atom.start === candidate.start && atom.end === candidate.end
+        && sameComposerAtomAuthority(atom, candidate);
     });
 }
 
@@ -286,16 +322,16 @@ export function mobileWorkspaceMentionToken(input: {
   return range === undefined ? label : `${label}:${range.startLine}–${range.endLine}`;
 }
 
-export function mobileComposerAtomToken(atom: Pick<MobileComposerAtom, "kind" | "text">): string {
+export function mobileComposerAtomToken(atom: MobileComposerAtomPresentation): string {
   if (atom.kind === "quote") return "⟦Quote from Assistant⟧";
+  if (atom.kind === "route-reference") return atom.serialized;
   const lines = mobilePastedTextLineCount(atom.text);
   return `⟦Pasted text (${lines} ${lines === 1 ? "line" : "lines"})⟧`;
 }
 
-export function mobileComposerAtomLabel(atom: Pick<MobileComposerAtom, "kind" | "text">): string {
-  return atom.kind === "quote"
-    ? "Quote from Assistant"
-    : mobileComposerAtomToken(atom).slice(1, -1);
+export function mobileComposerAtomLabel(atom: MobileComposerAtomPresentation): string {
+  if (atom.kind === "quote") return "Quote from Assistant";
+  return atom.kind === "route-reference" ? atom.displayText : mobileComposerAtomToken(atom).slice(1, -1);
 }
 
 export function isLongMobileComposerPaste(text: string): boolean {
@@ -509,6 +545,105 @@ export function insertMobileClipboardText(
   return replaceMobileComposerRange(current, range, text);
 }
 
+export function insertMobileStructuredClipboardText(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  text: string,
+  atomIdFactory: (index: number) => string
+): MobileComposerRoutePasteResult {
+  if (isLongMobileComposerPaste(text)) {
+    return { ...insertMobileClipboardText(draft, selection, text, atomIdFactory(0)), insertedAtomIds: [] };
+  }
+  const segments = segmentMobileComposerRoutePaste(text);
+  if (segments !== null) return insertMobileRouteReferencePaste(draft, selection, segments, atomIdFactory);
+  return { ...insertMobileClipboardText(draft, selection, text, atomIdFactory(0)), insertedAtomIds: [] };
+}
+
+export function insertMobileRouteReferencePaste(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  segments: readonly MobileComposerRoutePasteSegment[],
+  atomIdFactory: (index: number) => string
+): MobileComposerRoutePasteResult {
+  const current = normalizeMobileComposerDraft(draft);
+  if (!Array.isArray(segments) || !segments.some((segment) => segment?.kind === "route-reference")) {
+    throw new Error("The clipboard does not contain a Joko task link.");
+  }
+  const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
+  const quoteBefore = current.atoms.find((atom) => atom.kind === "quote" && atom.end === range.start);
+  const quoteAfter = current.atoms.find((atom) => atom.kind === "quote" && atom.start === range.end);
+  const prefix = range.start === range.end && quoteBefore?.end === current.text.length ? "\n\n" : "";
+  const suffix = range.start === range.end && quoteAfter?.start === 0 ? "\n\n" : "";
+  const replacement: string[] = [prefix];
+  const occurrences: MobileComposerRouteReferenceAtom[] = [];
+  let offset = range.start + prefix.length;
+  let routeIndex = 0;
+  for (const segment of segments) {
+    if (!segment || typeof segment !== "object") throw new Error("The pasted Joko task link is invalid.");
+    if (segment.kind === "text") {
+      if (typeof segment.text !== "string") throw new Error("The pasted Joko task link text is invalid.");
+      replacement.push(segment.text);
+      offset += segment.text.length;
+      continue;
+    }
+    if (segment.kind !== "route-reference") throw new Error("The pasted Joko task link is invalid.");
+    const seeded = seedMobileComposerRouteReference(segment);
+    const atomId = atomIdFactory(routeIndex++);
+    assertIdentity(atomId, "composer atom occurrence");
+    const atom = normalizeRouteReferenceAtom({
+      kind: "route-reference",
+      atomId,
+      href: seeded.href,
+      serialized: seeded.serialized,
+      sessionId: seeded.sessionId,
+      ...(seeded.messageId === undefined ? {} : { messageId: seeded.messageId }),
+      ...(seeded.eventId === undefined ? {} : { eventId: seeded.eventId }),
+      displayText: seeded.displayText,
+      start: offset,
+      end: offset + seeded.serialized.length
+    });
+    occurrences.push({ ...atom, atomId, start: offset, end: offset + seeded.serialized.length });
+    replacement.push(seeded.serialized);
+    offset += seeded.serialized.length;
+  }
+  replacement.push(suffix);
+  const result = replaceMobileComposerRange(current, range, replacement.join(""));
+  if (result.draft.atoms.length + occurrences.length > maximumComposerAtoms) {
+    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
+  }
+  const atoms = [...result.draft.atoms, ...occurrences]
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const next = normalizeMobileComposerDraft({ ...result.draft, atoms });
+  const caret = range.start + replacement.join("").length;
+  return {
+    draft: next,
+    selection: { start: caret, end: caret },
+    insertedAtomIds: occurrences.map((atom) => atom.atomId)
+  };
+}
+
+export function updateMobileRouteReferenceAtom(
+  draft: MobileComposerDraft,
+  expected: MobileComposerRouteReferenceAtom,
+  resolvedText: string
+): MobileComposerEditResult | undefined {
+  const current = normalizeMobileComposerDraft(draft);
+  const atom = current.atoms.find((candidate) => candidate.atomId === expected.atomId);
+  if (atom?.kind !== "route-reference" || !sameComposerAtomAuthority(atom, expected)) return undefined;
+  const displayText = atom.messageId !== undefined || atom.eventId !== undefined
+    ? summarizeMobileComposerMessageReference(resolvedText.slice(0, mobileComposerMessageReferenceTextMaximumCharacters))
+    : sanitizeMobileComposerReferenceLabel(resolvedText);
+  if (displayText === "") return undefined;
+  const serialized = atom.messageId !== undefined || atom.eventId !== undefined
+    ? atom.href
+    : `[${displayText}](${atom.href})`;
+  return replaceMobileComposerAtom(current, atom, normalizeRouteReferenceAtom({
+    ...atom,
+    displayText,
+    serialized
+  }));
+}
+
 export function insertMobilePastedText(
   draft: MobileComposerDraft,
   selection: MobileComposerSelection,
@@ -544,7 +679,7 @@ export function removeMobileComposerAtom(
 ): MobileComposerEditResult {
   const current = normalizeMobileComposerDraft(draft);
   const atom = current.atoms.find((candidate) => candidate.atomId === atomId);
-  if (!atom) throw new Error("The selected quote or pasted-text item is no longer in this draft.");
+  if (!atom) throw new Error("The selected structured message item is no longer in this draft.");
   if (atom.kind !== "quote") return replaceMobileComposerRange(current, { start: atom.start, end: atom.end }, "");
   const range = atom.start >= 2 && current.text.slice(atom.start - 2, atom.start) === "\n\n"
     ? { start: atom.start - 2, end: atom.end }
@@ -806,7 +941,7 @@ function insertMobileComposerMention(
 function insertMobileComposerAtom(
   draft: MobileComposerDraft,
   range: MobileComposerSelection,
-  atom: Omit<MobileComposerAtom, "atomId" | "start" | "end"> & { readonly atomId?: string },
+  atom: MobileComposerAtomSeed & { readonly atomId?: string },
   prefix: string,
   suffix: string
 ): MobileComposerEditResult {
@@ -815,7 +950,7 @@ function insertMobileComposerAtom(
   const token = mobileComposerAtomToken(atom);
   const result = replaceMobileComposerRange(draft, range, `${prefix}${token}${suffix}`);
   if (result.draft.atoms.length >= maximumComposerAtoms) {
-    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured quote or paste items.`);
+    throw new Error(`A task message can contain at most ${maximumComposerAtoms} structured message items.`);
   }
   const start = range.start + prefix.length;
   const occurrence = { ...atom, atomId, start, end: start + token.length } as MobileComposerAtom;
@@ -834,7 +969,7 @@ function insertMobileComposerAtom(
 function replaceMobileComposerAtom(
   draft: MobileComposerDraft,
   previous: MobileComposerAtom,
-  replacement: Omit<MobileComposerAtom, "atomId" | "start" | "end">
+  replacement: MobileComposerAtomSeed
 ): MobileComposerEditResult {
   const result = replaceMobileComposerRange(draft, { start: previous.start, end: previous.end }, mobileComposerAtomToken(replacement));
   const token = mobileComposerAtomToken(replacement);
@@ -873,6 +1008,37 @@ function normalizePastedTextAtom(
   return { kind: "pasted-text", text: atom.text };
 }
 
+function normalizeRouteReferenceAtom(
+  atom: MobileComposerRouteReferenceAtom
+): Omit<MobileComposerRouteReferenceAtom, "atomId" | "start" | "end"> {
+  const parsed = parseMobileComposerRouteHref(atom.href);
+  if (parsed === undefined || parsed.href !== atom.href || parsed.sessionId !== atom.sessionId
+    || parsed.messageId !== atom.messageId || parsed.eventId !== atom.eventId) {
+    throw new Error("The local Joko task link target is invalid.");
+  }
+  const displayText = sanitizeMobileComposerReferenceLabel(atom.displayText);
+  if (displayText === "" || displayText !== atom.displayText) {
+    throw new Error("The local Joko task link label is invalid.");
+  }
+  const anchored = parsed.messageId !== undefined || parsed.eventId !== undefined;
+  const expectedSerialized = anchored ? parsed.href : `[${displayText}](${parsed.href})`;
+  if (atom.serialized !== parsed.href && atom.serialized !== expectedSerialized) {
+    throw new Error("The local Joko task link wire text is invalid.");
+  }
+  if (anchored && atom.serialized !== parsed.href) {
+    throw new Error("A Joko message link must retain its exact deep-link wire text.");
+  }
+  return {
+    kind: "route-reference",
+    href: parsed.href,
+    serialized: atom.serialized,
+    sessionId: parsed.sessionId,
+    ...(parsed.messageId === undefined ? {} : { messageId: parsed.messageId }),
+    ...(parsed.eventId === undefined ? {} : { eventId: parsed.eventId }),
+    displayText
+  };
+}
+
 function normalizedSelectionQuoteText(value: string): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.replace(/\r\n?/gu, "\n").replace(/^\n+|\n+$/gu, "");
@@ -900,10 +1066,12 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
     text += draft.text.slice(cursor, atom.start);
     if (atom.kind === "quote") {
       text += mobileSelectionQuoteText(atom.text);
-    } else {
+    } else if (atom.kind === "pasted-text") {
       const start = text.length;
       text += atom.text;
       pastedTextRanges.push({ start, end: text.length, display: mobileComposerAtomLabel(atom) });
+    } else {
+      text += atom.serialized;
     }
     cursor = atom.end;
   }
@@ -926,7 +1094,9 @@ function projectComposerOffset(offset: number, atoms: readonly MobileComposerAto
   for (const atom of atoms) {
     if (offset <= atom.start) break;
     if (offset < atom.end) throw new Error("A Joko reference offset cannot be inside a composer atom.");
-    const serializedLength = atom.kind === "quote" ? mobileSelectionQuoteText(atom.text).length : atom.text.length;
+    const serializedLength = atom.kind === "quote"
+      ? mobileSelectionQuoteText(atom.text).length
+      : atom.kind === "pasted-text" ? atom.text.length : atom.serialized.length;
     projected += serializedLength - (atom.end - atom.start);
   }
   return projected;
@@ -1111,6 +1281,22 @@ function sameMentionAuthority(left: MobileComposerMention, right: MobileComposer
   }
   return right.kind === "artifact" && left.artifactId === right.artifactId
     && left.sourceSessionId === right.sourceSessionId;
+}
+
+function sameComposerAtomAuthority(left: MobileComposerAtom, right: MobileComposerAtom): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "pasted-text") return right.kind === "pasted-text" && left.text === right.text;
+  if (left.kind === "quote") {
+    return right.kind === "quote" && left.text === right.text
+      && left.sourceSessionId === right.sourceSessionId
+      && left.sourceMessageId === right.sourceMessageId
+      && left.sourceEventId === right.sourceEventId
+      && left.sourceRole === right.sourceRole;
+  }
+  return right.kind === "route-reference" && left.href === right.href
+    && left.serialized === right.serialized && left.sessionId === right.sessionId
+    && left.messageId === right.messageId && left.eventId === right.eventId
+    && left.displayText === right.displayText;
 }
 
 function mobileComposerInputPart(mention: MobileComposerMention) {

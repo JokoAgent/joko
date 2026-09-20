@@ -269,7 +269,7 @@ export function assertMobileAppCommandInvocation(
 ): MobileAppCommandInvocation {
   const exact = normalizeMobileComposerDraft(draft);
   if (exact.mentions.length > 0 || exact.atoms.length > 0) {
-    throw new Error("App commands cannot contain task references, Workspace references, quotes, or pasted-text blocks.");
+    throw new Error("App commands cannot contain references or structured message items.");
   }
   const parsed = parseMobileAppCommand(exact, controls);
   if (!parsed || !sameInvocation(parsed, expected)) {

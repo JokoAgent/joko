@@ -12,6 +12,7 @@ import {
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   insertMobilePastedText,
+  insertMobileStructuredClipboardText,
   plainTextMobileComposerDraft
 } from "./mobile-composer-document";
 
@@ -144,7 +145,7 @@ describe("mobile composer draft store", () => {
     expect(store.readSync(first)).toBeNull();
   });
 
-  it("round-trips v4 atoms and local/uploaded attachment identities without persisting picker URIs", async () => {
+  it("round-trips v5 atoms and local/uploaded attachment identities without persisting picker URIs", async () => {
     const memory = memoryDriver();
     const store = new MobileComposerDraftStore(memory.driver);
     const atomized = appendMobileSelectionQuote(insertMobilePastedText(
@@ -159,8 +160,14 @@ describe("mobile composer draft store", () => {
       sourceRole: "assistant",
       text: "quoted"
     }, "quote").draft;
+    const routed = insertMobileStructuredClipboardText(
+      atomized,
+      { start: 0, end: 0 },
+      "#/tasks/related",
+      () => "route"
+    ).draft;
     const attached = {
-      ...atomized,
+      ...routed,
       attachments: [
         {
           state: "local" as const,
@@ -191,7 +198,7 @@ describe("mobile composer draft store", () => {
 
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).resolves.toEqual(attached);
     const raw = memory.values.get(mobileComposerDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":4');
+    expect(raw).toContain('"version":5');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -230,7 +237,7 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 4,
+      version: 5,
       identity: first,
       draft: {
         text: "@Task",
@@ -242,18 +249,27 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 4,
+      version: 5,
       identity: second,
       draft: plainTextMobileComposerDraft("cross owner")
     }));
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 3,
+      version: 4,
       identity: first,
       draft: { text: "old", mentions: [], attachments: [] }
     }));
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+
+    for (const version of [1, 2, 3, 4]) {
+      memory.values.set(key, JSON.stringify({
+        version,
+        identity: first,
+        draft: plainTextMobileComposerDraft(`old-v${version}`)
+      }));
+      await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+    }
   });
 
   it("reports storage failures without discarding the current in-memory text", async () => {

@@ -46,7 +46,7 @@ import { addToMobileComposer } from "./composer-draft-behavior";
 import {
   emptyMobileComposerDraft,
   insertMobileArtifactMention,
-  insertMobileClipboardText,
+  insertMobileStructuredClipboardText,
   insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
@@ -63,6 +63,7 @@ import {
   type MobileComposerSelection,
   type MobileWorkspaceLineRange
 } from "./mobile-composer-document";
+import { enrichMobileComposerRouteReferences } from "./mobile-composer-route-enrichment";
 import {
   appendMobileComposerAttachments,
   formatMobileAttachmentBytes,
@@ -1412,9 +1413,31 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
         || AppState.currentState !== "active") {
         throw new Error("The new-task draft changed while clipboard text was being read. Paste it again.");
       }
-      const result = insertMobileClipboardText(captured, selection, text, randomUUID());
+      const result = insertMobileStructuredClipboardText(
+        captured,
+        selection,
+        text,
+        () => randomUUID()
+      );
       replaceInput(result.draft, result.selection);
       setTimeout(() => composerInputRef.current?.focus(), 0);
+      if (result.insertedAtomIds.length > 0) {
+        void enrichMobileComposerRouteReferences(
+          result.draft,
+          result.selection,
+          result.insertedAtomIds,
+          (target) => client.resolveComposerRouteReference(target)
+        ).then((resolved) => {
+          if (mobileComposerDraftsEqual(resolved.draft, result.draft)) return;
+          if (!mountedRef.current || profileIdRef.current !== ownerProfileId
+            || draftRef.current.targetId !== targetId || draftRef.current.input !== result.draft
+            || selectionRef.current.start !== result.selection.start
+            || selectionRef.current.end !== result.selection.end
+            || !referencesEditableRef.current || client.state.activeProfileId !== ownerProfileId
+            || client.state.status !== "connected" || AppState.currentState !== "active") return;
+          replaceInput(resolved.draft, resolved.selection);
+        }).catch(() => undefined);
+      }
     } catch (failure) {
       if (mountedRef.current && profileIdRef.current === ownerProfileId) setError(errorText(failure));
     }
@@ -3329,13 +3352,42 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         || AppState.currentState !== "active") {
         throw new Error("The task draft changed while clipboard text was being read. Paste it again.");
       }
-      const result = insertMobileClipboardText(captured, selection, text, randomUUID());
+      const result = insertMobileStructuredClipboardText(
+        captured,
+        selection,
+        text,
+        () => randomUUID()
+      );
       composerDraftRef.current = result.draft;
       composerSelectionRef.current = result.selection;
       setDraft(result.draft);
       setComposerSelection(result.selection);
       mobileComposerDrafts.save(identity, result.draft);
       setTimeout(() => composerInputRef.current?.focus(), 0);
+      if (result.insertedAtomIds.length > 0) {
+        void enrichMobileComposerRouteReferences(
+          result.draft,
+          result.selection,
+          result.insertedAtomIds,
+          (target) => client.resolveComposerRouteReference(target)
+        ).then((resolved) => {
+          if (mobileComposerDraftsEqual(resolved.draft, result.draft)) return;
+          if (!taskMountedRef.current || draftIdentityRef.current === undefined
+            || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== identityKey
+            || composerDraftRef.current !== result.draft
+            || composerSelectionRef.current.start !== result.selection.start
+            || composerSelectionRef.current.end !== result.selection.end
+            || !composerPasteEditableRef.current || queueEditRef.current
+            || client.state.activeProfileId !== identity.profileId
+            || client.state.selectedId !== identity.sessionId
+            || client.state.status !== "connected" || AppState.currentState !== "active") return;
+          composerDraftRef.current = resolved.draft;
+          composerSelectionRef.current = resolved.selection;
+          setDraft(resolved.draft);
+          setComposerSelection(resolved.selection);
+          mobileComposerDrafts.save(identity, resolved.draft);
+        }).catch(() => undefined);
+      }
     } catch (failure) {
       if (taskMountedRef.current && draftIdentityRef.current
         && mobileComposerDraftIdentityKey(draftIdentityRef.current) === identityKey) {
@@ -4541,13 +4593,13 @@ function MobileComposerAtomChips({ atoms, colors, disabled, onOpen }: {
     accessibilityLabel="Structured message items" contentContainerStyle={styles.mentionChips}
     showsHorizontalScrollIndicator={false}>
     {atoms.map((atom) => <Pressable key={atom.atomId} accessibilityRole="button"
-      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
+      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : atom.kind === "route-reference" ? "View task link" : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
       accessibilityHint="Opens this exact structured message item; it is removed as one unit if edited in the text field"
       accessibilityState={{ disabled }} disabled={disabled} onPress={() => onOpen(atom.atomId)}
       style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
         disabled && styles.disabled]}>
       <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>
-        {mobileComposerAtomLabel(atom)} · {atom.kind === "quote" ? "View" : "Edit"}
+        {mobileComposerAtomLabel(atom)} · {atom.kind === "pasted-text" ? "Edit" : "View"}
       </Text>
     </Pressable>)}
   </ScrollView>;

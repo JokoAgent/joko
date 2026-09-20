@@ -8,6 +8,7 @@ import {
 import {
   insertMobileResourceMention,
   insertMobileSessionMention,
+  insertMobileStructuredClipboardText,
   insertMobileWorkspaceMention,
   plainTextMobileComposerDraft,
   type MobileComposerDraft
@@ -48,11 +49,17 @@ function structuredInput() {
     { sessionId: "session-history", displayText: "History" },
     "mention-session"
   );
-  return insertMobileWorkspaceMention(
+  const workspace = insertMobileWorkspaceMention(
     session.draft,
     session.selection,
     { workspaceId: "workspace-one", relativePath: "src", displayText: "src", directory: true },
     "mention-workspace"
+  ).draft;
+  return insertMobileStructuredClipboardText(
+    workspace,
+    { start: workspace.text.length, end: workspace.text.length },
+    " #/tasks/session-related",
+    () => "route-related"
   ).draft;
 }
 
@@ -197,7 +204,7 @@ describe("mobile new-task retained draft store", () => {
     });
   });
 
-  it("atomically replaces a v4 attachment identity in both editable and frozen submission input", async () => {
+  it("atomically replaces a v5 attachment identity in both editable and frozen submission input", async () => {
     const memory = memoryDriver();
     const store = new MobileNewTaskDraftStore(memory.driver);
     const local = attachedInput("local");
@@ -214,7 +221,7 @@ describe("mobile new-task retained draft store", () => {
       first, authority.createOperationId, local, attachedInput("uploaded")
     )).rejects.toThrow(/changed while it was being committed/u);
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":4');
+    expect(raw).toContain('"version":5');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -246,21 +253,30 @@ describe("mobile new-task retained draft store", () => {
 
     const crossProfile = new MobileNewTaskDraftStore(memory.driver);
     memory.values.set(key, JSON.stringify({
-      version: 4,
+      version: 5,
       identity: second,
       draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
     await expect(crossProfile.read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 3,
+      version: 4,
       identity: first,
       draft: { targetId: "target-one", name: "", input: { text: "old", mentions: [], attachments: [] } }
     }));
     await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
+    for (const version of [1, 2, 3, 4]) {
+      memory.values.set(key, JSON.stringify({
+        version,
+        identity: first,
+        draft: { targetId: "target-one", name: "", input: input(`old-v${version}`) }
+      }));
+      await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
+    }
+
     memory.values.set(key, JSON.stringify({
-      version: 4,
+      version: 5,
       identity: first,
       draft: {
         targetId: "target-one",

@@ -201,7 +201,7 @@ describe("mobile app command invocation", () => {
       sourceSessionId: "session", sourceMessageId: "message", sourceEventId: "event",
       sourceRole: "assistant", text: "evidence"
     }, "quote").draft;
-    expect(() => assertMobileAppCommandInvocation(controls, quoted, parseMobileAppCommand(quoted, controls)!)).toThrow(/pasted-text blocks/u);
+    expect(() => assertMobileAppCommandInvocation(controls, quoted, parseMobileAppCommand(quoted, controls)!)).toThrow(/structured message items/u);
 
     const attachment = {
       attachmentId: "attachment", kind: "file" as const, state: "uploaded" as const,

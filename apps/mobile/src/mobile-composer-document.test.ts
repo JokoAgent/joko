@@ -16,6 +16,8 @@ import {
   appendPlainTextToMobileComposer,
   emptyMobileComposerDraft,
   insertMobileClipboardText,
+  insertMobileRouteReferencePaste,
+  insertMobileStructuredClipboardText,
   insertMobilePastedText,
   insertMobileArtifactMention,
   insertMobileResourceMention,
@@ -32,8 +34,10 @@ import {
   reconcileMobileComposerText,
   removeMobileComposerAtom,
   updateMobilePastedTextAtom,
+  updateMobileRouteReferenceAtom,
   removeMobileComposerMention
 } from "./mobile-composer-document";
+import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
 
 describe("mobile structured composer document", () => {
   it("serializes attachment-only image/file drafts in stable order and requires canonical uploaded identities", () => {
@@ -598,5 +602,92 @@ describe("mobile structured composer document", () => {
       mentionRanges: [create(InputMentionRangeSchema, { start: 4, end: 13, mentionIndex: 0 })]
     });
     expect(mobileInputSummary(invalidArtifact)).toBe("Use @Artifact\n[Invalid reference metadata]");
+  });
+
+  it("inserts, enriches, serializes, and removes multiple task-link atoms without typed authority", () => {
+    const segments = segmentMobileComposerRoutePaste(
+      "See #/tasks/session-one and [Second](#/tasks/session-two?message=message-two)."
+    )!;
+    const inserted = insertMobileRouteReferencePaste(
+      plainTextMobileComposerDraft("Before "),
+      { start: 7, end: 7 },
+      segments,
+      (index) => `route-${index}`
+    );
+    expect(inserted.insertedAtomIds).toEqual(["route-0", "route-1"]);
+    expect(inserted.draft.text).toBe("Before See #/tasks/session-one and #/tasks/session-two?message=message-two.");
+    expect(inserted.draft.atoms).toMatchObject([
+      {
+        kind: "route-reference",
+        atomId: "route-0",
+        href: "#/tasks/session-one",
+        serialized: "#/tasks/session-one",
+        sessionId: "session-one",
+        displayText: "session-one"
+      },
+      {
+        kind: "route-reference",
+        atomId: "route-1",
+        href: "#/tasks/session-two?message=message-two",
+        serialized: "#/tasks/session-two?message=message-two",
+        sessionId: "session-two",
+        messageId: "message-two",
+        displayText: "message-two"
+      }
+    ]);
+    expect(mobileComposerInput(inserted.draft)).toMatchObject({
+      parts: [{ content: { case: "text", value: inserted.draft.text } }],
+      mentionRanges: [],
+      pastedTextRanges: [],
+      quotesEncoded: false
+    });
+
+    const first = inserted.draft.atoms[0]!;
+    expect(first.kind).toBe("route-reference");
+    if (first.kind !== "route-reference") throw new Error("expected task link");
+    const titled = updateMobileRouteReferenceAtom(inserted.draft, first, "Roadmap @ team")!;
+    expect(titled.draft.text).toContain("[Roadmap ＠ team](#/tasks/session-one)");
+    expect(titled.draft.mentions).toEqual([]);
+    const second = titled.draft.atoms.find((atom) => atom.atomId === "route-1")!;
+    if (second.kind !== "route-reference") throw new Error("expected message link");
+    const resolved = updateMobileRouteReferenceAtom(titled.draft, second, "  Message\nbody  ")!;
+    expect(resolved.draft.text).toContain("#/tasks/session-two?message=message-two");
+    expect(resolved.draft.atoms.find((atom) => atom.atomId === "route-1")).toMatchObject({
+      displayText: "Message body",
+      serialized: "#/tasks/session-two?message=message-two"
+    });
+    expect(updateMobileRouteReferenceAtom(resolved.draft, second, "stale")).toBeUndefined();
+    expect(removeMobileComposerAtom(resolved.draft, "route-1").draft.atoms.map((atom) => atom.atomId))
+      .toEqual(["route-0"]);
+  });
+
+  it("rejects forged task-link authority and never retains credential-bearing hrefs", () => {
+    expect(() => normalizeMobileComposerDraft({
+      text: "#/tasks/session",
+      mentions: [],
+      atoms: [{
+        kind: "route-reference",
+        atomId: "route",
+        href: "https://user:pass@example.test/?token=secret#/tasks/session",
+        serialized: "#/tasks/session",
+        sessionId: "session",
+        displayText: "session",
+        start: 0,
+        end: 16
+      }],
+      attachments: []
+    })).toThrow(/target|range/u);
+  });
+
+  it("gives long-paste compaction precedence over task-link recognition", () => {
+    const text = `${"x".repeat(4_000)} #/tasks/session`;
+    const result = insertMobileStructuredClipboardText(
+      emptyMobileComposerDraft(),
+      { start: 0, end: 0 },
+      text,
+      (index) => `atom-${index}`
+    );
+    expect(result.insertedAtomIds).toEqual([]);
+    expect(result.draft.atoms).toMatchObject([{ kind: "pasted-text", atomId: "atom-0", text }]);
   });
 });

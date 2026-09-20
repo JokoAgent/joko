@@ -3,9 +3,11 @@ import {
   appendMobileSelectionQuote,
   emptyMobileComposerDraft,
   insertMobileClipboardText,
+  insertMobileRouteReferencePaste,
   insertMobileSessionMention,
   type MobileComposerDraft
 } from "./mobile-composer-document";
+import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
 import {
   mobileComposerAtomOccurrenceKey,
   mobileComposerMentionOccurrenceKey,
@@ -136,5 +138,37 @@ describe("mobile composer rich document", () => {
     expect(() => reconcileMobileComposerRichDocument(original, [
       { type: "text", text: "😀" }
     ], { start: 1, end: 1 })).toThrow(/selection/u);
+  });
+
+  it("projects task links as atomic accessible occurrences and permits whole-node deletion", () => {
+    const inserted = insertMobileRouteReferencePaste(
+      emptyMobileComposerDraft(),
+      { start: 0, end: 0 },
+      segmentMobileComposerRoutePaste("Open #/tasks/session-one now")!,
+      () => "route-1"
+    );
+    expect(mobileComposerRichDocument(inserted.draft).nodes).toEqual([
+      { type: "text", text: "Open " },
+      {
+        type: "occurrence",
+        occurrenceKey: "atom:route-1",
+        kind: "route-reference",
+        token: "#/tasks/session-one",
+        label: "session-one",
+        accessibilityLabel: "Task link session-one",
+        block: false
+      },
+      { type: "text", text: " now" }
+    ]);
+    const removed = reconcileMobileComposerRichDocument(inserted.draft, [
+      { type: "text", text: "Open  now" }
+    ], { start: 5, end: 5 });
+    expect(removed.draft.atoms).toEqual([]);
+    expect(removed.draft.text).toBe("Open  now");
+    expect(() => reconcileMobileComposerRichDocument(inserted.draft, [
+      { type: "text", text: "Open " },
+      { type: "occurrence", occurrenceKey: "atom:route-1" },
+      { type: "text", text: " now" }
+    ], { start: 6, end: 6 })).toThrow(/splits a structured occurrence/u);
   });
 });

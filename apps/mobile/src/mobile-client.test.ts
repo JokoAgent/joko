@@ -4991,6 +4991,92 @@ describe("native current-task context usage and compaction", () => {
   });
 });
 
+describe("native composer task-link resolution", () => {
+  function routeNetwork(detailTimeline: readonly Event[] = []): MobileNetwork {
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({
+      connection,
+      device,
+      snapshot: runtimeControlProjection(runtimeSession, false)
+    }));
+    network.readSession = vi.fn(async () => create(SnapshotSchema, {
+      ...runtimeControlProjection(runtimeSession, true),
+      timeline: [...detailTimeline]
+    }));
+    return network;
+  }
+
+  it("resolves an exact visible task title and cached message without a history read", async () => {
+    const network = routeNetwork([messageEvent]);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    await expect(app.resolveComposerRouteReference({
+      kind: "session",
+      href: "#/tasks/session",
+      sessionId: "session"
+    })).resolves.toBe("Task");
+    await expect(app.resolveComposerRouteReference({
+      kind: "message",
+      href: "#/tasks/session?message=message-1",
+      sessionId: "session",
+      messageId: "message-1"
+    })).resolves.toBe("Durable answer");
+    expect(network.readAround).not.toHaveBeenCalled();
+    expect(network.readNativeSessionTree).not.toHaveBeenCalled();
+  });
+
+  it("uses an exact authenticated around-read and then the validated native tree fallback", async () => {
+    const network = routeNetwork();
+    vi.mocked(network.readAround).mockResolvedValue([messageEvent]);
+    network.readNativeSessionTree = vi.fn(async () => branchTree(9n, "session-r9", "native-current"));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    await expect(app.resolveComposerRouteReference({
+      kind: "message",
+      href: "#/tasks/session?event=event-completed",
+      sessionId: "session",
+      eventId: "event-completed"
+    })).resolves.toBe("Durable answer");
+    await expect(app.resolveComposerRouteReference({
+      kind: "message",
+      href: "#/tasks/session?message=native-current",
+      sessionId: "session",
+      messageId: "native-current"
+    })).resolves.toBe("Current answer");
+    expect(network.readAround).toHaveBeenCalledWith(
+      credential,
+      "session",
+      "event-completed",
+      expect.any(AbortSignal)
+    );
+    expect(network.readNativeSessionTree).toHaveBeenCalledWith(
+      credential,
+      "session",
+      expect.any(AbortSignal)
+    );
+  });
+
+  it("retires an in-flight enrichment when foreground owner authority changes", async () => {
+    const network = routeNetwork();
+    let finish!: (events: Event[]) => void;
+    vi.mocked(network.readAround).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const pending = app.resolveComposerRouteReference({
+      kind: "message",
+      href: "#/tasks/session?event=event-completed",
+      sessionId: "session",
+      eventId: "event-completed"
+    });
+    app.setForeground(false);
+    finish([messageEvent]);
+    await expect(pending).resolves.toBeUndefined();
+  });
+});
+
 describe("native current-task branch navigation", () => {
   const ids = () => {
     let value = 0;

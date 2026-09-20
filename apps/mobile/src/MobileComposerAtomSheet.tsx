@@ -46,13 +46,22 @@ export function MobileComposerAtomSheet({
           </Pressable>
         </View>
         {atom.kind === "quote" && <Text style={[styles.help, { color: colors.muted }]}>Quoted from the exact assistant message in task {atom.sourceSessionId}.</Text>}
+        {atom.kind === "route-reference" && <Text style={[styles.help, { color: colors.muted }]}>
+          {atom.messageId || atom.eventId ? "Message link" : "Task link"} · task {atom.sessionId}. This link does not grant task access or navigate automatically.
+        </Text>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           {atom.kind === "quote"
             ? <Text selectable accessibilityLabel="Quoted assistant text"
                 style={[styles.readText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>{atom.text}</Text>
-            : <TextInput accessibilityLabel="Pasted text" multiline value={pasteText} editable={!busy}
+            : atom.kind === "pasted-text"
+              ? <TextInput accessibilityLabel="Pasted text" multiline value={pasteText} editable={!busy}
                 maxLength={mobileLongPasteMaximumCharacters} onChangeText={setPasteText}
-                style={[styles.input, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />}
+                style={[styles.input, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
+              : <View accessibilityLabel="Task link details"
+                  style={[styles.readText, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                  <Text selectable accessibilityLabel="Task link label" style={[styles.routeLabel, { color: colors.ink }]}>{atom.displayText}</Text>
+                  <Text selectable accessibilityLabel="Task link address" style={[styles.routeHref, { color: colors.muted }]}>{atom.href}</Text>
+                </View>}
         </ScrollView>
         {atom.kind === "pasted-text" && <Text accessibilityLiveRegion="polite"
           style={[styles.count, { color: colors.muted }]}>{pasteText.length.toLocaleString("en-US")} characters</Text>}
@@ -87,6 +96,8 @@ const styles = StyleSheet.create({
   help: { fontSize: 13, lineHeight: 19 },
   content: { flexGrow: 1 },
   readText: { minHeight: 160, borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 14, fontSize: 15, lineHeight: 22 },
+  routeLabel: { fontSize: 15, lineHeight: 22, fontWeight: "700" },
+  routeHref: { marginTop: 10, fontSize: 13, lineHeight: 20 },
   input: { minHeight: 180, maxHeight: 440, borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 14, fontSize: 15, lineHeight: 22, textAlignVertical: "top" },
   count: { fontSize: 12, fontWeight: "600" },
   actions: { flexDirection: "row", justifyContent: "flex-end", flexWrap: "wrap", gap: 10 },

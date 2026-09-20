@@ -764,7 +764,7 @@ describe("native mobile device through the durable product chain", () => {
     });
   });
 
-  it("preserves mobile selection quotes and long-paste ranges through HTTP, SQLite, and dispatch", async () => {
+  it("preserves mobile quote, long-paste, and task-link wire text through HTTP, SQLite, and dispatch", async () => {
     fixture = await OrchestratorE2eFixture.start({
       createAdapter: (profile) => new MobileMessageFixtureAdapter(profile)
     });
@@ -859,6 +859,57 @@ describe("native mobile device through the durable product chain", () => {
       quotesEncoded: true,
       pastedTextRanges: [pastedRange]
     });
+
+    const routeText = `Compare [Mobile structured composer](#/tasks/${encodeURIComponent(sessionId)}) and #/tasks/${encodeURIComponent(sessionId)}?message=message-two.`;
+    const routeSent = await submit(
+      clients.operation,
+      connectionId,
+      sendInputMutation(sessionId, generation, routeText)
+    );
+    const routeQueued = queueItemFrom(routeSent);
+    expect(routeQueued.input).toMatchObject({
+      quotesEncoded: false,
+      pastedTextRanges: [],
+      mentionRanges: [],
+      parts: [{ content: { case: "text", value: routeText } }]
+    });
+    const storedRouteBody = fixture.application.store.getQueueItem(routeQueued.queueItemId).body;
+    expect(storedRouteBody).toMatchObject({
+      text: routeText,
+      mentions: []
+    });
+    expect(storedRouteBody).not.toHaveProperty("mentionRanges");
+    expect(storedRouteBody).not.toHaveProperty("pastedTextRanges");
+    expect(storedRouteBody).not.toHaveProperty("quotesEncoded");
+    await waitFor(
+      () => clients.run.getRun({ runId: queueRunIdFrom(routeSent) }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      "mobile task-link wire dispatch"
+    );
+    const routeAccepted = fixture.application.store.listEvents({ sessionId }).find((event) =>
+      event.runId === routeQueued.runId && event.payload.type === "message_complete"
+      && event.payload.role === "user" && event.payload.acceptedInput?.text === routeText);
+    expect(routeAccepted?.payload).toMatchObject({
+      type: "message_complete",
+      acceptedInput: {
+        text: routeText,
+        mentions: []
+      }
+    });
+    if (routeAccepted?.payload.type !== "message_complete" || routeAccepted.payload.acceptedInput === undefined) {
+      throw new Error("The accepted mobile task-link input was not retained.");
+    }
+    expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("mentionRanges");
+    expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("pastedTextRanges");
+    expect(routeAccepted.payload.acceptedInput).not.toHaveProperty("quotesEncoded");
+    const dispatchedRoute = fixture.adapter().sendCalls.at(-1);
+    expect(dispatchedRoute).toMatchObject({
+      text: routeText,
+      mentions: []
+    });
+    expect(dispatchedRoute).not.toHaveProperty("mentionRanges");
+    expect(dispatchedRoute).not.toHaveProperty("pastedTextRanges");
+    expect(dispatchedRoute).not.toHaveProperty("quotesEncoded");
   });
 
   it("admits a mobile typed Session reference and preserves its public input ranges through dispatch", async () => {
