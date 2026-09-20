@@ -6,6 +6,8 @@ import {
 } from "./composer-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import {
+  insertMobileArtifactMention,
+  insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   plainTextMobileComposerDraft
@@ -104,7 +106,7 @@ describe("mobile composer draft store", () => {
       { sessionId: "source", displayText: "Task" },
       "mention-one"
     );
-    const submitted = insertMobileWorkspaceMention(
+    const workspace = insertMobileWorkspaceMention(
       session.draft,
       session.selection,
       {
@@ -112,6 +114,21 @@ describe("mobile composer draft store", () => {
         lineRange: { startLine: 2, endLine: 4 }
       },
       "mention-two"
+    );
+    const resource = insertMobileResourceMention(
+      workspace.draft,
+      workspace.selection,
+      {
+        resourceId: "resource", displayText: "Skill", discoveredRevision: "sha256:resource",
+        resourceVersion: "7", runtimeGeneration: "8"
+      },
+      "mention-three"
+    );
+    const submitted = insertMobileArtifactMention(
+      resource.draft,
+      resource.selection,
+      { artifactId: "artifact", sourceSessionId: "source", displayText: "report.txt" },
+      "mention-four"
     ).draft;
     store.save(first, submitted);
     await store.flush(first);

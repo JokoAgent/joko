@@ -71,6 +71,17 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import {
+  assertMobileCatalogMentionCandidate,
+  assertMobileCatalogMentionDraft,
+  assertMobileCatalogMentionDraftCatalog,
+  createMobileCatalogMentionControls,
+  projectMobileArtifactMentionCatalog,
+  projectMobileResourceMentionCatalog,
+  type MobileCatalogMentionCandidate,
+  type MobileCatalogMentionCatalog,
+  type MobileCatalogMentionControls
+} from "./mobile-catalog-mentions";
+import {
   assertMobileSessionMentionDraft,
   createMobileSessionMentionControls,
   type MobileSessionMentionControls
@@ -1959,9 +1970,14 @@ export class MobileClient {
     const mentionControls = this.taskSessionMentionControls();
     const workspaceMentionControls = this.taskWorkspaceMentionControls();
     const workspaceMentionOwnerKey = workspaceMentionControls?.surfaceOwnerKey;
-    const sendDraft = assertMobileWorkspaceMentionDraft(
-      workspaceMentionControls,
-      assertMobileSessionMentionDraft(mentionControls, exactDraft)
+    const catalogMentionControls = this.taskCatalogMentionControls();
+    const catalogMentionOwnerKey = catalogMentionControls?.surfaceOwnerKey;
+    const sendDraft = assertMobileCatalogMentionDraft(
+      catalogMentionControls,
+      assertMobileWorkspaceMentionDraft(
+        workspaceMentionControls,
+        assertMobileSessionMentionDraft(mentionControls, exactDraft)
+      )
     );
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
     const draftIdentity = { profileId: credential.profileId, sessionId };
@@ -1976,6 +1992,8 @@ export class MobileClient {
     assertMobileSessionMentionDraft(this.taskSessionMentionControls(), sendDraft);
     const currentWorkspaceMentionControls = this.taskWorkspaceMentionControls();
     assertMobileWorkspaceMentionDraft(currentWorkspaceMentionControls, sendDraft);
+    const currentCatalogMentionControls = this.taskCatalogMentionControls();
+    assertMobileCatalogMentionDraft(currentCatalogMentionControls, sendDraft);
     if (sendDraft.mentions.some((mention) => mention.kind === "workspace")) {
       if (!currentWorkspaceMentionControls || currentWorkspaceMentionControls.surfaceOwnerKey !== workspaceMentionOwnerKey) {
         throw new Error("The Workspace reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
@@ -1986,6 +2004,17 @@ export class MobileClient {
         throw new Error("The Workspace reference owner changed while its paths were being checked. Review the retained draft before sending.");
       }
       assertMobileWorkspaceMentionDraft(this.taskWorkspaceMentionControls(), sendDraft);
+    }
+    if (sendDraft.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+      if (!currentCatalogMentionControls || currentCatalogMentionControls.surfaceOwnerKey !== catalogMentionOwnerKey) {
+        throw new Error("The catalog reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
+      }
+      const catalog = await this.listTaskCatalogMentionCatalog(currentCatalogMentionControls.surfaceOwnerKey);
+      if (this.#taskAuthorityKey() !== authorityKey
+        || this.taskCatalogMentionControls()?.surfaceOwnerKey !== currentCatalogMentionControls.surfaceOwnerKey) {
+        throw new Error("The catalog reference owner changed while its candidates were being checked. Review the retained draft before sending.");
+      }
+      assertMobileCatalogMentionDraftCatalog(this.taskCatalogMentionControls(), catalog, sendDraft);
     }
     const action = this.#claimMutation();
     try {
@@ -2083,6 +2112,69 @@ export class MobileClient {
       this.#state.owner,
       this.#state.detail,
       this.#state.selectedId
+    );
+  }
+
+  taskCatalogMentionControls(): MobileCatalogMentionControls | undefined {
+    return createMobileCatalogMentionControls(
+      this.#taskAuthorityKey(),
+      this.#state.owner,
+      this.#state.detail,
+      this.#state.selectedId
+    );
+  }
+
+  async listTaskCatalogMentionCatalog(
+    expectedSurfaceOwnerKey: string,
+    signal?: AbortSignal
+  ): Promise<MobileCatalogMentionCatalog> {
+    const context = this.#catalogMentionContext(expectedSurfaceOwnerKey);
+    const [resources, artifacts] = await Promise.all([
+      context.controls.policy.resources
+        ? this.network.listSessionResources(context.credential, context.controls.sessionId, signal)
+        : Promise.resolve(undefined),
+      context.controls.policy.artifacts
+        ? this.network.listArtifactReferenceCatalog(
+            context.credential,
+            context.controls.sessionId,
+            BigInt(context.controls.runtimeGeneration),
+            signal
+          )
+        : Promise.resolve(undefined)
+    ]);
+    const current = this.#catalogMentionContext(expectedSurfaceOwnerKey);
+    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+      throw new Error("The catalog reference owner changed while its candidates were loading.");
+    }
+    return {
+      ...(resources === undefined ? {} : {
+        resources: projectMobileResourceMentionCatalog(context.controls, resources)
+      }),
+      ...(artifacts === undefined ? {} : {
+        artifacts: projectMobileArtifactMentionCatalog(
+          context.controls,
+          artifacts.artifacts,
+          artifacts.revision
+        )
+      })
+    };
+  }
+
+  async validateTaskCatalogMentionCandidate(
+    expectedSurfaceOwnerKey: string,
+    value: MobileCatalogMentionCandidate,
+    signal?: AbortSignal
+  ): Promise<MobileCatalogMentionCandidate> {
+    const context = this.#catalogMentionContext(expectedSurfaceOwnerKey);
+    if (value.kind === "resource" && !context.controls.policy.resources
+      || value.kind === "artifact" && !context.controls.policy.artifacts) {
+      throw new Error(`This Backend no longer supports ${value.kind === "resource" ? "Resource" : "Artifact"} references.`);
+    }
+    const catalog = await this.listTaskCatalogMentionCatalog(expectedSurfaceOwnerKey, signal);
+    return assertMobileCatalogMentionCandidate(
+      this.#catalogMentionContext(expectedSurfaceOwnerKey).controls,
+      catalog,
+      value
     );
   }
 
@@ -2657,6 +2749,18 @@ export class MobileClient {
     const controls = this.taskWorkspaceMentionControls();
     if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
       throw new Error("The Workspace reference owner changed. Reopen the reference list from the current task.");
+    }
+    return { credential, controls };
+  }
+
+  #catalogMentionContext(expectedSurfaceOwnerKey: string): {
+    readonly credential: PairedCredential;
+    readonly controls: MobileCatalogMentionControls;
+  } {
+    const credential = this.#ready();
+    const controls = this.taskCatalogMentionControls();
+    if (!controls || !expectedSurfaceOwnerKey || controls.surfaceOwnerKey !== expectedSurfaceOwnerKey) {
+      throw new Error("The catalog reference owner changed. Reopen the reference list from the current task.");
     }
     return { credential, controls };
   }

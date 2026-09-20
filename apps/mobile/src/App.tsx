@@ -36,6 +36,8 @@ import {
 import { addToMobileComposer } from "./composer-draft-behavior";
 import {
   emptyMobileComposerDraft,
+  insertMobileArtifactMention,
+  insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   mobileInputSummary,
@@ -69,6 +71,8 @@ import { MobileSessionMentionSheet } from "./MobileSessionMentionSheet";
 import type { MobileSessionMentionCandidate } from "./mobile-session-mentions";
 import { MobileWorkspaceMentionSheet } from "./MobileWorkspaceMentionSheet";
 import type { MobileWorkspaceMentionCandidate } from "./mobile-workspace-mentions";
+import { MobileCatalogMentionSheet } from "./MobileCatalogMentionSheet";
+import type { MobileCatalogMentionCandidate } from "./mobile-catalog-mentions";
 import {
   mobileInteractionDraftIdentity,
   mobileInteractionDraftIdentityKey,
@@ -888,6 +892,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
   const [sessionMentionError, setSessionMentionError] = useState("");
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
+  const [catalogMentionsVisible, setCatalogMentionsVisible] = useState(false);
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
     state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
   );
@@ -981,6 +986,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
   const workspaceMentionControls = client.taskWorkspaceMentionControls();
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
+  const catalogMentionControls = client.taskCatalogMentionControls();
+  const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${state.activeProfileId}\u001f${state.selectedId}`
     : undefined;
@@ -1029,6 +1036,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setNativeTreeVisible(false);
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
     if (ownerChanged) {
       setSelectedInteractionId(interactions[0]!.interactionId);
       setInteractionVisible(true);
@@ -1073,6 +1081,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     if (changed || next === undefined) setWorkspaceMentionsVisible(false);
   }, [workspaceMentionControls?.surfaceOwnerKey]);
   useEffect(() => {
+    const next = catalogMentionControls?.surfaceOwnerKey;
+    const changed = catalogMentionOwnerRef.current !== next;
+    catalogMentionOwnerRef.current = next;
+    if (changed || next === undefined) setCatalogMentionsVisible(false);
+  }, [catalogMentionControls?.surfaceOwnerKey]);
+  useEffect(() => {
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
       for (const interaction of interactions) {
@@ -1096,6 +1110,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setComposerContentHeight(composerMinimumInputHeight);
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
     if (!identity) {
       setDraft(emptyMobileComposerDraft());
       setComposerSelection({ start: 0, end: 0 });
@@ -1244,6 +1259,35 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     setWorkspaceMentionsVisible(false);
     setTimeout(() => composerInputRef.current?.focus(), 0);
   };
+  const insertCatalogMention = async (
+    surfaceOwnerKey: string,
+    candidate: MobileCatalogMentionCandidate
+  ): Promise<void> => {
+    const controls = catalogMentionControls;
+    const identity = draftIdentityRef.current;
+    if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
+      || catalogMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current || !identity) {
+      setCatalogMentionsVisible(false);
+      throw new Error("Catalog reference authority changed. Reopen the reference list and try again.");
+    }
+    const current = await client.validateTaskCatalogMentionCandidate(surfaceOwnerKey, candidate);
+    const latestControls = client.taskCatalogMentionControls();
+    if (!latestControls || latestControls.surfaceOwnerKey !== surfaceOwnerKey
+      || catalogMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current
+      || !draftIdentityRef.current
+      || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== mobileComposerDraftIdentityKey(identity)) {
+      setCatalogMentionsVisible(false);
+      throw new Error("Catalog reference authority changed while the candidate was being checked.");
+    }
+    const result = current.kind === "resource"
+      ? insertMobileResourceMention(draft, composerSelection, current, randomUUID())
+      : insertMobileArtifactMention(draft, composerSelection, current, randomUUID());
+    setDraft(result.draft);
+    setComposerSelection(result.selection);
+    mobileComposerDrafts.save(identity, result.draft);
+    setCatalogMentionsVisible(false);
+    setTimeout(() => composerInputRef.current?.focus(), 0);
+  };
   const removeComposerMention = (mentionId: string): void => {
     try {
       const result = removeMobileComposerMention(draft, mentionId);
@@ -1306,6 +1350,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
     const stashedDraft = draft;
     setSessionMentionsVisible(false);
     setWorkspaceMentionsVisible(false);
+    setCatalogMentionsVisible(false);
     setLocalError("");
     try {
       const lease = await client.beginQueueEdit(item.queueItemId);
@@ -1410,12 +1455,12 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       </View>
       <View style={styles.headerActions}>
         <Action label="Branches"
-          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
+          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
           disabled={nativeTreeControls === undefined || state.busy || interactions.length > 0} />
         <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
-          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
+          onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
           disabled={contextControls === undefined || state.busy || interactions.length > 0} />
-        <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
+        <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
           disabled={!runtimeControlsAvailable || state.busy || interactions.length > 0} />
         {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact />}
         <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact />
@@ -1524,7 +1569,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
         style={styles.composerResizeHandle} {...composerResizeResponder.panHandlers}>
         <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
       </View>
-      {!queueEdit && (sessionMentionControls || workspaceMentionControls || draft.mentions.length > 0) && <View style={styles.composerTools}>
+      {!queueEdit && (sessionMentionControls || workspaceMentionControls || catalogMentionControls || draft.mentions.length > 0) && <View style={styles.composerTools}>
         {sessionMentionControls && <Action label="Reference task" colors={colors} compact
           disabled={state.busy || !composerOwnerReady || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
@@ -1532,6 +1577,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             setContextVisible(false);
             setRuntimeControlsVisible(false);
             setWorkspaceMentionsVisible(false);
+            setCatalogMentionsVisible(false);
             setSessionMentionError("");
             setSessionMentionsVisible(true);
           }} />}
@@ -1542,13 +1588,30 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
             setContextVisible(false);
             setRuntimeControlsVisible(false);
             setSessionMentionsVisible(false);
+            setCatalogMentionsVisible(false);
             setSessionMentionError("");
             setWorkspaceMentionsVisible(true);
+          }} />}
+        {catalogMentionControls && <Action
+          label={catalogMentionControls.policy.resources && catalogMentionControls.policy.artifacts
+            ? "Reference Resource / Artifact"
+            : catalogMentionControls.policy.resources ? "Reference Resource" : "Reference Artifact"}
+          colors={colors} compact disabled={state.busy || !composerOwnerReady}
+          onPress={() => {
+            setNativeTreeVisible(false);
+            setContextVisible(false);
+            setRuntimeControlsVisible(false);
+            setSessionMentionsVisible(false);
+            setSessionMentionError("");
+            setWorkspaceMentionsVisible(false);
+            setCatalogMentionsVisible(true);
           }} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.mentions.map((mention) => <Pressable key={mention.mentionId}
-            accessibilityRole="button" accessibilityLabel={`Remove ${mention.kind === "session" ? "task" : mention.directory ? "directory" : "file"} reference ${mention.displayText}`}
+            accessibilityRole="button" accessibilityLabel={`Remove ${mention.kind === "session" ? "task"
+              : mention.kind === "workspace" ? mention.directory ? "directory" : "file"
+                : mention.kind === "resource" ? "resource" : "Artifact"} reference ${mention.displayText}`}
             accessibilityHint="Removes this exact reference occurrence from the message"
             disabled={state.busy} onPress={() => removeComposerMention(mention.mentionId)}
             style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }, state.busy && styles.disabled]}>
@@ -1640,6 +1703,11 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles }: ScreenPro
       onLoadDirectory={(surfaceOwnerKey, parentPath, signal) => client.listTaskWorkspaceMentionDirectory(surfaceOwnerKey, parentPath, signal)}
       onLoadFileIndex={(surfaceOwnerKey, signal) => client.listTaskWorkspaceMentionFileIndex(surfaceOwnerKey, signal)}
       onSelect={insertWorkspaceMention} />
+    <MobileCatalogMentionSheet visible={catalogMentionsVisible && catalogMentionControls !== undefined}
+      controls={catalogMentionControls} busy={state.busy} colors={colors}
+      onClose={() => setCatalogMentionsVisible(false)}
+      onLoad={(surfaceOwnerKey, signal) => client.listTaskCatalogMentionCatalog(surfaceOwnerKey, signal)}
+      onSelect={insertCatalogMention} />
     <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}
       onClosed={() => {

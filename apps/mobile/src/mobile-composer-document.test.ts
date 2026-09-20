@@ -4,6 +4,7 @@ import {
   InputContentSchema,
   InputMentionRangeSchema,
   InputPartSchema,
+  ResourceMentionSchema,
   SessionMentionSchema,
   WorkspaceLineRangeSchema,
   WorkspaceMentionSchema
@@ -11,6 +12,8 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   appendPlainTextToMobileComposer,
+  insertMobileArtifactMention,
+  insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   mobileComposerInput,
@@ -143,6 +146,81 @@ describe("mobile structured composer document", () => {
     expect(() => invalid({ directory: false, lineRange: { startLine: 1, endLine: 0x1_0000_0000 } })).toThrow(/one-based/u);
   });
 
+  it("serializes exact Resource and source-task Artifact authorities for equal display labels", () => {
+    const resource = insertMobileResourceMention(
+      plainTextMobileComposerDraft("Use "),
+      { start: 4, end: 4 },
+      {
+        resourceId: "resource-one",
+        displayText: "Release",
+        discoveredRevision: "sha256:resource-one",
+        resourceVersion: "7",
+        runtimeGeneration: "9"
+      },
+      "resource-occurrence"
+    );
+    const artifact = insertMobileArtifactMention(
+      resource.draft,
+      resource.selection,
+      { artifactId: "artifact-one", sourceSessionId: "source-task", displayText: "Release" },
+      "artifact-occurrence"
+    );
+
+    expect(artifact.draft.text).toBe("Use @Release @Release");
+    expect(artifact.draft.mentions).toEqual([
+      {
+        kind: "resource", mentionId: "resource-occurrence", resourceId: "resource-one", displayText: "Release",
+        discoveredRevision: "sha256:resource-one", resourceVersion: "7", runtimeGeneration: "9", start: 4, end: 12
+      },
+      {
+        kind: "artifact", mentionId: "artifact-occurrence", artifactId: "artifact-one", sourceSessionId: "source-task",
+        displayText: "Release", start: 13, end: 21
+      }
+    ]);
+    expect(mobileComposerInput(artifact.draft)).toMatchObject({
+      parts: [
+        { content: { case: "text", value: artifact.draft.text } },
+        { content: { case: "resourceMention", value: {
+          resourceId: "resource-one", displayText: "Release", discoveredRevision: "sha256:resource-one",
+          resourceVersion: 7n, runtimeGeneration: 9n
+        } } },
+        { content: { case: "artifactMention", value: {
+          artifactId: "artifact-one", sourceSessionId: "source-task", displayText: "Release"
+        } } }
+      ],
+      mentionRanges: [
+        { start: 4, end: 12, mentionIndex: 0 },
+        { start: 13, end: 21, mentionIndex: 1 }
+      ]
+    });
+  });
+
+  it("rejects incomplete, non-canonical, and out-of-range catalog authorities", () => {
+    const resource = (overrides: Record<string, unknown> = {}) => normalizeMobileComposerDraft({
+      text: "@Resource",
+      mentions: [{
+        kind: "resource", mentionId: "mention", resourceId: "resource", displayText: "Resource",
+        discoveredRevision: "revision", resourceVersion: "1", runtimeGeneration: "2", start: 0, end: 9,
+        ...overrides
+      }]
+    });
+    const artifact = (overrides: Record<string, unknown> = {}) => normalizeMobileComposerDraft({
+      text: "@Artifact",
+      mentions: [{
+        kind: "artifact", mentionId: "mention", artifactId: "artifact", sourceSessionId: "source",
+        displayText: "Artifact", start: 0, end: 9, ...overrides
+      }]
+    });
+
+    expect(() => resource({ discoveredRevision: "" })).toThrow(/resource revision/u);
+    expect(() => resource({ resourceVersion: "0" })).toThrow(/resource version/u);
+    expect(() => resource({ runtimeGeneration: "01" })).toThrow(/runtime generation/u);
+    expect(() => resource({ resourceVersion: "18446744073709551616" })).toThrow(/resource version/u);
+    expect(() => resource({ resourceId: " resource" })).toThrow(/resource identity/u);
+    expect(() => artifact({ sourceSessionId: "" })).toThrow(/source task/u);
+    expect(() => artifact({ artifactId: "artifact\n" })).toThrow(/Artifact identity/u);
+  });
+
   it("reconciles emoji substitutions without splitting a UTF-16 surrogate pair", () => {
     const changed = reconcileMobileComposerText(plainTextMobileComposerDraft("A 👋 B"), "A 👊 B");
 
@@ -235,5 +313,28 @@ describe("mobile structured composer document", () => {
       mentionRanges: workspace.mentionRanges
     });
     expect(mobileInputSummary(invalidWorkspace)).toBe("Inspect @main.ts:7–12\n[Invalid reference metadata]");
+
+    const invalidResource = create(InputContentSchema, {
+      parts: [
+        create(InputPartSchema, { content: { case: "text", value: "Use @Resource" } }),
+        create(InputPartSchema, { content: { case: "resourceMention", value: create(ResourceMentionSchema, {
+          resourceId: "resource", displayText: "Resource", discoveredRevision: "", resourceVersion: 0n,
+          runtimeGeneration: 0n
+        }) } })
+      ],
+      mentionRanges: [create(InputMentionRangeSchema, { start: 4, end: 13, mentionIndex: 0 })]
+    });
+    expect(mobileInputSummary(invalidResource)).toBe("Use @Resource\n[Invalid reference metadata]");
+
+    const invalidArtifact = create(InputContentSchema, {
+      parts: [
+        create(InputPartSchema, { content: { case: "text", value: "Use @Artifact" } }),
+        create(InputPartSchema, { content: { case: "artifactMention", value: create(ArtifactMentionSchema, {
+          artifactId: "artifact", sourceSessionId: "", displayText: "Artifact"
+        }) } })
+      ],
+      mentionRanges: [create(InputMentionRangeSchema, { start: 4, end: 13, mentionIndex: 0 })]
+    });
+    expect(mobileInputSummary(invalidArtifact)).toBe("Use @Artifact\n[Invalid reference metadata]");
   });
 });

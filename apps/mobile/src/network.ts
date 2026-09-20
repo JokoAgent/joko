@@ -1,13 +1,15 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
-  ArtifactService, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState, SessionService, TargetService,
+  ArtifactKind, ArtifactService, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
+  ResourceKind, SessionService, TargetService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
   type Artifact, type BlobRef, type BlobTransferTicket, type Connection, type Device, type DiscoveredNodeRecord,
   type Event, type EventCursor, type FilePreview, type FileRevision, type Operation, type OperationMutation,
-  type NativeSessionTree, type SessionMessageSearchMatch, type Snapshot, type Target, type WorkspaceEntry, type WorkspaceFileChange,
+  type NativeSessionTree, type SessionMessageSearchMatch, type SessionResource, type Snapshot, type Target,
+  type WorkspaceEntry, type WorkspaceFileChange,
   type WorkspaceSearchMatch
 } from "@joko/contracts";
 import {
@@ -54,6 +56,8 @@ export interface MobileNetwork {
   watchWorkspace(credential: PairedCredential, workspaceId: string, signal: AbortSignal): AsyncIterable<WorkspaceFileChange>;
   readWorkspaceFile(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<FilePreview>;
   listSessionArtifacts(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
+  listSessionResources(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly SessionResource[]>;
+  listArtifactReferenceCatalog(credential: PairedCredential, sessionId: string, generation: bigint, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
   prepareTarget(credential: PairedCredential, target: Target, signal?: AbortSignal): Promise<void>;
   submit(credential: PairedCredential, operationId: string, mutation: OperationMutation, signal?: AbortSignal): Promise<Operation>;
@@ -235,6 +239,69 @@ export async function collectArtifactPages(
   return { artifacts: pages.values, revision: pages.revision };
 }
 
+export function assertSessionResourceCatalog(
+  sessionId: string,
+  resources: readonly SessionResource[]
+): readonly SessionResource[] {
+  if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its Resource catalog.");
+  const ids = new Set<string>();
+  for (const resource of resources) {
+    if (resource.sessionId !== sessionId
+      || !validCatalogIdentity(resource.resourceId)
+      || ids.has(resource.resourceId)
+      || !validCatalogLabel(resource.name)
+      || !validCatalogIdentity(resource.discoveredRevision)
+      || resource.resourceVersion < 1n
+      || resource.runtimeGeneration < 1n
+      || ![ResourceKind.EXTENSION, ResourceKind.SKILL, ResourceKind.PROMPT_TEMPLATE, ResourceKind.PACKAGE].includes(resource.kind)) {
+      throw new Error("The Joko node returned an invalid task Resource catalog.");
+    }
+    ids.add(resource.resourceId);
+  }
+  return resources;
+}
+
+export async function collectArtifactReferencePages(
+  readPage: (pageToken: string) => Promise<ArtifactPage>,
+  now = Date.now()
+): Promise<ArtifactCatalogSnapshot> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const pages = await collectStablePages(readPage, "Artifact reference catalog", (page) => page.artifacts);
+      const identities = new Set<string>();
+      const artifacts: Artifact[] = [];
+      for (const artifact of pages.values) {
+        const identity = `${artifact.sessionId}\u0000${artifact.artifactId}`;
+        const blob = artifact.blob;
+        const createdAt = safeCatalogTimestamp(artifact.createdAt);
+        const expiresAt = artifact.expiresAt === undefined ? undefined : safeCatalogTimestamp(artifact.expiresAt);
+        if (!validCatalogIdentity(artifact.sessionId, 1_024)
+          || !validCatalogIdentity(artifact.artifactId)
+          || identities.has(identity)
+          || !artifactReferenceKind(artifact.kind)
+          || !blob
+          || !validCatalogIdentity(blob.blobId)
+          || !/^[a-f0-9]{64}$/u.test(blob.sha256Hex)
+          || blob.byteSize < 0n || blob.byteSize > BigInt(Number.MAX_SAFE_INTEGER)
+          || !validCatalogLabel(blob.mediaType)
+          || !validCatalogLabel(artifact.title || blob.fileName)
+          || createdAt === undefined
+          || artifact.expiresAt !== undefined && expiresAt === undefined) {
+          throw new Error("The Joko node returned an invalid Artifact reference catalog identity.");
+        }
+        identities.add(identity);
+        if (expiresAt === undefined || expiresAt > now) artifacts.push(artifact);
+      }
+      return { artifacts, revision: pages.revision };
+    } catch (error) {
+      const drift = error instanceof Error && error.message === "Artifact reference catalog changed while paging.";
+      if (attempt === 0 && drift) continue;
+      throw error;
+    }
+  }
+  throw new Error("The Artifact reference catalog changed repeatedly while it was loading.");
+}
+
 export function assertWorkspaceFilePreview(
   workspaceId: string,
   relativePath: string,
@@ -379,6 +446,31 @@ function responseRevision(revision: { readonly etag: string; readonly value: big
   const value = revision?.etag || revision?.value.toString(10) || "";
   if (!value) throw new Error("The Joko node returned an unfenced result.");
   return value;
+}
+
+function validCatalogIdentity(value: unknown, maximum = 4_096): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum && value === value.trim()
+    && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
+}
+
+function validCatalogLabel(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= 4_096
+    && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(value);
+}
+
+function artifactReferenceKind(value: ArtifactKind): boolean {
+  return value === ArtifactKind.FILE || value === ArtifactKind.IMAGE || value === ArtifactKind.EXPORT
+    || value === ArtifactKind.TOOL_RESULT || value === ArtifactKind.DIAGNOSTICS || value === ArtifactKind.DIFF;
+}
+
+function safeCatalogTimestamp(value: {
+  readonly seconds: bigint;
+  readonly nanos: number;
+} | undefined): number | undefined {
+  if (value === undefined || value.seconds < 0n || value.seconds > BigInt(Math.floor(Number.MAX_SAFE_INTEGER / 1_000))
+    || !Number.isSafeInteger(value.nanos) || value.nanos < 0 || value.nanos > 999_999_999) return undefined;
+  const milliseconds = Number(value.seconds) * 1_000 + Math.floor(value.nanos / 1_000_000);
+  return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
 }
 
 export function normalizeNodeOrigin(value: string): string {
@@ -629,6 +721,32 @@ export const mobileNetwork: MobileNetwork = {
         page: { pageSize: WORKSPACE_PAGE_SIZE, pageToken }
       }, options(signal));
       if (!response.page) throw new Error("The Joko node did not return Artifact page metadata.");
+      return {
+        artifacts: response.artifacts,
+        nextPageToken: response.page.nextPageToken,
+        totalSize: response.page.totalSize,
+        revision: responseRevision(response.revision)
+      };
+    });
+  },
+  async listSessionResources(credential, sessionId, signal) {
+    if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its Resource catalog.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .listSessionResources({ sessionId }, options(signal));
+    return assertSessionResourceCatalog(sessionId, response.resources);
+  },
+  async listArtifactReferenceCatalog(credential, sessionId, generation, signal) {
+    if (!validCatalogIdentity(sessionId, 1_024) || generation < 1n || generation > 0xffff_ffff_ffff_ffffn) {
+      throw new Error("A current task generation is required for its Artifact reference catalog.");
+    }
+    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    return collectArtifactReferencePages(async (pageToken) => {
+      const response = await client.listArtifacts({
+        referenceTargetSessionId: sessionId,
+        referenceTargetGeneration: generation,
+        page: { pageSize: WORKSPACE_PAGE_SIZE, pageToken }
+      }, options(signal));
+      if (!response.page) throw new Error("The Joko node did not return Artifact reference page metadata.");
       return {
         artifacts: response.artifacts,
         nextPageToken: response.page.nextPageToken,

@@ -7,7 +7,9 @@ import {
   FileKind,
   FilePreviewSchema,
   FileRevisionSchema,
+  ResourceKind,
   SessionMessageSearchMatchSchema,
+  SessionResourceSchema,
   TransferDirection,
   WorkspaceEntrySchema,
   WorkspaceSearchMatchSchema
@@ -15,8 +17,10 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
+  assertSessionResourceCatalog,
   assertWorkspaceFilePreview,
   collectArtifactPages,
+  collectArtifactReferencePages,
   collectSessionMessageSearchPages,
   collectWorkspaceDirectoryPages,
   collectWorkspaceSearchPages,
@@ -116,6 +120,57 @@ describe("mobile Workspace and Artifact paging", () => {
     }))).rejects.toThrow(/invalid Artifact catalog/);
   });
 
+  it("accepts only exact unique live-task Resource catalog identities", () => {
+    const resource = create(SessionResourceSchema, {
+      sessionId: "session", resourceId: "resource", kind: ResourceKind.SKILL, name: "Skill", version: "1.0.0",
+      discoveredRevision: "sha256:resource", resourceVersion: 7n, runtimeGeneration: 9n
+    });
+    expect(assertSessionResourceCatalog("session", [resource])).toEqual([resource]);
+    expect(() => assertSessionResourceCatalog("other", [resource])).toThrow(/invalid task Resource catalog/);
+    expect(() => assertSessionResourceCatalog("session", [resource, resource])).toThrow(/invalid task Resource catalog/);
+    expect(() => assertSessionResourceCatalog("session", [create(SessionResourceSchema, {
+      ...resource, discoveredRevision: " revision"
+    })])).toThrow(/invalid task Resource catalog/);
+    expect(() => assertSessionResourceCatalog("session", [create(SessionResourceSchema, {
+      ...resource, kind: ResourceKind.THEME
+    })])).toThrow(/invalid task Resource catalog/);
+  });
+
+  it("collects a stable cross-task Artifact reference catalog and filters expired entries", async () => {
+    const active = artifactReference("active", "source-one", { seconds: 100n });
+    const expired = artifactReference("expired", "source-two", { seconds: 9n });
+    const result = await collectArtifactReferencePages(async () => ({
+      artifacts: [active, expired], nextPageToken: "", totalSize: 2n, revision: "references-4"
+    }), 10_000);
+
+    expect(result).toEqual({ artifacts: [active], revision: "references-4" });
+  });
+
+  it("retries Artifact reference revision drift once and rejects cycles and duplicate exact identities", async () => {
+    const first = artifactReference("first", "source");
+    const second = artifactReference("second", "source");
+    let attempt = 0;
+    const readPage = vi.fn(async (token: string) => {
+      if (token === "") {
+        attempt += 1;
+        return { artifacts: [first], nextPageToken: "next", totalSize: 2n, revision: `revision-${attempt}` };
+      }
+      return { artifacts: [second], nextPageToken: "", totalSize: 2n,
+        revision: attempt === 1 ? "drifted" : `revision-${attempt}` };
+    });
+    await expect(collectArtifactReferencePages(readPage)).resolves.toEqual({
+      artifacts: [first, second], revision: "revision-2"
+    });
+    expect(readPage.mock.calls).toEqual([[""], ["next"], [""], ["next"]]);
+
+    await expect(collectArtifactReferencePages(async () => ({
+      artifacts: [first], nextPageToken: "repeat", totalSize: 3n, revision: "stable"
+    }))).rejects.toThrow(/cyclic Artifact reference catalog page token/);
+    await expect(collectArtifactReferencePages(async () => ({
+      artifacts: [first, first], nextPageToken: "", totalSize: 2n, revision: "stable"
+    }))).rejects.toThrow(/invalid Artifact reference catalog identity/);
+  });
+
   it("requires the response to match every field of the observed FileRevision", () => {
     const revision = create(FileRevisionSchema, {
       opaqueRevision: "file-9", sha256Hex: "a".repeat(64), byteSize: 4n,
@@ -159,6 +214,28 @@ describe("mobile Workspace and Artifact paging", () => {
     }), upgraded)).toThrow(/mismatched workspace file preview/);
   });
 });
+
+function artifactReference(
+  artifactId: string,
+  sessionId: string,
+  expiresAt?: { readonly seconds: bigint; readonly nanos?: number }
+) {
+  return create(ArtifactSchema, {
+    artifactId,
+    sessionId,
+    kind: ArtifactKind.TOOL_RESULT,
+    title: `${artifactId}.txt`,
+    blob: create(BlobRefSchema, {
+      blobId: `blob-${artifactId}`,
+      fileName: `${artifactId}.txt`,
+      mediaType: "text/plain",
+      byteSize: 4n,
+      sha256Hex: "a".repeat(64)
+    }),
+    createdAt: { seconds: 1n },
+    ...(expiresAt === undefined ? {} : { expiresAt })
+  });
+}
 
 describe("authenticated mobile Blob downloads", () => {
   const hash = "b".repeat(64);

@@ -1,6 +1,6 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
-  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema,
+  ArtifactKind, ArtifactSchema, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
@@ -10,7 +10,8 @@ import {
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema,
-  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind,
+  QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind,
+  SessionResourceSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
   TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
@@ -26,6 +27,8 @@ import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import { timelineRows } from "./timeline";
 import {
+  insertMobileArtifactMention,
+  insertMobileResourceMention,
   insertMobileSessionMention,
   insertMobileWorkspaceMention,
   mobileComposerInput,
@@ -148,6 +151,49 @@ const workspaceMentionDirectory = create(WorkspaceEntrySchema, {
 });
 const workspaceMentionFile = create(WorkspaceEntrySchema, {
   workspaceId: "workspace", relativePath: "src/main.ts", displayName: "main.ts", kind: FileKind.REGULAR
+});
+const catalogMentionSession = create(SessionSchema, {
+  ...snapshot.sessions[0]!,
+  version: create(EntityVersionSchema, {
+    generation: 8n,
+    revision: create(RevisionSchema, { value: 9n, etag: "session-r9" })
+  })
+});
+const catalogMentionSnapshot = create(SnapshotSchema, {
+  ...snapshot,
+  backends: [create(BackendDescriptorSchema, {
+    ...snapshot.backends[0]!,
+    version: "backend-v1",
+    capabilities: create(CapabilityManifestSchema, {
+      schemaVersion: "1",
+      revision: create(RevisionSchema, { value: 4n, etag: "capabilities-r4" }),
+      capabilities: [
+        create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+        create(CapabilitySchema, {
+          name: capabilityNames.inputMention,
+          support: CapabilitySupport.SUPPORTED,
+          options: create(CapabilityOptionsSchema, {
+            kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+              mediaTypes: ["resource", "artifact"]
+            }) }
+          })
+        })
+      ]
+    })
+  })],
+  sessions: [catalogMentionSession, relatedSession]
+});
+const catalogMentionResource = create(SessionResourceSchema, {
+  sessionId: "session", resourceId: "resource-one", kind: ResourceKind.SKILL, name: "Release helper",
+  version: "1.2.3", discoveredRevision: "sha256:resource-one", resourceVersion: 7n, runtimeGeneration: 8n
+});
+const catalogMentionArtifact = create(ArtifactSchema, {
+  artifactId: "artifact-one", sessionId: "related", kind: ArtifactKind.TOOL_RESULT, title: "Release report",
+  blob: create(BlobRefSchema, {
+    blobId: "blob-artifact-one", fileName: "report.txt", mediaType: "text/plain", byteSize: 42n,
+    sha256Hex: "a".repeat(64)
+  }),
+  createdAt: { seconds: 1n }
 });
 const filesSnapshot = create(SnapshotSchema, {
   ...snapshot,
@@ -495,6 +541,8 @@ function fakeNetwork(): MobileNetwork {
     }),
     readWorkspaceFile: vi.fn(async () => { throw new Error("No Workspace file fixture was configured."); }),
     listSessionArtifacts: vi.fn(async () => ({ artifacts: [], revision: "artifacts-1" })),
+    listSessionResources: vi.fn(async () => []),
+    listArtifactReferenceCatalog: vi.fn(async () => ({ artifacts: [], revision: "artifact-references-1" })),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
     prepareTarget: vi.fn(async () => undefined),
     submit: vi.fn(async (_credential, operationId, mutation) => {
@@ -1864,6 +1912,32 @@ describe("native current-task message and Queue actions", () => {
     ).draft;
   };
 
+  const catalogMentionDraft = () => {
+    const text = "Use 😀 ";
+    const resource = insertMobileResourceMention(
+      plainTextMobileComposerDraft(text),
+      { start: text.length, end: text.length },
+      {
+        resourceId: catalogMentionResource.resourceId,
+        displayText: catalogMentionResource.name,
+        discoveredRevision: catalogMentionResource.discoveredRevision,
+        resourceVersion: catalogMentionResource.resourceVersion.toString(10),
+        runtimeGeneration: catalogMentionResource.runtimeGeneration.toString(10)
+      },
+      "resource-occurrence-1"
+    );
+    return insertMobileArtifactMention(
+      resource.draft,
+      resource.selection,
+      {
+        artifactId: catalogMentionArtifact.artifactId,
+        sourceSessionId: catalogMentionArtifact.sessionId,
+        displayText: catalogMentionArtifact.title
+      },
+      "artifact-occurrence-1"
+    ).draft;
+  };
+
   function configureWorkspaceMentionDirectories(network: MobileNetwork): void {
     vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, workspaceId, parentPath) => ({
       entries: workspaceId !== "workspace" ? []
@@ -1874,6 +1948,13 @@ describe("native current-task message and Queue actions", () => {
     }));
     vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({
       paths: ["src/main.ts"], revision: "index-r1", truncated: false
+    });
+  }
+
+  function configureCatalogMentions(network: MobileNetwork): void {
+    vi.mocked(network.listSessionResources).mockResolvedValue([catalogMentionResource]);
+    vi.mocked(network.listArtifactReferenceCatalog).mockResolvedValue({
+      artifacts: [catalogMentionArtifact], revision: "artifact-references-r1"
     });
   }
 
@@ -2172,6 +2253,197 @@ describe("native current-task message and Queue actions", () => {
     vi.mocked(network.readSession).mockResolvedValue(changed);
     await app.refresh();
     resolveDirectory({ entries: [workspaceMentionDirectory], revision: "late-r1" });
+
+    await expect(loading).rejects.toThrow(/owner changed/u);
+  });
+
+  it("loads Resource and Artifact candidates only from their typed authoritative catalogs", async () => {
+    const network = projectedNetwork(catalogMentionSnapshot);
+    configureCatalogMentions(network);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskCatalogMentionControls()!;
+
+    await expect(app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey)).resolves.toMatchObject({
+      resources: { items: [{
+        kind: "resource", resourceId: "resource-one", discoveredRevision: "sha256:resource-one",
+        resourceVersion: "7", runtimeGeneration: "8"
+      }] },
+      artifacts: { revision: "artifact-references-r1", items: [{
+        kind: "artifact", artifactId: "artifact-one", sourceSessionId: "related",
+        sourceDisplayText: "Earlier task"
+      }] }
+    });
+    expect(network.listSessionResources).toHaveBeenCalledWith(credential, "session", undefined);
+    expect(network.listArtifactReferenceCatalog).toHaveBeenCalledWith(credential, "session", 8n, undefined);
+
+    const resourceOnly = create(SnapshotSchema, {
+      ...catalogMentionSnapshot,
+      backends: [create(BackendDescriptorSchema, {
+        ...catalogMentionSnapshot.backends[0]!,
+        capabilities: create(CapabilityManifestSchema, {
+          ...catalogMentionSnapshot.backends[0]!.capabilities!,
+          capabilities: [
+            create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }),
+            create(CapabilitySchema, {
+              name: capabilityNames.inputMention,
+              support: CapabilitySupport.SUPPORTED,
+              options: create(CapabilityOptionsSchema, {
+                kind: { case: "input", value: create(InputCapabilityOptionsSchema, { mediaTypes: ["resource"] }) }
+              })
+            })
+          ]
+        })
+      })]
+    });
+    const resourceNetwork = projectedNetwork(resourceOnly);
+    configureCatalogMentions(resourceNetwork);
+    const resourceApp = client(resourceNetwork, memoryStorage(credential).storage);
+    await resourceApp.start();
+    const resourceControls = resourceApp.taskCatalogMentionControls()!;
+    await expect(resourceApp.listTaskCatalogMentionCatalog(resourceControls.surfaceOwnerKey)).resolves.toMatchObject({
+      resources: { items: [{ resourceId: "resource-one" }] }
+    });
+    expect(resourceNetwork.listArtifactReferenceCatalog).not.toHaveBeenCalled();
+  });
+
+  it("re-reads the exact catalog before selection and rejects retired authorities", async () => {
+    const network = projectedNetwork(catalogMentionSnapshot);
+    configureCatalogMentions(network);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskCatalogMentionControls()!;
+    const catalog = await app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey);
+    const resource = catalog.resources!.items[0]!;
+    const artifact = catalog.artifacts!.items[0]!;
+
+    await expect(app.validateTaskCatalogMentionCandidate(controls.surfaceOwnerKey, resource)).resolves.toMatchObject({
+      resourceId: "resource-one", resourceVersion: "7"
+    });
+    await expect(app.validateTaskCatalogMentionCandidate(controls.surfaceOwnerKey, artifact)).resolves.toMatchObject({
+      artifactId: "artifact-one", sourceSessionId: "related"
+    });
+
+    vi.mocked(network.listSessionResources).mockResolvedValueOnce([create(SessionResourceSchema, {
+      ...catalogMentionResource, discoveredRevision: "sha256:new", resourceVersion: 8n
+    })]);
+    await expect(app.validateTaskCatalogMentionCandidate(controls.surfaceOwnerKey, resource))
+      .rejects.toThrow(/same runtime identity/u);
+    vi.mocked(network.listArtifactReferenceCatalog).mockResolvedValueOnce({
+      artifacts: [], revision: "artifact-references-r2"
+    });
+    await expect(app.validateTaskCatalogMentionCandidate(controls.surfaceOwnerKey, artifact))
+      .rejects.toThrow(/original task/u);
+  });
+
+  it("sends exact Resource and source-task Artifact wire identities with body-free receipts", async () => {
+    const network = projectedNetwork(catalogMentionSnapshot);
+    configureCatalogMentions(network);
+    const saved = memoryStorage(credential);
+    const drafts = memoryDraftStores();
+    const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = catalogMentionDraft();
+
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(vi.mocked(network.listSessionResources).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[0]!);
+    expect(vi.mocked(network.listArtifactReferenceCatalog).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[0]!);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      payload: { case: "sendInput", value: {
+        sessionId: "session",
+        input: {
+          parts: [
+            { content: { case: "text", value: draft.text } },
+            { content: { case: "resourceMention", value: {
+              resourceId: "resource-one", displayText: "Release helper", discoveredRevision: "sha256:resource-one",
+              resourceVersion: 7n, runtimeGeneration: 8n
+            } } },
+            { content: { case: "artifactMention", value: {
+              artifactId: "artifact-one", sourceSessionId: "related", displayText: "Release report"
+            } } }
+          ],
+          mentionRanges: [
+            { start: draft.mentions[0]!.start, end: draft.mentions[0]!.end, mentionIndex: 0 },
+            { start: draft.mentions[1]!.start, end: draft.mentions[1]!.end, mentionIndex: 1 }
+          ]
+        }
+      } }
+    });
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    expect(JSON.stringify(saved.pending())).not.toContain(draft.text);
+    expect(JSON.stringify(saved.pending())).not.toContain("resource-one");
+    expect(JSON.stringify(saved.pending())).not.toContain("artifact-one");
+  });
+
+  it("retains catalog-reference drafts for stale catalogs, rejected sends, and unknown receipts", async () => {
+    for (const outcome of ["stale", "rejected", "unknown"] as const) {
+      const network = projectedNetwork(catalogMentionSnapshot);
+      configureCatalogMentions(network);
+      const saved = memoryStorage(credential);
+      const drafts = memoryDraftStores();
+      if (outcome === "stale") {
+        vi.mocked(network.listSessionResources).mockResolvedValueOnce([create(SessionResourceSchema, {
+          ...catalogMentionResource, resourceVersion: 8n
+        })]);
+      } else if (outcome === "rejected") {
+        vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+          operationId: "mobile-id-1", connectionId: credential.connectionId, state: OperationState.CONFLICT,
+          error: { code: "GENERATION_CONFLICT", message: "The task runtime changed." }
+        }));
+      } else {
+        vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+      }
+      const app = client(network, saved.storage, undefined, undefined, ids(), undefined, drafts);
+      await app.start();
+      const draft = catalogMentionDraft();
+
+      if (outcome === "stale") await expect(app.send(draft)).rejects.toThrow(/same runtime identity/u);
+      else await expect(app.send(draft)).resolves.toBe(false);
+
+      expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+      if (outcome === "stale") expect(network.submit).not.toHaveBeenCalled();
+      expect(JSON.stringify(saved.pending())).not.toContain(draft.text);
+      expect(JSON.stringify(saved.pending())).not.toContain("resource-one");
+      expect(JSON.stringify(saved.pending())).not.toContain("artifact-one");
+      if (outcome === "unknown") expect(saved.pending()).toMatchObject([{ kind: "send", state: "unknown" }]);
+    }
+  });
+
+  it("retires a late catalog listing when an Artifact source authority changes", async () => {
+    const network = projectedNetwork(catalogMentionSnapshot);
+    let resolveResources!: (value: readonly (typeof catalogMentionResource)[]) => void;
+    vi.mocked(network.listSessionResources).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveResources = resolve;
+    }));
+    vi.mocked(network.listArtifactReferenceCatalog).mockResolvedValue({
+      artifacts: [catalogMentionArtifact], revision: "artifact-references-r1"
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskCatalogMentionControls()!;
+    const loading = app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey);
+    await vi.waitFor(() => expect(resolveResources).toBeDefined());
+
+    const changed = create(SnapshotSchema, {
+      ...catalogMentionSnapshot,
+      sessions: catalogMentionSnapshot.sessions.map((session) => session.sessionId === "related"
+        ? create(SessionSchema, {
+            ...session,
+            state: SessionState.CLOSED,
+            version: create(EntityVersionSchema, {
+              ...session.version!,
+              revision: create(RevisionSchema, { value: 8n, etag: "related-r8" })
+            })
+          })
+        : session)
+    });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: changed });
+    vi.mocked(network.readSession).mockResolvedValue(changed);
+    await app.refresh();
+    resolveResources([catalogMentionResource]);
 
     await expect(loading).rejects.toThrow(/owner changed/u);
   });

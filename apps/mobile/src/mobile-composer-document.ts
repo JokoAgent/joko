@@ -1,8 +1,10 @@
 import { create } from "@bufbuild/protobuf";
 import {
+  ArtifactMentionSchema,
   InputContentSchema,
   InputMentionRangeSchema,
   InputPartSchema,
+  ResourceMentionSchema,
   SessionMentionSchema,
   WorkspaceLineRangeSchema,
   WorkspaceMentionSchema,
@@ -36,7 +38,32 @@ export interface MobileComposerWorkspaceMention {
   readonly end: number;
 }
 
-export type MobileComposerMention = MobileComposerSessionMention | MobileComposerWorkspaceMention;
+export interface MobileComposerResourceMention {
+  readonly kind: "resource";
+  readonly mentionId: string;
+  readonly resourceId: string;
+  readonly displayText: string;
+  readonly discoveredRevision: string;
+  readonly resourceVersion: string;
+  readonly runtimeGeneration: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+export interface MobileComposerArtifactMention {
+  readonly kind: "artifact";
+  readonly mentionId: string;
+  readonly artifactId: string;
+  readonly sourceSessionId: string;
+  readonly displayText: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+export type MobileComposerMention = MobileComposerSessionMention
+  | MobileComposerWorkspaceMention
+  | MobileComposerResourceMention
+  | MobileComposerArtifactMention;
 
 export interface MobileComposerDraft {
   readonly text: string;
@@ -57,6 +84,7 @@ const maximumDraftCharacters = 1_000_000;
 const maximumSessionMentions = 8;
 const maximumDisplayCharacters = 256;
 const maximumLineNumber = 0xffff_ffff;
+const maximumUint64 = 18_446_744_073_709_551_615n;
 
 export function emptyMobileComposerDraft(): MobileComposerDraft {
   return { text: "", mentions: [] };
@@ -79,7 +107,8 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   const mentionIds = new Set<string>();
   let previousEnd = 0;
   const mentions = value.mentions.map((candidate) => {
-    if (!candidate || typeof candidate !== "object" || (candidate.kind !== "session" && candidate.kind !== "workspace")) {
+    if (!candidate || typeof candidate !== "object"
+      || !["session", "workspace", "resource", "artifact"].includes(candidate.kind)) {
       throw new Error("The local Joko task reference is invalid.");
     }
     assertIdentity(candidate.mentionId, "reference occurrence");
@@ -88,7 +117,11 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     const displayText = normalizeDisplayText(candidate.displayText);
     const normalized = candidate.kind === "session"
       ? normalizeSessionMention(candidate, displayText)
-      : normalizeWorkspaceMention(candidate, displayText);
+      : candidate.kind === "workspace"
+        ? normalizeWorkspaceMention(candidate, displayText)
+        : candidate.kind === "resource"
+          ? normalizeResourceMention(candidate, displayText)
+          : normalizeArtifactMention(candidate, displayText);
     if (!Number.isSafeInteger(candidate.start) || !Number.isSafeInteger(candidate.end)
       || candidate.start < previousEnd || candidate.start < 0 || candidate.end <= candidate.start
       || candidate.end > value.text.length || !isUtf16Boundary(value.text, candidate.start)
@@ -125,11 +158,7 @@ export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: Mobi
       const candidate = second.mentions[index];
       return candidate !== undefined && mention.kind === candidate.kind && mention.mentionId === candidate.mentionId
         && mention.displayText === candidate.displayText && mention.start === candidate.start && mention.end === candidate.end
-        && (mention.kind === "session"
-          ? candidate.kind === "session" && mention.sessionId === candidate.sessionId
-          : candidate.kind === "workspace" && mention.workspaceId === candidate.workspaceId
-            && mention.relativePath === candidate.relativePath && mention.directory === candidate.directory
-            && sameLineRange(mention.lineRange, candidate.lineRange));
+        && sameMentionAuthority(mention, candidate);
     });
 }
 
@@ -225,6 +254,46 @@ export function insertMobileWorkspaceMention(
   return insertMobileComposerMention(current, range, { ...normalized, mentionId, start: 0, end: 0 });
 }
 
+export function insertMobileResourceMention(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  candidate: {
+    readonly resourceId: string;
+    readonly displayText: string;
+    readonly discoveredRevision: string;
+    readonly resourceVersion: string;
+    readonly runtimeGeneration: string;
+  },
+  mentionId: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  assertIdentity(mentionId, "reference occurrence");
+  const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
+  const mention = normalizeResourceMention({
+    kind: "resource", mentionId, ...candidate, start: 0, end: 0
+  }, normalizeDisplayText(candidate.displayText));
+  return insertMobileComposerMention(current, range, { ...mention, mentionId, start: 0, end: 0 });
+}
+
+export function insertMobileArtifactMention(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  candidate: {
+    readonly artifactId: string;
+    readonly sourceSessionId: string;
+    readonly displayText: string;
+  },
+  mentionId: string
+): MobileComposerEditResult {
+  const current = normalizeMobileComposerDraft(draft);
+  assertIdentity(mentionId, "reference occurrence");
+  const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
+  const mention = normalizeArtifactMention({
+    kind: "artifact", mentionId, ...candidate, start: 0, end: 0
+  }, normalizeDisplayText(candidate.displayText));
+  return insertMobileComposerMention(current, range, { ...mention, mentionId, start: 0, end: 0 });
+}
+
 export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addition: string): MobileComposerDraft {
   const current = normalizeMobileComposerDraft(draft);
   if (!addition) return current;
@@ -251,24 +320,7 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   return create(InputContentSchema, {
     parts: [
       create(InputPartSchema, { content: { case: "text", value: exact.text } }),
-      ...exact.mentions.map((mention) => mention.kind === "session"
-        ? create(InputPartSchema, {
-            content: { case: "sessionMention", value: create(SessionMentionSchema, {
-              sessionId: mention.sessionId,
-              displayText: mention.displayText
-            }) }
-          })
-        : create(InputPartSchema, {
-            content: { case: "workspaceMention", value: create(WorkspaceMentionSchema, {
-              workspaceId: mention.workspaceId,
-              relativePath: mention.relativePath,
-              displayText: mention.displayText,
-              directory: mention.directory,
-              ...(mention.lineRange === undefined ? {} : {
-                lineRange: create(WorkspaceLineRangeSchema, mention.lineRange)
-              })
-            }) }
-          }))
+      ...exact.mentions.map(mobileComposerInputPart)
     ],
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
       start: mention.start,
@@ -297,8 +349,14 @@ export function mobileInputSummary(input: InputContent | undefined, typedMetadat
       label: part.content.value.displayText || part.content.value.relativePath,
       valid: validInputWorkspaceMention(part.content.value)
     }];
-    if (part.content.case === "resourceMention") return [{ label: part.content.value.displayText || part.content.value.resourceId, valid: true }];
-    if (part.content.case === "artifactMention") return [{ label: part.content.value.displayText || part.content.value.artifactId, valid: true }];
+    if (part.content.case === "resourceMention") return [{
+      label: part.content.value.displayText || part.content.value.resourceId,
+      valid: validInputResourceMention(part.content.value)
+    }];
+    if (part.content.case === "artifactMention") return [{
+      label: part.content.value.displayText || part.content.value.artifactId,
+      valid: validInputArtifactMention(part.content.value)
+    }];
     return [];
   });
   const rangesValid = mentions.every((mention) => mention.valid)
@@ -353,13 +411,13 @@ function insertMobileComposerMention(
 
 function mobileComposerMentionToken(mention: Pick<MobileComposerMention, "kind" | "displayText">
   & Partial<Pick<MobileComposerWorkspaceMention, "directory" | "lineRange">>): string {
-  return mention.kind === "session"
-    ? mobileSessionMentionToken(mention.displayText)
-    : mobileWorkspaceMentionToken({
+  return mention.kind === "workspace"
+    ? mobileWorkspaceMentionToken({
         displayText: mention.displayText,
         directory: mention.directory === true,
         ...(mention.lineRange === undefined ? {} : { lineRange: mention.lineRange })
-      });
+      })
+    : mobileSessionMentionToken(mention.displayText);
 }
 
 function normalizeSessionMention(
@@ -388,6 +446,36 @@ function normalizeWorkspaceMention(
   };
 }
 
+function normalizeResourceMention(
+  mention: MobileComposerResourceMention,
+  displayText: string
+): Omit<MobileComposerResourceMention, "mentionId" | "start" | "end"> {
+  const resourceId = normalizeExactIdentity(mention.resourceId, "resource", 4_096);
+  const discoveredRevision = normalizeExactIdentity(mention.discoveredRevision, "resource revision", 4_096);
+  const resourceVersion = normalizePositiveUint64Text(mention.resourceVersion, "resource version");
+  const runtimeGeneration = normalizePositiveUint64Text(mention.runtimeGeneration, "resource runtime generation");
+  return {
+    kind: "resource",
+    resourceId,
+    displayText,
+    discoveredRevision,
+    resourceVersion,
+    runtimeGeneration
+  };
+}
+
+function normalizeArtifactMention(
+  mention: MobileComposerArtifactMention,
+  displayText: string
+): Omit<MobileComposerArtifactMention, "mentionId" | "start" | "end"> {
+  return {
+    kind: "artifact",
+    artifactId: normalizeExactIdentity(mention.artifactId, "Artifact", 1_024),
+    sourceSessionId: normalizeExactIdentity(mention.sourceSessionId, "Artifact source task", 1_024),
+    displayText
+  };
+}
+
 function normalizeWorkspaceLineRange(
   range: MobileWorkspaceLineRange | undefined,
   directory: boolean
@@ -406,6 +494,66 @@ function sameLineRange(left: MobileWorkspaceLineRange | undefined, right: Mobile
     : left.startLine === right.startLine && left.endLine === right.endLine;
 }
 
+function sameMentionAuthority(left: MobileComposerMention, right: MobileComposerMention): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "session") return right.kind === "session" && left.sessionId === right.sessionId;
+  if (left.kind === "workspace") {
+    return right.kind === "workspace" && left.workspaceId === right.workspaceId
+      && left.relativePath === right.relativePath && left.directory === right.directory
+      && sameLineRange(left.lineRange, right.lineRange);
+  }
+  if (left.kind === "resource") {
+    return right.kind === "resource" && left.resourceId === right.resourceId
+      && left.discoveredRevision === right.discoveredRevision
+      && left.resourceVersion === right.resourceVersion
+      && left.runtimeGeneration === right.runtimeGeneration;
+  }
+  return right.kind === "artifact" && left.artifactId === right.artifactId
+    && left.sourceSessionId === right.sourceSessionId;
+}
+
+function mobileComposerInputPart(mention: MobileComposerMention) {
+  if (mention.kind === "session") {
+    return create(InputPartSchema, {
+      content: { case: "sessionMention", value: create(SessionMentionSchema, {
+        sessionId: mention.sessionId,
+        displayText: mention.displayText
+      }) }
+    });
+  }
+  if (mention.kind === "workspace") {
+    return create(InputPartSchema, {
+      content: { case: "workspaceMention", value: create(WorkspaceMentionSchema, {
+        workspaceId: mention.workspaceId,
+        relativePath: mention.relativePath,
+        displayText: mention.displayText,
+        directory: mention.directory,
+        ...(mention.lineRange === undefined ? {} : {
+          lineRange: create(WorkspaceLineRangeSchema, mention.lineRange)
+        })
+      }) }
+    });
+  }
+  if (mention.kind === "resource") {
+    return create(InputPartSchema, {
+      content: { case: "resourceMention", value: create(ResourceMentionSchema, {
+        resourceId: mention.resourceId,
+        displayText: mention.displayText,
+        discoveredRevision: mention.discoveredRevision,
+        resourceVersion: BigInt(mention.resourceVersion),
+        runtimeGeneration: BigInt(mention.runtimeGeneration)
+      }) }
+    });
+  }
+  return create(InputPartSchema, {
+    content: { case: "artifactMention", value: create(ArtifactMentionSchema, {
+      artifactId: mention.artifactId,
+      sourceSessionId: mention.sourceSessionId,
+      displayText: mention.displayText
+    }) }
+  });
+}
+
 function validInputWorkspaceMention(mention: {
   readonly workspaceId: string;
   readonly relativePath: string;
@@ -416,6 +564,36 @@ function validInputWorkspaceMention(mention: {
     assertIdentity(mention.workspaceId, "workspace");
     canonicalWorkspacePath(mention.relativePath);
     normalizeWorkspaceLineRange(mention.lineRange, mention.directory);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validInputResourceMention(mention: {
+  readonly resourceId: string;
+  readonly discoveredRevision: string;
+  readonly resourceVersion: bigint;
+  readonly runtimeGeneration: bigint;
+}): boolean {
+  try {
+    normalizeExactIdentity(mention.resourceId, "resource", 4_096);
+    normalizeExactIdentity(mention.discoveredRevision, "resource revision", 4_096);
+    normalizePositiveUint64Text(mention.resourceVersion.toString(10), "resource version");
+    normalizePositiveUint64Text(mention.runtimeGeneration.toString(10), "resource runtime generation");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validInputArtifactMention(mention: {
+  readonly artifactId: string;
+  readonly sourceSessionId: string;
+}): boolean {
+  try {
+    normalizeExactIdentity(mention.artifactId, "Artifact", 1_024);
+    normalizeExactIdentity(mention.sourceSessionId, "Artifact source task", 1_024);
     return true;
   } catch {
     return false;
@@ -454,6 +632,22 @@ function normalizeDisplayText(value: string): string {
     throw new Error("The local Joko reference label is invalid.");
   }
   return exact;
+}
+
+function normalizeExactIdentity(value: string, label: string, maximumCharacters: number): string {
+  if (typeof value !== "string" || !value || value !== value.trim() || value.length > maximumCharacters
+    || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
+    throw new Error(`The local Joko ${label} identity is invalid.`);
+  }
+  return value;
+}
+
+function normalizePositiveUint64Text(value: string, label: string): string {
+  if (typeof value !== "string" || value.length > 20 || !/^[1-9][0-9]*$/u.test(value)
+    || BigInt(value) > maximumUint64) {
+    throw new Error(`The local Joko ${label} is invalid.`);
+  }
+  return value;
 }
 
 function assertIdentity(value: string, label: string): void {
