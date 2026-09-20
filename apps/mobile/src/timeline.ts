@@ -6,8 +6,8 @@ import {
   type MobileImageGalleryPageSummary
 } from "./mobile-image-gallery";
 import {
-  mobileTimelinePreviewArtifacts,
-  type MobileTimelinePreviewArtifact
+  mobileTimelineArtifacts,
+  type MobileTimelineArtifact
 } from "./mobile-timeline-artifacts";
 
 export interface TimelineRow {
@@ -24,7 +24,7 @@ export interface TimelineRow {
     readonly text: string;
   };
   readonly images?: readonly MobileImageGalleryPageSummary[];
-  readonly artifacts?: readonly MobileTimelinePreviewArtifact[];
+  readonly artifacts?: readonly MobileTimelineArtifact[];
 }
 
 export function timelineRows(events: readonly Event[]): TimelineRow[] {
@@ -56,8 +56,12 @@ export function timelineRows(events: readonly Event[]): TimelineRow[] {
       case "messageCompleted": {
         const message = kind.value;
         const previous = byId.get(message.messageId);
-        const completedImages = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
-        const artifacts = mobileTimelinePreviewArtifacts(event);
+        const completedGalleryPages = mobileTimelineGalleryPages(event);
+        const completedImages = completedGalleryPages.map(mobileImageGalleryPageSummary);
+        const artifacts = mobileTimelineArtifacts(event).filter((artifact) => !completedGalleryPages.some((page) =>
+          page.source.kind === "timeline" && page.source.contentKind === "block"
+            && page.source.contentIndex === artifact.contentIndex
+        ));
         const images = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
           && previous?.images && previous.images.length > 0
           ? previous.images

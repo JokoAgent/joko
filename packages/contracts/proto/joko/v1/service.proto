@@ -1186,6 +1186,8 @@ message ReadWorkspaceFileRequest {
   uint64 start_byte = 3;
   uint64 maximum_bytes = 4;
   FileRevision expected_revision = 5;
+  // Requests one complete, revision-fenced Blob instead of the default bounded preview.
+  bool require_blob = 6;
 }
 
 message ReadWorkspaceFileResponse {

@@ -27,6 +27,7 @@ import type { MobileDiscovery } from "./connection-discovery";
 import type { MobileHomeStatusFilter } from "./home-navigation";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
+  MOBILE_FILE_SHARE_MAXIMUM_BYTES,
   normalizeNodeOrigin,
   type MobileNetwork, type NodeIdentity, type PairedCredential
 } from "./network";
@@ -254,11 +255,17 @@ import {
   mobileImageOutputMediaType
 } from "./mobile-image-output-format";
 import {
+  isMobileTimelinePreviewArtifact,
+  mobileTimelineArtifactWindowKey,
   mobileTimelinePreviewWindowKey,
+  resolveMobileTimelineArtifact,
   resolveMobileTimelinePreviewArtifact,
+  sameMobileTimelineArtifact,
   sameMobileTimelinePreviewArtifact,
+  type MobileTimelineArtifact,
   type MobileTimelinePreviewArtifact
 } from "./mobile-timeline-artifacts";
+import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 
 export type { MobileStorage, PendingOperation } from "./connection-storage";
 
@@ -397,6 +404,23 @@ interface MobileTimelinePreviewLease {
   model?: MobileModelPreviewLease;
 }
 
+type MobileFileShareLease = {
+  readonly controller: AbortController;
+  readonly profileId: string;
+  readonly sessionId: string;
+  readonly taskAuthorityKey: string;
+  phase: "preparing" | "dispatching";
+} & ({
+  readonly kind: "files";
+  readonly filesEpoch: number;
+  readonly filesAuthorityKey: string;
+  readonly source: MobileFilesComposerSource;
+} | {
+  readonly kind: "timeline";
+  readonly windowKey: string;
+  readonly artifact: MobileTimelineArtifact;
+});
+
 export interface MobileQueueEditLease {
   readonly connectionId: string;
   readonly sessionId: string;
@@ -508,6 +532,7 @@ export class MobileClient {
   #filesPdfPreview?: MobilePdfPreviewLease;
   #filesModelPreview?: MobileModelPreviewLease;
   #timelinePreview?: MobileTimelinePreviewLease;
+  #fileShareLease?: MobileFileShareLease;
   #filesWatchAbort?: AbortController;
   #filesRefreshTimer?: ReturnType<typeof setTimeout>;
   #queueEditLease?: MobileQueueEditLease;
@@ -529,7 +554,8 @@ export class MobileClient {
     private readonly attachmentFiles?: MobileAttachmentFiles,
     private readonly mediaPreviewFiles?: MobileMediaPreviewFiles,
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
-    private readonly modelPreviewFiles?: MobileModelPreviewFiles
+    private readonly modelPreviewFiles?: MobileModelPreviewFiles,
+    private readonly fileShare?: Pick<MobileFileShare, "perform">
   ) {}
 
   get state(): MobileState { return this.#state; }
@@ -563,6 +589,10 @@ export class MobileClient {
       next = { ...next, timelinePreview: undefined };
     }
     this.#state = next;
+    if (this.#fileShareLease?.phase === "preparing"
+      && !this.#fileShareLeaseCurrent(this.#fileShareLease)) {
+      this.#fileShareLease.controller.abort();
+    }
     for (const listener of this.#listeners) listener(this.#state);
   }
 
@@ -575,6 +605,7 @@ export class MobileClient {
     this.#homeSearchEpoch += 1;
     this.#cancelFilesRequests();
     this.#cancelTimelinePreviewLease();
+    this.#cancelPreparingFileShare();
     this.#composerImageEdit = undefined;
     this.#imageGallery = undefined;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
@@ -1938,11 +1969,14 @@ export class MobileClient {
     if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined } });
   }
 
-  async previewTimelineArtifact(selected: MobileTimelinePreviewArtifact): Promise<void> {
+  async previewTimelineArtifact(selected: MobileTimelineArtifact): Promise<void> {
     const credential = this.#ready();
     const taskAuthorityKey = this.#taskAuthorityKey();
     const sessionId = this.#state.selectedId;
     const events = this.#timelineEvents();
+    if (!isMobileTimelinePreviewArtifact(selected)) {
+      throw new Error("This Timeline file does not have an in-app preview.");
+    }
     const source = resolveMobileTimelinePreviewArtifact(events, selected);
     const generation = this.#state.owner?.generation;
     if (!taskAuthorityKey || !sessionId || !generation || !source
@@ -2040,6 +2074,154 @@ export class MobileClient {
   closeTimelinePreview(): void {
     this.#cancelTimelinePreviewLease();
     if (this.#state.timelinePreview) this.#set({ timelinePreview: undefined });
+  }
+
+  async shareFilesItem(
+    source: MobileFilesComposerSource,
+    onProgress?: (progress: MobileFileShareProgress) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    if (!this.fileShare) throw new Error("System file sharing is unavailable on this mobile runtime.");
+    if (this.#fileShareLease) throw new Error("Another file-sharing action is already in progress.");
+    const context = this.#filesContext();
+    const filesEpoch = this.#filesEpoch;
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    if (!taskAuthorityKey || !this.#state.files.open
+      || this.#state.files.authorityKey !== context.key
+      || !filesComposerSourceIsCurrent(this.#state.files, source)) {
+      throw new Error("Select a current file from Files before sharing it.");
+    }
+    const controller = new AbortController();
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const lease: MobileFileShareLease = {
+      kind: "files",
+      controller,
+      profileId: context.credential.profileId,
+      sessionId: context.authority.sessionId,
+      taskAuthorityKey,
+      phase: "preparing",
+      filesEpoch,
+      filesAuthorityKey: context.key,
+      source
+    };
+    this.#fileShareLease = lease;
+    try {
+      const artifact = filesComposerArtifact(source);
+      let blob: BlobRef;
+      let assertRemoteCurrent: () => Promise<void>;
+      if (artifact) {
+        const observedRevision = this.#state.files.artifactsRevision;
+        if (!observedRevision) throw new Error("The current Generated catalog is not revision-fenced.");
+        const current = await this.#revalidateGeneratedShareArtifact(
+          context, artifact, observedRevision, operationSignal
+        );
+        blob = current.blob!;
+        assertRemoteCurrent = async () => {
+          const refreshed = await this.#revalidateGeneratedShareArtifact(
+            context, current, observedRevision, operationSignal
+          );
+          if (!sameFilesComposerArtifact(refreshed, current)) {
+            throw new Error("The selected Generated file changed before system sharing began.");
+          }
+        };
+      } else {
+        const current = await this.#revalidateWorkspaceShareEntry(context, source, operationSignal);
+        const revision = current.revision!;
+        const materialized = await this.network.materializeWorkspaceFileBlob(
+          context.credential,
+          context.authority.workspace.workspaceId,
+          current.relativePath,
+          revision,
+          operationSignal
+        );
+        if (materialized.entry.workspaceId !== current.workspaceId
+          || materialized.entry.relativePath !== current.relativePath
+          || materialized.entry.kind !== FileKind.REGULAR
+          || (normalizeMediaType(materialized.entry.mediaType) || "application/octet-stream")
+            !== (normalizeMediaType(current.mediaType) || "application/octet-stream")
+          || !materialized.entry.revision
+          || !workspaceComposerRevisionMatches(revision, materialized.entry.revision)) {
+          throw new Error("The Workspace file changed while its complete Blob was materialized.");
+        }
+        blob = materialized.blob;
+        assertRemoteCurrent = async () => {
+          const refreshed = await this.#revalidateWorkspaceShareEntry(context, source, operationSignal);
+          if (!sameFilesWorkspaceEntry(refreshed, current)) {
+            throw new Error("The selected Workspace file changed before system sharing began.");
+          }
+        };
+      }
+      this.#assertFileShareLeaseCurrent(lease, operationSignal);
+      const authorized = await this.network.authorizeBlobDownload(context.credential, blob, operationSignal);
+      this.#assertFileShareLeaseCurrent(lease, operationSignal);
+      await this.fileShare.perform({
+        source: authorized,
+        signal: operationSignal,
+        onProgress,
+        assertCurrent: async () => {
+          this.#assertFileShareLeaseCurrent(lease, operationSignal);
+          await assertRemoteCurrent();
+          this.#assertFileShareLeaseCurrent(lease, operationSignal);
+        },
+        onDispatch: () => { lease.phase = "dispatching"; }
+      });
+    } finally {
+      if (this.#fileShareLease === lease) this.#fileShareLease = undefined;
+    }
+  }
+
+  async shareTimelineArtifact(
+    selected: MobileTimelineArtifact,
+    onProgress?: (progress: MobileFileShareProgress) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    if (!this.fileShare) throw new Error("System file sharing is unavailable on this mobile runtime.");
+    if (this.#fileShareLease) throw new Error("Another file-sharing action is already in progress.");
+    const credential = this.#ready();
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    const sessionId = this.#state.selectedId;
+    const events = this.#timelineEvents();
+    const source = resolveMobileTimelineArtifact(events, selected);
+    const generation = this.#state.owner?.generation;
+    if (!taskAuthorityKey || !sessionId || !generation || !source
+      || source.event.identity?.sessionId !== sessionId
+      || source.event.cursor?.generation !== generation) {
+      throw new Error("Select a verified file from the current task Timeline.");
+    }
+    const controller = new AbortController();
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const lease: MobileFileShareLease = {
+      kind: "timeline",
+      controller,
+      profileId: credential.profileId,
+      sessionId,
+      taskAuthorityKey,
+      phase: "preparing",
+      windowKey: mobileTimelineArtifactWindowKey(events),
+      artifact: source.artifact
+    };
+    this.#fileShareLease = lease;
+    try {
+      await this.#revalidateTimelineShareArtifact(credential, lease, source.blob, operationSignal);
+      this.#assertFileShareLeaseCurrent(lease, operationSignal);
+      const authorized = await this.network.authorizeBlobDownload(credential, source.blob, operationSignal);
+      this.#assertFileShareLeaseCurrent(lease, operationSignal);
+      await this.fileShare.perform({
+        source: authorized,
+        signal: operationSignal,
+        onProgress,
+        assertCurrent: async () => {
+          this.#assertFileShareLeaseCurrent(lease, operationSignal);
+          await this.#revalidateTimelineShareArtifact(credential, lease, source.blob, operationSignal);
+          this.#assertFileShareLeaseCurrent(lease, operationSignal);
+        },
+        onDispatch: () => { lease.phase = "dispatching"; }
+      });
+    } finally {
+      if (this.#fileShareLease === lease) this.#fileShareLease = undefined;
+    }
   }
 
   async addFilesItemToComposer(
@@ -6010,6 +6192,150 @@ export class MobileClient {
       && this.#state.files.authorityKey === key && this.#filesAuthorityKey(this.#state) === key;
   }
 
+  #fileShareLeaseCurrent(lease: MobileFileShareLease): boolean {
+    if (this.#fileShareLease !== lease || lease.controller.signal.aborted || this.#disposed
+      || !this.#foreground || this.#credential?.profileId !== lease.profileId
+      || this.#state.selectedId !== lease.sessionId
+      || this.#taskAuthorityKey() !== lease.taskAuthorityKey) return false;
+    if (lease.kind === "files") {
+      return this.#currentFiles(lease.filesEpoch, lease.filesAuthorityKey)
+        && filesComposerSourceIsCurrent(this.#state.files, lease.source);
+    }
+    const events = this.#timelineEvents();
+    if (mobileTimelineArtifactWindowKey(events) !== lease.windowKey) return false;
+    const source = resolveMobileTimelineArtifact(events, lease.artifact);
+    return source !== undefined
+      && source.event.identity?.sessionId === lease.sessionId
+      && source.event.cursor?.generation === this.#state.owner?.generation
+      && sameMobileTimelineArtifact(source.artifact, lease.artifact);
+  }
+
+  #assertFileShareLeaseCurrent(lease: MobileFileShareLease, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    if (!this.#fileShareLeaseCurrent(lease) || lease.phase !== "preparing") {
+      throw new Error("The selected file changed before system sharing began.");
+    }
+  }
+
+  #cancelPreparingFileShare(kind?: MobileFileShareLease["kind"]): void {
+    const lease = this.#fileShareLease;
+    if (lease?.phase === "preparing" && (kind === undefined || lease.kind === kind)) {
+      lease.controller.abort();
+    }
+  }
+
+  async #revalidateWorkspaceShareEntry(
+    context: MobileFilesContext,
+    source: MobileFilesComposerSource,
+    signal: AbortSignal
+  ): Promise<WorkspaceEntry> {
+    this.#assertFilesShareSourceCurrent(context, source, signal);
+    let selectedPath: string;
+    if (source.kind === "workspace-entry") selectedPath = source.entry.relativePath;
+    else {
+      const result = source.kind === "search-result" ? source.result : undefined;
+      if (!result || result.kind === "artifact") {
+        throw new Error("Select a regular Workspace file before sharing it.");
+      }
+      selectedPath = result.kind === "workspace-content" ? result.match.relativePath : result.relativePath;
+    }
+    const path = canonicalWorkspacePath(selectedPath);
+    const directory = await this.network.listWorkspaceDirectory(
+      context.credential,
+      context.authority.workspace.workspaceId,
+      workspaceParentPath(path),
+      signal
+    );
+    this.#assertFilesShareSourceCurrent(context, source, signal);
+    if (!directory.revision) throw new Error("The Joko node returned an unfenced Workspace directory.");
+    const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+    const entry = matches.length === 1 ? matches[0] : undefined;
+    if (!entry?.revision || entry.kind !== FileKind.REGULAR
+      || entry.workspaceId !== context.authority.workspace.workspaceId
+      || entry.revision.byteSize < 0n
+      || entry.revision.byteSize > BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES)) {
+      throw new Error("The selected Workspace file is unavailable or exceeds the mobile sharing limit.");
+    }
+    workspaceEntryRevisionKey(entry.revision);
+    if (source.kind === "workspace-entry" && !sameFilesWorkspaceEntry(entry, source.entry)) {
+      throw new Error("The selected Workspace file changed before it could be shared.");
+    }
+    if (source.kind === "search-result" && source.result.kind === "workspace-name"
+      && !this.#state.files.fileIndex.includes(path)) {
+      throw new Error("The selected Workspace file is no longer in the current file index.");
+    }
+    if (source.kind === "search-result" && source.result.kind === "workspace-content") {
+      const revision = source.result.match.revision;
+      if (!revision || workspaceEntryRevisionKey(revision) !== workspaceEntryRevisionKey(entry.revision)) {
+        throw new Error("The selected Workspace search result changed before it could be shared.");
+      }
+    }
+    return entry;
+  }
+
+  #assertFilesShareSourceCurrent(
+    context: MobileFilesContext,
+    source: MobileFilesComposerSource,
+    signal: AbortSignal
+  ): void {
+    signal.throwIfAborted();
+    const lease = this.#fileShareLease;
+    if (!lease || lease.kind !== "files" || lease.source !== source
+      || !this.#currentFiles(lease.filesEpoch, context.key)
+      || this.#taskAuthorityKey() !== lease.taskAuthorityKey
+      || !filesComposerSourceIsCurrent(this.#state.files, source)) {
+      throw new Error("Files authority changed before system sharing began.");
+    }
+  }
+
+  async #revalidateGeneratedShareArtifact(
+    context: MobileFilesContext,
+    expected: Artifact,
+    observedRevision: string,
+    signal: AbortSignal
+  ): Promise<Artifact> {
+    signal.throwIfAborted();
+    if (expected.sessionId !== context.authority.sessionId || !expected.blob
+      || expected.blob.byteSize < 0n
+      || expected.blob.byteSize > BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES)) {
+      throw new Error("The selected Generated file is unavailable or exceeds the mobile sharing limit.");
+    }
+    const refreshed = await this.network.listSessionArtifacts(
+      context.credential,
+      context.authority.sessionId,
+      signal
+    );
+    signal.throwIfAborted();
+    if (refreshed.revision !== observedRevision) {
+      throw new Error("The Generated catalog changed before system sharing began. Refresh Files and try again.");
+    }
+    const matches = refreshed.artifacts.filter((candidate) => candidate.artifactId === expected.artifactId
+      && candidate.sessionId === expected.sessionId);
+    const current = matches.length === 1 ? matches[0] : undefined;
+    if (!current?.blob || !sameFilesComposerArtifact(current, expected)) {
+      throw new Error("The selected Generated file changed before system sharing began.");
+    }
+    return current;
+  }
+
+  async #revalidateTimelineShareArtifact(
+    credential: PairedCredential,
+    lease: Extract<MobileFileShareLease, { readonly kind: "timeline" }>,
+    expectedBlob: BlobRef,
+    signal: AbortSignal
+  ): Promise<void> {
+    this.#assertFileShareLeaseCurrent(lease, signal);
+    const around = await this.network.readAround(credential, lease.sessionId, lease.artifact.eventId, signal);
+    this.#assertFileShareLeaseCurrent(lease, signal);
+    const source = resolveMobileTimelineArtifact(around, lease.artifact);
+    if (!source || source.event.identity?.sessionId !== lease.sessionId
+      || source.event.cursor?.generation !== this.#state.owner?.generation
+      || !sameMobileTimelineArtifact(source.artifact, lease.artifact)
+      || !sameFilesComposerBlob(source.blob, expectedBlob)) {
+      throw new Error("The selected Timeline file changed before system sharing began.");
+    }
+  }
+
   #assertFilesComposerLease(
     context: MobileFilesContext,
     epoch: number,
@@ -6360,6 +6686,7 @@ export class MobileClient {
 
   #cancelFilesRequests(): void {
     if (this.#imageGallery?.source.kind === "files") this.#imageGallery = undefined;
+    this.#cancelPreparingFileShare("files");
     void this.#releaseFilesBinaryPreviews().catch(() => undefined);
     this.#filesEpoch += 1;
     this.#filesListAbort?.abort();

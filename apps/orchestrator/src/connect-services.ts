@@ -2661,17 +2661,28 @@ export function createConnectServices(application: OrchestratorApplication): Con
     },
     readWorkspaceFile: async (request, context) => {
       authenticate(context);
+      if (request.requireBlob && request.maximumBytes === 0n) {
+        throw invalidArgument("A positive complete-file byte limit is required for Blob materialization.");
+      }
+      if (request.requireBlob && request.startByte !== 0n) {
+        throw invalidArgument("Blob materialization must start at byte zero.");
+      }
       const maximum = safeByteCount(request.maximumBytes, 2 * 1024 * 1024);
       const start = safeByteCount(request.startByte, 0);
-      const preview = await dependencies.workspaceService.preview(request.workspaceId, request.relativePath, start + maximum);
+      const preview = await dependencies.workspaceService.preview(
+        request.workspaceId,
+        request.relativePath,
+        request.requireBlob ? 1 : start + maximum
+      );
       if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== ""
         && request.expectedRevision.opaqueRevision !== preview.entry.revision
         && request.expectedRevision.opaqueRevision !== preview.observedRevision) {
         throw new ConnectError("Workspace file revision changed.", Code.Aborted);
       }
       let materialized: ArtifactRecord | undefined;
-      if (preview.bytes === undefined && preview.text === undefined) {
-        if (preview.entry.size > dependencies.artifactStore.maximumBlobBytes) {
+      if (request.requireBlob || preview.bytes === undefined && preview.text === undefined) {
+        if ((request.requireBlob && preview.entry.size > maximum)
+          || preview.entry.size > dependencies.artifactStore.maximumBlobBytes) {
           throw new ConnectError("Workspace file exceeds the configured Blob download limit.", Code.ResourceExhausted);
         }
         materialized = await dependencies.workspaceService.materializeFile(
@@ -7129,6 +7140,13 @@ async function mapFilePreview(
 ): Promise<contract.FilePreview> {
   let content: contract.FilePreview["content"];
   let byteWindowTruncated = false;
+  const mappedEntry = materialized === undefined
+    ? preview.entry
+    : {
+        ...preview.entry,
+        size: materialized.byteLength,
+        revision: `sha256:${materialized.sha256}:${materialized.byteLength}`
+      };
   if (preview.bytes !== undefined || materialized !== undefined) {
     const record = materialized ?? await artifacts.ingestBytes(preview.bytes!, {
       fileName: basename(preview.entry.path),
@@ -7172,9 +7190,9 @@ async function mapFilePreview(
     };
   }
   return create(contract.FilePreviewSchema, {
-    entry: mapWorkspaceEntry(workspaceId, preview.entry),
+    entry: mapWorkspaceEntry(workspaceId, mappedEntry),
     content,
-    truncated: preview.truncated || byteWindowTruncated
+    truncated: materialized === undefined && (preview.truncated || byteWindowTruncated)
   });
 }
 

@@ -173,6 +173,41 @@ describe("workspace, artifact, and capability boundaries", () => {
     expect(textMatch?.linePreview).toContain(marker);
     expect(textMatch?.revision?.opaqueRevision).not.toBe("");
 
+    const textBytes = Buffer.from(`${marker}\n`, "utf8");
+    const completeText = await paired.clients.workspace.readWorkspaceFile({
+      workspaceId,
+      relativePath: "mobile-search.txt",
+      expectedRevision: textMatch!.revision,
+      maximumBytes: BigInt(textBytes.byteLength),
+      requireBlob: true
+    });
+    expect(completeText.preview).toMatchObject({
+      truncated: false,
+      entry: {
+        workspaceId,
+        relativePath: "mobile-search.txt",
+        mediaType: "text/plain",
+        revision: {
+          opaqueRevision: `sha256:${sha256(textBytes)}:${textBytes.byteLength}`,
+          sha256Hex: sha256(textBytes),
+          byteSize: BigInt(textBytes.byteLength)
+        }
+      }
+    });
+    expect(completeText.preview?.content.case).toBe("blob");
+    if (completeText.preview?.content.case !== "blob") {
+      throw new Error("Complete Workspace text materialization returned no canonical BlobRef.");
+    }
+    const textBlob = completeText.preview.content.value;
+    const textTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: textBlob.blobId });
+    const textDownload = await fetch(`${fixture.baseUrl}${textTicket.ticket!.relativeEndpoint}`, {
+      headers: { authorization: `Bearer ${paired.authKey}` }
+    });
+    expect(textDownload.status).toBe(200);
+    expect(textDownload.headers.get("content-type")).toBe("text/plain");
+    expect(textDownload.headers.get("content-length")).toBe(String(textBytes.byteLength));
+    expect(Buffer.from(await textDownload.arrayBuffer())).toEqual(textBytes);
+
     const imageEntry = entries.find((entry) => entry.relativePath === "mobile-preview.png")!;
     expect(imageEntry.revision?.opaqueRevision).not.toBe("");
     const preview = await paired.clients.workspace.readWorkspaceFile({

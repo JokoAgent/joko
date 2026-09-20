@@ -292,6 +292,116 @@ describe("Connect formal Workspace Files contracts", () => {
     }), context())).rejects.toMatchObject({ code: Code.Aborted });
   });
 
+  it("materializes an exact revision-fenced Blob for a complete Workspace file request", async () => {
+    const bytes = Buffer.from("complete text file", "utf8");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const preview = vi.fn(async () => ({
+      entry: {
+        path: "notes/complete.txt",
+        name: "complete.txt",
+        kind: "file" as const,
+        size: bytes.byteLength,
+        modifiedAt: 12,
+        revision: "meta:complete-text",
+        generated: false
+      },
+      observedRevision: "meta:complete-text",
+      mediaType: "text/plain",
+      text: "c",
+      truncated: true
+    }));
+    const materializeFile = vi.fn(async () => ({
+      id: "blob-complete-text",
+      sha256: digest,
+      byteLength: bytes.byteLength,
+      mimeType: "text/plain",
+      fileName: "complete.txt",
+      storagePath: "artifact-only",
+      createdAt: 1,
+      expiresAt: 301_000
+    }));
+    const services = createConnectServices(application({ workspaces: { preview, materializeFile } }));
+    const response = await services.workspace.readWorkspaceFile(create(contract.ReadWorkspaceFileRequestSchema, {
+      workspaceId: "workspace-files",
+      relativePath: "notes/complete.txt",
+      startByte: 0n,
+      maximumBytes: BigInt(bytes.byteLength),
+      expectedRevision: create(contract.FileRevisionSchema, {
+        opaqueRevision: "meta:complete-text",
+        byteSize: BigInt(bytes.byteLength)
+      }),
+      requireBlob: true
+    }), context());
+
+    expect(preview).toHaveBeenCalledWith("workspace-files", "notes/complete.txt", 1);
+    expect(materializeFile).toHaveBeenCalledWith(
+      "workspace-files",
+      "notes/complete.txt",
+      "meta:complete-text",
+      expect.any(Function),
+      expect.any(AbortSignal)
+    );
+    expect(response.preview).toMatchObject({
+      truncated: false,
+      entry: {
+        relativePath: "notes/complete.txt",
+        mediaType: "text/plain",
+        revision: {
+          opaqueRevision: `sha256:${digest}:${bytes.byteLength}`,
+          sha256Hex: digest,
+          byteSize: BigInt(bytes.byteLength)
+        }
+      },
+      content: {
+        case: "blob",
+        value: {
+          blobId: "blob-complete-text",
+          fileName: "complete.txt",
+          mediaType: "text/plain",
+          byteSize: BigInt(bytes.byteLength),
+          sha256Hex: digest
+        }
+      }
+    });
+  });
+
+  it("rejects invalid or insufficient complete Workspace Blob bounds before materialization", async () => {
+    const materializeFile = vi.fn();
+    const preview = vi.fn(async () => ({
+      entry: {
+        path: "bounded.bin",
+        name: "bounded.bin",
+        kind: "file" as const,
+        size: 9,
+        modifiedAt: 1,
+        revision: "meta:bounded",
+        generated: false
+      },
+      mediaType: "application/octet-stream",
+      truncated: false
+    }));
+    const services = createConnectServices(application({ workspaces: { preview, materializeFile } }));
+    const request = (overrides: { startByte?: bigint; maximumBytes?: bigint }) => create(
+      contract.ReadWorkspaceFileRequestSchema,
+      {
+        workspaceId: "workspace-files",
+        relativePath: "bounded.bin",
+        startByte: overrides.startByte ?? 0n,
+        maximumBytes: overrides.maximumBytes ?? 9n,
+        expectedRevision: create(contract.FileRevisionSchema, { opaqueRevision: "meta:bounded" }),
+        requireBlob: true
+      }
+    );
+
+    await expect(services.workspace.readWorkspaceFile(request({ maximumBytes: 0n }), context()))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(services.workspace.readWorkspaceFile(request({ startByte: 1n }), context()))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(services.workspace.readWorkspaceFile(request({ maximumBytes: 8n }), context()))
+      .rejects.toMatchObject({ code: Code.ResourceExhausted });
+    expect(materializeFile).not.toHaveBeenCalled();
+  });
+
   it("returns typed Artifact refs for raster, PDF, video, and arbitrary binary files", async () => {
     const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
     const pdfBytes = Buffer.from("%PDF-1.7\n", "utf8");

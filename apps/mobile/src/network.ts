@@ -61,11 +61,13 @@ export interface MobileNetwork {
   searchWorkspace(credential: PairedCredential, workspaceId: string, query: string, caseSensitive: boolean, signal?: AbortSignal): Promise<WorkspaceSearchSnapshot>;
   watchWorkspace(credential: PairedCredential, workspaceId: string, signal: AbortSignal): AsyncIterable<WorkspaceFileChange>;
   readWorkspaceFile(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<FilePreview>;
+  materializeWorkspaceFileBlob(credential: PairedCredential, workspaceId: string, relativePath: string, revision: FileRevision, signal?: AbortSignal): Promise<MaterializedWorkspaceBlob>;
   listSessionArtifacts(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   listRuntimeCommands(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly RuntimeCommand[]>;
   listSessionResources(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<readonly SessionResource[]>;
   listArtifactReferenceCatalog(credential: PairedCredential, sessionId: string, generation: bigint, signal?: AbortSignal): Promise<ArtifactCatalogSnapshot>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
+  authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
   startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
@@ -107,6 +109,21 @@ export interface VerifiedBlobDownload {
   readonly mediaType: string;
 }
 
+export interface MaterializedWorkspaceBlob {
+  readonly entry: WorkspaceEntry;
+  readonly blob: BlobRef;
+}
+
+export interface AuthorizedBlobDownload {
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly blobId: string;
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+}
+
 export interface MobileBlobUploadSource {
   readonly uri: string;
   readonly fileName: string;
@@ -131,6 +148,7 @@ interface SessionMessageSearchPage {
 const MESSAGE_SEARCH_PAGE_SIZE = 100;
 const WORKSPACE_PAGE_SIZE = 500;
 export const MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES = 32 * 1024 * 1024;
+export const MOBILE_FILE_SHARE_MAXIMUM_BYTES = 256 * 1024 * 1024;
 
 interface WorkspaceDirectoryPage {
   readonly entries: readonly WorkspaceEntry[];
@@ -347,6 +365,34 @@ export function assertWorkspaceFilePreview(
   return preview;
 }
 
+export function assertMaterializedWorkspaceBlob(
+  workspaceId: string,
+  relativePath: string,
+  revision: FileRevision,
+  preview: FilePreview | undefined
+): MaterializedWorkspaceBlob {
+  const exact = assertWorkspaceFilePreview(workspaceId, relativePath, revision, preview);
+  const entry = exact.entry;
+  const blob = exact.content.case === "image"
+    ? exact.content.value.blob
+    : exact.content.case === "blob"
+      ? exact.content.value
+      : undefined;
+  const mediaType = normalizeMediaType(entry?.mediaType ?? "") || "application/octet-stream";
+  const filePath = canonicalWorkspacePath(relativePath);
+  const fileName = filePath.slice(filePath.lastIndexOf("/") + 1);
+  if (!entry || entry.kind !== FileKind.REGULAR || exact.truncated || !entry.revision
+    || !blob?.blobId || !/^[0-9a-f]{64}$/u.test(blob.sha256Hex)
+    || blob.fileName !== fileName
+    || blob.byteSize < 0n || blob.byteSize > BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES)
+    || entry.revision.byteSize !== blob.byteSize || entry.revision.sha256Hex !== blob.sha256Hex
+    || entry.revision.opaqueRevision !== `sha256:${blob.sha256Hex}:${blob.byteSize.toString(10)}`
+    || normalizeMediaType(blob.mediaType) !== mediaType) {
+    throw new Error("The Joko node returned a mismatched complete Workspace Blob.");
+  }
+  return { entry, blob };
+}
+
 function acceptedWorkspacePreviewRevision(expected: FileRevision, actual: FileRevision): boolean {
   if (workspaceEntryRevisionKey(actual) === workspaceEntryRevisionKey(expected)) return true;
   if (expected.opaqueRevision.startsWith("sha256:") || !actual.opaqueRevision.startsWith("sha256:")
@@ -405,6 +451,33 @@ export async function downloadVerifiedBlob(
   }
   signal?.throwIfAborted();
   return { bytes, mediaType: normalizeMediaType(blob.mediaType) };
+}
+
+export function authorizeVerifiedBlobDownload(
+  credential: Pick<PairedCredential, "origin" | "authKey">,
+  blob: BlobRef,
+  ticket: BlobTransferTicket | undefined
+): AuthorizedBlobDownload {
+  assertShareBlob(blob);
+  if (!ticket?.ticketId || ticket.direction !== TransferDirection.DOWNLOAD || ticket.blobId !== blob.blobId) {
+    throw new Error("The Joko node returned a mismatched Blob download ticket.");
+  }
+  const mediaType = normalizeMediaType(blob.mediaType);
+  if (ticket.maximumBytes !== blob.byteSize || normalizeMediaType(ticket.requiredMediaType) !== mediaType) {
+    throw new Error("The Joko node returned a Blob ticket with mismatched limits or media type.");
+  }
+  if (ticket.expiresAt && Number(ticket.expiresAt.seconds) * 1_000 <= Date.now()) {
+    throw new Error("The Joko node returned an expired Blob download ticket.");
+  }
+  return {
+    url: authorizedBlobEndpoint(credential.origin, ticket.relativeEndpoint),
+    headers: { authorization: `Bearer ${credential.authKey}` },
+    blobId: blob.blobId,
+    fileName: blob.fileName,
+    mediaType,
+    byteSize: Number(blob.byteSize),
+    sha256Hex: blob.sha256Hex
+  };
 }
 
 export async function uploadVerifiedBlob(
@@ -467,6 +540,16 @@ function assertDownloadBlob(blob: BlobRef): void {
   if (!blob.blobId || !normalizeMediaType(blob.mediaType) || !/^[0-9a-f]{64}$/u.test(blob.sha256Hex)
     || blob.byteSize < 0n || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) {
     throw new Error("The Blob is missing valid bounded download metadata.");
+  }
+}
+
+function assertShareBlob(blob: BlobRef): void {
+  const mediaType = normalizeMediaType(blob.mediaType);
+  if (!blob.blobId || !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)
+    || !/^[0-9a-f]{64}$/u.test(blob.sha256Hex)
+    || blob.byteSize < 0n || blob.byteSize > BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES)
+    || blob.byteSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("The Blob is missing valid bounded file-sharing metadata.");
   }
 }
 
@@ -819,6 +902,22 @@ export const mobileNetwork: MobileNetwork = {
     }, options(signal));
     return assertWorkspaceFilePreview(workspaceId, path, revision, response.preview);
   },
+  async materializeWorkspaceFileBlob(credential, workspaceId, relativePath, revision, signal) {
+    const path = canonicalWorkspacePath(relativePath);
+    if (!workspaceId || !revision.opaqueRevision) throw new Error("A current Workspace file revision is required.");
+    if (revision.byteSize < 0n || revision.byteSize > BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES)) {
+      throw new Error("The Workspace file exceeds the mobile sharing limit.");
+    }
+    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey)).readWorkspaceFile({
+      workspaceId,
+      relativePath: path,
+      startByte: 0n,
+      maximumBytes: BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES),
+      expectedRevision: revision,
+      requireBlob: true
+    }, options(signal));
+    return assertMaterializedWorkspaceBlob(workspaceId, path, revision, response.preview);
+  },
   async listSessionArtifacts(credential, sessionId, signal) {
     if (!sessionId) throw new Error("A current task is required for Generated files.");
     const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
@@ -873,6 +972,13 @@ export const mobileNetwork: MobileNetwork = {
     const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
     return downloadVerifiedBlob(credential, blob, response.ticket, signal);
+  },
+  async authorizeBlobDownload(credential, blob, signal) {
+    assertShareBlob(blob);
+    const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
+      .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
+    signal?.throwIfAborted();
+    return authorizeVerifiedBlobDownload(credential, blob, response.ticket);
   },
   async uploadBlob(credential, source, signal) {
     const exact = assertBlobUploadSource(source);

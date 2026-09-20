@@ -13,6 +13,7 @@ import {
   ResourceKind,
   SessionMessageSearchMatchSchema,
   SessionResourceSchema,
+  TextFilePreviewSchema,
   TransferDirection,
   WorkspaceEntrySchema,
   WorkspaceSearchMatchSchema
@@ -20,8 +21,11 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
+  MOBILE_FILE_SHARE_MAXIMUM_BYTES,
+  assertMaterializedWorkspaceBlob,
   assertSessionResourceCatalog,
   assertWorkspaceFilePreview,
+  authorizeVerifiedBlobDownload,
   collectArtifactPages,
   collectArtifactReferencePages,
   collectSessionMessageSearchPages,
@@ -217,6 +221,47 @@ describe("mobile Workspace and Artifact paging", () => {
       ...listed, sha256Hex: "c".repeat(64)
     }), upgraded)).toThrow(/mismatched workspace file preview/);
   });
+
+  it("accepts only a complete content-addressed Workspace Blob", () => {
+    const digest = "b".repeat(64);
+    const listed = create(FileRevisionSchema, {
+      opaqueRevision: "meta:listed", byteSize: 4n, modifiedAt: { seconds: 10n }
+    });
+    const contentRevision = create(FileRevisionSchema, {
+      opaqueRevision: `sha256:${digest}:4`, sha256Hex: digest, byteSize: 4n,
+      modifiedAt: listed.modifiedAt
+    });
+    const blob = create(BlobRefSchema, {
+      blobId: "blob-workspace", fileName: "file.txt", mediaType: "text/plain",
+      byteSize: 4n, sha256Hex: digest
+    });
+    const preview = create(FilePreviewSchema, {
+      entry: {
+        workspaceId: "workspace", relativePath: "src/file.txt", displayName: "file.txt",
+        kind: FileKind.REGULAR, mediaType: "text/plain", revision: contentRevision
+      },
+      content: { case: "blob", value: blob }
+    });
+
+    expect(assertMaterializedWorkspaceBlob("workspace", "src/file.txt", listed, preview)).toEqual({
+      entry: preview.entry,
+      blob
+    });
+    expect(() => assertMaterializedWorkspaceBlob("workspace", "src/file.txt", listed, create(FilePreviewSchema, {
+      ...preview,
+      truncated: true
+    }))).toThrow(/mismatched complete Workspace Blob/);
+    expect(() => assertMaterializedWorkspaceBlob("workspace", "src/file.txt", listed, create(FilePreviewSchema, {
+      ...preview,
+      content: { case: "text", value: create(TextFilePreviewSchema, {
+        utf8Text: "test", startByte: 0n, endByte: 4n, totalLines: 1
+      }) }
+    }))).toThrow(/mismatched complete Workspace Blob/);
+    expect(() => assertMaterializedWorkspaceBlob("workspace", "src/file.txt", listed, create(FilePreviewSchema, {
+      ...preview,
+      content: { case: "blob", value: create(BlobRefSchema, { ...blob, mediaType: "application/json" }) }
+    }))).toThrow(/mismatched complete Workspace Blob/);
+  });
 });
 
 function artifactReference(
@@ -299,6 +344,55 @@ describe("authenticated mobile Blob downloads", () => {
       create(BlobTransferTicketSchema, { ...ticket, maximumBytes: oversized.byteSize }), undefined,
       fetcher as unknown as typeof fetch, async () => hash)).rejects.toThrow(/bounded download metadata/);
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("authorizes a bounded streaming share without buffering the Blob", () => {
+    const shareBlob = create(BlobRefSchema, {
+      ...blob,
+      fileName: "archive.bin",
+      mediaType: "application/octet-stream",
+      byteSize: BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES) + 1n
+    });
+    const shareTicket = create(BlobTransferTicketSchema, {
+      ...ticket,
+      blobId: shareBlob.blobId,
+      maximumBytes: shareBlob.byteSize,
+      requiredMediaType: shareBlob.mediaType
+    });
+
+    expect(authorizeVerifiedBlobDownload(
+      { origin: "https://node.example", authKey: "secret" }, shareBlob, shareTicket
+    )).toEqual({
+      url: "https://node.example/v1/blobs/ticket-1",
+      headers: { authorization: "Bearer secret" },
+      blobId: shareBlob.blobId,
+      fileName: "archive.bin",
+      mediaType: "application/octet-stream",
+      byteSize: Number(shareBlob.byteSize),
+      sha256Hex: hash
+    });
+  });
+
+  it("fails closed before sharing for oversized, mismatched, expired, or unsafe tickets", () => {
+    const oversized = create(BlobRefSchema, {
+      ...blob, byteSize: BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES) + 1n
+    });
+    expect(() => authorizeVerifiedBlobDownload(
+      { origin: "https://node.example", authKey: "secret" }, oversized,
+      create(BlobTransferTicketSchema, { ...ticket, maximumBytes: oversized.byteSize })
+    )).toThrow(/bounded file-sharing metadata/);
+    expect(() => authorizeVerifiedBlobDownload(
+      { origin: "https://node.example", authKey: "secret" }, blob,
+      create(BlobTransferTicketSchema, { ...ticket, maximumBytes: 5n })
+    )).toThrow(/mismatched limits or media type/);
+    expect(() => authorizeVerifiedBlobDownload(
+      { origin: "https://node.example", authKey: "secret" }, blob,
+      create(BlobTransferTicketSchema, { ...ticket, relativeEndpoint: "//evil.example/blob" })
+    )).toThrow(/non-root-relative Blob endpoint/);
+    expect(() => authorizeVerifiedBlobDownload(
+      { origin: "https://node.example", authKey: "secret" }, blob,
+      create(BlobTransferTicketSchema, { ...ticket, expiresAt: create(TimestampSchema, { seconds: 1n }) })
+    )).toThrow(/expired Blob download ticket/);
   });
 });
 

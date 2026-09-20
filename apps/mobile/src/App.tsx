@@ -27,7 +27,7 @@ import {
   nextConnectionArtworkGroupIndex,
   type ConnectionArtworkVariant
 } from "./connection-artwork";
-import { mobileNetwork } from "./network";
+import { MOBILE_FILE_SHARE_MAXIMUM_BYTES, mobileNetwork } from "./network";
 import { mobileDiscovery } from "./native-lan-discovery";
 import {
   mobileAttachmentCamera,
@@ -100,7 +100,7 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { timelineRows, type TimelineRow } from "./timeline";
-import type { MobileTimelinePreviewArtifact } from "./mobile-timeline-artifacts";
+import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
@@ -200,6 +200,7 @@ import {
   type MobileImageOutputAction,
   type MobileImageOutputRenderedImage
 } from "./mobile-image-output";
+import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-share";
 import {
   commitMobileIncomingShare,
   mobileIncomingShare,
@@ -222,7 +223,8 @@ const client = new MobileClient(
   mobileAttachmentFiles,
   mobileMediaPreviewFiles,
   mobilePdfPreviewFiles,
-  mobileModelPreviewFiles
+  mobileModelPreviewFiles,
+  mobileFileShare
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
@@ -461,6 +463,7 @@ export function App() {
 
   useEffect(() => {
     void mobileImageOutput.maintain().catch(() => undefined);
+    void mobileFileShare.maintain().catch(() => undefined);
     void mobileIncomingShare.refresh().catch(() => undefined);
     client.setForeground(AppState.currentState === "active");
     void client.start();
@@ -2394,6 +2397,9 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const [pastedImageCount, setPastedImageCount] = useState(0);
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [composerNotice, setComposerNotice] = useState("");
+  const [fileShareBusy, setFileShareBusy] = useState(false);
+  const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
+  const [timelinePreviewSource, setTimelinePreviewSource] = useState<MobileTimelineArtifact>();
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
@@ -2537,6 +2543,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
   const attachmentAbortRef = useRef<AbortController | undefined>(undefined);
+  const fileShareAbortRef = useRef<AbortController | undefined>(undefined);
   const imagePasteLeaseRef = useRef<MobileTaskImagePasteLease | undefined>(undefined);
   const photoLibraryLeaseRef = useRef<MobilePhotoLibraryLease | undefined>(undefined);
   const imageEditorLeaseRef = useRef<MobileComposerImageEditorLease | undefined>(undefined);
@@ -2903,6 +2910,8 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       runtimeCommandAbortRef.current = undefined;
       runtimeCommandRequestRef.current += 1;
       attachmentAbortRef.current?.abort();
+      fileShareAbortRef.current?.abort();
+      fileShareAbortRef.current = undefined;
       attachmentNativeActivityRef.current = false;
       imagePasteLeaseRef.current = undefined;
       photoLibraryLeaseRef.current = undefined;
@@ -3196,13 +3205,45 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         if (taskMountedRef.current) setGalleryOpening(false);
       });
   };
-  const openTimelineArtifact = (artifact: MobileTimelinePreviewArtifact): void => {
+  const openTimelineArtifact = (artifact: MobileTimelineArtifact): void => {
+    if (!artifact.previewKind) return;
     if (state.timelinePreview || galleryOpening || imageGallery.view || state.status !== "connected"
-      || state.busy || attachmentBusy || voice.busy) return;
+      || state.busy || attachmentBusy || voice.busy || fileShareBusy) return;
     setComposerNotice("");
     setLocalError("");
+    setTimelinePreviewSource(artifact);
     void client.previewTimelineArtifact(artifact).catch((error) => {
-      if (taskMountedRef.current) setLocalError(errorText(error));
+      if (taskMountedRef.current) {
+        setTimelinePreviewSource(undefined);
+        setLocalError(errorText(error));
+      }
+    });
+  };
+  const shareTimelineArtifact = (artifact: MobileTimelineArtifact): void => {
+    if (fileShareAbortRef.current || state.status !== "connected" || state.busy
+      || attachmentBusy || voice.busy || galleryOpening || imageGallery.view) return;
+    const controller = new AbortController();
+    fileShareAbortRef.current = controller;
+    setFileShareBusy(true);
+    setFileShareProgress(undefined);
+    setComposerNotice("");
+    setLocalError("");
+    void client.shareTimelineArtifact(artifact, (progress) => {
+      if (taskMountedRef.current && fileShareAbortRef.current === controller) setFileShareProgress(progress);
+    }, controller.signal).then(() => {
+      if (taskMountedRef.current && fileShareAbortRef.current === controller) {
+        setComposerNotice("System file sharing completed.");
+      }
+    }).catch((error) => {
+      if (!controller.signal.aborted && taskMountedRef.current && fileShareAbortRef.current === controller) {
+        setLocalError(errorText(error));
+      }
+    }).finally(() => {
+      if (fileShareAbortRef.current === controller) fileShareAbortRef.current = undefined;
+      if (taskMountedRef.current) {
+        setFileShareBusy(false);
+        setFileShareProgress(undefined);
+      }
     });
   };
   useEffect(() => {
@@ -4149,6 +4190,10 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         : state.liveStatus === "polling" ? "Snapshot updates · live stream unavailable" : "Updates paused"}
     </Text>
     {state.error && <Banner text={state.error} colors={colors} />}
+    {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <ActivityIndicator color={colors.accent} />
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress)}</Text>
+    </View>}
     <FlatList data={rows} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
       ListHeaderComponent={<View style={styles.historyActions}>
         {state.window && <Action label="Return to latest" colors={colors} onPress={() => client.latest()} />}
@@ -4183,23 +4228,37 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} files`} style={styles.messageImages}>
           {item.artifacts.map((artifact) => {
             const disabled = state.timelinePreview !== undefined || galleryOpening || imageGallery.view !== undefined
-              || state.status !== "connected" || state.busy || attachmentBusy || voice.busy;
-            return <Pressable key={artifact.artifactId} accessibilityRole="button"
-              accessibilityLabel={`Open ${artifact.title}, ${artifact.mediaType}`}
-              accessibilityHint="Opens this verified completed-message file in the full-screen preview"
-              disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
-              style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
-                disabled && styles.disabled]}>
+              || state.status !== "connected" || state.busy || attachmentBusy || voice.busy || fileShareBusy;
+            const detail = <>
               <Text style={styles.messageImageGlyph}>{artifact.previewKind === "pdf" ? "▤"
-                : artifact.previewKind === "model" ? "⬡" : "▶"}</Text>
+                : artifact.previewKind === "model" ? "⬡" : artifact.previewKind === "media" ? "▶" : "◆"}</Text>
               <View style={styles.fill}>
                 <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifact.title}</Text>
                 <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
                   {artifact.mediaType} · {formatByteSize(artifact.byteSize)}
                 </Text>
               </View>
-              <Text style={[styles.caption, { color: colors.accent }]}>Open</Text>
-            </Pressable>;
+              <Text style={[styles.caption, { color: artifact.previewKind ? colors.accent : colors.muted }]}>
+                {artifact.previewKind ? "Open" : "File"}
+              </Text>
+            </>;
+            return <View key={artifact.artifactId} style={styles.fileActionRow}>
+              {artifact.previewKind ? <Pressable accessibilityRole="button"
+                accessibilityLabel={`Open ${artifact.title}, ${artifact.mediaType}`}
+                accessibilityHint="Opens this verified completed-message file in the full-screen preview"
+                disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
+                style={[styles.messageImageTile, styles.fileRowMain,
+                  { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
+                {detail}
+              </Pressable> : <View accessible accessibilityLabel={`${artifact.title}, ${artifact.mediaType}`}
+                style={[styles.messageImageTile, styles.fileRowMain,
+                  { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
+                {detail}
+              </View>}
+              <Action label={fileShareBusy ? "Sharing…" : "Share"}
+                accessibilityLabel={`Share ${artifact.title}`} compact colors={colors} disabled={disabled}
+                onPress={() => shareTimelineArtifact(artifact)} />
+            </View>;
           })}
         </View>}
         <View style={styles.messageActions}>
@@ -4515,8 +4574,13 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={imageGallery.close} onSave={imageGallery.save} />}
     <FilePreviewModal colors={colors} preview={state.timelinePreview} busy={false}
+      sharing={fileShareBusy} shareProgress={fileShareProgress}
+      onShare={timelinePreviewSource ? () => shareTimelineArtifact(timelinePreviewSource) : undefined}
       backLabel="Task" loadingLabel="Verifying the exact Timeline file…"
-      onClose={() => client.closeTimelinePreview()} />
+      onClose={() => {
+        setTimelinePreviewSource(undefined);
+        client.closeTimelinePreview();
+      }} />
     <MobileActionSheet visible={messageActionsVisible} items={messageActionItems} colors={colors}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileCommandHelpSheet visible={commandHelpItems !== undefined} items={commandHelpItems ?? []}
@@ -4606,9 +4670,13 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   const [localError, setLocalError] = useState("");
   const [imageOutputNotice, setImageOutputNotice] = useState("");
   const [handoffBusy, setHandoffBusy] = useState(false);
+  const [fileShareBusy, setFileShareBusy] = useState(false);
+  const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [previewSource, setPreviewSource] = useState<MobileFilesComposerSource>();
   const handoffRef = useRef<AbortController | undefined>(undefined);
+  const fileShareRef = useRef<AbortController | undefined>(undefined);
+  const filesMountedRef = useRef(true);
   const authorityKey = client.filesAuthorityKey();
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
@@ -4617,7 +4685,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
     client.closeFiles();
     onAdded();
   });
-  const filesBusy = handoffBusy || galleryOpening || imageGallery.view !== undefined;
+  const filesBusy = handoffBusy || fileShareBusy || galleryOpening || imageGallery.view !== undefined;
 
   useEffect(() => {
     if (!connected || !authorityKey) return;
@@ -4627,10 +4695,16 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
     }
   }, [authorityKey, connected, files.authorityKey, files.open, files.status]);
 
-  useEffect(() => () => {
-    handoffRef.current?.abort();
-    handoffRef.current = undefined;
-    client.closeFiles();
+  useEffect(() => {
+    filesMountedRef.current = true;
+    return () => {
+      filesMountedRef.current = false;
+      handoffRef.current?.abort();
+      handoffRef.current = undefined;
+      fileShareRef.current?.abort();
+      fileShareRef.current = undefined;
+      client.closeFiles();
+    };
   }, []);
 
   useEffect(() => {
@@ -4649,6 +4723,8 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   const leave = (): void => {
     handoffRef.current?.abort();
     handoffRef.current = undefined;
+    fileShareRef.current?.abort();
+    fileShareRef.current = undefined;
     imageGallery.close();
     client.closeFiles();
     onBack();
@@ -4694,6 +4770,32 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
       setLocalError(errorText(error));
     });
   };
+  const shareFile = (source: MobileFilesComposerSource): void => {
+    if (handoffRef.current || fileShareRef.current || galleryOpening || imageGallery.view) return;
+    const controller = new AbortController();
+    fileShareRef.current = controller;
+    setFileShareBusy(true);
+    setFileShareProgress(undefined);
+    setImageOutputNotice("");
+    setLocalError("");
+    void client.shareFilesItem(source, (progress) => {
+      if (filesMountedRef.current && fileShareRef.current === controller) setFileShareProgress(progress);
+    }, controller.signal).then(() => {
+      if (filesMountedRef.current && fileShareRef.current === controller) {
+        setImageOutputNotice("System file sharing completed.");
+      }
+    }).catch((error) => {
+      if (!controller.signal.aborted && filesMountedRef.current && fileShareRef.current === controller) {
+        setLocalError(errorText(error));
+      }
+    }).finally(() => {
+      if (fileShareRef.current === controller) fileShareRef.current = undefined;
+      if (filesMountedRef.current) {
+        setFileShareBusy(false);
+        setFileShareProgress(undefined);
+      }
+    });
+  };
   const locationTitle = files.location.kind === "generated"
     ? "Generated"
     : files.location.path || files.workspace?.displayName || "Workspace";
@@ -4719,6 +4821,10 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
     {handoffBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Adding the verified item to this task’s composer…</Text>
+    </View>}
+    {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <ActivityIndicator color={colors.accent} />
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress)}</Text>
     </View>}
     {galleryOpening && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
@@ -4772,6 +4878,8 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
             && <Text style={[styles.description, { color: colors.muted }]}>No matching files</Text>}
           {files.searchResults.map((result, index) => <FileSearchResultRow key={fileSearchResultKey(result, index)}
             result={result} colors={colors} disabled={!connected || filesBusy} onPress={() => openResult(result)}
+            shareDisabled={!shareableFileSearchResult(result)}
+            onShare={() => shareFile({ kind: "search-result", result })}
             onAdd={() => addToComposer({ kind: "search-result", result })} />)}
           {files.searchStatus === "ready" && <Text style={[styles.caption, { color: colors.muted }]}>
             {files.searchResults.length} result{files.searchResults.length === 1 ? "" : "s"}
@@ -4804,6 +4912,9 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
             <Action label="Add" accessibilityLabel={`Add Generated file ${artifactTitle(artifact)} to composer`}
               compact colors={colors} disabled={!connected || filesBusy}
               onPress={() => addToComposer(source)} />
+            <Action label="Share" accessibilityLabel={`Share Generated file ${artifactTitle(artifact)}`}
+              compact colors={colors} disabled={!connected || filesBusy || !shareableBlobSize(artifact.blob?.byteSize)}
+              onPress={() => shareFile(source)} />
           </View>})}
         </> : <>
           <View style={styles.sectionHeader}>
@@ -4843,11 +4954,18 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
               <Action label="Add" accessibilityLabel={`Add ${entry.kind === FileKind.DIRECTORY ? "directory" : "file"} ${label} to composer`}
                 compact colors={colors} disabled={!connected || filesBusy}
                 onPress={() => addToComposer(source)} />
+              <Action label="Share" accessibilityLabel={`Share file ${label}`}
+                compact colors={colors} disabled={!connected || filesBusy || entry.kind !== FileKind.REGULAR
+                  || !shareableBlobSize(entry.revision?.byteSize)}
+                onPress={() => shareFile(source)} />
             </View>;
           })}
         </>}
       </ScrollView>}
     <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy}
+      sharing={fileShareBusy} shareProgress={fileShareProgress}
+      onShare={previewSource && shareableMobileFilesSource(previewSource)
+        ? () => shareFile(previewSource) : undefined}
       onAdd={addToComposer} onOpenImage={openGallery} onClose={() => {
         setPreviewSource(undefined);
         client.closeFilesPreview();
@@ -4880,8 +4998,9 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   </View>;
 }
 
-function FileSearchResultRow({ result, colors, disabled, onPress, onAdd }: {
-  result: MobileFileSearchResult; colors: Colors; disabled: boolean; onPress: () => void; onAdd: () => void;
+function FileSearchResultRow({ result, colors, disabled, shareDisabled, onPress, onAdd, onShare }: {
+  result: MobileFileSearchResult; colors: Colors; disabled: boolean; shareDisabled: boolean;
+  onPress: () => void; onAdd: () => void; onShare: () => void;
 }) {
   const path = result.kind === "artifact" ? artifactTitle(result.artifact)
     : result.kind === "workspace-content" ? result.match.relativePath : result.relativePath;
@@ -4900,19 +5019,24 @@ function FileSearchResultRow({ result, colors, disabled, onPress, onAdd }: {
     </Pressable>
     <Action label="Add" accessibilityLabel={`Add ${path} to composer`} compact colors={colors}
       disabled={disabled} onPress={onAdd} />
+    <Action label="Share" accessibilityLabel={`Share ${path}`} compact colors={colors}
+      disabled={disabled || shareDisabled} onPress={onShare} />
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, busy, backLabel = "Files",
-  loadingLabel = "Loading the exact observed file revision…", onAdd, onOpenImage, onClose }: {
+function FilePreviewModal({ colors, preview, source, busy, sharing = false, shareProgress, backLabel = "Files",
+  loadingLabel = "Loading the exact observed file revision…", onAdd, onOpenImage, onShare, onClose }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
   busy: boolean;
+  sharing?: boolean;
+  shareProgress?: MobileFileShareProgress;
   backLabel?: string;
   loadingLabel?: string;
   onAdd?: (source: MobileFilesComposerSource) => void;
   onOpenImage?: (source: MobileFilesComposerSource) => void;
+  onShare?: () => void;
   onClose: () => void;
 }) {
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
@@ -4924,23 +5048,31 @@ function FilePreviewModal({ colors, preview, source, busy, backLabel = "Files",
   useEffect(() => setMediaStatus(undefined), [mediaLeaseId]);
   useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
   useEffect(() => setModelStatus(undefined), [modelLeaseId]);
-  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={busy ? () => undefined : onClose}>
+  const blocked = busy || sharing;
+  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={blocked ? () => undefined : onClose}>
     <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       {preview && <>
         <View style={[styles.header, { borderBottomColor: colors.border }]}>
-          <Back onPress={onClose} colors={colors} label={backLabel} disabled={busy} />
+          <Back onPress={onClose} colors={colors} label={backLabel} disabled={blocked} />
           <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{preview.title}</Text>
             <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{preview.sourceLabel}</Text></View>
           {source && onOpenImage && preview.kind === "image" && <Action label="Gallery"
             accessibilityLabel={`Open image gallery for ${preview.title}`} compact colors={colors}
-            disabled={busy} onPress={() => onOpenImage(source)} />}
+            disabled={blocked} onPress={() => onOpenImage(source)} />}
           {source && onAdd && <Action label={busy ? "Adding…" : "Add"}
             accessibilityLabel={`Add ${preview.title} to composer`} compact colors={colors}
-            disabled={busy || preview.kind === "loading"} onPress={() => onAdd(source)} />}
+            disabled={blocked || preview.kind === "loading"} onPress={() => onAdd(source)} />}
+          {onShare && <Action label={sharing ? "Sharing…" : "Share"}
+            accessibilityLabel={`Share ${preview.title}`} compact colors={colors}
+            disabled={blocked || preview.kind === "loading"} onPress={onShare} />}
         </View>
         {busy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <ActivityIndicator color={colors.accent} />
           <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Adding the verified item to this task’s composer…</Text>
+        </View>}
+        {sharing && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <ActivityIndicator color={colors.accent} />
+          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(shareProgress)}</Text>
         </View>}
         <View style={[styles.previewMetadata, { borderColor: colors.border, backgroundColor: colors.surface }]}>
           <Text selectable style={[styles.caption, { color: colors.muted }]}>{preview.mediaType} · {formatByteSize(preview.byteSize)}</Text>
@@ -5072,6 +5204,32 @@ function fileSearchResultKey(result: MobileFileSearchResult, index: number): str
   if (result.kind === "artifact") return `artifact:${result.artifact.artifactId}`;
   if (result.kind === "workspace-name") return `name:${result.relativePath}`;
   return `content:${result.match.relativePath}:${result.match.range?.startByte.toString(10) ?? index}:${index}`;
+}
+
+function shareableBlobSize(byteSize: bigint | undefined): boolean {
+  return byteSize !== undefined && byteSize >= 0n
+    && byteSize <= BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES);
+}
+
+function shareableFileSearchResult(result: MobileFileSearchResult): boolean {
+  if (result.kind === "artifact") return shareableBlobSize(result.artifact.blob?.byteSize);
+  if (result.kind === "workspace-content") return shareableBlobSize(result.match.revision?.byteSize);
+  return true;
+}
+
+function shareableMobileFilesSource(source: MobileFilesComposerSource): boolean {
+  if (source.kind === "artifact") return shareableBlobSize(source.artifact.blob?.byteSize);
+  if (source.kind === "workspace-entry") {
+    return source.entry.kind === FileKind.REGULAR && shareableBlobSize(source.entry.revision?.byteSize);
+  }
+  return shareableFileSearchResult(source.result);
+}
+
+function formatMobileFileShareProgress(progress: MobileFileShareProgress | undefined): string {
+  if (!progress) return "Preparing the verified file for system sharing…";
+  if (progress.phase === "dispatching") return "Opening the system share sheet…";
+  const verb = progress.phase === "verifying" ? "Verifying" : "Downloading";
+  return `${verb} ${formatByteSize(BigInt(progress.bytesCompleted))} of ${formatByteSize(BigInt(progress.totalBytes))}…`;
 }
 
 function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNew, onHome }: ScreenProps & {

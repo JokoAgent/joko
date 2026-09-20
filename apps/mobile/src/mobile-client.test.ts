@@ -21,7 +21,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import type { MobileDiscovery } from "./connection-discovery";
-import { normalizeNodeOrigin, parseNodeIdentity, type MobileNetwork, type NodeIdentity, type PairedCredential } from "./network";
+import {
+  normalizeNodeOrigin,
+  parseNodeIdentity,
+  type AuthorizedBlobDownload,
+  type MobileNetwork,
+  type NodeIdentity,
+  type PairedCredential
+} from "./network";
 import type { Event, Operation, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -42,6 +49,7 @@ import {
   type MobileModelPreviewFileDriver,
   type MobileModelPreviewFileSnapshot
 } from "./mobile-model-preview";
+import type { MobileFileShare } from "./mobile-file-share";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
@@ -785,11 +793,13 @@ function fakeNetwork(): MobileNetwork {
       });
     }),
     readWorkspaceFile: vi.fn(async () => { throw new Error("No Workspace file fixture was configured."); }),
+    materializeWorkspaceFileBlob: vi.fn(async () => { throw new Error("No Workspace Blob fixture was configured."); }),
     listSessionArtifacts: vi.fn(async () => ({ artifacts: [], revision: "artifacts-1" })),
     listRuntimeCommands: vi.fn(async () => []),
     listSessionResources: vi.fn(async () => []),
     listArtifactReferenceCatalog: vi.fn(async () => ({ artifacts: [], revision: "artifact-references-1" })),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
+    authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
     startVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
@@ -1223,11 +1233,12 @@ function client(
   attachmentFiles?: MobileAttachmentFiles,
   mediaPreviewFiles?: MobileMediaPreviewFiles,
   pdfPreviewFiles?: MobilePdfPreviewFiles,
-  modelPreviewFiles?: MobileModelPreviewFiles
+  modelPreviewFiles?: MobileModelPreviewFiles,
+  fileShare?: Pick<MobileFileShare, "perform">
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles);
+    modelPreviewFiles, fileShare);
   clients.push(instance);
   return instance;
 }
@@ -5694,6 +5705,150 @@ describe("native current-task Files ownership", () => {
       kind: "text", text: "# Joko", languageId: "markdown", startByte: 0n, endByte: 6n,
       totalLines: 1, truncated: false
     });
+  });
+
+  it("materializes, revalidates, and system-shares one exact Workspace file", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const blob = create(BlobRefSchema, {
+      blobId: "workspace-share-blob",
+      fileName: "README.md",
+      mediaType: "text/markdown",
+      byteSize: 6n,
+      sha256Hex: "a".repeat(64)
+    });
+    const materializedEntry = create(WorkspaceEntrySchema, {
+      ...readme,
+      revision: create(FileRevisionSchema, {
+        ...revision,
+        opaqueRevision: `sha256:${"a".repeat(64)}:6`
+      })
+    });
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry: materializedEntry, blob });
+    const authorized: AuthorizedBlobDownload = {
+      url: "http://192.168.1.20:4318/v1/blobs/share-ticket",
+      headers: { authorization: "Bearer private-key" },
+      blobId: blob.blobId,
+      fileName: blob.fileName,
+      mediaType: blob.mediaType,
+      byteSize: 6,
+      sha256Hex: blob.sha256Hex
+    };
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue(authorized);
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => {
+      request.onProgress?.({ phase: "downloading", bytesCompleted: 3, totalBytes: 6 });
+      await request.assertCurrent();
+      request.onDispatch?.();
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { perform });
+    await app.start();
+    await app.openFiles();
+    const progress = vi.fn();
+
+    await app.shareFilesItem({ kind: "workspace-entry", entry: app.state.files.entries[1]! }, progress);
+
+    expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledWith(
+      credential, "workspace", "README.md", revision, expect.any(AbortSignal)
+    );
+    expect(network.authorizeBlobDownload).toHaveBeenCalledWith(credential, blob, expect.any(AbortSignal));
+    expect(perform).toHaveBeenCalledWith(expect.objectContaining({ source: authorized }));
+    expect(progress).toHaveBeenCalledWith({ phase: "downloading", bytesCompleted: 3, totalBytes: 6 });
+    expect(vi.mocked(network.listWorkspaceDirectory).mock.calls.filter((call) => call[2] === ""))
+      .toHaveLength(3);
+  });
+
+  it("shares an exact Generated file and does not cancel after the native share sheet dispatches", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const authorized: AuthorizedBlobDownload = {
+      url: "http://192.168.1.20:4318/v1/blobs/generated-ticket",
+      headers: { authorization: "Bearer private-key" },
+      blobId: artifact.blob!.blobId,
+      fileName: artifact.blob!.fileName,
+      mediaType: artifact.blob!.mediaType,
+      byteSize: Number(artifact.blob!.byteSize),
+      sha256Hex: artifact.blob!.sha256Hex
+    };
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue(authorized);
+    let app!: MobileClient;
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => {
+      await request.assertCurrent();
+      request.onDispatch?.();
+      app.setForeground(false);
+    });
+    app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { perform });
+    await app.start();
+    await app.openFiles();
+
+    await expect(app.shareFilesItem({ kind: "artifact", artifact: app.state.files.artifacts[0]! }))
+      .resolves.toBeUndefined();
+
+    expect(network.authorizeBlobDownload).toHaveBeenCalledWith(
+      credential, artifact.blob, expect.any(AbortSignal)
+    );
+    expect(perform).toHaveBeenCalledTimes(1);
+    expect(network.listSessionArtifacts).toHaveBeenCalledTimes(3);
+  });
+
+  it("aborts a pre-dispatch Workspace share when Files closes", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    vi.mocked(network.materializeWorkspaceFileBlob).mockImplementation(async (
+      _credential, _workspaceId, _path, _revision, signal
+    ) => new Promise<never>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+    const perform = vi.fn();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { perform });
+    await app.start();
+    await app.openFiles();
+
+    const sharing = app.shareFilesItem({ kind: "workspace-entry", entry: app.state.files.entries[1]! });
+    await vi.waitFor(() => expect(network.materializeWorkspaceFileBlob).toHaveBeenCalled());
+    app.closeFiles();
+
+    await expect(sharing).rejects.toMatchObject({ name: "AbortError" });
+    expect(perform).not.toHaveBeenCalled();
+  });
+
+  it("shares a bounded non-preview Timeline Artifact only while its durable event remains exact", async () => {
+    const bytes = Uint8Array.from([1, 2, 3, 4]);
+    const event = timelinePreviewEvent("bundle.zip", "application/zip", bytes, "d".repeat(64), "Bundle");
+    const network = projectedNetwork(timelineGallerySnapshot(event));
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    const rowArtifact = timelineRows([event])[0]!.artifacts![0]!;
+    expect(rowArtifact.previewKind).toBeUndefined();
+    const payload = event.payload?.kind;
+    const block = payload?.case === "messageCompleted" ? payload.value.blocks[0] : undefined;
+    const blob = block?.content.case === "artifact"
+      ? block.content.value.blob!
+      : undefined;
+    expect(blob).toBeDefined();
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue({
+      url: "http://192.168.1.20:4318/v1/blobs/timeline-ticket",
+      headers: { authorization: "Bearer private-key" },
+      blobId: blob!.blobId,
+      fileName: blob!.fileName,
+      mediaType: blob!.mediaType,
+      byteSize: Number(blob!.byteSize),
+      sha256Hex: blob!.sha256Hex
+    });
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => {
+      await request.assertCurrent();
+      request.onDispatch?.();
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { perform });
+    await app.start();
+
+    await app.shareTimelineArtifact(rowArtifact);
+
+    expect(network.readAround).toHaveBeenCalledTimes(2);
+    expect(network.authorizeBlobDownload).toHaveBeenCalledWith(credential, blob, expect.any(AbortSignal));
+    expect(perform).toHaveBeenCalledTimes(1);
   });
 
   it("materializes an authenticated Generated video into one app-owned preview lease and cleans it on background", async () => {

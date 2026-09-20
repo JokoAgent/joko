@@ -52,4 +52,28 @@ describe("mobile Timeline quote source", () => {
       { eventId: "complete", messageId: "message", contentIndex: 1, title: "Model", previewKind: "model" }
     ]);
   });
+
+  it("keeps arbitrary and over-preview-limit files shareable without duplicating gallery images", () => {
+    const row = timelineRows([completed([
+      { content: { case: "artifact", value: { label: "Archive", blob: {
+        blobId: "archive", fileName: "archive.zip", mediaType: "application/zip",
+        byteSize: 256n, sha256Hex: "a".repeat(64)
+      } } } },
+      { content: { case: "artifact", value: { label: "Large image", blob: {
+        blobId: "large-image", fileName: "large.png", mediaType: "image/png",
+        byteSize: 33_554_433n, sha256Hex: "b".repeat(64)
+      } } } },
+      { content: { case: "artifact", value: { label: "Small image", blob: {
+        blobId: "small-image", fileName: "small.png", mediaType: "image/png",
+        byteSize: 256n, sha256Hex: "c".repeat(64)
+      } } } }
+    ])])[0];
+
+    expect(row?.images).toMatchObject([{ title: "Small image", mediaType: "image/png" }]);
+    expect(row?.artifacts).toMatchObject([
+      { contentIndex: 0, title: "Archive" },
+      { contentIndex: 1, title: "Large image" }
+    ]);
+    expect(row?.artifacts?.every((artifact) => artifact.previewKind === undefined)).toBe(true);
+  });
 });

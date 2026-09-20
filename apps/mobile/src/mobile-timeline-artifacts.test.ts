@@ -13,8 +13,11 @@ import {
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  mobileTimelineArtifacts,
+  mobileTimelineArtifactWindowKey,
   mobileTimelinePreviewArtifacts,
   mobileTimelinePreviewWindowKey,
+  resolveMobileTimelineArtifact,
   resolveMobileTimelinePreviewArtifact
 } from "./mobile-timeline-artifacts";
 
@@ -33,6 +36,22 @@ describe("mobile Timeline preview artifacts", () => {
     ]);
   });
 
+  it("projects arbitrary bounded files for sharing while keeping preview bounds distinct", () => {
+    const event = completedEvent([
+      artifactBlock("archive.zip", "application/zip", "Archive"),
+      artifactBlock("empty.txt", "text/plain", "Empty", { byteSize: 0n }),
+      artifactBlock("large.pdf", "application/pdf", "Large", { byteSize: 33_554_433n })
+    ]);
+    expect(mobileTimelineArtifacts(event)).toMatchObject([
+      { contentIndex: 0, title: "Archive", mediaType: "application/zip" },
+      { contentIndex: 1, title: "Empty", mediaType: "text/plain" },
+      { contentIndex: 2, title: "Large", mediaType: "application/pdf" }
+    ]);
+    expect(mobileTimelinePreviewArtifacts(event)).toEqual([]);
+    const selected = mobileTimelineArtifacts(event)[0]!;
+    expect(resolveMobileTimelineArtifact([event], selected)?.blob.fileName).toBe("archive.zip");
+  });
+
   it("rejects imported, malformed, oversized and non-completed sources", () => {
     const malformed = completedEvent([
       artifactBlock("song.mp3", "audio/mpeg", "", { sha256Hex: "bad" }),
@@ -41,6 +60,7 @@ describe("mobile Timeline preview artifacts", () => {
       artifactBlock("wrong.bin", "model/gltf-binary", "")
     ]);
     expect(mobileTimelinePreviewArtifacts(malformed)).toEqual([]);
+    expect(mobileTimelineArtifacts(malformed)).toHaveLength(2);
     expect(mobileTimelinePreviewArtifacts(create(EventSchema, {
       ...malformed,
       eventId: "started",
@@ -58,6 +78,7 @@ describe("mobile Timeline preview artifacts", () => {
     const replaced = completedEvent([artifactBlock("other.mp3", "audio/mpeg", "Song")]);
     expect(resolveMobileTimelinePreviewArtifact([replaced], selected)).toBeUndefined();
     expect(mobileTimelinePreviewWindowKey([event])).not.toBe(mobileTimelinePreviewWindowKey([replaced]));
+    expect(mobileTimelineArtifactWindowKey([event])).not.toBe(mobileTimelineArtifactWindowKey([replaced]));
     const contentReplaced = completedEvent([
       artifactBlock("song.mp3", "audio/mpeg", "Song", { sha256Hex: "b".repeat(64) })
     ]);

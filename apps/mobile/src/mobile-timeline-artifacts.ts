@@ -2,10 +2,10 @@ import { MessageRole, type BlobRef, type Event } from "@joko/contracts";
 import { mobileMediaPreviewKind } from "./mobile-media-preview";
 import { mobileModelPreviewKind } from "./mobile-model-preview";
 import { isMobilePdfPreviewMediaType } from "./mobile-pdf-preview";
-import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
+import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES, MOBILE_FILE_SHARE_MAXIMUM_BYTES } from "./network";
 import { normalizeMediaType } from "./workspace-files";
 
-export interface MobileTimelinePreviewArtifact {
+export interface MobileTimelineArtifact {
   readonly artifactId: string;
   readonly eventId: string;
   readonly messageId: string;
@@ -14,16 +14,20 @@ export interface MobileTimelinePreviewArtifact {
   readonly mediaType: string;
   readonly byteSize: bigint;
   readonly sourceKey: string;
+  readonly previewKind?: "media" | "pdf" | "model";
+}
+
+export interface MobileTimelinePreviewArtifact extends MobileTimelineArtifact {
   readonly previewKind: "media" | "pdf" | "model";
 }
 
-export interface MobileTimelinePreviewArtifactSource {
-  readonly artifact: MobileTimelinePreviewArtifact;
+export interface MobileTimelineArtifactSource<TArtifact extends MobileTimelineArtifact = MobileTimelineArtifact> {
+  readonly artifact: TArtifact;
   readonly blob: BlobRef;
   readonly event: Event;
 }
 
-export function mobileTimelinePreviewArtifacts(event: Event): readonly MobileTimelinePreviewArtifact[] {
+export function mobileTimelineArtifacts(event: Event): readonly MobileTimelineArtifact[] {
   const payload = event.payload?.kind;
   const sessionId = event.identity?.sessionId ?? "";
   if (payload?.case !== "messageCompleted" || !event.eventId || !sessionId
@@ -35,7 +39,8 @@ export function mobileTimelinePreviewArtifacts(event: Event): readonly MobileTim
     const previewKind = mobileMediaPreviewKind(mediaType) ? "media"
       : isMobilePdfPreviewMediaType(mediaType) ? "pdf"
         : mobileModelPreviewKind(mediaType, blob.fileName) ? "model" : undefined;
-    if (!previewKind || !validBlobIdentity(blob)) return [];
+    if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)
+      || !validBlobIdentity(blob, MOBILE_FILE_SHARE_MAXIMUM_BYTES)) return [];
     const title = boundedLabel(block.content.value.label) || boundedLabel(blob.fileName) || "Message file";
     return [{
       artifactId: JSON.stringify([event.eventId, payload.value.messageId, contentIndex, blob.blobId]),
@@ -48,29 +53,59 @@ export function mobileTimelinePreviewArtifacts(event: Event): readonly MobileTim
       sourceKey: JSON.stringify([
         blob.blobId, blob.fileName, mediaType, blob.byteSize.toString(10), blob.sha256Hex
       ]),
-      previewKind
+      ...(previewKind && blob.byteSize <= BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES) ? { previewKind } : {})
     }];
   });
 }
 
-export function resolveMobileTimelinePreviewArtifact(
+export function mobileTimelinePreviewArtifacts(event: Event): readonly MobileTimelinePreviewArtifact[] {
+  return mobileTimelineArtifacts(event).filter(isMobileTimelinePreviewArtifact);
+}
+
+export function isMobileTimelinePreviewArtifact(
+  artifact: MobileTimelineArtifact
+): artifact is MobileTimelinePreviewArtifact {
+  return artifact.previewKind !== undefined;
+}
+
+export function resolveMobileTimelineArtifact(
   events: readonly Event[],
-  selected: MobileTimelinePreviewArtifact
-): MobileTimelinePreviewArtifactSource | undefined {
+  selected: MobileTimelineArtifact
+): MobileTimelineArtifactSource | undefined {
   const matchingEvents = events.filter((event) => event.eventId === selected.eventId);
   if (matchingEvents.length !== 1) return undefined;
   const event = matchingEvents[0]!;
   const payload = event.payload?.kind;
   if (payload?.case !== "messageCompleted" || payload.value.messageId !== selected.messageId) return undefined;
-  const artifact = mobileTimelinePreviewArtifacts(event)
+  const artifact = mobileTimelineArtifacts(event)
     .find((candidate) => candidate.contentIndex === selected.contentIndex);
   const block = payload.value.blocks[selected.contentIndex];
-  if (!artifact || !sameMobileTimelinePreviewArtifact(artifact, selected)
+  if (!artifact || !sameMobileTimelineArtifact(artifact, selected)
     || block?.content.case !== "artifact" || !block.content.value.blob) return undefined;
   return { artifact, blob: block.content.value.blob, event };
 }
 
+export function resolveMobileTimelinePreviewArtifact(
+  events: readonly Event[],
+  selected: MobileTimelinePreviewArtifact
+): MobileTimelineArtifactSource<MobileTimelinePreviewArtifact> | undefined {
+  const source = resolveMobileTimelineArtifact(events, selected);
+  if (!source || source.artifact.previewKind === undefined) return undefined;
+  return { ...source, artifact: source.artifact as MobileTimelinePreviewArtifact };
+}
+
+export function mobileTimelineArtifactWindowKey(events: readonly Event[]): string {
+  return timelineWindowKey(events, mobileTimelineArtifacts);
+}
+
 export function mobileTimelinePreviewWindowKey(events: readonly Event[]): string {
+  return timelineWindowKey(events, mobileTimelinePreviewArtifacts);
+}
+
+function timelineWindowKey(
+  events: readonly Event[],
+  project: (event: Event) => readonly MobileTimelineArtifact[]
+): string {
   return JSON.stringify(events.map((event, eventIndex) => [
     eventIndex.toString(10),
     event.eventId,
@@ -79,7 +114,7 @@ export function mobileTimelinePreviewWindowKey(events: readonly Event[]): string
     event.cursor?.sequence.toString(10) ?? "",
     event.cursor?.opaqueToken ?? "",
     event.payload?.kind.case ?? "",
-    mobileTimelinePreviewArtifacts(event).map((artifact) => [
+    project(event).map((artifact) => [
       artifact.artifactId,
       artifact.sourceKey,
       artifact.mediaType,
@@ -93,6 +128,14 @@ export function sameMobileTimelinePreviewArtifact(
   left: MobileTimelinePreviewArtifact,
   right: MobileTimelinePreviewArtifact
 ): boolean {
+  return sameMobileTimelineArtifact(left, right)
+    && left.previewKind === right.previewKind;
+}
+
+export function sameMobileTimelineArtifact(
+  left: MobileTimelineArtifact,
+  right: MobileTimelineArtifact
+): boolean {
   return left.artifactId === right.artifactId
     && left.eventId === right.eventId
     && left.messageId === right.messageId
@@ -104,9 +147,11 @@ export function sameMobileTimelinePreviewArtifact(
     && left.previewKind === right.previewKind;
 }
 
-function validBlobIdentity(blob: BlobRef): boolean {
-  return Boolean(blob.blobId && blob.fileName && /^[a-f0-9]{64}$/u.test(blob.sha256Hex)
-    && blob.byteSize > 0n && blob.byteSize <= BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES));
+function validBlobIdentity(blob: BlobRef, maximumBytes: number): boolean {
+  const fileName = boundedLabel(blob.fileName);
+  return Boolean(blob.blobId && fileName && !fileName.includes("/") && !fileName.includes("\\")
+    && /^[a-f0-9]{64}$/u.test(blob.sha256Hex)
+    && blob.byteSize >= 0n && blob.byteSize <= BigInt(maximumBytes));
 }
 
 function previewableRole(role: MessageRole): boolean {
