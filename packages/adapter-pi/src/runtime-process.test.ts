@@ -32,6 +32,18 @@ function snapshot(rows: readonly PiProcessTableRow[]): PiProcessTableSnapshot {
 }
 
 describe("managed runtime process supervision", () => {
+  it.runIf(process.platform === "win32")(
+    "treats a missing Windows process as confirmed absent for capture and recovery",
+    async () => {
+      const supervisor = createDefaultPiManagedProcessSupervisor();
+      const missingPid = 2_147_483_647;
+
+      await expect(supervisor.capture(missingPid)).resolves.toBeUndefined();
+      await expect(supervisor.terminate(missingPid, "retired-process-identity", 100))
+        .resolves.toBe("not_running");
+    }
+  );
+
   it("parses POSIX and Windows scans without exposing them through the public usage shape", () => {
     const posix = parsePosixProcessTable(
       "12 1 S 2.5 2048 Mon Aug 25 04:00:00 2026 /opt/pi --mode rpc\n"

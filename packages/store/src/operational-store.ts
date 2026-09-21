@@ -3835,6 +3835,46 @@ export class OperationalStore {
   }
 
   /**
+   * Advance the private prompt of a service-owned Session. Public task mutation
+   * surfaces never call this; SessionHost owns the runtime refresh boundary.
+   */
+  updateSessionPrivatePrompt(
+    id: string,
+    appendSystemPrompt: string | undefined,
+    expectedRevision: bigint,
+    now = this.now()
+  ): StoredSession {
+    if ((appendSystemPrompt?.length ?? 0) > 8_000) {
+      throw new StoreError("Session append system prompt cannot exceed 8,000 characters.");
+    }
+    if (appendSystemPrompt?.includes("\0") === true) {
+      throw new StoreError("Session append system prompt cannot contain NUL characters.");
+    }
+    return this.write(() => {
+      const current = this.getSession(id);
+      if (current.revision !== expectedRevision) {
+        throw new RevisionConflictError("Session", id, expectedRevision, current.revision);
+      }
+      if (current.descriptor.appendSystemPrompt === appendSystemPrompt) return current;
+      const result = this.database.prepare(`
+        UPDATE product_sessions SET append_system_prompt = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        appendSystemPrompt ?? null,
+        now,
+        asSqlInteger(this.requireActiveRevision()),
+        id,
+        asSqlInteger(current.revision)
+      );
+      if (Number(result.changes) !== 1) {
+        const changed = this.getSession(id);
+        throw new RevisionConflictError("Session", id, expectedRevision, changed.revision);
+      }
+      return this.getSession(id);
+    });
+  }
+
+  /**
    * Changes only the Session's sidebar/navigation placement. Its Target,
    * Backend, native binding, worktree, and runtime identity stay immutable.
    */

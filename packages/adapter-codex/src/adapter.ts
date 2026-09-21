@@ -1178,7 +1178,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       inspection.scope.remote ? undefined : context.modelSelection,
       managedRoute,
       nativeConfiguration,
-      smartRoute
+      smartRoute,
+      context.appendSystemPrompt
     ).catch(async (error) => {
       managedRoute?.dispose();
       smartRoute?.dispose();
@@ -2388,7 +2389,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     selection?: { readonly providerId: string; readonly modelId: string },
     managedRoute?: ManagedProviderRouteBinding,
     nativeConfiguration?: JsonObject,
-    smartRoute?: ManagedProviderSmartRoutingBinding
+    smartRoute?: ManagedProviderSmartRoutingBinding,
+    developerInstructions?: string
   ) {
     scope.assertCurrent();
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
@@ -2402,6 +2404,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...(selection === undefined
         ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
         : { modelProvider: smartRoute?.modelProviderId ?? selection.providerId, model: selection.modelId }),
+      ...(developerInstructions === undefined ? {} : { developerInstructions }),
       ...(configuration === undefined ? {} : { config: configuration })
     }, { mutation: false, beforeDispatch: scope.assertCurrent });
     scope.assertCurrent();
@@ -3015,7 +3018,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         { providerId, modelId },
         route,
         preparedMcp.nativeConfiguration,
-        smartRoute
+        smartRoute,
+        context.appendSystemPrompt
       );
       assertCurrent();
       const record = objectValue(response.value, "route resume response");

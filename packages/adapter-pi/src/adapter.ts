@@ -851,6 +851,21 @@ export class PiBackendAdapter implements BackendAdapter {
     // A parented new_session starts by resuming the parent JSONL, avoiding the
     // otherwise unavoidable throwaway fresh JSONL before the RPC transition.
     let runtime = await this.#startRuntime(attachedBinding ?? parentBinding, profile, context);
+    if (
+      start.kind === "new"
+      && start.parentNativeReference === undefined
+      && context.target.remoteWorkspace === undefined
+    ) {
+      const materialized = await this.#sessionStore.materializeFreshSession({
+        binding: runtime.binding,
+        workspaceRoot: runtimeWorkspaceRoot(context.target)
+      });
+      // A fresh upstream SessionManager intentionally delays its first JSONL
+      // write until an assistant message exists. Materializing that prospective
+      // path externally makes the native manager's later exclusive create fail
+      // unless it reloads the now-durable header first.
+      runtime = await this.#confirmNativeSessionSwitch(runtime, materialized, context, false);
+    }
     if (start.kind === "attach" && attachedBinding !== undefined) {
       try {
         runtime = await this.#confirmNativeSessionSwitch(runtime, attachedBinding, context);
@@ -3612,6 +3627,14 @@ export class PiBackendAdapter implements BackendAdapter {
   }
 
   async switchNativeSession(path: string, context: AdapterContext): Promise<NativeSessionBinding> {
+    return this.#switchNativeSession(path, context, true);
+  }
+
+  async #switchNativeSession(
+    path: string,
+    context: AdapterContext,
+    emitEvent: boolean
+  ): Promise<NativeSessionBinding> {
     const runtime = this.#runtime(context);
     return this.#runExclusiveSessionMutation(runtime, context, async () => {
       let accepted = false;
@@ -3627,7 +3650,7 @@ export class PiBackendAdapter implements BackendAdapter {
         );
         assertSessionChangeAccepted(response, "switch_session");
         accepted = true;
-        return await this.#refreshBinding(runtime);
+        return await this.#refreshBinding(runtime, emitEvent);
       } catch (error) {
         if (accepted || isUnconfirmedSessionMutationError(error)) {
           return this.#failClosedUnconfirmedSessionMutation(
@@ -4611,8 +4634,8 @@ export class PiBackendAdapter implements BackendAdapter {
     const safePath = await this.#sessionStore.assertManagedSessionReference(state.sessionFile, { requireExists: false });
     runtime.binding = { opaqueRef: safePath, nativeSessionId: state.sessionId, generation: runtime.transport.generation };
     const refreshedContext: AdapterContext = { ...runtime.context, binding: runtime.binding };
-    const tree = await this.getTree(refreshedContext);
     if (emitEvent) {
+      const tree = await this.getTree(refreshedContext);
       await runtime.context.emit(
         {
           type: "native_session_changed",
@@ -4643,13 +4666,17 @@ export class PiBackendAdapter implements BackendAdapter {
   async #confirmNativeSessionSwitch(
     runtime: PiRuntime,
     binding: NativeSessionBinding,
-    context: AdapterContext
+    context: AdapterContext,
+    emitEvent = true
   ): Promise<PiRuntime> {
-    const confirmed = await this.switchNativeSession(binding.opaqueRef, {
+    const confirmed = await this.#switchNativeSession(binding.opaqueRef, {
       ...context,
       binding: runtime.binding
-    });
-    if (!samePath(confirmed.opaqueRef, binding.opaqueRef)) {
+    }, emitEvent);
+    if (
+      !samePath(confirmed.opaqueRef, binding.opaqueRef)
+      || confirmed.nativeSessionId !== binding.nativeSessionId
+    ) {
       throw piError("PI_SESSION_SWITCH_MISMATCH", "Pi switched to a different native session than requested", "session", {
         stateMayHaveChanged: true,
         recovery: "Reload the native session list and reconcile the active Pi runtime before retrying."

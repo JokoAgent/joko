@@ -7,6 +7,8 @@ describe("public route contract", () => {
   it("round-trips route identities and canonical optional focus", () => {
     const routes = [
       { route: { kind: "projects", projectId: "project/one" } as const, hash: "#/projects/project%2Fone" },
+      { route: { kind: "partners", partnerId: "partner/one" } as const, hash: "#/partners/partner%2Fone" },
+      { route: { kind: "partners" } as const, hash: "#/partners" },
       { route: { kind: "schedules", scheduleId: "schedule/one" } as const, hash: "#/schedules?focus=schedule%2Fone" },
       { route: { kind: "schedules" } as const, hash: "#/schedules" },
       { route: { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" } as const, hash: "#/tools?extension=extension_0123456789abcdef0123456789abcdef" },

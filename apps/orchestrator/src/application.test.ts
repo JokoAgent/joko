@@ -233,6 +233,8 @@ describe("Orchestrator application composition", () => {
       { name: "call_tool", permission: false },
       { name: "list_tools", permission: false }
     ]);
+    expect(application.partners?.listPartners()).toEqual([]);
+    expect(application.partners?.directory().state).toMatchObject({ activeCount: 0, archivedCount: 0, errorCount: 0 });
     expect(application.piResources?.list()).toEqual([]);
     expect(application.skillMarket?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
     expect(application.skillMarketSync?.listPolicies()).toEqual([]);
@@ -475,6 +477,7 @@ describe("Orchestrator application composition", () => {
     const reopened = await createOrchestratorApplication(config);
     cleanups.push(() => reopened.close());
     expect(reopened.serverId).toBe(durableServerId);
+    expect(reopened.partners?.listPartners()).toEqual([]);
     expect(reopened.store.listBackends().map((backend) => ({
       id: backend.descriptor.id,
       generation: backend.descriptor.instanceGeneration

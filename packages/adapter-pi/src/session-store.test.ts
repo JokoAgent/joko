@@ -18,13 +18,29 @@ describe("PiSessionStore", () => {
     await store.initialize();
   });
 
-  it("accepts an unmaterialized new-session reference but never as a resume", async () => {
+  it("materializes an unflushed new-session reference before it becomes resumable", async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-pi-empty-session-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-empty-session-workspace-"));
     const store = new PiSessionStore(home);
     await store.initialize();
     const prospective = join(store.sessionsRoot, "future.jsonl");
     await expect(store.assertManagedSessionReference(prospective, { requireExists: false })).resolves.toBe(prospective);
     await expect(store.assertManagedSession(prospective)).rejects.toMatchObject({ publicError: { code: "PI_SESSION_NOT_FOUND" } });
+
+    await expect(store.materializeFreshSession({
+      binding: { opaqueRef: prospective, nativeSessionId: "fresh-native", generation: 4 },
+      workspaceRoot: workspace
+    })).resolves.toEqual({ opaqueRef: prospective, nativeSessionId: "fresh-native", generation: 4 });
+    await expect(store.binding(prospective, 5)).resolves.toEqual({
+      opaqueRef: prospective,
+      nativeSessionId: "fresh-native",
+      generation: 5
+    });
+    expect(JSON.parse((await readFile(prospective, "utf8")).trim())).toMatchObject({
+      type: "session",
+      id: "fresh-native",
+      cwd: workspace
+    });
   });
 
   it("lists native JSONL and uses recoverable managed trash", async () => {

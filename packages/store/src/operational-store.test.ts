@@ -280,7 +280,7 @@ describe("OperationalStore", () => {
     })).toThrow();
   });
 
-  it("round-trips the private Session append prompt and rejects oversized values", () => {
+  it("round-trips and revision-fences the private Session append prompt", () => {
     const { store } = createFixture();
     const source = store.getSession("session-1").descriptor;
     const prompt = "Prefer terse explanations and preserve repository conventions.";
@@ -296,6 +296,26 @@ describe("OperationalStore", () => {
 
     expect(stored.descriptor.appendSystemPrompt).toBe(prompt);
     expect(store.getSession(stored.descriptor.id).descriptor.appendSystemPrompt).toBe(prompt);
+    const advanced = store.updateSessionPrivatePrompt(
+      stored.descriptor.id,
+      "Use the current long-lived partner identity.",
+      stored.revision,
+      4
+    );
+    expect(advanced.descriptor.appendSystemPrompt).toBe("Use the current long-lived partner identity.");
+    expect(advanced.descriptor.updatedAt).toBe(4);
+    expect(() => store.updateSessionPrivatePrompt(
+      stored.descriptor.id,
+      "stale write",
+      stored.revision
+    )).toThrow(RevisionConflictError);
+    const cleared = store.updateSessionPrivatePrompt(
+      stored.descriptor.id,
+      undefined,
+      advanced.revision,
+      5
+    );
+    expect(cleared.descriptor.appendSystemPrompt).toBeUndefined();
     expect(() => store.createSession({
       ...source,
       id: "session-prompt-too-long",
@@ -308,6 +328,11 @@ describe("OperationalStore", () => {
       binding: { opaqueRef: "native/nul.jsonl", generation: 0 },
       appendSystemPrompt: "valid prefix\0invalid suffix"
     })).toThrow(StoreError);
+    expect(() => store.updateSessionPrivatePrompt(
+      stored.descriptor.id,
+      "x".repeat(8_001),
+      cleared.revision
+    )).toThrow(StoreError);
   });
 
   it("persists a capability-neutral derivation origin and resolves its visible message anchor after restart", () => {

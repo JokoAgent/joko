@@ -395,6 +395,7 @@ import { createTerminalConnectService } from "./terminal-connect-service.js";
 import type { TerminalProvider } from "@joko/tool-terminal";
 import { createManagedModelRuntimeConnectService } from "./managed-model-runtime-connect-service.js";
 import { createContactConnectService } from "./contact-connect-service.js";
+import { createPartnerConnectService } from "./partner-connect-service.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
@@ -669,6 +670,7 @@ export interface ConnectServiceSet {
   readonly credential: ServiceImpl<typeof contract.CredentialService>;
   readonly settings: ServiceImpl<typeof contract.SettingsService>;
   readonly contact: ServiceImpl<typeof contract.ContactService>;
+  readonly partner: ServiceImpl<typeof contract.PartnerService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
   readonly extension: ServiceImpl<typeof contract.ExtensionService>;
@@ -1000,6 +1002,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.CredentialService, withConnectErrors(services.credential));
   router.service(contract.SettingsService, withConnectErrors(services.settings));
   router.service(contract.ContactService, withConnectErrors(services.contact));
+  router.service(contract.PartnerService, withConnectErrors(services.partner));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
   router.service(contract.ExtensionService, withConnectErrors(services.extension));
@@ -1208,6 +1211,10 @@ export function createConnectServices(application: OrchestratorApplication): Con
     application.contacts,
     (context) => authenticate(context),
     application.contactSync
+  );
+  const partner = createPartnerConnectService(
+    application.partners,
+    (context) => authenticate(context)
   );
   const worktree = createWorktreeConnectService(
     dependencies.sessionWorktrees,
@@ -4812,7 +4819,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, contact, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, contact, partner, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -11938,6 +11945,7 @@ function protoDynamicToolFieldType(value: DynamicInputFieldType): contract.ToolF
     case "object": return contract.ToolFieldType.OBJECT;
     case "array": return contract.ToolFieldType.ARRAY;
     case "blob": return contract.ToolFieldType.BLOB;
+    case "unknown": return contract.ToolFieldType.UNSPECIFIED;
   }
 }
 

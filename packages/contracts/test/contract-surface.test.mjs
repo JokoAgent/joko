@@ -235,6 +235,33 @@ test("Contacts exposes revision-fenced local and explicit device-sync authority 
   assert.equal(field(contract.ContactVCardImportDecisionSchema, "target_contact_id").proto.proto3Optional, true);
 });
 
+test("Partners exposes revision-fenced durable profiles without private home or runtime authority", () => {
+  assert.deepEqual([...methodNames(contract.PartnerService)], [
+    "getPartnerDirectory",
+    "listPartners",
+    "getPartner",
+    "createPartner",
+    "updatePartner",
+    "setPartnerLifecycle",
+    "retryPartnerInitialization",
+    "updatePartnerDefaults"
+  ]);
+  assertNoFields([
+    contract.PartnerDirectorySchema,
+    contract.PartnerProfileSchema,
+    contract.PartnerTemplateSchema,
+    contract.PartnerDraftSchema,
+    contract.PartnerPatchSchema
+  ], [
+    "absolute_path", "workspace_root", "database_path", "credential", "credential_reference_id",
+    "auth_key", "operation_id", "raw_error", "error_message"
+  ]);
+  assert.equal(field(contract.PartnerProfileSchema, "canonical_session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPatchSchema, "display_name").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPatchSchema, "permission_mode").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPatchSchema, "uses_directory_defaults").proto.proto3Optional, true);
+});
+
 test("discovery metadata is a closed public allowlist", () => {
   assert.deepEqual(fields(contract.DiscoveredNodeSchema).map((candidate) => candidate.name), [
     "server_id", "display_name", "origin", "version", "api_version", "pairing_enabled", "last_seen"

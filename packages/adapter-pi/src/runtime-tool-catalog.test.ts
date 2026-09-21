@@ -136,6 +136,58 @@ describe("Pi runtime tool catalog projection", () => {
       .toEqual({ kind: "catalog", tools: [] });
   });
 
+  it("keeps a live catalog when a tool accepts a heterogeneous scalar revision", () => {
+    const result = projectCatalog({
+      format: 1,
+      complete: true,
+      activeToolNames: ["schedule_update"],
+      tools: [{
+        name: "schedule_update",
+        description: "Update a schedule.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            expectedRevision: {
+              anyOf: [
+                { type: "string", pattern: "^[0-9]+$", maxLength: 32 },
+                { type: "integer", minimum: 0 }
+              ],
+              description: "Optional optimistic-concurrency revision."
+            },
+            expireAt: {
+              anyOf: [
+                { type: "integer", minimum: 0 },
+                { type: "null" }
+              ]
+            }
+          }
+        },
+        promptGuidelines: [],
+        sourceInfo: {
+          path: "C:\\runtime\\schedule.ts",
+          source: "schedule.ts",
+          scope: "temporary",
+          origin: "top-level"
+        }
+      }]
+    });
+
+    expect(result).toMatchObject({
+      kind: "catalog",
+      tools: [{
+        name: "schedule_update",
+        active: true,
+        inputSchema: {
+          fields: [
+            { fieldPath: "expectedRevision", type: "unknown", required: false },
+            { fieldPath: "expireAt", type: "integer", required: false }
+          ]
+        }
+      }]
+    });
+  });
+
   it("rejects malformed or internally inconsistent snapshots instead of guessing", () => {
     expect(() => projectCatalog({
       format: 1,

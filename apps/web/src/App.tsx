@@ -110,6 +110,7 @@ const SessionPane = lazy(async () => ({ default: (await import("./components/Ses
 const Inspector = lazy(async () => ({ default: (await import("./components/Inspector.js")).Inspector }));
 const SchedulesPage = lazy(async () => ({ default: (await import("./components/SchedulesPage.js")).SchedulesPage }));
 const ProjectsPage = lazy(async () => ({ default: (await import("./components/ProjectsPage.js")).ProjectsPage }));
+const PartnersPage = lazy(async () => ({ default: (await import("./components/PartnersPage.js")).PartnersPage }));
 const SettingsPage = lazy(async () => ({ default: (await import("./components/SettingsPage.js")).SettingsPage }));
 const StandaloneAboutPage = lazy(async () => ({ default: (await import("./components/SettingsPage.js")).StandaloneAboutPage }));
 const ToolsPage = lazy(async () => ({ default: (await import("./components/ToolsPage.js")).ToolsPage }));
@@ -1834,6 +1835,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
+          {state.route.kind === "partners" && <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}
             snapshot={state.snapshot}

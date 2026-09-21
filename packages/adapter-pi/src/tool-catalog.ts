@@ -166,32 +166,34 @@ export function projectPiInputSchema(raw: unknown, toolName: string): DynamicInp
     if (task.kind === "property") {
       const property = record(task.rawProperty, `${task.prefix}${task.name}`);
       const path = task.prefix === "" ? task.name : `${task.prefix}.${task.name}`;
-      const type = schemaFieldType(property, path);
+      const projected = projectFieldSchema(property, path);
+      const type = projected.type;
       fields.push(projectSchemaField(
-        property,
+        projected.schema,
         path,
         type,
         task.required.has(task.name),
         humanize(task.name),
         SECRET_FIELD.test(task.name)
       ));
-      if (type === "object") tasks.push({ kind: "object", schema: property, prefix: path });
-      if (type === "array") tasks.push({ kind: "array", schema: property, path });
+      if (type === "object") tasks.push({ kind: "object", schema: projected.schema, prefix: path });
+      if (type === "array") tasks.push({ kind: "array", schema: projected.schema, path });
       continue;
     }
 
     const itemPath = `${task.path}[]`;
-    const type = schemaFieldType(task.item, itemPath);
+    const projected = projectFieldSchema(task.item, itemPath);
+    const type = projected.type;
     fields.push(projectSchemaField(
-      task.item,
+      projected.schema,
       itemPath,
       type,
       true,
       `${humanize(task.path.split(".").at(-1) ?? task.path)} item`,
       SECRET_FIELD.test(task.path)
     ));
-    if (type === "object") tasks.push({ kind: "object", schema: task.item, prefix: itemPath });
-    if (type === "array") tasks.push({ kind: "array", schema: task.item, path: itemPath });
+    if (type === "object") tasks.push({ kind: "object", schema: projected.schema, prefix: itemPath });
+    if (type === "array") tasks.push({ kind: "array", schema: projected.schema, path: itemPath });
   }
   return {
     fields,
@@ -255,14 +257,63 @@ function fieldConstraints(
   return Object.keys(value).length === 0 ? undefined : value;
 }
 
-function schemaFieldType(schema: Readonly<Record<string, unknown>>, fieldPath: string): DynamicInputFieldType {
+function projectFieldSchema(
+  schema: Readonly<Record<string, unknown>>,
+  fieldPath: string
+): { readonly schema: Readonly<Record<string, unknown>>; readonly type: DynamicInputFieldType } {
+  const direct = directSchemaFieldType(schema);
+  if (direct !== undefined) return { schema, type: direct };
+  if (literalStringUnion(schema["anyOf"], fieldPath) !== undefined) return { schema, type: "string" };
+  const nullable = nullableUnionSchema(schema, fieldPath);
+  if (nullable !== undefined) return nullable;
+  const unionType = scalarUnionType(schema["anyOf"], fieldPath);
+  if (unionType !== undefined) return { schema, type: unionType };
+  throw catalogError(`Pi tool field '${fieldPath}' uses an unsupported schema type.`);
+}
+
+function directSchemaFieldType(schema: Readonly<Record<string, unknown>>): DynamicInputFieldType | undefined {
   if (schema["contentEncoding"] === "base64") return "blob";
   const value = schema["type"];
   if (value === "string" || value === "number" || value === "integer" || value === "boolean" || value === "object" || value === "array") {
     return value;
   }
-  if (literalStringUnion(schema["anyOf"], fieldPath) !== undefined) return "string";
-  throw catalogError(`Pi tool field '${fieldPath}' uses an unsupported schema type.`);
+  return undefined;
+}
+
+function nullableUnionSchema(
+  schema: Readonly<Record<string, unknown>>,
+  fieldPath: string
+): { readonly schema: Readonly<Record<string, unknown>>; readonly type: DynamicInputFieldType } | undefined {
+  const value = schema["anyOf"];
+  if (!Array.isArray(value) || value.length !== 2) return undefined;
+  const branches = value.map((candidate, index) => record(candidate, `${fieldPath}.anyOf[${index}]`));
+  const concrete = branches.filter((branch) => branch["type"] !== "null");
+  if (concrete.length !== 1 || branches.filter((branch) => branch["type"] === "null").length !== 1) return undefined;
+  const type = directSchemaFieldType(concrete[0]!);
+  if (type === undefined) return undefined;
+  return {
+    // Parent metadata (for example the union-level description) wins while
+    // branch constraints and nested fields remain available to the projection.
+    schema: { ...concrete[0], ...schema },
+    type
+  };
+}
+
+function scalarUnionType(value: unknown, fieldPath: string): DynamicInputFieldType | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const types = new Set<"string" | "number" | "integer" | "boolean">();
+  for (const [index, candidate] of value.entries()) {
+    const branch = record(candidate, `${fieldPath}.anyOf[${index}]`);
+    const type = branch["type"];
+    if (type !== "string" && type !== "number" && type !== "integer" && type !== "boolean") return undefined;
+    types.add(type);
+  }
+  if (types.size === 1) return [...types][0];
+  if ([...types].every((type) => type === "number" || type === "integer")) return "number";
+  // DynamicInputSchema is a display-safe projection rather than the schema
+  // used for invocation. Preserve a valid heterogeneous scalar union without
+  // pretending that one branch describes the whole field.
+  return "unknown";
 }
 
 function stringEnum(schema: Readonly<Record<string, unknown>>, fieldPath: string): readonly string[] {

@@ -94,6 +94,7 @@ export type AppRoute =
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
+  | { readonly kind: "partners"; readonly partnerId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
   | { readonly kind: "tools"; readonly extensionId?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
@@ -2292,6 +2293,19 @@ export function useAppController(): AppController {
     saveProviderCredentialSurface: (backendId, providerId, surfaceId, secret) => gateway().saveProviderCredentialSurface(backendId, providerId, surfaceId, secret),
     clearProviderCredentialSurface: (backendId, providerId, surfaceId) => gateway().clearProviderCredentialSurface(backendId, providerId, surfaceId),
     deleteCredential: (credentialId) => gateway().deleteCredential(credentialId),
+    getPartnerDirectory: (signal) => gateway().getPartnerDirectory(signal),
+    listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
+    getPartner: (partnerId, signal) => gateway().getPartner(partnerId, signal),
+    createPartner: (expectedDirectoryRevision, draft, signal) =>
+      gateway().createPartner(expectedDirectoryRevision, draft, signal),
+    updatePartner: (partnerId, expectedRevision, patch, signal) =>
+      gateway().updatePartner(partnerId, expectedRevision, patch, signal),
+    setPartnerLifecycle: (partnerId, expectedRevision, lifecycle, signal) =>
+      gateway().setPartnerLifecycle(partnerId, expectedRevision, lifecycle, signal),
+    retryPartnerInitialization: (partnerId, expectedRevision, signal) =>
+      gateway().retryPartnerInitialization(partnerId, expectedRevision, signal),
+    updatePartnerDefaults: (expectedDirectoryRevision, capabilities, signal) =>
+      gateway().updatePartnerDefaults(expectedDirectoryRevision, capabilities, signal),
     getContactDirectory: (signal) => gateway().getContactDirectory(signal),
     setContactDirectoryEnabled: (expectedRevision, enabled, signal) =>
       gateway().setContactDirectoryEnabled(expectedRevision, enabled, signal),
@@ -3026,6 +3040,7 @@ export function routeFromHash(hash: string): AppRoute {
     };
   }
   if (parts[0] === "projects") return { kind: "projects", ...(parts[1] === undefined ? {} : { projectId: parts[1] }) };
+  if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
     return {
@@ -3085,6 +3100,7 @@ export function appRouteHash(route: AppRoute): string {
     return `#/tasks/new${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "projects") return route.projectId === undefined ? "#/projects" : `#/projects/${encodeURIComponent(route.projectId)}`;
+  if (route.kind === "partners") return route.partnerId === undefined ? "#/partners" : `#/partners/${encodeURIComponent(route.partnerId)}`;
   if (route.kind === "schedules") {
     const query = new URLSearchParams();
     if (route.scheduleId !== undefined) query.set("focus", route.scheduleId);

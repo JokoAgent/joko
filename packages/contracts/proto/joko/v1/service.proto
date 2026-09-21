@@ -13,6 +13,7 @@ import "joko/v1/managed_model_runtime.proto";
 import "joko/v1/mobile_push.proto";
 import "joko/v1/model.proto";
 import "joko/v1/operation.proto";
+import "joko/v1/partner.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/portable_session.proto";
 import "joko/v1/runtime.proto";
@@ -225,6 +226,20 @@ service ContactService {
   rpc GrantContactSyncPeer(GrantContactSyncPeerRequest) returns (GrantContactSyncPeerResponse);
   rpc RevokeContactSyncPeer(RevokeContactSyncPeerRequest) returns (RevokeContactSyncPeerResponse);
   rpc SyncContactsNow(SyncContactsNowRequest) returns (SyncContactsNowResponse);
+}
+
+// Authenticated, node-local authority for durable long-lived partners. Home
+// filesystem paths remain private; clients receive only stable Target and
+// canonical Session identities.
+service PartnerService {
+  rpc GetPartnerDirectory(GetPartnerDirectoryRequest) returns (GetPartnerDirectoryResponse);
+  rpc ListPartners(ListPartnersRequest) returns (ListPartnersResponse);
+  rpc GetPartner(GetPartnerRequest) returns (GetPartnerResponse);
+  rpc CreatePartner(CreatePartnerRequest) returns (CreatePartnerResponse);
+  rpc UpdatePartner(UpdatePartnerRequest) returns (UpdatePartnerResponse);
+  rpc SetPartnerLifecycle(SetPartnerLifecycleRequest) returns (SetPartnerLifecycleResponse);
+  rpc RetryPartnerInitialization(RetryPartnerInitializationRequest) returns (RetryPartnerInitializationResponse);
+  rpc UpdatePartnerDefaults(UpdatePartnerDefaultsRequest) returns (UpdatePartnerDefaultsResponse);
 }
 
 // Orchestrator-node-owned local inference runtimes. Shared clients discover every

@@ -389,6 +389,90 @@ export class PiSessionStore {
     }
   }
 
+  /**
+   * Some native runtimes expose a fresh Session identity before flushing its
+   * first JSONL record. Materialize that exact empty identity so a product
+   * Session is resumable even when no user turn has been dispatched yet.
+   */
+  async materializeFreshSession(input: {
+    readonly binding: NativeSessionBinding;
+    readonly workspaceRoot: string;
+  }): Promise<NativeSessionBinding> {
+    const nativeSessionId = input.binding.nativeSessionId;
+    if (nativeSessionId === undefined) {
+      throw piError("PI_SESSION_MATERIALIZATION_ID_MISSING", "Fresh native Session identity is missing", "session");
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(nativeSessionId)) {
+      throw piError("PI_SESSION_MATERIALIZATION_ID_INVALID", "Fresh native Session identity is invalid", "session");
+    }
+    const [target, workspaceRoot] = await Promise.all([
+      this.assertManagedSessionReference(input.binding.opaqueRef, { requireExists: false }),
+      canonicalWorkspaceRoot(input.workspaceRoot)
+    ]);
+    const header = `${JSON.stringify({
+      type: "session",
+      version: CURRENT_SESSION_VERSION,
+      id: nativeSessionId,
+      timestamp: new Date().toISOString(),
+      cwd: workspaceRoot
+    })}\n`;
+    let created = false;
+    try {
+      await writeFile(target, header, { flag: "wx", mode: 0o600 });
+      created = true;
+      return await this.#confirmMaterializedFreshSession(
+        target,
+        nativeSessionId,
+        input.binding.generation,
+        workspaceRoot
+      );
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        return this.#confirmMaterializedFreshSession(
+          target,
+          nativeSessionId,
+          input.binding.generation,
+          workspaceRoot
+        );
+      }
+      if (created) await unlink(target).catch(() => undefined);
+      throw asPiError(error, {
+        code: "PI_SESSION_MATERIALIZATION_FAILED",
+        phase: "session",
+        retryable: true,
+        recovery: "Retry after the managed native Session directory is stable and writable."
+      });
+    }
+  }
+
+  async #confirmMaterializedFreshSession(
+    path: string,
+    nativeSessionId: string,
+    generation: number,
+    workspaceRoot: string
+  ): Promise<NativeSessionBinding> {
+    const binding = await this.binding(path, generation);
+    const info = await inspectSessionFile(binding.opaqueRef);
+    const observedWorkspace = info.cwd === undefined
+      ? undefined
+      : await canonicalWorkspaceRoot(info.cwd).catch(() => undefined);
+    if (
+      binding.nativeSessionId !== nativeSessionId
+      || info.state !== "ready"
+      || observedWorkspace === undefined
+      || !samePath(observedWorkspace, workspaceRoot)
+      || info.parentSession !== undefined
+    ) {
+      throw piError(
+        "PI_SESSION_MATERIALIZATION_CONFLICT",
+        "Fresh native Session storage belongs to a different identity or workspace",
+        "session",
+        { recovery: "Reconcile the exact managed native Session before retrying creation." }
+      );
+    }
+    return binding;
+  }
+
   async materializeDetachedFork(input: PiDetachedForkMaterialization): Promise<NativeSessionBinding> {
     if (input.binding.nativeSessionId === undefined) {
       throw piError("PI_FORK_MATERIALIZATION_ID_MISSING", "Detached fork has no native Session identity", "session");

@@ -53,7 +53,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { ContactStore, OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -165,6 +165,7 @@ import { CollaborationManager } from "./collaboration-manager.js";
 import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
+import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -351,6 +352,8 @@ export interface OrchestratorApplication {
   readonly contacts?: ContactManager;
   /** Explicitly granted, encrypted node-to-node Contacts convergence owner. */
   readonly contactSync?: ContactSyncManager;
+  /** Node-local authority for long-lived partner profiles and their canonical Sessions. */
+  readonly partners?: PartnerManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -452,6 +455,15 @@ export async function createOrchestratorApplication(
     throw error;
   }
   const contacts = new ContactManager(contactStore);
+  let partnerStore: PartnerStore;
+  try {
+    partnerStore = new PartnerStore(join(config.dataDirectory, "partners.db"));
+  } catch (error) {
+    contacts.close();
+    contactStore.close();
+    store.close();
+    throw error;
+  }
   let backendInstances!: BackendInstanceRegistry;
   let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
   const subagentModels = new SubagentModelSettings({
@@ -1239,6 +1251,7 @@ export async function createOrchestratorApplication(
         && providers.list(backendId).some((provider) => !provider.enabled)
       ),
     sessionRuntimeFallbackEnabled: () => configuredSessionRuntimeFallback(store),
+    serviceSessionRuntimeFallback: (input) => partnerSessionRuntimeFallback(partnerStore, input),
     backendDispatchBlocked: (backendId) => deferredBackendRestarts?.blocksDispatch(backendId) === true,
     onBackendMayBeIdle: (backendId) => deferredBackendRestarts?.onBackendMayBeIdle(backendId),
     sessionRuntimeFallbackContext: (backendId) => {
@@ -1265,6 +1278,12 @@ export async function createOrchestratorApplication(
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
     },
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
+  });
+  const partners = new PartnerManager({
+    store: partnerStore,
+    operationalStore: store,
+    sessionHost,
+    homesRoot: join(config.dataDirectory, "partner-homes")
   });
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
@@ -1824,6 +1843,7 @@ export async function createOrchestratorApplication(
         await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
       }
     }
+    await partners.recoverPending();
 
     const computerRuntimeAdapter = computerAutomationRuntime(computerRuntime);
     computerAutomation = new ComputerAutomationSettingsController({
@@ -2067,6 +2087,7 @@ export async function createOrchestratorApplication(
     contactSync.close();
     contacts.close();
     contactStore.close();
+    partnerStore.close();
     store.close();
     throw error;
   }
@@ -2118,6 +2139,7 @@ export async function createOrchestratorApplication(
     collaboration,
     contacts,
     contactSync,
+    partners,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -2226,6 +2248,7 @@ export async function createOrchestratorApplication(
         await attempt(() => contactSync.close());
         await attempt(() => contacts.close());
         await attempt(() => contactStore.close());
+        await attempt(() => partnerStore.close());
         await attempt(() => store.close());
         if (failures.length === 1) throw failures[0];
         if (failures.length > 1) throw new AggregateError(failures, "Some Orchestrator owners could not finish shutdown.");

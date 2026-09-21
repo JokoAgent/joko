@@ -10,6 +10,7 @@ export * from "./gen/joko/v1/mobile_push_pb.js";
 export * from "./gen/joko/v1/model_pb.js";
 export * from "./gen/joko/v1/objective_pb.js";
 export * from "./gen/joko/v1/operation_pb.js";
+export * from "./gen/joko/v1/partner_pb.js";
 export * from "./gen/joko/v1/pi_pb.js";
 export * from "./gen/joko/v1/portable_session_pb.js";
 export * from "./gen/joko/v1/remote_host_pb.js";

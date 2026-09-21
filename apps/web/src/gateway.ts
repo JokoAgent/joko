@@ -74,6 +74,11 @@ import {
   ContactVCardImportDecisionKind,
   ContactVCardImportDisposition,
   ContactVCardImportOutcome,
+  PartnerInitializationErrorCode,
+  PartnerInitializationState,
+  PartnerInvitationStage,
+  PartnerLifecycle,
+  PartnerService,
   CredentialKind,
   CredentialService,
   DeviceKind,
@@ -319,6 +324,9 @@ import {
   type ContactSummary as ProtoContactSummary,
   type ContactSyncStatus as ProtoContactSyncStatus,
   type ContactVCardImportPreviewEntry as ProtoContactVCardImportPreviewEntry,
+  type PartnerCapabilities as ProtoPartnerCapabilities,
+  type PartnerDirectory as ProtoPartnerDirectory,
+  type PartnerProfile as ProtoPartnerProfile,
   type CollaborationDirectory as ProtoCollaborationDirectory,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
@@ -559,6 +567,19 @@ import type {
   ModelView,
   ManagedModelRuntimeView,
   OperationApi,
+  PartnerCapabilitiesView,
+  PartnerDefaultsMutationView,
+  PartnerDirectoryView,
+  PartnerDraftView,
+  PartnerInitializationErrorCodeView,
+  PartnerInitializationStateView,
+  PartnerInvitationStageView,
+  PartnerLifecycleView,
+  PartnerListView,
+  PartnerModelRouteView,
+  PartnerMutationView,
+  PartnerPatchView,
+  PartnerProfileView,
   PermissionArgumentView,
   PermissionMode,
   PermissionSubjectView,
@@ -5762,6 +5783,116 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async deleteCredential(credentialId: string): Promise<void> {
     await this.submit({ case: "deleteCredential", value: { credentialReferenceId: credentialId } }, true);
+  }
+
+  async getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerDirectory({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerDirectory(response.directory);
+  }
+
+  async listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartners({
+      ...(lifecycle === undefined ? {} : { lifecycle: protoPartnerLifecycle(lifecycle) })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      partners: response.partners.map(mapPartnerProfile),
+      directory: mapPartnerDirectory(response.directory)
+    };
+  }
+
+  async getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartner({ partnerId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerProfile(response.partner);
+  }
+
+  async createPartner(
+    expectedDirectoryRevision: bigint,
+    draft: PartnerDraftView,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).createPartner({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      draft: {
+        displayName: draft.displayName,
+        avatar: draft.avatar,
+        identitySource: draft.identitySource,
+        templateId: draft.templateId,
+        ...(draft.capabilities === undefined ? {} : { capabilities: protoPartnerCapabilities(draft.capabilities) }),
+        usesDirectoryDefaults: draft.usesDirectoryDefaults
+      }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async updatePartner(
+    partnerId: string,
+    expectedRevision: bigint,
+    patch: PartnerPatchView,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).updatePartner({
+      partnerId,
+      expectedRevision: { value: expectedRevision },
+      patch: protoPartnerPatch(patch)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async setPartnerLifecycle(
+    partnerId: string,
+    expectedRevision: bigint,
+    lifecycle: PartnerLifecycleView,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).setPartnerLifecycle({
+      partnerId,
+      expectedRevision: { value: expectedRevision },
+      lifecycle: protoPartnerLifecycle(lifecycle)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async retryPartnerInitialization(
+    partnerId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retryPartnerInitialization({
+      partnerId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async updatePartnerDefaults(
+    expectedDirectoryRevision: bigint,
+    capabilities: PartnerCapabilitiesView,
+    signal?: AbortSignal
+  ): Promise<PartnerDefaultsMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).updatePartnerDefaults({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      capabilities: protoPartnerCapabilities(capabilities)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      directory: mapPartnerDirectory(response.directory),
+      affectedPartners: response.affectedPartners.map(mapPartnerProfile)
+    };
   }
 
   async getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView> {
@@ -16190,6 +16321,189 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
     }
   }
   return attachments;
+}
+
+function requiredPartnerRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 1n) throw new GatewayError(`Orchestrator returned an invalid ${label} revision.`);
+  return value.value;
+}
+
+function protoPartnerLifecycle(value: PartnerLifecycleView): PartnerLifecycle {
+  if (value === "active") return PartnerLifecycle.ACTIVE;
+  if (value === "archived") return PartnerLifecycle.ARCHIVED;
+  return PartnerLifecycle.DELETED;
+}
+
+function partnerLifecycle(value: PartnerLifecycle): PartnerLifecycleView {
+  if (value === PartnerLifecycle.ACTIVE) return "active";
+  if (value === PartnerLifecycle.ARCHIVED) return "archived";
+  if (value === PartnerLifecycle.DELETED) return "deleted";
+  throw new GatewayError("Orchestrator returned an unknown Partner lifecycle.");
+}
+
+function partnerInitializationState(value: PartnerInitializationState): PartnerInitializationStateView {
+  if (value === PartnerInitializationState.PENDING) return "pending";
+  if (value === PartnerInitializationState.READY) return "ready";
+  if (value === PartnerInitializationState.ERROR) return "error";
+  throw new GatewayError("Orchestrator returned an unknown Partner initialization state.");
+}
+
+function partnerInvitationStage(value: PartnerInvitationStage): PartnerInvitationStageView {
+  if (value === PartnerInvitationStage.HOME) return "home";
+  if (value === PartnerInvitationStage.AVATAR) return "avatar";
+  if (value === PartnerInvitationStage.SESSION) return "session";
+  if (value === PartnerInvitationStage.READY) return "ready";
+  if (value === PartnerInvitationStage.FAILED) return "failed";
+  throw new GatewayError("Orchestrator returned an unknown Partner invitation stage.");
+}
+
+function partnerInitializationError(value: PartnerInitializationErrorCode): PartnerInitializationErrorCodeView {
+  if (value === PartnerInitializationErrorCode.HOME_UNAVAILABLE) return "homeUnavailable";
+  if (value === PartnerInitializationErrorCode.AVATAR_UNAVAILABLE) return "avatarUnavailable";
+  if (value === PartnerInitializationErrorCode.MODEL_UNAVAILABLE) return "modelUnavailable";
+  if (value === PartnerInitializationErrorCode.SESSION_UNAVAILABLE) return "sessionUnavailable";
+  if (value === PartnerInitializationErrorCode.STATE_CHANGED) return "stateChanged";
+  throw new GatewayError("Orchestrator returned an unknown Partner initialization error.");
+}
+
+function protoPartnerRoute(value: PartnerModelRouteView) {
+  return {
+    backendId: value.backendId,
+    providerId: value.providerId,
+    modelId: value.modelId,
+    ...(value.effort === undefined ? {} : { effort: value.effort }),
+    fastMode: value.fastMode
+  };
+}
+
+function protoPartnerCapabilities(value: PartnerCapabilitiesView) {
+  return {
+    modelChain: value.modelChain.map(protoPartnerRoute),
+    permissionMode: protoPermission(value.permissionMode),
+    planMode: value.planMode
+  };
+}
+
+function protoPartnerPatch(value: PartnerPatchView) {
+  return {
+    ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
+    ...(value.avatar === undefined ? {} : { avatar: value.avatar }),
+    ...(value.identitySource === undefined ? {} : { identitySource: value.identitySource }),
+    ...(value.modelChain === undefined ? {} : { modelChain: { routes: value.modelChain.map(protoPartnerRoute) } }),
+    ...(value.permissionMode === undefined ? {} : { permissionMode: protoPermission(value.permissionMode) }),
+    ...(value.planMode === undefined ? {} : { planMode: value.planMode }),
+    ...(value.usesDirectoryDefaults === undefined ? {} : { usesDirectoryDefaults: value.usesDirectoryDefaults })
+  };
+}
+
+function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): PartnerCapabilitiesView {
+  if (value === undefined || value.modelChain.length < 1 || value.modelChain.length > 3) {
+    throw new GatewayError("Orchestrator returned an invalid Partner model chain.");
+  }
+  const routes = value.modelChain.map((route): PartnerModelRouteView => {
+    if (route.backendId.trim() === "" || route.providerId.trim() === "" || route.modelId.trim() === ""
+      || (route.effort !== undefined && route.effort.trim() === "")) {
+      throw new GatewayError("Orchestrator returned an incomplete Partner model route.");
+    }
+    return {
+      backendId: route.backendId,
+      providerId: route.providerId,
+      modelId: route.modelId,
+      ...(route.effort === undefined ? {} : { effort: route.effort }),
+      fastMode: route.fastMode
+    };
+  });
+  const backendId = routes[0]!.backendId;
+  const identities = new Set(routes.map((route) => `${route.providerId}\u0000${route.modelId}`));
+  if (routes.some((route) => route.backendId !== backendId) || identities.size !== routes.length) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner model chain.");
+  }
+  const permissionMode = value.permissionMode === ProtoPermissionMode.ASK ? "ask" as const
+    : value.permissionMode === ProtoPermissionMode.AUTO ? "auto" as const : undefined;
+  if (permissionMode === undefined) throw new GatewayError("Orchestrator returned an unsupported Partner permission mode.");
+  return { modelChain: routes, permissionMode, planMode: value.planMode };
+}
+
+function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfileView {
+  if (value === undefined || value.partnerId.trim() === "" || value.displayName.trim() === ""
+    || value.avatar.trim() === "" || value.identitySource.trim() === "" || value.templateId.trim() === ""
+    || value.homeTargetId.trim() === "" || value.profileVersion < 1n
+    || (value.canonicalSessionId !== undefined && value.canonicalSessionId.trim() === "")) {
+    throw new GatewayError("Orchestrator returned an incomplete Partner profile.");
+  }
+  const lifecycle = partnerLifecycle(value.lifecycle);
+  const initializationState = partnerInitializationState(value.initializationState);
+  const invitationStage = partnerInvitationStage(value.invitationStage);
+  const initializationErrorCode = value.initializationErrorCode === undefined
+    ? undefined : partnerInitializationError(value.initializationErrorCode);
+  if ((initializationState === "error") !== (initializationErrorCode !== undefined)
+    || (initializationState === "error") !== (invitationStage === "failed")
+    || (initializationState === "ready") !== (invitationStage === "ready")
+    || (initializationState === "ready" && value.canonicalSessionId === undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner initialization state.");
+  }
+  return {
+    id: value.partnerId,
+    revision: requiredPartnerRevision(value.revision, "Partner"),
+    profileVersion: value.profileVersion,
+    displayName: value.displayName,
+    avatar: value.avatar,
+    identitySource: value.identitySource,
+    templateId: value.templateId,
+    lifecycle,
+    initializationState,
+    invitationStage,
+    ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
+    homeTargetId: value.homeTargetId,
+    ...(value.canonicalSessionId === undefined ? {} : { canonicalSessionId: value.canonicalSessionId }),
+    capabilities: mapPartnerCapabilities(value.capabilities),
+    usesDirectoryDefaults: value.usesDirectoryDefaults,
+    createdAt: requiredContactTimestamp(value.createdAt, "Partner creation"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner update")
+  };
+}
+
+function mapPartnerDirectory(value: ProtoPartnerDirectory | undefined): PartnerDirectoryView {
+  if (value === undefined || ![value.activeCount, value.archivedCount, value.errorCount]
+    .every((count) => Number.isSafeInteger(count) && count >= 0)) {
+    throw new GatewayError("Orchestrator returned an invalid Partner directory.");
+  }
+  const templates = value.templates.map((template) => {
+    if (template.templateId.trim() === "" || template.displayName.trim() === ""
+      || template.description.trim() === "" || template.identitySource.trim() === "") {
+      throw new GatewayError("Orchestrator returned an incomplete Partner template.");
+    }
+    return {
+      id: template.templateId,
+      displayName: template.displayName,
+      description: template.description,
+      identitySource: template.identitySource
+    };
+  });
+  const templateIds = new Set(templates.map((template) => template.id));
+  const avatars = value.avatarPresets.map((avatar) => avatar.trim());
+  if (templateIds.size !== templates.length || avatars.some((avatar) => avatar === "")
+    || new Set(avatars).size !== avatars.length) {
+    throw new GatewayError("Orchestrator returned a duplicate Partner directory option.");
+  }
+  return {
+    revision: requiredPartnerRevision(value.revision, "Partner directory"),
+    activeCount: value.activeCount,
+    archivedCount: value.archivedCount,
+    errorCount: value.errorCount,
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner directory update"),
+    templates,
+    avatarPresets: avatars,
+    ...(value.defaultCapabilities === undefined
+      ? {} : { defaultCapabilities: mapPartnerCapabilities(value.defaultCapabilities) })
+  };
+}
+
+function mapPartnerMutation(
+  partner: ProtoPartnerProfile | undefined,
+  directory: ProtoPartnerDirectory | undefined
+): PartnerMutationView {
+  return { partner: mapPartnerProfile(partner), directory: mapPartnerDirectory(directory) };
 }
 
 function requiredContactRevision(value: { readonly value: bigint } | undefined, label: string): bigint {

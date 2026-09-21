@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+
+enum PartnerLifecycle {
+  PARTNER_LIFECYCLE_UNSPECIFIED = 0;
+  PARTNER_LIFECYCLE_ACTIVE = 1;
+  PARTNER_LIFECYCLE_ARCHIVED = 2;
+  PARTNER_LIFECYCLE_DELETED = 3;
+}
+
+enum PartnerInitializationState {
+  PARTNER_INITIALIZATION_STATE_UNSPECIFIED = 0;
+  PARTNER_INITIALIZATION_STATE_PENDING = 1;
+  PARTNER_INITIALIZATION_STATE_READY = 2;
+  PARTNER_INITIALIZATION_STATE_ERROR = 3;
+}
+
+enum PartnerInitializationErrorCode {
+  PARTNER_INITIALIZATION_ERROR_CODE_UNSPECIFIED = 0;
+  PARTNER_INITIALIZATION_ERROR_CODE_HOME_UNAVAILABLE = 1;
+  PARTNER_INITIALIZATION_ERROR_CODE_MODEL_UNAVAILABLE = 2;
+  PARTNER_INITIALIZATION_ERROR_CODE_SESSION_UNAVAILABLE = 3;
+  PARTNER_INITIALIZATION_ERROR_CODE_STATE_CHANGED = 4;
+  PARTNER_INITIALIZATION_ERROR_CODE_AVATAR_UNAVAILABLE = 5;
+}
+
+enum PartnerInvitationStage {
+  PARTNER_INVITATION_STAGE_UNSPECIFIED = 0;
+  PARTNER_INVITATION_STAGE_HOME = 1;
+  PARTNER_INVITATION_STAGE_AVATAR = 2;
+  PARTNER_INVITATION_STAGE_SESSION = 3;
+  PARTNER_INVITATION_STAGE_READY = 4;
+  PARTNER_INVITATION_STAGE_FAILED = 5;
+}
+
+message PartnerModelRoute {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  optional string effort = 4;
+  bool fast_mode = 5;
+}
+
+message PartnerModelChain {
+  repeated PartnerModelRoute routes = 1;
+}
+
+message PartnerCapabilities {
+  repeated PartnerModelRoute model_chain = 1;
+  PermissionMode permission_mode = 2;
+  bool plan_mode = 3;
+}
+
+message PartnerTemplate {
+  string template_id = 1;
+  string display_name = 2;
+  string description = 3;
+  string identity_source = 4;
+}
+
+message PartnerProfile {
+  string partner_id = 1;
+  Revision revision = 2;
+  uint64 profile_version = 3;
+  string display_name = 4;
+  string avatar = 5;
+  string identity_source = 6;
+  string template_id = 7;
+  PartnerLifecycle lifecycle = 8;
+  PartnerInitializationState initialization_state = 9;
+  PartnerInvitationStage invitation_stage = 10;
+  optional PartnerInitializationErrorCode initialization_error_code = 11;
+  string home_target_id = 12;
+  optional string canonical_session_id = 13;
+  PartnerCapabilities capabilities = 14;
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+  bool uses_directory_defaults = 17;
+}
+
+message PartnerDirectory {
+  Revision revision = 1;
+  uint32 active_count = 2;
+  uint32 archived_count = 3;
+  uint32 error_count = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  repeated PartnerTemplate templates = 6;
+  repeated string avatar_presets = 7;
+  optional PartnerCapabilities default_capabilities = 8;
+}
+
+message PartnerDraft {
+  string display_name = 1;
+  string avatar = 2;
+  string identity_source = 3;
+  string template_id = 4;
+  PartnerCapabilities capabilities = 5;
+  bool uses_directory_defaults = 6;
+}
+
+message PartnerPatch {
+  optional string display_name = 1;
+  optional string avatar = 2;
+  optional string identity_source = 3;
+  optional PartnerModelChain model_chain = 4;
+  optional PermissionMode permission_mode = 5;
+  optional bool plan_mode = 6;
+  optional bool uses_directory_defaults = 7;
+}
+
+message GetPartnerDirectoryRequest {}
+
+message GetPartnerDirectoryResponse {
+  PartnerDirectory directory = 1;
+}
+
+message ListPartnersRequest {
+  optional PartnerLifecycle lifecycle = 1;
+}
+
+message ListPartnersResponse {
+  repeated PartnerProfile partners = 1;
+  PartnerDirectory directory = 2;
+}
+
+message GetPartnerRequest {
+  string partner_id = 1;
+}
+
+message GetPartnerResponse {
+  PartnerProfile partner = 1;
+}
+
+message CreatePartnerRequest {
+  Revision expected_directory_revision = 1;
+  PartnerDraft draft = 2;
+}
+
+message CreatePartnerResponse {
+  PartnerProfile partner = 1;
+  PartnerDirectory directory = 2;
+}
+
+message UpdatePartnerRequest {
+  string partner_id = 1;
+  Revision expected_revision = 2;
+  PartnerPatch patch = 3;
+}
+
+message UpdatePartnerResponse {
+  PartnerProfile partner = 1;
+  PartnerDirectory directory = 2;
+}
+
+message SetPartnerLifecycleRequest {
+  string partner_id = 1;
+  Revision expected_revision = 2;
+  PartnerLifecycle lifecycle = 3;
+}
+
+message SetPartnerLifecycleResponse {
+  PartnerProfile partner = 1;
+  PartnerDirectory directory = 2;
+}
+
+message RetryPartnerInitializationRequest {
+  string partner_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RetryPartnerInitializationResponse {
+  PartnerProfile partner = 1;
+  PartnerDirectory directory = 2;
+}
+
+message UpdatePartnerDefaultsRequest {
+  Revision expected_directory_revision = 1;
+  PartnerCapabilities capabilities = 2;
+}
+
+message UpdatePartnerDefaultsResponse {
+  PartnerDirectory directory = 1;
+  repeated PartnerProfile affected_partners = 2;
+}

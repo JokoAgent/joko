@@ -1886,6 +1886,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
         <nav className="sidebar__utility" aria-label={t("a11y.productNavigation")}>
         <button type="button" className={cx(route.kind === "projects" && "is-active")} onClick={() => navigateAndClose({ kind: "projects" })}><FolderKanban aria-hidden="true" /><span>{t("nav.projects")}</span><span className="nav-count">{snapshot.targets.filter((target) => !target.archived).length}</span></button>
+        <button type="button" className={cx(route.kind === "partners" && "is-active")} onClick={() => navigateAndClose({ kind: "partners" })}><Bot aria-hidden="true" /><span>{t("nav.partners")}</span></button>
         <button type="button" className={cx(route.kind === "schedules" && "is-active")} onClick={() => navigateAndClose({ kind: "schedules" })}><CalendarClock aria-hidden="true" /><span>{t("nav.schedules")}</span><span className="nav-count">{snapshot.schedules.filter((schedule) => schedule.enabled).length}</span></button>
         <button type="button" className={cx(route.kind === "tools" && "is-active")} onClick={() => navigateAndClose({ kind: "tools" })}><Wrench aria-hidden="true" /><span>{t("nav.tools")}</span>{snapshot.diagnostics.length > 0 && <span className="notification-dot" />}</button>
         <button type="button" className={cx(route.kind === "settings" && "is-active")} onClick={() => navigateAndClose({ kind: "settings" })}><Settings aria-hidden="true" /><span>{t("nav.settings")}</span></button>
@@ -1993,6 +1994,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             label={t("workspace.browseFiles", { name: activeTarget.name })}
             onClick={() => callbacks.onBrowseFiles(activeSession)}
           ><FolderOpen aria-hidden="true" /></IconButton>}
+          <IconButton className={cx(route.kind === "partners" && "is-active")} label={t("nav.partners")} onClick={() => navigateAndClose({ kind: "partners" })}><Bot aria-hidden="true" /></IconButton>
           <IconButton className={cx(route.kind === "schedules" && "is-active")} label={t("nav.schedules")} onClick={() => navigateAndClose({ kind: "schedules" })}><CalendarClock aria-hidden="true" /></IconButton>
           <IconButton className={cx(route.kind === "tools" && "is-active")} label={t("nav.tools")} onClick={() => navigateAndClose({ kind: "tools" })}><Wrench aria-hidden="true" />{snapshot.diagnostics.length > 0 && <span className="notification-dot" />}</IconButton>
           <IconButton className={cx(route.kind === "settings" && "is-active")} label={t("nav.settings")} onClick={() => navigateAndClose({ kind: "settings" })}><Settings aria-hidden="true" /></IconButton>

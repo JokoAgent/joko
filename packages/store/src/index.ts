@@ -29,6 +29,14 @@ export {
 } from "./contact-sync.js";
 export type * from "./contact-sync.js";
 export {
+  PARTNER_SCHEMA_BASELINE_ID,
+  PartnerStore,
+  normalizedPartnerName
+} from "./partner-store.js";
+export type * from "./partner-store.js";
+export { PartnerStoreError } from "./partner-types.js";
+export type * from "./partner-types.js";
+export {
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   OperationalStore
 } from "./operational-store.js";

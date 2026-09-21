@@ -90,6 +90,7 @@ import {
 import { materializedSessionRuntimeState, SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
 import { materializedRuntimeCommands, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 import { providerRateLimitSettingKey } from "./provider-rate-limit.js";
+import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -1490,6 +1491,52 @@ describe("SessionHost", () => {
       : undefined))).toEqual(new Set(recoveries
       .filter((event) => event.payload.type === "runtime_recovery" && event.payload.state === "running")
       .map((event) => event.payload.type === "runtime_recovery" ? event.payload.recoveryId : undefined)));
+  });
+
+  it("uses a service-owned model chain while ordinary runtime fallback is disabled", async () => {
+    const adapter = new RuntimeRecoveryFakeAdapter();
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackEnabled: () => false,
+      serviceSessionRuntimeFallback: ({ current }) => ({
+        owned: true,
+        candidate: {
+          ...current,
+          providerId: "provider-b",
+          modelId: "reasoner"
+        }
+      }),
+      sessionRuntimeRecoveryDelayMs: () => 0
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-service-runtime-recovery",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Service runtime recovery",
+      providerId: "provider-a",
+      modelId: "reasoner",
+      effort: "medium",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+
+    fixture.host.enqueueInput({
+      operationId: "send-service-runtime-recovery",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "follow the owned chain", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+
+    await eventually(() => adapter.prompts.length === 3 && fixture.store.listRuns({
+      sessionId,
+      states: ["completed"],
+      limit: 10
+    }).length === 1, 5_000);
+    expect(adapter.modelSelections).toContainEqual({ providerId: "provider-b", modelId: "reasoner" });
+    expect(fixture.host.getSessionRuntimeControl(sessionId)).toMatchObject({
+      effective: { providerId: "provider-b", modelId: "reasoner" },
+      fallbackHop: 1
+    });
   });
 
   it("keeps a temporary route when the owner changes only effort and Fast", async () => {
@@ -8627,7 +8674,7 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(source.descriptor.id).descriptor.worktree).toEqual(source.descriptor.worktree);
   });
 
-  it("snapshots a private append prompt for fresh creation, restart, and derivation", async () => {
+  it("snapshots a private append prompt and safely advances a service-owned runtime identity", async () => {
     const adapter = new PersonalizationPromptFakeAdapter();
     const fixture = await createFixture(adapter);
     const prompt = "Keep answers concise and explain risky changes before editing.";
@@ -8656,6 +8703,12 @@ describe("SessionHost", () => {
     await fixture.host.resume(sessionId);
     expect(adapter.resumeContexts.at(-1)?.appendSystemPrompt).toBe(prompt);
 
+    const currentPrompt = "Use the current version-two long-lived partner identity.";
+    await fixture.host.updateServiceSessionPrompt(sessionId, currentPrompt);
+    expect(fixture.store.getSession(sessionId).descriptor.appendSystemPrompt).toBe(currentPrompt);
+    await fixture.host.resume(sessionId);
+    expect(adapter.resumeContexts.at(-1)?.appendSystemPrompt).toBe(currentPrompt);
+
     const derived = await fixture.host.deriveSession({
       operationId: "clone-personalized",
       connection: fixture.connection,
@@ -8663,7 +8716,7 @@ describe("SessionHost", () => {
       title: "Personalized clone",
       kind: "clone"
     });
-    expect(fixture.store.getSession(derived.value.sessionId).descriptor.appendSystemPrompt).toBe(prompt);
+    expect(fixture.store.getSession(derived.value.sessionId).descriptor.appendSystemPrompt).toBe(currentPrompt);
 
     await expect(fixture.host.createSession({
       operationId: "create-personalized-too-long",
@@ -12110,6 +12163,12 @@ async function createFixture(
     readonly modelRoutingEnabled?: (backendId: string, providerId: string, modelId: string) => boolean;
     readonly modelAccessRestricted?: (backendId: string) => boolean;
     readonly sessionRuntimeFallbackEnabled?: () => boolean;
+    readonly serviceSessionRuntimeFallback?: (input: {
+      readonly sessionId: string;
+      readonly current: SessionRuntimeProfile;
+      readonly visitedRoutes: readonly string[];
+      readonly currentHop: number;
+    }) => { readonly owned: boolean; readonly candidate?: SessionRuntimeProfile };
     readonly sessionRuntimeFallbackContext?: (backendId: string) => {
       readonly availableProviderIds: ReadonlySet<string>;
       readonly explicitDefault?: { readonly providerId: string; readonly modelId: string };

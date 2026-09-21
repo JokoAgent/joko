@@ -350,6 +350,103 @@ export interface RemoteHostCapabilitiesView {
   readonly backendRuntimeSetup: boolean;
 }
 
+export type PartnerLifecycleView = "active" | "archived" | "deleted";
+export type PartnerInitializationStateView = "pending" | "ready" | "error";
+export type PartnerInitializationErrorCodeView =
+  | "homeUnavailable"
+  | "avatarUnavailable"
+  | "modelUnavailable"
+  | "sessionUnavailable"
+  | "stateChanged";
+export type PartnerInvitationStageView = "home" | "avatar" | "session" | "ready" | "failed";
+export type PartnerPermissionModeView = Extract<PermissionMode, "ask" | "auto">;
+
+export interface PartnerModelRouteView {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+}
+
+export interface PartnerCapabilitiesView {
+  readonly modelChain: readonly PartnerModelRouteView[];
+  readonly permissionMode: PartnerPermissionModeView;
+  readonly planMode: boolean;
+}
+
+export interface PartnerTemplateView {
+  readonly id: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly identitySource: string;
+}
+
+export interface PartnerDirectoryView {
+  readonly revision: bigint;
+  readonly activeCount: number;
+  readonly archivedCount: number;
+  readonly errorCount: number;
+  readonly updatedAt: number;
+  readonly templates: readonly PartnerTemplateView[];
+  readonly avatarPresets: readonly string[];
+  readonly defaultCapabilities?: PartnerCapabilitiesView;
+}
+
+export interface PartnerProfileView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly profileVersion: bigint;
+  readonly displayName: string;
+  readonly avatar: string;
+  readonly identitySource: string;
+  readonly templateId: string;
+  readonly lifecycle: PartnerLifecycleView;
+  readonly initializationState: PartnerInitializationStateView;
+  readonly invitationStage: PartnerInvitationStageView;
+  readonly initializationErrorCode?: PartnerInitializationErrorCodeView;
+  readonly homeTargetId: string;
+  readonly canonicalSessionId?: string;
+  readonly capabilities: PartnerCapabilitiesView;
+  readonly usesDirectoryDefaults: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface PartnerDraftView {
+  readonly displayName: string;
+  readonly avatar: string;
+  readonly identitySource: string;
+  readonly templateId: string;
+  readonly capabilities?: PartnerCapabilitiesView;
+  readonly usesDirectoryDefaults: boolean;
+}
+
+export interface PartnerPatchView {
+  readonly displayName?: string;
+  readonly avatar?: string;
+  readonly identitySource?: string;
+  readonly modelChain?: readonly PartnerModelRouteView[];
+  readonly permissionMode?: PartnerPermissionModeView;
+  readonly planMode?: boolean;
+  readonly usesDirectoryDefaults?: boolean;
+}
+
+export interface PartnerListView {
+  readonly partners: readonly PartnerProfileView[];
+  readonly directory: PartnerDirectoryView;
+}
+
+export interface PartnerMutationView {
+  readonly partner: PartnerProfileView;
+  readonly directory: PartnerDirectoryView;
+}
+
+export interface PartnerDefaultsMutationView {
+  readonly directory: PartnerDirectoryView;
+  readonly affectedPartners: readonly PartnerProfileView[];
+}
+
 export type ContactKindView = "person" | "organization";
 export type ContactStatusView = "confirmed" | "pending";
 export type ContactSourceView = "manual" | "agent" | "import";
@@ -5090,6 +5187,14 @@ export interface OperationApi {
   clearProviderCredentialSurface(backendId: string, providerId: string, surfaceId: string): Promise<void>;
   saveCredential(draft: CredentialDraft, signal?: AbortSignal): Promise<void>;
   deleteCredential(credentialId: string): Promise<void>;
+  getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;
+  listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
+  getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;
+  createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatchView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  setPartnerLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  retryPartnerInitialization(partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerMutationView>;
+  updatePartnerDefaults(expectedDirectoryRevision: bigint, capabilities: PartnerCapabilitiesView, signal?: AbortSignal): Promise<PartnerDefaultsMutationView>;
   getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView>;
   setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView>;
   listContacts(options?: ContactListOptionsView, signal?: AbortSignal): Promise<ContactListPageView>;
