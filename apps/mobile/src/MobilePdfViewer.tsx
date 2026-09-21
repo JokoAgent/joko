@@ -7,7 +7,7 @@ import {
   type ForwardRefExoticComponent,
   type RefAttributes
 } from "react";
-import { AppState, View, type StyleProp, type ViewStyle } from "react-native";
+import { StyleSheet, Text, View, type AccessibilityValue, type StyleProp, type ViewStyle } from "react-native";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
@@ -16,10 +16,11 @@ import { MobilePdfTransferSession, type MobilePdfChunkFileDriver } from "./mobil
 import {
   buildMobilePdfViewerCommand,
   buildMobilePdfViewerHtml,
-  createMobilePdfViewerLifecycle,
   parseMobilePdfViewerMessage,
   type MobilePdfViewerStatus
 } from "./mobile-pdf-viewer";
+import { MobilePreviewControlBar, MobilePreviewControlButton } from "./MobilePreviewControls";
+import { useMobilePreviewResourceLifecycle } from "./use-mobile-preview-resource-lifecycle";
 
 interface MobilePdfWebViewHandle {
   postMessage(value: string): void;
@@ -69,35 +70,57 @@ export function MobilePdfViewer({
 }) {
   const webViewRef = useRef<MobilePdfWebViewHandle | null>(null);
   const transferRef = useRef<MobilePdfTransferSession | undefined>(undefined);
-  const lifecycleRef = useRef(createMobilePdfViewerLifecycle());
   const mountedRef = useRef(true);
-  const activeRef = useRef(AppState.currentState === "active");
   const statusRef = useRef(onStatusChange);
-  const [reloadGeneration, setReloadGeneration] = useState(0);
+  const [viewerStatus, setViewerStatus] = useState<MobilePdfViewerStatus>();
   statusRef.current = onStatusChange;
 
   const html = useMemo(() => buildMobilePdfViewerHtml({
     instanceId, locale, title, background, surface, ink, muted, accent, border
   }, pdfJsRuntime), [accent, background, border, ink, instanceId, locale, muted, surface, title]);
 
+  const publishStatus = useCallback((status: MobilePdfViewerStatus) => {
+    if (!mountedRef.current) return;
+    setViewerStatus(status);
+    statusRef.current?.(status);
+  }, []);
+
   const emitFailure = useCallback((_error: unknown, message = mobileMessage(locale, "preview.pdfError")) => {
     const text = message.replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 512)
       || mobileMessage(locale, "preview.pdfError");
-    statusRef.current?.({ type: "joko-pdf-viewer/status", instanceId, state: "error",
-      pageCount: 0, renderedPages: 0, zoomPercent: 100, error: text });
-  }, [instanceId, locale]);
+    publishStatus({ type: "joko-pdf-viewer/status", instanceId, state: "error",
+      pageCount: 0, currentPage: 0, renderedPages: 0, zoomPercent: 100, error: text });
+  }, [instanceId, locale, publishStatus]);
 
   const stopViewer = useCallback(() => {
     const transfer = transferRef.current;
     transferRef.current = undefined;
     void transfer?.abort().catch(() => undefined);
-    try { webViewRef.current?.postMessage(buildMobilePdfViewerCommand(instanceId, { command: "dispose" })); } catch {}
-    webViewRef.current?.stopLoading();
+    const handle = webViewRef.current;
+    webViewRef.current = null;
+    try { handle?.postMessage(buildMobilePdfViewerCommand(instanceId, { command: "dispose" })); } catch {}
+    handle?.stopLoading();
   }, [instanceId]);
 
-  const startTransfer = useCallback(() => {
-    const current = transferRef.current;
-    if (current) return;
+  const attachWebView = useCallback((handle: MobilePdfWebViewHandle | null) => {
+    if (handle) webViewRef.current = handle;
+    else stopViewer();
+  }, [stopViewer]);
+
+  const handleResourceFailure = useCallback((failure: "unavailable" | "recovery-exhausted") => {
+    emitFailure(undefined, mobileMessage(locale, failure === "unavailable"
+      ? "preview.resourcePressureUnavailable" : "preview.pdfFailure"));
+  }, [emitFailure, locale]);
+
+  const resource = useMobilePreviewResourceLifecycle({
+    ownerKey: [instanceId, uri, fileName, byteSize, sha256Hex, locale,
+      background, surface, ink, muted, accent, border, title].join("\u0000"),
+    releaseRenderer: stopViewer,
+    reportFailure: handleResourceFailure
+  });
+
+  const startTransfer = useCallback((rendererToken: string) => {
+    if (transferRef.current || !resource.ownsRenderer(rendererToken)) return;
     let transfer!: MobilePdfTransferSession;
     transfer = new MobilePdfTransferSession({
       instanceId,
@@ -107,7 +130,8 @@ export function MobilePdfViewer({
       sha256Hex,
       driver: readerDriver,
       send(message) {
-        if (!mountedRef.current || !activeRef.current || transferRef.current !== transfer) return;
+        if (!mountedRef.current || !resource.ownsRenderer(rendererToken)
+          || transferRef.current !== transfer) return;
         webViewRef.current?.postMessage(message);
       }
     });
@@ -116,29 +140,7 @@ export function MobilePdfViewer({
       if (transferRef.current !== transfer) return;
       emitFailure(error);
     });
-  }, [byteSize, emitFailure, fileName, instanceId, readerDriver, sha256Hex, uri]);
-
-  useEffect(() => {
-    activeRef.current = AppState.currentState === "active";
-    const subscription = AppState.addEventListener("change", (state) => {
-      const active = state === "active";
-      activeRef.current = active;
-      if (!active) {
-        lifecycleRef.current.onBackground();
-        stopViewer();
-        return;
-      }
-      const recovery = lifecycleRef.current.consumeReloadOnActive();
-      if (recovery === "reload") setReloadGeneration((value) => value + 1);
-      else if (recovery === "failed") emitFailure(undefined, mobileMessage(locale, "preview.pdfFailure"));
-    });
-    return () => subscription.remove();
-  }, [emitFailure, locale, stopViewer]);
-
-  useEffect(() => {
-    lifecycleRef.current.reset();
-    return stopViewer;
-  }, [instanceId, stopViewer, uri]);
+  }, [byteSize, emitFailure, fileName, instanceId, readerDriver, resource, sha256Hex, uri]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -149,12 +151,16 @@ export function MobilePdfViewer({
   }, [stopViewer]);
 
   const handleMessage = useCallback((event: WebViewMessageEvent) => {
-    if (!mountedRef.current || !activeRef.current) return;
+    const rendererToken = resource.rendererToken;
+    if (!mountedRef.current || !resource.ownsRenderer(rendererToken)) return;
     const message = parseMobilePdfViewerMessage(event.nativeEvent.data, instanceId);
     if (!message) return;
     if (message.type === "joko-pdf-viewer/status") {
-      statusRef.current?.(message);
-      if (message.state === "ready") startTransfer();
+      publishStatus(message);
+      if (message.state === "ready") {
+        resource.onRendererReady(rendererToken);
+        startTransfer(rendererToken);
+      }
       else if (message.state === "error") void transferRef.current?.abort().catch(() => undefined);
       return;
     }
@@ -164,21 +170,51 @@ export function MobilePdfViewer({
       if (transferRef.current !== transfer) return;
       emitFailure(error);
     });
-  }, [emitFailure, instanceId, startTransfer]);
+  }, [emitFailure, instanceId, publishStatus, resource, startTransfer]);
 
-  const recoverProcess = useCallback((): boolean => {
-    stopViewer();
-    const recovery = lifecycleRef.current.onProcessLost(activeRef.current);
-    if (recovery === "reload") setReloadGeneration((value) => value + 1);
-    else if (recovery === "failed") emitFailure(undefined, mobileMessage(locale, "preview.pdfFailure"));
-    return true;
-  }, [emitFailure, locale, stopViewer]);
+  useEffect(() => {
+    if (resource.phase !== "suspended" && resource.phase !== "recovering") return;
+    publishStatus({ type: "joko-pdf-viewer/status", instanceId, state: resource.phase,
+      pageCount: 0, currentPage: 0, renderedPages: 0, zoomPercent: 100, error: null });
+  }, [instanceId, publishStatus, resource.phase]);
+
+  const sendControl = useCallback((command: "fit" | "zoom-in" | "zoom-out" | "page-previous" | "page-next") => {
+    if (!resource.ownsRenderer(resource.rendererToken)) return;
+    webViewRef.current?.postMessage(buildMobilePdfViewerCommand(instanceId, { command }));
+  }, [instanceId, resource]);
+
+  const controllable = resource.phase === "active" && (viewerStatus?.pageCount ?? 0) > 0
+    && viewerStatus?.state !== "error";
+  const releasedLabel = mobileMessage(locale, resource.phase === "recovering"
+    ? "preview.status.pdfRecovering" : "preview.status.pdfSuspended");
 
   return <View style={style}>
-    <PdfWebView
-      key={`${instanceId}:${locale}:${reloadGeneration}`}
-      ref={(handle) => { if (handle) webViewRef.current = handle; }}
+    <MobilePreviewControlBar accessibilityLabel={mobileMessage(locale, "preview.pdfControls")}
+      background={surface} border={border}>
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfPrevious")}
+        disabled={!controllable || (viewerStatus?.currentPage ?? 0) <= 1} ink={ink} label="‹"
+        onPress={() => sendControl("page-previous")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfNext")}
+        disabled={!controllable || (viewerStatus?.currentPage ?? 0) >= (viewerStatus?.pageCount ?? 0)} ink={ink} label="›"
+        onPress={() => sendControl("page-next")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfFitLabel")}
+        disabled={!controllable} ink={ink} label={mobileMessage(locale, "preview.pdfFit")}
+        onPress={() => sendControl("fit")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfZoomOut")}
+        disabled={!controllable || (viewerStatus?.zoomPercent ?? 100) <= 50} ink={ink} label="−"
+        onPress={() => sendControl("zoom-out")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfZoomIn")}
+        disabled={!controllable || (viewerStatus?.zoomPercent ?? 100) >= 300} ink={ink} label="+"
+        onPress={() => sendControl("zoom-in")} surface={background} />
+    </MobilePreviewControlBar>
+    {resource.rendererMounted ? <PdfWebView
+      key={`${instanceId}:${resource.rendererGeneration}`}
+      ref={attachWebView}
       accessibilityLabel={mobileMessage(locale, "preview.pdfLabel", { title })}
+      accessibilityState={{ busy: resource.phase === "recovering"
+        || viewerStatus?.state === "receiving" || viewerStatus?.state === "rendering",
+        disabled: viewerStatus?.state === "error" }}
+      accessibilityValue={pdfAccessibilityValue(viewerStatus)}
       allowFileAccess={false}
       allowFileAccessFromFileURLs={false}
       allowUniversalAccessFromFileURLs={false}
@@ -187,9 +223,9 @@ export function MobilePdfViewer({
       javaScriptCanOpenWindowsAutomatically={false}
       javaScriptEnabled
       mixedContentMode="never"
-      onContentProcessDidTerminate={recoverProcess}
+      onContentProcessDidTerminate={() => resource.onRendererProcessLost(resource.rendererToken)}
       onMessage={handleMessage}
-      onRenderProcessGone={recoverProcess}
+      onRenderProcessGone={() => resource.onRendererProcessLost(resource.rendererToken)}
       onShouldStartLoadWithRequest={(request: { readonly url: string }) => request.url === "about:blank"
         || request.url === pdfViewerBaseUrl || request.url === `${pdfViewerBaseUrl}/`}
       originWhitelist={["about:blank", pdfViewerBaseUrl]}
@@ -199,6 +235,21 @@ export function MobilePdfViewer({
       source={{ html, baseUrl: pdfViewerBaseUrl }}
       style={{ backgroundColor: "transparent", flex: 1 }}
       thirdPartyCookiesEnabled={false}
-    />
+    /> : <View accessible accessibilityRole="text" accessibilityLabel={releasedLabel}
+      accessibilityState={{ busy: resource.phase === "recovering", disabled: resource.phase !== "recovering" }}
+      style={[styles.placeholder, { backgroundColor: background }]}>
+      <Text style={[styles.placeholderText, { color: ink }]}>{releasedLabel}</Text>
+    </View>}
   </View>;
 }
+
+function pdfAccessibilityValue(status: MobilePdfViewerStatus | undefined): AccessibilityValue | undefined {
+  if (!status || status.pageCount < 1 || status.currentPage < 1) return undefined;
+  return { min: 1, now: status.currentPage, max: status.pageCount,
+    text: `${status.currentPage}/${status.pageCount} · ${status.zoomPercent}%` };
+}
+
+const styles = StyleSheet.create({
+  placeholder: { flex: 1, minHeight: 200, alignItems: "center", justifyContent: "center", padding: 24 },
+  placeholderText: { fontSize: 14, lineHeight: 20, textAlign: "center" }
+});

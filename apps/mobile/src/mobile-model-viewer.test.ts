@@ -3,7 +3,6 @@ import {
   assertMobileModelViewerManifest,
   buildMobileModelViewerCommand,
   buildMobileModelViewerHtml,
-  createMobileModelViewerLifecycle,
   parseMobileModelViewerMessage,
   type MobileModelRuntimeBundle,
   type MobileModelViewerManifest
@@ -22,6 +21,10 @@ describe("mobile model viewer protocol", () => {
       .toMatchObject({ command: "commit" });
     expect(JSON.parse(buildMobileModelViewerCommand("model-1", { command: "dispose" })))
       .toMatchObject({ command: "dispose" });
+    expect(JSON.parse(buildMobileModelViewerCommand("model-1", { command: "reset" })))
+      .toEqual({ type: "joko-model-viewer/command", instanceId: "model-1", command: "reset" });
+    expect(JSON.parse(buildMobileModelViewerCommand("model-1", { command: "zoom-in" })))
+      .toMatchObject({ command: "zoom-in" });
     expect(() => assertMobileModelViewerManifest({ ...manifest,
       files: manifest.files.map((file, index) => index === 1 ? { ...file, byteOffset: 7 } : file)
     })).toThrow(/manifest|layout/u);
@@ -32,18 +35,20 @@ describe("mobile model viewer protocol", () => {
 
   it("accepts exact instance-bound status and acknowledgements only", () => {
     expect(parseMobileModelViewerMessage(JSON.stringify({
-      type: "joko-model-viewer/status", instanceId: "model-1", state: "complete", fileCount: 2, error: null
-    }), "model-1")).toMatchObject({ state: "complete", fileCount: 2 });
+      type: "joko-model-viewer/status", instanceId: "model-1", state: "complete",
+      fileCount: 2, zoomPercent: 125, error: null
+    }), "model-1")).toMatchObject({ state: "complete", fileCount: 2, zoomPercent: 125 });
     expect(parseMobileModelViewerMessage(JSON.stringify({
       type: "joko-model-viewer/ack", instanceId: "model-1", command: "chunk",
       fileIndex: 1, index: 2, offset: 8, byteSize: 4
     }), "model-1")).toMatchObject({ command: "chunk", fileIndex: 1, index: 2, offset: 8, byteSize: 4 });
     expect(parseMobileModelViewerMessage(JSON.stringify({
-      type: "joko-model-viewer/status", instanceId: "forged", state: "complete", fileCount: 2, error: null
+      type: "joko-model-viewer/status", instanceId: "forged", state: "complete",
+      fileCount: 2, zoomPercent: 100, error: null
     }), "model-1")).toBeUndefined();
     expect(parseMobileModelViewerMessage(JSON.stringify({
       type: "joko-model-viewer/status", instanceId: "model-1", state: "complete",
-      fileCount: 2, error: null, extra: true
+      fileCount: 2, zoomPercent: 100, error: null, extra: true
     }), "model-1")).toBeUndefined();
   });
 });
@@ -75,19 +80,6 @@ describe("mobile model viewer HTML", () => {
       instanceId: "model-1", locale: "en", title: "Scene", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, { ...runtime, modelViewerVersion: "4.3.0" })).toThrow(/runtime bundle/u);
-  });
-});
-
-describe("mobile model viewer lifecycle", () => {
-  it("retires on background, reloads once, and then fails closed", () => {
-    const lifecycle = createMobileModelViewerLifecycle();
-    lifecycle.onLoadEnd();
-    lifecycle.onBackground();
-    expect(lifecycle.consumeReloadOnActive()).toBe("reload");
-    expect(lifecycle.onProcessLost(true)).toBe("failed");
-    lifecycle.reset();
-    expect(lifecycle.onProcessLost(false)).toBe("wait");
-    expect(lifecycle.consumeReloadOnActive()).toBe("reload");
   });
 });
 

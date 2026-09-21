@@ -17,13 +17,15 @@ export const mobileModelViewerLimits = {
   threeVersion: "0.183.2"
 } as const;
 
-export type MobileModelViewerState = "ready" | "receiving" | "loading" | "complete" | "error";
+export type MobileModelRendererState = "ready" | "receiving" | "loading" | "complete" | "error";
+export type MobileModelViewerState = MobileModelRendererState | "suspended" | "recovering";
 
 export interface MobileModelViewerStatus {
   readonly type: "joko-model-viewer/status";
   readonly instanceId: string;
   readonly state: MobileModelViewerState;
   readonly fileCount: number;
+  readonly zoomPercent: number;
   readonly error: string | null;
 }
 
@@ -60,7 +62,8 @@ export type MobileModelViewerCommand =
   | { readonly command: "chunk"; readonly fileIndex: number; readonly index: number;
       readonly offset: number; readonly base64: string }
   | { readonly command: "commit" }
-  | { readonly command: "dispose" };
+  | { readonly command: "dispose" }
+  | { readonly command: "zoom-in" | "zoom-out" | "reset" };
 
 export function buildMobileModelViewerCommand(instanceId: string, command: MobileModelViewerCommand): string {
   const exactInstanceId = viewerInstanceId(instanceId);
@@ -92,7 +95,8 @@ export function buildMobileModelViewerCommand(instanceId: string, command: Mobil
       command: "chunk", fileIndex: command.fileIndex, index: command.index,
       offset: command.offset, base64: command.base64 });
   }
-  if (command.command !== "commit" && command.command !== "dispose") {
+  if (command.command !== "commit" && command.command !== "dispose" && command.command !== "zoom-in"
+    && command.command !== "zoom-out" && command.command !== "reset") {
     throw new Error("The model viewer command is invalid.");
   }
   return JSON.stringify({ type: "joko-model-viewer/command", instanceId: exactInstanceId,
@@ -124,16 +128,19 @@ export function parseMobileModelViewerMessage(
         byteSize: value["byteSize"] as number };
     }
     if (value["type"] !== "joko-model-viewer/status"
-      || !exactKeys(value, ["type", "instanceId", "state", "fileCount", "error"])
+      || !exactKeys(value, ["type", "instanceId", "state", "fileCount", "zoomPercent", "error"])
       || !modelViewerState(value["state"])
       || !Number.isSafeInteger(value["fileCount"]) || (value["fileCount"] as number) < 0
       || (value["fileCount"] as number) > MOBILE_MODEL_PREVIEW_MAXIMUM_FILES
+      || !Number.isSafeInteger(value["zoomPercent"]) || (value["zoomPercent"] as number) < 25
+      || (value["zoomPercent"] as number) > 400
       || !viewerError(value["error"])) return undefined;
     return {
       type: "joko-model-viewer/status",
       instanceId: exactInstanceId,
       state: value["state"],
       fileCount: value["fileCount"] as number,
+      zoomPercent: value["zoomPercent"] as number,
       error: value["error"]
     };
   } catch {
@@ -256,7 +263,7 @@ export function buildMobileModelViewerHtml({
     body { display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow: hidden; }
     #toolbar { align-items: center; background: ${cssColor(surface)}; border-bottom: 1px solid ${cssColor(border)}; display: flex; flex: 0 0 auto; gap: 8px; min-height: 48px; padding: 6px 10px; }
     #status { color: ${cssColor(muted)}; flex: 1; font-size: 13px; line-height: 18px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    button { background: ${cssColor(background)}; border: 1px solid ${cssColor(border)}; border-radius: 10px; color: ${cssColor(ink)}; font: inherit; font-weight: 650; min-height: 34px; min-width: 38px; padding: 6px 10px; }
+    button { background: ${cssColor(background)}; border: 1px solid ${cssColor(border)}; border-radius: 10px; color: ${cssColor(ink)}; font: inherit; font-weight: 650; min-height: 44px; min-width: 44px; padding: 8px 10px; }
     button:focus-visible { outline: 3px solid ${cssColor(accent)}; outline-offset: 1px; }
     #stage { align-items: center; display: flex; flex: 1 1 auto; justify-content: center; min-height: 0; overflow: hidden; position: relative; touch-action: none; }
     model-viewer { background: ${cssColor(background)}; height: 100%; width: 100%; }
@@ -286,6 +293,8 @@ export function buildMobileModelViewerHtml({
       var disposed = false;
       var viewer = null;
       var viewerTimer = 0;
+      var zoomPercent = 100;
+      var currentState = 'ready';
       var ownedUrls = [];
       var stage = document.getElementById('stage');
       var statusNode = document.getElementById('status');
@@ -303,6 +312,7 @@ export function buildMobileModelViewerHtml({
         return labels.error;
       }
       function emit(state, error) {
+        currentState = state;
         var count = manifest && Array.isArray(manifest.files) ? manifest.files.length : 0;
         var label = state === 'ready' ? labels.ready
           : state === 'receiving' ? labels.receiving
@@ -312,7 +322,8 @@ export function buildMobileModelViewerHtml({
         statusNode.textContent = label;
         statusNode.setAttribute('role', state === 'error' ? 'alert' : 'status');
         post({ type: 'joko-model-viewer/status', instanceId: instanceId,
-          state: state, fileCount: count, error: state === 'error' ? cleanError(error) : null });
+          state: state, fileCount: count, zoomPercent: zoomPercent,
+          error: state === 'error' ? cleanError(error) : null });
       }
       function ack(command, fileIndex, index, offset, byteSize) {
         post({ type: 'joko-model-viewer/ack', instanceId: instanceId, command: command,
@@ -385,7 +396,8 @@ export function buildMobileModelViewerHtml({
             && Number.isSafeInteger(value.offset) && value.offset >= 0 && typeof value.base64 === 'string'
             && value.base64.length >= 4 && value.base64.length <= Math.ceil(MAX_CHUNK / 3) * 4
             && value.base64.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value.base64)) return value;
-          if ((value.command === 'commit' || value.command === 'dispose')
+          if ((value.command === 'commit' || value.command === 'dispose' || value.command === 'zoom-in'
+            || value.command === 'zoom-out' || value.command === 'reset')
             && exactKeys(value, ['type','instanceId','command'])) return value;
         } catch (_) {}
         return null;
@@ -525,12 +537,15 @@ export function buildMobileModelViewerHtml({
         var radius = Math.max(0.001, Math.min(1000000, orbit.radius * factor));
         viewer.cameraOrbit = String(orbit.theta) + 'rad ' + String(orbit.phi) + 'rad ' + String(radius) + 'm';
         if (typeof viewer.jumpCameraToGoal === 'function') viewer.jumpCameraToGoal();
+        zoomPercent = Math.max(50, Math.min(300, Math.round(zoomPercent / factor)));
+        emit(currentState, null);
       }
       function reset() {
         if (!viewer) return;
         viewer.cameraOrbit = 'auto auto auto'; viewer.cameraTarget = 'auto auto auto'; viewer.fieldOfView = 'auto';
         if (typeof viewer.resetTurntableRotation === 'function') viewer.resetTurntableRotation();
         if (typeof viewer.jumpCameraToGoal === 'function') viewer.jumpCameraToGoal();
+        zoomPercent = 100; emit(currentState, null);
       }
       function dispose() {
         if (disposed) return;
@@ -540,6 +555,9 @@ export function buildMobileModelViewerHtml({
       function receive(value) {
         if (value.command === 'dispose') { dispose(); return; }
         if (disposed || committing) return;
+        if (value.command === 'zoom-out') { zoom(1.25); return; }
+        if (value.command === 'zoom-in') { zoom(0.8); return; }
+        if (value.command === 'reset') { reset(); return; }
         if (value.command === 'begin') {
           if (manifest || bytes) { fail('The model transfer was started more than once.'); return; }
           manifest = { byteSize: value.byteSize, sha256Hex: value.sha256Hex, modelKind: value.modelKind,
@@ -600,33 +618,6 @@ export function buildMobileModelViewerHtml({
 </html>`;
 }
 
-export function createMobileModelViewerLifecycle(maximumReloads = 1) {
-  if (!Number.isSafeInteger(maximumReloads) || maximumReloads < 0 || maximumReloads > 3) {
-    throw new Error("The model viewer reload budget is invalid.");
-  }
-  let reloadOnActive = false;
-  let reloads = 0;
-  return {
-    onLoadStart() {},
-    onLoadEnd() {},
-    onBackground() { reloadOnActive = true; },
-    onProcessLost(active: boolean): "reload" | "wait" | "failed" {
-      if (!active) { reloadOnActive = true; return "wait"; }
-      if (reloads >= maximumReloads) return "failed";
-      reloads += 1;
-      return "reload";
-    },
-    consumeReloadOnActive(): "reload" | "failed" | undefined {
-      if (!reloadOnActive) return undefined;
-      reloadOnActive = false;
-      if (reloads >= maximumReloads) return "failed";
-      reloads += 1;
-      return "reload";
-    },
-    reset() { reloadOnActive = false; reloads = 0; }
-  };
-}
-
 function assertRuntimeBundle(runtime: MobileModelRuntimeBundle): void {
   if (!plainObject(runtime)
     || !exactKeys(runtime, ["modelViewerVersion", "threeVersion", "script", "scriptSha256Hex"])
@@ -643,7 +634,7 @@ function modelAckCommand(value: unknown): value is MobileModelViewerAck["command
   return value === "begin" || value === "chunk" || value === "commit";
 }
 
-function modelViewerState(value: unknown): value is MobileModelViewerState {
+function modelViewerState(value: unknown): value is MobileModelRendererState {
   return value === "ready" || value === "receiving" || value === "loading"
     || value === "complete" || value === "error";
 }

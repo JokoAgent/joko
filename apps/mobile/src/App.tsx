@@ -5468,7 +5468,10 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
     ? mobileMessage(locale, "files.generated")
     : files.location.path || files.workspace?.displayName || mobileMessage(locale, "files.workspace");
 
+  const previewModalOpen = files.preview !== undefined || imageGallery.view !== undefined;
   return <View style={styles.fill}>
+    <View style={styles.fill} accessibilityElementsHidden={previewModalOpen}
+      importantForAccessibility={previewModalOpen ? "no-hide-descendants" : "auto"}>
     <View style={[styles.header, { borderBottomColor: colors.border }]}>
       <Back onPress={leave} colors={colors} label={mobileMessage(locale, "files.task")}
         accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "files.task") })} />
@@ -5630,6 +5633,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
           })}
         </>}
       </ScrollView>}
+    </View>
     <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
       onShare={previewSource && shareableMobileFilesSource(previewSource)
@@ -5717,6 +5721,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
   const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
   const [modelStatus, setModelStatus] = useState<MobileModelViewerStatus>();
+  const closeRequestedForRef = useRef<string | undefined>(undefined);
   const exactBackLabel = backLabel ?? mobileMessage(locale, "preview.filesTitle");
   const exactLoadingLabel = loadingLabel ?? mobileMessage(locale, "preview.loadingExact");
   const mediaLeaseId = preview?.kind === "media" ? preview.leaseId : undefined;
@@ -5726,11 +5731,21 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   useEffect(() => setPdfStatus(undefined), [pdfLeaseId]);
   useEffect(() => setModelStatus(undefined), [modelLeaseId]);
   const blocked = busy || sharing;
-  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={blocked ? () => undefined : onClose}>
-    <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
+  const previewIdentity = preview ? `${preview.kind}\u0000${preview.revisionKey}` : undefined;
+  useEffect(() => {
+    if (previewIdentity === undefined) closeRequestedForRef.current = undefined;
+  }, [previewIdentity]);
+  const requestClose = useCallback(() => {
+    if (blocked || previewIdentity === undefined || closeRequestedForRef.current === previewIdentity) return;
+    closeRequestedForRef.current = previewIdentity;
+    onClose();
+  }, [blocked, onClose, previewIdentity]);
+  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={requestClose}>
+    <SafeAreaView accessibilityViewIsModal style={[styles.fill, { backgroundColor: colors.background }]}
+      edges={["top", "bottom", "left", "right"]}>
       {preview && <>
         <View style={[styles.header, { borderBottomColor: colors.border }]}>
-          <Back onPress={onClose} colors={colors} label={exactBackLabel}
+          <Back onPress={requestClose} colors={colors} label={exactBackLabel}
             accessibilityLabel={backAccessibilityLabel ?? mobileMessage(locale, "common.backTo", { label: exactBackLabel })}
             disabled={blocked} />
           <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{preview.title}</Text>
@@ -5763,13 +5778,19 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
               end: preview.endByte.toString(10)
             })}
           </Text>}
-          {preview.kind === "media" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: mediaStatus?.state === "error" ? colors.negative : colors.muted }]}>
+          {preview.kind === "media" && <Text accessibilityRole={mediaStatus?.state === "error" ? "alert" : "text"}
+            accessibilityLiveRegion={mediaStatus?.state === "error" ? "assertive" : "polite"}
+            style={[styles.caption, { color: mediaStatus?.state === "error" ? colors.negative : colors.muted }]}>
             {formatMobileMediaPlayerStatus(mediaStatus, preview.mediaKind, locale)}
           </Text>}
-          {preview.kind === "pdf" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: pdfStatus?.state === "error" ? colors.negative : colors.muted }]}>
+          {preview.kind === "pdf" && <Text accessibilityRole={pdfStatus?.state === "error" ? "alert" : "text"}
+            accessibilityLiveRegion={pdfStatus?.state === "error" ? "assertive" : "polite"}
+            style={[styles.caption, { color: pdfStatus?.state === "error" ? colors.negative : colors.muted }]}>
             {formatMobilePdfViewerStatus(pdfStatus, locale)}
           </Text>}
-          {preview.kind === "model" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: modelStatus?.state === "error" ? colors.negative : colors.muted }]}>
+          {preview.kind === "model" && <Text accessibilityRole={modelStatus?.state === "error" ? "alert" : "text"}
+            accessibilityLiveRegion={modelStatus?.state === "error" ? "assertive" : "polite"}
+            style={[styles.caption, { color: modelStatus?.state === "error" ? colors.negative : colors.muted }]}>
             {formatMobileModelViewerStatus(modelStatus, locale)}
           </Text>}
         </View>
@@ -5787,6 +5808,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
             <MobileMediaPlayer
               key={preview.leaseId}
               background={colors.background}
+              border={colors.border}
               ink={colors.ink}
               instanceId={preview.leaseId}
               kind={preview.mediaKind}
@@ -5856,12 +5878,15 @@ function formatMobilePdfViewerStatus(
 ): string {
   if (!status) return mobileMessage(locale, "preview.status.preparingPdf");
   if (status.state === "error") return status.error || mobileMessage(locale, "preview.pdfError");
+  if (status.state === "suspended") return mobileMessage(locale, "preview.status.pdfSuspended");
+  if (status.state === "recovering") return mobileMessage(locale, "preview.status.pdfRecovering");
   if (status.state === "ready") return mobileMessage(locale, "preview.status.pdfReady");
   if (status.state === "receiving") return mobileMessage(locale, "preview.status.receivingPdf");
   if (status.state === "document" || status.state === "complete") {
     return mobileMessage(locale, status.state === "document"
       ? "preview.status.pdfDocument" : "preview.status.pdfComplete", {
       pages: status.pageCount,
+      page: status.currentPage,
       zoom: status.zoomPercent
     });
   }
@@ -5877,6 +5902,8 @@ function formatMobileModelViewerStatus(
 ): string {
   if (!status) return mobileMessage(locale, "preview.status.preparingModel");
   if (status.state === "error") return status.error || mobileMessage(locale, "preview.modelError");
+  if (status.state === "suspended") return mobileMessage(locale, "preview.status.modelSuspended");
+  if (status.state === "recovering") return mobileMessage(locale, "preview.status.modelRecovering");
   if (status.state === "ready") return mobileMessage(locale, "preview.status.modelReady");
   if (status.state === "receiving") return mobileMessage(locale, "preview.status.receivingModel");
   if (status.state === "loading") return mobileMessage(locale, "preview.status.loadingModelFiles", {
@@ -5885,7 +5912,8 @@ function formatMobileModelViewerStatus(
   });
   return mobileMessage(locale, "preview.status.modelComplete", {
     files: status.fileCount,
-    kind: mobileMessage(locale, status.fileCount === 1 ? "preview.status.file" : "preview.status.files")
+    kind: mobileMessage(locale, status.fileCount === 1 ? "preview.status.file" : "preview.status.files"),
+    zoom: status.zoomPercent
   });
 }
 
@@ -5898,6 +5926,8 @@ function formatMobileMediaPlayerStatus(
     kind: mobileMessage(locale, kind === "video" ? "preview.video" : "preview.audio")
   });
   if (status.state === "error") return status.error || mobileMessage(locale, "preview.mediaError");
+  if (status.state === "suspended") return mobileMessage(locale, "preview.status.mediaSuspended");
+  if (status.state === "recovering") return mobileMessage(locale, "preview.status.mediaRecovering");
   const current = status.currentTime === null ? undefined : formatMediaTime(status.currentTime);
   const duration = status.duration === null ? undefined : formatMediaTime(status.duration);
   const progress = current && duration ? `· ${current} / ${duration}` : current ? `· ${current}` : "";

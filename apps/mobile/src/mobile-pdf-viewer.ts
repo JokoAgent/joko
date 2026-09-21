@@ -11,13 +11,15 @@ export const mobilePdfViewerLimits = {
   standardFontResourceCount: 16
 } as const;
 
-export type MobilePdfViewerState = "ready" | "receiving" | "document" | "rendering" | "complete" | "error";
+export type MobilePdfRendererState = "ready" | "receiving" | "document" | "rendering" | "complete" | "error";
+export type MobilePdfViewerState = MobilePdfRendererState | "suspended" | "recovering";
 
 export interface MobilePdfViewerStatus {
   readonly type: "joko-pdf-viewer/status";
   readonly instanceId: string;
   readonly state: MobilePdfViewerState;
   readonly pageCount: number;
+  readonly currentPage: number;
   readonly renderedPages: number;
   readonly zoomPercent: number;
   readonly error: string | null;
@@ -48,7 +50,8 @@ export type MobilePdfViewerCommand =
   | { readonly command: "begin"; readonly byteSize: number; readonly sha256Hex: string }
   | { readonly command: "chunk"; readonly index: number; readonly offset: number; readonly base64: string }
   | { readonly command: "commit" }
-  | { readonly command: "dispose" };
+  | { readonly command: "dispose" }
+  | { readonly command: "fit" | "zoom-in" | "zoom-out" | "page-previous" | "page-next" };
 
 export function buildMobilePdfViewerCommand(instanceId: string, command: MobilePdfViewerCommand): string {
   const exactInstanceId = viewerInstanceId(instanceId);
@@ -71,7 +74,9 @@ export function buildMobilePdfViewerCommand(instanceId: string, command: MobileP
     return JSON.stringify({ type: "joko-pdf-viewer/command", instanceId: exactInstanceId,
       command: "chunk", index: command.index, offset: command.offset, base64: command.base64 });
   }
-  if (command.command !== "commit" && command.command !== "dispose") {
+  if (command.command !== "commit" && command.command !== "dispose" && command.command !== "fit"
+    && command.command !== "zoom-in" && command.command !== "zoom-out"
+    && command.command !== "page-previous" && command.command !== "page-next") {
     throw new Error("The PDF viewer command is invalid.");
   }
   return JSON.stringify({ type: "joko-pdf-viewer/command", instanceId: exactInstanceId, command: command.command });
@@ -91,8 +96,9 @@ export function parseMobilePdfViewerMessage(data: string, instanceId: string): M
         command: value["command"], index: value["index"] as number };
     }
     if (value["type"] !== "joko-pdf-viewer/status"
-      || !exactKeys(value, ["type", "instanceId", "state", "pageCount", "renderedPages", "zoomPercent", "error"])
+      || !exactKeys(value, ["type", "instanceId", "state", "pageCount", "currentPage", "renderedPages", "zoomPercent", "error"])
       || !pdfViewerState(value["state"]) || !safeCount(value["pageCount"], mobilePdfViewerLimits.maximumPageCount)
+      || !safeCurrentPage(value["currentPage"], value["pageCount"] as number)
       || !safeCount(value["renderedPages"], value["pageCount"] as number)
       || !Number.isSafeInteger(value["zoomPercent"]) || (value["zoomPercent"] as number) < 25
       || (value["zoomPercent"] as number) > 400 || !viewerError(value["error"])) return undefined;
@@ -101,6 +107,7 @@ export function parseMobilePdfViewerMessage(data: string, instanceId: string): M
       instanceId: exactInstanceId,
       state: value["state"],
       pageCount: value["pageCount"] as number,
+      currentPage: value["currentPage"] as number,
       renderedPages: value["renderedPages"] as number,
       zoomPercent: value["zoomPercent"] as number,
       error: value["error"]
@@ -163,7 +170,7 @@ export function buildMobilePdfViewerHtml({
     body { display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow: hidden; }
     #toolbar { align-items: center; background: ${cssColor(surface)}; border-bottom: 1px solid ${cssColor(border)}; display: flex; flex: 0 0 auto; gap: 8px; min-height: 48px; padding: 6px 10px; }
     #status { color: ${cssColor(muted)}; flex: 1; font-size: 13px; line-height: 18px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    button { background: ${cssColor(background)}; border: 1px solid ${cssColor(border)}; border-radius: 10px; color: ${cssColor(ink)}; font: inherit; font-weight: 650; min-height: 34px; min-width: 38px; padding: 6px 10px; }
+    button { background: ${cssColor(background)}; border: 1px solid ${cssColor(border)}; border-radius: 10px; color: ${cssColor(ink)}; font: inherit; font-weight: 650; min-height: 44px; min-width: 44px; padding: 8px 10px; }
     button:focus-visible { outline: 3px solid ${cssColor(accent)}; outline-offset: 1px; }
     #pages { align-items: center; display: flex; flex: 1 1 auto; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
     .page { align-items: center; background: ${cssColor(surface)}; border: 1px solid ${cssColor(border)}; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); display: flex; flex: 0 0 auto; justify-content: center; min-height: 320px; overflow: hidden; position: relative; width: min(100%, 760px); }
@@ -204,6 +211,8 @@ export function buildMobilePdfViewerHtml({
       var resident = [];
       var seen = new Set();
       var pageCount = 0;
+      var currentPage = 0;
+      var currentState = 'ready';
       var zoom = 1;
       var fit = true;
       var pages = document.getElementById('pages');
@@ -227,6 +236,7 @@ export function buildMobilePdfViewerHtml({
         return labels.error;
       }
       function emit(state, error) {
+        currentState = state;
         var label = state === 'ready' ? labels.ready
           : state === 'receiving' ? labels.receiving
           : state === 'document' ? text(labels.pageCount, { pages: pageCount })
@@ -235,7 +245,8 @@ export function buildMobilePdfViewerHtml({
           : text(labels.renderedProgress, { rendered: seen.size, pages: pageCount });
         statusNode.textContent = label;
         post({ type: 'joko-pdf-viewer/status', instanceId: instanceId, state: state,
-          pageCount: pageCount, renderedPages: seen.size, zoomPercent: Math.round(zoom * 100),
+          pageCount: pageCount, currentPage: currentPage, renderedPages: seen.size,
+          zoomPercent: Math.round(zoom * 100),
           error: state === 'error' ? cleanError(error) : null });
       }
       function ack(command, index) {
@@ -259,7 +270,9 @@ export function buildMobilePdfViewerHtml({
             && Number.isSafeInteger(value.offset) && value.offset >= 0 && typeof value.base64 === 'string'
             && value.base64.length >= 4 && value.base64.length <= Math.ceil(MAX_CHUNK / 3) * 4
             && value.base64.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value.base64)) return value;
-          if ((value.command === 'commit' || value.command === 'dispose')
+          if ((value.command === 'commit' || value.command === 'dispose' || value.command === 'fit'
+            || value.command === 'zoom-in' || value.command === 'zoom-out'
+            || value.command === 'page-previous' || value.command === 'page-next')
             && exactKeys(value, ['type','instanceId','command'])) return value;
         } catch (_) {}
         return null;
@@ -393,9 +406,22 @@ export function buildMobilePdfViewerHtml({
         if (disposed || !pdfDocument) return;
         document.querySelectorAll('.page').forEach(function (section) { if (visible(section)) void renderPage(Number(section.dataset.page)); });
       }
+      function updateCurrentPage() {
+        if (!pageCount) return;
+        var bounds = pages.getBoundingClientRect();
+        var target = Math.max(bounds.top, Math.min(bounds.bottom, bounds.top + bounds.height * 0.35));
+        var bestPage = currentPage || 1;
+        var bestDistance = Number.POSITIVE_INFINITY;
+        document.querySelectorAll('.page').forEach(function (section) {
+          var rect = section.getBoundingClientRect();
+          var distance = Math.abs((rect.top + rect.bottom) / 2 - target);
+          if (distance < bestDistance) { bestDistance = distance; bestPage = Number(section.dataset.page); }
+        });
+        if (bestPage !== currentPage) { currentPage = bestPage; emit(currentState, null); }
+      }
       function resetRenderedPages() {
         renderGeneration += 1; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
-        rendered.clear(); resident = [];
+        rendered.clear(); seen.clear(); resident = [];
         document.querySelectorAll('.page canvas').forEach(function (canvas) { canvas.width = 1; canvas.height = 1; canvas.remove(); });
         renderVisiblePages(); emit(seen.size === pageCount ? 'complete' : 'rendering', null);
       }
@@ -413,7 +439,7 @@ export function buildMobilePdfViewerHtml({
           section.dataset.page = String(pageNumber); section.setAttribute('aria-label', text(labels.page, { page: pageNumber, pages: pageCount }));
           var label = document.createElement('span'); label.className = 'page-label'; label.textContent = String(pageNumber) + ' / ' + String(pageCount); section.appendChild(label); fragment.appendChild(section);
         }
-        pages.replaceChildren(fragment); emit('document', null);
+        currentPage = 1; pages.replaceChildren(fragment); emit('document', null);
         if (typeof IntersectionObserver === 'function') {
           observer = new IntersectionObserver(function (entries) { entries.forEach(function (entry) { if (entry.isIntersecting) void renderPage(Number(entry.target.dataset.page)); }); },
             { root: pages, rootMargin: '100% 0px', threshold: 0.01 });
@@ -439,6 +465,16 @@ export function buildMobilePdfViewerHtml({
         var command = parseCommand(event && event.data); if (!command || disposed) return;
         try {
           if (command.command === 'dispose') { void dispose(); return; }
+          if (command.command === 'fit') { fit = true; zoom = 1; resetRenderedPages(); return; }
+          if (command.command === 'zoom-out') { fit = false; zoom = Math.max(0.5, Math.round((zoom - 0.25) * 100) / 100); resetRenderedPages(); return; }
+          if (command.command === 'zoom-in') { fit = false; zoom = Math.min(3, Math.round((zoom + 0.25) * 100) / 100); resetRenderedPages(); return; }
+          if (command.command === 'page-previous' || command.command === 'page-next') {
+            if (!pageCount) return;
+            currentPage = Math.max(1, Math.min(pageCount,
+              (currentPage || 1) + (command.command === 'page-next' ? 1 : -1)));
+            document.getElementById('page-' + String(currentPage))?.scrollIntoView({ block: 'start' });
+            emit(currentState, null); return;
+          }
           if (command.command === 'begin') {
             if (bytes || loadingTask || received !== 0) throw new Error('The PDF transfer has already started.');
             byteSize = command.byteSize; expectedHash = command.sha256Hex; bytes = new Uint8Array(byteSize);
@@ -454,7 +490,7 @@ export function buildMobilePdfViewerHtml({
       }
 
       window.addEventListener('message', handleCommand); document.addEventListener('message', handleCommand);
-      pages.addEventListener('scroll', renderVisiblePages, { passive: true });
+      pages.addEventListener('scroll', function () { renderVisiblePages(); updateCurrentPage(); }, { passive: true });
       document.getElementById('fit').addEventListener('click', function () { fit = true; zoom = 1; resetRenderedPages(); });
       document.getElementById('zoom-out').addEventListener('click', function () { fit = false; zoom = Math.max(0.5, Math.round((zoom - 0.25) * 100) / 100); resetRenderedPages(); });
       document.getElementById('zoom-in').addEventListener('click', function () { fit = false; zoom = Math.min(3, Math.round((zoom + 0.25) * 100) / 100); resetRenderedPages(); });
@@ -464,31 +500,6 @@ export function buildMobilePdfViewerHtml({
   </script>
 </body>
 </html>`;
-}
-
-export function createMobilePdfViewerLifecycle(maximumReloads = 1) {
-  if (!Number.isSafeInteger(maximumReloads) || maximumReloads < 0 || maximumReloads > 3) {
-    throw new Error("The PDF viewer reload budget is invalid.");
-  }
-  let reloadOnActive = false;
-  let reloads = 0;
-  return {
-    onBackground() { reloadOnActive = true; },
-    onProcessLost(active: boolean): "reload" | "wait" | "failed" {
-      if (!active) { reloadOnActive = true; return "wait"; }
-      if (reloads >= maximumReloads) return "failed";
-      reloads += 1;
-      return "reload";
-    },
-    consumeReloadOnActive(): "reload" | "failed" | undefined {
-      if (!reloadOnActive) return undefined;
-      reloadOnActive = false;
-      if (reloads >= maximumReloads) return "failed";
-      reloads += 1;
-      return "reload";
-    },
-    reset() { reloadOnActive = false; reloads = 0; }
-  };
 }
 
 function assertRuntimeBundle(runtime: MobilePdfJsRuntimeBundle): void {
@@ -514,9 +525,15 @@ function assertRuntimeBundle(runtime: MobilePdfJsRuntimeBundle): void {
   }
 }
 
-function pdfViewerState(value: unknown): value is MobilePdfViewerState {
+function pdfViewerState(value: unknown): value is MobilePdfRendererState {
   return value === "ready" || value === "receiving" || value === "document"
     || value === "rendering" || value === "complete" || value === "error";
+}
+
+function safeCurrentPage(value: unknown, pageCount: number): value is number {
+  return Number.isSafeInteger(value) && (pageCount === 0
+    ? value === 0
+    : (value as number) >= 1 && (value as number) <= pageCount);
 }
 
 function pdfAckCommand(value: unknown): value is MobilePdfViewerAck["command"] {

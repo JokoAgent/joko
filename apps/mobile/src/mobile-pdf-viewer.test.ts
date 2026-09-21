@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   buildMobilePdfViewerCommand,
   buildMobilePdfViewerHtml,
-  createMobilePdfViewerLifecycle,
   mobilePdfViewerLimits,
   parseMobilePdfViewerMessage,
   type MobilePdfJsRuntimeBundle
@@ -19,6 +18,10 @@ describe("mobile PDF viewer protocol", () => {
     }))).toMatchObject({ command: "chunk", index: 0, offset: 0, base64: "AQID" });
     expect(JSON.parse(buildMobilePdfViewerCommand("pdf-1", { command: "commit" }))).toMatchObject({ command: "commit" });
     expect(JSON.parse(buildMobilePdfViewerCommand("pdf-1", { command: "dispose" }))).toMatchObject({ command: "dispose" });
+    expect(JSON.parse(buildMobilePdfViewerCommand("pdf-1", { command: "page-next" })))
+      .toEqual({ type: "joko-pdf-viewer/command", instanceId: "pdf-1", command: "page-next" });
+    expect(JSON.parse(buildMobilePdfViewerCommand("pdf-1", { command: "zoom-in" })))
+      .toMatchObject({ command: "zoom-in" });
     expect(() => buildMobilePdfViewerCommand("pdf-1", {
       command: "begin", byteSize: 63, sha256Hex: "a".repeat(64)
     })).toThrow(/identity/u);
@@ -30,18 +33,18 @@ describe("mobile PDF viewer protocol", () => {
   it("accepts exact instance-bound status and acknowledgements only", () => {
     expect(parseMobilePdfViewerMessage(JSON.stringify({
       type: "joko-pdf-viewer/status", instanceId: "pdf-1", state: "rendering",
-      pageCount: 12, renderedPages: 4, zoomPercent: 125, error: null
-    }), "pdf-1")).toMatchObject({ state: "rendering", pageCount: 12, renderedPages: 4 });
+      pageCount: 12, currentPage: 3, renderedPages: 4, zoomPercent: 125, error: null
+    }), "pdf-1")).toMatchObject({ state: "rendering", pageCount: 12, currentPage: 3, renderedPages: 4 });
     expect(parseMobilePdfViewerMessage(JSON.stringify({
       type: "joko-pdf-viewer/ack", instanceId: "pdf-1", command: "chunk", index: 2
     }), "pdf-1")).toEqual({ type: "joko-pdf-viewer/ack", instanceId: "pdf-1", command: "chunk", index: 2 });
     expect(parseMobilePdfViewerMessage(JSON.stringify({
       type: "joko-pdf-viewer/status", instanceId: "forged", state: "complete",
-      pageCount: 1, renderedPages: 1, zoomPercent: 100, error: null
+      pageCount: 1, currentPage: 1, renderedPages: 1, zoomPercent: 100, error: null
     }), "pdf-1")).toBeUndefined();
     expect(parseMobilePdfViewerMessage(JSON.stringify({
       type: "joko-pdf-viewer/status", instanceId: "pdf-1", state: "complete",
-      pageCount: 1, renderedPages: 2, zoomPercent: 100, error: null
+      pageCount: 1, currentPage: 1, renderedPages: 2, zoomPercent: 100, error: null
     }), "pdf-1")).toBeUndefined();
     expect(parseMobilePdfViewerMessage(JSON.stringify({
       type: "joko-pdf-viewer/ack", instanceId: "pdf-1", command: "chunk", index: 2, extra: true
@@ -92,18 +95,6 @@ describe("mobile PDF viewer HTML", () => {
       instanceId: "pdf-1", locale: "en", title: "Proof", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, { ...runtime, cMaps: missingCMap })).toThrow(/runtime bundle/u);
-  });
-});
-
-describe("mobile PDF viewer lifecycle", () => {
-  it("reloads once after background/process loss and then fails closed", () => {
-    const lifecycle = createMobilePdfViewerLifecycle();
-    lifecycle.onBackground();
-    expect(lifecycle.consumeReloadOnActive()).toBe("reload");
-    expect(lifecycle.onProcessLost(true)).toBe("failed");
-    lifecycle.reset();
-    expect(lifecycle.onProcessLost(false)).toBe("wait");
-    expect(lifecycle.consumeReloadOnActive()).toBe("reload");
   });
 });
 

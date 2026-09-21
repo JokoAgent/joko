@@ -7,7 +7,7 @@ import {
   type ForwardRefExoticComponent,
   type RefAttributes
 } from "react";
-import { AppState, View, type StyleProp, type ViewStyle } from "react-native";
+import { StyleSheet, Text, View, type AccessibilityValue, type StyleProp, type ViewStyle } from "react-native";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
 import modelRuntime from "./model-viewer-runtime.modeljs";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -17,10 +17,11 @@ import { MobileModelTransferSession, type MobileModelChunkFileDriver } from "./m
 import {
   buildMobileModelViewerCommand,
   buildMobileModelViewerHtml,
-  createMobileModelViewerLifecycle,
   parseMobileModelViewerMessage,
   type MobileModelViewerStatus
 } from "./mobile-model-viewer";
+import { MobilePreviewControlBar, MobilePreviewControlButton } from "./MobilePreviewControls";
+import { useMobilePreviewResourceLifecycle } from "./use-mobile-preview-resource-lifecycle";
 
 interface MobileModelWebViewHandle {
   postMessage(value: string): void;
@@ -63,41 +64,65 @@ export function MobileModelViewer({
   const instanceId = lease.leaseId;
   const webViewRef = useRef<MobileModelWebViewHandle | null>(null);
   const transferRef = useRef<MobileModelTransferSession | undefined>(undefined);
-  const lifecycleRef = useRef(createMobileModelViewerLifecycle());
   const mountedRef = useRef(true);
-  const activeRef = useRef(AppState.currentState === "active");
   const statusRef = useRef(onStatusChange);
-  const [reloadGeneration, setReloadGeneration] = useState(0);
+  const [viewerStatus, setViewerStatus] = useState<MobileModelViewerStatus>();
   statusRef.current = onStatusChange;
 
   const html = useMemo(() => buildMobileModelViewerHtml({
     instanceId, locale, title, background, surface, ink, muted, accent, border
   }, modelRuntime), [accent, background, border, ink, instanceId, locale, muted, surface, title]);
 
+  const publishStatus = useCallback((status: MobileModelViewerStatus) => {
+    if (!mountedRef.current) return;
+    setViewerStatus(status);
+    statusRef.current?.(status);
+  }, []);
+
   const emitFailure = useCallback((_error: unknown, message = mobileMessage(locale, "preview.modelError")) => {
     const text = message.replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 512)
       || mobileMessage(locale, "preview.modelError");
-    statusRef.current?.({ type: "joko-model-viewer/status", instanceId,
-      state: "error", fileCount: 0, error: text });
-  }, [instanceId, locale]);
+    publishStatus({ type: "joko-model-viewer/status", instanceId,
+      state: "error", fileCount: 0, zoomPercent: 100, error: text });
+  }, [instanceId, locale, publishStatus]);
 
   const stopViewer = useCallback(() => {
     const transfer = transferRef.current;
     transferRef.current = undefined;
     void transfer?.abort().catch(() => undefined);
-    try { webViewRef.current?.postMessage(buildMobileModelViewerCommand(instanceId, { command: "dispose" })); } catch {}
-    webViewRef.current?.stopLoading();
+    const handle = webViewRef.current;
+    webViewRef.current = null;
+    try { handle?.postMessage(buildMobileModelViewerCommand(instanceId, { command: "dispose" })); } catch {}
+    handle?.stopLoading();
   }, [instanceId]);
 
-  const startTransfer = useCallback(() => {
-    if (transferRef.current) return;
+  const attachWebView = useCallback((handle: MobileModelWebViewHandle | null) => {
+    if (handle) webViewRef.current = handle;
+    else stopViewer();
+  }, [stopViewer]);
+
+  const handleResourceFailure = useCallback((failure: "unavailable" | "recovery-exhausted") => {
+    emitFailure(undefined, mobileMessage(locale, failure === "unavailable"
+      ? "preview.resourcePressureUnavailable" : "preview.modelFailure"));
+  }, [emitFailure, locale]);
+
+  const resource = useMobilePreviewResourceLifecycle({
+    ownerKey: [instanceId, lease.uri, lease.packageSha256Hex, locale,
+      background, surface, ink, muted, accent, border, title].join("\u0000"),
+    releaseRenderer: stopViewer,
+    reportFailure: handleResourceFailure
+  });
+
+  const startTransfer = useCallback((rendererToken: string) => {
+    if (transferRef.current || !resource.ownsRenderer(rendererToken)) return;
     let transfer!: MobileModelTransferSession;
     transfer = new MobileModelTransferSession({
       instanceId,
       lease,
       driver: readerDriver,
       send(message) {
-        if (!mountedRef.current || !activeRef.current || transferRef.current !== transfer) return;
+        if (!mountedRef.current || !resource.ownsRenderer(rendererToken)
+          || transferRef.current !== transfer) return;
         webViewRef.current?.postMessage(message);
       }
     });
@@ -106,31 +131,7 @@ export function MobileModelViewer({
       if (transferRef.current !== transfer) return;
       emitFailure(error);
     });
-  }, [emitFailure, instanceId, lease, readerDriver]);
-
-  useEffect(() => {
-    activeRef.current = AppState.currentState === "active";
-    const subscription = AppState.addEventListener("change", (state) => {
-      const active = state === "active";
-      activeRef.current = active;
-      if (!active) {
-        lifecycleRef.current.onBackground();
-        stopViewer();
-        return;
-      }
-      const recovery = lifecycleRef.current.consumeReloadOnActive();
-      if (recovery === "reload") setReloadGeneration((value) => value + 1);
-      else if (recovery === "failed") {
-        emitFailure(undefined, mobileMessage(locale, "preview.modelFailure"));
-      }
-    });
-    return () => subscription.remove();
-  }, [emitFailure, locale, stopViewer]);
-
-  useEffect(() => {
-    lifecycleRef.current.reset();
-    return stopViewer;
-  }, [instanceId, lease.uri, stopViewer]);
+  }, [emitFailure, instanceId, lease, readerDriver, resource]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -141,12 +142,16 @@ export function MobileModelViewer({
   }, [stopViewer]);
 
   const handleMessage = useCallback((event: WebViewMessageEvent) => {
-    if (!mountedRef.current || !activeRef.current) return;
+    const rendererToken = resource.rendererToken;
+    if (!mountedRef.current || !resource.ownsRenderer(rendererToken)) return;
     const message = parseMobileModelViewerMessage(event.nativeEvent.data, instanceId);
     if (!message) return;
     if (message.type === "joko-model-viewer/status") {
-      statusRef.current?.(message);
-      if (message.state === "ready") startTransfer();
+      publishStatus(message);
+      if (message.state === "ready") {
+        resource.onRendererReady(rendererToken);
+        startTransfer(rendererToken);
+      }
       else if (message.state === "error") void transferRef.current?.abort().catch(() => undefined);
       return;
     }
@@ -156,23 +161,43 @@ export function MobileModelViewer({
       if (transferRef.current !== transfer) return;
       emitFailure(error);
     });
-  }, [emitFailure, instanceId, startTransfer]);
+  }, [emitFailure, instanceId, publishStatus, resource, startTransfer]);
 
-  const recoverProcess = useCallback((): boolean => {
-    stopViewer();
-    const recovery = lifecycleRef.current.onProcessLost(activeRef.current);
-    if (recovery === "reload") setReloadGeneration((value) => value + 1);
-    else if (recovery === "failed") {
-      emitFailure(undefined, mobileMessage(locale, "preview.modelFailure"));
-    }
-    return true;
-  }, [emitFailure, locale, stopViewer]);
+  useEffect(() => {
+    if (resource.phase !== "suspended" && resource.phase !== "recovering") return;
+    publishStatus({ type: "joko-model-viewer/status", instanceId, state: resource.phase,
+      fileCount: 0, zoomPercent: 100, error: null });
+  }, [instanceId, publishStatus, resource.phase]);
+
+  const sendControl = useCallback((command: "zoom-in" | "zoom-out" | "reset") => {
+    if (!resource.ownsRenderer(resource.rendererToken)) return;
+    webViewRef.current?.postMessage(buildMobileModelViewerCommand(instanceId, { command }));
+  }, [instanceId, resource]);
+
+  const controllable = resource.phase === "active" && viewerStatus?.state === "complete";
+  const releasedLabel = mobileMessage(locale, resource.phase === "recovering"
+    ? "preview.status.modelRecovering" : "preview.status.modelSuspended");
 
   return <View style={style}>
-    <ModelWebView
-      key={`${instanceId}:${locale}:${reloadGeneration}`}
-      ref={(handle) => { if (handle) webViewRef.current = handle; }}
+    <MobilePreviewControlBar accessibilityLabel={mobileMessage(locale, "preview.modelControls")}
+      background={surface} border={border}>
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.modelZoomOut")}
+        disabled={!controllable || (viewerStatus?.zoomPercent ?? 100) <= 50} ink={ink} label="−"
+        onPress={() => sendControl("zoom-out")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.modelResetLabel")}
+        disabled={!controllable} ink={ink} label={mobileMessage(locale, "preview.modelReset")}
+        onPress={() => sendControl("reset")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.modelZoomIn")}
+        disabled={!controllable || (viewerStatus?.zoomPercent ?? 100) >= 300} ink={ink} label="+"
+        onPress={() => sendControl("zoom-in")} surface={background} />
+    </MobilePreviewControlBar>
+    {resource.rendererMounted ? <ModelWebView
+      key={`${instanceId}:${resource.rendererGeneration}`}
+      ref={attachWebView}
       accessibilityLabel={mobileMessage(locale, "preview.modelLabel", { title })}
+      accessibilityState={{ busy: resource.phase === "recovering" || viewerStatus?.state === "loading"
+        || viewerStatus?.state === "receiving", disabled: viewerStatus?.state === "error" }}
+      accessibilityValue={modelAccessibilityValue(viewerStatus)}
       allowFileAccess={false}
       allowFileAccessFromFileURLs={false}
       allowUniversalAccessFromFileURLs={false}
@@ -181,11 +206,9 @@ export function MobileModelViewer({
       javaScriptCanOpenWindowsAutomatically={false}
       javaScriptEnabled
       mixedContentMode="never"
-      onContentProcessDidTerminate={recoverProcess}
-      onLoadEnd={() => lifecycleRef.current.onLoadEnd()}
-      onLoadStart={() => lifecycleRef.current.onLoadStart()}
+      onContentProcessDidTerminate={() => resource.onRendererProcessLost(resource.rendererToken)}
       onMessage={handleMessage}
-      onRenderProcessGone={recoverProcess}
+      onRenderProcessGone={() => resource.onRendererProcessLost(resource.rendererToken)}
       onShouldStartLoadWithRequest={(request: { readonly url: string }) => request.url === "about:blank"
         || request.url === modelViewerBaseUrl || request.url === `${modelViewerBaseUrl}/`}
       originWhitelist={["about:blank", modelViewerBaseUrl]}
@@ -195,6 +218,20 @@ export function MobileModelViewer({
       source={{ html, baseUrl: modelViewerBaseUrl }}
       style={{ backgroundColor: "transparent", flex: 1 }}
       thirdPartyCookiesEnabled={false}
-    />
+    /> : <View accessible accessibilityRole="text" accessibilityLabel={releasedLabel}
+      accessibilityState={{ busy: resource.phase === "recovering", disabled: resource.phase !== "recovering" }}
+      style={[styles.placeholder, { backgroundColor: background }]}>
+      <Text style={[styles.placeholderText, { color: ink }]}>{releasedLabel}</Text>
+    </View>}
   </View>;
 }
+
+function modelAccessibilityValue(status: MobileModelViewerStatus | undefined): AccessibilityValue | undefined {
+  if (!status || status.state !== "complete") return undefined;
+  return { min: 50, now: status.zoomPercent, max: 300, text: `${status.zoomPercent}%` };
+}
+
+const styles = StyleSheet.create({
+  placeholder: { flex: 1, minHeight: 200, alignItems: "center", justifyContent: "center", padding: 24 },
+  placeholderText: { fontSize: 14, lineHeight: 20, textAlign: "center" }
+});

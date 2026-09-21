@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   buildMobileMediaPlayerCommand,
   buildMobileMediaPlayerHtml,
-  createMobileMediaPlayerLifecycle,
   parseMobileMediaPlayerStatus
 } from "./mobile-media-player";
 
@@ -51,6 +50,11 @@ describe("mobile media player protocol and HTML", () => {
       instanceId: "lease-1",
       command: "pause"
     });
+    expect(JSON.parse(buildMobileMediaPlayerCommand("lease-1", "play"))).toMatchObject({
+      type: "joko-media-player/command",
+      instanceId: "lease-1",
+      command: "play"
+    });
     const status = JSON.stringify({
       type: "joko-media-player/status",
       instanceId: "lease-1",
@@ -66,26 +70,5 @@ describe("mobile media player protocol and HTML", () => {
     expect(parseMobileMediaPlayerStatus(JSON.stringify({ ...JSON.parse(status), currentTime: -1 }), "lease-1"))
       .toBeUndefined();
     expect(parseMobileMediaPlayerStatus("not json", "lease-1")).toBeUndefined();
-  });
-});
-
-describe("mobile media player lifecycle", () => {
-  it("reloads once after background interrupts an in-flight load", () => {
-    const lifecycle = createMobileMediaPlayerLifecycle(1);
-    lifecycle.onBackground();
-    expect(lifecycle.consumeReloadOnActive()).toBe("reload");
-    expect(lifecycle.consumeReloadOnActive()).toBeUndefined();
-    lifecycle.onLoadEnd();
-    lifecycle.onBackground();
-    expect(lifecycle.consumeReloadOnActive()).toBeUndefined();
-  });
-
-  it("bounds process-loss reload and resets for a new exact source", () => {
-    const lifecycle = createMobileMediaPlayerLifecycle(1);
-    expect(lifecycle.onProcessLost(true)).toBe("reload");
-    expect(lifecycle.onProcessLost(true)).toBe("failed");
-    lifecycle.reset();
-    expect(lifecycle.onProcessLost(false)).toBe("wait");
-    expect(lifecycle.consumeReloadOnActive()).toBe("reload");
   });
 });

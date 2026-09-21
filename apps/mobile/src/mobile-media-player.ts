@@ -3,8 +3,9 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { normalizeMediaType } from "./workspace-files";
 
-export type MobileMediaPlayerCommand = "pause" | "reset";
-export type MobileMediaPlayerState = "ready" | "playing" | "paused" | "waiting" | "ended" | "error";
+export type MobileMediaPlayerCommand = "play" | "pause" | "reset";
+export type MobileMediaRendererState = "ready" | "playing" | "paused" | "waiting" | "ended" | "error";
+export type MobileMediaPlayerState = MobileMediaRendererState | "suspended" | "recovering";
 
 export interface MobileMediaPlayerStatus {
   readonly type: "joko-media-player/status";
@@ -17,7 +18,9 @@ export interface MobileMediaPlayerStatus {
 
 export function buildMobileMediaPlayerCommand(instanceId: string, command: MobileMediaPlayerCommand): string {
   const exactInstanceId = playerInstanceId(instanceId);
-  if (command !== "pause" && command !== "reset") throw new Error("The media player command is invalid.");
+  if (command !== "play" && command !== "pause" && command !== "reset") {
+    throw new Error("The media player command is invalid.");
+  }
   return JSON.stringify({ type: "joko-media-player/command", instanceId: exactInstanceId, command });
 }
 
@@ -126,12 +129,20 @@ export function buildMobileMediaPlayerHtml({
           var keys = Object.keys(value).sort().join(',');
           if (keys !== 'command,instanceId,type' || value.type !== 'joko-media-player/command'
             || value.instanceId !== instanceId) return null;
-          return value.command === 'pause' || value.command === 'reset' ? value.command : null;
+          return value.command === 'play' || value.command === 'pause' || value.command === 'reset'
+            ? value.command : null;
         } catch (_) { return null; }
       }
       function handleCommand(event) {
         var value = command(event && event.data);
         if (!value || !media) return;
+        if (value === 'play') {
+          if (media.ended) {
+            try { media.currentTime = 0; } catch (_) {}
+          }
+          Promise.resolve(media.play()).catch(function () { emit('error', errorLabel, true); });
+          return;
+        }
         media.pause();
         if (value === 'reset') {
           try { media.currentTime = 0; } catch (_) {}
@@ -156,44 +167,7 @@ export function buildMobileMediaPlayerHtml({
 </html>`;
 }
 
-export function createMobileMediaPlayerLifecycle(maximumReloads = 1) {
-  if (!Number.isSafeInteger(maximumReloads) || maximumReloads < 0 || maximumReloads > 3) {
-    throw new Error("The media player reload budget is invalid.");
-  }
-  let loading = true;
-  let reloadOnActive = false;
-  let reloads = 0;
-  return {
-    onLoadStart() { loading = true; },
-    onLoadEnd() { loading = false; },
-    onBackground() { reloadOnActive ||= loading; },
-    onProcessLost(active: boolean): "reload" | "wait" | "failed" {
-      loading = true;
-      if (!active) {
-        reloadOnActive = true;
-        return "wait";
-      }
-      if (reloads >= maximumReloads) return "failed";
-      reloads += 1;
-      return "reload";
-    },
-    consumeReloadOnActive(): "reload" | "failed" | undefined {
-      if (!reloadOnActive) return undefined;
-      reloadOnActive = false;
-      if (reloads >= maximumReloads) return "failed";
-      reloads += 1;
-      loading = true;
-      return "reload";
-    },
-    reset() {
-      loading = true;
-      reloadOnActive = false;
-      reloads = 0;
-    }
-  };
-}
-
-function playerState(value: unknown): value is MobileMediaPlayerState {
+function playerState(value: unknown): value is MobileMediaRendererState {
   return value === "ready" || value === "playing" || value === "paused"
     || value === "waiting" || value === "ended" || value === "error";
 }

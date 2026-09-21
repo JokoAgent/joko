@@ -19,6 +19,7 @@ const bridge = vi.hoisted(() => ({
   appState: "active",
   mounts: 0,
   onAppStateChange: ((_state: string): void => undefined),
+  onResourcePressure: (() => undefined) as () => void,
   props: undefined as undefined | {
     allowFileAccess: boolean;
     allowFileAccessFromFileURLs: boolean;
@@ -32,15 +33,31 @@ const bridge = vi.hoisted(() => ({
   stopLoading: vi.fn<() => void>()
 }));
 
-vi.mock("react-native", () => ({
-  AppState: {
-    get currentState() { return bridge.appState; },
-    addEventListener: (_type: string, listener: (state: string) => void) => {
-      bridge.onAppStateChange = listener;
-      return { remove: () => { bridge.onAppStateChange = () => undefined; } };
-    }
-  },
-  View: "div"
+vi.mock("react-native", async () => {
+  const { createElement } = await import("react");
+  return {
+    AppState: {
+      get currentState() { return bridge.appState; },
+      addEventListener: (_type: string, listener: (state: string) => void) => {
+        bridge.onAppStateChange = listener;
+        return { remove: () => { bridge.onAppStateChange = () => undefined; } };
+      }
+    },
+    Pressable: ({ children, onPress, style: _style, ...props }: {
+      children?: import("react").ReactNode; onPress?: () => void; style?: unknown; [key: string]: unknown;
+    }) => createElement("button", { ...props, onClick: onPress }, children),
+    StyleSheet: { create: (value: unknown) => value },
+    Text: "span",
+    View: "div"
+  };
+});
+
+vi.mock("./mobile-resource-pressure", () => ({
+  mobileResourcePressureSupported: () => true,
+  subscribeMobileResourcePressure: (listener: () => void) => {
+    bridge.onResourcePressure = listener;
+    return { remove: () => { bridge.onResourcePressure = () => undefined; } };
+  }
 }));
 
 vi.mock("react-native-webview", async () => {
@@ -48,7 +65,7 @@ vi.mock("react-native-webview", async () => {
   return {
     WebView: forwardRef((props: NonNullable<typeof bridge.props>, ref) => {
       bridge.props = props;
-      useImperativeHandle(ref, () => ({ postMessage: bridge.postMessage, stopLoading: bridge.stopLoading }));
+      useImperativeHandle(ref, () => ({ postMessage: bridge.postMessage, stopLoading: bridge.stopLoading }), []);
       useEffect(() => { bridge.mounts += 1; }, []);
       return null;
     })
@@ -66,6 +83,7 @@ afterEach(() => {
   bridge.postMessage.mockReset();
   bridge.stopLoading.mockReset();
   bridge.onAppStateChange = () => undefined;
+  bridge.onResourcePressure = () => undefined;
 });
 
 describe("MobileModelViewer", () => {
@@ -93,7 +111,7 @@ describe("MobileModelViewer", () => {
       allowUniversalAccessFromFileURLs: false });
     expect(bridge.props?.source.html).not.toContain("file:///cache");
     await message({ type: "joko-model-viewer/status", instanceId: "model-1",
-      state: "ready", fileCount: 0, error: null });
+      state: "ready", fileCount: 0, zoomPercent: 100, error: null });
     expect(lastCommand()).toMatchObject({ command: "begin", instanceId: "model-1", byteSize: 80 });
     await message({ type: "joko-model-viewer/ack", instanceId: "model-1", command: "begin",
       fileIndex: -1, index: -1, offset: 0, byteSize: 80 });
@@ -106,7 +124,7 @@ describe("MobileModelViewer", () => {
     expect(close).toHaveBeenCalledOnce();
 
     await message({ type: "joko-model-viewer/status", instanceId: "forged",
-      state: "complete", fileCount: 1, error: null });
+      state: "complete", fileCount: 1, zoomPercent: 100, error: null });
     expect(onStatusChange).toHaveBeenCalledTimes(1);
 
     act(() => { bridge.appState = "background"; bridge.onAppStateChange("background"); });
@@ -115,7 +133,22 @@ describe("MobileModelViewer", () => {
     act(() => { bridge.appState = "active"; bridge.onAppStateChange("active"); });
     expect(bridge.mounts).toBe(2);
     act(() => { bridge.props?.onRenderProcessGone(); });
+    expect(bridge.mounts).toBe(3);
+    act(() => { bridge.props?.onRenderProcessGone(); });
     expect(onStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ state: "error" }));
+  });
+
+  it("disposes the exact renderer before replacing its owner presentation", () => {
+    root = createRoot(document.createElement("div"));
+    const render = (surface: string) => createElement(MobileModelViewer, {
+      accent: "#3366ff", background: "#ffffff", border: "#dddddd", ink: "#111111",
+      lease: lease(80), locale: "en" as const, muted: "#666666", surface, title: "Owner"
+    });
+    act(() => root!.render(render("#f5f5f5")));
+    act(() => root!.render(render("#eeeeee")));
+    expect(lastCommand()).toMatchObject({ command: "dispose" });
+    expect(bridge.stopLoading).toHaveBeenCalledOnce();
+    expect(bridge.mounts).toBe(2);
   });
 
   it("disposes, aborts, and stops loading on unmount", async () => {
@@ -128,13 +161,34 @@ describe("MobileModelViewer", () => {
       lease: lease(80), locale: "en", muted: "#666666", readerDriver: driver, surface: "#f5f5f5", title: "Scene"
     })));
     await message({ type: "joko-model-viewer/status", instanceId: "model-1",
-      state: "ready", fileCount: 0, error: null });
+      state: "ready", fileCount: 0, zoomPercent: 100, error: null });
     act(() => root!.unmount());
     root = undefined;
     resolve({ byteSize: 80, read: () => new Uint8Array(80), close });
     await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
     expect(lastCommand()).toMatchObject({ command: "dispose", instanceId: "model-1" });
     expect(bridge.stopLoading).toHaveBeenCalled();
+  });
+
+  it("releases on native pressure and ignores status from the retired WebGL renderer", async () => {
+    const onStatusChange = vi.fn();
+    root = createRoot(document.createElement("div"));
+    await act(async () => root!.render(createElement(MobileModelViewer, {
+      accent: "#3366ff", background: "#ffffff", border: "#dddddd", ink: "#111111",
+      lease: lease(80), locale: "en", muted: "#666666", onStatusChange,
+      readerDriver: { async open() {
+        return { byteSize: 80, read: () => new Uint8Array(80), close: () => undefined };
+      } }, surface: "#f5f5f5", title: "Scene"
+    })));
+    const retired = bridge.props;
+    act(() => bridge.onResourcePressure());
+    expect(lastCommand()).toMatchObject({ command: "dispose", instanceId: "model-1" });
+    expect(bridge.mounts).toBe(2);
+    await act(async () => retired?.onMessage({ nativeEvent: { data: JSON.stringify({
+      type: "joko-model-viewer/status", instanceId: "model-1", state: "complete",
+      fileCount: 1, zoomPercent: 100, error: null
+    }) } }));
+    expect(onStatusChange).not.toHaveBeenCalledWith(expect.objectContaining({ state: "complete" }));
   });
 });
 
