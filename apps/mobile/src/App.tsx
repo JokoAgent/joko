@@ -61,11 +61,19 @@ import {
   mobileOfflineCache,
   mobileDiagnostics,
   mobileLocalePreferences,
+  mobilePushDeviceStore,
   mobileStorage,
   mobileThemePreferences,
   mobileVoiceDictionary,
   mobileUpdates
 } from "./storage";
+import nativeNotifications from "./native-notifications";
+import { MobilePushController } from "./mobile-push-controller";
+import {
+  createMobilePushRegistrationId,
+  createMobilePushRevocationSecret,
+  mobilePushTokenDigest
+} from "./mobile-push-crypto";
 import {
   mobileComposerDraftIdentityKey,
   type MobileComposerDraftIdentity,
@@ -268,6 +276,17 @@ const client = new MobileClient(
   mobileFileShare,
   mobileOfflineCache
 );
+const mobilePush = new MobilePushController({
+  platform: Platform.OS,
+  environment: __DEV__ ? "sandbox" : "production",
+  locale: mobileLocalePreferences.snapshot.effectiveLocale,
+  client,
+  deviceStore: mobilePushDeviceStore,
+  notifications: nativeNotifications,
+  digest: mobilePushTokenDigest,
+  registrationId: createMobilePushRegistrationId,
+  revocationSecret: createMobilePushRevocationSecret
+});
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
 const mobileCopyLinks = new MobileCopyLinkWriter({
@@ -520,6 +539,10 @@ export function App() {
     (listener) => mobileUpdates.subscribe(listener),
     () => mobileUpdates.snapshot
   );
+  const push = useSyncExternalStore(
+    (listener) => mobilePush.subscribe(listener),
+    () => mobilePush.snapshot
+  );
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -576,6 +599,7 @@ export function App() {
       diagnosticsState = status;
       diagnosticsTick = performance.now();
       setForeground(foreground);
+      mobilePush.handleAppStateChange(foreground);
       client.setForeground(foreground);
       void mobileUpdates.handleAppStateChange(status);
       mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
@@ -613,6 +637,8 @@ export function App() {
       return intent !== undefined;
     };
     const removeLinking = installMobileNativeIntentLinking(Linking, offerUrl);
+    void mobilePush.start(offerUrl);
+    mobilePush.handleAppStateChange(AppState.currentState === "active");
     return () => {
       appMountedRef.current = false;
       nativeIntentDeliveryRef.current!.invalidate();
@@ -621,6 +647,7 @@ export function App() {
       clearInterval(diagnosticTimer);
       subscription.remove();
       removeLinking();
+      mobilePush.stop();
       client.setForeground(false);
       void mobileComposerDrafts.flush().catch(() => undefined);
       void mobileInteractionDrafts.flush().catch(() => undefined);
@@ -628,6 +655,10 @@ export function App() {
       void mobileDiagnostics.flush().catch(() => undefined);
     };
   }, []);
+
+  useEffect(() => {
+    mobilePush.setLocale(locale.effectiveLocale);
+  }, [locale.effectiveLocale]);
 
   useEffect(() => {
     if (!foreground || nativeIntentExecutingRef.current || state.status === "starting" || state.status === "connecting"
@@ -765,9 +796,10 @@ export function App() {
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
                   theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
-                  updates={updates} updateActions={mobileUpdateActions} client={client}
+                  updates={updates} updateActions={mobileUpdateActions} push={push} client={client}
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
+                  onPushEnabledChange={(enabled) => mobilePush.setEnabled(enabled)}
                   onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
                   onDiagnosticsClear={() => mobileDiagnostics.clear()}
                   onDiagnosticsExport={() => mobileDiagnostics.export({

@@ -47,6 +47,7 @@ import type {
   DeviceControlRelationRecord,
   DeviceRecord,
   InteractionRecord,
+  MobilePushRegistrationRecord,
   OperationExecution,
   OperationRecord,
   OperationalStore,
@@ -114,6 +115,12 @@ import type { AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import type { ComputerAutomationSettingsController } from "./computer-automation-settings.js";
 import type { ComputerToolBridgeProvider } from "./computer-tool-bridge.js";
 import { ConnectionAuthenticationError, PairingRequestError, type ConnectionManager } from "./connection-manager.js";
+import {
+  MobilePushInputError,
+  MobilePushTicketError,
+  MobilePushUnavailableError,
+  type MobilePushCoordinator
+} from "./mobile-push.js";
 import type {
   CredentialDescriptor as NativeCredentialDescriptor,
   CredentialKind as NativeCredentialKind,
@@ -494,6 +501,7 @@ interface ConnectServiceDependencies {
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  readonly mobilePush?: MobilePushCoordinator;
   readonly refreshPiGeneration?: () => Promise<void>;
   readonly resolveSessionContextDefaults?: SessionContextDefaultsResolver;
   readonly piSettingsDefaults?: OrchestratorApplication["piSettingsDefaults"];
@@ -727,6 +735,9 @@ function toConnectError(error: unknown): ConnectError {
     return new ConnectError(error.message, Code.Aborted);
   }
   if (error instanceof AuthorizationError) return new ConnectError(error.message, Code.Unauthenticated);
+  if (error instanceof MobilePushUnavailableError) return new ConnectError(error.message, Code.Unimplemented);
+  if (error instanceof MobilePushTicketError) return new ConnectError(error.message, Code.PermissionDenied);
+  if (error instanceof MobilePushInputError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof PairingError) return new ConnectError("Pairing failed.", Code.PermissionDenied);
   if (error instanceof SensitiveDataError || error instanceof ProtoMappingError || error instanceof RangeError) {
     return new ConnectError(error.message, Code.InvalidArgument);
@@ -1079,6 +1090,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
     ...(application.voiceInputSettings === undefined ? {} : { voiceInputSettings: application.voiceInputSettings }),
+    ...(application.mobilePush === undefined ? {} : { mobilePush: application.mobilePush }),
     ...(application.refreshPiGeneration === undefined ? {} : { refreshPiGeneration: application.refreshPiGeneration }),
     ...(application.resolveSessionContextDefaults === undefined
       ? {}
@@ -1295,6 +1307,78 @@ export function createConnectServices(application: OrchestratorApplication): Con
       authenticate(context);
       const device = dependencies.store.getDevice(request.deviceId);
       return { device: deviceFromRecord(device, dependencies.store.listDeviceConnections(device.id), now()) };
+    },
+    getMobilePushCapability: () => {
+      const capability = dependencies.mobilePush?.capability() ?? {
+        supported: false,
+        unavailableReasonCode: "APNS_NOT_CONFIGURED"
+      };
+      return {
+        capability: create(contract.MobilePushCapabilitySchema, {
+          supported: capability.supported,
+          provider: contract.MobilePushProvider.APNS,
+          unavailableReasonCode: capability.unavailableReasonCode ?? ""
+        })
+      };
+    },
+    registerMobilePush: (request, context) => {
+      const connection = authenticate(context);
+      if (request.connectionId !== connection.id || request.deviceId !== connection.deviceId) {
+        throw new ConnectError(
+          "Mobile push may only be registered for the authenticated Connection and its Device.",
+          Code.PermissionDenied
+        );
+      }
+      if (request.provider !== contract.MobilePushProvider.APNS) {
+        throw invalidArgument("provider must be APNs");
+      }
+      const coordinator = dependencies.mobilePush;
+      if (coordinator === undefined) throw new MobilePushUnavailableError("APNS_NOT_CONFIGURED");
+      const registered = coordinator.register({
+        connectionId: connection.id,
+        deviceId: connection.deviceId,
+        expectedDeviceRevision: request.expectedDeviceRevision,
+        environment: nativeMobilePushEnvironment(request.environment),
+        locale: nativeMobilePushLocale(request.locale),
+        deviceToken: request.deviceToken,
+        registrationId: request.registrationId,
+        revocationSecret: request.revocationSecret
+      });
+      return {
+        registration: toProtoMobilePushRegistration(registered.registration),
+        revocationTicket: create(contract.MobilePushRevocationTicketSchema, {
+          serverId: coordinator.serverId,
+          registrationId: registered.registration.id,
+          secret: registered.revocationSecret
+        })
+      };
+    },
+    unregisterMobilePush: (request, context) => {
+      const coordinator = dependencies.mobilePush;
+      if (coordinator === undefined) throw new MobilePushUnavailableError("APNS_NOT_CONFIGURED");
+      if (request.serverId !== coordinator.serverId) throw new MobilePushTicketError();
+      const authorization = context.requestHeader.get("authorization") ?? undefined;
+      let connection: ConnectionRecord | undefined;
+      if (authorization !== undefined) {
+        try { connection = dependencies.connections.authenticate(authorization); }
+        catch { /* The exact revocation ticket remains a valid fallback. */ }
+      }
+      const registration = dependencies.store.findMobilePushRegistration(request.registrationId);
+      if (registration === undefined) return {};
+      if (connection !== undefined && registration.connectionId === connection.id) {
+        coordinator.unregisterAuthenticated(registration.id, connection.id);
+        return {};
+      }
+      if (request.revocationSecret !== "") {
+        coordinator.unregisterWithTicket(request.serverId, registration.id, request.revocationSecret);
+        return {};
+      }
+      throw new ConnectError(
+        connection === undefined
+          ? "Mobile push unregistration requires authentication or its exact revocation ticket."
+          : "The mobile push registration belongs to another Connection.",
+        connection === undefined ? Code.Unauthenticated : Code.PermissionDenied
+      );
     },
     listDeviceControlRelations: (request, context) => {
       authenticate(context);
@@ -6181,6 +6265,52 @@ function deviceFromRecord(
     remoteControlEnabled: record.remoteControlEnabled,
     presence: online ? contract.DevicePresenceState.ONLINE : contract.DevicePresenceState.OFFLINE,
     version: toProtoEntityVersion(record.revision, 0, record.lastSeenAt ?? record.revokedAt ?? record.pairedAt)
+  });
+}
+
+function nativeMobilePushEnvironment(
+  value: contract.MobilePushEnvironment
+): MobilePushRegistrationRecord["environment"] {
+  switch (value) {
+    case contract.MobilePushEnvironment.APNS_SANDBOX: return "apns_sandbox";
+    case contract.MobilePushEnvironment.APNS_PRODUCTION: return "apns_production";
+    default: throw invalidArgument("environment is required");
+  }
+}
+
+function nativeMobilePushLocale(value: contract.MobilePushLocale): MobilePushRegistrationRecord["locale"] {
+  switch (value) {
+    case contract.MobilePushLocale.EN: return "en";
+    case contract.MobilePushLocale.ZH_CN: return "zh-CN";
+    case contract.MobilePushLocale.ZH_TW: return "zh-TW";
+    case contract.MobilePushLocale.JA: return "ja";
+    case contract.MobilePushLocale.KO: return "ko";
+    default: throw invalidArgument("locale is required");
+  }
+}
+
+function toProtoMobilePushRegistration(
+  record: MobilePushRegistrationRecord
+): contract.MobilePushRegistration {
+  return create(contract.MobilePushRegistrationSchema, {
+    registrationId: record.id,
+    connectionId: record.connectionId,
+    deviceId: record.deviceId,
+    provider: contract.MobilePushProvider.APNS,
+    environment: record.environment === "apns_sandbox"
+      ? contract.MobilePushEnvironment.APNS_SANDBOX
+      : contract.MobilePushEnvironment.APNS_PRODUCTION,
+    locale: record.locale === "en"
+      ? contract.MobilePushLocale.EN
+      : record.locale === "zh-CN"
+        ? contract.MobilePushLocale.ZH_CN
+        : record.locale === "zh-TW"
+          ? contract.MobilePushLocale.ZH_TW
+          : record.locale === "ja"
+            ? contract.MobilePushLocale.JA
+            : contract.MobilePushLocale.KO,
+    expiresAt: toProtoTimestamp(record.expiresAt),
+    version: toProtoEntityVersion(record.revision, 0, record.updatedAt)
   });
 }
 

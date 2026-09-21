@@ -98,6 +98,77 @@ export interface RevokedDeviceResult {
   readonly connections: readonly ConnectionRecord[];
 }
 
+export type MobilePushEnvironment = "apns_sandbox" | "apns_production";
+export type MobilePushLocale = "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
+
+/** Ciphertext-only representation accepted by Store. Raw device tokens and
+ * scoped revocation secrets stay behind the Orchestrator credential vault. */
+export interface SealedMobilePushCredential {
+  readonly algorithm: "aes-256-gcm";
+  readonly nonce: string;
+  readonly ciphertext: string;
+  readonly tag: string;
+}
+
+export interface MobilePushRegistrationRecord {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly deviceId: string;
+  readonly provider: "apns";
+  readonly environment: MobilePushEnvironment;
+  readonly locale: MobilePushLocale;
+  readonly tokenDigest: string;
+  readonly sealedToken: SealedMobilePushCredential;
+  readonly revocationSecretDigest: string;
+  readonly sealedRevocationSecret: SealedMobilePushCredential;
+  readonly expiresAt: UnixMillis;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface PutMobilePushRegistrationInput {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly deviceId: string;
+  readonly expectedDeviceRevision: bigint;
+  readonly environment: MobilePushEnvironment;
+  readonly locale: MobilePushLocale;
+  readonly tokenDigest: string;
+  readonly sealedToken: SealedMobilePushCredential;
+  readonly revocationSecretDigest: string;
+  readonly sealedRevocationSecret: SealedMobilePushCredential;
+  readonly expiresAt: UnixMillis;
+  readonly now?: UnixMillis;
+}
+
+export type MobilePushDeliveryStatus = "pending" | "dispatching" | "delivered" | "failed" | "unknown";
+
+export interface MobilePushDeliveryRecord {
+  readonly id: string;
+  readonly registrationId: string;
+  readonly sessionId: string;
+  readonly kind: "done" | "awaiting" | "error";
+  readonly subjectCursor: bigint;
+  readonly subjectGeneration: number;
+  readonly messageId?: string;
+  readonly messageEventId?: string;
+  readonly status: MobilePushDeliveryStatus;
+  readonly availableAt: UnixMillis;
+  readonly attempts: number;
+  readonly claimToken?: string;
+  readonly claimedAt?: UnixMillis;
+  readonly outcomeCode?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface ClaimedMobilePushDelivery {
+  readonly delivery: MobilePushDeliveryRecord;
+  readonly registration: MobilePushRegistrationRecord;
+}
+
 export interface PairingRecord {
   readonly id: string;
   readonly codeDigest: string;

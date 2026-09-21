@@ -919,6 +919,18 @@ function fakeNetwork(): MobileNetwork {
     requestPairing: vi.fn(async () => ({ challengeId: "challenge", identity: node })),
     completePairing: vi.fn(async () => ({ credential, identity: node })),
     readOwner: vi.fn(async () => ({ connection, device, snapshot })),
+    getMobilePushCapability: vi.fn(async () => ({ supported: true })),
+    registerMobilePush: vi.fn(async (_credential, input) => ({
+      registrationId: input.ticket.registrationId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      environment: input.environment,
+      locale: input.locale,
+      expiresAt: Date.now() + 86_400_000,
+      revision: 1n,
+      ticket: input.ticket
+    })),
+    unregisterMobilePush: vi.fn(async () => undefined),
     readSession: vi.fn(async () => snapshot),
     readNativeSessionTree: vi.fn(async () => create(NativeSessionTreeSchema, {
       sessionId: "session",
@@ -1602,7 +1614,83 @@ function clientWithOfflineCache(
   return client(network, storage, undefined, now, undefined, undefined, undefined,
     undefined, undefined, undefined, undefined, undefined, offlineCache);
 }
+
+function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient {
+  const instance = new MobileClient(
+    network,
+    storage,
+    { scan: vi.fn(async () => []) },
+    () => "operation-1",
+    "ios"
+  );
+  clients.push(instance);
+  return instance;
+}
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); });
+
+describe("native mobile push authority", () => {
+  it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {
+    const iosDevice = create(DeviceSchema, { ...device, platform: "ios" });
+    const iosSnapshot = create(SnapshotSchema, { ...snapshot, devices: [iosDevice] });
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device: iosDevice, snapshot: iosSnapshot }));
+    network.readSession = vi.fn(async () => iosSnapshot);
+    const saved = memoryStorage(credential);
+    const app = iosClient(network, saved.storage);
+    await app.start();
+
+    const owner = app.mobilePushAuthority();
+    expect(owner).toMatchObject({
+      profileId: credential.profileId,
+      origin: credential.origin,
+      serverId: credential.serverId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      deviceRevision: 5n
+    });
+    expect(await app.getMobilePushCapability(owner!)).toEqual({ supported: true });
+    const ticket = { serverId: credential.serverId, registrationId: "registration-1", secret: "s".repeat(43) };
+    await app.registerMobilePush(owner!, {
+      environment: "sandbox",
+      locale: "en",
+      deviceToken: "native-token",
+      ticket
+    });
+    expect(network.registerMobilePush).toHaveBeenLastCalledWith(credential, {
+      expectedDeviceRevision: 5n,
+      environment: "sandbox",
+      locale: "en",
+      deviceToken: "native-token",
+      ticket
+    }, undefined);
+
+    let finish!: (value: Awaited<ReturnType<MobileNetwork["registerMobilePush"]>>) => void;
+    network.registerMobilePush = vi.fn<MobileNetwork["registerMobilePush"]>(
+      () => new Promise<Awaited<ReturnType<MobileNetwork["registerMobilePush"]>>>((resolve) => { finish = resolve; })
+    );
+    const late = app.registerMobilePush(owner!, {
+      environment: "sandbox",
+      locale: "ja",
+      deviceToken: "rotated-token",
+      ticket
+    });
+    await vi.waitFor(() => expect(network.registerMobilePush).toHaveBeenCalled());
+    app.setForeground(false);
+    finish({
+      registrationId: ticket.registrationId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      environment: "sandbox",
+      locale: "ja",
+      expiresAt: 99_999,
+      revision: 2n,
+      ticket
+    });
+    await expect(late).rejects.toThrow(/owner changed/u);
+    await app.unregisterMobilePush(credential.origin, ticket);
+    expect(network.unregisterMobilePush).toHaveBeenCalledWith(credential.origin, ticket, undefined);
+  });
+});
 
 describe("native mobile Automation ownership and recovery", () => {
   it("loads exact catalog/detail/history pages and persists Schedule+trigger receipt before dispatch", async () => {

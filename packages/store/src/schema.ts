@@ -181,6 +181,72 @@ CREATE TABLE devices (
         revision INTEGER NOT NULL CHECK (revision >= 1)
       ) STRICT;
 
+CREATE TABLE mobile_push_registrations (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL UNIQUE REFERENCES connections(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK (provider = 'apns'),
+        environment TEXT NOT NULL CHECK (environment IN ('apns_sandbox', 'apns_production')),
+        locale TEXT NOT NULL CHECK (locale IN ('en', 'zh-CN', 'zh-TW', 'ja', 'ko')),
+        token_digest TEXT NOT NULL UNIQUE CHECK (
+          token_digest GLOB 'sha256:*' AND length(token_digest) = 71
+        ),
+        token_nonce TEXT NOT NULL CHECK (length(token_nonce) BETWEEN 16 AND 64),
+        token_ciphertext TEXT NOT NULL CHECK (length(token_ciphertext) BETWEEN 4 AND 2048),
+        token_tag TEXT NOT NULL CHECK (length(token_tag) BETWEEN 16 AND 64),
+        revocation_secret_digest TEXT NOT NULL UNIQUE CHECK (
+          revocation_secret_digest GLOB 'sha256:*' AND length(revocation_secret_digest) = 71
+        ),
+        revocation_secret_nonce TEXT NOT NULL CHECK (length(revocation_secret_nonce) BETWEEN 16 AND 64),
+        revocation_secret_ciphertext TEXT NOT NULL CHECK (
+          length(revocation_secret_ciphertext) BETWEEN 4 AND 2048
+        ),
+        revocation_secret_tag TEXT NOT NULL CHECK (length(revocation_secret_tag) BETWEEN 16 AND 64),
+        expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
+      ) STRICT;
+
+CREATE TABLE mobile_push_deliveries (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        registration_id TEXT NOT NULL REFERENCES mobile_push_registrations(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('done', 'awaiting', 'error')),
+        subject_cursor INTEGER NOT NULL CHECK (subject_cursor >= 1),
+        subject_generation INTEGER NOT NULL CHECK (subject_generation >= 0),
+        message_id TEXT CHECK (
+          message_id IS NULL OR (length(message_id) BETWEEN 1 AND 256 AND instr(message_id, char(0)) = 0)
+        ),
+        message_event_id TEXT CHECK (
+          message_event_id IS NULL OR (length(message_event_id) BETWEEN 1 AND 256 AND instr(message_event_id, char(0)) = 0)
+        ),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'dispatching', 'delivered', 'failed', 'unknown')),
+        available_at INTEGER NOT NULL CHECK (available_at >= 0),
+        attempts INTEGER NOT NULL CHECK (attempts >= 0),
+        claim_token TEXT,
+        claimed_at INTEGER,
+        outcome_code TEXT CHECK (
+          outcome_code IS NULL OR (
+            length(outcome_code) BETWEEN 1 AND 64
+            AND outcome_code NOT GLOB '*[^A-Z0-9_]*'
+          )
+        ),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(registration_id, session_id, subject_cursor, subject_generation),
+        CHECK ((message_id IS NULL) = (message_event_id IS NULL)),
+        CHECK ((status = 'dispatching') = (claim_token IS NOT NULL AND claimed_at IS NOT NULL))
+      ) STRICT;
+
+CREATE INDEX mobile_push_deliveries_pending_idx
+  ON mobile_push_deliveries(status, available_at, created_at, id);
+
 CREATE TABLE diagnostics (
         id TEXT PRIMARY KEY,
         severity TEXT NOT NULL CHECK (severity IN ('debug', 'info', 'warning', 'error')),

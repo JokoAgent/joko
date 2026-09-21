@@ -34,7 +34,8 @@ import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
   MOBILE_FILE_SHARE_MAXIMUM_BYTES,
   normalizeNodeOrigin,
-  type MobileNetwork, type NodeIdentity, type PairedCredential
+  type MobileNetwork, type MobilePushCapabilityResult, type MobilePushRegistrationInput,
+  type MobilePushRegistrationResult, type MobilePushRevocationTicket, type NodeIdentity, type PairedCredential
 } from "./network";
 import {
   artifactTitle,
@@ -352,6 +353,21 @@ export interface MobileState {
   readonly error?: string;
 }
 
+export interface MobilePushAuthority {
+  readonly key: string;
+  readonly profileId: string;
+  readonly origin: string;
+  readonly serverId: string;
+  readonly connectionId: string;
+  readonly deviceId: string;
+  readonly deviceRevision: bigint;
+}
+
+export interface MobilePushLifecycleScope {
+  readonly ready: boolean;
+  readonly activeProfileId?: string;
+}
+
 interface MobileFilesContext {
   readonly credential: PairedCredential;
   readonly authority: MobileWorkspaceAuthority;
@@ -616,6 +632,80 @@ export class MobileClient {
   ) {}
 
   get state(): MobileState { return this.#state; }
+
+  mobilePushLifecycleScope(): MobilePushLifecycleScope {
+    return {
+      ready: this.#state.status !== "starting",
+      ...(this.#state.activeProfileId === undefined ? {} : { activeProfileId: this.#state.activeProfileId })
+    };
+  }
+
+  mobilePushAuthority(): MobilePushAuthority | undefined {
+    const credential = this.#credential;
+    const node = this.#state.node;
+    const owner = this.#state.owner;
+    if (!this.#foreground || this.platform !== "ios" || this.#state.status !== "connected" || !credential || !node || !owner
+      || this.#activeProfileId !== credential.profileId || this.#state.activeProfileId !== credential.profileId
+      || this.#state.origin !== credential.origin || node.serverId !== credential.serverId
+      || owner.server?.serverId !== credential.serverId || owner.server.apiVersion !== node.apiVersion) return undefined;
+    const connections = owner.connections.filter((item) => item.connectionId === credential.connectionId);
+    const devices = owner.devices.filter((item) => item.deviceId === credential.deviceId);
+    if (connections.length !== 1 || devices.length !== 1) return undefined;
+    const connection = connections[0]!;
+    const device = devices[0]!;
+    const revision = device.version?.revision?.value ?? 0n;
+    if (connection.connectionProfileId !== credential.profileId || connection.deviceId !== credential.deviceId
+      || connection.state !== ConnectionState.CONNECTED || device.kind !== DeviceKind.MOBILE || device.revoked
+      || device.platform.trim().toLocaleLowerCase("en-US") !== "ios"
+      || !device.connectionIds.includes(credential.connectionId) || revision < 1n) return undefined;
+    return Object.freeze({
+      key: [credential.profileId, credential.origin, credential.serverId, credential.connectionId,
+        credential.deviceId, revision.toString(10)].join("\u001f"),
+      profileId: credential.profileId,
+      origin: credential.origin,
+      serverId: credential.serverId,
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      deviceRevision: revision
+    });
+  }
+
+  async getMobilePushCapability(
+    authority: MobilePushAuthority,
+    signal?: AbortSignal
+  ): Promise<MobilePushCapabilityResult> {
+    if (this.mobilePushAuthority()?.key !== authority.key) throw new Error("The mobile push owner changed.");
+    const result = await this.network.getMobilePushCapability(authority.origin, signal);
+    if (this.mobilePushAuthority()?.key !== authority.key) throw new Error("The mobile push owner changed.");
+    return result;
+  }
+
+  async registerMobilePush(
+    authority: MobilePushAuthority,
+    input: Omit<MobilePushRegistrationInput, "expectedDeviceRevision">,
+    signal?: AbortSignal
+  ): Promise<MobilePushRegistrationResult> {
+    const current = this.mobilePushAuthority();
+    if (current?.key !== authority.key) throw new Error("The mobile push owner changed.");
+    const credential = this.#ready();
+    if (credential.profileId !== authority.profileId || credential.origin !== authority.origin
+      || credential.serverId !== authority.serverId || credential.connectionId !== authority.connectionId
+      || credential.deviceId !== authority.deviceId) throw new Error("The mobile push owner changed.");
+    const result = await this.network.registerMobilePush(credential, {
+      ...input,
+      expectedDeviceRevision: authority.deviceRevision
+    }, signal);
+    if (this.mobilePushAuthority()?.key !== authority.key) throw new Error("The mobile push owner changed.");
+    return result;
+  }
+
+  unregisterMobilePush(
+    origin: string,
+    ticket: MobilePushRevocationTicket,
+    signal?: AbortSignal
+  ): Promise<void> {
+    return this.network.unregisterMobilePush(origin, ticket, signal);
+  }
 
   subscribe(listener: (state: MobileState) => void): () => void {
     this.#listeners.add(listener);

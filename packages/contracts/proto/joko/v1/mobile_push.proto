@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+// The first-release mobile notification channel is deliberately narrow. The
+// device token is accepted only by the registration request and is never
+// projected into snapshots, Events, Operations, diagnostics, or status reads.
+enum MobilePushProvider {
+  MOBILE_PUSH_PROVIDER_UNSPECIFIED = 0;
+  MOBILE_PUSH_PROVIDER_APNS = 1;
+}
+
+enum MobilePushEnvironment {
+  MOBILE_PUSH_ENVIRONMENT_UNSPECIFIED = 0;
+  MOBILE_PUSH_ENVIRONMENT_APNS_SANDBOX = 1;
+  MOBILE_PUSH_ENVIRONMENT_APNS_PRODUCTION = 2;
+}
+
+enum MobilePushLocale {
+  MOBILE_PUSH_LOCALE_UNSPECIFIED = 0;
+  MOBILE_PUSH_LOCALE_EN = 1;
+  MOBILE_PUSH_LOCALE_ZH_CN = 2;
+  MOBILE_PUSH_LOCALE_ZH_TW = 3;
+  MOBILE_PUSH_LOCALE_JA = 4;
+  MOBILE_PUSH_LOCALE_KO = 5;
+}
+
+message MobilePushCapability {
+  bool supported = 1;
+  MobilePushProvider provider = 2;
+  // Closed, non-sensitive machine reason. It never contains a raw Provider
+  // response, credential, path, token, or host diagnostic.
+  string unavailable_reason_code = 3;
+}
+
+message MobilePushRegistration {
+  string registration_id = 1;
+  string connection_id = 2;
+  string device_id = 3;
+  MobilePushProvider provider = 4;
+  MobilePushEnvironment environment = 5;
+  MobilePushLocale locale = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  EntityVersion version = 8;
+}
+
+// A narrowly-scoped credential that can only delete one exact registration
+// from one exact node. Mobile retains it in device-private secure storage so a
+// failed unregister can finish after the paired Auth Key has been forgotten.
+message MobilePushRevocationTicket {
+  string server_id = 1;
+  string registration_id = 2;
+  string secret = 3;
+}
+
+message GetMobilePushCapabilityRequest {}
+
+message GetMobilePushCapabilityResponse {
+  MobilePushCapability capability = 1;
+}
+
+message RegisterMobilePushRequest {
+  string connection_id = 1;
+  string device_id = 2;
+  uint64 expected_device_revision = 3;
+  MobilePushProvider provider = 4;
+  MobilePushEnvironment environment = 5;
+  MobilePushLocale locale = 6;
+  // Private input. It must never be copied into an Operation or product Event.
+  string device_token = 7;
+  // Device-private, precommitted revocation identity. Mobile persists both
+  // values before dispatch so an unknown registration response can still be
+  // retired exactly after logout, forget, or a profile switch.
+  string registration_id = 8;
+  string revocation_secret = 9;
+}
+
+message RegisterMobilePushResponse {
+  MobilePushRegistration registration = 1;
+  MobilePushRevocationTicket revocation_ticket = 2;
+}
+
+message UnregisterMobilePushRequest {
+  string server_id = 1;
+  string registration_id = 2;
+  // Required only when the request has no valid paired authorization. An
+  // authenticated owner may omit it for its own current registration.
+  string revocation_secret = 3;
+}
+
+message UnregisterMobilePushResponse {}

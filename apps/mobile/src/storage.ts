@@ -16,8 +16,9 @@ import { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
 import { MobileUpdateDeviceStore } from "./mobile-update-device-store";
 import { MobileUpdateController } from "./mobile-update-controller";
 import { createMobileUpdateRuntimeEnvironment } from "./mobile-update-runtime";
+import { MobilePushDeviceStore } from "./mobile-push-device-store";
 
-const plainStorage = {
+export const mobilePlainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
   setItem: (key: string, value: string) => AsyncStorage.setItem(key, value),
   removeItem: (key: string) => AsyncStorage.removeItem(key),
@@ -25,31 +26,34 @@ const plainStorage = {
   multiRemove: (keys: readonly string[]) => AsyncStorage.multiRemove([...keys])
 };
 
-export const mobileComposerDrafts = new MobileComposerDraftStore(plainStorage);
-export const mobileInteractionDrafts = new MobileInteractionDraftStore(plainStorage);
-export const mobileNewTaskDrafts = new MobileNewTaskDraftStore(plainStorage);
+export const mobileSecureStorage = {
+  isAvailable: () => SecureStore.isAvailableAsync(),
+  getItem: (key: string) => SecureStore.getItemAsync(key),
+  setItem: (key: string, value: string) => SecureStore.setItemAsync(key, value, {
+    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY
+  }),
+  removeItem: (key: string) => SecureStore.deleteItemAsync(key)
+};
+
+export const mobileComposerDrafts = new MobileComposerDraftStore(mobilePlainStorage);
+export const mobileInteractionDrafts = new MobileInteractionDraftStore(mobilePlainStorage);
+export const mobileNewTaskDrafts = new MobileNewTaskDraftStore(mobilePlainStorage);
 export const mobileAttachmentFiles = new MobileAttachmentFiles();
 export const mobileAttachmentCamera = new MobileAttachmentCamera(mobileAttachmentFiles);
 export const mobilePhotoLibrary = new MobilePhotoLibrary(mobileAttachmentFiles);
-export const mobileOfflineCache = new MobileOfflineCache(plainStorage, Date.now, randomUUID);
-export const mobileThemePreferences = new MobileThemePreferenceStore(plainStorage);
-export const mobileDiagnostics = new MobileDiagnosticsStore(plainStorage, undefined, Date.now, randomUUID);
-export const mobileLocalePreferences = new MobileLocalePreferenceStore(plainStorage);
-export const mobileVoiceDictionary = new MobileVoiceDictionaryStore(plainStorage, Date.now, randomUUID);
+export const mobileOfflineCache = new MobileOfflineCache(mobilePlainStorage, Date.now, randomUUID);
+export const mobileThemePreferences = new MobileThemePreferenceStore(mobilePlainStorage);
+export const mobileDiagnostics = new MobileDiagnosticsStore(mobilePlainStorage, undefined, Date.now, randomUUID);
+export const mobileLocalePreferences = new MobileLocalePreferenceStore(mobilePlainStorage);
+export const mobileVoiceDictionary = new MobileVoiceDictionaryStore(mobilePlainStorage, Date.now, randomUUID);
 const mobileUpdateRuntime = createMobileUpdateRuntimeEnvironment();
 export const mobileUpdates = new MobileUpdateController({
   ...mobileUpdateRuntime,
-  deviceStore: new MobileUpdateDeviceStore(plainStorage)
+  deviceStore: new MobileUpdateDeviceStore(mobilePlainStorage)
 });
+export const mobilePushDeviceStore = new MobilePushDeviceStore(mobilePlainStorage, mobileSecureStorage);
 
 export const mobileStorage = createMobileStorage(
-  plainStorage,
-  {
-    isAvailable: () => SecureStore.isAvailableAsync(),
-    getItem: (key) => SecureStore.getItemAsync(key),
-    setItem: (key, value) => SecureStore.setItemAsync(key, value, {
-      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY
-    }),
-    removeItem: (key) => SecureStore.deleteItemAsync(key)
-  }
+  mobilePlainStorage,
+  mobileSecureStorage
 );

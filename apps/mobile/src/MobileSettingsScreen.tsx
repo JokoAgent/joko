@@ -31,6 +31,7 @@ import type {
 } from "./mobile-voice-dictionary-store";
 import { MobileUpdateSettingsSection, type MobileUpdateActions } from "./MobileUpdateSurface";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
+import type { MobilePushControllerState } from "./mobile-push-controller";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -55,10 +56,12 @@ export interface MobileSettingsScreenProps {
   readonly diagnostics: MobileDiagnosticsState;
   readonly voiceDictionary: MobileVoiceDictionaryStoreState;
   readonly updates: MobileUpdateControllerState;
+  readonly push: MobilePushControllerState;
   readonly updateActions: Pick<MobileUpdateActions, "onChannelChange" | "onCheck" | "onReset">;
   readonly client: MobileSettingsClient;
   readonly onThemeChange: (preference: MobileThemePreference) => Promise<void>;
   readonly onLocaleChange: (preference: MobileLocalePreference) => Promise<void>;
+  readonly onPushEnabledChange: (enabled: boolean) => Promise<void>;
   readonly onDiagnosticsEnabledChange: (enabled: boolean) => Promise<void>;
   readonly onDiagnosticsClear: () => Promise<void>;
   readonly onDiagnosticsExport: () => Promise<void>;
@@ -106,9 +109,9 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
 }
 
 export function MobileSettingsScreen({ colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
-  onLocaleChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
+  onLocaleChange, onPushEnabledChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
   onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange, onVoiceDictionaryAdd,
-  onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, updates, updateActions,
+  onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, updates, updateActions, push,
   appVersion }: MobileSettingsScreenProps) {
   const current = resolveMobileSettingsCurrentDevice(state);
   const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
@@ -356,6 +359,28 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
     <NavigationRow label={t("settings.allDevices")} description={t("settings.allDevicesDescription")}
       colors={colors} onPress={onDevices} />
 
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.notifications.title")}</Text>
+    <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <Text style={[styles.description, { color: colors.ink }]}>{t("settings.notifications.description")}</Text>
+      <View style={styles.toggleRow}>
+        <View style={styles.fill}>
+          <Text style={[styles.label, { color: colors.ink }]}>{t("settings.notifications.toggle")}</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{t(pushStatusMessage(push))}</Text>
+        </View>
+        <Switch accessibilityLabel={t("settings.notifications.toggle")} value={push.enabled}
+          disabled={push.status === "loading" || push.status === "unsupported-platform" || push.saving}
+          trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface}
+          onValueChange={(value) => {
+            setLocalError("");
+            setNotice("");
+            void onPushEnabledChange(value).catch(() => setLocalError(t("settings.notifications.error")));
+          }} />
+      </View>
+      <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.notifications.privacy")}</Text>
+      {push.error && <ErrorNotice colors={colors} text={t(push.error === "retirement"
+        ? "settings.notifications.retirement" : "settings.notifications.error")} />}
+    </View>
+
     {pendingRename && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Text style={[styles.warning, { color: colors.negative }]}>
         {pendingRename.state === "unknown" ? t("settings.receipt.unknown") : t("settings.receipt.awaiting")}
@@ -452,6 +477,18 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
       backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>{notice}</Text>}
     {(localError || state.error) && <ErrorNotice colors={colors} text={localError || state.error || ""} />}
   </ScrollView>;
+}
+
+function pushStatusMessage(state: MobilePushControllerState): MobileMessageKey {
+  if (state.status === "loading") return "settings.notifications.loading";
+  if (state.status === "disabled") return "settings.notifications.disabled";
+  if (state.status === "waiting") return "settings.notifications.waiting";
+  if (state.status === "syncing") return "settings.notifications.syncing";
+  if (state.status === "registered") return "settings.notifications.registered";
+  if (state.status === "permission-denied") return "settings.notifications.permissionDenied";
+  if (state.status === "unsupported-platform") return "settings.notifications.unsupportedPlatform";
+  if (state.status === "unsupported-node") return "settings.notifications.unsupportedNode";
+  return state.error === "retirement" ? "settings.notifications.retirement" : "settings.notifications.error";
 }
 
 function ThemeChoice({ preference, selected, disabled, colors, language, onPress }: {

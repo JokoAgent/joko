@@ -1,7 +1,9 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
-  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
+  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind,
+  MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
+  MobilePushProvider, OperationService, OperationState,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
   VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
   VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
@@ -54,12 +56,49 @@ export interface NodeIdentity {
   readonly pairingEnabled: boolean;
 }
 
+export type MobilePushEnvironment = "sandbox" | "production";
+export type MobilePushLocale = "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
+
+export interface MobilePushRevocationTicket {
+  readonly serverId: string;
+  readonly registrationId: string;
+  readonly secret: string;
+}
+
+export interface MobilePushRegistrationInput {
+  readonly expectedDeviceRevision: bigint;
+  readonly environment: MobilePushEnvironment;
+  readonly locale: MobilePushLocale;
+  readonly deviceToken: string;
+  readonly ticket: MobilePushRevocationTicket;
+}
+
+export interface MobilePushRegistrationResult {
+  readonly registrationId: string;
+  readonly connectionId: string;
+  readonly deviceId: string;
+  readonly environment: MobilePushEnvironment;
+  readonly locale: MobilePushLocale;
+  readonly expiresAt: number;
+  readonly revision: bigint;
+  readonly ticket: MobilePushRevocationTicket;
+}
+
+export interface MobilePushCapabilityResult {
+  readonly supported: boolean;
+  readonly unavailableReasonCode?: string;
+}
+
 export interface MobileNetwork {
   inspect(origin: string, signal?: AbortSignal): Promise<NodeIdentity>;
   discover(origin: string, signal?: AbortSignal): Promise<readonly DiscoveredNodeRecord[]>;
   requestPairing(origin: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
   completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
   readOwner(credential: PairedCredential, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
+  getMobilePushCapability(origin: string, signal?: AbortSignal): Promise<MobilePushCapabilityResult>;
+  registerMobilePush(credential: PairedCredential, input: MobilePushRegistrationInput,
+    signal?: AbortSignal): Promise<MobilePushRegistrationResult>;
+  unregisterMobilePush(origin: string, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
@@ -839,6 +878,42 @@ export function normalizeNodeOrigin(value: string): string {
   return parsed.origin;
 }
 
+function boundedMobilePushIdentity(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 256 || value !== value.trim()
+    || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) {
+    throw new Error(`The Joko node returned an invalid ${label}.`);
+  }
+  return value;
+}
+
+function normalizedMobilePushTicket(ticket: MobilePushRevocationTicket): MobilePushRevocationTicket {
+  const serverId = boundedMobilePushIdentity(ticket.serverId, "mobile push Server ID");
+  const registrationId = boundedMobilePushIdentity(ticket.registrationId, "mobile push registration ID");
+  const secret = ticket.secret.trim();
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(secret)) throw new Error("The mobile push revocation ticket is invalid.");
+  return { serverId, registrationId, secret };
+}
+
+function wireMobilePushEnvironment(value: MobilePushEnvironment): WireMobilePushEnvironment {
+  return value === "sandbox" ? WireMobilePushEnvironment.APNS_SANDBOX : WireMobilePushEnvironment.APNS_PRODUCTION;
+}
+
+function wireMobilePushLocale(value: MobilePushLocale): WireMobilePushLocale {
+  if (value === "en") return WireMobilePushLocale.EN;
+  if (value === "zh-CN") return WireMobilePushLocale.ZH_CN;
+  if (value === "zh-TW") return WireMobilePushLocale.ZH_TW;
+  if (value === "ja") return WireMobilePushLocale.JA;
+  return WireMobilePushLocale.KO;
+}
+
+function normalizedMobilePushToken(value: string): string {
+  const token = value.trim();
+  if (!token || token.length > 512 || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(token)) {
+    throw new Error("The native notification token is invalid.");
+  }
+  return token;
+}
+
 function transport(origin: string, authKey?: string): Transport {
   const interceptors: Interceptor[] = authKey === undefined ? [] : [
     (next) => async (request) => {
@@ -935,6 +1010,71 @@ export const mobileNetwork: MobileNetwork = {
     ]);
     if (!connection.connection || !device.device || !snapshot.snapshot) throw new Error("The Joko node returned an incomplete owner snapshot.");
     return { connection: connection.connection, device: device.device, snapshot: snapshot.snapshot };
+  },
+  async getMobilePushCapability(rawOrigin, signal) {
+    const origin = normalizeNodeOrigin(rawOrigin);
+    const capability = (await createClient(ConnectionService, transport(origin))
+      .getMobilePushCapability({}, options(signal))).capability;
+    if (!capability || capability.provider !== MobilePushProvider.APNS) {
+      throw new Error("The Joko node returned an invalid mobile push capability.");
+    }
+    const reason = capability.unavailableReasonCode;
+    if (reason && !/^[A-Z0-9_]{1,64}$/u.test(reason)) {
+      throw new Error("The Joko node returned an invalid mobile push capability reason.");
+    }
+    if (capability.supported && reason) {
+      throw new Error("The Joko node returned an incoherent mobile push capability.");
+    }
+    return { supported: capability.supported, ...(reason ? { unavailableReasonCode: reason } : {}) };
+  },
+  async registerMobilePush(credential, input, signal) {
+    if (input.expectedDeviceRevision < 1n) throw new Error("A current Device revision is required for mobile push.");
+    const ticket = normalizedMobilePushTicket(input.ticket);
+    if (ticket.serverId !== credential.serverId) throw new Error("The mobile push ticket belongs to another Joko node.");
+    const environment = wireMobilePushEnvironment(input.environment);
+    const locale = wireMobilePushLocale(input.locale);
+    const response = await createClient(ConnectionService, transport(credential.origin, credential.authKey)).registerMobilePush({
+      connectionId: credential.connectionId,
+      deviceId: credential.deviceId,
+      expectedDeviceRevision: input.expectedDeviceRevision,
+      provider: MobilePushProvider.APNS,
+      environment,
+      locale,
+      deviceToken: normalizedMobilePushToken(input.deviceToken),
+      registrationId: ticket.registrationId,
+      revocationSecret: ticket.secret
+    }, options(signal));
+    const registration = response.registration;
+    const returnedTicket = response.revocationTicket;
+    const expiresAt = safeCatalogTimestamp(registration?.expiresAt);
+    const revision = registration?.version?.revision?.value ?? 0n;
+    if (!registration || !returnedTicket || expiresAt === undefined || expiresAt < 1 || revision < 1n
+      || registration.registrationId !== ticket.registrationId
+      || registration.connectionId !== credential.connectionId || registration.deviceId !== credential.deviceId
+      || registration.provider !== MobilePushProvider.APNS || registration.environment !== environment
+      || registration.locale !== locale || returnedTicket.serverId !== ticket.serverId
+      || returnedTicket.registrationId !== ticket.registrationId || returnedTicket.secret !== ticket.secret) {
+      throw new Error("The Joko node returned an invalid mobile push registration.");
+    }
+    return {
+      registrationId: registration.registrationId,
+      connectionId: registration.connectionId,
+      deviceId: registration.deviceId,
+      environment: input.environment,
+      locale: input.locale,
+      expiresAt,
+      revision,
+      ticket
+    };
+  },
+  async unregisterMobilePush(rawOrigin, rawTicket, signal) {
+    const origin = normalizeNodeOrigin(rawOrigin);
+    const ticket = normalizedMobilePushTicket(rawTicket);
+    await createClient(ConnectionService, transport(origin)).unregisterMobilePush({
+      serverId: ticket.serverId,
+      registrationId: ticket.registrationId,
+      revocationSecret: ticket.secret
+    }, options(signal));
   },
   async readSession(credential, sessionId, signal) {
     const response = await createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({

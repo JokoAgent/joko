@@ -26,6 +26,7 @@ import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 import type { MobileVoiceDictionaryStoreState } from "./mobile-voice-dictionary-store";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
+import type { MobilePushControllerState } from "./mobile-push-controller";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -252,6 +253,11 @@ const readyUpdates: MobileUpdateControllerState = {
   forcedCheckFailed: false,
   authorityAvailable: true
 };
+const readyPush: MobilePushControllerState = {
+  enabled: false,
+  saving: false,
+  status: "unsupported-platform"
+};
 
 let root: Root | undefined;
 
@@ -271,12 +277,14 @@ function mount(options: {
   diagnostics?: MobileDiagnosticsState;
   voiceDictionary?: MobileVoiceDictionaryStoreState;
   updates?: MobileUpdateControllerState;
+  push?: MobilePushControllerState;
   client?: MobileSettingsClient;
 } = {}) {
   const container = document.createElement("div");
   const client = options.client ?? mobileClient();
   const onThemeChange = vi.fn(async () => undefined);
   const onLocaleChange = vi.fn(async () => undefined);
+  const onPushEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
   const onDiagnosticsEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
   const onDiagnosticsClear = vi.fn(async () => undefined);
   const onDiagnosticsExport = vi.fn(async () => undefined);
@@ -293,6 +301,7 @@ function mount(options: {
   let diagnostics = options.diagnostics ?? readyDiagnostics;
   let voiceDictionary = options.voiceDictionary ?? readyVoiceDictionary;
   let updates = options.updates ?? readyUpdates;
+  let push = options.push ?? readyPush;
   const render = () => createElement(MobileSettingsScreen, {
     colors,
     state,
@@ -302,10 +311,12 @@ function mount(options: {
     diagnostics,
     voiceDictionary,
     updates,
+    push,
     updateActions: { onChannelChange, onCheck, onReset },
     client,
     onThemeChange,
     onLocaleChange,
+    onPushEnabledChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
@@ -328,6 +339,7 @@ function mount(options: {
     client,
     onThemeChange,
     onLocaleChange,
+    onPushEnabledChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
@@ -340,7 +352,7 @@ function mount(options: {
     rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
       locale?: MobileLocalePreferenceState;
       diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoiceDictionaryStoreState;
-      updates?: MobileUpdateControllerState }) => {
+      updates?: MobileUpdateControllerState; push?: MobilePushControllerState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
       theme = next.theme ?? theme;
@@ -348,6 +360,7 @@ function mount(options: {
       diagnostics = next.diagnostics ?? diagnostics;
       voiceDictionary = next.voiceDictionary ?? voiceDictionary;
       updates = next.updates ?? updates;
+      push = next.push ?? push;
       act(() => root!.render(render()));
     }
   };

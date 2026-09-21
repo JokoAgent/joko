@@ -111,6 +111,11 @@ import {
   ProviderCatalogManager
 } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+import { ApnsMobilePushProvider } from "./apns-mobile-push-provider.js";
+import {
+  MobilePushCoordinator,
+  type MobilePushProviderPort
+} from "./mobile-push.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
@@ -316,6 +321,7 @@ export interface OrchestratorApplication {
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  readonly mobilePush?: MobilePushCoordinator;
   /** Point-in-time projection of current Backend process instances. */
   readonly adapters: readonly BackendAdapter[];
   /** Idle-only, durable-generation Backend process replacement. */
@@ -401,6 +407,8 @@ export interface OrchestratorApplicationDependencies {
   readonly codeHostProviders?: readonly CodeHostProvider[];
   /** Test-only transport seam; production uses the host fetch implementation. */
   readonly providerAccountUsageFetch?: typeof fetch;
+  /** Test-only transport seam; production uses the configured generic APNs provider. */
+  readonly mobilePushProvider?: MobilePushProviderPort;
 }
 
 export type OutboundProxyResolver = (
@@ -512,6 +520,20 @@ export async function createOrchestratorApplication(
   const baseSettings = await loadJsonFile<PiManagedSettings>(config.piSettingsFile, {});
   const settings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", "settings.pi.pi")?.value);
   const credentialVault = await CredentialVault.open(join(config.dataDirectory, "credentials", "master.key"));
+  const mobilePushProvider = dependencies.mobilePushProvider ?? (config.mobilePush === undefined
+    ? undefined
+    : new ApnsMobilePushProvider({
+        teamId: config.mobilePush.apns.teamId,
+        keyId: config.mobilePush.apns.keyId,
+        privateKeyPem: await readFile(config.mobilePush.apns.privateKeyPath, "utf8"),
+        topic: config.mobilePush.apns.topic
+      }));
+  const mobilePush = new MobilePushCoordinator({
+    store,
+    vault: credentialVault,
+    serverId,
+    ...(mobilePushProvider === undefined ? {} : { provider: mobilePushProvider })
+  });
   const credentials = new CredentialManager({
     vault: credentialVault,
     storagePath: join(config.dataDirectory, "credentials", "records.json")
@@ -1938,6 +1960,7 @@ export async function createOrchestratorApplication(
     skillMarketSync.beginPending();
     messageSearch.start();
     sessionNavigation.start();
+    mobilePush.start();
     scheduler.start();
     armMaintenance();
     void runMaintenance().catch(() => {
@@ -1962,6 +1985,7 @@ export async function createOrchestratorApplication(
     await extensionMainViews.close().catch(() => undefined);
     await extensionPackagePublisher.close().catch(() => undefined);
     scheduler.stop();
+    await mobilePush.close().catch(() => undefined);
     providerAuth.beginShutdown();
     providerAccountUsage.invalidate();
     await managedModelRuntimeSystem.close().catch(() => undefined);
@@ -2029,6 +2053,7 @@ export async function createOrchestratorApplication(
     terminals,
     voiceInput,
     voiceInputSettings,
+    mobilePush,
     get adapters() {
       return backendInstances.availableAdapters();
     },
@@ -2109,6 +2134,7 @@ export async function createOrchestratorApplication(
         await attempt(() => extensionPackagePublisher.close());
         if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
         await attempt(() => scheduler.stop());
+        await attempt(() => mobilePush.close());
         await attempt(() => sessionNavigation.dispose());
         await attempt(() => auxiliaryText.dispose());
         await attempt(() => providerAuth.beginShutdown());

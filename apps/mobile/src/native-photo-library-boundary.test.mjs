@@ -74,6 +74,7 @@ describe("native photo-library config boundary", () => {
     });
     expect(new Set(app.android.blockedPermissions)).toEqual(new Set([
       "android.permission.ACCESS_MEDIA_LOCATION",
+      "android.permission.POST_NOTIFICATIONS",
       "android.permission.READ_EXTERNAL_STORAGE",
       "android.permission.READ_MEDIA_AUDIO",
       "android.permission.READ_MEDIA_IMAGES",

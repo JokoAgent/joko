@@ -131,6 +131,9 @@ import type {
   MakerMemorySearchHit,
   MessageEmbeddingJob,
   MessageEmbeddingStatus,
+  ClaimedMobilePushDelivery,
+  MobilePushDeliveryRecord,
+  MobilePushRegistrationRecord,
   ModelPriceOverrideRecord,
   NativeSessionDerivationRecord,
   RecordNativeSessionDerivationInput,
@@ -152,6 +155,7 @@ import type {
   PutArtifactInput,
   PutObjectiveInput,
   PutMakerMemoryEntryInput,
+  PutMobilePushRegistrationInput,
   PutLocalModelPullCheckpointInput,
   PutLocalRuntimeProviderBindingInput,
   PinRemoteHostTrustInput,
@@ -1492,6 +1496,320 @@ export class OperationalStore {
     `).all(deviceId) as Row[]).map(connectionFromRow);
   }
 
+  getMobilePushRegistration(id: string): MobilePushRegistrationRecord {
+    const registration = this.findMobilePushRegistration(id);
+    if (registration === undefined) throw new NotFoundError("Mobile push registration", id);
+    return registration;
+  }
+
+  findMobilePushRegistration(id: string): MobilePushRegistrationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM mobile_push_registrations WHERE id = ?"
+    ).get(boundedPrivateIdentity(id, "Mobile push registration ID")) as Row | undefined;
+    return row === undefined ? undefined : mobilePushRegistrationFromRow(row);
+  }
+
+  findMobilePushRegistrationForConnection(connectionId: string): MobilePushRegistrationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM mobile_push_registrations WHERE connection_id = ?"
+    ).get(nonBlank(connectionId, "Mobile push Connection ID")) as Row | undefined;
+    return row === undefined ? undefined : mobilePushRegistrationFromRow(row);
+  }
+
+  listMobilePushRegistrations(): MobilePushRegistrationRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(
+      "SELECT * FROM mobile_push_registrations ORDER BY created_at, id"
+    ).all() as Row[]).map(mobilePushRegistrationFromRow);
+  }
+
+  putMobilePushRegistration(input: PutMobilePushRegistrationInput): MobilePushRegistrationRecord {
+    return this.write(() => {
+      const now = input.now ?? this.now();
+      const id = boundedPrivateIdentity(input.id, "Mobile push registration ID");
+      const connection = this.getConnection(nonBlank(input.connectionId, "Mobile push Connection ID"));
+      const device = this.getDevice(nonBlank(input.deviceId, "Mobile push Device ID"));
+      if (connection.deviceId !== device.id || connection.state !== "active" || device.state !== "active"
+        || device.kind !== "mobile" || device.platform.trim().toLocaleLowerCase("en-US") !== "ios") {
+        throw new AuthorizationError("Mobile push registration requires the exact active iOS mobile Device connection.");
+      }
+      if (device.revision !== input.expectedDeviceRevision) {
+        throw new RevisionConflictError("Device", device.id, input.expectedDeviceRevision, device.revision);
+      }
+      if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(input.expiresAt)
+        || input.expiresAt <= now || input.expiresAt - now > 90 * 24 * 60 * 60 * 1_000) {
+        throw new StoreError("Mobile push registration expiry is invalid.");
+      }
+      const tokenDigest = normalizedSha256Digest(input.tokenDigest, "Mobile push token digest");
+      const secretDigest = normalizedSha256Digest(
+        input.revocationSecretDigest,
+        "Mobile push revocation-secret digest"
+      );
+      const token = normalizedSealedMobilePushCredential(input.sealedToken, "Mobile push token");
+      const secret = normalizedSealedMobilePushCredential(
+        input.sealedRevocationSecret,
+        "Mobile push revocation secret"
+      );
+      if (!(input.environment === "apns_sandbox" || input.environment === "apns_production")) {
+        throw new StoreError("Mobile push environment is invalid.");
+      }
+      if (!(input.locale === "en" || input.locale === "zh-CN" || input.locale === "zh-TW"
+        || input.locale === "ja" || input.locale === "ko")) {
+        throw new StoreError("Mobile push locale is invalid.");
+      }
+      const current = this.findMobilePushRegistrationForConnection(connection.id);
+      if (current !== undefined && current.id !== id) {
+        throw new StoreError("The mobile Connection already owns another push registration.");
+      }
+      const deviceRow = this.database.prepare(
+        "SELECT id FROM mobile_push_registrations WHERE device_id = ?"
+      ).get(device.id) as Row | undefined;
+      if (deviceRow !== undefined && stringValue(deviceRow["id"]) !== id) {
+        throw new StoreError("The mobile Device already owns another push registration.");
+      }
+
+      // Possession of the same current native token transfers the registration
+      // away from an obsolete pairing. This is the only cross-Device cleanup
+      // path and does not grant read or mutation authority to the old Device.
+      this.database.prepare(
+        "DELETE FROM mobile_push_registrations WHERE token_digest = ? AND id <> ?"
+      ).run(tokenDigest, id);
+      const createdAt = current?.createdAt ?? now;
+      this.database.prepare(`
+        INSERT INTO mobile_push_registrations(
+          id, connection_id, device_id, provider, environment, locale,
+          token_digest, token_nonce, token_ciphertext, token_tag,
+          revocation_secret_digest, revocation_secret_nonce,
+          revocation_secret_ciphertext, revocation_secret_tag,
+          expires_at, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, 'apns', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          connection_id = excluded.connection_id,
+          device_id = excluded.device_id,
+          environment = excluded.environment,
+          locale = excluded.locale,
+          token_digest = excluded.token_digest,
+          token_nonce = excluded.token_nonce,
+          token_ciphertext = excluded.token_ciphertext,
+          token_tag = excluded.token_tag,
+          revocation_secret_digest = excluded.revocation_secret_digest,
+          revocation_secret_nonce = excluded.revocation_secret_nonce,
+          revocation_secret_ciphertext = excluded.revocation_secret_ciphertext,
+          revocation_secret_tag = excluded.revocation_secret_tag,
+          expires_at = excluded.expires_at,
+          updated_at = excluded.updated_at,
+          revision = excluded.revision
+      `).run(
+        id,
+        connection.id,
+        device.id,
+        input.environment,
+        input.locale,
+        tokenDigest,
+        token.nonce,
+        token.ciphertext,
+        token.tag,
+        secretDigest,
+        secret.nonce,
+        secret.ciphertext,
+        secret.tag,
+        input.expiresAt,
+        createdAt,
+        now,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getMobilePushRegistration(id);
+    });
+  }
+
+  removeMobilePushRegistrationForConnection(connectionId: string): boolean {
+    return this.write(() => Number(this.database.prepare(
+      "DELETE FROM mobile_push_registrations WHERE connection_id = ?"
+    ).run(nonBlank(connectionId, "Mobile push Connection ID")).changes) > 0);
+  }
+
+  removeMobilePushRegistrationsForDevice(deviceId: string): number {
+    return this.write(() => Number(this.database.prepare(
+      "DELETE FROM mobile_push_registrations WHERE device_id = ?"
+    ).run(nonBlank(deviceId, "Mobile push Device ID")).changes));
+  }
+
+  removeMobilePushRegistrationAuthorized(input: {
+    readonly registrationId: string;
+    readonly connectionId: string;
+  }): boolean {
+    return this.write(() => {
+      const registration = this.findMobilePushRegistration(input.registrationId);
+      if (registration === undefined) return false;
+      if (registration.connectionId !== input.connectionId) {
+        throw new AuthorizationError("The push registration belongs to another Connection.");
+      }
+      return Number(this.database.prepare(
+        "DELETE FROM mobile_push_registrations WHERE id = ? AND connection_id = ?"
+      ).run(registration.id, registration.connectionId).changes) === 1;
+    });
+  }
+
+  removeMobilePushRegistrationWithSecret(input: {
+    readonly registrationId: string;
+    readonly revocationSecretDigest: string;
+  }): boolean {
+    return this.write(() => {
+      const registration = this.findMobilePushRegistration(input.registrationId);
+      if (registration === undefined) return false;
+      const digest = normalizedSha256Digest(
+        input.revocationSecretDigest,
+        "Mobile push revocation-secret digest"
+      );
+      if (!constantTimeEqual(registration.revocationSecretDigest, digest)) return false;
+      return Number(this.database.prepare(
+        "DELETE FROM mobile_push_registrations WHERE id = ?"
+      ).run(registration.id).changes) === 1;
+    });
+  }
+
+  pruneExpiredMobilePushRegistrations(now = this.now()): number {
+    return this.write(() => Number(this.database.prepare(
+      "DELETE FROM mobile_push_registrations WHERE expires_at <= ?"
+    ).run(safeNonNegativeInteger(now, "Mobile push maintenance time")).changes));
+  }
+
+  listMobilePushDeliveries(): MobilePushDeliveryRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(
+      "SELECT * FROM mobile_push_deliveries ORDER BY created_at, id"
+    ).all() as Row[]).map(mobilePushDeliveryFromRow);
+  }
+
+  recoverInterruptedMobilePushDeliveries(now = this.now()): number {
+    return this.write(() => Number(this.database.prepare(`
+      UPDATE mobile_push_deliveries
+      SET status = 'unknown', claim_token = NULL, claimed_at = NULL,
+          outcome_code = 'INTERRUPTED_UNKNOWN', updated_at = ?, revision = ?
+      WHERE status = 'dispatching'
+    `).run(
+      safeNonNegativeInteger(now, "Mobile push recovery time"),
+      asSqlInteger(this.requireActiveRevision())
+    ).changes));
+  }
+
+  claimNextMobilePushDelivery(now = this.now()): ClaimedMobilePushDelivery | undefined {
+    return this.write(() => {
+      const at = safeNonNegativeInteger(now, "Mobile push claim time");
+      this.database.prepare(
+        "DELETE FROM mobile_push_registrations WHERE expires_at <= ?"
+      ).run(at);
+      const row = this.database.prepare(`
+        SELECT delivery.id
+        FROM mobile_push_deliveries AS delivery
+        JOIN mobile_push_registrations AS registration ON registration.id = delivery.registration_id
+        JOIN connections AS connection ON connection.id = registration.connection_id
+        JOIN devices AS device ON device.id = registration.device_id
+        WHERE delivery.status = 'pending' AND delivery.available_at <= ?
+          AND registration.expires_at > ?
+          AND connection.state = 'active' AND connection.device_id = registration.device_id
+          AND device.state = 'active' AND device.kind = 'mobile'
+        ORDER BY delivery.available_at, delivery.created_at, delivery.id
+        LIMIT 1
+      `).get(at, at) as Row | undefined;
+      if (row === undefined) return undefined;
+      const id = stringValue(row["id"]);
+      const claimToken = this.idFactory();
+      const result = this.database.prepare(`
+        UPDATE mobile_push_deliveries
+        SET status = 'dispatching', attempts = attempts + 1,
+            claim_token = ?, claimed_at = ?, outcome_code = NULL,
+            updated_at = ?, revision = ?
+        WHERE id = ? AND status = 'pending' AND available_at <= ?
+      `).run(
+        claimToken,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        id,
+        at
+      );
+      if (Number(result.changes) !== 1) return undefined;
+      const deliveryRow = this.database.prepare(
+        "SELECT * FROM mobile_push_deliveries WHERE id = ?"
+      ).get(id) as Row;
+      const delivery = mobilePushDeliveryFromRow(deliveryRow);
+      return {
+        delivery,
+        registration: this.getMobilePushRegistration(delivery.registrationId)
+      };
+    });
+  }
+
+  finishMobilePushDelivery(input: {
+    readonly deliveryId: string;
+    readonly claimToken: string;
+    readonly outcome: "delivered" | "retry" | "failed" | "unknown" | "invalid_registration";
+    readonly outcomeCode: string;
+    readonly retryAt?: number;
+    readonly now?: number;
+  }): MobilePushDeliveryRecord | undefined {
+    return this.write(() => {
+      const id = boundedPrivateIdentity(input.deliveryId, "Mobile push delivery ID");
+      const claimToken = boundedPrivateIdentity(input.claimToken, "Mobile push claim token");
+      const at = safeNonNegativeInteger(input.now ?? this.now(), "Mobile push completion time");
+      const code = normalizedOutcomeCode(input.outcomeCode);
+      const row = this.database.prepare(
+        "SELECT * FROM mobile_push_deliveries WHERE id = ?"
+      ).get(id) as Row | undefined;
+      if (row === undefined) return undefined;
+      const current = mobilePushDeliveryFromRow(row);
+      if (current.status !== "dispatching" || current.claimToken !== claimToken) {
+        throw new StoreError("The mobile push delivery claim is stale.");
+      }
+      if (input.outcome === "invalid_registration") {
+        this.database.prepare(
+          "DELETE FROM mobile_push_registrations WHERE id = ?"
+        ).run(current.registrationId);
+        return undefined;
+      }
+      const status = input.outcome === "retry" ? "pending" : input.outcome;
+      const availableAt = input.outcome === "retry"
+        ? safeNonNegativeInteger(input.retryAt, "Mobile push retry time")
+        : current.availableAt;
+      if (input.outcome === "retry" && availableAt <= at) {
+        throw new StoreError("Mobile push retry time must be in the future.");
+      }
+      this.database.prepare(`
+        UPDATE mobile_push_deliveries
+        SET status = ?, available_at = ?, claim_token = NULL, claimed_at = NULL,
+            outcome_code = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND status = 'dispatching' AND claim_token = ?
+      `).run(
+        status,
+        availableAt,
+        code,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        id,
+        claimToken
+      );
+      const updated = this.database.prepare(
+        "SELECT * FROM mobile_push_deliveries WHERE id = ?"
+      ).get(id) as Row | undefined;
+      return updated === undefined ? undefined : mobilePushDeliveryFromRow(updated);
+    });
+  }
+
+  nextMobilePushDeliveryAt(): number | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT MIN(delivery.available_at) AS available_at
+      FROM mobile_push_deliveries AS delivery
+      JOIN mobile_push_registrations AS registration ON registration.id = delivery.registration_id
+      WHERE delivery.status = 'pending' AND registration.expires_at > ?
+    `).get(this.now()) as Row | undefined;
+    const value = row?.["available_at"];
+    return value === null || value === undefined ? undefined : numberValue(value);
+  }
+
   findConnectionByAuthKeyDigest(authKeyDigest: string): ConnectionRecord | undefined {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM connections WHERE auth_key_digest = ?")
@@ -1575,7 +1893,12 @@ export class OperationalStore {
       if (expectedRevision !== undefined && current.revision !== expectedRevision) {
         throw new RevisionConflictError("Connection", id, expectedRevision, current.revision);
       }
-      if (current.state === "revoked") return current;
+      if (current.state === "revoked") {
+        this.database.prepare(
+          "DELETE FROM mobile_push_registrations WHERE connection_id = ?"
+        ).run(current.id);
+        return current;
+      }
       this.database.prepare(`
         UPDATE connections
         SET state = 'revoked', revoked_at = ?, revision = ?
@@ -1590,6 +1913,9 @@ export class OperationalStore {
       if (updated.state !== "revoked") {
         throw new RevisionConflictError("Connection", id, current.revision, updated.revision);
       }
+      this.database.prepare(
+        "DELETE FROM mobile_push_registrations WHERE connection_id = ?"
+      ).run(updated.id);
       return updated;
     });
   }
@@ -1616,6 +1942,9 @@ export class OperationalStore {
           WHERE device_id = ? AND state = 'active'
         `).run(revokedAt, revision, id);
       }
+      this.database.prepare(
+        "DELETE FROM mobile_push_registrations WHERE device_id = ?"
+      ).run(current.id);
       return { device: this.getDevice(id), connections: this.listDeviceConnections(id) };
     });
   }
@@ -3294,6 +3623,15 @@ export class OperationalStore {
         input.traceId,
         input.operationId
       );
+      if (
+        current === undefined ||
+        !current.unread ||
+        updated.kind !== current.kind ||
+        updated.subjectCursor !== current.subjectCursor ||
+        updated.subjectGeneration !== current.subjectGeneration
+      ) {
+        this.enqueueMobilePushDeliveries(session, updated, at);
+      }
       return updated;
     });
   }
@@ -8540,6 +8878,92 @@ export class OperationalStore {
     });
   }
 
+  /** Creates the durable delivery work only for a newly published attention
+   * subject. Dispatch is owned by the node worker and cannot begin until this
+   * surrounding Store transaction commits. */
+  private enqueueMobilePushDeliveries(
+    session: StoredSession,
+    attention: SessionAttentionRecord,
+    at: number
+  ): void {
+    const message = this.latestMobilePushMessageOrigin(
+      session.descriptor.id,
+      attention.subjectCursor
+    );
+    const registrations = this.database.prepare(`
+      SELECT registration.id
+      FROM mobile_push_registrations AS registration
+      JOIN connections AS connection ON connection.id = registration.connection_id
+      JOIN devices AS device ON device.id = registration.device_id
+      WHERE registration.expires_at > ?
+        AND connection.state = 'active'
+        AND connection.device_id = registration.device_id
+        AND device.state = 'active'
+        AND device.kind = 'mobile'
+        AND lower(device.platform) = 'ios'
+      ORDER BY registration.created_at, registration.id
+    `).all(at) as Row[];
+    const insert = this.database.prepare(`
+      INSERT OR IGNORE INTO mobile_push_deliveries(
+        id, registration_id, session_id, kind, subject_cursor,
+        subject_generation, message_id, message_event_id, status,
+        available_at, attempts, claim_token, claimed_at, outcome_code,
+        created_at, updated_at, revision
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, NULL, NULL, ?, ?, ?)
+    `);
+    for (const row of registrations) {
+      insert.run(
+        boundedPrivateIdentity(this.idFactory(), "Mobile push delivery ID"),
+        stringValue(row["id"]),
+        session.descriptor.id,
+        attention.kind,
+        asSqlInteger(attention.subjectCursor),
+        attention.subjectGeneration,
+        message?.messageId ?? null,
+        message?.eventId ?? null,
+        at,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+    }
+  }
+
+  private latestMobilePushMessageOrigin(
+    sessionId: string,
+    throughCursor: bigint
+  ): { readonly messageId: string; readonly eventId: string } | undefined {
+    const nativeVisibility = this.nativeMessageSearchVisibility(
+      { kind: "session", id: sessionId },
+      throughCursor
+    );
+    const row = this.database.prepare(`
+      WITH RECURSIVE ${nativeVisibility.ctes}
+      SELECT event.*
+      FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ?
+        AND event.global_cursor <= ?
+        AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
+        AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        ${nativeVisibility.clause("event")}
+      ORDER BY event.global_cursor DESC
+      LIMIT 1
+    `).get(
+      ...nativeVisibility.params,
+      sessionId,
+      asSqlInteger(throughCursor)
+    ) as Row | undefined;
+    if (row === undefined) return undefined;
+    const event = eventFromRow(row);
+    const messageId = sessionTimelineMessageId(event);
+    return mobilePushPublicIdentity(messageId) && mobilePushPublicIdentity(event.id)
+      ? { messageId, eventId: event.id }
+      : undefined;
+  }
+
   /** Normal terminals never downgrade or resurrect an unresolved interaction;
    * failures and pre-existing unread errors remain the higher-priority truth. */
   private recordTerminalSessionAttention(
@@ -13050,6 +13474,70 @@ function deviceFromRow(row: Row): DeviceRecord {
   };
 }
 
+function mobilePushRegistrationFromRow(row: Row): MobilePushRegistrationRecord {
+  return {
+    id: boundedPrivateIdentity(stringValue(row["id"]), "Stored mobile push registration ID"),
+    connectionId: stringValue(row["connection_id"]),
+    deviceId: stringValue(row["device_id"]),
+    provider: enumValue(row["provider"], ["apns"] as const),
+    environment: enumValue(row["environment"], ["apns_sandbox", "apns_production"] as const),
+    locale: enumValue(row["locale"], ["en", "zh-CN", "zh-TW", "ja", "ko"] as const),
+    tokenDigest: normalizedSha256Digest(stringValue(row["token_digest"]), "Stored mobile push token digest"),
+    sealedToken: normalizedSealedMobilePushCredential({
+      algorithm: "aes-256-gcm",
+      nonce: stringValue(row["token_nonce"]),
+      ciphertext: stringValue(row["token_ciphertext"]),
+      tag: stringValue(row["token_tag"])
+    }, "Stored mobile push token"),
+    revocationSecretDigest: normalizedSha256Digest(
+      stringValue(row["revocation_secret_digest"]),
+      "Stored mobile push revocation-secret digest"
+    ),
+    sealedRevocationSecret: normalizedSealedMobilePushCredential({
+      algorithm: "aes-256-gcm",
+      nonce: stringValue(row["revocation_secret_nonce"]),
+      ciphertext: stringValue(row["revocation_secret_ciphertext"]),
+      tag: stringValue(row["revocation_secret_tag"])
+    }, "Stored mobile push revocation secret"),
+    expiresAt: numberValue(row["expires_at"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function mobilePushDeliveryFromRow(row: Row): MobilePushDeliveryRecord {
+  const messageId = optionalString("messageId", row["message_id"]).messageId;
+  const messageEventId = optionalString("messageEventId", row["message_event_id"]).messageEventId;
+  if ((messageId === undefined) !== (messageEventId === undefined)) {
+    throw new StoreError("Stored mobile push message identity is incomplete.");
+  }
+  return {
+    id: boundedPrivateIdentity(stringValue(row["id"]), "Stored mobile push delivery ID"),
+    registrationId: boundedPrivateIdentity(
+      stringValue(row["registration_id"]),
+      "Stored mobile push registration ID"
+    ),
+    sessionId: stringValue(row["session_id"]),
+    kind: enumValue(row["kind"], ["done", "awaiting", "error"] as const),
+    subjectCursor: toBigInt(row["subject_cursor"]),
+    subjectGeneration: numberValue(row["subject_generation"]),
+    ...(messageId === undefined ? {} : { messageId, messageEventId: messageEventId! }),
+    status: enumValue(
+      row["status"],
+      ["pending", "dispatching", "delivered", "failed", "unknown"] as const
+    ),
+    availableAt: numberValue(row["available_at"]),
+    attempts: numberValue(row["attempts"]),
+    ...optionalString("claimToken", row["claim_token"]),
+    ...optionalNumber("claimedAt", row["claimed_at"]),
+    ...optionalString("outcomeCode", row["outcome_code"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
 function pairingFromRow(row: Row): PairingRecord {
   const deviceId = optionalString("deviceId", row["device_id"]).deviceId;
   const deviceName = optionalString("deviceName", row["device_name"]).deviceName;
@@ -15110,6 +15598,80 @@ function normalizeOffset(value: number | undefined): number {
 function nonBlank(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized === "") throw new StoreError(`${label} must not be blank.`);
+  return normalized;
+}
+
+function boundedPrivateIdentity(value: string, label: string): string {
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    [...normalized].length > 256 ||
+    /[\p{Cc}\u2028\u2029]/u.test(normalized)
+  ) {
+    throw new StoreError(`${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function mobilePushPublicIdentity(value: string): boolean {
+  const normalized = value.trim();
+  return normalized === value && normalized.length > 0 && [...normalized].length <= 256 &&
+    !/[\p{Cc}\u2028\u2029]/u.test(normalized);
+}
+
+function normalizedSha256Digest(value: string, label: string): string {
+  const match = /^sha256:([a-f0-9]{64})$/u.exec(value.trim().toLowerCase());
+  if (match === null) throw new StoreError(`${label} is invalid.`);
+  return `sha256:${match[1]}`;
+}
+
+function normalizedSealedMobilePushCredential(
+  value: MobilePushRegistrationRecord["sealedToken"],
+  label: string
+): MobilePushRegistrationRecord["sealedToken"] {
+  if (value.algorithm !== "aes-256-gcm") {
+    throw new StoreError(`${label} ciphertext algorithm is invalid.`);
+  }
+  return {
+    algorithm: "aes-256-gcm",
+    nonce: canonicalMobilePushBase64(value.nonce, `${label} nonce`, 12, 12),
+    ciphertext: canonicalMobilePushBase64(value.ciphertext, `${label} ciphertext`, 1, 1_024),
+    tag: canonicalMobilePushBase64(value.tag, `${label} tag`, 16, 16)
+  };
+}
+
+function canonicalMobilePushBase64(
+  value: string,
+  label: string,
+  minimumBytes: number,
+  maximumBytes: number
+): string {
+  if (typeof value !== "string" || value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/u.test(value)) {
+    throw new StoreError(`${label} is invalid.`);
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (
+    decoded.byteLength < minimumBytes ||
+    decoded.byteLength > maximumBytes ||
+    decoded.toString("base64") !== value
+  ) {
+    throw new StoreError(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function safeNonNegativeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new StoreError(`${label} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function normalizedOutcomeCode(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  if (!/^[A-Z0-9_]{1,64}$/u.test(normalized)) {
+    throw new StoreError("Mobile push outcome code is invalid.");
+  }
   return normalized;
 }
 

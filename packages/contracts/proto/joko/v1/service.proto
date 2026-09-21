@@ -9,6 +9,7 @@ import "joko/v1/event.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/managed_model_runtime.proto";
+import "joko/v1/mobile_push.proto";
 import "joko/v1/model.proto";
 import "joko/v1/operation.proto";
 import "joko/v1/pi.proto";
@@ -35,6 +36,11 @@ service ConnectionService {
   rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
   rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
   rpc ListDeviceControlRelations(ListDeviceControlRelationsRequest) returns (ListDeviceControlRelationsResponse);
+  rpc GetMobilePushCapability(GetMobilePushCapabilityRequest) returns (GetMobilePushCapabilityResponse);
+  rpc RegisterMobilePush(RegisterMobilePushRequest) returns (RegisterMobilePushResponse);
+  // Authentication is optional only for possession of the exact, scoped
+  // MobilePushRevocationTicket returned by RegisterMobilePush.
+  rpc UnregisterMobilePush(UnregisterMobilePushRequest) returns (UnregisterMobilePushResponse);
 }
 
 service EventService {
