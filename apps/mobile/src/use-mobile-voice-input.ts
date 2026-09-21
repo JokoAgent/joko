@@ -264,9 +264,9 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (next) => {
-      if (next === "active") return;
+      if (next !== "background") return;
       const run = runRef.current;
-      if (run?.currentState === "starting" || run?.currentState === "listening" || run?.currentState === "submitting") {
+      if (run?.shouldCancelForBackground) {
         void run.cancel();
       }
     });

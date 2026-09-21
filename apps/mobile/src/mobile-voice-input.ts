@@ -73,6 +73,10 @@ export interface MobileVoiceTransport {
   readonly profileId: string;
   readonly surfaceOwnerKey: string;
   isCurrent(): boolean;
+  /** Waits for a lifecycle-driven reconnect to prove the exact same owner.
+   * Transports without lifecycle suspension can omit this and stay strictly
+   * synchronous through isCurrent(). */
+  waitUntilCurrent?(signal?: AbortSignal): Promise<boolean>;
   getCapabilities(signal?: AbortSignal): Promise<MobileVoiceCapability>;
   adviseVoiceInputDictionaryEdit(
     draft: MobileVoiceDictionaryAdviceDraft,
@@ -195,6 +199,7 @@ export class MobileVoiceInputRun {
   #acceptedDurationMs = 0;
   #capturedBytes = 0;
   #capturedDurationMs = 0;
+  #backgroundSensitiveResources = false;
   #generation = 0;
   #stopRequested = false;
   #disposed = false;
@@ -214,6 +219,12 @@ export class MobileVoiceInputRun {
 
   get currentState(): MobileVoiceRunState { return this.#state; }
   get currentSession(): MobileVoiceSession | undefined { return this.#session; }
+  /** A system permission sheet may background Android before audio or a
+   * service session exists. That prompt must survive; actual capture and
+   * submitting sessions must not. */
+  get shouldCancelForBackground(): boolean {
+    return this.#backgroundSensitiveResources || this.#state === "listening" || this.#state === "submitting";
+  }
 
   async start(): Promise<void> {
     if (this.#disposed || !["idle", "done", "error", "cancelled"].includes(this.#state)) return;
@@ -226,6 +237,7 @@ export class MobileVoiceInputRun {
     this.#acceptedDurationMs = 0;
     this.#capturedBytes = 0;
     this.#capturedDurationMs = 0;
+    this.#backgroundSensitiveResources = false;
     this.#appendChain = Promise.resolve();
     this.#startBarrier = new Promise<void>((resolve) => { this.#releaseStartBarrier = resolve; });
     const abort = new AbortController();
@@ -246,7 +258,13 @@ export class MobileVoiceInputRun {
       if (!permission.granted) {
         throw new MobileVoiceRunError(permission.canAskAgain ? "permissionDenied" : "permissionBlocked");
       }
+      if (!this.#transport.isCurrent()) {
+        const restored = await this.#transport.waitUntilCurrent?.(abort.signal);
+        if (!this.#isCurrent(generation, abort)) throw new MobileVoiceRunError("cancelled");
+        if (restored !== true) throw new MobileVoiceRunError("ownerChanged");
+      }
       this.#assertOwner();
+      this.#backgroundSensitiveResources = true;
 
       const requestId = this.#requestId();
       if (!IDENTIFIER_PATTERN.test(requestId)) throw new MobileVoiceRunError("serviceUnavailable");
@@ -511,7 +529,10 @@ export class MobileVoiceInputRun {
     const stop = this.#stopCapture;
     this.#stopCapture = undefined;
     try { await stop?.(); }
-    finally { await this.#capture.release().catch(() => undefined); }
+    finally {
+      this.#backgroundSensitiveResources = false;
+      await this.#capture.release().catch(() => undefined);
+    }
   }
 
   #setState(state: MobileVoiceRunState, session = this.#session, error?: MobileVoiceRunError): void {

@@ -1678,6 +1678,19 @@ export class MobileClient {
     }
   }
 
+  /** Retires a possibly half-open native fetch after a material active network
+   * path change. Busy writes keep their receipt-owned recovery path and defer
+   * the observation refresh instead of starting a competing request. */
+  notifyNetworkChanged(): void {
+    if (!this.#foreground || this.#disposed) return;
+    if (this.#state.busy || this.#mutationOwner) {
+      if (this.#timer !== undefined) clearTimeout(this.#timer);
+      this.#timer = setTimeout(() => this.notifyNetworkChanged(), 1_000);
+      return;
+    }
+    void this.refresh();
+  }
+
   async refresh(): Promise<void> {
     const credential = this.#credential;
     if (!this.#foreground) return;
@@ -6879,10 +6892,40 @@ export class MobileClient {
       assertCurrent();
       return result;
     };
+    const waitUntilCurrent = (signal?: AbortSignal): Promise<boolean> => {
+      if (isCurrent()) return Promise.resolve(true);
+      if (signal?.aborted || this.#disposed) return Promise.resolve(false);
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        let unsubscribe = (): void => undefined;
+        const finish = (current: boolean): void => {
+          if (settled) return;
+          settled = true;
+          signal?.removeEventListener("abort", aborted);
+          unsubscribe();
+          resolve(current);
+        };
+        const aborted = (): void => finish(false);
+        signal?.addEventListener("abort", aborted, { once: true });
+        const registered = this.subscribe((state) => {
+          if (isCurrent()) {
+            finish(true);
+            return;
+          }
+          // A permission prompt may temporarily background Android. Only a
+          // proven foreground reconnect can resume the microphone request.
+          if (!this.#foreground || state.status === "connecting") return;
+          finish(false);
+        });
+        unsubscribe = registered;
+        if (settled) registered();
+      });
+    };
     return {
       profileId: credential.profileId,
       surfaceOwnerKey,
       isCurrent,
+      waitUntilCurrent,
       getCapabilities: (signal) => owned(() => this.network.getVoiceInputCapabilities(credential, signal)),
       adviseVoiceInputDictionaryEdit: (draft, signal) => owned(() =>
         this.network.adviseVoiceInputDictionaryEdit(credential, draft, signal)),

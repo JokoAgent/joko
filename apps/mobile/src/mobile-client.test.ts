@@ -2121,6 +2121,21 @@ describe("native mobile connection and operation ownership", () => {
     await expect(taskVoice!.cancel("voice-one")).resolves.toMatchObject({ outcome: "cancelled" });
     expect(network.getVoiceInputSession).not.toHaveBeenCalled();
     expect(network.cancelVoiceInput).toHaveBeenCalledWith(credential, "voice-one", undefined);
+
+    let resolveInspection!: (identity: NodeIdentity) => void;
+    vi.mocked(network.inspect).mockImplementationOnce(() => new Promise<NodeIdentity>((resolve) => {
+      resolveInspection = resolve;
+    }));
+    const resumed = taskVoice!.waitUntilCurrent!();
+    let resumedSettled = false;
+    void resumed.then(() => { resumedSettled = true; });
+    app.setForeground(true);
+    expect(app.state.status).toBe("connecting");
+    await Promise.resolve();
+    expect(resumedSettled).toBe(false);
+    resolveInspection(node);
+    await expect(resumed).resolves.toBe(true);
+    expect(taskVoice?.isCurrent()).toBe(true);
   });
 
   it("accepts only the exact current Joko API identity before any authenticated work", () => {
@@ -2711,6 +2726,21 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.saved[0]).toMatchObject({ connectionId: credential.connectionId, automatic: false });
     expect(network.inspect).not.toHaveBeenCalled();
     expect(network.readOwner).not.toHaveBeenCalled();
+  });
+
+  it("retires a half-open observation and re-reads the exact active owner after a network path change", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    vi.mocked(network.inspect).mockClear();
+    vi.mocked(network.readOwner).mockClear();
+
+    app.notifyNetworkChanged();
+
+    await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledOnce());
+    expect(network.inspect).toHaveBeenCalledWith(credential.origin, expect.any(AbortSignal));
+    expect(network.readOwner).toHaveBeenCalledWith(credential, expect.any(AbortSignal));
+    expect(app.state.status).toBe("connected");
   });
 
   it("reloads a newly durable pairing after backgrounding before in-memory adoption", async () => {

@@ -22,6 +22,7 @@ import {
   supportsMobileVoiceCapture,
   type MobileVoiceCapability,
   type MobileVoiceCaptureRuntime,
+  type MobileVoicePermission,
   type MobileVoicePcmChunk,
   type MobileVoiceSession,
   type MobileVoiceTransport
@@ -287,6 +288,57 @@ describe("MobileVoiceInputRun", () => {
     await vi.waitFor(() => expect(transport.cancel).toHaveBeenCalledWith("voice-one"));
     expect(errors.at(-1)?.code).toBe("ownerChanged");
     expect(capture.stop).toHaveBeenCalledOnce();
+  });
+
+  it("does not classify a pending system permission sheet as active audio resources", async () => {
+    let resolvePermission!: (value: { granted: boolean; canAskAgain: boolean }) => void;
+    const capture = fakeCapture();
+    capture.ensurePermission = vi.fn(() => new Promise<MobileVoicePermission>((resolve) => { resolvePermission = resolve; }));
+    const run = new MobileVoiceInputRun({
+      transport: fakeTransport(),
+      capture,
+      requestId: () => "request-permission-lifecycle"
+    });
+
+    const starting = run.start();
+    await vi.waitFor(() => expect(capture.ensurePermission).toHaveBeenCalledOnce());
+    expect(run.currentState).toBe("starting");
+    expect(run.shouldCancelForBackground).toBe(false);
+    resolvePermission({ granted: true, canAskAgain: true });
+    await starting;
+    expect(run.shouldCancelForBackground).toBe(true);
+    await run.cancel();
+    expect(run.shouldCancelForBackground).toBe(false);
+  });
+
+  it("waits for the exact owner to be re-proved after an Android permission-sheet resume", async () => {
+    let current = true;
+    let resolvePermission!: (value: MobileVoicePermission) => void;
+    let resolveOwner!: (value: boolean) => void;
+    const transport = fakeTransport(() => current);
+    transport.waitUntilCurrent = vi.fn(() => new Promise<boolean>((resolve) => { resolveOwner = resolve; }));
+    const capture = fakeCapture();
+    capture.ensurePermission = vi.fn(() => new Promise<MobileVoicePermission>((resolve) => { resolvePermission = resolve; }));
+    const run = new MobileVoiceInputRun({
+      transport,
+      capture,
+      requestId: () => "request-permission-resume"
+    });
+
+    const starting = run.start();
+    await vi.waitFor(() => expect(capture.ensurePermission).toHaveBeenCalledOnce());
+    current = false;
+    resolvePermission({ granted: true, canAskAgain: true });
+    await vi.waitFor(() => expect(transport.waitUntilCurrent).toHaveBeenCalledWith(expect.any(AbortSignal)));
+    expect(transport.start).not.toHaveBeenCalled();
+    expect(run.shouldCancelForBackground).toBe(false);
+
+    current = true;
+    resolveOwner(true);
+    await starting;
+    expect(transport.start).toHaveBeenCalledOnce();
+    expect(capture.start).toHaveBeenCalledOnce();
+    expect(run.shouldCancelForBackground).toBe(true);
   });
 
   it("cancels a service session that arrives after startup was abandoned", async () => {

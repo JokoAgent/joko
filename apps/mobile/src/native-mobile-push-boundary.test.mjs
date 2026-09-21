@@ -26,8 +26,9 @@ describe("mobile push native boundary", () => {
 
   it("wires startup, foreground, locale, Settings, and public-intent delivery at the root", () => {
     expect(root).toContain("new MobilePushController");
-    expect(root).toContain("mobilePush.start(offerUrl)");
-    expect(root).toContain("mobilePush.handleAppStateChange(foreground)");
+    expect(root).toContain("mobilePush.start(offerUrl, lifecycle.transportForeground)");
+    expect(root).toContain("mobilePush.handleAppStateChange(status)");
+    expect(root).toContain("mobilePush.handleAppStateChange(AppState.currentState)");
     expect(root).toContain("mobilePush.setLocale(locale.effectiveLocale)");
     expect(root).toContain("onPushEnabledChange={(enabled) => mobilePush.setEnabled(enabled)}");
     expect(controller).toContain("shouldShowBanner: false");

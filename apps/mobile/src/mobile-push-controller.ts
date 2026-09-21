@@ -89,12 +89,14 @@ export class MobilePushController {
   #activeController: AbortController | undefined;
   #enabled = false;
   #foreground = true;
+  #interactive = true;
   #generation = 0;
   #hydrated = false;
   #lastAuthorityObservation = "";
   #listeners = new Set<() => void>();
   #locale: MobilePushStoredLocale;
   #offerIntent: ((intent: string) => boolean | void) | undefined;
+  #pendingResponse: NotificationResponse | undefined;
   #removeClient: (() => void) | undefined;
   #responseSubscription: { remove(): void } | undefined;
   #started = false;
@@ -127,11 +129,12 @@ export class MobilePushController {
     return () => this.#listeners.delete(listener);
   }
 
-  async start(offerIntent: (intent: string) => boolean | void): Promise<void> {
+  async start(offerIntent: (intent: string) => boolean | void, foreground = true): Promise<void> {
     this.#offerIntent = offerIntent;
     if (this.#started) return;
     this.#started = true;
-    this.#foreground = true;
+    this.#foreground = foreground;
+    this.#interactive = foreground;
     this.#generation += 1;
     if (this.#platform !== "ios") {
       this.#publish({ enabled: false, saving: false, status: "unsupported-platform" });
@@ -152,7 +155,7 @@ export class MobilePushController {
       if (this.#enabled && this.#foreground) void this.reconcile();
     });
     this.#removeClient = this.#client.subscribe(() => this.#handleClientChange());
-    void this.#readLastResponse();
+    if (this.#interactive) void this.#readLastResponse();
     try {
       const snapshot = await this.#deviceStore.hydrate();
       if (!this.#started) return;
@@ -185,6 +188,7 @@ export class MobilePushController {
     this.#tokenSubscription?.remove();
     this.#tokenSubscription = undefined;
     this.#offerIntent = undefined;
+    this.#pendingResponse = undefined;
   }
 
   setLocale(locale: MobilePushStoredLocale): void {
@@ -193,16 +197,29 @@ export class MobilePushController {
     if (this.#enabled && this.#started && this.#foreground) void this.reconcile();
   }
 
-  handleAppStateChange(foreground: boolean): void {
-    this.#foreground = foreground;
-    if (!foreground) {
+  handleAppStateChange(state: string): void {
+    // `inactive` is a transient interaction fence on iOS, including the
+    // permission sheet used by this controller. Only a real background event
+    // retires registration work.
+    if (state !== "active") this.#interactive = false;
+    if (state === "background") {
+      if (!this.#foreground) return;
+      this.#foreground = false;
       this.#generation += 1;
       this.#activeController?.abort();
       this.#activeController = undefined;
       return;
     }
+    if (state !== "active") return;
+    if (this.#interactive && this.#foreground) return;
+    const resumed = !this.#foreground;
+    this.#foreground = true;
+    this.#interactive = true;
+    const pending = this.#pendingResponse;
+    this.#pendingResponse = undefined;
+    if (pending) this.#consumeResponse(pending);
     void this.#readLastResponse();
-    if (this.#enabled) void this.reconcile();
+    if (resumed && this.#enabled) void this.reconcile();
   }
 
   setEnabled(enabled: boolean): Promise<void> {
@@ -392,6 +409,10 @@ export class MobilePushController {
   }
 
   #consumeResponse(response: NotificationResponse): void {
+    if (!this.#interactive) {
+      this.#pendingResponse = response;
+      return;
+    }
     const intent = parseMobileNotificationResponseIntent(response);
     if (!intent) return;
     const key = mobileNotificationResponseKey(response, intent);
@@ -406,7 +427,7 @@ export class MobilePushController {
   }
 
   async #readLastResponse(): Promise<void> {
-    if (!this.#started || this.#platform !== "ios") return;
+    if (!this.#started || !this.#interactive || this.#platform !== "ios") return;
     try {
       const response = await this.#notifications.getLastNotificationResponseAsync();
       if (response) this.#consumeResponse(response);

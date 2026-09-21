@@ -70,6 +70,11 @@ import {
 import nativeNotifications from "./native-notifications";
 import { MobilePushController } from "./mobile-push-controller";
 import {
+  MobileAppLifecycleCoordinator,
+  mobileNetworkPathChanged,
+  type MobileNetworkPath
+} from "./mobile-app-lifecycle";
+import {
   createMobilePushRegistrationId,
   createMobilePushRevocationSecret,
   mobilePushTokenDigest
@@ -576,6 +581,7 @@ export function App() {
 
   useEffect(() => {
     appMountedRef.current = true;
+    const lifecycle = new MobileAppLifecycleCoordinator(AppState.currentState);
     void mobileThemePreferences.hydrate();
     void mobileLocalePreferences.hydrate();
     void mobileVoiceDictionary.hydrate();
@@ -592,26 +598,47 @@ export function App() {
     void mobileImageOutput.maintain().catch(() => undefined);
     void mobileFileShare.maintain().catch(() => undefined);
     void mobileIncomingShare.refresh().catch(() => undefined);
-    client.setForeground(AppState.currentState === "active");
+    client.setForeground(lifecycle.transportForeground);
     void client.start();
     const subscription = AppState.addEventListener("change", (status) => {
-      const foreground = status === "active";
+      const transition = lifecycle.transition(status);
+      const foreground = transition.interactive;
       diagnosticsState = status;
       diagnosticsTick = performance.now();
       setForeground(foreground);
-      mobilePush.handleAppStateChange(foreground);
-      client.setForeground(foreground);
+      mobilePush.handleAppStateChange(status);
+      if (transition.transportForeground !== undefined) client.setForeground(transition.transportForeground);
       void mobileUpdates.handleAppStateChange(status);
       mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
       if (foreground) mobileLocalePreferences.refreshSystemLocale();
-      if (!foreground) {
+      if (transition.enteredBackground) {
         void mobileComposerDrafts.flush().catch(() => undefined);
         void mobileInteractionDrafts.flush().catch(() => undefined);
         void mobileNewTaskDrafts.flush().catch(() => undefined);
         void mobileDiagnostics.flush().catch(() => undefined);
       }
     });
+    let networkStopped = false;
+    let networkSubscription: { remove(): void } | undefined;
+    let previousNetwork: MobileNetworkPath | undefined;
+    let networkRevision = 0;
+    void import("expo-network").then(({ addNetworkStateListener, getNetworkStateAsync }) => {
+      if (networkStopped) return;
+      networkSubscription = addNetworkStateListener((network) => {
+        networkRevision += 1;
+        const changed = mobileNetworkPathChanged(previousNetwork, network);
+        previousNetwork = network;
+        if (!changed || AppState.currentState !== "active") return;
+        client.notifyNetworkChanged();
+      });
+      const seedRevision = networkRevision;
+      void getNetworkStateAsync().then((network) => {
+        if (!networkStopped && networkRevision === seedRevision && previousNetwork === undefined) {
+          previousNetwork = network;
+        }
+      }).catch(() => undefined);
+    }).catch(() => undefined);
     const diagnosticTimer = setInterval(() => {
       const nextTick = performance.now();
       if (diagnosticsState === "active" && nextTick - diagnosticsTick > 3_000) {
@@ -637,8 +664,8 @@ export function App() {
       return intent !== undefined;
     };
     const removeLinking = installMobileNativeIntentLinking(Linking, offerUrl);
-    void mobilePush.start(offerUrl);
-    mobilePush.handleAppStateChange(AppState.currentState === "active");
+    void mobilePush.start(offerUrl, lifecycle.transportForeground);
+    mobilePush.handleAppStateChange(AppState.currentState);
     return () => {
       appMountedRef.current = false;
       nativeIntentDeliveryRef.current!.invalidate();
@@ -646,6 +673,8 @@ export function App() {
       diagnosticsStopped = true;
       clearInterval(diagnosticTimer);
       subscription.remove();
+      networkStopped = true;
+      networkSubscription?.remove();
       removeLinking();
       mobilePush.stop();
       client.setForeground(false);
@@ -705,11 +734,11 @@ export function App() {
 
   useEffect(() => {
     const batch = incomingShare.batch;
-    if (!batch || openedIncomingShareRef.current === batch.batchId || !state.activeProfileId
+    if (!foreground || !batch || openedIncomingShareRef.current === batch.batchId || !state.activeProfileId
       || !externalIntentFenceRef.current!.shareMayNavigate()) return;
     openedIncomingShareRef.current = batch.batchId;
     setPage("new");
-  }, [incomingShare.batch, state.activeProfileId]);
+  }, [foreground, incomingShare.batch, state.activeProfileId]);
 
   useEffect(() => {
     const batch = incomingShare.batch;

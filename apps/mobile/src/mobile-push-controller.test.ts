@@ -41,7 +41,9 @@ function clientFixture(initial = authority()) {
     return { expiresAt: 30 * 24 * 60 * 60 * 1_000 };
   });
   const unregisterMobilePush = vi.fn(async () => undefined);
-  const getMobilePushCapability = vi.fn(async () => ({ supported: true }));
+  const getMobilePushCapability = vi.fn<MobilePushClientPort["getMobilePushCapability"]>(
+    async () => ({ supported: true })
+  );
   const client: MobilePushClientPort = {
     get state() { return { status: current ? "connected" : "unpaired", activeProfileId }; },
     subscribe(listener) {
@@ -82,6 +84,7 @@ function notificationsFixture(initialPermission: typeof granted | typeof denied 
   const getPermissionsAsync = vi.fn(async () => permission);
   const getDevicePushTokenAsync = vi.fn(async () => ({ type: "ios", data: nativeToken }));
   const clearLastNotificationResponseAsync = vi.fn(async () => undefined);
+  const getLastNotificationResponseAsync = vi.fn(async () => lastResponse);
   const api = {
     setNotificationHandler: (value: typeof handler) => { handler = value; },
     getPermissionsAsync,
@@ -95,7 +98,7 @@ function notificationsFixture(initialPermission: typeof granted | typeof denied 
       responseListener = listener;
       return { remove: () => { responseListener = undefined; } };
     },
-    getLastNotificationResponseAsync: async () => lastResponse,
+    getLastNotificationResponseAsync,
     clearLastNotificationResponseAsync
   } as unknown as NativeNotificationsApi;
   return {
@@ -103,6 +106,7 @@ function notificationsFixture(initialPermission: typeof granted | typeof denied 
     requestPermissionsAsync,
     getPermissionsAsync,
     getDevicePushTokenAsync,
+    getLastNotificationResponseAsync,
     clearLastNotificationResponseAsync,
     handler: () => handler,
     setLastResponse(value: unknown) { lastResponse = value; },
@@ -196,6 +200,47 @@ describe("MobilePushController", () => {
     expect(fixture.notifications.requestPermissionsAsync).not.toHaveBeenCalled();
     expect(fixture.client.registerMobilePush).toHaveBeenCalledTimes(1);
     expect(fixture.controller.snapshot.status).toBe("registered");
+  });
+
+  it("keeps a cold background start suspended until the first active state", async () => {
+    const fixture = controllerFixture({ enabled: true, permission: granted });
+    const offered = vi.fn(() => true);
+    const intent = "joko://task/session-cold";
+    fixture.notifications.setLastResponse({
+      notification: { request: { identifier: "push-cold", content: { data: { intent } }, trigger: {} } }
+    });
+    await fixture.controller.start(offered, false);
+    expect(fixture.controller.snapshot).toMatchObject({ enabled: true, status: "waiting" });
+    expect(fixture.notifications.getPermissionsAsync).not.toHaveBeenCalled();
+    expect(fixture.notifications.getLastNotificationResponseAsync).not.toHaveBeenCalled();
+    expect(fixture.client.registerMobilePush).not.toHaveBeenCalled();
+    expect(offered).not.toHaveBeenCalled();
+
+    fixture.controller.handleAppStateChange("active");
+    await vi.waitFor(() => expect(fixture.client.registerMobilePush).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(offered).toHaveBeenCalledWith(intent));
+    expect(fixture.controller.snapshot.status).toBe("registered");
+  });
+
+  it("keeps registration work across inactive jitter but aborts it on a real background", async () => {
+    const fixture = controllerFixture({ enabled: true, permission: granted });
+    let finish!: (value: { supported: boolean }) => void;
+    fixture.client.getMobilePushCapability.mockImplementationOnce((_owner, signal) => {
+      expect(signal).toBeInstanceOf(AbortSignal);
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    const starting = fixture.controller.start(() => true);
+    await vi.waitFor(() => expect(fixture.client.getMobilePushCapability).toHaveBeenCalledOnce());
+    const signal = fixture.client.getMobilePushCapability.mock.calls[0]?.[1];
+
+    fixture.controller.handleAppStateChange("inactive");
+    expect(signal?.aborted).toBe(false);
+    fixture.controller.handleAppStateChange("active");
+    expect(signal?.aborted).toBe(false);
+    fixture.controller.handleAppStateChange("background");
+    expect(signal?.aborted).toBe(true);
+    finish({ supported: true });
+    await starting;
   });
 
   it("blocks a new profile until the exact old registration is retired", async () => {
