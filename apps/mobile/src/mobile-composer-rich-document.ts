@@ -1,5 +1,4 @@
 import {
-  mobileComposerAtomLabel,
   normalizeMobileComposerDraft,
   type MobileComposerAtom,
   type MobileComposerDraft,
@@ -8,6 +7,8 @@ import {
   type MobileComposerSelection,
   type MobileComposerSlashCommandMark
 } from "./mobile-composer-document";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export type MobileComposerRichOccurrenceKind = MobileComposerMention["kind"] | MobileComposerAtom["kind"];
 
@@ -59,7 +60,10 @@ export function mobileComposerAtomOccurrenceKey(atomId: string): string {
   return `atom:${atomId}`;
 }
 
-export function mobileComposerRichDocument(draft: MobileComposerDraft): MobileComposerRichDocument {
+export function mobileComposerRichDocument(
+  draft: MobileComposerDraft,
+  locale: MobileSupportedLocale
+): MobileComposerRichDocument {
   const exact = normalizeMobileComposerDraft(draft);
   const occurrences = orderedOccurrences(exact);
   const nodes: MobileComposerRichRenderNode[] = [];
@@ -75,12 +79,12 @@ export function mobileComposerRichDocument(draft: MobileComposerDraft): MobileCo
         kind: mention.kind,
         token,
         label: token,
-        accessibilityLabel: `${mentionLabel(mention)} reference ${mention.displayText}`,
+        accessibilityLabel: mentionAccessibilityLabel(mention, locale),
         block: false
       });
     } else if (occurrence.atom) {
       const atom = occurrence.atom;
-      const label = mobileComposerAtomLabel(atom);
+      const label = mobileComposerRichAtomLabel(atom, locale);
       nodes.push({
         type: "occurrence",
         occurrenceKey: occurrence.occurrenceKey,
@@ -88,9 +92,10 @@ export function mobileComposerRichDocument(draft: MobileComposerDraft): MobileCo
         token,
         label,
         accessibilityLabel: atom.kind === "quote"
-          ? "Quote from Assistant"
+          ? mobileMessage(locale, "composer.rich.quote")
           : atom.kind === "route-reference"
-            ? `${atom.routeKind === "project" ? "Project link" : atom.routeKind === "path" ? "Workspace path" : "Task link"} ${label}`
+            ? mobileMessage(locale, atom.routeKind === "project" ? "composer.rich.projectLink"
+              : atom.routeKind === "path" ? "composer.rich.workspacePath" : "composer.rich.taskLink", { name: label })
             : label,
         block: atom.kind === "quote"
       });
@@ -330,9 +335,33 @@ function isUtf16Boundary(value: string, offset: number): boolean {
   return !(previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff);
 }
 
-function mentionLabel(mention: MobileComposerMention): string {
-  if (mention.kind === "session") return "Task";
-  if (mention.kind === "workspace") return mention.directory ? "Workspace directory" : "Workspace file";
-  if (mention.kind === "resource") return "Resource";
-  return "Artifact";
+function mentionAccessibilityLabel(
+  mention: MobileComposerMention,
+  locale: MobileSupportedLocale
+): string {
+  if (mention.kind === "session") {
+    return mobileMessage(locale, "composer.rich.taskReference", { name: mention.displayText });
+  }
+  if (mention.kind === "workspace") {
+    return mobileMessage(locale, mention.directory
+      ? "composer.rich.directoryReference" : "composer.rich.fileReference", { name: mention.displayText });
+  }
+  if (mention.kind === "resource") {
+    return mobileMessage(locale, "composer.rich.resourceReference", { name: mention.displayText });
+  }
+  return mobileMessage(locale, "composer.rich.artifactReference", { name: mention.displayText });
+}
+
+export function mobileComposerRichAtomLabel(
+  atom: MobileComposerAtom,
+  locale: MobileSupportedLocale
+): string {
+  if (atom.kind === "quote") return mobileMessage(locale, "composer.rich.quote");
+  if (atom.kind === "route-reference") return atom.displayText;
+  let lines = atom.text.length === 0 ? 0 : 1;
+  for (let index = 0; index < atom.text.length; index += 1) {
+    if (atom.text.charCodeAt(index) === 10) lines += 1;
+  }
+  return lines === 1 ? mobileMessage(locale, "composer.rich.pastedOneLine")
+    : mobileMessage(locale, "composer.rich.pastedLines", { count: lines });
 }

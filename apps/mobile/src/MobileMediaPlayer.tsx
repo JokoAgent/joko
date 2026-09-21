@@ -15,7 +15,9 @@ import {
   parseMobileMediaPlayerStatus,
   type MobileMediaPlayerStatus
 } from "./mobile-media-player";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type { MobileMediaPreviewKind } from "./mobile-media-preview";
+import { mobileMessage } from "./mobile-messages";
 
 interface MobileMediaWebViewHandle {
   postMessage(value: string): void;
@@ -31,6 +33,7 @@ export function MobileMediaPlayer({
   ink,
   instanceId,
   kind,
+  locale,
   mediaType,
   onStatusChange,
   style,
@@ -42,6 +45,7 @@ export function MobileMediaPlayer({
   readonly ink: string;
   readonly instanceId: string;
   readonly kind: MobileMediaPreviewKind;
+  readonly locale: MobileSupportedLocale;
   readonly mediaType: string;
   readonly onStatusChange?: (status: MobileMediaPlayerStatus) => void;
   readonly style?: StyleProp<ViewStyle>;
@@ -65,9 +69,9 @@ export function MobileMediaPlayer({
       state: "error",
       currentTime: null,
       duration: null,
-      error: "The media preview process stopped repeatedly. Close the preview and try again."
+      error: mobileMessage(locale, "preview.mediaFailure")
     });
-  }, [instanceId]);
+  }, [instanceId, locale]);
 
   const pausePlayback = useCallback(() => {
     webViewRef.current?.postMessage(buildMobileMediaPlayerCommand(instanceId, "pause"));
@@ -124,9 +128,12 @@ export function MobileMediaPlayer({
 
   return <View style={style}>
     <MediaWebView
-      key={`${instanceId}:${reloadGeneration}`}
+      key={`${instanceId}:${locale}:${reloadGeneration}`}
       ref={(handle) => { if (handle) webViewRef.current = handle; }}
-      accessibilityLabel={`${kind === "video" ? "Video" : "Audio"} player for ${title}`}
+      accessibilityLabel={mobileMessage(locale, "preview.mediaLabel", {
+        kind: mobileMessage(locale, kind === "video" ? "preview.video" : "preview.audio"),
+        title
+      })}
       allowFileAccess
       allowFileAccessFromFileURLs={false}
       allowingReadAccessToURL={baseUrl}
@@ -153,6 +160,7 @@ export function MobileMediaPlayer({
         html: buildMobileMediaPlayerHtml({
           instanceId,
           kind,
+          locale,
           mediaType,
           title,
           uri,

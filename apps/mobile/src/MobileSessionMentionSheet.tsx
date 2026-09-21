@@ -12,6 +12,8 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   filterMobileSessionMentionCandidates,
   type MobileSessionMentionCandidate,
@@ -24,6 +26,7 @@ export function MobileSessionMentionSheet({
   busy,
   error,
   colors,
+  locale,
   onClose,
   onSelect
 }: {
@@ -32,6 +35,7 @@ export function MobileSessionMentionSheet({
   readonly busy: boolean;
   readonly error?: string;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onSelect: (candidate: MobileSessionMentionCandidate) => void;
 }) {
@@ -56,34 +60,34 @@ export function MobileSessionMentionSheet({
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
     <MobileKeyboardAvoidingView keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined} style={styles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close task references"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.task.close")}
         disabled={busy} onPress={onClose} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.header}>
           <View style={styles.headerText}>
-            <Text style={[styles.eyebrow, { color: colors.muted }]}>Task context</Text>
-            <Text style={[styles.title, { color: colors.ink }]}>Reference another task</Text>
+            <Text style={[styles.eyebrow, { color: colors.muted }]}>{mobileMessage(locale, "mention.task.eyebrow")}</Text>
+            <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "mention.task.title")}</Text>
           </View>
-          <Pressable accessibilityRole="button" accessibilityLabel="Close task references"
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.task.close")}
             accessibilityState={{ disabled: busy }} disabled={busy} onPress={onClose} style={styles.closeButton}>
             <Text style={[styles.closeText, { color: colors.ink }]}>×</Text>
           </Pressable>
         </View>
-        <TextInput ref={searchRef} accessibilityLabel="Search task references" value={query}
+        <TextInput ref={searchRef} accessibilityLabel={mobileMessage(locale, "mention.task.searchLabel")} value={query}
           onChangeText={setQuery} editable={!busy} autoCapitalize="none" autoCorrect={false}
-          placeholder="Search tasks" placeholderTextColor={colors.muted}
+          placeholder={mobileMessage(locale, "mention.task.search")} placeholderTextColor={colors.muted}
           style={[styles.search, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
         {error && <Text accessibilityRole="alert" accessibilityLiveRegion="polite"
           style={[styles.error, { color: colors.negative }]}>{error}</Text>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           {controls.candidates.length === 0
-            ? <Text style={[styles.empty, { color: colors.muted }]}>No other current tasks are available to reference.</Text>
+            ? <Text style={[styles.empty, { color: colors.muted }]}>{mobileMessage(locale, "mention.task.empty")}</Text>
             : candidates.length === 0
-              ? <Text style={[styles.empty, { color: colors.muted }]}>No tasks match this search.</Text>
+              ? <Text style={[styles.empty, { color: colors.muted }]}>{mobileMessage(locale, "mention.task.noMatch")}</Text>
               : candidates.map((candidate) => <Pressable key={candidate.sessionId}
-                  accessibilityRole="button" accessibilityLabel={`Reference task ${candidate.displayText}`}
-                  accessibilityHint="Inserts an exact task reference at the current message selection"
+                  accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.task.reference", { name: candidate.displayText })}
+                  accessibilityHint={mobileMessage(locale, "mention.task.hint")}
                   accessibilityState={{ disabled: busy }} disabled={busy}
                   onPress={() => onSelect(candidate)}
                   style={[styles.row, { borderColor: colors.border }, busy && styles.disabled]}>
@@ -91,7 +95,7 @@ export function MobileSessionMentionSheet({
                     <Text style={[styles.rowLabel, { color: colors.ink }]} numberOfLines={2}>{candidate.displayText}</Text>
                     <Text selectable style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{candidate.sessionId}</Text>
                   </View>
-                  <Text style={[styles.add, { color: colors.accent }]}>Add</Text>
+                  <Text style={[styles.add, { color: colors.accent }]}>{mobileMessage(locale, "common.add")}</Text>
                 </Pressable>)}
         </ScrollView>
       </SafeAreaView>

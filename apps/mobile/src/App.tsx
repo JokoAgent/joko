@@ -64,7 +64,6 @@ import {
   mobileComposerNativeInputMaximumCharacters,
   mobileComposerDraftsEqual,
   mobileInputSummary,
-  mobileComposerAtomLabel,
   plainTextMobileComposerDraft,
   removeMobileComposerAtom,
   removeMobileComposerMention,
@@ -74,6 +73,7 @@ import {
   type MobileComposerSelection,
   type MobileWorkspaceLineRange
 } from "./mobile-composer-document";
+import { mobileComposerRichAtomLabel } from "./mobile-composer-rich-document";
 import { enrichMobileComposerRouteReferences } from "./mobile-composer-route-enrichment";
 import { findMobileComposerWorkspacePathCandidates } from "./mobile-composer-route-links";
 import {
@@ -318,7 +318,10 @@ interface MobileImageGalleryView {
   readonly error?: string;
 }
 
-function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void) {
+function useMobileImageGallery(
+  locale: MobileSupportedLocale,
+  onCommitted: (draft: MobileComposerDraft) => void
+) {
   const [view, setView] = useState<MobileImageGalleryView>();
   const viewRef = useRef<MobileImageGalleryView | undefined>(undefined);
   const pageControllerRef = useRef<AbortController | undefined>(undefined);
@@ -379,28 +382,28 @@ function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void
       setView(next);
     }).catch((error) => {
       if (controller.signal.aborted || viewRef.current?.descriptor.leaseId !== current.descriptor.leaseId) return;
-      const failed = { ...current, busy: false, error: errorText(error) };
+      const failed = { ...current, busy: false, error: errorText(error, locale) };
       viewRef.current = failed;
       setView(failed);
     }).finally(() => {
       if (pageControllerRef.current === controller) pageControllerRef.current = undefined;
     });
-  }, []);
+  }, [locale]);
 
   const decoded = useCallback((value: MobileImageGalleryNativeDecode): void => {
     const current = viewRef.current;
-    if (!current) throw new Error("The image gallery was closed before decode completed.");
+    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
     client.confirmImageGalleryPageDecoded(
       current.descriptor.leaseId,
       current.session.leaseId,
       current.session.pageId,
       value
     );
-  }, []);
+  }, [locale]);
 
   const addOriginal = useCallback(async (signal: AbortSignal): Promise<void> => {
     const current = viewRef.current;
-    if (!current) throw new Error("The image gallery was closed before the item could be added.");
+    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
     const draft = await client.addImageGalleryPageToComposer(
       current.descriptor.leaseId,
       current.session.leaseId,
@@ -410,7 +413,7 @@ function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void
     viewRef.current = undefined;
     setView(undefined);
     onCommittedRef.current(draft);
-  }, []);
+  }, [locale]);
 
   const save = useCallback(async (
     strokes: readonly MobileImageAnnotationStroke[],
@@ -418,7 +421,7 @@ function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void
     signal: AbortSignal
   ): Promise<void> => {
     const current = viewRef.current;
-    if (!current) throw new Error("The image gallery was closed before the annotation could be added.");
+    if (!current) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
     const draft = await client.commitImageGalleryPageToComposer(
       current.descriptor.leaseId,
       current.session.leaseId,
@@ -430,7 +433,7 @@ function useMobileImageGallery(onCommitted: (draft: MobileComposerDraft) => void
     viewRef.current = undefined;
     setView(undefined);
     onCommittedRef.current(draft);
-  }, []);
+  }, [locale]);
 
   return { view, open, close, navigate, decoded, addOriginal, save };
 }
@@ -440,13 +443,13 @@ async function performMobileImageOutput(
   action: MobileImageOutputAction,
   decoded: MobileImageGalleryNativeDecode,
   rendered: MobileImageOutputRenderedImage | undefined,
-  signal: AbortSignal
+  signal: AbortSignal,
+  locale: MobileSupportedLocale
 ): Promise<string> {
   const source = await client.prepareImageOutput(session.leaseId, decoded, signal);
   await mobileImageOutput.perform(action, source, rendered, signal);
-  return action === "copy" ? "Image copied to the system clipboard."
-    : action === "save" ? "Image saved to the photo library."
-      : "System image sharing completed.";
+  return mobileMessage(locale, action === "copy" ? "image.copied"
+    : action === "save" ? "image.saved" : "image.shared");
 }
 
 export function App() {
@@ -1563,7 +1566,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     locale,
     requestId: randomUUID
   });
-  useMobileVoicePermissionSettings(voice.error);
+  useMobileVoicePermissionSettings(voice.error, locale);
   useEffect(() => {
     if (!voice.busy) return;
     setSessionMentionsVisible(false);
@@ -1589,7 +1592,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!controls || sessionMentionOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable) {
       setSessionMentionsVisible(false);
       setSessionMentionError("");
-      setError("Task reference authority changed. Reopen the reference list and try again.");
+      setError(mobileMessage(locale, "task.error.taskReferenceChanged"));
       return;
     }
     const ownerKey = controls.surfaceOwnerKey;
@@ -1598,7 +1601,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     void client.validateNewTaskSessionMentionCandidate(targetId, ownerKey, candidate).then((current) => {
       if (!mountedRef.current || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
         || sessionMentionOwnerRef.current !== ownerKey) {
-        throw new Error("Task reference authority changed while the candidate was being checked.");
+        throw new Error(mobileMessage(locale, "task.error.taskReferenceChecking"));
       }
       const result = insertMobileSessionMention(draftRef.current.input, selectionRef.current, current, randomUUID());
       replaceInput(result.draft, result.selection);
@@ -1623,10 +1626,10 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
       || workspaceMentionOwnerRef.current !== surfaceOwnerKey || !referencesEditable) {
       setWorkspaceMentionsVisible(false);
-      throw new Error("Workspace reference authority changed. Reopen the reference list and try again.");
+      throw new Error(mobileMessage(locale, "task.error.workspaceReferenceChanged"));
     }
     if (lineRange !== undefined && !controls.policy.lineRanges) {
-      throw new Error("This Backend no longer supports Workspace line references.");
+      throw new Error(mobileMessage(locale, "task.error.workspaceLineUnsupported"));
     }
     const current = await client.validateNewTaskWorkspaceMentionCandidate(
       targetId,
@@ -1636,7 +1639,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!mountedRef.current || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
       || workspaceMentionOwnerRef.current !== surfaceOwnerKey) {
       setWorkspaceMentionsVisible(false);
-      throw new Error("Workspace reference authority changed while the path was being checked.");
+      throw new Error(mobileMessage(locale, "task.error.workspaceChecking"));
     }
     const result = insertMobileWorkspaceMention(draftRef.current.input, selectionRef.current, {
       ...current,
@@ -1662,7 +1665,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     const ownerSnapshot = client.state.owner;
     const workspacePathControls = client.newTaskWorkspacePathPasteControls(targetId);
     if (!ownerProfileId || !referencesEditableRef.current || AppState.currentState !== "active") {
-      setError("Return to the active new-task composer before pasting text.");
+      setError(mobileMessage(locale, "task.error.returnActiveNewTaskPaste"));
       return;
     }
     setError("");
@@ -1675,7 +1678,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
         || client.state.owner !== ownerSnapshot
         || client.state.status === "unpaired" || client.state.status === "revoked"
         || AppState.currentState !== "active") {
-        throw new Error("The new-task draft changed while clipboard text was being read. Paste it again.");
+        throw new Error(mobileMessage(locale, "task.error.newTaskClipboardChanged"));
       }
       const pathCandidates = workspacePathControls !== undefined && !isLongMobileComposerPaste(text)
         ? findMobileComposerWorkspacePathCandidates(text, workspacePathControls.serverPathDisplay)
@@ -1701,7 +1704,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
           || client.newTaskWorkspacePathPasteControls(targetId)?.surfaceOwnerKey
             !== workspacePathControls.surfaceOwnerKey
           || client.state.status !== "connected" || AppState.currentState !== "active") {
-          throw new Error("The new-task Workspace changed while clipboard paths were being checked. Paste them again.");
+          throw new Error(mobileMessage(locale, "task.error.newTaskWorkspaceChanged"));
         }
       }
       const result = insertMobileStructuredClipboardText(
@@ -1791,7 +1794,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!lease || request.draft !== lease.draft.input || request.count !== request.images.length
       || request.count !== lease.count) {
       if (lease) cancelClipboardImagePaste(lease.draft.input);
-      setError("The clipboard image batch no longer belongs to this new-task draft. Paste it again.");
+      setError(mobileMessage(locale, "task.error.clipboardBatchNewTask"));
       return;
     }
     try {
@@ -1829,7 +1832,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
             || client.state.busy || AppState.currentState !== "active"
             || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey
             || !sameMobileAttachmentControls(latest, lease.controls)) {
-            throw new Error("Attachment authority changed while the clipboard images were being prepared.");
+            throw new Error(mobileMessage(locale, "task.error.clipboardAttachmentChanged"));
           }
         }
       });
@@ -1890,8 +1893,9 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable
       || attachmentNativeActivityRef.current) {
-      const sourceName = source === "camera" ? "camera" : source === "photos" ? "photo library" : "picker";
-      setError(`Attachment authority changed. Reopen the ${sourceName} from the current project.`);
+      const sourceName = mobileMessage(locale, source === "camera" ? "attachments.source.camera"
+        : source === "photos" ? "attachments.source.photos" : "attachments.source.filePicker");
+      setError(mobileMessage(locale, "task.error.attachmentReopenNewTask", { source: sourceName }));
       return;
     }
     const generation = ++attachmentGenerationRef.current;
@@ -1948,7 +1952,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
         || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
         || latest.profileId !== ownerProfileId || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
         || attachmentOwnerRef.current !== controls.surfaceOwnerKey) {
-        throw new Error("Attachment authority changed while the selected media was being staged.");
+        throw new Error(mobileMessage(locale, "task.error.selectedMediaChanged"));
       }
       const input = {
         ...draftRef.current.input,
@@ -1976,7 +1980,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
   const bindIncomingShare = async (batch: MobileIncomingShareReadyBatch): Promise<void> => {
     const ownerProfileId = profileIdRef.current;
     if (!ownerProfileId || !ownerReady || state.status !== "connected" || AppState.currentState !== "active") {
-      setError("Connect and return to the foreground before choosing where to keep these shared files.");
+      setError(mobileMessage(locale, "incoming.connectForeground"));
       return;
     }
     setError("");
@@ -1992,7 +1996,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     setIncomingShareNotice("");
     try {
       await mobileIncomingShare.discard(batchId);
-      if (mountedRef.current) setIncomingShareNotice("Shared files were discarded from the Joko inbox.");
+      if (mountedRef.current) setIncomingShareNotice(mobileMessage(locale, "incoming.discarded"));
     } catch (failure) {
       if (mountedRef.current) setError(errorText(failure));
     }
@@ -2004,7 +2008,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
       || batch.boundProfileId !== ownerProfileId || attachmentOwnerRef.current !== controls.surfaceOwnerKey
       || !referencesEditable || attachmentNativeActivityRef.current || AppState.currentState !== "active") {
-      setError("Shared-file authority changed. Reopen this inbox from the current project and try again.");
+      setError(mobileMessage(locale, "incoming.authorityChanged"));
       return;
     }
     const generation = ++attachmentGenerationRef.current;
@@ -2026,7 +2030,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
         preview
       );
       const claimId = claimedBatch.claim?.claimId;
-      if (!claimId) throw new Error("The incoming share target claim is unavailable.");
+      if (!claimId) throw new Error(mobileMessage(locale, "incoming.claimUnavailable"));
       const result = await commitMobileIncomingShare({
         batch: claimedBatch,
         profileId: ownerProfileId,
@@ -2055,7 +2059,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
           if (!mountedRef.current || attachmentGenerationRef.current !== generation
             || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
             || attachmentOwnerRef.current !== controls.surfaceOwnerKey) {
-            throw new Error("Shared-file authority changed while the files were being added.");
+            throw new Error(mobileMessage(locale, "incoming.authorityAdding"));
           }
           return latest;
         },
@@ -2068,10 +2072,17 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       setDraft(next);
       setIncomingShareNotice([
         result.plan.accepted.length > 0
-          ? `${result.replayed ? "Confirmed" : "Added"} ${result.plan.accepted.length} shared ${result.plan.accepted.length === 1 ? "file" : "files"}.`
-          : "No shared files were added.",
+          ? mobileMessage(locale, "incoming.result", {
+            verb: mobileMessage(locale, result.replayed ? "incoming.confirmed" : "incoming.added"),
+            count: result.plan.accepted.length,
+            files: mobileMessage(locale, result.plan.accepted.length === 1 ? "incoming.file" : "incoming.files")
+          })
+          : mobileMessage(locale, "incoming.noneAdded"),
         result.plan.rejected.length > 0
-          ? `${result.plan.rejected.length} ${result.plan.rejected.length === 1 ? "item was" : "items were"} skipped as shown.`
+          ? mobileMessage(locale, "incoming.skipped", {
+            count: result.plan.rejected.length,
+            items: mobileMessage(locale, result.plan.rejected.length === 1 ? "incoming.itemWas" : "incoming.itemsWere")
+          })
           : ""
       ].filter(Boolean).join(" "));
     } catch (failure) {
@@ -2102,7 +2113,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !referencesEditable
       || attachmentNativeActivityRef.current || !mobilePhotoLibrarySupported(controls.policy)) {
-      setError("Photo-library authority changed. Reopen Photos from the current project.");
+      setError(mobileMessage(locale, "task.error.photoLibraryNewTask"));
       return;
     }
     const generation = ++attachmentGenerationRef.current;
@@ -2141,7 +2152,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     if (!lease || !ownerProfileId || lease.controls.profileId !== ownerProfileId
       || lease.scopeKey !== `${ownerProfileId}\u001f${targetId}`
       || attachmentGenerationRef.current !== lease.generation) {
-      throw new Error("Photo-library authority changed. Reopen Photos from the current project.");
+      throw new Error(mobileMessage(locale, "task.error.photoLibraryNewTask"));
     }
     let staged: readonly MobileComposerAttachment[] = [];
     try {
@@ -2175,7 +2186,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
         || latest.profileId !== ownerProfileId
         || latest.surfaceOwnerKey !== lease.controls.surfaceOwnerKey
         || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey) {
-        throw new Error("Attachment authority changed while the selected photos were being staged.");
+        throw new Error(mobileMessage(locale, "task.error.selectedPhotosChanged"));
       }
       const input = {
         ...draftRef.current.input,
@@ -2205,7 +2216,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       await mobileNewTaskDrafts.flush(identity);
       const retainedDraft = mobileNewTaskDrafts.readSync(identity);
       if (retainedDraft?.input.attachments.some((attachment) => attachment.attachmentId === attachmentId)) {
-        throw new Error("The attachment removal could not be confirmed in the retained new-task draft.");
+        throw new Error(mobileMessage(locale, "task.error.attachmentRemovalNewTask"));
       }
       await mobileAttachmentFiles.remove(ownerProfileId, result.removed);
     } catch (failure) {
@@ -2264,11 +2275,11 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     signal: AbortSignal
   ): Promise<void> => {
     const lease = imageEditorLeaseRef.current;
-    if (!lease) throw new Error("The image editor is no longer open.");
+    if (!lease) throw new Error(mobileMessage(locale, "task.error.imageEditorClosed"));
     const result = await client.commitComposerImageEditor(lease.session.leaseId, strokes, burned, signal);
     if (!mountedRef.current || imageEditorLeaseRef.current !== lease || result.surface !== "new-task"
       || lease.scopeKey !== `${profileIdRef.current ?? ""}\u001f${draftRef.current.targetId}`) {
-      throw new Error("The new-task image editor owner changed before its result could be displayed.");
+      throw new Error(mobileMessage(locale, "task.error.imageEditorNewTask"));
     }
     const next = { ...draftRef.current, input: result.draft };
     draftRef.current = next;
@@ -2283,68 +2294,81 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     }).catch((failure) => setError(errorText(failure)));
   };
   return <ScrollView contentContainerStyle={styles.screen} keyboardShouldPersistTaps="handled">
-    <Back onPress={() => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); }} colors={colors} />
-    <Text style={[styles.title, { color: colors.ink }]}>New task</Text>
-    <Text style={[styles.description, { color: colors.muted }]}>Choose an active project and enter the first message. Joko retains this draft on this device until the first message is durably accepted.</Text>
+    <Back label={mobileMessage(locale, "common.tasks")}
+      accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
+      onPress={() => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); }} colors={colors} />
+    <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "newTask.title")}</Text>
+    <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "newTask.description")}</Text>
     {incomingShareNotice && <Banner text={incomingShareNotice} colors={colors} />}
     {incomingShareState.error && !incomingShareBatch && <Banner text={incomingShareState.error} colors={colors} />}
     {incomingShareBatch && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}
-      accessibilityRole="summary" accessibilityLabel="Files shared with Joko">
-      <Text style={[styles.label, { color: colors.ink }]}>Shared with Joko</Text>
+      accessibilityRole="summary" accessibilityLabel={mobileMessage(locale, "incoming.summary")}>
+      <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "incoming.title")}</Text>
       {incomingShareBatch.status === "invalid" ? <>
         <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
-          {incomingShareBatch.invalidReason} This batch was kept so you can retry cleanup or discard it explicitly.
+          {incomingShareBatch.invalidReason} {mobileMessage(locale, "incoming.invalidKept")}
         </Text>
-        <Action label={incomingShareState.busy ? "Discarding…" : "Discard invalid share"} colors={colors} compact
+        <Action label={mobileMessage(locale, incomingShareState.busy ? "incoming.discarding" : "incoming.discardInvalid")} colors={colors} compact
           disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
       </> : <>
         <Text style={[styles.description, { color: colors.muted }]}>
-          {incomingShareBatch.items.length + incomingShareBatch.overflowCount} external {incomingShareBatch.items.length + incomingShareBatch.overflowCount === 1 ? "item is" : "items are"} waiting in the protected device inbox. Nothing is sent automatically.
+          {mobileMessage(locale, "incoming.waiting", {
+            count: incomingShareBatch.items.length + incomingShareBatch.overflowCount,
+            items: mobileMessage(locale, incomingShareBatch.items.length + incomingShareBatch.overflowCount === 1
+              ? "incoming.item" : "incoming.items")
+          })}
         </Text>
         {incomingShareBatch.boundProfileId === undefined ? <>
-          <Text style={[styles.caption, { color: colors.muted }]}>Choose this active connection explicitly before Joko copies any file into its new-task draft.</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.chooseConnection")}</Text>
           <View style={styles.actionRow}>
-            <Action label={incomingShareState.busy ? "Binding…" : "Use with this connection"} colors={colors} compact
+            <Action label={mobileMessage(locale, incomingShareState.busy ? "incoming.binding" : "incoming.useConnection")} colors={colors} compact
               disabled={incomingShareState.busy || !ownerReady || state.status !== "connected"}
               onPress={() => void bindIncomingShare(incomingShareBatch)} />
-            <Action label="Discard" colors={colors} compact disabled={incomingShareState.busy}
+            <Action label={mobileMessage(locale, "common.discard")} colors={colors} compact disabled={incomingShareState.busy}
               onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
           </View>
         </> : incomingShareBatch.boundProfileId !== profileId ? <>
           <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
-            This share belongs to a different connection profile and cannot enter the current draft.
+            {mobileMessage(locale, "incoming.boundMismatch")}
           </Text>
-          <Action label={incomingShareState.busy ? "Discarding…" : "Discard bound share"} colors={colors} compact
+          <Action label={mobileMessage(locale, incomingShareState.busy ? "incoming.discarding" : "incoming.discardBound")} colors={colors} compact
             disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
         </> : incomingShareClaimCurrent === false ? <>
           <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
-            This share was already claimed by a different project, model, or attachment policy. Return to that exact project state to retry, or discard it explicitly.
+            {mobileMessage(locale, "incoming.claimedMismatch")}
           </Text>
-          <Action label="Discard claimed share" colors={colors} compact
+          <Action label={mobileMessage(locale, "incoming.discardClaimed")} colors={colors} compact
             disabled={incomingShareState.busy || attachmentBusy}
             onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
         </> : !attachmentControls || !targetAvailable || !incomingSharePlan ? <>
-          <Text style={[styles.caption, { color: colors.muted }]}>Choose a current project whose model accepts these image or file attachments, or discard the share.</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.chooseCompatible")}</Text>
           {incomingShareBatch.items.filter((item) => item.state === "rejected").map((rejection) => <Text
             key={rejection.itemId} accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
             {rejection.fileName ? `${rejection.fileName}: ` : ""}{rejection.reason}
           </Text>)}
           {incomingShareBatch.overflowCount > 0 && <Text accessibilityRole="alert"
-            style={[styles.caption, { color: colors.negative }]}>{incomingShareBatch.overflowCount} additional shared {incomingShareBatch.overflowCount === 1 ? "item was" : "items were"} rejected because one share can contain at most 20 items.</Text>}
-          <Action label="Discard" colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
+            style={[styles.caption, { color: colors.negative }]}>{mobileMessage(locale, "incoming.overflow", {
+              count: incomingShareBatch.overflowCount,
+              items: mobileMessage(locale, incomingShareBatch.overflowCount === 1 ? "incoming.itemWas" : "incoming.itemsWere")
+            })}</Text>}
+          <Action label={mobileMessage(locale, "common.discard")} colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
             onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
         </> : <>
-          <Text style={[styles.caption, { color: colors.muted }]}>Before you continue: {incomingSharePlan.accepted.length} {incomingSharePlan.accepted.length === 1 ? "file matches" : "files match"} this project; {incomingSharePlan.rejected.length} will be skipped.</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.preview", {
+            accepted: incomingSharePlan.accepted.length,
+            files: mobileMessage(locale, incomingSharePlan.accepted.length === 1 ? "incoming.fileMatches" : "incoming.filesMatch"),
+            skipped: incomingSharePlan.rejected.length
+          })}</Text>
           {incomingSharePlan.rejected.map((rejection, index) => <Text key={`${rejection.itemId ?? "overflow"}-${index}`}
             accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
             {rejection.fileName ? `${rejection.fileName}: ` : ""}{rejection.reason}
           </Text>)}
           <View style={styles.actionRow}>
-            <Action label={attachmentBusy || incomingShareState.busy ? "Adding…"
-              : incomingSharePlan.accepted.length > 0 ? "Add shared files" : "Confirm and clear"}
+            <Action label={mobileMessage(locale, attachmentBusy || incomingShareState.busy ? "incoming.adding"
+              : incomingSharePlan.accepted.length > 0 ? "incoming.add" : "incoming.confirmClear")}
               colors={colors} compact disabled={!referencesEditable || incomingShareState.busy}
               onPress={() => void importIncomingShare(incomingShareBatch)} />
-            <Action label="Discard" colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
+            <Action label={mobileMessage(locale, "common.discard")} colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
               onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
           </View>
         </>}
@@ -2352,10 +2376,10 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
           style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>{incomingShareState.error}</Text>}
       </>}
     </View>}
-    <Text style={[styles.section, { color: colors.muted }]}>Project</Text>
-    {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No project currently supports text tasks. Create one on a connected Joko client, then refresh.</Text>}
+    <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "newTask.project")}</Text>
+    {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "newTask.noProject")}</Text>}
     {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}
-      accessibilityLabel={`Project ${target.displayName}`} disabled={!ownerReady || state.busy || attachmentBusy || voice.busy || retained !== undefined}
+      accessibilityLabel={mobileMessage(locale, "newTask.projectAccessibility", { name: target.displayName })} disabled={!ownerReady || state.busy || attachmentBusy || voice.busy || retained !== undefined}
       onPress={() => {
         setSessionMentionsVisible(false);
         setWorkspaceMentionsVisible(false);
@@ -2367,50 +2391,54 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       <Text style={[styles.label, { color: colors.ink }]}>{target.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{state.owner?.backends.find((backend) => backend.backendId === target.backendId)?.displayName}</Text>
     </Pressable>)}
-    {draft.targetId && !targetAvailable && <Banner text="The retained project is no longer an active text target. Choose a current project; your name and first message were kept." colors={colors} />}
-    <Field label="Task name" value={draft.name} onChange={(name) => patchDraft({ name })} placeholder="New task" colors={colors}
+    {draft.targetId && !targetAvailable && <Banner text={mobileMessage(locale, "newTask.retainedProject")} colors={colors} />}
+    <Field label={mobileMessage(locale, "newTask.name")} value={draft.name} onChange={(name) => patchDraft({ name })}
+      placeholder={mobileMessage(locale, "newTask.title")} colors={colors}
       editable={ownerReady && !state.busy && !attachmentBusy && !voice.busy && retained === undefined} maxLength={256} />
     <View style={styles.field}>
-      <Text style={[styles.caption, { color: colors.muted }]}>First message</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "newTask.firstMessage")}</Text>
       {(voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || attachmentControls
         || ownerReady || draft.input.mentions.length > 0 || draft.input.atoms.length > 0
         || draft.input.attachments.length > 0) && <View style={styles.composerTools}>
-        {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
+        {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors} locale={locale}
           disabled={!ownerReady || !targetAvailable || state.busy || mentionBusy || attachmentBusy
             || state.status !== "connected" || retained !== undefined} />}
-        {sessionMentionControls && <Action label="Reference task" colors={colors} compact
+        {sessionMentionControls && <Action label={mobileMessage(locale, "composer.referenceTask")} colors={colors} compact
           disabled={!referencesEditable || draft.input.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
             setWorkspaceMentionsVisible(false);
             setSessionMentionError("");
             setSessionMentionsVisible(true);
           }} />}
-        {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
+        {workspaceMentionControls && <Action label={mobileMessage(locale, "composer.referenceWorkspace")} colors={colors} compact
           disabled={!referencesEditable}
           onPress={() => {
             setSessionMentionsVisible(false);
             setSessionMentionError("");
             setWorkspaceMentionsVisible(true);
           }} />}
-        <Action label="Paste text" colors={colors} compact disabled={!referencesEditable}
+        <Action label={mobileMessage(locale, "composer.pasteText")} colors={colors} compact disabled={!referencesEditable}
           onPress={() => void pasteClipboardText()} />
-        {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"} colors={colors} compact
+        {attachmentControls && <Action label={mobileMessage(locale, attachmentBusy ? "common.selecting" : "composer.attach")} colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
-        {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
+        {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label={mobileMessage(locale, "composer.photos")}
           colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={openPhotoLibrary} />}
-        {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
+        {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label={mobileMessage(locale, "composer.takePhoto")}
           colors={colors} compact
           disabled={!referencesEditable || draft.input.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("camera")} />}
         {draft.input.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.input.mentions.map((mention) => <Pressable key={mention.mentionId}
-            accessibilityRole="button" accessibilityLabel={`Remove ${mention.kind === "session" ? "task"
-              : mention.kind === "workspace" && mention.directory ? "directory" : "file"} reference ${mention.displayText}`}
-            accessibilityHint="Removes this exact reference occurrence from the first message"
+            accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "composer.removeReference", {
+              kind: mobileMessage(locale, mention.kind === "session" ? "composer.kind.task"
+                : mention.kind === "workspace" && mention.directory ? "composer.kind.directory" : "composer.kind.file"),
+              label: mention.displayText
+            })}
+            accessibilityHint={mobileMessage(locale, "composer.removeReferenceHint.newTask")}
             disabled={!referencesEditable} onPress={() => removeMention(mention.mentionId)}
             style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
               !referencesEditable && styles.disabled]}>
@@ -2419,22 +2447,23 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
             </Text>
           </Pressable>)}
         </ScrollView>}
-        <MobileComposerAtomChips atoms={draft.input.atoms} colors={colors}
+        <MobileComposerAtomChips atoms={draft.input.atoms} colors={colors} locale={locale}
           disabled={!referencesEditable} onOpen={setComposerAtomId} />
       </View>}
-      <MobileAttachmentTray attachments={draft.input.attachments} colors={colors}
+      <MobileAttachmentTray attachments={draft.input.attachments} colors={colors} locale={locale}
         disabled={!referencesEditable} busy={attachmentBusy || state.busy} pendingCount={pastedImageCount}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />
       <MobileComposerRichInput key={`new-task-rich-${profileId ?? "none"}-${draft.targetId}`}
-        ref={composerInputRef} accessibilityLabel="First message"
-        accessibilityHint="This structured message is sent after the task is created"
+        ref={composerInputRef} accessibilityLabel={mobileMessage(locale, "newTask.inputLabel")}
+        accessibilityHint={mobileMessage(locale, "newTask.inputHint")}
         bordered draft={ownerReady ? draft.input : emptyMobileComposerDraft()} editable={referencesEditable}
-        height={composerHeight} maxHeight={260} ownerKey={`new-task\u001f${profileId ?? "none"}\u001f${draft.targetId}`}
-        placeholder={ownerReady ? "What should Joko do?" : "Restoring saved draft…"}
+        height={composerHeight} locale={locale} maxHeight={260}
+        ownerKey={`new-task\u001f${profileId ?? "none"}\u001f${draft.targetId}`}
+        placeholder={mobileMessage(locale, ownerReady ? "newTask.placeholder" : "newTask.restoring")}
         selection={ownerReady ? composerSelection : { start: 0, end: 0 }} theme={composerTheme}
         onEdit={(result, sourceDraft) => {
           if (!referencesEditableRef.current || draftRef.current.input !== sourceDraft) {
-            setError("Return to the active new-task composer before editing the first message.");
+            setError(mobileMessage(locale, "newTask.returnActive"));
             return;
           }
           replaceInput(result.draft, result.selection);
@@ -2453,36 +2482,37 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
         }} />
     </View>
     {retained && <View accessibilityLiveRegion="polite" style={[styles.card, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
-      <Text style={[styles.label, { color: colors.ink }]}>{retained.phase === "creating" ? "Task creation retained" : "First message retained"}</Text>
+      <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
+        retained.phase === "creating" ? "newTask.creationRetained" : "newTask.messageRetained")}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{retained.phase === "creating"
-        ? "Joko will only reconcile this exact creation operation; it will not create a second task automatically."
-        : "The task exists. If delivery failed or is unknown, the exact structured input is retained in its composer without automatic replay."}</Text>
+        ? mobileMessage(locale, "newTask.creationRecovery")
+        : mobileMessage(locale, "newTask.deliveryRecovery")}</Text>
     </View>}
-    <Action label={state.busy ? "Creating and sending…" : "Create and send"}
+    <Action label={mobileMessage(locale, state.busy ? "newTask.creatingAndSending" : "newTask.createAndSend")}
       disabled={!ownerReady || !draft.targetId || !targetAvailable
         || (!draft.input.text.trim() && draft.input.attachments.length === 0)
         || state.busy || mentionBusy || attachmentBusy || voice.busy
         || state.status !== "connected" || retained !== undefined || pendingCreate}
       colors={colors} onPress={submit} />
     {retained?.phase === "sending" && state.selectedId === retained.sessionId
-      && <Action label="Open created task" onPress={onCreated} colors={colors} />}
+      && <Action label={mobileMessage(locale, "newTask.openCreated")} onPress={onCreated} colors={colors} />}
     {(error || state.error) && <Banner text={error || state.error || ""} colors={colors} />}
-    {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors}
+    {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors} locale={locale}
       onDismiss={() => setImageOutputNotice("")} />}
     <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors} locale={locale}
       disabled={state.status !== "connected"} onError={setError} />
-    {(pendingCreate || retained !== undefined) && <Action label="Check retained status" onPress={() => {
+    {(pendingCreate || retained !== undefined) && <Action label={mobileMessage(locale, "newTask.checkRetained")} onPress={() => {
       setError("");
       void client.reconcile().then(() => {
         const current = identity ? mobileNewTaskDrafts.readSync(identity)?.submission : undefined;
         if (current?.phase === "sending" && client.state.selectedId === current.sessionId) onCreated();
       }).catch((failure) => setError(errorText(failure)));
     }} colors={colors} disabled={state.busy || state.status !== "connected"} />}
-    <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined}
+    <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined} locale={locale}
       controls={sessionMentionControls} busy={state.busy || mentionBusy} error={sessionMentionError} colors={colors}
       onClose={() => { if (!mentionBusy) { setSessionMentionsVisible(false); setSessionMentionError(""); } }}
       onSelect={insertSessionMention} />
-    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined}
+    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined} locale={locale}
       controls={workspaceMentionControls} busy={state.busy || mentionBusy} colors={colors}
       onClose={() => setWorkspaceMentionsVisible(false)}
       onLoadDirectory={(surfaceOwnerKey, parentPath, signal) => client.listNewTaskWorkspaceMentionDirectory(
@@ -2497,21 +2527,21 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
         signal
       )}
       onSelect={insertWorkspaceMention} />
-    <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined}
+    <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined} locale={locale}
       ownerKey={photoLibraryLease?.controls.surfaceOwnerKey}
       maximumSelection={Math.max(0, (photoLibraryLease?.controls.policy.maximumItems ?? 0)
         - draft.input.attachments.length)}
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
-    <MobileComposerAtomSheet atom={draft.input.atoms.find((atom) => atom.atomId === composerAtomId)}
+    <MobileComposerAtomSheet atom={draft.input.atoms.find((atom) => atom.atomId === composerAtomId)} locale={locale}
       colors={colors} busy={!referencesEditable} onClose={() => setComposerAtomId(undefined)}
       onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
-    {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
+    {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session} locale={locale}
       onOutputAction={async (action, decoded, rendered, signal) => {
         setImageOutputNotice("");
         setError("");
         try {
-          const message = await performMobileImageOutput(imageEditorLease.session, action, decoded, rendered, signal);
+          const message = await performMobileImageOutput(imageEditorLease.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted && mountedRef.current && imageEditorLeaseRef.current === imageEditorLease) {
             setImageOutputNotice(message);
           }
@@ -2626,12 +2656,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     : undefined;
   const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
   draftIdentityRef.current = draftIdentity;
-  const imageGallery = useMobileImageGallery((nextDraft) => {
+  const imageGallery = useMobileImageGallery(locale, (nextDraft) => {
     const identity = draftIdentityRef.current;
     if (!identity || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
     composerDraftRef.current = nextDraft;
     setDraft(nextDraft);
-    setComposerNotice("Image added to the composer. Review it before sending.");
+    setComposerNotice(mobileMessage(locale, "task.imageAdded"));
     setTimeout(() => composerInputRef.current?.focus(), 0);
   });
   const galleryOwnerRef = useRef(draftIdentityKey);
@@ -3169,7 +3199,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     locale,
     requestId: randomUUID
   });
-  useMobileVoicePermissionSettings(voice.error);
+  useMobileVoicePermissionSettings(voice.error, locale);
   const composerPasteEditable = state.status === "connected" && composerOwnerReady && queueEdit === undefined && !state.busy
     && !composerOperationPending
     && !voice.busy && !attachmentBusy;
@@ -3314,7 +3344,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         || composerDraftRef.current !== lease.sourceDraft
         || !sameComposerSelection(composerSelectionRef.current, lease.selection)
         || !sameRuntimeCommandActivation(currentActivation, lease.activation)) {
-        throw new Error("The task draft or command owner changed. Type the slash command again.");
+        throw new Error(mobileMessage(locale, "task.error.commandOwnerChanged"));
       }
       const exact = isMobileAppCommandCandidate(candidate)
         ? assertMobileAppCommandCandidate(controls, candidate)
@@ -3325,7 +3355,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
           );
       const result = replaceMobileRuntimeCommandRun(lease.sourceDraft, lease.activation, exact);
       if (!mobileComposerDrafts.saveIfRevision(identity, result.draft, lease.revision)) {
-        throw new Error("The task draft changed before the runtime command could be inserted.");
+        throw new Error(mobileMessage(locale, "task.error.commandInsertChanged"));
       }
       composerDraftRef.current = result.draft;
       composerSelectionRef.current = result.selection;
@@ -3439,7 +3469,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       if (taskMountedRef.current && fileShareAbortRef.current === controller) setFileShareProgress(progress);
     }, controller.signal).then(() => {
       if (taskMountedRef.current && fileShareAbortRef.current === controller) {
-        setComposerNotice("System file sharing completed.");
+        setComposerNotice(mobileMessage(locale, "task.shareCompleted"));
       }
     }).catch((error) => {
       if (!controller.signal.aborted && taskMountedRef.current && fileShareAbortRef.current === controller) {
@@ -3469,8 +3499,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     if (!controls || !identity || controls.profileId !== identity.profileId
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerOwnerReady
       || queueEditRef.current || state.busy || attachmentNativeActivityRef.current) {
-      const sourceName = source === "camera" ? "camera" : source === "photos" ? "photo library" : "picker";
-      setLocalError(`Attachment authority changed. Reopen the ${sourceName} from the current task.`);
+      const sourceName = mobileMessage(locale, source === "camera" ? "attachments.source.camera"
+        : source === "photos" ? "attachments.source.photos" : "attachments.source.filePicker");
+      setLocalError(mobileMessage(locale, "task.error.attachmentReopenTask", { source: sourceName }));
       return;
     }
     const identityKey = mobileComposerDraftIdentityKey(identity);
@@ -3529,7 +3560,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         || !latestIdentity || mobileComposerDraftIdentityKey(latestIdentity) !== identityKey
         || latest.profileId !== identity.profileId || latest.surfaceOwnerKey !== controls.surfaceOwnerKey
         || attachmentOwnerRef.current !== controls.surfaceOwnerKey || queueEditRef.current) {
-        throw new Error("Attachment authority changed while the selected media was being staged.");
+        throw new Error(mobileMessage(locale, "task.error.selectedMediaChanged"));
       }
       const next = {
         ...composerDraftRef.current,
@@ -3565,7 +3596,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerOwnerReady
       || queueEditRef.current || state.busy || attachmentNativeActivityRef.current
       || !mobilePhotoLibrarySupported(controls.policy)) {
-      setLocalError("Photo-library authority changed. Reopen Photos from the current task.");
+      setLocalError(mobileMessage(locale, "task.error.photoLibraryTask"));
       return;
     }
     const generation = ++attachmentGenerationRef.current;
@@ -3607,7 +3638,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     if (!lease || !identity || lease.controls.profileId !== identity.profileId
       || lease.scopeKey !== mobileComposerDraftIdentityKey(identity)
       || attachmentGenerationRef.current !== lease.generation || queueEditRef.current) {
-      throw new Error("Photo-library authority changed. Reopen Photos from the current task.");
+      throw new Error(mobileMessage(locale, "task.error.photoLibraryTask"));
     }
     let staged: readonly MobileComposerAttachment[] = [];
     try {
@@ -3643,7 +3674,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         || latest.profileId !== identity.profileId
         || latest.surfaceOwnerKey !== lease.controls.surfaceOwnerKey
         || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey || queueEditRef.current) {
-        throw new Error("Attachment authority changed while the selected photos were being staged.");
+        throw new Error(mobileMessage(locale, "task.error.selectedPhotosChanged"));
       }
       const next = {
         ...composerDraftRef.current,
@@ -3674,7 +3705,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       if (mobileComposerDrafts.readSync(identity)?.attachments.some(
         (attachment) => attachment.attachmentId === attachmentId
       )) {
-        throw new Error("The attachment removal could not be confirmed in the retained task draft.");
+        throw new Error(mobileMessage(locale, "task.error.attachmentRemovalTask"));
       }
       await mobileAttachmentFiles.remove(identity.profileId, result.removed);
     } catch (error) {
@@ -3733,12 +3764,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     signal: AbortSignal
   ): Promise<void> => {
     const lease = imageEditorLeaseRef.current;
-    if (!lease) throw new Error("The image editor is no longer open.");
+    if (!lease) throw new Error(mobileMessage(locale, "task.error.imageEditorClosed"));
     const result = await client.commitComposerImageEditor(lease.session.leaseId, strokes, burned, signal);
     const identity = draftIdentityRef.current;
     if (!taskMountedRef.current || imageEditorLeaseRef.current !== lease || result.surface !== "task"
       || !identity || lease.scopeKey !== mobileComposerDraftIdentityKey(identity)) {
-      throw new Error("The task image editor owner changed before its result could be displayed.");
+      throw new Error(mobileMessage(locale, "task.error.imageEditorTask"));
     }
     composerDraftRef.current = result.draft;
     setDraft(result.draft);
@@ -3755,7 +3786,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     if (!controls || sessionMentionOwnerRef.current !== controls.surfaceOwnerKey || queueEditRef.current) {
       setSessionMentionsVisible(false);
       setSessionMentionError("");
-      setLocalError("Task reference authority changed. Reopen the reference list and try again.");
+      setLocalError(mobileMessage(locale, "task.error.taskReferenceChanged"));
       return;
     }
     try {
@@ -3780,10 +3811,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
       || workspaceMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current || !identity) {
       setWorkspaceMentionsVisible(false);
-      throw new Error("Workspace reference authority changed. Reopen the reference list and try again.");
+      throw new Error(mobileMessage(locale, "task.error.workspaceReferenceChanged"));
     }
     if (lineRange !== undefined && !controls.policy.lineRanges) {
-      throw new Error("This Backend no longer supports Workspace line references.");
+      throw new Error(mobileMessage(locale, "task.error.workspaceLineUnsupported"));
     }
     const current = await client.validateTaskWorkspaceMentionCandidate(surfaceOwnerKey, candidate);
     const latestControls = client.taskWorkspaceMentionControls();
@@ -3792,7 +3823,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       || !draftIdentityRef.current
       || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== mobileComposerDraftIdentityKey(identity)) {
       setWorkspaceMentionsVisible(false);
-      throw new Error("Workspace reference authority changed while the path was being checked.");
+      throw new Error(mobileMessage(locale, "task.error.workspaceChecking"));
     }
     const result = insertMobileWorkspaceMention(draft, composerSelection, {
       ...current,
@@ -3813,7 +3844,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
       || catalogMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current || !identity) {
       setCatalogMentionsVisible(false);
-      throw new Error("Catalog reference authority changed. Reopen the reference list and try again.");
+      throw new Error(mobileMessage(locale, "task.error.catalogReferenceChanged"));
     }
     const current = await client.validateTaskCatalogMentionCandidate(surfaceOwnerKey, candidate);
     const latestControls = client.taskCatalogMentionControls();
@@ -3822,7 +3853,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       || !draftIdentityRef.current
       || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== mobileComposerDraftIdentityKey(identity)) {
       setCatalogMentionsVisible(false);
-      throw new Error("Catalog reference authority changed while the candidate was being checked.");
+      throw new Error(mobileMessage(locale, "task.error.catalogChecking"));
     }
     const result = current.kind === "resource"
       ? insertMobileResourceMention(draft, composerSelection, current, randomUUID())
@@ -3850,7 +3881,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     const ownerSnapshot = client.state.owner;
     const workspacePathControls = client.taskWorkspacePathPasteControls();
     if (!identity || !composerPasteEditableRef.current || AppState.currentState !== "active") {
-      setLocalError("Return to the active task composer before pasting text.");
+      setLocalError(mobileMessage(locale, "task.error.returnActiveTaskPaste"));
       return;
     }
     const identityKey = mobileComposerDraftIdentityKey(identity);
@@ -3867,7 +3898,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         || client.state.owner !== ownerSnapshot
         || client.state.status === "unpaired" || client.state.status === "revoked"
         || AppState.currentState !== "active") {
-        throw new Error("The task draft changed while clipboard text was being read. Paste it again.");
+        throw new Error(mobileMessage(locale, "task.error.taskClipboardChanged"));
       }
       const pathCandidates = workspacePathControls !== undefined && !isLongMobileComposerPaste(text)
         ? findMobileComposerWorkspacePathCandidates(text, workspacePathControls.serverPathDisplay)
@@ -3895,7 +3926,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
           || client.taskWorkspacePathPasteControls()?.surfaceOwnerKey
             !== workspacePathControls.surfaceOwnerKey
           || client.state.status !== "connected" || AppState.currentState !== "active") {
-          throw new Error("The task Workspace changed while clipboard paths were being checked. Paste them again.");
+          throw new Error(mobileMessage(locale, "task.error.taskWorkspaceChanged"));
         }
       }
       const result = insertMobileStructuredClipboardText(
@@ -4002,7 +4033,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     if (!lease || request.draft !== lease.draft || request.count !== request.images.length
       || request.count !== lease.count) {
       if (lease) cancelClipboardImagePaste(lease.draft);
-      setLocalError("The clipboard image batch no longer belongs to this task draft. Paste it again.");
+      setLocalError(mobileMessage(locale, "task.error.clipboardBatchTask"));
       return;
     }
     const identityKey = mobileComposerDraftIdentityKey(lease.identity);
@@ -4038,7 +4069,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             || client.state.busy || AppState.currentState !== "active"
             || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey
             || !sameMobileAttachmentControls(latest, lease.controls)) {
-            throw new Error("Attachment authority changed while the clipboard images were being prepared.");
+            throw new Error(mobileMessage(locale, "task.error.clipboardAttachmentChanged"));
           }
         }
       });
@@ -4114,7 +4145,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     try {
       if (captured.draftIdentityKey !== identityKey || currentNormalDraft !== captured.draft
         || captured.queueLease !== activeQueueEdit?.lease || AppState.currentState !== "active") {
-        throw new Error("The task composer changed while the quote was being selected. Select it again.");
+        throw new Error(mobileMessage(locale, "task.error.quoteComposerChanged"));
       }
       const result = commitMobileQuoteSelection({
         lease: captured.lease,
@@ -4171,7 +4202,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       const lease = captureMobileQuoteSelection(selected.sessionId, latest);
       if (!identity || !lease || queueEditRef.current?.lease.sessionId !== undefined
         && queueEditRef.current.lease.sessionId !== selected.sessionId) {
-        setLocalError("Only a current completed assistant text message can be quoted.");
+        setLocalError(mobileMessage(locale, "task.error.quoteUnavailable"));
         return;
       }
       const activeQueueEdit = queueEditRef.current;
@@ -4189,15 +4220,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       return;
     }
     if (!client.canDeleteMessage(latest.eventId)) {
-      setLocalError("This message is no longer deletable in the current idle task.");
+      setLocalError(mobileMessage(locale, "task.error.messageNotDeletable"));
       return;
     }
     Alert.alert(
-      "Delete this message?",
-      "This removes the selected durable message from the current task.",
+      mobileMessage(locale, "actions.deleteMessageTitle"),
+      mobileMessage(locale, "actions.deleteMessageBody"),
       [
-        { text: "Cancel", style: "cancel" },
-        { text: "Delete", style: "destructive", onPress: () => {
+        { text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+        { text: mobileMessage(locale, "common.delete"), style: "destructive", onPress: () => {
           setLocalError("");
           void client.deleteMessage(latest.eventId).catch((error) => {
             if (taskMountedRef.current) setLocalError(errorText(error));
@@ -4274,7 +4305,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
           const controls = client.taskAppCommandControls();
           const invocation = parseMobileAppCommand(sourceDraft, controls);
           if (!identity || !controls || !invocation) {
-            throw new Error("This app command is unavailable here or its syntax is invalid. The draft was retained.");
+            throw new Error(mobileMessage(locale, "task.error.commandInvalid"));
           }
           if (composerOperationPending) return;
           const helpItems = controls.surfaceOwnerKey === appCommandControls?.surfaceOwnerKey
@@ -4302,15 +4333,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
           if (outcome.kind === "help") {
             setCommandHelpItems(helpItems);
           } else if (outcome.status === "unknown") {
-            setComposerNotice("The command result is unknown. Check its durable operation; Joko will not run it again automatically.");
+            setComposerNotice(mobileMessage(locale, "task.command.unknown"));
           } else if (outcome.status === "rejected") {
-            setLocalError("The command was rejected. Its draft was retained.");
+            setLocalError(mobileMessage(locale, "task.command.rejected"));
           } else if (outcome.kind === "userShell") {
-            setComposerNotice("Shell command completed with a typed acknowledgement.");
+            setComposerNotice(mobileMessage(locale, "task.command.shellComplete"));
           } else if (outcome.kind === "sessionReset") {
-            setComposerNotice("Task context cleared.");
+            setComposerNotice(mobileMessage(locale, "task.command.contextCleared"));
           } else if (outcome.kind === "review") {
-            setComposerNotice("Independent Review started.");
+            setComposerNotice(mobileMessage(locale, "task.command.reviewStarted"));
           }
           return;
         }
@@ -4370,57 +4401,59 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       behavior={Platform.OS === "android" ? "height" : undefined}
       accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
     <View style={styles.header}>
-      {wideNavigation.enabled ? <Pressable ref={drawerMenuRef} accessibilityRole="button" accessibilityLabel="Open task list"
+      {wideNavigation.enabled ? <Pressable ref={drawerMenuRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.openList")}
         onPress={() => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); }}
         style={[styles.headerIconButton, { borderColor: colors.border, backgroundColor: colors.surface }]}>
         <Text style={[styles.headerIcon, { color: colors.ink }]}>☰</Text>
-      </Pressable> : <Back onPress={onBack} colors={colors} />}
+      </Pressable> : <Back label={mobileMessage(locale, "common.tasks")}
+        accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
+        onPress={onBack} colors={colors} />}
       <View style={styles.fill}>
-        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || "Task"}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state, locale) : "Loading…"}</Text>
+        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || mobileMessage(locale, "task.titleFallback")}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}</Text>
       </View>
       <View style={styles.headerActions}>
-        <Action label="Branches"
+        <Action label={mobileMessage(locale, "task.branches")}
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); }} colors={colors} compact
           disabled={state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        <Action label={contextControls?.usage ? `Context ${contextControls.usage.percent}%` : "Context"}
+        <Action label={contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context")}
           onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); }} colors={colors} compact
           disabled={state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        <Action label="Controls" onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
+        <Action label={mobileMessage(locale, "task.controls")} onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
           disabled={state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
-        {client.canOpenFiles() && <Action label="Files" onPress={onFiles} colors={colors} compact
+        {client.canOpenFiles() && <Action label={mobileMessage(locale, "task.files")} onPress={onFiles} colors={colors} compact
           disabled={state.status !== "connected" || attachmentBusy} />}
-        <Action label="Refresh" onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
+        <Action label={mobileMessage(locale, "common.refresh")} onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
       </View>
     </View>
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
-      {state.liveStatus === "streaming" ? "Live events" : state.liveStatus === "verifying" ? "Checking live updates…"
-        : state.liveStatus === "polling" ? "Snapshot updates · live stream unavailable" : "Updates paused"}
+      {mobileMessage(locale, state.liveStatus === "streaming" ? "task.live"
+        : state.liveStatus === "verifying" ? "task.checkingLive"
+          : state.liveStatus === "polling" ? "task.polling" : "task.updatesPaused")}
     </Text>
     {state.status === "offline" && state.offlineSnapshotAt !== undefined
       && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} locale={locale} colors={colors} />}
     {state.error && <Banner text={state.error} colors={colors} />}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
-      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress)}</Text>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     <FlatList data={rows} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
       ListHeaderComponent={<View style={styles.historyActions}>
-        {state.window && <Action label="Return to latest" colors={colors} onPress={() => client.latest()} />}
-        {!state.historyEnd && <Action label={state.historyBusy ? "Loading history…" : "Load earlier history"} colors={colors}
+        {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
+        {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
           disabled={state.historyBusy || state.status !== "connected"}
           onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
       </View>}
-      ListEmptyComponent={<Centered label={state.status === "offline"
-        ? state.detail ? "No messages in the saved offline copy." : "No saved offline messages for this task. Reconnect to load it."
-        : "No messages yet"} colors={colors} />}
+      ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
+        ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
       renderItem={({ item }) => <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
         <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
-        {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} images`} style={styles.messageImages}>
+        {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
           {item.images.map((image, index) => <Pressable key={image.pageId} accessibilityRole="imagebutton"
-            accessibilityLabel={`Open image ${index + 1} of ${item.images!.length}, ${image.title}`}
-            accessibilityHint="Opens this completed message image in the full-screen gallery"
+            accessibilityLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}
+            accessibilityHint={mobileMessage(locale, "task.openImageHint")}
             disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
             onPress={() => openTimelineImage(item, image)}
             style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
@@ -4434,10 +4467,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
                   ? ` · ${image.widthPixels} × ${image.heightPixels}` : ""} · {formatByteSize(BigInt(image.byteSize))}
               </Text>
             </View>
-            <Text style={[styles.caption, { color: colors.accent }]}>Open</Text>
+            <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "common.open")}</Text>
           </Pressable>)}
         </View>}
-        {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} files`} style={styles.messageImages}>
+        {item.artifacts && item.artifacts.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.filesCount", { count: item.artifacts.length })}`} style={styles.messageImages}>
           {item.artifacts.map((artifact) => {
             const disabled = state.timelinePreview !== undefined || galleryOpening || imageGallery.view !== undefined
               || state.status !== "connected" || state.busy || attachmentBusy || voice.busy || fileShareBusy;
@@ -4451,13 +4484,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
                 </Text>
               </View>
               <Text style={[styles.caption, { color: artifact.previewKind ? colors.accent : colors.muted }]}>
-                {artifact.previewKind ? "Open" : "File"}
+                {mobileMessage(locale, artifact.previewKind ? "common.open" : "task.fileFallback")}
               </Text>
             </>;
             return <View key={artifact.artifactId} style={styles.fileActionRow}>
               {artifact.previewKind ? <Pressable accessibilityRole="button"
-                accessibilityLabel={`Open ${artifact.title}, ${artifact.mediaType}`}
-                accessibilityHint="Opens this verified completed-message file in the full-screen preview"
+                accessibilityLabel={mobileMessage(locale, "task.openFile", { name: artifact.title, type: artifact.mediaType })}
+                accessibilityHint={mobileMessage(locale, "task.openFileHint")}
                 disabled={disabled} onPress={() => openTimelineArtifact(artifact)}
                 style={[styles.messageImageTile, styles.fileRowMain,
                   { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
@@ -4467,29 +4500,29 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
                   { borderColor: colors.border, backgroundColor: colors.background }, disabled && styles.disabled]}>
                 {detail}
               </View>}
-              <Action label={fileShareBusy ? "Sharing…" : "Share"}
-                accessibilityLabel={`Share ${artifact.title}`} compact colors={colors} disabled={disabled}
+              <Action label={mobileMessage(locale, fileShareBusy ? "image.sharing" : "common.share")}
+                accessibilityLabel={mobileMessage(locale, "task.shareFile", { name: artifact.title })} compact colors={colors} disabled={disabled}
                 onPress={() => shareTimelineArtifact(artifact)} />
             </View>;
           })}
         </View>}
         <View style={styles.messageActions}>
-          <Pressable accessibilityRole="button" accessibilityLabel={`View context for ${item.label}`}
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.viewContextFor", { name: item.label })}
             disabled={state.historyBusy || state.status !== "connected"}
             onPress={() => { setLocalError(""); void client.around(item.eventId).catch((error) => setLocalError(errorText(error))); }}
             style={styles.inlineTouchAction}>
-            <Text style={[styles.caption, { color: colors.accent }]}>View context</Text>
+            <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "task.viewContext")}</Text>
           </Pressable>
            {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId) }).length > 0
-            && <Pressable accessibilityRole="button" accessibilityLabel={`More actions for ${item.label}`}
+            && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.moreFor", { name: item.label })}
               disabled={state.status !== "connected" || voice.busy} onPress={() => openMessageActions(item)}
               style={[styles.inlineTouchAction, (state.status !== "connected" || voice.busy) && styles.disabled]}>
-              <Text style={[styles.caption, { color: state.status !== "connected" || voice.busy ? colors.muted : colors.accent }]}>More</Text>
+              <Text style={[styles.caption, { color: state.status !== "connected" || voice.busy ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
             </Pressable>}
         </View>
       </View>} />
     {queueItems.length > 0 && <View style={styles.queueRegion}>
-      <Text style={[styles.section, { color: colors.muted }]}>Queue</Text>
+      <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList}
         keyboardShouldPersistTaps="handled">
       {queueItems.map((item, index) => {
@@ -4497,19 +4530,19 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         const disabled = state.busy || voice.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
         const editableText = queueItemText(item.input);
         return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
-          <Text style={[styles.caption, { color: colors.muted }]}>Queued {index + 1} · {queueState(item.state)}{item.editLocked && !editing ? " · Editing elsewhere" : ""}</Text>
-          <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item)}</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queued")} {index + 1} · {queueState(item.state, locale)}{item.editLocked && !editing ? mobileMessage(locale, "task.editingElsewhere") : ""}</Text>
+          <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
           <View style={styles.queueActions}>
-            {queueCapabilities.edit && <Action label={editing ? "Editing" : "Edit"} colors={colors} compact
+            {queueCapabilities.edit && <Action label={editing ? mobileMessage(locale, "composer.editing") : mobileMessage(locale, "common.edit")} colors={colors} compact
               disabled={disabled || editing || item.editLocked || editableText === undefined}
               onPress={() => void beginQueueEdit(item)} />}
-            {queueCapabilities.cancel && <Action label="Remove" colors={colors} compact
+            {queueCapabilities.cancel && <Action label={mobileMessage(locale, "common.remove")} colors={colors} compact
               disabled={disabled || editing}
               onPress={() => mutateQueue(() => client.cancelQueueItem(item.queueItemId))} />}
-            {queueCapabilities.reorder && <Action label="Move up" colors={colors} compact
+            {queueCapabilities.reorder && <Action label={mobileMessage(locale, "task.moveUp")} colors={colors} compact
               disabled={disabled || editing || index === 0}
               onPress={() => mutateQueue(() => client.moveQueueItem(item.queueItemId, "up"))} />}
-            {queueCapabilities.reorder && <Action label="Move down" colors={colors} compact
+            {queueCapabilities.reorder && <Action label={mobileMessage(locale, "task.moveDown")} colors={colors} compact
               disabled={disabled || editing || index === queueItems.length - 1}
               onPress={() => mutateQueue(() => client.moveQueueItem(item.queueItemId, "down"))} />}
           </View>
@@ -4518,12 +4551,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       </ScrollView>
     </View>}
     {state.pending.filter((item) => item.sessionId === state.selectedId).map((item) => <View key={item.operationId} style={styles.pending}>
-      <Text style={[styles.warning, { color: colors.negative }]}>{item.state === "unknown" ? "Operation result unknown" : "Awaiting durable result"} · {item.operationId}</Text>
-      <Action label="Check status" onPress={() => void client.reconcile()} colors={colors} compact
+      <Text style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale,
+        item.state === "unknown" ? "task.operationUnknown" : "task.awaitingResult")} · {item.operationId}</Text>
+      <Action label={mobileMessage(locale, "receipt.check")} onPress={() => void client.reconcile()} colors={colors} compact
         disabled={state.status !== "connected"} />
-      {item.state === "unknown" && <Action label="Clear unconfirmed receipt" onPress={() => Alert.alert(
-        "Clear this receipt?", "Only continue if you have checked the task. Joko will verify the operation is absent before clearing this local warning; it will not repeat the operation.",
-        [{ text: "Keep checking", style: "cancel" }, { text: "Verify and clear", onPress: () => {
+      {item.state === "unknown" && <Action label={mobileMessage(locale, "task.clearReceipt")} onPress={() => Alert.alert(
+        mobileMessage(locale, "task.clearReceiptTitle"), mobileMessage(locale, "task.clearReceiptBody"),
+        [{ text: mobileMessage(locale, "task.keepChecking"), style: "cancel" }, { text: mobileMessage(locale, "common.verifyClear"), onPress: () => {
           void client.dismissUnconfirmed(item.operationId).catch((error) => setLocalError(errorText(error)));
         } }]
       )} colors={colors} compact disabled={state.status !== "connected"} />}
@@ -4532,31 +4566,38 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     {composerNotice && <View accessibilityLiveRegion="polite"
       style={[styles.connectionNotice, { backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>
       <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>{composerNotice}</Text>
-      <Pressable accessibilityRole="button" accessibilityLabel="Dismiss composer notice" onPress={() => setComposerNotice("")}
-        style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>Dismiss</Text></Pressable>
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "composer.dismissNotice")} onPress={() => setComposerNotice("")}
+        style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "common.dismiss")}</Text></Pressable>
     </View>}
     {queueEdit && <View style={[styles.queueEditBanner, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>
         {queueEdit.lease.replacesStructuredInput
-          ? "Editing queued input · changing its text removes structured reference and quote authority"
-          : "Editing queued input"}
+          ? mobileMessage(locale, "composer.editingStructured")
+          : mobileMessage(locale, "composer.editing")}
       </Text>
-      <Action label="Cancel edit" colors={colors} compact disabled={state.status !== "connected" || state.busy}
+      <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
     {interactions.length > 0 ? <View style={[styles.interactionAwaiting, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <View style={styles.fill}>
-        <Text style={[styles.caption, { color: colors.muted }]}>{interactions.length === 1 ? "Task needs a response" : `${interactions.length} task requests need responses`}</Text>
-        <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{activeInteraction ? mobileInteractionTitle(activeInteraction) : "Open request"}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{interactions.length === 1
+          ? mobileMessage(locale, "task.taskNeedsResponse")
+          : mobileMessage(locale, "task.requestsNeedResponse", { count: interactions.length })}</Text>
+        <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{activeInteraction
+          ? mobileInteractionTitle(activeInteraction, locale) : mobileMessage(locale, "task.openRequest")}</Text>
       </View>
-      <Action label="Open request" colors={colors} compact disabled={interactionMutationPending}
+      <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact disabled={interactionMutationPending}
         onPress={() => setInteractionVisible(true)} />
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-      <View accessible accessibilityRole="adjustable" accessibilityLabel="Message input height"
-        accessibilityHint="Swipe up or down to resize. Accessibility actions resize or return to automatic height."
-        accessibilityActions={[{ name: "increment", label: "Increase height" }, { name: "decrement", label: "Decrease height" }, { name: "activate", label: "Use automatic height" }]}
+      <View accessible accessibilityRole="adjustable" accessibilityLabel={mobileMessage(locale, "composer.heightLabel")}
+        accessibilityHint={mobileMessage(locale, "composer.heightHint")}
+        accessibilityActions={[{ name: "increment", label: mobileMessage(locale, "composer.heightIncrease") },
+          { name: "decrement", label: mobileMessage(locale, "composer.heightDecrease") },
+          { name: "activate", label: mobileMessage(locale, "composer.heightAutomaticAction") }]}
         accessibilityValue={{ min: composerBounds.minimumHeight, max: composerBounds.maximumHeight,
-          now: Math.round(composerHeight.visibleHeight), text: composerHeight.mode === "automatic" ? "Automatic height" : `Manual height ${Math.round(composerHeight.visibleHeight)}` }}
+          now: Math.round(composerHeight.visibleHeight), text: composerHeight.mode === "automatic"
+            ? mobileMessage(locale, "composer.heightAutomatic")
+            : mobileMessage(locale, "composer.heightManual", { height: Math.round(composerHeight.visibleHeight) }) }}
         onAccessibilityAction={(event) => {
           const direction = event.nativeEvent.actionName === "increment" ? "increase"
             : event.nativeEvent.actionName === "decrement" ? "decrease" : "automatic";
@@ -4572,10 +4613,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       {!queueEdit && (voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || catalogMentionControls
         || attachmentControls || composerOwnerReady || draft.mentions.length > 0 || draft.atoms.length > 0
         || draft.attachments.length > 0) && <View style={styles.composerTools}>
-        {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors}
+        {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors} locale={locale}
           disabled={!composerOwnerReady || state.busy || composerOperationPending || attachmentBusy
             || state.status !== "connected"} />}
-        {sessionMentionControls && <Action label="Reference task" colors={colors} compact
+        {sessionMentionControls && <Action label={mobileMessage(locale, "composer.referenceTask")} colors={colors} compact
           disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || !composerOwnerReady
             || draft.mentions.filter((mention) => mention.kind === "session").length >= 8}
           onPress={() => {
@@ -4587,7 +4628,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             setSessionMentionError("");
             setSessionMentionsVisible(true);
           }} />}
-        {workspaceMentionControls && <Action label="Reference Workspace" colors={colors} compact
+        {workspaceMentionControls && <Action label={mobileMessage(locale, "composer.referenceWorkspace")} colors={colors} compact
           disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
@@ -4599,9 +4640,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             setWorkspaceMentionsVisible(true);
           }} />}
         {catalogMentionControls && <Action
-          label={catalogMentionControls.policy.resources && catalogMentionControls.policy.artifacts
-            ? "Reference Resource / Artifact"
-            : catalogMentionControls.policy.resources ? "Reference Resource" : "Reference Artifact"}
+          label={mobileMessage(locale, catalogMentionControls.policy.resources && catalogMentionControls.policy.artifacts
+            ? "composer.referenceResourceArtifact"
+            : catalogMentionControls.policy.resources ? "composer.referenceResource" : "composer.referenceArtifact")}
           colors={colors} compact disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || !composerOwnerReady}
           onPress={() => {
             setNativeTreeVisible(false);
@@ -4612,20 +4653,20 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             setWorkspaceMentionsVisible(false);
             setCatalogMentionsVisible(true);
           }} />}
-        <Action label="Paste text" colors={colors} compact
+        <Action label={mobileMessage(locale, "composer.pasteText")} colors={colors} compact
           disabled={!composerPasteEditable}
           onPress={() => void pasteClipboardText()} />
-        {attachmentControls && <Action label={attachmentBusy ? "Selecting…" : "Attach"}
+        {attachmentControls && <Action label={mobileMessage(locale, attachmentBusy ? "common.selecting" : "composer.attach")}
           colors={colors} compact
           disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
-        {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label="Photos"
+        {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label={mobileMessage(locale, "composer.photos")}
           colors={colors} compact
           disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={openPhotoLibrary} />}
-        {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label="Take photo"
+        {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label={mobileMessage(locale, "composer.takePhoto")}
           colors={colors} compact
           disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
@@ -4633,10 +4674,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
           contentContainerStyle={styles.mentionChips} showsHorizontalScrollIndicator={false}>
           {draft.mentions.map((mention) => <Pressable key={mention.mentionId}
-            accessibilityRole="button" accessibilityLabel={`Remove ${mention.kind === "session" ? "task"
-              : mention.kind === "workspace" ? mention.directory ? "directory" : "file"
-                : mention.kind === "resource" ? "resource" : "Artifact"} reference ${mention.displayText}`}
-            accessibilityHint="Removes this exact reference occurrence from the message"
+            accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "composer.removeReference", {
+              kind: mobileMessage(locale, mention.kind === "session" ? "composer.kind.task"
+                : mention.kind === "workspace" ? mention.directory ? "composer.kind.directory" : "composer.kind.file"
+                  : mention.kind === "resource" ? "composer.kind.resource" : "composer.kind.artifact"),
+              label: mention.displayText
+            })}
+            accessibilityHint={mobileMessage(locale, "composer.removeReferenceHint.task")}
             disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy}
             onPress={() => removeComposerMention(mention.mentionId)}
             style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
@@ -4644,16 +4688,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>{draft.text.slice(mention.start, mention.end)} ×</Text>
           </Pressable>)}
         </ScrollView>}
-        <MobileComposerAtomChips atoms={draft.atoms} colors={colors}
+        <MobileComposerAtomChips atoms={draft.atoms} colors={colors} locale={locale}
           disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
           onOpen={setComposerAtomId} />
       </View>}
-      {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors}
+      {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors} locale={locale}
         disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
         busy={state.busy || composerOperationPending || voice.busy || attachmentBusy}
         pendingCount={pastedImageCount}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
-      <MobileRuntimeCommandPalette visible={runtimeCommandPaletteVisible}
+      <MobileRuntimeCommandPalette visible={runtimeCommandPaletteVisible} locale={locale}
         query={runtimeCommandActivation?.query ?? ""} items={runtimeCommandResults.items}
         selectedIndex={selectedRuntimeCommandIndex} status={runtimeCommandPaletteStatus}
         error={runtimeCommandLoadMatches ? runtimeCommandLoad.error : undefined}
@@ -4664,7 +4708,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         onRefresh={loadRuntimeCommandCatalog} onRetry={loadRuntimeCommandCatalog}
         onSelect={(candidate) => { void commitRuntimeCommand(candidate); }} />
       <View style={styles.composerRow}>
-        {queueEdit ? <TextInput ref={queueInputRef} accessibilityLabel="Queued input" multiline
+        {queueEdit ? <TextInput ref={queueInputRef} accessibilityLabel={mobileMessage(locale, "composer.queuedInput")} multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection}
           maxLength={mobileComposerNativeInputMaximumCharacters}
           onSelectionChange={(event) => {
@@ -4678,22 +4722,23 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             Math.ceil(event.nativeEvent.contentSize.height)
           ))}
           scrollEnabled={composerHeight.scrollEnabled}
-          editable={state.status === "connected" && !state.busy && !composerOperationPending && composerOwnerReady} placeholder="Edit queued input…"
+          editable={state.status === "connected" && !state.busy && !composerOperationPending && composerOwnerReady}
+          placeholder={mobileMessage(locale, "composer.editQueued")}
           placeholderTextColor={colors.muted}
           style={[styles.composerInput, { color: colors.ink, height: composerHeight.visibleHeight }]} />
           : <MobileComposerRichInput key={`task-rich-${draftIdentityKey ?? "none"}`}
-            ref={composerInputRef} accessibilityLabel="Task message"
+            ref={composerInputRef} accessibilityLabel={mobileMessage(locale, "composer.taskMessage")}
             commandPaletteOpen={runtimeCommandPaletteVisible}
             draft={composerOwnerReady ? draft : emptyMobileComposerDraft()}
-            editable={composerPasteEditable} height={composerHeight.visibleHeight}
+            editable={composerPasteEditable} height={composerHeight.visibleHeight} locale={locale}
             maxHeight={composerBounds.maximumHeight} ownerKey={`task\u001f${draftIdentityKey ?? "none"}`}
-            placeholder={composerOwnerReady ? "Message Joko…" : "Restoring saved draft…"}
+            placeholder={mobileMessage(locale, composerOwnerReady ? "composer.placeholder" : "composer.restoring")}
             selection={composerOwnerReady ? composerSelection : { start: 0, end: 0 }} theme={composerTheme}
             onEdit={(result, sourceDraft) => {
               const identity = draftIdentityRef.current;
               if (!identity || queueEditRef.current || !composerPasteEditableRef.current
                 || composerDraftRef.current !== sourceDraft) {
-                setLocalError("Return to the active task composer before editing this message.");
+                setLocalError(mobileMessage(locale, "composer.returnActive"));
                 return;
               }
               composerDraftRef.current = result.draft;
@@ -4731,7 +4776,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
               composerSelectionRef.current = nextSelection;
               setComposerSelection(nextSelection);
             }} />}
-        <Action label={state.busy || appCommandRunning ? (queueEdit ? "Saving…" : "Sending…") : (queueEdit ? "Save edit" : "Send")} colors={colors} compact
+        <Action label={mobileMessage(locale, state.busy || appCommandRunning
+          ? queueEdit ? "common.saving" : "common.sending"
+          : queueEdit ? "composer.saveEdit" : "composer.send")} colors={colors} compact
           disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
             || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || composerOperationPending
             || state.status !== "connected"}
@@ -4739,18 +4786,18 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       </View>
     </View>}
     </MobileKeyboardAvoidingView>
-    <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined}
+    <MobilePhotoLibrarySheet visible={photoLibraryLease !== undefined} locale={locale}
       ownerKey={photoLibraryLease?.controls.surfaceOwnerKey}
       maximumSelection={Math.max(0, (photoLibraryLease?.controls.policy.maximumItems ?? 0)
         - draft.attachments.length)}
       colors={colors} library={mobilePhotoLibrary}
       onAdd={addPhotoLibraryAssets} onClose={closePhotoLibrary} />
-    {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session}
+    {imageEditorLease && <MobileImageLightbox session={imageEditorLease.session} locale={locale}
       onOutputAction={async (action, decoded, rendered, signal) => {
         setComposerNotice("");
         setLocalError("");
         try {
-          const message = await performMobileImageOutput(imageEditorLease.session, action, decoded, rendered, signal);
+          const message = await performMobileImageOutput(imageEditorLease.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted && taskMountedRef.current && imageEditorLeaseRef.current === imageEditorLease) {
             setComposerNotice(message);
           }
@@ -4763,7 +4810,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       onNativeActivityChange={(active) => { attachmentNativeActivityRef.current = active; }}
       onClose={closeImageEditor} onSave={saveImageEditor} />}
     {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
-      session={imageGallery.view.session}
+      session={imageGallery.view.session} locale={locale}
       gallery={{
         session: imageGallery.view.session,
         busy: imageGallery.view.busy,
@@ -4777,8 +4824,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         setLocalError("");
         try {
           const view = imageGallery.view;
-          if (!view) throw new Error("The image gallery closed before output started.");
-          const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal);
+          if (!view) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+          const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted && taskMountedRef.current) setComposerNotice(message);
           return message;
         } catch (failure) {
@@ -4791,23 +4838,25 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     <FilePreviewModal colors={colors} preview={state.timelinePreview} busy={false}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
       onShare={timelinePreviewSource ? () => shareTimelineArtifact(timelinePreviewSource) : undefined}
-      backLabel="Task" loadingLabel="Verifying the exact Timeline file…"
+      backLabel={mobileMessage(locale, "preview.taskTitle")}
+      backAccessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "preview.taskTitle") })}
+      loadingLabel={mobileMessage(locale, "preview.verifyingTimeline")} locale={locale}
       onClose={() => {
         setTimelinePreviewSource(undefined);
         client.closeTimelinePreview();
       }} />
-    <MobileActionSheet visible={state.status === "connected" && messageActionsVisible} items={messageActionItems} colors={colors}
+    <MobileActionSheet visible={state.status === "connected" && messageActionsVisible} items={messageActionItems} colors={colors} locale={locale}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
-    <MobileCommandHelpSheet visible={state.status === "connected" && commandHelpItems !== undefined} items={commandHelpItems ?? []}
+    <MobileCommandHelpSheet visible={state.status === "connected" && commandHelpItems !== undefined} items={commandHelpItems ?? []} locale={locale}
       colors={colors} onClose={() => setCommandHelpItems(undefined)} />
-    <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined}
+    <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined} locale={locale}
       colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
     <MobileComposerAtomSheet atom={state.status === "connected"
       ? draft.atoms.find((atom) => atom.atomId === composerAtomId) : undefined}
-      colors={colors} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
+      colors={colors} locale={locale} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
-    <MobileInteractionSheet visible={interactionVisible && interactions.length > 0}
+    <MobileInteractionSheet visible={interactionVisible && interactions.length > 0} locale={locale}
       profileId={state.activeProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionMutationPending} colors={colors}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
@@ -4822,19 +4871,19 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         return completed;
       }}
       onError={setLocalError} />
-    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined}
+    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined} locale={locale}
       controls={runtimeControls} busy={state.busy || runtimeControlPending || attachmentBusy} colors={colors}
       onClose={() => setRuntimeControlsVisible(false)}
       onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}
       onSetPermission={(authorityKey, mode) => client.setTaskPermission(authorityKey, mode)}
       onSetPlanMode={(authorityKey, enabled) => client.setTaskPlanMode(authorityKey, enabled)}
       onError={setLocalError} />
-    <MobileContextSheet visible={contextVisible && contextControls !== undefined}
+    <MobileContextSheet visible={contextVisible && contextControls !== undefined} locale={locale}
       controls={contextControls} busy={state.busy || contextPending} colors={colors}
       onClose={() => setContextVisible(false)}
       onCompact={(authorityKey) => client.compactTaskContext(authorityKey)}
       onError={setLocalError} />
-    <MobileNativeTreeSheet visible={nativeTreeVisible && nativeTreeControls !== undefined}
+    <MobileNativeTreeSheet visible={nativeTreeVisible && nativeTreeControls !== undefined} locale={locale}
       controls={nativeTreeControls} busy={state.busy || nativeTreePending} colors={colors}
       onClose={() => setNativeTreeVisible(false)}
       onLoad={(authorityKey) => client.loadTaskNativeTree(authorityKey)}
@@ -4846,16 +4895,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         customInstructions
       )}
       onError={setLocalError} />
-    <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined}
+    <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined} locale={locale}
       controls={sessionMentionControls} busy={state.busy} error={sessionMentionError} colors={colors}
       onClose={() => { setSessionMentionsVisible(false); setSessionMentionError(""); }} onSelect={insertSessionMention} />
-    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined}
+    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined} locale={locale}
       controls={workspaceMentionControls} busy={state.busy} colors={colors}
       onClose={() => setWorkspaceMentionsVisible(false)}
       onLoadDirectory={(surfaceOwnerKey, parentPath, signal) => client.listTaskWorkspaceMentionDirectory(surfaceOwnerKey, parentPath, signal)}
       onLoadFileIndex={(surfaceOwnerKey, signal) => client.listTaskWorkspaceMentionFileIndex(surfaceOwnerKey, signal)}
       onSelect={insertWorkspaceMention} />
-    <MobileCatalogMentionSheet visible={catalogMentionsVisible && catalogMentionControls !== undefined}
+    <MobileCatalogMentionSheet visible={catalogMentionsVisible && catalogMentionControls !== undefined} locale={locale}
       controls={catalogMentionControls} busy={state.busy} colors={colors}
       onClose={() => setCatalogMentionsVisible(false)}
       onLoad={(surfaceOwnerKey, signal) => client.listTaskCatalogMentionCatalog(surfaceOwnerKey, signal)}
@@ -4881,7 +4930,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   </View>;
 }
 
-function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack: () => void; onAdded: () => void }) {
+function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & { onBack: () => void; onAdded: () => void }) {
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<MobileFilesSearchMode>("name");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -4899,7 +4948,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
   const searching = query.trim().length > 0;
-  const imageGallery = useMobileImageGallery(() => {
+  const imageGallery = useMobileImageGallery(locale, () => {
     client.closeFiles();
     onAdded();
   });
@@ -5034,7 +5083,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Offline · showing only the in-memory view already loaded for this task. New reads are paused.</Text>
     </View>}
     {(localError || files.error) && <Banner text={localError || files.error || ""} colors={colors} />}
-    {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors}
+    {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors} locale={locale}
       onDismiss={() => setImageOutputNotice("")} />}
     {handoffBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
@@ -5042,7 +5091,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
     </View>}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
-      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress)}</Text>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     {galleryOpening && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
@@ -5180,7 +5229,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
           })}
         </>}
       </ScrollView>}
-    <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy}
+    <FilePreviewModal colors={colors} preview={files.preview} source={previewSource} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
       onShare={previewSource && shareableMobileFilesSource(previewSource)
         ? () => shareFile(previewSource) : undefined}
@@ -5190,6 +5239,7 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
       }} />
     {imageGallery.view && <MobileImageLightbox key={imageGallery.view.session.leaseId}
       session={imageGallery.view.session}
+      locale={locale}
       gallery={{
         session: imageGallery.view.session,
         busy: imageGallery.view.busy,
@@ -5203,8 +5253,8 @@ function FilesScreen({ colors, state, onBack, onAdded }: ScreenProps & { onBack:
         setLocalError("");
         try {
           const view = imageGallery.view;
-          if (!view) throw new Error("The image gallery closed before output started.");
-          const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal);
+          if (!view) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+          const message = await performMobileImageOutput(view.session, action, decoded, rendered, signal, locale);
           if (!signal.aborted) setImageOutputNotice(message);
           return message;
         } catch (failure) {
@@ -5242,8 +5292,9 @@ function FileSearchResultRow({ result, colors, disabled, shareDisabled, onPress,
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, busy, sharing = false, shareProgress, backLabel = "Files",
-  loadingLabel = "Loading the exact observed file revision…", onAdd, onOpenImage, onShare, onClose }: {
+function FilePreviewModal({ colors, preview, source, busy, sharing = false, shareProgress, backLabel,
+  backAccessibilityLabel, loadingLabel, locale,
+  onAdd, onOpenImage, onShare, onClose }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
@@ -5251,7 +5302,9 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   sharing?: boolean;
   shareProgress?: MobileFileShareProgress;
   backLabel?: string;
+  backAccessibilityLabel?: string;
   loadingLabel?: string;
+  locale: MobileSupportedLocale;
   onAdd?: (source: MobileFilesComposerSource) => void;
   onOpenImage?: (source: MobileFilesComposerSource) => void;
   onShare?: () => void;
@@ -5260,6 +5313,8 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   const [mediaStatus, setMediaStatus] = useState<MobileMediaPlayerStatus>();
   const [pdfStatus, setPdfStatus] = useState<MobilePdfViewerStatus>();
   const [modelStatus, setModelStatus] = useState<MobileModelViewerStatus>();
+  const exactBackLabel = backLabel ?? mobileMessage(locale, "preview.filesTitle");
+  const exactLoadingLabel = loadingLabel ?? mobileMessage(locale, "preview.loadingExact");
   const mediaLeaseId = preview?.kind === "media" ? preview.leaseId : undefined;
   const pdfLeaseId = preview?.kind === "pdf" ? preview.leaseId : undefined;
   const modelLeaseId = preview?.kind === "model" ? preview.leaseId : undefined;
@@ -5271,47 +5326,57 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
     <SafeAreaView style={[styles.fill, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       {preview && <>
         <View style={[styles.header, { borderBottomColor: colors.border }]}>
-          <Back onPress={onClose} colors={colors} label={backLabel} disabled={blocked} />
+          <Back onPress={onClose} colors={colors} label={exactBackLabel}
+            accessibilityLabel={backAccessibilityLabel ?? mobileMessage(locale, "common.backTo", { label: exactBackLabel })}
+            disabled={blocked} />
           <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{preview.title}</Text>
             <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{preview.sourceLabel}</Text></View>
-          {source && onOpenImage && preview.kind === "image" && <Action label="Gallery"
-            accessibilityLabel={`Open image gallery for ${preview.title}`} compact colors={colors}
+          {source && onOpenImage && preview.kind === "image" && <Action label={mobileMessage(locale, "preview.gallery")}
+            accessibilityLabel={mobileMessage(locale, "preview.openGalleryFor", { title: preview.title })} compact colors={colors}
             disabled={blocked} onPress={() => onOpenImage(source)} />}
-          {source && onAdd && <Action label={busy ? "Adding…" : "Add"}
-            accessibilityLabel={`Add ${preview.title} to composer`} compact colors={colors}
+          {source && onAdd && <Action label={busy ? mobileMessage(locale, "preview.adding") : mobileMessage(locale, "common.add")}
+            accessibilityLabel={mobileMessage(locale, "preview.addToComposer", { title: preview.title })} compact colors={colors}
             disabled={blocked || preview.kind === "loading"} onPress={() => onAdd(source)} />}
-          {onShare && <Action label={sharing ? "Sharing…" : "Share"}
-            accessibilityLabel={`Share ${preview.title}`} compact colors={colors}
+          {onShare && <Action label={sharing ? mobileMessage(locale, "preview.sharing") : mobileMessage(locale, "common.share")}
+            accessibilityLabel={mobileMessage(locale, "preview.shareTitle", { title: preview.title })} compact colors={colors}
             disabled={blocked || preview.kind === "loading"} onPress={onShare} />}
         </View>
         {busy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <ActivityIndicator color={colors.accent} />
-          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Adding the verified item to this task’s composer…</Text>
+          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "preview.addingVerified")}</Text>
         </View>}
         {sharing && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <ActivityIndicator color={colors.accent} />
-          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(shareProgress)}</Text>
+          <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(shareProgress, locale)}</Text>
         </View>}
         <View style={[styles.previewMetadata, { borderColor: colors.border, backgroundColor: colors.surface }]}>
           <Text selectable style={[styles.caption, { color: colors.muted }]}>{preview.mediaType} · {formatByteSize(preview.byteSize)}</Text>
           {preview.kind === "text" && <Text style={[styles.caption, { color: colors.muted }]}>
-            {preview.languageId || "plain text"} · lines {preview.totalLines} · bytes {preview.startByte.toString(10)}–{preview.endByte.toString(10)}
+            {mobileMessage(locale, "preview.textMetadata", {
+              language: preview.languageId || mobileMessage(locale, "preview.plainText"),
+              lines: preview.totalLines,
+              start: preview.startByte.toString(10),
+              end: preview.endByte.toString(10)
+            })}
           </Text>}
           {preview.kind === "media" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: mediaStatus?.state === "error" ? colors.negative : colors.muted }]}>
-            {formatMobileMediaPlayerStatus(mediaStatus, preview.mediaKind)}
+            {formatMobileMediaPlayerStatus(mediaStatus, preview.mediaKind, locale)}
           </Text>}
           {preview.kind === "pdf" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: pdfStatus?.state === "error" ? colors.negative : colors.muted }]}>
-            {formatMobilePdfViewerStatus(pdfStatus)}
+            {formatMobilePdfViewerStatus(pdfStatus, locale)}
           </Text>}
           {preview.kind === "model" && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: modelStatus?.state === "error" ? colors.negative : colors.muted }]}>
-            {formatMobileModelViewerStatus(modelStatus)}
+            {formatMobileModelViewerStatus(modelStatus, locale)}
           </Text>}
         </View>
-        {preview.kind === "loading" ? <Centered label={loadingLabel} colors={colors} />
+        {preview.kind === "loading" ? <Centered label={exactLoadingLabel} colors={colors} />
           : preview.kind === "image" ? <ScrollView style={styles.fill} contentContainerStyle={styles.imagePreviewContainer}>
             <Image source={{ uri: preview.dataUri }} accessibilityLabel={preview.altText} resizeMode="contain" style={styles.imagePreview} />
             {(preview.widthPixels > 0 || preview.heightPixels > 0) && <Text style={[styles.caption, { color: colors.muted }]}>
-              {preview.widthPixels} × {preview.heightPixels} pixels
+              {mobileMessage(locale, "preview.imageDimensions", {
+                width: preview.widthPixels,
+                height: preview.heightPixels
+              })}
             </Text>}
           </ScrollView>
           : preview.kind === "media" ? <View style={styles.mediaPreviewContainer}>
@@ -5321,6 +5386,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
               ink={colors.ink}
               instanceId={preview.leaseId}
               kind={preview.mediaKind}
+              locale={locale}
               mediaType={preview.mediaType}
               onStatusChange={setMediaStatus}
               style={styles.mediaPreview}
@@ -5339,6 +5405,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
               fileName={preview.fileName}
               ink={colors.ink}
               instanceId={preview.leaseId}
+              locale={locale}
               muted={colors.muted}
               onStatusChange={setPdfStatus}
               sha256Hex={preview.sha256Hex}
@@ -5356,6 +5423,7 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
               border={colors.border}
               ink={colors.ink}
               lease={preview}
+              locale={locale}
               muted={colors.muted}
               onStatusChange={setModelStatus}
               style={styles.modelPreview}
@@ -5364,12 +5432,12 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
             />
           </View>
           : preview.kind === "text" ? <ScrollView style={styles.fill} contentContainerStyle={styles.textPreviewContainer}>
-            {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>Preview is truncated to the authenticated byte window shown above.</Text>}
-            <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || "(empty file)"}</Text>
+            {preview.truncated && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale, "preview.truncated")}</Text>}
+            <Text selectable style={[styles.textPreview, { color: colors.ink }]}>{preview.text || mobileMessage(locale, "preview.emptyFile")}</Text>
           </ScrollView>
           : <View style={styles.previewMessage}>
             <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
-              {preview.kind === "error" ? "Preview unavailable" : "No in-app preview"}
+              {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
             </Text>
             <Text selectable style={[styles.description, { color: colors.muted }]}>{preview.reason}</Text>
           </View>}
@@ -5378,38 +5446,63 @@ function FilePreviewModal({ colors, preview, source, busy, sharing = false, shar
   </Modal>;
 }
 
-function formatMobilePdfViewerStatus(status: MobilePdfViewerStatus | undefined): string {
-  if (!status) return "Verified PDF · preparing offline renderer";
-  if (status.state === "error") return status.error || "PDF preview failed";
-  if (status.state === "ready") return "Offline renderer ready";
-  if (status.state === "receiving") return "Transferring verified PDF";
-  if (status.state === "document") return `${status.pageCount} ${status.pageCount === 1 ? "page" : "pages"} · ${status.zoomPercent}%`;
-  if (status.state === "complete") return `All ${status.pageCount} pages rendered · ${status.zoomPercent}%`;
-  return `${status.renderedPages} of ${status.pageCount} pages rendered · ${status.zoomPercent}%`;
+function formatMobilePdfViewerStatus(
+  status: MobilePdfViewerStatus | undefined,
+  locale: MobileSupportedLocale
+): string {
+  if (!status) return mobileMessage(locale, "preview.status.preparingPdf");
+  if (status.state === "error") return status.error || mobileMessage(locale, "preview.pdfError");
+  if (status.state === "ready") return mobileMessage(locale, "preview.status.pdfReady");
+  if (status.state === "receiving") return mobileMessage(locale, "preview.status.receivingPdf");
+  if (status.state === "document" || status.state === "complete") {
+    return mobileMessage(locale, status.state === "document"
+      ? "preview.status.pdfDocument" : "preview.status.pdfComplete", {
+      pages: status.pageCount,
+      zoom: status.zoomPercent
+    });
+  }
+  return mobileMessage(locale, "preview.status.renderingPdf", {
+    rendered: status.renderedPages,
+    pages: status.pageCount
+  });
 }
 
-function formatMobileModelViewerStatus(status: MobileModelViewerStatus | undefined): string {
-  if (!status) return "Verified 3D model · preparing offline renderer";
-  if (status.state === "error") return status.error || "3D model preview failed";
-  if (status.state === "ready") return "Offline 3D renderer ready";
-  if (status.state === "receiving") return "Transferring verified model package";
-  if (status.state === "loading") return `Loading ${status.fileCount} verified model file${status.fileCount === 1 ? "" : "s"}`;
-  return `Interactive 3D model ready · ${status.fileCount} verified file${status.fileCount === 1 ? "" : "s"}`;
+function formatMobileModelViewerStatus(
+  status: MobileModelViewerStatus | undefined,
+  locale: MobileSupportedLocale
+): string {
+  if (!status) return mobileMessage(locale, "preview.status.preparingModel");
+  if (status.state === "error") return status.error || mobileMessage(locale, "preview.modelError");
+  if (status.state === "ready") return mobileMessage(locale, "preview.status.modelReady");
+  if (status.state === "receiving") return mobileMessage(locale, "preview.status.receivingModel");
+  if (status.state === "loading") return mobileMessage(locale, "preview.status.loadingModelFiles", {
+    files: status.fileCount,
+    kind: mobileMessage(locale, status.fileCount === 1 ? "preview.status.file" : "preview.status.files")
+  });
+  return mobileMessage(locale, "preview.status.modelComplete", {
+    files: status.fileCount,
+    kind: mobileMessage(locale, status.fileCount === 1 ? "preview.status.file" : "preview.status.files")
+  });
 }
 
 function formatMobileMediaPlayerStatus(
   status: MobileMediaPlayerStatus | undefined,
-  kind: "audio" | "video"
+  kind: "audio" | "video",
+  locale: MobileSupportedLocale
 ): string {
-  if (!status) return `Verified ${kind} · ready to load`;
-  if (status.state === "error") return status.error || `${kind === "video" ? "Video" : "Audio"} playback failed`;
+  if (!status) return mobileMessage(locale, "preview.status.preparingMedia", {
+    kind: mobileMessage(locale, kind === "video" ? "preview.video" : "preview.audio")
+  });
+  if (status.state === "error") return status.error || mobileMessage(locale, "preview.mediaError");
   const current = status.currentTime === null ? undefined : formatMediaTime(status.currentTime);
   const duration = status.duration === null ? undefined : formatMediaTime(status.duration);
-  const progress = current && duration ? ` · ${current} / ${duration}` : current ? ` · ${current}` : "";
-  const label = status.state === "ready" ? "Ready" : status.state === "playing" ? "Playing"
-    : status.state === "paused" ? "Paused" : status.state === "waiting" ? "Buffering"
-      : status.state === "ended" ? "Finished" : "Unavailable";
-  return `${label}${progress}`;
+  const progress = current && duration ? `· ${current} / ${duration}` : current ? `· ${current}` : "";
+  if (status.state === "ready") return mobileMessage(locale, "preview.status.ready", { time: progress }).trim();
+  if (status.state === "playing") return mobileMessage(locale, "preview.status.playing", { time: progress }).trim();
+  if (status.state === "paused") return mobileMessage(locale, "preview.status.paused", { time: progress }).trim();
+  if (status.state === "waiting") return mobileMessage(locale, "preview.status.waiting", { time: progress }).trim();
+  if (status.state === "ended") return mobileMessage(locale, "preview.status.ended", { time: progress }).trim();
+  return mobileMessage(locale, "preview.status.unavailable");
 }
 
 function formatMediaTime(value: number): string {
@@ -5443,11 +5536,16 @@ function shareableMobileFilesSource(source: MobileFilesComposerSource): boolean 
   return shareableFileSearchResult(source.result);
 }
 
-function formatMobileFileShareProgress(progress: MobileFileShareProgress | undefined): string {
-  if (!progress) return "Preparing the verified file for system sharing…";
-  if (progress.phase === "dispatching") return "Opening the system share sheet…";
-  const verb = progress.phase === "verifying" ? "Verifying" : "Downloading";
-  return `${verb} ${formatByteSize(BigInt(progress.bytesCompleted))} of ${formatByteSize(BigInt(progress.totalBytes))}…`;
+function formatMobileFileShareProgress(
+  progress: MobileFileShareProgress | undefined,
+  locale: MobileSupportedLocale
+): string {
+  if (!progress) return mobileMessage(locale, "task.share.preparing");
+  if (progress.phase === "dispatching") return mobileMessage(locale, "task.share.opening");
+  return mobileMessage(locale, progress.phase === "verifying" ? "task.share.verifying" : "task.share.downloading", {
+    completed: formatByteSize(BigInt(progress.bytesCompleted)),
+    total: formatByteSize(BigInt(progress.totalBytes))
+  });
 }
 
 function TaskListDrawer({ colors, state, locale, closeButtonRef, onClose, onSelect, onNew, onHome }: ScreenProps & {
@@ -5535,32 +5633,41 @@ function ModeTab({ label, selected, onPress, colors, disabled }: {
   </Pressable>;
 }
 
-function MobileComposerAtomChips({ atoms, colors, disabled, onOpen }: {
+function MobileComposerAtomChips({ atoms, colors, locale, disabled, onOpen }: {
   readonly atoms: readonly MobileComposerAtom[];
   readonly colors: Colors;
+  readonly locale: MobileSupportedLocale;
   readonly disabled: boolean;
   readonly onOpen: (atomId: string) => void;
 }) {
   if (atoms.length === 0) return null;
   return <ScrollView horizontal keyboardShouldPersistTaps="handled"
-    accessibilityLabel="Structured message items" contentContainerStyle={styles.mentionChips}
+    accessibilityLabel={mobileMessage(locale, "composer.atoms.title")} contentContainerStyle={styles.mentionChips}
     showsHorizontalScrollIndicator={false}>
-    {atoms.map((atom) => <Pressable key={atom.atomId} accessibilityRole="button"
-      accessibilityLabel={`${atom.kind === "quote" ? "View quote" : atom.kind === "route-reference" ? `View ${atom.routeKind === "project" ? "project link" : atom.routeKind === "path" ? "Workspace path" : "task link"}` : "Edit pasted text"}: ${mobileComposerAtomLabel(atom)}`}
-      accessibilityHint="Opens this exact structured message item; it is removed as one unit if edited in the text field"
+    {atoms.map((atom) => {
+      const action = atom.kind === "quote" ? mobileMessage(locale, "composer.atoms.viewQuote")
+        : atom.kind === "route-reference" ? mobileMessage(locale, "composer.atoms.viewKind", {
+          kind: mobileMessage(locale, atom.routeKind === "project" ? "composer.atoms.projectLink"
+            : atom.routeKind === "path" ? "composer.atoms.workspacePath" : "composer.atoms.taskLink")
+        }) : mobileMessage(locale, "composer.atoms.editPaste");
+      return <Pressable key={atom.atomId} accessibilityRole="button"
+      accessibilityLabel={`${action}: ${mobileComposerRichAtomLabel(atom, locale)}`}
+      accessibilityHint={mobileMessage(locale, "composer.atoms.openHint")}
       accessibilityState={{ disabled }} disabled={disabled} onPress={() => onOpen(atom.atomId)}
       style={[styles.mentionChip, { borderColor: colors.border, backgroundColor: colors.brandBackground },
         disabled && styles.disabled]}>
       <Text style={[styles.mentionChipText, { color: colors.ink }]} numberOfLines={1}>
-        {mobileComposerAtomLabel(atom)} · {atom.kind === "pasted-text" ? "Edit" : "View"}
+        {mobileComposerRichAtomLabel(atom, locale)} · {mobileMessage(locale, atom.kind === "pasted-text" ? "common.edit" : "common.open")}
       </Text>
-    </Pressable>)}
+    </Pressable>;
+    })}
   </ScrollView>;
 }
 
-function MobileAttachmentTray({ attachments, colors, disabled, busy, pendingCount = 0, onPreview, onRemove }: {
+function MobileAttachmentTray({ attachments, colors, locale, disabled, busy, pendingCount = 0, onPreview, onRemove }: {
   attachments: readonly MobileComposerAttachment[];
   colors: Colors;
+  locale: MobileSupportedLocale;
   disabled: boolean;
   busy: boolean;
   pendingCount?: number;
@@ -5568,17 +5675,23 @@ function MobileAttachmentTray({ attachments, colors, disabled, busy, pendingCoun
   onRemove: (attachmentId: string) => void;
 }) {
   if (attachments.length === 0 && pendingCount === 0) return null;
-  return <View accessibilityLabel="Attachments" style={styles.attachmentTray}>
+  return <View accessibilityLabel={mobileMessage(locale, "attachments.title")} style={styles.attachmentTray}>
     {pendingCount > 0 && <View accessible accessibilityLiveRegion="polite"
-      accessibilityLabel={`Adding ${pendingCount} pasted ${pendingCount === 1 ? "image" : "images"}`}
+      accessibilityLabel={mobileMessage(locale, "attachments.addingPasted", {
+        count: pendingCount,
+        kind: mobileMessage(locale, pendingCount === 1 ? "attachments.image" : "attachments.images")
+      })}
       style={[styles.attachmentChip, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <ActivityIndicator color={colors.accent} size="small" />
       <View style={styles.fill}>
         <Text style={[styles.attachmentName, { color: colors.ink }]} numberOfLines={1}>
-          Adding {pendingCount} pasted {pendingCount === 1 ? "image" : "images"}…
+          {mobileMessage(locale, "attachments.addingPasted", {
+            count: pendingCount,
+            kind: mobileMessage(locale, pendingCount === 1 ? "attachments.image" : "attachments.images")
+          })}…
         </Text>
         <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-          Verifying and saving the complete clipboard batch
+          {mobileMessage(locale, "attachments.verifyingBatch")}
         </Text>
       </View>
     </View>}
@@ -5587,20 +5700,20 @@ function MobileAttachmentTray({ attachments, colors, disabled, busy, pendingCoun
       <View style={styles.fill}>
         <Text style={[styles.attachmentName, { color: colors.ink }]} numberOfLines={1}>{attachment.fileName}</Text>
         <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-          {attachment.kind === "image" ? "Image" : "File"} · {formatMobileAttachmentBytes(attachment.byteSize)}
-          {attachment.state === "uploaded" ? " · Uploaded" : " · Ready"}
+          {mobileMessage(locale, attachment.kind === "image" ? "attachments.kindImage" : "attachments.kindFile")} · {formatMobileAttachmentBytes(attachment.byteSize)}
+          {` · ${mobileMessage(locale, attachment.state === "uploaded" ? "attachments.uploaded" : "attachments.ready")}`}
         </Text>
       </View>
       {busy && attachment.state === "local" && <ActivityIndicator color={colors.accent} size="small" />}
       {attachment.kind === "image" && <Pressable accessibilityRole="button"
-        accessibilityLabel={`Preview image ${attachment.fileName}`}
-        accessibilityHint="Opens the full-screen image viewer and annotation tools" disabled={disabled}
+        accessibilityLabel={mobileMessage(locale, "attachments.previewImage", { name: attachment.fileName })}
+        accessibilityHint={mobileMessage(locale, "attachments.previewHint")} disabled={disabled}
         onPress={() => onPreview(attachment.attachmentId)}
         style={[styles.attachmentPreview, disabled && styles.disabled]}>
-        <Text style={[styles.attachmentPreviewText, { color: colors.accent }]}>Preview</Text>
+        <Text style={[styles.attachmentPreviewText, { color: colors.accent }]}>{mobileMessage(locale, "common.open")}</Text>
       </Pressable>}
-      <Pressable accessibilityRole="button" accessibilityLabel={`Remove attachment ${attachment.fileName}`}
-        accessibilityHint="Removes this exact attachment from the draft" disabled={disabled}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "attachments.remove", { name: attachment.fileName })}
+        accessibilityHint={mobileMessage(locale, "attachments.removeHint")} disabled={disabled}
         onPress={() => onRemove(attachment.attachmentId)} style={[styles.attachmentRemove, disabled && styles.disabled]}>
         <Text style={[styles.attachmentRemoveText, { color: colors.muted }]}>×</Text>
       </Pressable>
@@ -5608,37 +5721,40 @@ function MobileAttachmentTray({ attachments, colors, disabled, busy, pendingCoun
   </View>;
 }
 
-function useMobileVoicePermissionSettings(error?: MobileVoiceRunError): void {
+function useMobileVoicePermissionSettings(error: MobileVoiceRunError | undefined, locale: MobileSupportedLocale): void {
   useEffect(() => {
     if (error?.code !== "permissionBlocked") return;
     Alert.alert(
-      "Allow microphone access",
-      "Voice input needs microphone access. Open system settings and allow microphone access for Joko.",
+      mobileMessage(locale, "voice.permissionTitle"),
+      mobileMessage(locale, "voice.permissionBody"),
       [
-        { text: "Not now", style: "cancel" },
-        { text: "Open Settings", onPress: () => {
+        { text: mobileMessage(locale, "voice.notNow"), style: "cancel" },
+        { text: mobileMessage(locale, "voice.openSettings"), onPress: () => {
           void Linking.openSettings().catch(() => {
-            Alert.alert("Settings unavailable", "Open your device settings and allow microphone access for Joko.");
+            Alert.alert(mobileMessage(locale, "voice.settingsUnavailableTitle"), mobileMessage(locale, "voice.settingsUnavailableBody"));
           });
         } }
       ]
     );
-  }, [error]);
+  }, [error, locale]);
 }
 
-function MobileVoiceAction({ voice, colors, disabled }: {
+function MobileVoiceAction({ voice, colors, locale, disabled }: {
   voice: MobileVoiceInputBinding;
   colors: Colors;
+  locale: MobileSupportedLocale;
   disabled?: boolean;
 }) {
   const longPressRef = useRef(false);
   const recording = voice.state === "starting" || voice.state === "listening";
   const submitting = voice.state === "submitting";
   const controlDisabled = voice.checking || submitting || !voice.busy && disabled === true;
-  const label = submitting ? "Transcribing…" : recording ? voice.elapsedLabel ?? "0:00" : voice.checking ? "Checking voice…" : "Voice";
+  const label = submitting ? mobileMessage(locale, "voice.transcribing") : recording ? voice.elapsedLabel ?? "0:00"
+    : voice.checking ? mobileMessage(locale, "voice.checking") : mobileMessage(locale, "voice.label");
   return <View style={styles.voiceControls}>
-    <Pressable accessibilityRole="button" accessibilityLabel={recording ? `Stop voice input, recording ${label}` : label}
-      accessibilityHint="Tap to start or stop. Touch and hold to record until release."
+    <Pressable accessibilityRole="button" accessibilityLabel={recording
+      ? mobileMessage(locale, "voice.stopLabel", { duration: label }) : label}
+      accessibilityHint={mobileMessage(locale, "voice.hint")}
       accessibilityState={{ disabled: controlDisabled, busy: voice.busy }} disabled={controlDisabled}
       onPressIn={() => {
         longPressRef.current = false;
@@ -5668,7 +5784,7 @@ function MobileVoiceAction({ voice, colors, disabled }: {
         <Text style={[styles.voiceLabel, { color: recording ? colors.ink : controlDisabled ? colors.muted : "#2b2316" }]}>{label}</Text>
       </>}
     </Pressable>
-    {voice.busy && <Action label="Cancel voice input" colors={colors} compact danger onPress={() => void voice.cancel()} />}
+    {voice.busy && <Action label={mobileMessage(locale, "voice.cancel")} colors={colors} compact danger onPress={() => void voice.cancel()} />}
   </View>;
 }
 
@@ -5730,12 +5846,14 @@ function AutomaticEntryChoice({ checked, disabled, onPress, colors, locale }: {
 function Banner({ text, colors }: { text: string; colors: Colors }) {
   return <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{text}</Text>;
 }
-function Notice({ text, colors, onDismiss }: { text: string; colors: Colors; onDismiss: () => void }) {
+function Notice({ text, colors, locale, onDismiss }: {
+  text: string; colors: Colors; locale: MobileSupportedLocale; onDismiss: () => void;
+}) {
   return <View accessibilityLiveRegion="polite"
     style={[styles.connectionNotice, { backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>
     <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>{text}</Text>
-    <Pressable accessibilityRole="button" accessibilityLabel="Dismiss image output notice" onPress={onDismiss}
-      style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>Dismiss</Text></Pressable>
+    <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "composer.dismissNotice")} onPress={onDismiss}
+      style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "common.dismiss")}</Text></Pressable>
   </View>;
 }
 function Centered({ label, colors }: { label: string; colors: Colors }) {
@@ -5877,21 +5995,21 @@ function sessionState(value: number, locale: MobileSupportedLocale): string {
   ] as const;
   return mobileMessage(locale, key[value] ?? "home.state.unknown");
 }
-function queueState(value: QueueItemState): string {
+function queueState(value: QueueItemState, locale: MobileSupportedLocale): string {
   switch (value) {
-    case QueueItemState.ACCEPTED: return "Queued";
-    case QueueItemState.DISPATCHING: return "Dispatching";
-    case QueueItemState.BACKEND_ACCEPTED: return "Backend accepted";
-    case QueueItemState.DISPATCH_UNKNOWN: return "Delivery unknown";
-    case QueueItemState.COMPLETED: return "Completed";
-    case QueueItemState.CANCELLED: return "Cancelled";
-    case QueueItemState.FAILED: return "Failed";
-    default: return "Unknown";
+    case QueueItemState.ACCEPTED: return mobileMessage(locale, "task.queueState.accepted");
+    case QueueItemState.DISPATCHING: return mobileMessage(locale, "task.queueState.dispatching");
+    case QueueItemState.BACKEND_ACCEPTED: return mobileMessage(locale, "task.queueState.backendAccepted");
+    case QueueItemState.DISPATCH_UNKNOWN: return mobileMessage(locale, "task.queueState.dispatchUnknown");
+    case QueueItemState.COMPLETED: return mobileMessage(locale, "task.queueState.completed");
+    case QueueItemState.CANCELLED: return mobileMessage(locale, "task.queueState.cancelled");
+    case QueueItemState.FAILED: return mobileMessage(locale, "task.queueState.failed");
+    default: return mobileMessage(locale, "task.queueState.unknown");
   }
 }
 
-function queueItemSummary(item: QueueItem): string {
-  return mobileInputSummary(item.input).trim() || "[Queued input]";
+function queueItemSummary(item: QueueItem, locale: MobileSupportedLocale): string {
+  return mobileInputSummary(item.input).trim() || mobileMessage(locale, "task.queueFallback");
 }
 
 const styles = StyleSheet.create({

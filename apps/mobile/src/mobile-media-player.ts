@@ -1,4 +1,6 @@
 import { mobileMediaPreviewKind, type MobileMediaPreviewKind } from "./mobile-media-preview";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import { normalizeMediaType } from "./workspace-files";
 
 export type MobileMediaPlayerCommand = "pause" | "reset";
@@ -44,6 +46,7 @@ export function parseMobileMediaPlayerStatus(data: string, instanceId: string): 
 export function buildMobileMediaPlayerHtml({
   instanceId,
   kind,
+  locale,
   mediaType,
   title,
   uri,
@@ -53,6 +56,7 @@ export function buildMobileMediaPlayerHtml({
 }: {
   readonly instanceId: string;
   readonly kind: MobileMediaPreviewKind;
+  readonly locale: MobileSupportedLocale;
   readonly mediaType: string;
   readonly title: string;
   readonly uri: string;
@@ -65,14 +69,16 @@ export function buildMobileMediaPlayerHtml({
   if (mobileMediaPreviewKind(exactMediaType) !== kind) throw new Error("The media player kind does not match its media type.");
   if (typeof uri !== "string" || !uri.startsWith("file://") || uri.length > 4_096
     || /[\u0000-\u001f\u007f]/u.test(uri)) throw new Error("The media player URI is invalid.");
-  const exactTitle = boundedText(title, 512) || (kind === "video" ? "Video preview" : "Audio preview");
+  const exactTitle = boundedText(title, 512) || mobileMessage(locale,
+    kind === "video" ? "preview.videoTitle" : "preview.audioTitle");
+  const errorLabel = mobileMessage(locale, "preview.mediaError");
   const tag = kind === "video" ? "video" : "audio";
   const videoAttributes = kind === "video" ? " playsinline" : "";
   const safeBackground = cssColor(background);
   const safeSurface = cssColor(surface);
   const safeInk = cssColor(ink);
   return `<!doctype html>
-<html>
+<html lang="${locale}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
@@ -90,6 +96,7 @@ export function buildMobileMediaPlayerHtml({
     (function () {
       'use strict';
       var instanceId = ${JSON.stringify(exactInstanceId)};
+      var errorLabel = ${JSON.stringify(errorLabel)};
       var media = document.querySelector(${JSON.stringify(tag)});
       var lastTimeUpdate = 0;
       function finite(value) { return Number.isFinite(value) && value >= 0 ? value : null; }
@@ -141,8 +148,7 @@ export function buildMobileMediaPlayerHtml({
       media.addEventListener('waiting', function () { emit('waiting', null, true); });
       media.addEventListener('ended', function () { emit('ended', null, true); });
       media.addEventListener('error', function () {
-        var detail = media.error ? String(media.error.code || media.error.message || 'media error') : 'media error';
-        emit('error', detail, true);
+        emit('error', errorLabel, true);
       });
     })();
   </script>

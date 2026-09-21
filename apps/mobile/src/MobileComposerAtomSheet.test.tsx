@@ -63,6 +63,7 @@ describe("MobileComposerAtomSheet", () => {
     container = document.createElement("div");
     root = createRoot(container);
     act(() => root!.render(createElement(MobileComposerAtomSheet, {
+      locale: "en",
       atom: {
         kind: "route-reference",
         routeKind: "session",
@@ -98,6 +99,7 @@ describe("MobileComposerAtomSheet", () => {
     container = document.createElement("div");
     root = createRoot(container);
     act(() => root!.render(createElement(MobileComposerAtomSheet, {
+      locale: "en",
       atom: {
         kind: "route-reference",
         routeKind: "project",
@@ -128,6 +130,7 @@ describe("MobileComposerAtomSheet", () => {
     container = document.createElement("div");
     root = createRoot(container);
     act(() => root!.render(createElement(MobileComposerAtomSheet, {
+      locale: "en",
       atom: {
         kind: "route-reference",
         routeKind: "path",

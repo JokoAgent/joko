@@ -11,6 +11,7 @@ describe("mobile media player protocol and HTML", () => {
     const html = buildMobileMediaPlayerHtml({
       instanceId: "lease-1",
       kind: "video",
+      locale: "en",
       mediaType: "video/mp4",
       title: "Demo <clip>",
       uri: "file:///cache/demo&one.mp4",
@@ -32,6 +33,7 @@ describe("mobile media player protocol and HTML", () => {
     const base = {
       instanceId: "lease-1",
       kind: "audio" as const,
+      locale: "en" as const,
       mediaType: "audio/mpeg",
       title: "Voice",
       background: "#000000",

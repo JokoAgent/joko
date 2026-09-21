@@ -63,7 +63,7 @@ describe("offline mobile model viewer runtime", () => {
       references: [{ uri: "texture.png", path: "texture.png", kind: "image", fileIndex: 1 }]
     };
     const html = buildMobileModelViewerHtml({
-      instanceId: "runtime-1", title: "Runtime model", background: "#ffffff", surface: "#f5f5f5",
+      instanceId: "runtime-1", locale: "en", title: "Runtime model", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, runtimeBundle());
     document.documentElement.innerHTML = html;

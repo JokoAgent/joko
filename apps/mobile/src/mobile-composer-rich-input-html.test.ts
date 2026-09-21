@@ -17,6 +17,12 @@ const theme = {
   textSecondary: "#514c63"
 };
 
+const labels = {
+  selectedCommand: "Selected slash command {command}",
+  structuredItem: "Structured item",
+  taskMessage: "Task message"
+};
+
 describe("mobile composer rich input HTML", () => {
   it("builds a no-network semantic editor with atomic edit and recovery hooks", () => {
     const document: MobileComposerRichDocument = {
@@ -35,6 +41,8 @@ describe("mobile composer rich input HTML", () => {
       commandPaletteOpen: true,
       editable: true,
       instanceId: "instance-1",
+      labels,
+      locale: "en",
       maxHeight: 260,
       placeholder: "Message Joko…",
       selection: { start: 6, end: 6 },
@@ -94,6 +102,8 @@ describe("mobile composer rich input HTML", () => {
       accessibilityLabel: dangerous,
       commandPaletteOpen: false,
       editable: false,
+      labels,
+      locale: "en",
       maxHeight: 144,
       placeholder: dangerous,
       theme
@@ -115,6 +125,8 @@ describe("mobile composer rich input HTML", () => {
       commandPaletteOpen: false,
       editable: true,
       instanceId: "instance-2",
+      labels,
+      locale: "en",
       maxHeight: 132,
       placeholder: "What should Joko do?",
       selection: { start: 0, end: 0 },

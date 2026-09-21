@@ -1,5 +1,6 @@
 import type { MobileComposerSelection } from "./mobile-composer-document";
 import type { MobileComposerRichDocument } from "./mobile-composer-rich-document";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import {
   mobileComposerPastedImageMediaTypes,
   mobileComposerRichProtocolLimits
@@ -21,6 +22,12 @@ export interface MobileComposerRichInputConfig {
   readonly documentId: number;
   readonly editable: boolean;
   readonly instanceId: string;
+  readonly labels: {
+    readonly selectedCommand: string;
+    readonly structuredItem: string;
+    readonly taskMessage: string;
+  };
+  readonly locale: MobileSupportedLocale;
   readonly commandPaletteOpen: boolean;
   readonly maxHeight: number;
   readonly placeholder: string;
@@ -29,7 +36,7 @@ export interface MobileComposerRichInputConfig {
 }
 
 export type MobileComposerRichRuntimeConfig = Pick<MobileComposerRichInputConfig,
-  "accessibilityLabel" | "commandPaletteOpen" | "editable" | "maxHeight" | "placeholder" | "theme">;
+  "accessibilityLabel" | "commandPaletteOpen" | "editable" | "labels" | "locale" | "maxHeight" | "placeholder" | "theme">;
 
 const singleLineHeight = 44;
 
@@ -58,7 +65,7 @@ export function buildMobileComposerRichConfigScript(config: MobileComposerRichRu
 export function buildMobileComposerRichInputHtml(config: MobileComposerRichInputConfig): string {
   const initial = mobileComposerRichJson(config);
   return `<!doctype html>
-<html><head><meta charset="utf-8" />
+<html lang="${config.locale}"><head><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'none'; media-src 'none'; connect-src 'none'; font-src 'none'; frame-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" />
 <style>
@@ -114,8 +121,9 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
   const setConfig = (value) => {
     runtime = Object.assign({}, runtime, value || {});
     applyTheme(runtime.theme || {});
+    document.documentElement.lang = String(runtime.locale || '');
     root.dataset.placeholder = String(runtime.placeholder || '');
-    root.setAttribute('aria-label', String(runtime.accessibilityLabel || 'Task message'));
+    root.setAttribute('aria-label', String(runtime.accessibilityLabel || runtime.labels.taskMessage));
     root.setAttribute('aria-disabled', runtime.editable ? 'false' : 'true');
     root.contentEditable = runtime.editable ? 'true' : 'false';
     const maxHeight = safeInteger(runtime.maxHeight) ? Math.max(${singleLineHeight}, Math.min(4096, runtime.maxHeight)) : 260;
@@ -129,10 +137,10 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
     element.draggable = false;
     element.tabIndex = 0;
     element.setAttribute('role', 'button');
-    element.setAttribute('aria-label', String(node.accessibilityLabel || node.label || 'Structured item'));
+    element.setAttribute('aria-label', String(node.accessibilityLabel || node.label || runtime.labels.structuredItem));
     element.dataset.occurrenceKey = String(node.occurrenceKey || '');
     element.dataset.tokenLength = String(String(node.token || '').length);
-    element.textContent = String(node.label || node.token || 'Structured item');
+    element.textContent = String(node.label || node.token || runtime.labels.structuredItem);
     return element;
   };
   const makeNodes = (node) => {
@@ -145,7 +153,7 @@ html,body{margin:0;padding:0;background:transparent;overflow:hidden}
         mark.className = 'slash-command';
         mark.dataset.slashCommand = text;
         mark.setAttribute('role', 'text');
-        mark.setAttribute('aria-label', 'Selected slash command ' + text);
+        mark.setAttribute('aria-label', String(runtime.labels.selectedCommand).split('{command}').join(text));
         mark.textContent = text;
         return [mark];
       }

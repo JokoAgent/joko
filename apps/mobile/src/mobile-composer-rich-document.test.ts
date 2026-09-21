@@ -42,7 +42,7 @@ function structuredDraft(): MobileComposerDraft {
 
 describe("mobile composer rich document", () => {
   it("projects only editable text and bounded occurrence presentation", () => {
-    const rich = mobileComposerRichDocument(structuredDraft());
+    const rich = mobileComposerRichDocument(structuredDraft(), "en");
     expect(rich.version).toBe(1);
     expect(rich.nodes).toEqual([
       { type: "occurrence", occurrenceKey: "mention:mention-1", kind: "session", token: "@Source task",
@@ -149,7 +149,7 @@ describe("mobile composer rich document", () => {
       7,
       "/review"
     );
-    expect(mobileComposerRichDocument(selected).nodes).toEqual([
+    expect(mobileComposerRichDocument(selected, "en").nodes).toEqual([
       { type: "text", text: "Before " },
       { type: "text", text: "/review", slashCommand: "/review" },
       { type: "text", text: " after" }
@@ -181,7 +181,7 @@ describe("mobile composer rich document", () => {
       segmentMobileComposerRoutePaste("Open #/tasks/session-one now")!,
       () => "route-1"
     );
-    expect(mobileComposerRichDocument(inserted.draft).nodes).toEqual([
+    expect(mobileComposerRichDocument(inserted.draft, "en").nodes).toEqual([
       { type: "text", text: "Open " },
       {
         type: "occurrence",
@@ -213,7 +213,7 @@ describe("mobile composer rich document", () => {
       segmentMobileComposerRoutePaste("#/projects/project-one")!,
       () => "project-route"
     );
-    expect(mobileComposerRichDocument(inserted.draft).nodes).toEqual([{
+    expect(mobileComposerRichDocument(inserted.draft, "en").nodes).toEqual([{
       type: "occurrence",
       occurrenceKey: "atom:project-route",
       kind: "route-reference",
@@ -240,7 +240,7 @@ describe("mobile composer rich document", () => {
         }]
       } }
     );
-    expect(mobileComposerRichDocument(inserted.draft).nodes).toEqual([
+    expect(mobileComposerRichDocument(inserted.draft, "en").nodes).toEqual([
       { type: "text", text: "Open " },
       {
         type: "occurrence",

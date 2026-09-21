@@ -101,6 +101,7 @@ function render(overrides: Partial<Parameters<typeof MobileRuntimeCommandPalette
   container = document.createElement("div");
   root = createRoot(container);
   act(() => root!.render(createElement(MobileRuntimeCommandPalette, {
+    locale: "en",
     visible: true,
     query: "re",
     items,

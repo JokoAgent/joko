@@ -14,6 +14,8 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import type {
   MobileNativeTreeControls,
   MobileNativeTreeRow,
@@ -27,6 +29,7 @@ export function MobileNativeTreeSheet({
   controls,
   busy,
   colors,
+  locale,
   onClose,
   onLoad,
   onNavigate,
@@ -36,6 +39,7 @@ export function MobileNativeTreeSheet({
   readonly controls?: MobileNativeTreeControls;
   readonly busy: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onLoad: (authorityKey: string) => Promise<MobileNativeTreeSnapshot>;
   readonly onNavigate: (
@@ -102,7 +106,7 @@ export function MobileNativeTreeSheet({
     }).catch((error) => {
       if (!mountedRef.current || !visibleRef.current || requestRef.current !== request
         || authorityRef.current !== authorityKey || surfaceOwnerRef.current !== surfaceOwnerKey) return;
-      setLoadError(errorText(error));
+      setLoadError(errorText(error, locale));
     }).finally(() => {
       if (mountedRef.current && requestRef.current === request) setLoading(false);
     });
@@ -124,7 +128,7 @@ export function MobileNativeTreeSheet({
     }).catch((error) => {
       if (!mountedRef.current || !visibleRef.current || requestRef.current !== request
         || authorityRef.current !== authorityKey || surfaceOwnerRef.current !== surfaceOwnerKey) return;
-      setLoadError(errorText(error));
+      setLoadError(errorText(error, locale));
     }).finally(() => {
       if (mountedRef.current && requestRef.current === request) setLoading(false);
     });
@@ -149,14 +153,11 @@ export function MobileNativeTreeSheet({
         customInstructions
       );
       if (!mountedRef.current || !visibleRef.current || surfaceOwnerRef.current !== surfaceOwnerKey) return;
-      setFeedback(outcome === "navigated"
-        ? "Branch changed. The current task has been refreshed."
-        : outcome === "rejected"
-          ? "The Backend rejected this branch change. The displayed tree was kept."
-          : "The branch result is not yet confirmed. Check operation status before retrying.");
+      setFeedback(mobileMessage(locale, outcome === "navigated" ? "branches.changed"
+        : outcome === "rejected" ? "branches.rejected" : "branches.unknown"));
     } catch (error) {
       if (mountedRef.current && visibleRef.current && surfaceOwnerRef.current === surfaceOwnerKey) {
-        onError(errorText(error));
+        onError(errorText(error, locale));
       }
     } finally {
       if (mountedRef.current) setNavigatingId(undefined);
@@ -170,7 +171,7 @@ export function MobileNativeTreeSheet({
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={close}>
     <MobileKeyboardAvoidingView keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined} style={styles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close task branches"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "branches.close")}
         disabled={navigating} onPress={close} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -179,53 +180,53 @@ export function MobileNativeTreeSheet({
             <Text style={[styles.eyebrow, { color: colors.muted }]} numberOfLines={1}>
               {controls.backend.displayName || controls.backend.backendId}
             </Text>
-            <Text style={[styles.title, { color: colors.ink }]}>Branches</Text>
+            <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "branches.title")}</Text>
           </View>
-          <IconButton label="Refresh task branches" text="↻" disabled={loading || disabled}
+          <IconButton label={mobileMessage(locale, "branches.refresh")} text="↻" disabled={loading || disabled}
             colors={colors} onPress={load} />
-          <IconButton label="Close task branches" text="×" disabled={navigating}
+          <IconButton label={mobileMessage(locale, "branches.close")} text="×" disabled={navigating}
             colors={colors} onPress={close} />
         </View>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           <View style={[styles.notice, { borderColor: colors.border, backgroundColor: colors.background }]}>
-            <Text style={[styles.noticeTitle, { color: colors.ink }]}>Changes native conversation context</Text>
-            <Text style={[styles.body, { color: colors.muted }]}>Choosing an earlier entry changes the active Backend branch. Joko messages and workspace files are not rewound or deleted.</Text>
+            <Text style={[styles.noticeTitle, { color: colors.ink }]}>{mobileMessage(locale, "branches.warningTitle")}</Text>
+            <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "branches.warningBody")}</Text>
           </View>
 
           <View style={[styles.summaryCard, { borderColor: colors.border }]}>
             <View style={styles.settingRow}>
               <View style={styles.flex}>
-                <Text style={[styles.rowLabel, { color: colors.ink }]}>Summarize abandoned context</Text>
-                <Text style={[styles.caption, { color: colors.muted }]}>Off by default. Enable only when you want the Backend to carry a summary into the selected branch.</Text>
+                <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "branches.summarize")}</Text>
+                <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "branches.summarizeDescription")}</Text>
               </View>
-              <Switch accessibilityLabel="Summarize abandoned branch context"
+              <Switch accessibilityLabel={mobileMessage(locale, "branches.summarizeLabel")}
                 accessibilityState={{ disabled }} disabled={disabled}
                 value={summarize} onValueChange={setSummarize}
                 trackColor={{ false: colors.border, true: colors.accent }} />
             </View>
-            {summarize && <TextInput accessibilityLabel="Branch summary focus" multiline maxLength={4000}
+            {summarize && <TextInput accessibilityLabel={mobileMessage(locale, "branches.focusLabel")} multiline maxLength={4000}
               editable={!disabled} value={customInstructions} onChangeText={setCustomInstructions}
-              placeholder="Optional focus for the summary" placeholderTextColor={colors.muted}
+              placeholder={mobileMessage(locale, "branches.focusPlaceholder")} placeholderTextColor={colors.muted}
               style={[styles.instructions, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.background }]} />}
           </View>
 
           {controls.navigationUnavailableReason && <Text accessibilityRole="alert"
             style={[styles.warning, { color: colors.muted }]}>{controls.navigationUnavailableReason}</Text>}
           {feedback && <Text accessibilityRole="alert" style={[styles.feedback, { color: colors.accent }]}>{feedback}</Text>}
-          {loadError && <Pressable accessibilityRole="button" accessibilityLabel="Retry loading task branches"
+          {loadError && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "branches.retry")}
             disabled={loading || disabled} onPress={load}
             style={[styles.errorCard, { borderColor: colors.negative, backgroundColor: colors.background }]}>
             <Text style={[styles.body, { color: colors.negative }]}>{loadError}</Text>
-            <Text style={[styles.retry, { color: colors.accent }]}>Retry</Text>
+            <Text style={[styles.retry, { color: colors.accent }]}>{mobileMessage(locale, "common.retry")}</Text>
           </Pressable>}
-          {loading && <View accessibilityLabel="Loading task branches" style={styles.loading}>
+          {loading && <View accessibilityLabel={mobileMessage(locale, "branches.loading")} style={styles.loading}>
             <ActivityIndicator color={colors.muted} />
           </View>}
-          {!loading && !loadError && tree?.rows.length === 0 && <Text style={[styles.empty, { color: colors.muted }]}>No native branch entries are available.</Text>}
+          {!loading && !loadError && tree?.rows.length === 0 && <Text style={[styles.empty, { color: colors.muted }]}>{mobileMessage(locale, "branches.empty")}</Text>}
           {!loading && tree && tree.rows.length > 0 && <View style={styles.tree}>
             {tree.rows.map((row) => <TreeRow key={row.entryId} row={row}
               disabled={disabled || !controls.canNavigate} navigating={navigatingId === row.entryId}
-              colors={colors} onPress={() => void navigate(row)} />)}
+              colors={colors} locale={locale} onPress={() => void navigate(row)} />)}
           </View>}
         </ScrollView>
       </SafeAreaView>
@@ -233,17 +234,18 @@ export function MobileNativeTreeSheet({
   </Modal>;
 }
 
-function TreeRow({ row, disabled, navigating, colors, onPress }: {
+function TreeRow({ row, disabled, navigating, colors, locale, onPress }: {
   readonly row: MobileNativeTreeRow;
   readonly disabled: boolean;
   readonly navigating: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onPress: () => void;
 }) {
-  const label = `${roleLabel(row)}${row.active ? " · Current" : ""}`;
+  const label = `${roleLabel(row, locale)}${row.active ? mobileMessage(locale, "branches.currentSuffix") : ""}`;
   const indent = 12 + Math.min(row.branchDepth, 8) * 14;
   return <Pressable accessibilityRole="button" accessibilityLabel={`${label}. ${row.label}`}
-    accessibilityHint={row.active ? "This is the current native entry" : "Change the active Backend branch to this entry"}
+    accessibilityHint={mobileMessage(locale, row.active ? "branches.currentHint" : "branches.changeHint")}
     accessibilityState={{ disabled: disabled || row.active, selected: row.active }}
     disabled={disabled || row.active} onPress={onPress}
     style={({ pressed }) => [styles.node, { paddingLeft: indent, borderColor: row.activePath ? colors.accent : colors.border,
@@ -258,19 +260,19 @@ function TreeRow({ row, disabled, navigating, colors, onPress }: {
     <View style={styles.flex}>
       <Text style={[styles.nodeMeta, { color: colors.muted }]} numberOfLines={1}>{label}</Text>
       <Text style={[styles.nodeLabel, { color: colors.ink }]} numberOfLines={3}>{row.label}</Text>
-      {row.createdAtMs !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>{new Date(row.createdAtMs).toLocaleString()}</Text>}
+      {row.createdAtMs !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>{new Date(row.createdAtMs).toLocaleString(locale)}</Text>}
     </View>
   </Pressable>;
 }
 
-function roleLabel(row: MobileNativeTreeRow): string {
-  if (row.role === "user") return "User";
-  if (row.role === "assistant") return "Assistant";
-  if (row.role === "tool") return "Tool result";
-  if (row.kind === "model") return "Model change";
-  if (row.kind === "compaction") return "Compaction";
-  if (row.kind === "summary") return "Branch summary";
-  return "Native entry";
+function roleLabel(row: MobileNativeTreeRow, locale: MobileSupportedLocale): string {
+  if (row.role === "user") return mobileMessage(locale, "common.user");
+  if (row.role === "assistant") return mobileMessage(locale, "common.assistant");
+  if (row.role === "tool") return mobileMessage(locale, "branches.role.tool");
+  if (row.kind === "model") return mobileMessage(locale, "branches.role.model");
+  if (row.kind === "compaction") return mobileMessage(locale, "common.compaction");
+  if (row.kind === "summary") return mobileMessage(locale, "branches.role.summary");
+  return mobileMessage(locale, "branches.role.entry");
 }
 
 function IconButton({ label, text, disabled, colors, onPress }: {
@@ -286,8 +288,8 @@ function IconButton({ label, text, disabled, colors, onPress }: {
   </Pressable>;
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : "Task branches could not be loaded.";
+function errorText(error: unknown, locale: MobileSupportedLocale): string {
+  return error instanceof Error ? error.message : mobileMessage(locale, "branches.error");
 }
 
 const styles = StyleSheet.create({

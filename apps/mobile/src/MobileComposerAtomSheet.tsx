@@ -2,15 +2,18 @@ import { useEffect, useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
-  mobileComposerAtomLabel,
   mobileLongPasteMaximumCharacters,
   type MobileComposerAtom
 } from "./mobile-composer-document";
+import { mobileComposerRichAtomLabel } from "./mobile-composer-rich-document";
 
 export function MobileComposerAtomSheet({
   atom,
   colors,
+  locale,
   busy,
   onClose,
   onSavePaste,
@@ -18,6 +21,7 @@ export function MobileComposerAtomSheet({
 }: {
   readonly atom?: MobileComposerAtom;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly busy: boolean;
   readonly onClose: () => void;
   readonly onSavePaste: (atomId: string, text: string) => void;
@@ -31,57 +35,73 @@ export function MobileComposerAtomSheet({
 
   return <Modal visible transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
     <View style={styles.root}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close structured message item"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "atom.close")}
         disabled={busy} onPress={onClose} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal importantForAccessibility="yes" edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.header}>
           <View style={styles.headerText}>
-            <Text style={[styles.eyebrow, { color: colors.muted }]}>Structured message item</Text>
-            <Text style={[styles.title, { color: colors.ink }]}>{mobileComposerAtomLabel(atom)}</Text>
+            <Text style={[styles.eyebrow, { color: colors.muted }]}>{mobileMessage(locale, "atom.title")}</Text>
+            <Text style={[styles.title, { color: colors.ink }]}>{mobileComposerRichAtomLabel(atom, locale)}</Text>
           </View>
-          <Pressable accessibilityRole="button" accessibilityLabel="Close structured message item"
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "atom.close")}
             disabled={busy} onPress={onClose} style={styles.close}>
             <Text style={[styles.closeText, { color: colors.ink }]}>×</Text>
           </Pressable>
         </View>
-        {atom.kind === "quote" && <Text style={[styles.help, { color: colors.muted }]}>Quoted from the exact assistant message in task {atom.sourceSessionId}.</Text>}
+        {atom.kind === "quote" && <Text style={[styles.help, { color: colors.muted }]}>{mobileMessage(locale, "atom.quoteSource", { task: atom.sourceSessionId })}</Text>}
         {atom.kind === "route-reference" && <Text style={[styles.help, { color: colors.muted }]}>
           {atom.routeKind === "path"
-            ? `Workspace ${atom.directory ? "directory" : "file"} · ${atom.relativePath}.`
+            ? mobileMessage(locale, "atom.workspace", {
+              kind: mobileMessage(locale, atom.directory ? "composer.kind.directory" : "composer.kind.file"),
+              path: atom.relativePath ?? ""
+            })
             : atom.routeKind === "project"
-            ? `Project link · project ${atom.projectId}.`
-            : `${atom.messageId || atom.eventId ? "Message link" : "Task link"} · task ${atom.sessionId}.`} This item does not grant access or navigate automatically.
+            ? mobileMessage(locale, "atom.projectLink", { project: atom.projectId })
+            : mobileMessage(locale, "atom.taskLink", {
+              kind: mobileMessage(locale, atom.messageId || atom.eventId ? "atom.messageLink" : "atom.taskLinkKind"),
+              task: atom.sessionId
+            })} {mobileMessage(locale, "atom.noNavigation")}
         </Text>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           {atom.kind === "quote"
-            ? <Text selectable accessibilityLabel="Quoted assistant text"
+            ? <Text selectable accessibilityLabel={mobileMessage(locale, "atom.quotedText")}
                 style={[styles.readText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>{atom.text}</Text>
             : atom.kind === "pasted-text"
-              ? <TextInput accessibilityLabel="Pasted text" multiline value={pasteText} editable={!busy}
+              ? <TextInput accessibilityLabel={mobileMessage(locale, "atom.pastedText")} multiline value={pasteText} editable={!busy}
                 maxLength={mobileLongPasteMaximumCharacters} onChangeText={setPasteText}
                 style={[styles.input, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
-              : <View accessibilityLabel={`${atom.routeKind === "project" ? "Project link" : atom.routeKind === "path" ? "Workspace path" : "Task link"} details`}
+              : <View accessibilityLabel={mobileMessage(locale, "atom.details", { kind: mobileMessage(locale,
+                    atom.routeKind === "project" ? "composer.atoms.projectLink"
+                      : atom.routeKind === "path" ? "composer.atoms.workspacePath" : "composer.atoms.taskLink") })}
                   style={[styles.readText, { backgroundColor: colors.background, borderColor: colors.border }]}>
-                  <Text selectable accessibilityLabel={`${atom.routeKind === "project" ? "Project link" : atom.routeKind === "path" ? "Workspace path" : "Task link"} label`}
+                  <Text selectable accessibilityLabel={mobileMessage(locale, "atom.label", { kind: mobileMessage(locale,
+                      atom.routeKind === "project" ? "composer.atoms.projectLink"
+                        : atom.routeKind === "path" ? "composer.atoms.workspacePath" : "composer.atoms.taskLink") })}
                     style={[styles.routeLabel, { color: colors.ink }]}>{atom.displayText}</Text>
-                  <Text selectable accessibilityLabel={`${atom.routeKind === "path" ? "Workspace path wire text" : `${atom.routeKind === "project" ? "Project" : "Task"} link address`}`}
+                  <Text selectable accessibilityLabel={atom.routeKind === "path" ? mobileMessage(locale, "atom.workspaceWire")
+                    : mobileMessage(locale, "atom.linkAddress", { kind: mobileMessage(locale,
+                      atom.routeKind === "project" ? "newTask.project" : "preview.taskTitle") })}
                     style={[styles.routeHref, { color: colors.muted }]}>{atom.routeKind === "path" ? atom.serialized : atom.href}</Text>
                 </View>}
         </ScrollView>
         {atom.kind === "pasted-text" && <Text accessibilityLiveRegion="polite"
-          style={[styles.count, { color: colors.muted }]}>{pasteText.length.toLocaleString("en-US")} characters</Text>}
+          style={[styles.count, { color: colors.muted }]}>{mobileMessage(locale, "atom.characters", {
+            count: pasteText.length.toLocaleString(locale)
+          })}</Text>}
         <View style={styles.actions}>
-          <Pressable accessibilityRole="button" accessibilityLabel={`Remove ${mobileComposerAtomLabel(atom)}`}
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "atom.remove", {
+            label: mobileComposerRichAtomLabel(atom, locale)
+          })}
             disabled={busy} onPress={() => onRemove(atom.atomId)}
             style={[styles.button, { borderColor: colors.negative }, busy && styles.disabled]}>
-            <Text style={[styles.buttonText, { color: colors.negative }]}>Remove</Text>
+            <Text style={[styles.buttonText, { color: colors.negative }]}>{mobileMessage(locale, "common.remove")}</Text>
           </Pressable>
-          {atom.kind === "pasted-text" && <Pressable accessibilityRole="button" accessibilityLabel="Save pasted text changes"
+          {atom.kind === "pasted-text" && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "atom.savePaste")}
             accessibilityState={{ disabled: !canSave }} disabled={!canSave}
             onPress={() => onSavePaste(atom.atomId, pasteText)}
             style={[styles.button, { backgroundColor: colors.accent, borderColor: colors.accent }, !canSave && styles.disabled]}>
-            <Text style={[styles.buttonText, { color: colors.surface }]}>Save</Text>
+            <Text style={[styles.buttonText, { color: colors.surface }]}>{mobileMessage(locale, "common.save")}</Text>
           </Pressable>}
         </View>
       </SafeAreaView>

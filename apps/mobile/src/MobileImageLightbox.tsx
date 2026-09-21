@@ -57,6 +57,8 @@ import { useMobileAnnotationBurn } from "./use-mobile-annotation-burn";
 import type { MobileImageGalleryNativeDecode, MobileImageGalleryPageSession } from "./mobile-image-gallery";
 import type { MobileImageOutputAction, MobileImageOutputRenderedImage } from "./mobile-image-output";
 import { mobileImageOutputMediaType } from "./mobile-image-output-format";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
 
 interface MobileImageLightboxGalleryControls {
@@ -72,6 +74,7 @@ const PreviewImage = ExpoImage as unknown as ComponentType<ExpoImageProps>;
 
 interface MobileImageLightboxProps {
   readonly session: MobileComposerImageEditorSession;
+  readonly locale: MobileSupportedLocale;
   readonly gallery?: MobileImageLightboxGalleryControls;
   readonly onClose: () => void;
   readonly onSave: (
@@ -103,6 +106,7 @@ const emptySize: MobileImageSize = { width: 0, height: 0 };
 
 export function MobileImageLightbox({
   session,
+  locale,
   gallery,
   onClose,
   onSave,
@@ -244,7 +248,7 @@ export function MobileImageLightbox({
         const existingPoints = strokePointCount(strokesRef.current);
         if (!point || strokesRef.current.length >= MOBILE_ANNOTATION_MAX_STROKES
           || existingPoints >= MOBILE_ANNOTATION_MAX_POINTS) {
-          if (point) setError("This annotation has reached its drawing limit.");
+          if (point) setError(mobileMessage(locale, "image.annotationLimit"));
           gestureRef.current = { ...base, mode: "idle" };
           return;
         }
@@ -303,7 +307,7 @@ export function MobileImageLightbox({
         const draft = draftStrokeRef.current;
         if (!normalized || !draft || !shouldAppendMobileAnnotationPoint(draft, normalized)) return;
         if (strokePointCount(strokesRef.current) + draft.points.length >= MOBILE_ANNOTATION_MAX_POINTS) {
-          setError("This annotation has reached its drawing limit.");
+          setError(mobileMessage(locale, "image.annotationLimit"));
           return;
         }
         const next = { points: [...draft.points, normalized] };
@@ -391,7 +395,7 @@ export function MobileImageLightbox({
       setDraftStroke(undefined);
       lastTapRef.current = undefined;
     }
-  }), [session.annotatable, session.initialStrokes]);
+  }), [locale, session.annotatable, session.initialStrokes]);
 
   const displayed = mobileContainedImageSize(container, natural);
   const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
@@ -472,7 +476,7 @@ export function MobileImageLightbox({
       close();
     } catch (failure) {
       if (!controller.signal.aborted) {
-        setError(failure instanceof Error ? failure.message : "The gallery image could not be added.");
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.galleryAddError"));
       }
     } finally {
       if (saveControllerRef.current === controller) {
@@ -513,7 +517,7 @@ export function MobileImageLightbox({
       close();
     } catch (failure) {
       if (!controller.signal.aborted) {
-        setError(failure instanceof Error ? failure.message : "The annotated image could not be saved.");
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.annotationSaveError"));
       }
     } finally {
       if (saveControllerRef.current === controller) {
@@ -559,10 +563,10 @@ export function MobileImageLightbox({
       }
       const message = await onOutputAction(action, exactDecoded, rendered, controller.signal);
       controller.signal.throwIfAborted();
-      setNotice(message || imageOutputSuccessMessage(action));
+      setNotice(message || imageOutputSuccessMessage(action, locale));
     } catch (failure) {
       if (!controller.signal.aborted) {
-        setError(failure instanceof Error ? failure.message : "The image output action could not be completed.");
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.outputError"));
       }
     } finally {
       if (invokesNativeUi && nativeActivityRef.current) {
@@ -582,15 +586,20 @@ export function MobileImageLightbox({
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
     <SafeAreaView style={styles.root} edges={["top", "right", "bottom", "left"]}>
       <View style={styles.header}>
-        <ToolButton label="Close" onPress={close} disabled={false} />
+        <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
         <View style={styles.heading}>
           <Text numberOfLines={1} style={styles.fileName}>{session.fileName}</Text>
           <Text style={styles.meta}>{gallery
-            ? `${gallery.session.sourceLabel} · ${gallery.session.pageIndex + 1} of ${gallery.session.pageCount} · ${transform.scale.toFixed(1)}×`
-            : `${transform.scale.toFixed(1)}× · pinch or double-tap to zoom`}</Text>
+            ? mobileMessage(locale, "image.galleryMeta", {
+              source: gallery.session.sourceLabel,
+              index: gallery.session.pageIndex + 1,
+              count: gallery.session.pageCount,
+              scale: transform.scale.toFixed(1)
+            })
+            : mobileMessage(locale, "image.zoomMeta", { scale: transform.scale.toFixed(1) })}</Text>
         </View>
       </View>
-      <View accessibilityRole="image" accessibilityLabel={`Image preview ${session.fileName}`}
+      <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: session.fileName })}
         style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
         {displayed.width > 0 && displayed.height > 0 && <View pointerEvents="none" style={[
           styles.imagePosition,
@@ -607,12 +616,12 @@ export function MobileImageLightbox({
                 const { width, height, mediaType, isAnimated } = event.source;
                 try {
                   if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
-                    throw new Error("The image decoder returned invalid dimensions.");
+                    throw new Error(mobileMessage(locale, "image.decoderDimensions"));
                   }
                   if (gallery) {
                     if (width !== gallery.session.expectedWidthPixels || height !== gallery.session.expectedHeightPixels
                       || isAnimated === true) {
-                      throw new Error("The decoded image does not match its canonical gallery metadata.");
+                      throw new Error(mobileMessage(locale, "image.galleryMetadata"));
                     }
                     gallery.onDecoded({ width, height, mediaType, isAnimated });
                   }
@@ -626,13 +635,13 @@ export function MobileImageLightbox({
                 } catch (failure) {
                   decodedRef.current = undefined;
                   setDecoded(undefined);
-                  setError(failure instanceof Error ? failure.message : "The image preview could not be verified.");
+                  setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.verifyError"));
                 }
               }}
               onError={() => {
                 decodedRef.current = undefined;
                 setDecoded(undefined);
-                setError("The image preview could not be displayed.");
+                setError(mobileMessage(locale, "image.displayError"));
               }} />
             {natural.width > 0 && natural.height > 0 && paths.length > 0 && <View
               pointerEvents="none" style={styles.annotation}>
@@ -647,36 +656,36 @@ export function MobileImageLightbox({
       {visibleError !== "" && <Text accessibilityRole="alert" style={styles.error}>{visibleError}</Text>}
       {notice !== "" && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
       <View style={styles.toolbar}>
-        {gallery && <ToolButton label="Previous image" onPress={() => navigate(gallery.session.pageIndex - 1)}
+        {gallery && <ToolButton label={mobileMessage(locale, "image.previous")} onPress={() => navigate(gallery.session.pageIndex - 1)}
           disabled={interactionBusy || gallery.session.pageIndex === 0} />}
         {gallery && <Text accessibilityLiveRegion="polite" style={styles.pageCount}>
           {gallery.session.pageIndex + 1} / {gallery.session.pageCount}
         </Text>}
-        {gallery && <ToolButton label="Next image" onPress={() => navigate(gallery.session.pageIndex + 1)}
+        {gallery && <ToolButton label={mobileMessage(locale, "image.next")} onPress={() => navigate(gallery.session.pageIndex + 1)}
           disabled={interactionBusy || gallery.session.pageIndex + 1 >= gallery.session.pageCount} />}
-        {onOutputAction && <ToolButton label={outputAction === "copy" ? "Copying…" : "Copy image"}
+        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
           onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
-        {onOutputAction && <ToolButton label={outputAction === "save" ? "Saving image…" : "Save image"}
+        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
           onPress={() => void output("save")} disabled={interactionBusy || !outputReady} />}
-        {onOutputAction && <ToolButton label={outputAction === "share" ? "Sharing…" : "Share image"}
+        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "share" ? "image.sharing" : "image.share")}
           onPress={() => void output("share")} disabled={interactionBusy || !outputReady} />}
-        <ToolButton label="Zoom out" onPress={() => zoom(-0.5)}
+        <ToolButton label={mobileMessage(locale, "image.zoomOut")} onPress={() => zoom(-0.5)}
           disabled={interactionBusy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />
-        <ToolButton label="Zoom in" onPress={() => zoom(0.5)}
+        <ToolButton label={mobileMessage(locale, "image.zoomIn")} onPress={() => zoom(0.5)}
           disabled={interactionBusy || transform.scale >= MOBILE_LIGHTBOX_MAX_SCALE} />
-        <ToolButton label="Reset" onPress={resetTransform}
+        <ToolButton label={mobileMessage(locale, "image.reset")} onPress={resetTransform}
           disabled={interactionBusy || transform.scale === 1 && transform.translateX === 0 && transform.translateY === 0} />
-        {gallery && gallery.session.addable && <ToolButton label={busy ? "Adding…" : "Add original"}
+        {gallery && gallery.session.addable && <ToolButton label={mobileMessage(locale, busy ? "image.adding" : "image.addOriginal")}
           onPress={() => void addOriginal()} disabled={interactionBusy || !drawingReady} emphasized />}
-        {session.annotatable && <ToolButton label="Annotate" selected={annotating}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, "image.annotate")} selected={annotating}
           onPress={() => { setAnnotating((value) => !value); setError(""); }} disabled={interactionBusy || !drawingReady} />}
-        {session.annotatable && <ToolButton label="Undo" onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
-        {session.annotatable && <ToolButton label="Discard" onPress={discard} disabled={interactionBusy || !dirty} />}
-        {session.annotatable && <ToolButton label={busy ? "Saving…" : gallery ? "Add marked" : "Save"}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, "image.undo")} onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, "common.discard")} onPress={discard} disabled={interactionBusy || !dirty} />}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, busy ? "common.saving" : gallery ? "image.addMarked" : "common.save")}
           onPress={() => void save()} disabled={interactionBusy || !dirty || !drawingReady} emphasized />}
       </View>
       {annotating && <Text accessibilityLiveRegion="polite" style={styles.hint}>
-        Draw with one finger. Use two fingers to move and zoom.
+        {mobileMessage(locale, "image.drawHint")}
       </Text>}
       {host}
     </SafeAreaView>
@@ -727,10 +736,9 @@ function strokePointCount(strokes: readonly MobileImageAnnotationStroke[]): numb
   return strokes.reduce((count, stroke) => count + stroke.points.length, 0);
 }
 
-function imageOutputSuccessMessage(action: MobileImageOutputAction): string {
-  return action === "copy" ? "Image copied to the system clipboard."
-    : action === "save" ? "Image saved to the photo library."
-      : "System image sharing completed.";
+function imageOutputSuccessMessage(action: MobileImageOutputAction, locale: MobileSupportedLocale): string {
+  return mobileMessage(locale, action === "copy" ? "image.copied"
+    : action === "save" ? "image.saved" : "image.shared");
 }
 
 function cloneStrokes(strokes: readonly MobileImageAnnotationStroke[]): MobileImageAnnotationStroke[] {

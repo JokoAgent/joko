@@ -9,6 +9,8 @@ import {
 } from "react";
 import { AppState, View, type StyleProp, type ViewStyle } from "react-native";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import pdfJsRuntime from "./pdfjs-runtime.pdfjs";
 import { MobilePdfTransferSession, type MobilePdfChunkFileDriver } from "./mobile-pdf-transfer";
 import {
@@ -38,6 +40,7 @@ export function MobilePdfViewer({
   fileName,
   ink,
   instanceId,
+  locale,
   muted,
   onStatusChange,
   readerDriver,
@@ -54,6 +57,7 @@ export function MobilePdfViewer({
   readonly fileName: string;
   readonly ink: string;
   readonly instanceId: string;
+  readonly locale: MobileSupportedLocale;
   readonly muted: string;
   readonly onStatusChange?: (status: MobilePdfViewerStatus) => void;
   readonly readerDriver?: MobilePdfChunkFileDriver;
@@ -73,15 +77,15 @@ export function MobilePdfViewer({
   statusRef.current = onStatusChange;
 
   const html = useMemo(() => buildMobilePdfViewerHtml({
-    instanceId, title, background, surface, ink, muted, accent, border
-  }, pdfJsRuntime), [accent, background, border, ink, instanceId, muted, surface, title]);
+    instanceId, locale, title, background, surface, ink, muted, accent, border
+  }, pdfJsRuntime), [accent, background, border, ink, instanceId, locale, muted, surface, title]);
 
-  const emitFailure = useCallback((error: unknown) => {
-    const text = String(error instanceof Error ? error.message : error || "PDF preview failed")
-      .replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 512) || "PDF preview failed";
+  const emitFailure = useCallback((_error: unknown, message = mobileMessage(locale, "preview.pdfError")) => {
+    const text = message.replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 512)
+      || mobileMessage(locale, "preview.pdfError");
     statusRef.current?.({ type: "joko-pdf-viewer/status", instanceId, state: "error",
       pageCount: 0, renderedPages: 0, zoomPercent: 100, error: text });
-  }, [instanceId]);
+  }, [instanceId, locale]);
 
   const stopViewer = useCallback(() => {
     const transfer = transferRef.current;
@@ -126,10 +130,10 @@ export function MobilePdfViewer({
       }
       const recovery = lifecycleRef.current.consumeReloadOnActive();
       if (recovery === "reload") setReloadGeneration((value) => value + 1);
-      else if (recovery === "failed") emitFailure("The PDF preview process stopped repeatedly. Close the preview and try again.");
+      else if (recovery === "failed") emitFailure(undefined, mobileMessage(locale, "preview.pdfFailure"));
     });
     return () => subscription.remove();
-  }, [emitFailure, stopViewer]);
+  }, [emitFailure, locale, stopViewer]);
 
   useEffect(() => {
     lifecycleRef.current.reset();
@@ -166,15 +170,15 @@ export function MobilePdfViewer({
     stopViewer();
     const recovery = lifecycleRef.current.onProcessLost(activeRef.current);
     if (recovery === "reload") setReloadGeneration((value) => value + 1);
-    else if (recovery === "failed") emitFailure("The PDF preview process stopped repeatedly. Close the preview and try again.");
+    else if (recovery === "failed") emitFailure(undefined, mobileMessage(locale, "preview.pdfFailure"));
     return true;
-  }, [emitFailure, stopViewer]);
+  }, [emitFailure, locale, stopViewer]);
 
   return <View style={style}>
     <PdfWebView
-      key={`${instanceId}:${reloadGeneration}`}
+      key={`${instanceId}:${locale}:${reloadGeneration}`}
       ref={(handle) => { if (handle) webViewRef.current = handle; }}
-      accessibilityLabel={`PDF viewer for ${title}`}
+      accessibilityLabel={mobileMessage(locale, "preview.pdfLabel", { title })}
       allowFileAccess={false}
       allowFileAccessFromFileURLs={false}
       allowUniversalAccessFromFileURLs={false}

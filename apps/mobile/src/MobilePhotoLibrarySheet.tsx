@@ -11,6 +11,8 @@ import {
 } from "react-native";
 import { Image as ExpoImage, type ImageProps as ExpoImageProps } from "expo-image";
 import { SafeAreaView } from "react-native-safe-area-context";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   type MobilePhotoLibrary,
   type MobilePhotoLibraryAsset,
@@ -36,6 +38,7 @@ export function MobilePhotoLibrarySheet({
   ownerKey,
   maximumSelection,
   colors,
+  locale,
   library,
   onAdd,
   onClose
@@ -44,6 +47,7 @@ export function MobilePhotoLibrarySheet({
   ownerKey?: string;
   maximumSelection: number;
   colors: PhotoLibraryColors;
+  locale: MobileSupportedLocale;
   library: MobilePhotoLibrary;
   onAdd: (assets: readonly MobilePhotoLibraryAsset[]) => Promise<void>;
   onClose: () => void;
@@ -77,7 +81,7 @@ export function MobilePhotoLibrarySheet({
         setSelected([]);
       }
     } catch (failure) {
-      if (generation === loadGenerationRef.current) setError(errorText(failure));
+      if (generation === loadGenerationRef.current) setError(errorText(failure, locale));
     } finally {
       if (generation === loadGenerationRef.current) setLoading(false);
     }
@@ -105,7 +109,7 @@ export function MobilePhotoLibrarySheet({
       const existing = current.findIndex((candidate) => candidate.id === asset.id);
       if (existing >= 0) return current.filter((_, index) => index !== existing);
       if (current.length >= maximumSelection) {
-        setError(`Select no more than ${maximumSelection} photo${maximumSelection === 1 ? "" : "s"}.`);
+        setError(mobileMessage(locale, "photos.maximum", { count: maximumSelection }));
         return current;
       }
       return [...current, asset];
@@ -120,7 +124,7 @@ export function MobilePhotoLibrarySheet({
       await onAdd(selected);
       onClose();
     } catch (failure) {
-      setError(errorText(failure));
+      setError(errorText(failure, locale));
       setSubmitting(false);
     }
   };
@@ -133,7 +137,7 @@ export function MobilePhotoLibrarySheet({
       await library.manageLimitedAccess();
       await load(false);
     } catch (failure) {
-      setError(errorText(failure));
+      setError(errorText(failure, locale));
       setLoading(false);
     }
   };
@@ -141,7 +145,7 @@ export function MobilePhotoLibrarySheet({
   const openSettings = async (): Promise<void> => {
     setError("");
     try { await library.openSettings(); }
-    catch (failure) { setError(errorText(failure)); }
+    catch (failure) { setError(errorText(failure, locale)); }
   };
 
   const assets = catalog?.status === "ready" ? catalog.assets : [];
@@ -150,12 +154,12 @@ export function MobilePhotoLibrarySheet({
     <SafeAreaView style={[styles.root, { backgroundColor: colors.background }]} edges={["top", "bottom"]}>
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
         <View style={styles.headingCopy}>
-          <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>Photos</Text>
-          <Text style={[styles.caption, { color: colors.muted }]}>Choose up to {maximumSelection} for this message.</Text>
+          <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "photos.title")}</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "photos.choose", { count: maximumSelection })}</Text>
         </View>
-        <Pressable accessibilityRole="button" accessibilityLabel="Close photo library"
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "photos.close")}
           disabled={submitting} onPress={onClose} style={[styles.close, submitting && styles.disabled]}>
-          <Text style={[styles.closeText, { color: colors.accent }]}>Close</Text>
+          <Text style={[styles.closeText, { color: colors.accent }]}>{mobileMessage(locale, "common.close")}</Text>
         </Pressable>
       </View>
 
@@ -163,11 +167,11 @@ export function MobilePhotoLibrarySheet({
         {(["recent", "screenshots"] as const).map((candidate) => {
           const active = kind === candidate;
           return <Pressable key={candidate} accessibilityRole="tab" accessibilityState={{ selected: active }}
-            accessibilityLabel={candidate === "recent" ? "Recent photos" : "Screenshots"}
+            accessibilityLabel={mobileMessage(locale, candidate === "recent" ? "photos.recentLabel" : "photos.screenshots")}
             disabled={submitting} onPress={() => setKind(candidate)}
             style={[styles.tab, active && { backgroundColor: colors.brandBackground }]}>
             <Text style={[styles.tabText, { color: active ? colors.ink : colors.muted }]}>
-              {candidate === "recent" ? "Recent" : "Screenshots"}
+              {mobileMessage(locale, candidate === "recent" ? "photos.recent" : "photos.screenshots")}
             </Text>
           </Pressable>;
         })}
@@ -175,40 +179,40 @@ export function MobilePhotoLibrarySheet({
 
       {catalog?.status === "ready" && catalog.access === "limited" && <View
         style={[styles.notice, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
-        <Text style={[styles.noticeText, { color: colors.ink }]}>Only photos currently allowed by iOS are shown.</Text>
-        <Pressable accessibilityRole="button" accessibilityLabel="Manage limited photo access"
+        <Text style={[styles.noticeText, { color: colors.ink }]}>{mobileMessage(locale, "photos.limited")}</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "photos.manageLabel")}
           disabled={loading || submitting} onPress={() => void manageLimited()} style={styles.inlineAction}>
-          <Text style={[styles.inlineActionText, { color: colors.accent }]}>Manage access</Text>
+          <Text style={[styles.inlineActionText, { color: colors.accent }]}>{mobileMessage(locale, "photos.manage")}</Text>
         </Pressable>
       </View>}
 
       {error !== "" && <View accessibilityRole="alert" style={[styles.error, { borderColor: colors.negative }]}>
         <Text style={[styles.errorText, { color: colors.negative }]}>{error}</Text>
-        <Pressable accessibilityRole="button" accessibilityLabel="Retry loading photos"
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "photos.retry")}
           disabled={loading || submitting} onPress={() => void load(false)} style={styles.inlineAction}>
-          <Text style={[styles.inlineActionText, { color: colors.accent }]}>Retry</Text>
+          <Text style={[styles.inlineActionText, { color: colors.accent }]}>{mobileMessage(locale, "common.retry")}</Text>
         </Pressable>
       </View>}
 
       {denied && <View style={styles.center}>
-        <Text style={[styles.stateTitle, { color: colors.ink }]}>Photo access is off</Text>
-        <Text style={[styles.stateCopy, { color: colors.muted }]}>Joko only reads photos after you open this surface.</Text>
+        <Text style={[styles.stateTitle, { color: colors.ink }]}>{mobileMessage(locale, "photos.accessOff")}</Text>
+        <Text style={[styles.stateCopy, { color: colors.muted }]}>{mobileMessage(locale, "photos.privacy")}</Text>
         <Pressable accessibilityRole="button"
-          accessibilityLabel={denied.canAskAgain ? "Allow photo access" : "Open Joko photo settings"}
+          accessibilityLabel={mobileMessage(locale, denied.canAskAgain ? "photos.allowLabel" : "photos.settingsLabel")}
           disabled={loading || submitting}
           onPress={() => void (denied.canAskAgain ? load(true) : openSettings())}
           style={[styles.primary, { backgroundColor: colors.accent }]}>
-          <Text style={styles.primaryText}>{denied.canAskAgain ? "Allow photos" : "Open settings"}</Text>
+          <Text style={styles.primaryText}>{mobileMessage(locale, denied.canAskAgain ? "photos.allow" : "photos.openSettings")}</Text>
         </Pressable>
       </View>}
 
       {catalog?.status === "unavailable" && <View style={styles.center}>
-        <Text style={[styles.stateTitle, { color: colors.ink }]}>Photos are unavailable</Text>
-        <Text style={[styles.stateCopy, { color: colors.muted }]}>This device cannot provide the iOS photo-library surface.</Text>
+        <Text style={[styles.stateTitle, { color: colors.ink }]}>{mobileMessage(locale, "photos.unavailable")}</Text>
+        <Text style={[styles.stateCopy, { color: colors.muted }]}>{mobileMessage(locale, "photos.unavailableBody")}</Text>
       </View>}
 
       {!denied && catalog?.status !== "unavailable" && <FlatList
-        accessibilityLabel={kind === "recent" ? "Recent photos" : "Screenshots"}
+        accessibilityLabel={mobileMessage(locale, kind === "recent" ? "photos.recentLabel" : "photos.screenshots")}
         data={assets}
         key={kind}
         keyExtractor={(asset) => asset.id}
@@ -219,15 +223,15 @@ export function MobilePhotoLibrarySheet({
         onRefresh={() => void load(false)}
         ListEmptyComponent={loading || !catalog
           ? <View style={styles.center}><ActivityIndicator color={colors.accent} />
-              <Text style={[styles.stateCopy, { color: colors.muted }]}>Loading photos…</Text></View>
+              <Text style={[styles.stateCopy, { color: colors.muted }]}>{mobileMessage(locale, "photos.loading")}</Text></View>
           : <View style={styles.center}><Text style={[styles.stateTitle, { color: colors.ink }]}>
-              {kind === "recent" ? "No recent photos" : "No screenshots"}
-            </Text><Text style={[styles.stateCopy, { color: colors.muted }]}>Pull down or use Refresh after adding photos.</Text></View>}
+              {mobileMessage(locale, kind === "recent" ? "photos.noRecent" : "photos.noScreenshots")}
+            </Text><Text style={[styles.stateCopy, { color: colors.muted }]}>{mobileMessage(locale, "photos.emptyHint")}</Text></View>}
         renderItem={({ item }) => {
           const order = selectedOrder.get(item.id);
           const selectionFull = selected.length >= maximumSelection && order === undefined;
           return <Pressable accessibilityRole="button"
-            accessibilityLabel={`${order ? "Deselect" : "Select"} ${item.fileName}`}
+            accessibilityLabel={mobileMessage(locale, order ? "photos.deselect" : "photos.select", { name: item.fileName })}
             accessibilityState={{ selected: order !== undefined, disabled: submitting || selectionFull }}
             disabled={submitting || selectionFull} onPress={() => toggle(item)}
             style={[styles.thumb, { width: thumbSize, height: thumbSize, backgroundColor: colors.surface },
@@ -242,19 +246,23 @@ export function MobilePhotoLibrarySheet({
       />}
 
       <View style={[styles.footer, { borderTopColor: colors.border, backgroundColor: colors.background }]}>
-        <Pressable accessibilityRole="button" accessibilityLabel="Refresh photo library"
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "photos.refresh")}
           disabled={loading || submitting} onPress={() => void load(false)}
           style={[styles.secondary, { borderColor: colors.border }, (loading || submitting) && styles.disabled]}>
-          <Text style={[styles.secondaryText, { color: colors.ink }]}>Refresh</Text>
+          <Text style={[styles.secondaryText, { color: colors.ink }]}>{mobileMessage(locale, "common.refresh")}</Text>
         </Pressable>
         <Pressable accessibilityRole="button"
-          accessibilityLabel={selected.length === 0 ? "Add selected photos" : `Add ${selected.length} selected photos`}
+          accessibilityLabel={selected.length === 0
+            ? mobileMessage(locale, "photos.addSelectedLabel")
+            : mobileMessage(locale, "photos.addCountLabel", { count: selected.length })}
           accessibilityState={{ disabled: selected.length === 0 || submitting }}
           disabled={selected.length === 0 || submitting} onPress={() => void submit()}
           style={[styles.primary, { backgroundColor: selected.length === 0 ? colors.border : colors.accent }]}>
           {submitting ? <ActivityIndicator color="#2b2316" />
             : <Text style={[styles.primaryText, selected.length === 0 && { color: colors.muted }]}>
-                {selected.length === 0 ? "Select photos" : `Add ${selected.length} photo${selected.length === 1 ? "" : "s"}`}
+                {selected.length === 0 ? mobileMessage(locale, "photos.selectPhotos")
+                  : selected.length === 1 ? mobileMessage(locale, "photos.addOne")
+                    : mobileMessage(locale, "photos.addMany", { count: selected.length })}
               </Text>}
         </Pressable>
       </View>
@@ -262,8 +270,8 @@ export function MobilePhotoLibrarySheet({
   </Modal>;
 }
 
-function errorText(value: unknown): string {
-  return value instanceof Error && value.message ? value.message : "The photo library could not be used.";
+function errorText(value: unknown, locale: MobileSupportedLocale): string {
+  return value instanceof Error && value.message ? value.message : mobileMessage(locale, "photos.error");
 }
 
 const styles = StyleSheet.create({

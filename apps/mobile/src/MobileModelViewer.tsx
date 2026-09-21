@@ -10,6 +10,8 @@ import {
 import { AppState, View, type StyleProp, type ViewStyle } from "react-native";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
 import modelRuntime from "./model-viewer-runtime.modeljs";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import type { MobileModelPreviewLease } from "./mobile-model-preview";
 import { MobileModelTransferSession, type MobileModelChunkFileDriver } from "./mobile-model-transfer";
 import {
@@ -37,6 +39,7 @@ export function MobileModelViewer({
   border,
   ink,
   lease,
+  locale,
   muted,
   onStatusChange,
   readerDriver,
@@ -49,6 +52,7 @@ export function MobileModelViewer({
   readonly border: string;
   readonly ink: string;
   readonly lease: MobileModelPreviewLease;
+  readonly locale: MobileSupportedLocale;
   readonly muted: string;
   readonly onStatusChange?: (status: MobileModelViewerStatus) => void;
   readonly readerDriver?: MobileModelChunkFileDriver;
@@ -67,15 +71,15 @@ export function MobileModelViewer({
   statusRef.current = onStatusChange;
 
   const html = useMemo(() => buildMobileModelViewerHtml({
-    instanceId, title, background, surface, ink, muted, accent, border
-  }, modelRuntime), [accent, background, border, ink, instanceId, muted, surface, title]);
+    instanceId, locale, title, background, surface, ink, muted, accent, border
+  }, modelRuntime), [accent, background, border, ink, instanceId, locale, muted, surface, title]);
 
-  const emitFailure = useCallback((error: unknown) => {
-    const text = String(error instanceof Error ? error.message : error || "3D model preview failed")
-      .replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 512) || "3D model preview failed";
+  const emitFailure = useCallback((_error: unknown, message = mobileMessage(locale, "preview.modelError")) => {
+    const text = message.replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 512)
+      || mobileMessage(locale, "preview.modelError");
     statusRef.current?.({ type: "joko-model-viewer/status", instanceId,
       state: "error", fileCount: 0, error: text });
-  }, [instanceId]);
+  }, [instanceId, locale]);
 
   const stopViewer = useCallback(() => {
     const transfer = transferRef.current;
@@ -117,11 +121,11 @@ export function MobileModelViewer({
       const recovery = lifecycleRef.current.consumeReloadOnActive();
       if (recovery === "reload") setReloadGeneration((value) => value + 1);
       else if (recovery === "failed") {
-        emitFailure("The 3D preview process stopped repeatedly. Close the preview and try again.");
+        emitFailure(undefined, mobileMessage(locale, "preview.modelFailure"));
       }
     });
     return () => subscription.remove();
-  }, [emitFailure, stopViewer]);
+  }, [emitFailure, locale, stopViewer]);
 
   useEffect(() => {
     lifecycleRef.current.reset();
@@ -159,16 +163,16 @@ export function MobileModelViewer({
     const recovery = lifecycleRef.current.onProcessLost(activeRef.current);
     if (recovery === "reload") setReloadGeneration((value) => value + 1);
     else if (recovery === "failed") {
-      emitFailure("The 3D preview process stopped repeatedly. Close the preview and try again.");
+      emitFailure(undefined, mobileMessage(locale, "preview.modelFailure"));
     }
     return true;
-  }, [emitFailure, stopViewer]);
+  }, [emitFailure, locale, stopViewer]);
 
   return <View style={style}>
     <ModelWebView
-      key={`${instanceId}:${reloadGeneration}`}
+      key={`${instanceId}:${locale}:${reloadGeneration}`}
       ref={(handle) => { if (handle) webViewRef.current = handle; }}
-      accessibilityLabel={`Interactive 3D model viewer for ${title}`}
+      accessibilityLabel={mobileMessage(locale, "preview.modelLabel", { title })}
       allowFileAccess={false}
       allowFileAccessFromFileURLs={false}
       allowUniversalAccessFromFileURLs={false}

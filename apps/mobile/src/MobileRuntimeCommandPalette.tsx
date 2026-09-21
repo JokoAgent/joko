@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { RuntimeCommandSource } from "@joko/contracts";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   isMobileAppCommandCandidate,
   type MobileCommandPaletteCandidate
@@ -20,6 +22,7 @@ export function MobileRuntimeCommandPalette({
   disabled,
   checkingDraft,
   colors,
+  locale,
   onClose,
   onRefresh,
   onRetry,
@@ -35,6 +38,7 @@ export function MobileRuntimeCommandPalette({
   readonly disabled: boolean;
   readonly checkingDraft: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onRefresh: () => void;
   readonly onRetry: () => void;
@@ -50,45 +54,44 @@ export function MobileRuntimeCommandPalette({
   }, [selected?.commandId, selectedPosition, status, visible]);
   if (!visible) return null;
   const baseUnavailable = disabled || checkingDraft;
-  return <View accessibilityLabel="Commands" accessibilityRole="list"
+  return <View accessibilityLabel={mobileMessage(locale, "commands.title")} accessibilityRole="list"
     style={[styles.palette, { backgroundColor: colors.surface, borderColor: colors.border }]}>
     {selected && <Text accessibilityLiveRegion="polite" style={styles.screenReaderStatus}>
-      Selected /{selected.name}
+      {mobileMessage(locale, "commands.selected", { name: selected.name })}
     </Text>}
     <View style={styles.header}>
       <View style={styles.headerText}>
-        <Text style={[styles.title, { color: colors.ink }]}>Commands</Text>
+        <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "commands.title")}</Text>
         <Text style={[styles.query, { color: colors.muted }]} numberOfLines={1}>/{query}</Text>
       </View>
       {status === "refreshing" && <Text accessibilityLiveRegion="polite"
-        style={[styles.status, { color: colors.muted }]}>Refreshing…</Text>}
+        style={[styles.status, { color: colors.muted }]}>{mobileMessage(locale, "commands.refreshing")}</Text>}
       {checkingDraft && <Text accessibilityLiveRegion="polite"
-        style={[styles.status, { color: colors.muted }]}>Checking draft…</Text>}
-      <Pressable accessibilityRole="button" accessibilityLabel="Refresh runtime commands"
+        style={[styles.status, { color: colors.muted }]}>{mobileMessage(locale, "commands.checkingDraft")}</Text>}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "commands.refresh")}
         accessibilityState={{ disabled: !runtimeAvailable || disabled || status === "loading" || status === "refreshing" }}
         disabled={!runtimeAvailable || disabled || status === "loading" || status === "refreshing"}
         onPress={onRefresh} style={styles.headerButton}>
         <Text style={[styles.headerAction, { color: colors.accent }]}>↻</Text>
       </Pressable>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close commands"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "commands.close")}
         onPress={onClose} style={styles.headerButton}>
         <Text style={[styles.headerAction, { color: colors.ink }]}>×</Text>
       </Pressable>
     </View>
     {status === "error" && <View accessibilityRole="alert" style={styles.errorRow}>
-          <Text style={[styles.error, { color: colors.negative }]}>{error || "Runtime commands could not be loaded."}</Text>
-          <Pressable accessibilityRole="button" accessibilityLabel="Retry runtime commands" disabled={!runtimeAvailable || disabled}
+          <Text style={[styles.error, { color: colors.negative }]}>{error || mobileMessage(locale, "commands.loadError")}</Text>
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "commands.retry")} disabled={!runtimeAvailable || disabled}
             accessibilityState={{ disabled: !runtimeAvailable || disabled }} onPress={onRetry}
             style={[styles.retry, { borderColor: colors.border }, (!runtimeAvailable || disabled) && styles.disabled]}>
-            <Text style={[styles.retryText, { color: colors.ink }]}>Retry</Text>
+            <Text style={[styles.retryText, { color: colors.ink }]}>{mobileMessage(locale, "common.retry")}</Text>
           </Pressable>
         </View>}
     {status === "loading" && items.length === 0 ? <Text accessibilityLiveRegion="polite"
-      style={[styles.empty, { color: colors.muted }]}>Loading runtime commands…</Text>
+      style={[styles.empty, { color: colors.muted }]}>{mobileMessage(locale, "commands.loading")}</Text>
       : items.length === 0 ? <Text accessibilityLiveRegion="polite"
             style={[styles.empty, { color: colors.muted }]}>
-            {query ? "No matching commands. Enter and Tab will keep this text unsent."
-              : "No commands are available."}
+            {mobileMessage(locale, query ? "commands.noMatch" : "commands.empty")}
           </Text>
           : <ScrollView ref={listRef} keyboardShouldPersistTaps="always" nestedScrollEnabled style={styles.list}
               contentContainerStyle={styles.listContent}>
@@ -97,8 +100,11 @@ export function MobileRuntimeCommandPalette({
                 const unavailable = baseUnavailable
                   || !isMobileAppCommandCandidate(item) && status !== "ready";
                 return <Pressable key={item.commandId} accessibilityRole="button"
-                  accessibilityLabel={`Insert ${isMobileAppCommandCandidate(item) ? "app" : "runtime"} command /${item.name}`}
-                  accessibilityHint={item.description || commandSourceLabel(item)}
+                  accessibilityLabel={mobileMessage(locale, "commands.insert", {
+                    source: mobileMessage(locale, isMobileAppCommandCandidate(item) ? "commands.sourceApp" : "commands.sourceRuntime"),
+                    name: item.name
+                  })}
+                  accessibilityHint={item.description || commandSourceLabel(item, locale)}
                   accessibilityState={{ selected, disabled: unavailable }} disabled={unavailable}
                   onPress={() => onSelect(item)}
                   style={[styles.item, {
@@ -108,7 +114,7 @@ export function MobileRuntimeCommandPalette({
                   <View style={styles.itemText}>
                     <Text style={[styles.command, { color: colors.ink }]} numberOfLines={1}>/{item.name}</Text>
                     <Text style={[styles.description, { color: colors.muted }]} numberOfLines={2}>
-                      {item.description || commandSourceLabel(item)}
+                      {item.description || commandSourceLabel(item, locale)}
                     </Text>
                   </View>
                   {selected && <Text accessibilityElementsHidden style={[styles.selected, { color: colors.accent }]}>↵</Text>}
@@ -118,15 +124,16 @@ export function MobileRuntimeCommandPalette({
   </View>;
 }
 
-function commandSourceLabel(candidate: MobileCommandPaletteCandidate): string {
-  return isMobileAppCommandCandidate(candidate) ? "Joko command" : `${runtimeCommandSourceLabel(candidate.source)} command`;
+function commandSourceLabel(candidate: MobileCommandPaletteCandidate, locale: MobileSupportedLocale): string {
+  return isMobileAppCommandCandidate(candidate) ? mobileMessage(locale, "commands.jokoCommand")
+    : mobileMessage(locale, "commands.sourceCommand", { source: runtimeCommandSourceLabel(candidate.source, locale) });
 }
 
-export function runtimeCommandSourceLabel(source: RuntimeCommandSource): string {
-  if (source === RuntimeCommandSource.SKILL) return "Skill";
-  if (source === RuntimeCommandSource.PROMPT) return "Prompt";
-  if (source === RuntimeCommandSource.EXTENSION) return "Extension";
-  return "Backend command";
+export function runtimeCommandSourceLabel(source: RuntimeCommandSource, locale: MobileSupportedLocale): string {
+  if (source === RuntimeCommandSource.SKILL) return mobileMessage(locale, "commands.source.skill");
+  if (source === RuntimeCommandSource.PROMPT) return mobileMessage(locale, "commands.source.prompt");
+  if (source === RuntimeCommandSource.EXTENSION) return mobileMessage(locale, "commands.source.extension");
+  return mobileMessage(locale, "commands.backendCommand");
 }
 
 const styles = StyleSheet.create({

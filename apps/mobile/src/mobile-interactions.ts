@@ -24,6 +24,8 @@ import {
   type QuestionField,
   type Snapshot
 } from "@joko/contracts";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export type MobileQuestionAnswerDraft =
   | { readonly kind: "text"; readonly value: string }
@@ -119,40 +121,50 @@ export function initialMobileInteractionDraft(interaction: Interaction): MobileI
   return undefined;
 }
 
-export function mobileQuestionFieldError(field: QuestionField, answer: MobileQuestionAnswerDraft | undefined): string | undefined {
+export function mobileQuestionFieldError(
+  field: QuestionField,
+  answer: MobileQuestionAnswerDraft | undefined,
+  locale: MobileSupportedLocale
+): string | undefined {
   validateQuestionFieldDeclaration(field);
   const label = field.label || field.fieldId;
-  if (answer === undefined) return field.required ? `${label} is required.` : undefined;
+  if (answer === undefined) return field.required ? mobileMessage(locale, "interaction.field.required", { label }) : undefined;
   if (field.input.case === "text") {
-    if (answer.kind !== "text") return `${label} requires text.`;
-    return field.required && answer.value.trim() === "" ? `${label} is required.` : undefined;
+    if (answer.kind !== "text") return mobileMessage(locale, "interaction.field.text", { label });
+    return field.required && answer.value.trim() === ""
+      ? mobileMessage(locale, "interaction.field.required", { label }) : undefined;
   }
-  if (field.input.case === "boolean") return answer.kind === "boolean" ? undefined : `${label} requires yes or no.`;
+  if (field.input.case === "boolean") return answer.kind === "boolean" ? undefined
+    : mobileMessage(locale, "interaction.field.boolean", { label });
   if (field.input.case === "singleChoice") {
-    if (answer.kind !== "single") return `${label} requires one choice.`;
+    if (answer.kind !== "single") return mobileMessage(locale, "interaction.field.oneChoice", { label });
     if (answer.selection.kind === "choice") {
       const choiceId = answer.selection.choiceId;
       return field.input.value.choices.some((choice) => choice.choiceId === choiceId)
         ? undefined
-        : `${label} contains a choice that is no longer available.`;
+        : mobileMessage(locale, "interaction.field.choiceUnavailable", { label });
     }
     return field.input.value.allowOther && answer.selection.text.trim() !== ""
       ? undefined
-      : `${label} requires allowed free text.`;
+      : mobileMessage(locale, "interaction.field.freeText", { label });
   }
-  if (field.input.case !== "multipleChoice" || answer.kind !== "multiple") return `${label} requires a list of choices.`;
+  if (field.input.case !== "multipleChoice" || answer.kind !== "multiple") {
+    return mobileMessage(locale, "interaction.field.choiceList", { label });
+  }
   const ids = new Set(field.input.value.choices.map((choice) => choice.choiceId));
   if (new Set(answer.choiceIds).size !== answer.choiceIds.length || answer.choiceIds.some((choiceId) => !ids.has(choiceId))) {
-    return `${label} contains a choice that is no longer available.`;
+    return mobileMessage(locale, "interaction.field.choiceUnavailable", { label });
   }
   if (answer.otherText !== undefined && (!field.input.value.allowOther || answer.otherText.trim() === "")) {
-    return `${label} contains free text that is not allowed.`;
+    return mobileMessage(locale, "interaction.field.freeTextNotAllowed", { label });
   }
   const count = answer.choiceIds.length + (answer.otherText === undefined ? 0 : 1);
   const minimum = Math.max(field.required ? 1 : 0, field.input.value.minimumSelections);
   const maximum = field.input.value.maximumSelections === 0 ? undefined : field.input.value.maximumSelections;
-  if (count < minimum) return `${label} requires at least ${minimum} selection${minimum === 1 ? "" : "s"}.`;
-  if (maximum !== undefined && count > maximum) return `${label} allows at most ${maximum} selection${maximum === 1 ? "" : "s"}.`;
+  if (count < minimum) return mobileMessage(locale, "interaction.field.minimum", { label, count: minimum });
+  if (maximum !== undefined && count > maximum) {
+    return mobileMessage(locale, "interaction.field.maximum", { label, count: maximum });
+  }
   return undefined;
 }
 
@@ -162,7 +174,7 @@ export function mobileQuestionCanSubmit(interaction: Interaction, answers: Mobil
     validateQuestionDeclaration(interaction.request.value.fields);
     const fieldIds = new Set(interaction.request.value.fields.map((field) => field.fieldId));
     if (Object.keys(answers).some((fieldId) => !fieldIds.has(fieldId))) return false;
-    return interaction.request.value.fields.every((field) => mobileQuestionFieldError(field, answers[field.fieldId]) === undefined);
+    return interaction.request.value.fields.every((field) => mobileQuestionFieldError(field, answers[field.fieldId], "en") === undefined);
   } catch {
     return false;
   }
@@ -253,7 +265,7 @@ export function createMobileInteractionResolution(
   }
   const answers = fields.flatMap((field) => {
     const draft = submission.answers[field.fieldId];
-    const invalid = mobileQuestionFieldError(field, draft);
+    const invalid = mobileQuestionFieldError(field, draft, "en");
     if (invalid !== undefined) throw new Error(invalid);
     if (draft === undefined) return [];
     if (field.input.case === "text" && draft.kind === "text") {
@@ -289,37 +301,38 @@ export function createMobileInteractionResolution(
   });
 }
 
-export function mobileInteractionTitle(interaction: Interaction): string {
-  if (interaction.request.case === "permission") return interaction.request.value.title || "Permission required";
-  if (interaction.request.case === "question") return interaction.request.value.title || interaction.request.value.fields[0]?.label || "Question";
-  if (interaction.request.case === "planReview") return interaction.request.value.title || "Review plan";
-  return "Request";
+export function mobileInteractionTitle(interaction: Interaction, locale: MobileSupportedLocale): string {
+  if (interaction.request.case === "permission") return interaction.request.value.title || mobileMessage(locale, "interaction.title.permission");
+  if (interaction.request.case === "question") return interaction.request.value.title || interaction.request.value.fields[0]?.label
+    || mobileMessage(locale, "interaction.title.question");
+  if (interaction.request.case === "planReview") return interaction.request.value.title || mobileMessage(locale, "interaction.title.plan");
+  return mobileMessage(locale, "interaction.kind.request");
 }
 
-export function mobileInteractionKindLabel(interaction: Interaction): string {
-  if (interaction.request.case === "permission") return "Permission";
-  if (interaction.request.case === "question") return "Question";
-  if (interaction.request.case === "planReview") return "Plan review";
-  return "Request";
+export function mobileInteractionKindLabel(interaction: Interaction, locale: MobileSupportedLocale): string {
+  if (interaction.request.case === "permission") return mobileMessage(locale, "interaction.kind.permission");
+  if (interaction.request.case === "question") return mobileMessage(locale, "interaction.kind.question");
+  if (interaction.request.case === "planReview") return mobileMessage(locale, "interaction.kind.plan");
+  return mobileMessage(locale, "interaction.kind.request");
 }
 
-export function mobilePermissionRiskLabel(risk: PermissionRisk): string {
-  if (risk === PermissionRisk.READ_ONLY) return "Read only";
-  if (risk === PermissionRisk.LOW) return "Low risk";
-  if (risk === PermissionRisk.MEDIUM) return "Medium risk";
-  if (risk === PermissionRisk.HIGH) return "High risk";
-  if (risk === PermissionRisk.CRITICAL) return "Critical risk";
-  return "Unspecified risk";
+export function mobilePermissionRiskLabel(risk: PermissionRisk, locale: MobileSupportedLocale): string {
+  if (risk === PermissionRisk.READ_ONLY) return mobileMessage(locale, "interaction.risk.readOnly");
+  if (risk === PermissionRisk.LOW) return mobileMessage(locale, "interaction.risk.low");
+  if (risk === PermissionRisk.MEDIUM) return mobileMessage(locale, "interaction.risk.medium");
+  if (risk === PermissionRisk.HIGH) return mobileMessage(locale, "interaction.risk.high");
+  if (risk === PermissionRisk.CRITICAL) return mobileMessage(locale, "interaction.risk.critical");
+  return mobileMessage(locale, "interaction.risk.unspecified");
 }
 
-export function mobilePermissionDecisionLabel(decision: PermissionDecisionKind): string {
-  if (decision === PermissionDecisionKind.ALLOW_ONCE) return "Allow once";
-  if (decision === PermissionDecisionKind.ALLOW_FOR_TURN) return "Allow for this turn";
-  if (decision === PermissionDecisionKind.ALLOW_FOR_SESSION) return "Allow for this task";
-  if (decision === PermissionDecisionKind.DENY_ONCE) return "Deny";
-  if (decision === PermissionDecisionKind.DENY_FOR_SESSION) return "Deny for this task";
-  if (decision === PermissionDecisionKind.ABORT_RUN) return "Stop task";
-  return "Unavailable decision";
+export function mobilePermissionDecisionLabel(decision: PermissionDecisionKind, locale: MobileSupportedLocale): string {
+  if (decision === PermissionDecisionKind.ALLOW_ONCE) return mobileMessage(locale, "interaction.decision.allowOnce");
+  if (decision === PermissionDecisionKind.ALLOW_FOR_TURN) return mobileMessage(locale, "interaction.decision.allowTurn");
+  if (decision === PermissionDecisionKind.ALLOW_FOR_SESSION) return mobileMessage(locale, "interaction.decision.allowTask");
+  if (decision === PermissionDecisionKind.DENY_ONCE) return mobileMessage(locale, "interaction.decision.deny");
+  if (decision === PermissionDecisionKind.DENY_FOR_SESSION) return mobileMessage(locale, "interaction.decision.denyTask");
+  if (decision === PermissionDecisionKind.ABORT_RUN) return mobileMessage(locale, "interaction.decision.stop");
+  return mobileMessage(locale, "interaction.decision.unavailable");
 }
 
 export function mobilePermissionDecisionDanger(decision: PermissionDecisionKind): boolean {
@@ -337,55 +350,68 @@ export function mobilePermissionDecisionNeedsConfirmation(interaction: Interacti
     && risk !== PermissionRisk.MEDIUM;
 }
 
-export function mobilePlanDecisionLabel(decision: PlanReviewDecisionKind): string {
-  if (decision === PlanReviewDecisionKind.EXECUTE) return "Execute plan";
-  if (decision === PlanReviewDecisionKind.STAY_IN_PLAN_MODE) return "Stay in plan mode";
-  if (decision === PlanReviewDecisionKind.REFINE) return "Refine plan";
-  return "Unavailable decision";
+export function mobilePlanDecisionLabel(decision: PlanReviewDecisionKind, locale: MobileSupportedLocale): string {
+  if (decision === PlanReviewDecisionKind.EXECUTE) return mobileMessage(locale, "interaction.plan.execute");
+  if (decision === PlanReviewDecisionKind.STAY_IN_PLAN_MODE) return mobileMessage(locale, "interaction.plan.stay");
+  if (decision === PlanReviewDecisionKind.REFINE) return mobileMessage(locale, "interaction.plan.refine");
+  return mobileMessage(locale, "interaction.decision.unavailable");
 }
 
-export function mobilePlanStepStateLabel(state: PlanStepState): string {
-  if (state === PlanStepState.IN_PROGRESS) return "In progress";
-  if (state === PlanStepState.COMPLETED) return "Completed";
-  if (state === PlanStepState.SKIPPED) return "Skipped";
-  return "Pending";
+export function mobilePlanStepStateLabel(state: PlanStepState, locale: MobileSupportedLocale): string {
+  if (state === PlanStepState.IN_PROGRESS) return mobileMessage(locale, "interaction.step.inProgress");
+  if (state === PlanStepState.COMPLETED) return mobileMessage(locale, "interaction.step.completed");
+  if (state === PlanStepState.SKIPPED) return mobileMessage(locale, "interaction.step.skipped");
+  return mobileMessage(locale, "interaction.step.pending");
 }
 
-export function mobilePermissionDetails(subject: PermissionSubject | undefined): readonly MobilePermissionDetail[] {
+export function mobilePermissionDetails(
+  subject: PermissionSubject | undefined,
+  locale: MobileSupportedLocale
+): readonly MobilePermissionDetail[] {
   if (!subject) return [];
   const kind = subject.kind;
   if (kind.case === "file") return [
-    { label: "Action", value: fileActionLabel(kind.value.action) },
-    { label: "Workspace", value: kind.value.workspaceId || "Current workspace" },
-    { label: "Paths", value: kind.value.relativePaths.length > 0 ? kind.value.relativePaths.join("\n") : "No path supplied" },
-    ...(kind.value.outsidePrimaryWorkspace ? [{ label: "Boundary", value: "Outside the primary workspace" }] : [])
+    { label: mobileMessage(locale, "interaction.detail.action"), value: fileActionLabel(kind.value.action, locale) },
+    { label: mobileMessage(locale, "interaction.detail.workspace"), value: kind.value.workspaceId || mobileMessage(locale, "interaction.detail.currentWorkspace") },
+    { label: mobileMessage(locale, "interaction.detail.paths"), value: kind.value.relativePaths.length > 0
+      ? kind.value.relativePaths.join("\n") : mobileMessage(locale, "interaction.detail.noPath") },
+    ...(kind.value.outsidePrimaryWorkspace ? [{
+      label: mobileMessage(locale, "interaction.detail.boundary"),
+      value: mobileMessage(locale, "interaction.detail.outsidePrimary")
+    }] : [])
   ];
   if (kind.case === "command") return [
-    { label: "Command", value: [kind.value.executable, ...kind.value.arguments].join(" ").trim() || "No command supplied" },
-    { label: "Working directory", value: kind.value.workingDirectoryDisplay || "Not supplied" },
-    { label: "Network", value: kind.value.networkAccess ? "Requested" : "Not requested" },
-    { label: "Outside workspace", value: kind.value.writesOutsideWorkspace ? "May write outside" : "No" },
-    { label: "Shell", value: kind.value.usesShell ? "Uses a shell" : "Direct execution" }
+    { label: mobileMessage(locale, "interaction.detail.command"), value: [kind.value.executable, ...kind.value.arguments].join(" ").trim()
+      || mobileMessage(locale, "interaction.detail.noCommand") },
+    { label: mobileMessage(locale, "interaction.detail.workingDirectory"), value: kind.value.workingDirectoryDisplay
+      || mobileMessage(locale, "interaction.detail.notSupplied") },
+    { label: mobileMessage(locale, "interaction.detail.network"), value: mobileMessage(locale, kind.value.networkAccess
+      ? "interaction.detail.requested" : "interaction.detail.notRequested") },
+    { label: mobileMessage(locale, "interaction.detail.outsideWorkspace"), value: mobileMessage(locale,
+      kind.value.writesOutsideWorkspace ? "interaction.detail.mayWriteOutside" : "common.no") },
+    { label: mobileMessage(locale, "interaction.detail.shell"), value: mobileMessage(locale,
+      kind.value.usesShell ? "interaction.detail.usesShell" : "interaction.detail.direct") }
   ];
   if (kind.case === "mcp") return [
-    { label: "MCP server", value: kind.value.serverId || "Not supplied" },
-    { label: "Tool", value: kind.value.toolName || "Not supplied" },
-    ...kind.value.arguments.map(argumentDetail)
+    { label: mobileMessage(locale, "interaction.detail.mcpServer"), value: kind.value.serverId || mobileMessage(locale, "interaction.detail.notSupplied") },
+    { label: mobileMessage(locale, "interaction.detail.tool"), value: kind.value.toolName || mobileMessage(locale, "interaction.detail.notSupplied") },
+    ...kind.value.arguments.map((argument) => argumentDetail(argument, locale))
   ];
   if (kind.case === "browser") return [
-    { label: "Action", value: browserActionLabel(kind.value.action) },
-    { label: "Origin", value: kind.value.origin || "Not supplied" },
-    { label: "Browser", value: kind.value.browserProviderId || "Not supplied" },
-    { label: "Page", value: kind.value.pageId || "Not supplied" }
+    { label: mobileMessage(locale, "interaction.detail.action"), value: browserActionLabel(kind.value.action, locale) },
+    { label: mobileMessage(locale, "interaction.detail.origin"), value: kind.value.origin || mobileMessage(locale, "interaction.detail.notSupplied") },
+    { label: mobileMessage(locale, "interaction.detail.browser"), value: kind.value.browserProviderId || mobileMessage(locale, "interaction.detail.notSupplied") },
+    { label: mobileMessage(locale, "interaction.detail.page"), value: kind.value.pageId || mobileMessage(locale, "interaction.detail.notSupplied") }
   ];
   if (kind.case === "customTool") return [
-    { label: "Tool", value: kind.value.displayName || kind.value.toolId || "Not supplied" },
-    ...kind.value.arguments.map(argumentDetail)
+    { label: mobileMessage(locale, "interaction.detail.tool"), value: kind.value.displayName || kind.value.toolId
+      || mobileMessage(locale, "interaction.detail.notSupplied") },
+    ...kind.value.arguments.map((argument) => argumentDetail(argument, locale))
   ];
   if (kind.case === "resource") return [
-    { label: "Action", value: resourceActionLabel(kind.value.action) },
-    { label: "Resource", value: kind.value.resourceId || "Not supplied" },
-    { label: "Source", value: kind.value.sourcePathDisplay || "Not supplied" }
+    { label: mobileMessage(locale, "interaction.detail.action"), value: resourceActionLabel(kind.value.action, locale) },
+    { label: mobileMessage(locale, "interaction.detail.resource"), value: kind.value.resourceId || mobileMessage(locale, "interaction.detail.notSupplied") },
+    { label: mobileMessage(locale, "interaction.detail.source"), value: kind.value.sourcePathDisplay || mobileMessage(locale, "interaction.detail.notSupplied") }
   ];
   return [];
 }
@@ -497,46 +523,57 @@ function compareTimestamp(left: Interaction, right: Interaction): number {
   return (left.createdAt?.nanos ?? 0) - (right.createdAt?.nanos ?? 0);
 }
 
-function argumentDetail(argument: DisplayArgument): MobilePermissionDetail {
-  const label = argument.fieldPath || "Argument";
-  if (argument.redacted) return { label, value: argument.redactedPlaceholder || "Redacted", redacted: true };
+function argumentDetail(argument: DisplayArgument, locale: MobileSupportedLocale): MobilePermissionDetail {
+  const label = argument.fieldPath || mobileMessage(locale, "interaction.detail.argument");
+  if (argument.redacted) return {
+    label,
+    value: argument.redactedPlaceholder || mobileMessage(locale, "interaction.detail.redacted"),
+    redacted: true
+  };
   const value = argument.value;
   if (value.case === "text") return { label, value: value.value };
   if (value.case === "number") return { label, value: String(value.value) };
   if (value.case === "integer") return { label, value: value.value.toString(10) };
   if (value.case === "boolean") return { label, value: value.value ? "true" : "false" };
-  if (value.case === "blob") return { label, value: value.value.fileName || `${value.value.mediaType || "Blob"} (${value.value.byteSize.toString(10)} bytes)` };
+  if (value.case === "blob") return { label, value: value.value.fileName || mobileMessage(locale, "interaction.detail.blobBytes", {
+    name: value.value.mediaType || mobileMessage(locale, "interaction.detail.blob"),
+    bytes: value.value.byteSize.toString(10)
+  }) };
   if (value.case === "null") return { label, value: "null" };
   if (value.case === "composite") return {
     label,
-    value: `${value.value.kind === CompositeArgumentKind.ARRAY ? "Array" : "Object"} (${value.value.childCount} item${value.value.childCount === 1 ? "" : "s"})`
+    value: mobileMessage(locale, "interaction.detail.composite", {
+      kind: mobileMessage(locale, value.value.kind === CompositeArgumentKind.ARRAY
+        ? "interaction.detail.array" : "interaction.detail.object"),
+      count: value.value.childCount
+    })
   };
-  return { label, value: "Not supplied" };
+  return { label, value: mobileMessage(locale, "interaction.detail.notSupplied") };
 }
 
-function fileActionLabel(value: FilePermissionAction): string {
-  if (value === FilePermissionAction.READ) return "Read";
-  if (value === FilePermissionAction.CREATE) return "Create";
-  if (value === FilePermissionAction.UPDATE) return "Update";
-  if (value === FilePermissionAction.DELETE) return "Delete";
-  if (value === FilePermissionAction.MOVE) return "Move";
-  return "Unspecified";
+function fileActionLabel(value: FilePermissionAction, locale: MobileSupportedLocale): string {
+  if (value === FilePermissionAction.READ) return mobileMessage(locale, "interaction.action.read");
+  if (value === FilePermissionAction.CREATE) return mobileMessage(locale, "interaction.action.create");
+  if (value === FilePermissionAction.UPDATE) return mobileMessage(locale, "interaction.action.update");
+  if (value === FilePermissionAction.DELETE) return mobileMessage(locale, "interaction.action.delete");
+  if (value === FilePermissionAction.MOVE) return mobileMessage(locale, "interaction.action.move");
+  return mobileMessage(locale, "interaction.action.unspecified");
 }
 
-function browserActionLabel(value: BrowserPermissionAction): string {
-  if (value === BrowserPermissionAction.READ_PAGE) return "Read page";
-  if (value === BrowserPermissionAction.NAVIGATE) return "Navigate";
-  if (value === BrowserPermissionAction.INTERACT) return "Interact";
-  if (value === BrowserPermissionAction.UPLOAD) return "Upload";
-  if (value === BrowserPermissionAction.DOWNLOAD) return "Download";
-  if (value === BrowserPermissionAction.TAKE_OVER) return "Take over";
-  return "Unspecified";
+function browserActionLabel(value: BrowserPermissionAction, locale: MobileSupportedLocale): string {
+  if (value === BrowserPermissionAction.READ_PAGE) return mobileMessage(locale, "interaction.action.readPage");
+  if (value === BrowserPermissionAction.NAVIGATE) return mobileMessage(locale, "interaction.action.navigate");
+  if (value === BrowserPermissionAction.INTERACT) return mobileMessage(locale, "interaction.action.interact");
+  if (value === BrowserPermissionAction.UPLOAD) return mobileMessage(locale, "interaction.action.upload");
+  if (value === BrowserPermissionAction.DOWNLOAD) return mobileMessage(locale, "interaction.action.download");
+  if (value === BrowserPermissionAction.TAKE_OVER) return mobileMessage(locale, "interaction.action.takeOver");
+  return mobileMessage(locale, "interaction.action.unspecified");
 }
 
-function resourceActionLabel(value: ResourcePermissionAction): string {
-  if (value === ResourcePermissionAction.APPROVE) return "Approve";
-  if (value === ResourcePermissionAction.INSTALL) return "Install";
-  if (value === ResourcePermissionAction.UPDATE) return "Update";
-  if (value === ResourcePermissionAction.ENABLE) return "Enable";
-  return "Unspecified";
+function resourceActionLabel(value: ResourcePermissionAction, locale: MobileSupportedLocale): string {
+  if (value === ResourcePermissionAction.APPROVE) return mobileMessage(locale, "interaction.action.approve");
+  if (value === ResourcePermissionAction.INSTALL) return mobileMessage(locale, "interaction.action.install");
+  if (value === ResourcePermissionAction.UPDATE) return mobileMessage(locale, "interaction.action.update");
+  if (value === ResourcePermissionAction.ENABLE) return mobileMessage(locale, "interaction.action.enable");
+  return mobileMessage(locale, "interaction.action.unspecified");
 }

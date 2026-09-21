@@ -51,7 +51,7 @@ describe("mobile model viewer protocol", () => {
 describe("mobile model viewer HTML", () => {
   it("embeds the pinned runtime in a no-network/no-file interactive viewer", () => {
     const html = buildMobileModelViewerHtml({
-      instanceId: "model-1", title: "Scene <final>", background: "#ffffff", surface: "#f5f5f5",
+      instanceId: "model-1", locale: "en", title: "Scene <final>", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, runtimeBundle());
     expect(html).toContain("Interactive 3D model: Scene &lt;final&gt;");
@@ -72,7 +72,7 @@ describe("mobile model viewer HTML", () => {
   it("rejects unpinned or incomplete runtime bundles", () => {
     const runtime = runtimeBundle();
     expect(() => buildMobileModelViewerHtml({
-      instanceId: "model-1", title: "Scene", background: "#ffffff", surface: "#f5f5f5",
+      instanceId: "model-1", locale: "en", title: "Scene", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, { ...runtime, modelViewerVersion: "4.3.0" })).toThrow(/runtime bundle/u);
   });

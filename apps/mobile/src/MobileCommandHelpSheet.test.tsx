@@ -80,6 +80,7 @@ describe("MobileCommandHelpSheet", () => {
     container = document.createElement("div");
     root = createRoot(container);
     act(() => root!.render(createElement(MobileCommandHelpSheet, {
+      locale: "en",
       visible: true,
       items: [
         {
@@ -112,5 +113,30 @@ describe("MobileCommandHelpSheet", () => {
     act(() => container!.querySelector('[data-modal="true"]')
       ?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
     expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("rerenders a mounted sheet in the newly selected locale without translating runtime data", () => {
+    const onClose = vi.fn();
+    const items = [{
+      commandId: "skill-review",
+      name: "skill:review",
+      description: "Review the active change",
+      source: RuntimeCommandSource.SKILL,
+      resourceId: "review-skill"
+    }];
+    container = document.createElement("div");
+    root = createRoot(container);
+    act(() => root!.render(createElement(MobileCommandHelpSheet, {
+      locale: "en", visible: true, items, colors, onClose
+    })));
+    expect(container.querySelector('[aria-label="Available commands"]')).not.toBeNull();
+
+    act(() => root!.render(createElement(MobileCommandHelpSheet, {
+      locale: "ja", visible: true, items, colors, onClose
+    })));
+    expect(container.querySelector('[aria-label="利用可能なコマンド"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="コマンドヘルプを閉じる"]')).not.toBeNull();
+    expect(container.textContent).toContain("スキル");
+    expect(container.textContent).toContain("Review the active change");
   });
 });

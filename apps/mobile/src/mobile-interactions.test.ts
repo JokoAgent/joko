@@ -137,7 +137,7 @@ describe("mobile interactions", () => {
     answer = setMobileQuestionOther(multiple, answer, "Desktop");
     expect(answer).toEqual({ kind: "multiple", choiceIds: ["web"], otherText: "Desktop" });
     expect(toggleMobileQuestionChoice(multiple, answer, "mobile")).toEqual(answer);
-    expect(mobileQuestionFieldError(multiple, answer)).toBeUndefined();
+    expect(mobileQuestionFieldError(multiple, answer, "en")).toBeUndefined();
     expect(setMobileQuestionOther(multiple, answer, "")).toEqual({ kind: "multiple", choiceIds: ["web"] });
   });
 
@@ -165,7 +165,10 @@ describe("mobile interactions", () => {
       permissionInteraction("unspecified", PermissionRisk.UNSPECIFIED),
       PermissionDecisionKind.ALLOW_ONCE
     )).toBe(true);
-    const details = mobilePermissionDetails(permission.request.case === "permission" ? permission.request.value.subject : undefined);
+    const details = mobilePermissionDetails(
+      permission.request.case === "permission" ? permission.request.value.subject : undefined,
+      "en"
+    );
     expect(details).toContainEqual({ label: "token", value: "Secret value", redacted: true });
     expect(JSON.stringify(details)).not.toContain("must-not-render");
   });

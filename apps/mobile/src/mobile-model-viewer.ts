@@ -1,4 +1,6 @@
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   MOBILE_MODEL_PREVIEW_MAXIMUM_FILES,
   MOBILE_MODEL_PREVIEW_MAXIMUM_REFERENCES,
@@ -212,6 +214,7 @@ export function assertMobileModelViewerManifest(
 
 export function buildMobileModelViewerHtml({
   instanceId,
+  locale,
   title,
   background,
   surface,
@@ -221,6 +224,7 @@ export function buildMobileModelViewerHtml({
   border
 }: {
   readonly instanceId: string;
+  readonly locale: MobileSupportedLocale;
   readonly title: string;
   readonly background: string;
   readonly surface: string;
@@ -230,10 +234,17 @@ export function buildMobileModelViewerHtml({
   readonly border: string;
 }, runtime: MobileModelRuntimeBundle): string {
   const exactInstanceId = viewerInstanceId(instanceId);
-  const exactTitle = boundedText(title, 512) || "3D model preview";
+  const exactTitle = boundedText(title, 512) || mobileMessage(locale, "preview.modelTitle");
   assertRuntimeBundle(runtime);
+  const labels = {
+    error: mobileMessage(locale, "preview.modelError"),
+    ready: mobileMessage(locale, "preview.status.modelReady"),
+    receiving: mobileMessage(locale, "preview.status.receivingModel"),
+    loading: mobileMessage(locale, "preview.status.loadingModel"),
+    complete: mobileMessage(locale, "preview.status.modelReady")
+  };
   return `<!doctype html>
-<html>
+<html lang="${locale}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
@@ -253,18 +264,19 @@ export function buildMobileModelViewerHtml({
   </style>
 </head>
 <body aria-label="${escapeHtml(exactTitle)}">
-  <div id="toolbar" role="toolbar" aria-label="3D model preview controls">
-    <span id="status" role="status" aria-live="polite">Preparing verified 3D model…</span>
-    <button id="zoom-out" type="button" aria-label="Zoom 3D model out">−</button>
-    <button id="reset" type="button" aria-label="Reset 3D model view">Reset</button>
-    <button id="zoom-in" type="button" aria-label="Zoom 3D model in">+</button>
+  <div id="toolbar" role="toolbar" aria-label="${escapeHtml(mobileMessage(locale, "preview.modelControls"))}">
+    <span id="status" role="status" aria-live="polite">${escapeHtml(mobileMessage(locale, "preview.status.preparingModel"))}</span>
+    <button id="zoom-out" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.modelZoomOut"))}">−</button>
+    <button id="reset" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.modelResetLabel"))}">${escapeHtml(mobileMessage(locale, "preview.modelReset"))}</button>
+    <button id="zoom-in" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.modelZoomIn"))}">+</button>
   </div>
-  <main id="stage" aria-label="Interactive 3D model: ${escapeHtml(exactTitle)}"><span id="empty">Preparing verified 3D model…</span></main>
+  <main id="stage" aria-label="${escapeHtml(mobileMessage(locale, "preview.modelStage", { title: exactTitle }))}"><span id="empty">${escapeHtml(mobileMessage(locale, "preview.status.preparingModel"))}</span></main>
   <script>${runtime.script}</script>
   <script>
     (function () {
       'use strict';
       var instanceId = ${JSON.stringify(exactInstanceId)};
+      var labels = ${JSON.stringify(labels)};
       var title = ${JSON.stringify(exactTitle)};
       var bytes = null;
       var manifest = null;
@@ -287,17 +299,15 @@ export function buildMobileModelViewerHtml({
           window.ReactNativeWebView.postMessage(JSON.stringify(value));
         }
       }
-      function cleanError(value) {
-        var text = String(value && value.message ? value.message : value || '3D model preview failed')
-          .replace(/[\\u0000-\\u001f\\u007f]/g, ' ').trim();
-        return (text || '3D model preview failed').slice(0, 512);
+      function cleanError(_) {
+        return labels.error;
       }
       function emit(state, error) {
         var count = manifest && Array.isArray(manifest.files) ? manifest.files.length : 0;
-        var label = state === 'ready' ? 'Ready for verified 3D model bytes'
-          : state === 'receiving' ? 'Receiving verified 3D model…'
-          : state === 'loading' ? 'Loading interactive 3D model…'
-          : state === 'complete' ? 'Interactive 3D model ready'
+        var label = state === 'ready' ? labels.ready
+          : state === 'receiving' ? labels.receiving
+          : state === 'loading' ? labels.loading
+          : state === 'complete' ? labels.complete
           : cleanError(error);
         statusNode.textContent = label;
         statusNode.setAttribute('role', state === 'error' ? 'alert' : 'status');

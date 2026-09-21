@@ -88,7 +88,7 @@ describe("MobilePdfViewer", () => {
     root = createRoot(document.createElement("div"));
     await act(async () => root!.render(createElement(MobilePdfViewer, {
       accent: "#3366ff", background: "#ffffff", border: "#dddddd", byteSize: 80,
-      fileName: "preview-pdf-1.pdf", ink: "#111111", instanceId: "pdf-1", muted: "#666666",
+      fileName: "preview-pdf-1.pdf", ink: "#111111", instanceId: "pdf-1", locale: "en", muted: "#666666",
       onStatusChange, readerDriver: driver, sha256Hex: "a".repeat(64), surface: "#f5f5f5",
       title: "Proof", uri: "file:///cache/joko-pdf-preview/preview-pdf-1.pdf"
     })));
@@ -127,7 +127,7 @@ describe("MobilePdfViewer", () => {
     root = createRoot(document.createElement("div"));
     act(() => root!.render(createElement(MobilePdfViewer, {
       accent: "#3366ff", background: "#ffffff", border: "#dddddd", byteSize: 80,
-      fileName: "preview-pdf-2.pdf", ink: "#111111", instanceId: "pdf-2", muted: "#666666",
+      fileName: "preview-pdf-2.pdf", ink: "#111111", instanceId: "pdf-2", locale: "en", muted: "#666666",
       readerDriver: driver, sha256Hex: "a".repeat(64), surface: "#f5f5f5", title: "Proof",
       uri: "file:///cache/joko-pdf-preview/preview-pdf-2.pdf"
     })));

@@ -5,10 +5,12 @@ import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerRichInput } from "./MobileComposerRichInput";
 import {
+  insertMobilePastedText,
   markMobileComposerSlashCommand,
   plainTextMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
 
 const bridge = vi.hoisted((): {
   instanceId: string;
@@ -123,12 +125,13 @@ function mount(initialDraft: MobileComposerDraft) {
     window: { jokoComposer: page }
   }));
   root = createRoot(document.createElement("div"));
-  const render = (draft: MobileComposerDraft) => act(() => root!.render(createElement(MobileComposerRichInput, {
+  const render = (draft: MobileComposerDraft, locale: MobileSupportedLocale = "en") => act(() => root!.render(createElement(MobileComposerRichInput, {
     accessibilityLabel: "Task message",
     commandPaletteOpen: true,
     draft,
     editable: true,
     height: 88,
+    locale,
     maxHeight: 264,
     onBlur,
     onEdit,
@@ -158,6 +161,31 @@ function mount(initialDraft: MobileComposerDraft) {
 }
 
 describe("mobile composer rich input lifecycle", () => {
+  it("updates a mounted editor document and runtime labels when the locale changes", () => {
+    const draft = insertMobilePastedText(
+      plainTextMobileComposerDraft(""),
+      { start: 0, end: 0 },
+      "first\nsecond",
+      "paste-one"
+    ).draft;
+    const mounted = mount(draft);
+    mounted.ready();
+    expect(mounted.page.document).toEqual({
+      version: 1,
+      nodes: [expect.objectContaining({ label: "Pasted text (2 lines)" })]
+    });
+    const englishDocumentId = mounted.page.documentId;
+
+    mounted.render(draft, "ja");
+    expect(bridge.mounts).toBe(1);
+    expect(mounted.page.documentId).toBeGreaterThan(englishDocumentId);
+    expect(mounted.page.document).toEqual({
+      version: 1,
+      nodes: [expect.objectContaining({ label: "貼り付けたテキスト（2 行）" })]
+    });
+    expect(mounted.page.setConfig).toHaveBeenLastCalledWith(expect.objectContaining({ locale: "ja" }));
+  });
+
   it("restores the latest accepted native document after process loss and ignores old callbacks", () => {
     const mounted = mount(plainTextMobileComposerDraft("initial"));
     mounted.ready();

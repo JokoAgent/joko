@@ -46,6 +46,8 @@ import {
   type MobileQuestionAnswers
 } from "./mobile-interactions";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export interface MobileInteractionSheetColors {
   readonly background: string;
@@ -65,6 +67,7 @@ export function MobileInteractionSheet({
   selectedId,
   busy,
   colors,
+  locale,
   onSelect,
   onMinimize,
   onResolve,
@@ -77,6 +80,7 @@ export function MobileInteractionSheet({
   readonly selectedId?: string;
   readonly busy: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onSelect: (interactionId: string) => void;
   readonly onMinimize: () => void;
   readonly onResolve: (interaction: Interaction, submission: MobileInteractionSubmission) => Promise<boolean>;
@@ -85,7 +89,7 @@ export function MobileInteractionSheet({
 }) {
   const interaction = interactions.find((candidate) => candidate.interactionId === selectedId) ?? interactions[0];
   const interactionIndex = interaction === undefined ? -1 : interactions.indexOf(interaction);
-  const validation = useMemo(() => validateForDisplay(interaction), [interaction]);
+  const validation = useMemo(() => validateForDisplay(interaction, locale), [interaction, locale]);
   const authorityKey = interaction === undefined ? undefined : `${profileId ?? ""}\u001f${displayAuthorityKey(interaction)}`;
   const authorityRef = useRef(authorityKey);
   authorityRef.current = authorityKey;
@@ -145,7 +149,7 @@ export function MobileInteractionSheet({
       setDraft(validation.initialDraft);
       setLoadedKey(key);
       setDraftReady(true);
-      onError(errorText(error));
+      onError(errorText(error, locale));
     });
     return () => {
       current = false;
@@ -161,7 +165,7 @@ export function MobileInteractionSheet({
     setDraft(next);
     if (!identity) return;
     try { mobileInteractionDrafts.save(identity, next); }
-    catch (error) { onError(errorText(error)); }
+    catch (error) { onError(errorText(error, locale)); }
   };
 
   const settle = async (submission: MobileInteractionSubmission): Promise<void> => {
@@ -175,7 +179,7 @@ export function MobileInteractionSheet({
       if (identity) await mobileInteractionDrafts.clear(identity);
       if (mountedRef.current && authorityRef.current === currentAuthorityKey) setDraft(validation.initialDraft);
     } catch (error) {
-      if (mountedRef.current) onError(errorText(error));
+      if (mountedRef.current) onError(errorText(error, locale));
     } finally {
       if (mountedRef.current) setSettling(false);
     }
@@ -184,11 +188,11 @@ export function MobileInteractionSheet({
   const dismiss = (): void => {
     if (disabled) return;
     Alert.alert(
-      "Dismiss this request?",
-      "This sends a durable dismissal to the current task. Minimizing the sheet does not dismiss it.",
+      mobileMessage(locale, "interaction.dismissTitle"),
+      mobileMessage(locale, "interaction.dismissBody"),
       [
-        { text: "Keep request", style: "cancel" },
-        { text: "Dismiss", style: "destructive", onPress: () => {
+        { text: mobileMessage(locale, "interaction.keep"), style: "cancel" },
+        { text: mobileMessage(locale, "common.dismiss"), style: "destructive", onPress: () => {
           const currentAuthorityKey = authorityKey;
           setSettling(true);
           onError("");
@@ -197,7 +201,7 @@ export function MobileInteractionSheet({
             if (identity) await mobileInteractionDrafts.clear(identity);
             if (mountedRef.current && authorityRef.current === currentAuthorityKey) setDraft(validation.initialDraft);
           }).catch((error) => {
-            if (mountedRef.current) onError(errorText(error));
+            if (mountedRef.current) onError(errorText(error, locale));
           }).finally(() => {
             if (mountedRef.current) setSettling(false);
           });
@@ -209,66 +213,74 @@ export function MobileInteractionSheet({
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={onMinimize}>
     <MobileKeyboardAvoidingView keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined} style={sheetStyles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Minimize request" onPress={onMinimize}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "interaction.minimize")} onPress={onMinimize}
         style={sheetStyles.backdrop} />
       <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
         style={[sheetStyles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={sheetStyles.header}>
           <View style={sheetStyles.headerText}>
             <Text style={[sheetStyles.eyebrow, { color: colors.muted }]}>
-              {mobileInteractionKindLabel(interaction)} · Request {interactionIndex + 1} of {interactions.length}
+              {mobileMessage(locale, "interaction.requestPosition", {
+                kind: mobileInteractionKindLabel(interaction, locale),
+                index: interactionIndex + 1,
+                count: interactions.length
+              })}
             </Text>
             <Text accessibilityRole="header" style={[sheetStyles.title, { color: colors.ink }]}>
-              {mobileInteractionTitle(interaction)}
+              {mobileInteractionTitle(interaction, locale)}
             </Text>
           </View>
-          <Pressable accessibilityRole="button" accessibilityLabel="Minimize request" onPress={onMinimize}
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "interaction.minimize")} onPress={onMinimize}
             style={sheetStyles.iconButton}>
             <Text style={[sheetStyles.iconText, { color: colors.accent }]}>—</Text>
           </Pressable>
         </View>
         {interactions.length > 1 && <View style={sheetStyles.requestNavigation}>
-          <SheetButton label="Previous request" colors={colors} quiet disabled={interactionIndex <= 0 || disabled}
+          <SheetButton label={mobileMessage(locale, "interaction.previous")} colors={colors} quiet disabled={interactionIndex <= 0 || disabled}
             onPress={() => onSelect(interactions[interactionIndex - 1]!.interactionId)} />
-          <SheetButton label="Next request" colors={colors} quiet disabled={interactionIndex >= interactions.length - 1 || disabled}
+          <SheetButton label={mobileMessage(locale, "interaction.next")} colors={colors} quiet disabled={interactionIndex >= interactions.length - 1 || disabled}
             onPress={() => onSelect(interactions[interactionIndex + 1]!.interactionId)} />
         </View>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={sheetStyles.content}>
           {validation.error !== undefined
             ? <Text accessibilityRole="alert" style={[sheetStyles.error, { color: colors.negative }]}>{validation.error}</Text>
             : !ready
-              ? <Text style={[sheetStyles.body, { color: colors.muted }]}>Restoring saved response…</Text>
+              ? <Text style={[sheetStyles.body, { color: colors.muted }]}>{mobileMessage(locale, "interaction.restoring")}</Text>
               : interaction.request.case === "permission"
-                ? <PermissionRequest interaction={interaction} disabled={disabled} colors={colors} onResolve={(decision) => {
+                ? <PermissionRequest interaction={interaction} disabled={disabled} colors={colors} locale={locale} onResolve={(decision) => {
                   const submit = () => void settle({ kind: "permission", decision });
                   if (!mobilePermissionDecisionNeedsConfirmation(interaction, decision)) { submit(); return; }
                   Alert.alert(
-                    `${mobilePermissionRiskLabel(interaction.request.case === "permission" ? interaction.request.value.risk : 0)} permission`,
-                    "This approval can perform a high-impact action. Review the exact subject before continuing.",
-                    [{ text: "Cancel", style: "cancel" }, { text: mobilePermissionDecisionLabel(decision), style: "destructive", onPress: submit }]
+                    mobileMessage(locale, "interaction.highRiskTitle", {
+                      risk: mobilePermissionRiskLabel(interaction.request.case === "permission" ? interaction.request.value.risk : 0, locale)
+                    }),
+                    mobileMessage(locale, "interaction.highRiskBody"),
+                    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+                      { text: mobilePermissionDecisionLabel(decision, locale), style: "destructive", onPress: submit }]
                   );
                 }} />
                 : interaction.request.case === "question" && draft?.kind === "question"
-                  ? <QuestionRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors}
+                  ? <QuestionRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors} locale={locale}
                     onDraft={updateDraft} onResolve={(answers) => void settle({ kind: "question", answers })} />
                   : interaction.request.case === "planReview" && draft?.kind === "plan"
-                    ? <PlanRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors}
+                    ? <PlanRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors} locale={locale}
                       onDraft={updateDraft} onResolve={(decision, feedback) => void settle({ kind: "plan", decision, feedback })} />
-                    : <Text accessibilityRole="alert" style={[sheetStyles.error, { color: colors.negative }]}>This response draft no longer matches the current request.</Text>}
+                    : <Text accessibilityRole="alert" style={[sheetStyles.error, { color: colors.negative }]}>{mobileMessage(locale, "interaction.draftMismatch")}</Text>}
         </ScrollView>
         <View style={[sheetStyles.footer, { borderColor: colors.border }]}>
-          <SheetButton label="Dismiss request" colors={colors} quiet danger disabled={disabled} onPress={dismiss} />
-          <SheetButton label="Minimize" colors={colors} quiet disabled={settling} onPress={onMinimize} />
+          <SheetButton label={mobileMessage(locale, "interaction.dismiss")} colors={colors} quiet danger disabled={disabled} onPress={dismiss} />
+          <SheetButton label={mobileMessage(locale, "interaction.minimizeShort")} colors={colors} quiet disabled={settling} onPress={onMinimize} />
         </View>
       </SafeAreaView>
     </MobileKeyboardAvoidingView>
   </Modal>;
 }
 
-function PermissionRequest({ interaction, disabled, colors, onResolve }: {
+function PermissionRequest({ interaction, disabled, colors, locale, onResolve }: {
   readonly interaction: Interaction;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onResolve: (decision: PermissionDecisionKind) => void;
 }) {
   if (interaction.request.case !== "permission") return null;
@@ -276,10 +288,10 @@ function PermissionRequest({ interaction, disabled, colors, onResolve }: {
   const riskDanger = request.risk !== PermissionRisk.READ_ONLY
     && request.risk !== PermissionRisk.LOW
     && request.risk !== PermissionRisk.MEDIUM;
-  const details = mobilePermissionDetails(request.subject);
+  const details = mobilePermissionDetails(request.subject, locale);
   return <View style={sheetStyles.sectionStack}>
     <View style={[sheetStyles.riskPill, { backgroundColor: riskDanger ? colors.negative : colors.brandBackground }]}>
-      <Text style={[sheetStyles.riskText, { color: riskDanger ? "#fff" : colors.ink }]}>{mobilePermissionRiskLabel(request.risk)}</Text>
+      <Text style={[sheetStyles.riskText, { color: riskDanger ? "#fff" : colors.ink }]}>{mobilePermissionRiskLabel(request.risk, locale)}</Text>
     </View>
     {request.explanation.trim() !== "" && <Text selectable style={[sheetStyles.body, { color: colors.ink }]}>{request.explanation}</Text>}
     {details.length > 0 && <View style={[sheetStyles.detailCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
@@ -289,7 +301,7 @@ function PermissionRequest({ interaction, disabled, colors, onResolve }: {
       </View>)}
     </View>}
     <View style={sheetStyles.decisionStack}>
-      {request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePermissionDecisionLabel(decision)}
+      {request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePermissionDecisionLabel(decision, locale)}
         colors={colors} disabled={disabled} danger={mobilePermissionDecisionDanger(decision)}
         quiet={decision === PermissionDecisionKind.DENY_ONCE || decision === PermissionDecisionKind.DENY_FOR_SESSION}
         onPress={() => onResolve(decision)} />)}
@@ -297,11 +309,12 @@ function PermissionRequest({ interaction, disabled, colors, onResolve }: {
   </View>;
 }
 
-function QuestionRequest({ interaction, draft, disabled, colors, onDraft, onResolve }: {
+function QuestionRequest({ interaction, draft, disabled, colors, locale, onDraft, onResolve }: {
   readonly interaction: Interaction;
   readonly draft: Extract<MobileInteractionDraft, { readonly kind: "question" }>;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onDraft: (draft: MobileInteractionDraft) => void;
   readonly onResolve: (answers: MobileQuestionAnswers) => void;
 }) {
@@ -310,7 +323,7 @@ function QuestionRequest({ interaction, draft, disabled, colors, onDraft, onReso
   const index = clampMobileQuestionIndex(draft.fieldIndex, request.fields.length);
   const field = request.fields[index]!;
   const answer = draft.answers[field.fieldId];
-  const fieldError = mobileQuestionFieldError(field, answer);
+  const fieldError = mobileQuestionFieldError(field, answer, locale);
   const canSubmit = mobileQuestionCanSubmit(interaction, draft.answers);
   const updateAnswer = (next: MobileQuestionAnswerDraft | undefined): void => {
     const answers = { ...draft.answers };
@@ -321,46 +334,50 @@ function QuestionRequest({ interaction, draft, disabled, colors, onDraft, onReso
   const go = (fieldIndex: number): void => onDraft({ ...draft, fieldIndex: clampMobileQuestionIndex(fieldIndex, request.fields.length) });
   return <View style={sheetStyles.sectionStack}>
     {request.prompt.trim() !== "" && <Text selectable style={[sheetStyles.body, { color: colors.ink }]}>{request.prompt}</Text>}
-    <Text style={[sheetStyles.eyebrow, { color: colors.muted }]}>Question {index + 1} of {request.fields.length}</Text>
+    <Text style={[sheetStyles.eyebrow, { color: colors.muted }]}>{mobileMessage(locale, "interaction.questionPosition", {
+      index: index + 1,
+      count: request.fields.length
+    })}</Text>
     <View style={[sheetStyles.questionCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
       <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>{field.label || field.fieldId}{field.required ? " *" : ""}</Text>
       {field.description.trim() !== "" && <Text style={[sheetStyles.caption, { color: colors.muted }]}>{field.description}</Text>}
-      <QuestionFieldInput field={field} answer={answer} disabled={disabled} colors={colors} onChange={updateAnswer} />
+      <QuestionFieldInput field={field} answer={answer} disabled={disabled} colors={colors} locale={locale} onChange={updateAnswer} />
       {fieldError !== undefined && <Text accessibilityRole="alert" style={[sheetStyles.fieldError, { color: colors.negative }]}>{fieldError}</Text>}
     </View>
     <View style={sheetStyles.requestNavigation}>
-      <SheetButton label="Back" colors={colors} quiet disabled={disabled || index === 0} onPress={() => go(index - 1)} />
-      {!field.required && <SheetButton label="Skip" colors={colors} quiet disabled={disabled} onPress={() => {
+      <SheetButton label={mobileMessage(locale, "common.back")} colors={colors} quiet disabled={disabled || index === 0} onPress={() => go(index - 1)} />
+      {!field.required && <SheetButton label={mobileMessage(locale, "common.skip")} colors={colors} quiet disabled={disabled} onPress={() => {
         const answers = { ...draft.answers };
         delete answers[field.fieldId];
         onDraft({ ...draft, answers,
           fieldIndex: index < request.fields.length - 1 ? index + 1 : index });
       }} />}
       {index < request.fields.length - 1
-        ? <SheetButton label="Continue" colors={colors} disabled={disabled || fieldError !== undefined} onPress={() => go(index + 1)} />
-        : <SheetButton label="Submit answers" colors={colors} disabled={disabled || !canSubmit} onPress={() => onResolve(draft.answers)} />}
+        ? <SheetButton label={mobileMessage(locale, "common.continue")} colors={colors} disabled={disabled || fieldError !== undefined} onPress={() => go(index + 1)} />
+        : <SheetButton label={mobileMessage(locale, "interaction.submitAnswers")} colors={colors} disabled={disabled || !canSubmit} onPress={() => onResolve(draft.answers)} />}
     </View>
   </View>;
 }
 
-function QuestionFieldInput({ field, answer, disabled, colors, onChange }: {
+function QuestionFieldInput({ field, answer, disabled, colors, locale, onChange }: {
   readonly field: QuestionField;
   readonly answer: MobileQuestionAnswerDraft | undefined;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onChange: (answer: MobileQuestionAnswerDraft | undefined) => void;
 }) {
   const input = field.input;
   if (input.case === "text") return <TextInput accessibilityLabel={field.label || field.fieldId}
     multiline={input.value.multiline} editable={!disabled} value={answer?.kind === "text" ? answer.value : ""}
-    placeholder={input.value.placeholder || "Type your answer"} placeholderTextColor={colors.muted}
+    placeholder={input.value.placeholder || mobileMessage(locale, "interaction.answerPlaceholder")} placeholderTextColor={colors.muted}
     onChangeText={(value) => onChange({ kind: "text", value })}
     style={[sheetStyles.textInput, input.value.multiline && sheetStyles.multilineInput,
       { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />;
   if (input.case === "boolean") return <View style={sheetStyles.choiceStack}>
-    <ChoiceRow label="Yes" selected={answer?.kind === "boolean" && answer.value} disabled={disabled} colors={colors}
+    <ChoiceRow label={mobileMessage(locale, "common.yes")} selected={answer?.kind === "boolean" && answer.value} disabled={disabled} colors={colors}
       role="radio" onPress={() => onChange({ kind: "boolean", value: true })} />
-    <ChoiceRow label="No" selected={answer?.kind === "boolean" && !answer.value} disabled={disabled} colors={colors}
+    <ChoiceRow label={mobileMessage(locale, "common.no")} selected={answer?.kind === "boolean" && !answer.value} disabled={disabled} colors={colors}
       role="radio" onPress={() => onChange({ kind: "boolean", value: false })} />
   </View>;
   if (input.case === "singleChoice") {
@@ -371,11 +388,11 @@ function QuestionFieldInput({ field, answer, disabled, colors, onChange }: {
         selected={answer?.kind === "single" && answer.selection.kind === "choice" && answer.selection.choiceId === choice.choiceId}
         colors={colors} onPress={() => onChange(toggleMobileQuestionChoice(field, answer, choice.choiceId))} />)}
       {input.value.allowOther && <View style={sheetStyles.otherStack}>
-        <ChoiceRow label="Other" role="radio" disabled={disabled}
+        <ChoiceRow label={mobileMessage(locale, "common.other")} role="radio" disabled={disabled}
           selected={answer?.kind === "single" && answer.selection.kind === "other"}
           colors={colors} onPress={() => onChange(setMobileQuestionOther(field, answer, other))} />
-        <TextInput accessibilityLabel={`${field.label || field.fieldId} other response`} editable={!disabled}
-          value={other} placeholder="Type another response" placeholderTextColor={colors.muted}
+        <TextInput accessibilityLabel={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} editable={!disabled}
+          value={other} placeholder={mobileMessage(locale, "interaction.otherPlaceholder")} placeholderTextColor={colors.muted}
           onFocus={() => onChange(setMobileQuestionOther(field, answer, other))}
           onChangeText={(value) => onChange(setMobileQuestionOther(field, answer, value))}
           style={[sheetStyles.textInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
@@ -396,24 +413,28 @@ function QuestionFieldInput({ field, answer, disabled, colors, onChange }: {
           onPress={() => onChange(toggleMobileQuestionChoice(field, answer, choice.choiceId))} />;
       })}
       {input.value.allowOther && <View style={sheetStyles.otherStack}>
-        <TextInput accessibilityLabel={`${field.label || field.fieldId} other response`} editable={!disabled && (!atMaximum || other !== "")}
-          value={other} placeholder="Add another response" placeholderTextColor={colors.muted}
+        <TextInput accessibilityLabel={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} editable={!disabled && (!atMaximum || other !== "")}
+          value={other} placeholder={mobileMessage(locale, "interaction.addOtherPlaceholder")} placeholderTextColor={colors.muted}
           onChangeText={(value) => onChange(setMobileQuestionOther(field, answer, value))}
           style={[sheetStyles.textInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
       </View>}
       <Text style={[sheetStyles.caption, { color: colors.muted }]}>
-        Select at least {minimum}{maximum === undefined ? "" : ` and at most ${maximum}`}.
+        {mobileMessage(locale, "interaction.selectionBounds", {
+          minimum,
+          maximum: maximum === undefined ? "" : mobileMessage(locale, "interaction.selectionMaximum", { maximum })
+        })}
       </Text>
     </View>;
   }
   return null;
 }
 
-function PlanRequest({ interaction, draft, disabled, colors, onDraft, onResolve }: {
+function PlanRequest({ interaction, draft, disabled, colors, locale, onDraft, onResolve }: {
   readonly interaction: Interaction;
   readonly draft: Extract<MobileInteractionDraft, { readonly kind: "plan" }>;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onDraft: (draft: MobileInteractionDraft) => void;
   readonly onResolve: (decision: PlanReviewDecisionKind, feedback: string) => void;
 }) {
@@ -421,25 +442,25 @@ function PlanRequest({ interaction, draft, disabled, colors, onDraft, onResolve 
   const request = interaction.request.value;
   return <View style={sheetStyles.sectionStack}>
     <Text selectable style={[sheetStyles.planText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>
-      {request.markdown || "No plan text was supplied."}
+      {request.markdown || mobileMessage(locale, "interaction.noPlan")}
     </Text>
     {request.steps.length > 0 && <View style={sheetStyles.stepStack}>
       {request.steps.map((step, index) => <View key={step.stepId} style={[sheetStyles.stepCard, { borderColor: colors.border }]}>
         <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>{index + 1}. {step.title || step.stepId}</Text>
-        <Text style={[sheetStyles.eyebrow, { color: colors.muted }]}>{mobilePlanStepStateLabel(step.state)}</Text>
+        <Text style={[sheetStyles.eyebrow, { color: colors.muted }]}>{mobilePlanStepStateLabel(step.state, locale)}</Text>
         {step.description.trim() !== "" && <Text style={[sheetStyles.caption, { color: colors.muted }]}>{step.description}</Text>}
       </View>)}
     </View>}
     <View style={sheetStyles.otherStack}>
-      <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>Feedback</Text>
-      <TextInput accessibilityLabel="Plan feedback" multiline editable={!disabled} value={draft.feedback}
-        placeholder="Describe changes if the plan needs refinement" placeholderTextColor={colors.muted}
+      <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>{mobileMessage(locale, "interaction.feedback")}</Text>
+      <TextInput accessibilityLabel={mobileMessage(locale, "interaction.planFeedback")} multiline editable={!disabled} value={draft.feedback}
+        placeholder={mobileMessage(locale, "interaction.planPlaceholder")} placeholderTextColor={colors.muted}
         onChangeText={(feedback) => onDraft({ kind: "plan", feedback })}
         style={[sheetStyles.textInput, sheetStyles.multilineInput,
           { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
     </View>
     <View style={sheetStyles.decisionStack}>
-      {request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePlanDecisionLabel(decision)}
+      {request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePlanDecisionLabel(decision, locale)}
         colors={colors} disabled={disabled || decision === PlanReviewDecisionKind.REFINE && draft.feedback.trim() === ""}
         quiet={decision === PlanReviewDecisionKind.STAY_IN_PLAN_MODE}
         onPress={() => onResolve(decision, draft.feedback)} />)}
@@ -484,10 +505,13 @@ function SheetButton({ label, colors, onPress, disabled, quiet, danger }: {
   </Pressable>;
 }
 
-function validateForDisplay(interaction: Interaction | undefined): { readonly initialDraft?: MobileInteractionDraft; readonly error?: string } {
+function validateForDisplay(
+  interaction: Interaction | undefined,
+  locale: MobileSupportedLocale
+): { readonly initialDraft?: MobileInteractionDraft; readonly error?: string } {
   if (!interaction) return {};
   try { return { initialDraft: initialMobileInteractionDraft(interaction) }; }
-  catch (error) { return { error: errorText(error) }; }
+  catch (error) { return { error: errorText(error, locale) }; }
 }
 
 function displayAuthorityKey(interaction: Interaction): string {
@@ -500,8 +524,8 @@ function displayAuthorityKey(interaction: Interaction): string {
   }
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : "This request could not be updated.";
+function errorText(error: unknown, locale: MobileSupportedLocale): string {
+  return error instanceof Error ? error.message : mobileMessage(locale, "interaction.updateError");
 }
 
 const sheetStyles = StyleSheet.create({

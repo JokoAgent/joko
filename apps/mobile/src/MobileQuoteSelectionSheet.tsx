@@ -2,18 +2,22 @@ import { useEffect, useRef, useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import { mobileSelectionQuoteMaximumCharacters, type MobileComposerSelection } from "./mobile-composer-document";
 import type { MobileQuoteSelectionLease } from "./mobile-composer-quote";
 
 export function MobileQuoteSelectionSheet({
   lease,
   colors,
+  locale,
   busy,
   onClose,
   onAdd
 }: {
   readonly lease?: MobileQuoteSelectionLease;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly busy: boolean;
   readonly onClose: () => void;
   readonly onAdd: (selection: MobileComposerSelection) => void;
@@ -34,40 +38,42 @@ export function MobileQuoteSelectionSheet({
 
   return <Modal visible transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
     <View style={styles.root}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close quote selection"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "quote.close")}
         disabled={busy} onPress={onClose} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal importantForAccessibility="yes" edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.header}>
           <View style={styles.headerText}>
-            <Text style={[styles.eyebrow, { color: colors.muted }]}>Assistant message</Text>
-            <Text style={[styles.title, { color: colors.ink }]}>Select text to quote</Text>
+            <Text style={[styles.eyebrow, { color: colors.muted }]}>{mobileMessage(locale, "quote.eyebrow")}</Text>
+            <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "quote.title")}</Text>
           </View>
-          <Pressable accessibilityRole="button" accessibilityLabel="Close quote selection"
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "quote.close")}
             disabled={busy} onPress={onClose} style={styles.close}>
             <Text style={[styles.closeText, { color: colors.ink }]}>×</Text>
           </Pressable>
         </View>
-        <Text style={[styles.help, { color: colors.muted }]}>Select up to {mobileSelectionQuoteMaximumCharacters.toLocaleString("en-US")} characters. The source message is frozen while this sheet is open.</Text>
+        <Text style={[styles.help, { color: colors.muted }]}>{mobileMessage(locale, "quote.help", {
+          count: mobileSelectionQuoteMaximumCharacters.toLocaleString(locale)
+        })}</Text>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
-          <TextInput ref={inputRef} accessibilityLabel="Assistant text to quote" multiline readOnly
+          <TextInput ref={inputRef} accessibilityLabel={mobileMessage(locale, "quote.input")} multiline readOnly
             showSoftInputOnFocus={false} value={lease.text} selection={selection}
             onSelectionChange={(event) => setSelection(event.nativeEvent.selection)}
             style={[styles.text, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
         </ScrollView>
         <Text accessibilityLiveRegion="polite" style={[styles.count, {
           color: selectedCharacters > mobileSelectionQuoteMaximumCharacters ? colors.negative : colors.muted
-        }]}>{selectedCharacters.toLocaleString("en-US")} selected</Text>
+        }]}>{mobileMessage(locale, "quote.selected", { count: selectedCharacters.toLocaleString(locale) })}</Text>
         <View style={styles.actions}>
-          <Pressable accessibilityRole="button" accessibilityLabel="Select all assistant text"
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "quote.selectAllLabel")}
             disabled={busy} onPress={() => setSelection({ start: 0, end: lease.text.length })}
             style={[styles.button, { borderColor: colors.border }, busy && styles.disabled]}>
-            <Text style={[styles.buttonText, { color: colors.ink }]}>Select all</Text>
+            <Text style={[styles.buttonText, { color: colors.ink }]}>{mobileMessage(locale, "quote.selectAll")}</Text>
           </Pressable>
-          <Pressable accessibilityRole="button" accessibilityLabel="Add selected text as quote"
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "quote.addLabel")}
             accessibilityState={{ disabled: !canAdd }} disabled={!canAdd} onPress={() => onAdd(selection)}
             style={[styles.button, { backgroundColor: colors.accent, borderColor: colors.accent }, !canAdd && styles.disabled]}>
-            <Text style={[styles.buttonText, { color: colors.surface }]}>Add quote</Text>
+            <Text style={[styles.buttonText, { color: colors.surface }]}>{mobileMessage(locale, "quote.add")}</Text>
           </Pressable>
         </View>
       </SafeAreaView>

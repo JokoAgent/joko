@@ -35,6 +35,8 @@ import {
   type MobileComposerCommandPaletteKey,
   type MobileComposerPastedImageMediaType
 } from "./mobile-composer-rich-input-protocol";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export interface MobileComposerRichInputHandle {
   blur(): void;
@@ -70,6 +72,7 @@ export interface MobileComposerRichInputProps {
   readonly draft: MobileComposerDraft;
   readonly editable: boolean;
   readonly height: number;
+  readonly locale: MobileSupportedLocale;
   readonly maxHeight: number;
   readonly onBlur?: () => void;
   readonly onCommandPaletteKey?: (key: MobileComposerCommandPaletteKey) => void;
@@ -98,6 +101,7 @@ interface AcceptedDocument {
   readonly document: MobileComposerRichDocument;
   readonly documentId: number;
   readonly draft: MobileComposerDraft;
+  readonly locale: MobileSupportedLocale;
 }
 
 interface SurfaceIdentity {
@@ -139,6 +143,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
     draft,
     editable,
     height,
+    locale,
     maxHeight,
     onBlur,
     onCommandPaletteKey,
@@ -175,9 +180,10 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       onPasteText, onSelectionChange
     });
     const acceptedRef = useRef<AcceptedDocument>({
-      document: mobileComposerRichDocument(draft),
+      document: mobileComposerRichDocument(draft, locale),
       documentId: 1,
-      draft
+      draft,
+      locale
     });
     const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
     const heartbeatTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -199,10 +205,16 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       accessibilityLabel,
       commandPaletteOpen,
       editable,
+      labels: {
+        selectedCommand: mobileMessage(locale, "composer.rich.selectedCommand", { command: "{command}" }),
+        structuredItem: mobileMessage(locale, "composer.rich.structuredItem"),
+        taskMessage: mobileMessage(locale, "composer.rich.taskMessage")
+      },
+      locale,
       maxHeight: Math.max(44, Math.min(4_096, Math.ceil(maxHeight))),
       placeholder,
       theme
-    }), [accessibilityLabel, commandPaletteOpen, editable, maxHeight, placeholder, theme]);
+    }), [accessibilityLabel, commandPaletteOpen, editable, locale, maxHeight, placeholder, theme]);
 
     const initialHtml = useMemo(() => buildMobileComposerRichInputHtml({
       ...runtimeConfig,
@@ -238,10 +250,10 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       nextSelection: MobileComposerSelection,
       focus = false
     ) => {
-      const document = mobileComposerRichDocument(nextDraft);
+      const document = mobileComposerRichDocument(nextDraft, locale);
       const normalizedSelection = validateMobileComposerRichSelection(nextDraft, nextSelection);
       const documentId = acceptedRef.current.documentId + 1;
-      acceptedRef.current = { document, documentId, draft: nextDraft };
+      acceptedRef.current = { document, documentId, draft: nextDraft, locale };
       selectionRef.current = normalizedSelection;
       if (readyRef.current) inject(buildMobileComposerRichApplyScript({
         document,
@@ -250,7 +262,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         focus
       }));
       else if (focus) pendingFocusRef.current = true;
-    }, [inject]);
+    }, [inject, locale]);
 
     const rebuildSurface = useCallback(() => {
       deferredRecoveryRef.current = false;
@@ -291,9 +303,9 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
           pendingHeartbeatRef.current = undefined;
           return;
         }
-        recover("The structured message editor stopped responding and was reloaded.");
+        recover(mobileMessage(locale, "composer.rich.unresponsive"));
       }, heartbeatTimeoutMilliseconds);
-    }, [inject, recover]);
+    }, [inject, locale, recover]);
 
     const startHeartbeat = useCallback(() => {
       clearHeartbeat();
@@ -313,17 +325,17 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
 
     useEffect(() => {
       const current = acceptedRef.current;
-      if (mobileComposerDraftsEqual(current.draft, draft)) {
+      if (mobileComposerDraftsEqual(current.draft, draft) && current.locale === locale) {
         acceptedRef.current = { ...current, draft };
         return;
       }
       cancelPendingImagePaste();
       try {
         applyAcceptedDocument(draft, selectionRef.current);
-      } catch (failure) {
-        callbacksRef.current.onError(errorText(failure));
+      } catch {
+        callbacksRef.current.onError(mobileMessage(locale, "composer.rich.invalidUpdate"));
       }
-    }, [applyAcceptedDocument, cancelPendingImagePaste, draft]);
+    }, [applyAcceptedDocument, cancelPendingImagePaste, draft, locale]);
 
     useEffect(() => {
       if (readyRef.current) inject(buildMobileComposerRichConfigScript(runtimeConfig));
@@ -418,7 +430,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
             ...(message.text === undefined ? {} : { text: message.text })
           });
         } catch (failure) {
-          callbacksRef.current.onError(errorText(failure));
+          callbacksRef.current.onError(errorText(failure, locale));
           applyAcceptedDocument(current.draft, selectionRef.current);
         }
         return;
@@ -426,7 +438,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       if (message.type === "pasteImagesStart") {
         if (message.documentId !== current.documentId) return;
         if (!editableRef.current || AppState.currentState !== "active" || pendingImagePasteRef.current) {
-          callbacksRef.current.onError("Finish the active attachment action before pasting more images.");
+          callbacksRef.current.onError(mobileMessage(locale, "composer.rich.finishAttachment"));
           return;
         }
         let accepted = false;
@@ -434,18 +446,18 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
           accepted = callbacksRef.current.onPasteImages !== undefined
             && callbacksRef.current.onPasteImagesStart?.({ count: message.count, draft: current.draft }) === true;
         } catch (failure) {
-          callbacksRef.current.onError(errorText(failure));
+          callbacksRef.current.onError(errorText(failure, locale));
           return;
         }
         if (!accepted) {
-          callbacksRef.current.onError("Image paste is unavailable for this task and model.");
+          callbacksRef.current.onError(mobileMessage(locale, "composer.rich.imagePasteUnavailable"));
           return;
         }
         const timeout = setTimeout(() => {
           const pending = pendingImagePasteRef.current;
           if (!pending || pending.documentId !== message.documentId || pending.requestId !== message.requestId) return;
           cancelPendingImagePaste();
-          callbacksRef.current.onError("The clipboard images took too long to read. The batch was discarded.");
+          callbacksRef.current.onError(mobileMessage(locale, "composer.rich.imagePasteTimeout"));
         }, pastedImageReadTimeoutMilliseconds);
         pendingImagePasteRef.current = {
           count: message.count,
@@ -464,7 +476,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         if (!pending || pending.documentId !== message.documentId || pending.requestId !== message.requestId) return;
         if (message.index >= pending.count || pending.settled.has(message.index)) {
           cancelPendingImagePaste();
-          callbacksRef.current.onError("The clipboard image batch was malformed and was discarded.");
+          callbacksRef.current.onError(mobileMessage(locale, "composer.rich.imagePasteMalformed"));
           return;
         }
         pending.settled.add(message.index);
@@ -482,7 +494,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         clearTimeout(pending.timeout);
         if (pending.failed || pending.images.some((image) => image === undefined)) {
           callbacksRef.current.onPasteImagesCancel?.(pending.draft);
-          callbacksRef.current.onError("One or more clipboard images could not be read. The batch was discarded.");
+          callbacksRef.current.onError(mobileMessage(locale, "composer.rich.imagePasteFailed"));
           return;
         }
         try {
@@ -493,7 +505,7 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
           });
         } catch (failure) {
           callbacksRef.current.onPasteImagesCancel?.(pending.draft);
-          callbacksRef.current.onError(errorText(failure));
+          callbacksRef.current.onError(errorText(failure, locale));
         }
         return;
       }
@@ -511,18 +523,19 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
       try {
         const result = reconcileMobileComposerRichDocument(current.draft, message.segments, message);
         acceptedRef.current = {
-          document: mobileComposerRichDocument(result.draft),
+          document: mobileComposerRichDocument(result.draft, locale),
           documentId: current.documentId,
-          draft: result.draft
+          draft: result.draft,
+          locale
         };
         selectionRef.current = result.selection;
         callbacksRef.current.onSelectionChange(result.selection, current.draft);
         callbacksRef.current.onEdit(result, current.draft);
       } catch (failure) {
-        callbacksRef.current.onError(errorText(failure));
+        callbacksRef.current.onError(mobileMessage(locale, "composer.rich.invalidUpdate"));
         applyAcceptedDocument(current.draft, selectionRef.current);
       }
-    }, [applyAcceptedDocument, cancelPendingImagePaste, inject, maxHeight, ownerKey, runtimeConfig, startHeartbeat]);
+    }, [applyAcceptedDocument, cancelPendingImagePaste, inject, locale, maxHeight, ownerKey, runtimeConfig, startHeartbeat]);
 
     return <View style={[
       styles.frame,
@@ -545,11 +558,11 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
         keyboardDisplayRequiresUserAction={false}
         hideKeyboardAccessoryView={Platform.OS === "ios" && !Platform.isPad}
         mixedContentMode="never"
-        onContentProcessDidTerminate={() => recover("The structured message editor was reclaimed and is being restored.")}
-        onError={() => recover("The structured message editor failed to load and is being restored.")}
+        onContentProcessDidTerminate={() => recover(mobileMessage(locale, "composer.rich.reclaimed"))}
+        onError={() => recover(mobileMessage(locale, "composer.rich.loadFailed"))}
         onMessage={handleMessage}
         onRenderProcessGone={() => {
-          recover("The structured message editor process ended and is being restored.");
+          recover(mobileMessage(locale, "composer.rich.processEnded"));
           return true;
         }}
         onShouldStartLoadWithRequest={(request: { readonly url: string }) => request.url === richInputBaseUrl
@@ -569,8 +582,8 @@ export const MobileComposerRichInput = forwardRef<MobileComposerRichInputHandle,
   }
 );
 
-function errorText(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : "The structured message editor rejected an invalid update.";
+function errorText(error: unknown, locale: MobileSupportedLocale): string {
+  return error instanceof Error && error.message ? error.message : mobileMessage(locale, "composer.rich.invalidUpdate");
 }
 
 export const mobileComposerRichInputTesting = {

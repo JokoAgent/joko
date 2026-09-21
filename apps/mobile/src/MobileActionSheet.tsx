@@ -10,18 +10,22 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useReducedMotion } from "./MobileDrawer";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import { DeferredSheetAction, type MobileMessageActionId, type MobileMessageActionItem } from "./task-actions";
 
 export function MobileActionSheet({
   visible,
   items,
   colors,
+  locale,
   onClose,
   onAction
 }: {
   readonly visible: boolean;
   readonly items: readonly MobileMessageActionItem[];
   readonly colors: { readonly surface: string; readonly ink: string; readonly muted: string; readonly border: string; readonly negative: string };
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onAction: (action: MobileMessageActionId) => void;
 }) {
@@ -87,7 +91,7 @@ export function MobileActionSheet({
   if (!mounted) return null;
   return <Modal transparent visible animationType="none" statusBarTranslucent onRequestClose={cancel}>
     <View style={styles.root}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Cancel message actions" onPress={cancel} style={styles.backdrop} />
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "actions.cancelMessage")} onPress={cancel} style={styles.backdrop} />
       <Animated.View accessibilityViewIsModal importantForAccessibility="yes"
         style={[styles.area, { paddingBottom: Math.max(12, insets.bottom), transform: [{ translateY }] }]}>
         <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -99,9 +103,9 @@ export function MobileActionSheet({
             </Pressable>
           </View>)}
         </View>
-        <Pressable accessibilityRole="button" accessibilityLabel="Cancel" onPress={cancel}
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.cancel")} onPress={cancel}
           style={({ pressed }) => [styles.cancel, { backgroundColor: colors.surface, borderColor: colors.border }, pressed && styles.pressed]}>
-          <Text style={[styles.label, { color: colors.ink }]}>Cancel</Text>
+          <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "common.cancel")}</Text>
         </Pressable>
       </Animated.View>
     </View>

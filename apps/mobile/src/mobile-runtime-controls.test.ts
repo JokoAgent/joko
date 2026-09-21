@@ -78,7 +78,7 @@ describe("mobile runtime controls", () => {
     });
     expect(filterMobileModelRoutes(controls?.models ?? [], "128")).toEqual([]);
     expect(filterMobileModelRoutes(controls?.models ?? [], "alpha")).toHaveLength(1);
-    expect(formatMobileTokenLimit(128_000n)).toBe("128K context");
+    expect(formatMobileTokenLimit(128_000n, "en")).toBe("128K context");
     expect(detail.models).toEqual([]);
     expect(detail.providers).toEqual([]);
     expect(detail.settings).toBeUndefined();

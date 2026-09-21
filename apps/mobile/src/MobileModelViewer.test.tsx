@@ -84,7 +84,7 @@ describe("MobileModelViewer", () => {
     root = createRoot(document.createElement("div"));
     await act(async () => root!.render(createElement(MobileModelViewer, {
       accent: "#3366ff", background: "#ffffff", border: "#dddddd", ink: "#111111",
-      lease: lease(80), muted: "#666666", onStatusChange, readerDriver: driver,
+      lease: lease(80), locale: "en", muted: "#666666", onStatusChange, readerDriver: driver,
       surface: "#f5f5f5", title: "Scene"
     })));
 
@@ -125,7 +125,7 @@ describe("MobileModelViewer", () => {
     root = createRoot(document.createElement("div"));
     await act(async () => root!.render(createElement(MobileModelViewer, {
       accent: "#3366ff", background: "#ffffff", border: "#dddddd", ink: "#111111",
-      lease: lease(80), muted: "#666666", readerDriver: driver, surface: "#f5f5f5", title: "Scene"
+      lease: lease(80), locale: "en", muted: "#666666", readerDriver: driver, surface: "#f5f5f5", title: "Scene"
     })));
     await message({ type: "joko-model-viewer/status", instanceId: "model-1",
       state: "ready", fileCount: 0, error: null });

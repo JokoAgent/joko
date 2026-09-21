@@ -1,4 +1,6 @@
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export const mobilePdfViewerLimits = {
   maximumChunkBytes: 128 * 1024,
@@ -110,6 +112,7 @@ export function parseMobilePdfViewerMessage(data: string, instanceId: string): M
 
 export function buildMobilePdfViewerHtml({
   instanceId,
+  locale,
   title,
   background,
   surface,
@@ -119,6 +122,7 @@ export function buildMobilePdfViewerHtml({
   border
 }: {
   readonly instanceId: string;
+  readonly locale: MobileSupportedLocale;
   readonly title: string;
   readonly background: string;
   readonly surface: string;
@@ -128,12 +132,26 @@ export function buildMobilePdfViewerHtml({
   readonly border: string;
 }, runtime: MobilePdfJsRuntimeBundle): string {
   const exactInstanceId = viewerInstanceId(instanceId);
-  const exactTitle = boundedText(title, 512) || "PDF preview";
+  const exactTitle = boundedText(title, 512) || mobileMessage(locale, "preview.pdfTitle");
   assertRuntimeBundle(runtime);
   const cMaps = JSON.stringify(runtime.cMaps);
   const standardFonts = JSON.stringify(runtime.standardFonts);
+  const labels = {
+    error: mobileMessage(locale, "preview.pdfError"),
+    ready: mobileMessage(locale, "preview.status.pdfReady"),
+    receiving: mobileMessage(locale, "preview.status.receivingPdf"),
+    preparing: mobileMessage(locale, "preview.status.preparingPdf"),
+    pageCount: mobileMessage(locale, "preview.pdfPageCount", { pages: "{pages}" }),
+    allRendered: mobileMessage(locale, "preview.pdfAllRendered", { pages: "{pages}" }),
+    renderedProgress: mobileMessage(locale, "preview.pdfRenderedProgress", {
+      rendered: "{rendered}", pages: "{pages}"
+    }),
+    renderedPage: mobileMessage(locale, "preview.pdfRenderedPage", { page: "{page}", pages: "{pages}" }),
+    page: mobileMessage(locale, "preview.pdfPage", { page: "{page}", pages: "{pages}" }),
+    pageError: mobileMessage(locale, "preview.pdfPageError", { page: "{page}" })
+  };
   return `<!doctype html>
-<html>
+<html lang="${locale}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
@@ -155,18 +173,19 @@ export function buildMobilePdfViewerHtml({
   </style>
 </head>
 <body aria-label="${escapeHtml(exactTitle)}">
-  <div id="toolbar" role="toolbar" aria-label="PDF preview controls">
-    <span id="status" role="status" aria-live="polite">Preparing verified PDF…</span>
-    <button id="fit" type="button" aria-label="Fit PDF pages to width">Fit</button>
-    <button id="zoom-out" type="button" aria-label="Zoom PDF out">−</button>
-    <button id="zoom-in" type="button" aria-label="Zoom PDF in">+</button>
+  <div id="toolbar" role="toolbar" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfControls"))}">
+    <span id="status" role="status" aria-live="polite">${escapeHtml(labels.preparing)}</span>
+    <button id="fit" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfFitLabel"))}">${escapeHtml(mobileMessage(locale, "preview.pdfFit"))}</button>
+    <button id="zoom-out" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfZoomOut"))}">−</button>
+    <button id="zoom-in" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfZoomIn"))}">+</button>
   </div>
-  <main id="pages" aria-label="Pages of ${escapeHtml(exactTitle)}"></main>
+  <main id="pages" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfPagesOf", { title: exactTitle }))}"></main>
   <script>${runtime.script}</script>
   <script>
     (function () {
       'use strict';
       var instanceId = ${JSON.stringify(exactInstanceId)};
+      var labels = ${JSON.stringify(labels)};
       var cMaps = ${cMaps};
       var standardFonts = ${standardFonts};
       var resourceCache = Object.create(null);
@@ -199,18 +218,21 @@ export function buildMobilePdfViewerHtml({
           window.ReactNativeWebView.postMessage(JSON.stringify(value));
         }
       }
-      function cleanError(value) {
-        var text = String(value && value.message ? value.message : value || 'PDF preview failed')
-          .replace(/[\\u0000-\\u001f\\u007f]/g, ' ').trim();
-        return (text || 'PDF preview failed').slice(0, 512);
+      function text(template, values) {
+        return Object.keys(values || {}).reduce(function (result, key) {
+          return result.split('{' + key + '}').join(String(values[key]));
+        }, template);
+      }
+      function cleanError(_) {
+        return labels.error;
       }
       function emit(state, error) {
-        var label = state === 'ready' ? 'Ready for verified PDF bytes'
-          : state === 'receiving' ? 'Receiving verified PDF…'
-          : state === 'document' ? String(pageCount) + (pageCount === 1 ? ' page' : ' pages')
-          : state === 'complete' ? 'All ' + String(pageCount) + ' pages rendered'
+        var label = state === 'ready' ? labels.ready
+          : state === 'receiving' ? labels.receiving
+          : state === 'document' ? text(labels.pageCount, { pages: pageCount })
+          : state === 'complete' ? text(labels.allRendered, { pages: pageCount })
           : state === 'error' ? cleanError(error)
-          : 'Rendered ' + String(seen.size) + ' of ' + String(pageCount) + ' pages';
+          : text(labels.renderedProgress, { rendered: seen.size, pages: pageCount });
         statusNode.textContent = label;
         post({ type: 'joko-pdf-viewer/status', instanceId: instanceId, state: state,
           pageCount: pageCount, renderedPages: seen.size, zoomPercent: Math.round(zoom * 100),
@@ -351,7 +373,7 @@ export function buildMobilePdfViewerHtml({
           var error = section.querySelector('.page-error'); if (error) error.remove();
           var canvas = document.createElement('canvas'); canvas.width = pixelWidth; canvas.height = pixelHeight;
           canvas.style.width = String(Math.ceil(viewport.width)) + 'px'; canvas.style.height = String(Math.ceil(viewport.height)) + 'px';
-          canvas.setAttribute('aria-label', 'Rendered PDF page ' + String(pageNumber) + ' of ' + String(pageCount));
+          canvas.setAttribute('aria-label', text(labels.renderedPage, { page: pageNumber, pages: pageCount }));
           section.style.height = String(Math.ceil(viewport.height)) + 'px'; section.appendChild(canvas);
           var context = canvas.getContext('2d', { alpha: false }); if (!context) throw new Error('Canvas rendering is unavailable.');
           var task = page.render({ canvasContext: context, viewport: viewport, transform: dpr === 1 ? null : [dpr,0,0,dpr,0,0] });
@@ -363,7 +385,7 @@ export function buildMobilePdfViewerHtml({
           if (disposed || generation !== renderGeneration || (error && error.name === 'RenderingCancelledException')) return;
           var priorCanvas = section.querySelector('canvas'); if (priorCanvas) priorCanvas.remove();
           var message = document.createElement('p'); message.className = 'page-error'; message.setAttribute('role','alert');
-          message.textContent = 'Page ' + String(pageNumber) + ' could not be rendered: ' + cleanError(error); section.appendChild(message);
+          message.textContent = text(labels.pageError, { page: pageNumber }); section.appendChild(message);
           emit('error', error);
         } finally { renderTasks.delete(pageNumber); }
       }
@@ -388,7 +410,7 @@ export function buildMobilePdfViewerHtml({
         var fragment = document.createDocumentFragment();
         for (var pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
           var section = document.createElement('section'); section.className = 'page'; section.id = 'page-' + String(pageNumber);
-          section.dataset.page = String(pageNumber); section.setAttribute('aria-label', 'PDF page ' + String(pageNumber) + ' of ' + String(pageCount));
+          section.dataset.page = String(pageNumber); section.setAttribute('aria-label', text(labels.page, { page: pageNumber, pages: pageCount }));
           var label = document.createElement('span'); label.className = 'page-label'; label.textContent = String(pageNumber) + ' / ' + String(pageCount); section.appendChild(label); fragment.appendChild(section);
         }
         pages.replaceChildren(fragment); emit('document', null);

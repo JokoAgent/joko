@@ -9,6 +9,8 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   formatMobileContextTokens,
   type MobileCompactOutcome,
@@ -27,6 +29,7 @@ export function MobileContextSheet({
   controls,
   busy,
   colors,
+  locale,
   onClose,
   onCompact,
   onError
@@ -35,6 +38,7 @@ export function MobileContextSheet({
   readonly controls?: MobileContextControls;
   readonly busy: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onCompact: (authorityKey: string) => Promise<MobileCompactOutcome | undefined>;
   readonly onError: (message: string) => void;
@@ -85,41 +89,39 @@ export function MobileContextSheet({
       const outcome = await onCompact(pending.authorityKey);
       if (!mountedRef.current || surfaceOwnerRef.current !== pending.surfaceOwnerKey) return;
       setConfirmation(undefined);
-      setFeedback(outcome === "compacted"
-        ? "Context compacted. The task snapshot has been refreshed."
-        : outcome === "noop"
-          ? "The Backend reported that no context compaction was needed."
-          : "The compaction result is not yet confirmed. Check operation status before retrying.");
+      setFeedback(mobileMessage(locale, outcome === "compacted" ? "context.compacted"
+        : outcome === "noop" ? "context.noop" : "context.unknownResult"));
     } catch (error) {
-      if (mountedRef.current && surfaceOwnerRef.current === pending.surfaceOwnerKey) onError(errorText(error));
+      if (mountedRef.current && surfaceOwnerRef.current === pending.surfaceOwnerKey) onError(errorText(error, locale));
     } finally {
       if (mountedRef.current) setSettling(false);
     }
   };
 
-  const title = confirmation ? "Compact task context?" : "Task context";
-  const subtitle = confirmation ? "Review the observed context before continuing" : controls.backend.displayName || controls.backend.backendId;
+  const title = mobileMessage(locale, confirmation ? "context.confirmTitle" : "context.title");
+  const subtitle = confirmation ? mobileMessage(locale, "context.confirmSubtitle")
+    : controls.backend.displayName || controls.backend.backendId;
 
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={back}>
     <View style={styles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel={confirmation ? "Back to task context" : "Close task context"}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, confirmation ? "context.back" : "context.close")}
         disabled={disabled} onPress={back} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.header}>
-          {confirmation && <IconButton label="Back" text="‹" disabled={disabled} colors={colors}
+          {confirmation && <IconButton label={mobileMessage(locale, "common.back")} text="‹" disabled={disabled} colors={colors}
             onPress={() => setConfirmation(undefined)} />}
           <View style={styles.headerText}>
             <Text style={[styles.eyebrow, { color: colors.muted }]} numberOfLines={1}>{subtitle}</Text>
             <Text style={[styles.title, { color: colors.ink }]} numberOfLines={2}>{title}</Text>
           </View>
-          <IconButton label="Close task context" text="×" disabled={disabled} colors={colors} onPress={onClose} />
+          <IconButton label={mobileMessage(locale, "context.close")} text="×" disabled={disabled} colors={colors} onPress={onClose} />
         </View>
         <ScrollView contentContainerStyle={styles.content}>
           {confirmation
-            ? <CompactConfirmationView confirmation={confirmation} disabled={disabled} colors={colors}
+            ? <CompactConfirmationView confirmation={confirmation} disabled={disabled} colors={colors} locale={locale}
                 onCancel={() => setConfirmation(undefined)} onConfirm={() => void confirmCompact()} />
-            : <ContextDetails controls={controls} disabled={disabled} feedback={feedback}
+            : <ContextDetails controls={controls} disabled={disabled} feedback={feedback} locale={locale}
                 colors={colors} onCompact={requestCompact} />}
         </ScrollView>
       </SafeAreaView>
@@ -127,93 +129,103 @@ export function MobileContextSheet({
   </Modal>;
 }
 
-function ContextDetails({ controls, disabled, feedback, colors, onCompact }: {
+function ContextDetails({ controls, disabled, feedback, colors, locale, onCompact }: {
   readonly controls: MobileContextControls;
   readonly disabled: boolean;
   readonly feedback?: string;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onCompact: () => void;
 }) {
   const usage = controls.usage;
   return <View style={styles.stack}>
     {usage ? <>
       <View style={[styles.usageCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
-        <View accessibilityLabel={`${usage.percent} percent of task context used`}
+        <View accessibilityLabel={mobileMessage(locale, "context.percentLabel", { percent: usage.percent })}
           style={[styles.meter, { borderColor: usage.percent >= 90 ? colors.negative : colors.accent }]}>
           <Text style={[styles.meterValue, { color: usage.percent >= 90 ? colors.negative : colors.ink }]}>{usage.percent}%</Text>
-          <Text style={[styles.meterLabel, { color: colors.muted }]}>used</Text>
+          <Text style={[styles.meterLabel, { color: colors.muted }]}>{mobileMessage(locale, "context.used")}</Text>
         </View>
         <View style={styles.usageSummary}>
-          <Text style={[styles.modelTitle, { color: colors.ink }]}>Current context window</Text>
-          <Text style={[styles.body, { color: colors.ink }]}>{formatMobileContextTokens(usage.usedTokens)} used</Text>
+          <Text style={[styles.modelTitle, { color: colors.ink }]}>{mobileMessage(locale, "context.window")}</Text>
+          <Text style={[styles.body, { color: colors.ink }]}>{mobileMessage(locale, "context.usedCount", {
+            count: formatMobileContextTokens(usage.usedTokens)
+          })}</Text>
           <Text style={[styles.caption, { color: colors.muted }]}>{usage.contextWindowTokens > 0n
-            ? `${formatMobileContextTokens(usage.contextWindowTokens)} total · ${formatMobileContextTokens(usage.reservedTokens)} reserved`
-            : "Context window boundary unavailable"}</Text>
+            ? mobileMessage(locale, "context.windowTotals", {
+              total: formatMobileContextTokens(usage.contextWindowTokens),
+              reserved: formatMobileContextTokens(usage.reservedTokens)
+            }) : mobileMessage(locale, "context.boundaryUnavailable")}</Text>
           <Text style={[styles.caption, { color: colors.muted }]}>{usage.measuredAtMs === undefined
-            ? "Measurement time unavailable"
-            : `Measured ${new Date(usage.measuredAtMs).toLocaleString()}`}</Text>
+            ? mobileMessage(locale, "context.measurementUnavailable")
+            : mobileMessage(locale, "context.measured", { time: new Date(usage.measuredAtMs).toLocaleString(locale) })}</Text>
         </View>
       </View>
-      <SectionTitle label="Cumulative usage" colors={colors} />
+      <SectionTitle label={mobileMessage(locale, "context.cumulative")} colors={colors} />
       {usage.cumulative ? <View style={[styles.metrics, { borderColor: colors.border }]}>
-        <Metric label="Input" value={usage.cumulative.inputTokens} colors={colors} />
-        <Metric label="Output" value={usage.cumulative.outputTokens} colors={colors} />
-        <Metric label="Cache read" value={usage.cumulative.cacheReadTokens} colors={colors} />
-        <Metric label="Cache write" value={usage.cumulative.cacheWriteTokens} colors={colors} />
-        <Metric label="Total" value={usage.cumulative.totalTokens} colors={colors} />
-      </View> : <Text style={[styles.body, { color: colors.muted }]}>Cumulative token usage is unavailable.</Text>}
+        <Metric label={mobileMessage(locale, "common.input")} value={usage.cumulative.inputTokens} colors={colors} />
+        <Metric label={mobileMessage(locale, "common.output")} value={usage.cumulative.outputTokens} colors={colors} />
+        <Metric label={mobileMessage(locale, "context.cacheRead")} value={usage.cumulative.cacheReadTokens} colors={colors} />
+        <Metric label={mobileMessage(locale, "context.cacheWrite")} value={usage.cumulative.cacheWriteTokens} colors={colors} />
+        <Metric label={mobileMessage(locale, "common.total")} value={usage.cumulative.totalTokens} colors={colors} />
+      </View> : <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "context.cumulativeUnavailable")}</Text>}
     </> : <View style={[styles.noticeCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
-      <Text style={[styles.modelTitle, { color: colors.ink }]}>Context usage unavailable</Text>
+      <Text style={[styles.modelTitle, { color: colors.ink }]}>{mobileMessage(locale, "context.unavailable")}</Text>
       <Text style={[styles.body, { color: colors.muted }]}>{controls.usageSupported
-        ? "The Backend supports context reporting but has not supplied a trustworthy current measurement."
-        : "The Backend does not advertise current context usage reporting."}</Text>
+        ? mobileMessage(locale, "context.untrusted") : mobileMessage(locale, "context.unsupported")}</Text>
     </View>}
 
-    <SectionTitle label="Runtime" colors={colors} />
+    <SectionTitle label={mobileMessage(locale, "common.runtime")} colors={colors} />
     <View style={[styles.settingRow, { borderColor: colors.border }]}>
       <View style={styles.flex}>
-        <Text style={[styles.rowLabel, { color: colors.ink }]}>Automatic compaction</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>Backend-neutral observed state; change it from settings when supported.</Text>
+        <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "context.autoCompaction")}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "context.autoDescription")}</Text>
       </View>
       <Text style={[styles.value, { color: colors.ink }]}>{controls.session.contextState?.autoCompaction === undefined
-        ? "Unknown" : controls.session.contextState.autoCompaction ? "On" : "Off"}</Text>
+        ? mobileMessage(locale, "common.unknown") : mobileMessage(locale,
+          controls.session.contextState.autoCompaction ? "common.on" : "common.off")}</Text>
     </View>
     {controls.activeCompaction && <View accessibilityRole="alert"
       style={[styles.noticeCard, { borderColor: colors.accent, backgroundColor: colors.background }]}>
-      <Text style={[styles.rowLabel, { color: colors.ink }]}>Compaction in progress</Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>{controls.activeCompaction.automatic ? "Automatic" : "Manual"}
+      <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "context.inProgress")}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+        controls.activeCompaction.automatic ? "common.automatic" : "common.manual")}
         {controls.activeCompaction.reason ? ` · ${controls.activeCompaction.reason}` : ""}</Text>
     </View>}
     {feedback && <Text accessibilityRole="alert" style={[styles.feedback, { color: colors.accent }]}>{feedback}</Text>}
 
     {controls.compactSupported && <>
-      <SectionTitle label="Manual compaction" colors={colors} />
-      <Text style={[styles.body, { color: colors.muted }]}>Ask the Backend to summarize older context while preserving the current task.</Text>
+      <SectionTitle label={mobileMessage(locale, "context.manualTitle")} colors={colors} />
+      <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "context.manualDescription")}</Text>
       {controls.compactUnavailableReason && <Text style={[styles.warning, { color: colors.muted }]}>{controls.compactUnavailableReason}</Text>}
-      <SheetButton label="Compact context" disabled={disabled || !controls.canCompact}
+      <SheetButton label={mobileMessage(locale, "context.compact")} disabled={disabled || !controls.canCompact}
         colors={colors} onPress={onCompact} />
     </>}
   </View>;
 }
 
-function CompactConfirmationView({ confirmation, disabled, colors, onCancel, onConfirm }: {
+function CompactConfirmationView({ confirmation, disabled, colors, locale, onCancel, onConfirm }: {
   readonly confirmation: CompactConfirmation;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onCancel: () => void;
   readonly onConfirm: () => void;
 }) {
   const usage = confirmation.usage;
   return <View style={styles.stack}>
     <View style={[styles.riskCard, { borderColor: colors.accent, backgroundColor: colors.background }]}>
-      <Text style={[styles.modelTitle, { color: colors.ink }]}>Older task context may be summarized</Text>
-      <Text style={[styles.body, { color: colors.ink }]}>The Backend will decide what can be compacted. Durable messages remain in Joko, but the active native context may change.</Text>
-      <Text style={[styles.body, { color: colors.muted }]}>{formatMobileContextTokens(usage.usedTokens)} used
-        {usage.contextWindowTokens > 0n ? ` of ${formatMobileContextTokens(usage.contextWindowTokens)}` : ""} at confirmation.</Text>
+      <Text style={[styles.modelTitle, { color: colors.ink }]}>{mobileMessage(locale, "context.confirmHeading")}</Text>
+      <Text style={[styles.body, { color: colors.ink }]}>{mobileMessage(locale, "context.confirmBody")}</Text>
+      <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale,
+        usage.contextWindowTokens > 0n ? "context.confirmUsage" : "context.confirmUsageNoWindow", {
+          used: formatMobileContextTokens(usage.usedTokens),
+          ...(usage.contextWindowTokens > 0n ? { window: formatMobileContextTokens(usage.contextWindowTokens) } : {})
+        })}</Text>
     </View>
     <View style={styles.actions}>
-      <SheetButton label="Cancel" quiet disabled={disabled} colors={colors} onPress={onCancel} />
-      <SheetButton label="Compact context" disabled={disabled} colors={colors} onPress={onConfirm} />
+      <SheetButton label={mobileMessage(locale, "common.cancel")} quiet disabled={disabled} colors={colors} onPress={onCancel} />
+      <SheetButton label={mobileMessage(locale, "context.compact")} disabled={disabled} colors={colors} onPress={onConfirm} />
     </View>
   </View>;
 }
@@ -262,8 +274,8 @@ function SheetButton({ label, disabled, quiet, colors, onPress }: {
   </Pressable>;
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : "The task context could not be compacted.";
+function errorText(error: unknown, locale: MobileSupportedLocale): string {
+  return error instanceof Error ? error.message : mobileMessage(locale, "context.error");
 }
 
 const styles = StyleSheet.create({

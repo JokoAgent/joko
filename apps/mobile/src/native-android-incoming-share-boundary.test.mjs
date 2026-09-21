@@ -34,6 +34,7 @@ const moduleSource = readFileSync(
 );
 const bridge = readFileSync(new URL("src/mobile-incoming-share.ts", project), "utf8");
 const surface = readFileSync(new URL("src/App.tsx", project), "utf8");
+const messages = readFileSync(new URL("src/mobile-task-messages.ts", project), "utf8");
 
 describe("Android incoming-share native boundary", () => {
   it("declares one exported non-browsable stream receiver without competing Expo MainActivity filters", () => {
@@ -112,7 +113,8 @@ describe("Android incoming-share native boundary", () => {
     expect(moduleSource).toContain('AsyncFunction("acknowledgeBatch")');
     expect(moduleSource).toContain('AsyncFunction("discardBatch")');
     expect(bridge).toContain('Platform.OS === "ios" || Platform.OS === "android"');
-    expect(surface).toContain("protected device inbox");
+    expect(surface).toContain('mobileMessage(locale, "incoming.waiting"');
+    expect(messages).toContain("protected device inbox");
     expect(moduleSource).not.toMatch(/credential|accessToken|refreshToken|client\.create|\.send\(/u);
   });
 });

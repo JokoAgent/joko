@@ -13,6 +13,8 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   filterMobileWorkspaceMentionCandidates,
   normalizeMobileWorkspaceLineRange,
@@ -29,6 +31,7 @@ export function MobileWorkspaceMentionSheet({
   controls,
   busy,
   colors,
+  locale,
   onClose,
   onLoadDirectory,
   onLoadFileIndex,
@@ -38,6 +41,7 @@ export function MobileWorkspaceMentionSheet({
   readonly controls?: MobileWorkspaceMentionControls;
   readonly busy: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onLoadDirectory: (
     surfaceOwnerKey: string,
@@ -126,7 +130,7 @@ export function MobileWorkspaceMentionSheet({
     }).catch((error) => {
       if (!mountedRef.current || controller.signal.aborted || requestRef.current !== request
         || controlsRef.current?.surfaceOwnerKey !== ownerKey) return;
-      setLoadError(errorText(error));
+      setLoadError(errorText(error, locale));
     }).finally(() => {
       if (mountedRef.current && requestRef.current === request) setLoading(false);
     });
@@ -166,7 +170,7 @@ export function MobileWorkspaceMentionSheet({
     }).catch((error) => {
       if (!mountedRef.current || controller.signal.aborted || requestRef.current !== request
         || controlsRef.current?.surfaceOwnerKey !== ownerKey) return;
-      setLoadError(errorText(error));
+      setLoadError(errorText(error, locale));
     }).finally(() => {
       if (mountedRef.current && requestRef.current === request) setLoading(false);
     });
@@ -187,7 +191,7 @@ export function MobileWorkspaceMentionSheet({
       await selectRef.current(ownerKey, candidate, lineRange);
     } catch (error) {
       if (mountedRef.current && visibleRef.current && controlsRef.current?.surfaceOwnerKey === ownerKey) {
-        setActionError(errorText(error));
+        setActionError(errorText(error, locale));
       }
     } finally {
       if (mountedRef.current && controlsRef.current?.surfaceOwnerKey === ownerKey) setSelectingPath(undefined);
@@ -208,84 +212,85 @@ export function MobileWorkspaceMentionSheet({
     if (!lineCandidate) return;
     try {
       if (!/^\d+$/u.test(startLineText) || !/^\d+$/u.test(endLineText)) {
-        throw new Error("Enter both a start line and an end line.");
+        throw new Error(mobileMessage(locale, "mention.workspace.rangeRequired"));
       }
       const range = normalizeMobileWorkspaceLineRange(Number(startLineText), Number(endLineText));
       void select(lineCandidate, range);
     } catch (error) {
-      setActionError(errorText(error));
+      setActionError(errorText(error, locale));
     }
   };
 
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={closeOrBack}>
     <MobileKeyboardAvoidingView keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined} style={styles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close Workspace references"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.workspace.close")}
         disabled={disabled} onPress={onClose} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.header}>
           <View style={styles.headerText}>
             <Text style={[styles.eyebrow, { color: colors.muted }]} numberOfLines={1}>{controls.workspaceDisplayName}</Text>
-            <Text style={[styles.title, { color: colors.ink }]}>Reference Workspace</Text>
+            <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "mention.workspace.title")}</Text>
             <Text style={[styles.path, { color: colors.muted }]} numberOfLines={1}>/{directory?.parentPath ?? ""}</Text>
           </View>
-          <IconButton label="Refresh Workspace references" text="↻" disabled={disabled || loading}
+          <IconButton label={mobileMessage(locale, "mention.workspace.refresh")} text="↻" disabled={disabled || loading}
             colors={colors} onPress={() => load(directory?.parentPath ?? "", true)} />
-          <IconButton label="Close Workspace references" text="×" disabled={disabled}
+          <IconButton label={mobileMessage(locale, "mention.workspace.close")} text="×" disabled={disabled}
             colors={colors} onPress={onClose} />
         </View>
         <View style={styles.searchRow}>
-          {(directory?.parentPath ?? "") !== "" && <IconButton label="Browse parent directory" text="‹"
+          {(directory?.parentPath ?? "") !== "" && <IconButton label={mobileMessage(locale, "mention.workspace.parent")} text="‹"
             disabled={disabled || loading} colors={colors}
             onPress={() => load(workspaceParentPath(directory!.parentPath), false)} />}
-          <TextInput ref={searchRef} accessibilityLabel="Search Workspace references" value={query}
+          <TextInput ref={searchRef} accessibilityLabel={mobileMessage(locale, "mention.workspace.searchLabel")} value={query}
             onChangeText={setQuery} editable={!disabled && !loading} autoCapitalize="none" autoCorrect={false}
-            placeholder={controls.policy.files ? "Search files or this directory" : "Search this directory"}
+            placeholder={mobileMessage(locale, controls.policy.files
+              ? "mention.workspace.searchFiles" : "mention.workspace.searchDirectory")}
             placeholderTextColor={colors.muted}
             style={[styles.search, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
         </View>
         {(loadError || actionError) && <View accessibilityRole="alert" style={styles.errorRow}>
           <Text style={[styles.error, { color: colors.negative }]}>{loadError ?? actionError}</Text>
-          {loadError && <Pressable accessibilityRole="button" accessibilityLabel="Retry loading Workspace references"
+          {loadError && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.workspace.retry")}
             disabled={disabled || loading} onPress={() => load(directory?.parentPath ?? "", true)}
             style={styles.retryButton}>
-            <Text style={[styles.retry, { color: colors.accent }]}>Retry</Text>
+            <Text style={[styles.retry, { color: colors.accent }]}>{mobileMessage(locale, "common.retry")}</Text>
           </Pressable>}
         </View>}
         {lineCandidate && <View style={[styles.lineCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
-          <Text style={[styles.rowLabel, { color: colors.ink }]} numberOfLines={1}>Lines from {lineCandidate.displayText}</Text>
+          <Text style={[styles.rowLabel, { color: colors.ink }]} numberOfLines={1}>{mobileMessage(locale, "mention.workspace.linesFrom", { name: lineCandidate.displayText })}</Text>
           <View style={styles.lineInputs}>
-            <TextInput accessibilityLabel="Workspace reference start line" value={startLineText}
-              onChangeText={setStartLineText} editable={!disabled} keyboardType="number-pad" placeholder="Start"
+            <TextInput accessibilityLabel={mobileMessage(locale, "mention.workspace.startLabel")} value={startLineText}
+              onChangeText={setStartLineText} editable={!disabled} keyboardType="number-pad" placeholder={mobileMessage(locale, "mention.workspace.start")}
               placeholderTextColor={colors.muted} maxLength={10}
               style={[styles.lineInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
-            <TextInput accessibilityLabel="Workspace reference end line" value={endLineText}
-              onChangeText={setEndLineText} editable={!disabled} keyboardType="number-pad" placeholder="End"
+            <TextInput accessibilityLabel={mobileMessage(locale, "mention.workspace.endLabel")} value={endLineText}
+              onChangeText={setEndLineText} editable={!disabled} keyboardType="number-pad" placeholder={mobileMessage(locale, "mention.workspace.end")}
               placeholderTextColor={colors.muted} maxLength={10}
               style={[styles.lineInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
           </View>
           <View style={styles.lineActions}>
-            <Pressable accessibilityRole="button" accessibilityLabel="Cancel Workspace line range"
+            <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.workspace.cancelRange")}
               disabled={disabled} onPress={() => { setLineCandidate(undefined); setStartLineText(""); setEndLineText(""); }}
               style={styles.textButton}>
-              <Text style={[styles.actionText, { color: colors.muted }]}>Cancel</Text>
+              <Text style={[styles.actionText, { color: colors.muted }]}>{mobileMessage(locale, "common.cancel")}</Text>
             </Pressable>
-            <Pressable accessibilityRole="button" accessibilityLabel="Reference Workspace line range"
+            <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "mention.workspace.referenceRange")}
               disabled={disabled} onPress={submitLines} style={styles.textButton}>
-              <Text style={[styles.actionText, { color: colors.accent }]}>Reference lines</Text>
+              <Text style={[styles.actionText, { color: colors.accent }]}>{mobileMessage(locale, "mention.workspace.referenceLines")}</Text>
             </Pressable>
           </View>
         </View>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
-          {loading && <View accessibilityLabel="Loading Workspace references" style={styles.loading}>
+          {loading && <View accessibilityLabel={mobileMessage(locale, "mention.workspace.loading")} style={styles.loading}>
             <ActivityIndicator color={colors.muted} />
           </View>}
           {!loading && !loadError && results.items.length === 0 && <Text style={[styles.empty, { color: colors.muted }]}>
-            {query.trim() ? "No Workspace paths match this search." : "This Workspace directory is empty."}
+            {mobileMessage(locale, query.trim() ? "mention.workspace.noMatch" : "mention.workspace.empty")}
           </Text>}
           {!loading && results.items.map((candidate) => <WorkspaceRow key={`${candidate.directory ? "d" : "f"}:${candidate.relativePath}`}
-            candidate={candidate} controls={controls} disabled={disabled}
+            candidate={candidate} controls={controls} disabled={disabled} locale={locale}
             selecting={selectingPath === candidate.relativePath} colors={colors}
             onOpen={() => load(candidate.relativePath, false)}
             onReference={() => void select(candidate)}
@@ -296,7 +301,7 @@ export function MobileWorkspaceMentionSheet({
               setEndLineText("");
             }} />)}
           {!loading && results.truncated && <Text accessibilityRole="alert" style={[styles.notice, { color: colors.muted }]}>
-            More matching files exist. Refine the search to select an exact path.
+            {mobileMessage(locale, "mention.workspace.more")}
           </Text>}
         </ScrollView>
       </SafeAreaView>
@@ -304,12 +309,13 @@ export function MobileWorkspaceMentionSheet({
   </Modal>;
 }
 
-function WorkspaceRow({ candidate, controls, disabled, selecting, colors, onOpen, onReference, onLines }: {
+function WorkspaceRow({ candidate, controls, disabled, selecting, colors, locale, onOpen, onReference, onLines }: {
   readonly candidate: MobileWorkspaceMentionCandidate;
   readonly controls: MobileWorkspaceMentionControls;
   readonly disabled: boolean;
   readonly selecting: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onOpen: () => void;
   readonly onReference: () => void;
   readonly onLines: () => void;
@@ -317,8 +323,10 @@ function WorkspaceRow({ candidate, controls, disabled, selecting, colors, onOpen
   const referenceable = candidate.directory ? controls.policy.directories : controls.policy.files;
   return <View style={[styles.row, { borderColor: colors.border }, disabled && styles.disabled]}>
     <Pressable accessibilityRole="button"
-      accessibilityLabel={`${candidate.directory ? "Open directory" : "Reference file"} ${candidate.displayText}`}
-      accessibilityHint={candidate.directory ? "Browses this directory without referencing it" : "Inserts this exact Workspace file at the current message selection"}
+      accessibilityLabel={`${mobileMessage(locale, candidate.directory
+        ? "mention.workspace.openDirectory" : "mention.workspace.referenceFile")} ${candidate.displayText}`}
+      accessibilityHint={mobileMessage(locale, candidate.directory
+        ? "mention.workspace.openHint" : "mention.workspace.fileHint")}
       accessibilityState={{ disabled }} disabled={disabled}
       onPress={candidate.directory ? onOpen : onReference} style={styles.rowMain}>
       <Text style={[styles.glyph, { color: colors.accent }]}>{candidate.directory ? "▰" : "◇"}</Text>
@@ -329,15 +337,15 @@ function WorkspaceRow({ candidate, controls, disabled, selecting, colors, onOpen
       {selecting && <ActivityIndicator size="small" color={colors.muted} />}
     </Pressable>
     {candidate.directory && referenceable && <Pressable accessibilityRole="button"
-      accessibilityLabel={`Reference directory ${candidate.displayText}`}
-      accessibilityHint="References this directory without browsing into it"
+      accessibilityLabel={mobileMessage(locale, "mention.workspace.referenceDirectory", { name: candidate.displayText })}
+      accessibilityHint={mobileMessage(locale, "mention.workspace.directoryHint")}
       accessibilityState={{ disabled }} disabled={disabled} onPress={onReference} style={styles.rowAction}>
-      <Text style={[styles.actionText, { color: colors.accent }]}>Reference</Text>
+      <Text style={[styles.actionText, { color: colors.accent }]}>{mobileMessage(locale, "mention.workspace.referenceShort")}</Text>
     </Pressable>}
     {!candidate.directory && controls.policy.lineRanges && <Pressable accessibilityRole="button"
-      accessibilityLabel={`Choose lines from ${candidate.displayText}`}
+      accessibilityLabel={mobileMessage(locale, "mention.workspace.chooseLines", { name: candidate.displayText })}
       accessibilityState={{ disabled }} disabled={disabled} onPress={onLines} style={styles.rowAction}>
-      <Text style={[styles.actionText, { color: colors.accent }]}>Lines</Text>
+      <Text style={[styles.actionText, { color: colors.accent }]}>{mobileMessage(locale, "mention.workspace.lines")}</Text>
     </Pressable>}
   </View>;
 }
@@ -355,8 +363,8 @@ function IconButton({ label, text, disabled, colors, onPress }: {
   </Pressable>;
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : "Workspace references could not be loaded.";
+function errorText(error: unknown, locale: MobileSupportedLocale): string {
+  return error instanceof Error ? error.message : mobileMessage(locale, "mention.workspace.loadError");
 }
 
 const styles = StyleSheet.create({

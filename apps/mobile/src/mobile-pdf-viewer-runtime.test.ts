@@ -47,7 +47,7 @@ describe("offline mobile PDF viewer runtime", () => {
     Object.defineProperty(window, "crypto", { configurable: true, value: {} });
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
 
-    const html = buildMobilePdfViewerHtml({ instanceId: "runtime-1", title: "Runtime proof",
+    const html = buildMobilePdfViewerHtml({ instanceId: "runtime-1", locale: "en", title: "Runtime proof",
       background: "#ffffff", surface: "#f5f5f5", ink: "#111111", muted: "#666666",
       accent: "#3366ff", border: "#dddddd" }, runtimeBundle());
     document.documentElement.innerHTML = html;

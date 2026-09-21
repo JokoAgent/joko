@@ -14,6 +14,8 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { PermissionMode } from "@joko/contracts";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   assertMobileModelSelection,
   defaultMobileModelSelection,
@@ -37,6 +39,7 @@ export function MobileRuntimeControlsSheet({
   controls,
   busy,
   colors,
+  locale,
   onClose,
   onSetModel,
   onSetPermission,
@@ -47,6 +50,7 @@ export function MobileRuntimeControlsSheet({
   readonly controls?: MobileRuntimeControls;
   readonly busy: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onSetModel: (authorityKey: string, selection: MobileModelControlSelection) => Promise<boolean>;
   readonly onSetPermission: (authorityKey: string, mode: PermissionMode) => Promise<boolean>;
@@ -117,7 +121,7 @@ export function MobileRuntimeControlsSheet({
       const completed = await action(authorityKey);
       if (completed && mountedRef.current && surfaceOwnerRef.current === surfaceOwnerKey) onClose();
     } catch (error) {
-      if (mountedRef.current && surfaceOwnerRef.current === surfaceOwnerKey) onError(errorText(error));
+      if (mountedRef.current && surfaceOwnerRef.current === surfaceOwnerKey) onError(errorText(error, locale));
     } finally {
       if (mountedRef.current) setSettling(false);
     }
@@ -128,8 +132,8 @@ export function MobileRuntimeControlsSheet({
     try {
       const validated = assertMobileModelSelection(controls, selection);
       void settle((authorityKey) => onSetModel(authorityKey, validated));
-    } catch (error) {
-      onError(errorText(error));
+    } catch {
+      onError(mobileMessage(locale, "controls.modelInvalid"));
     }
   };
 
@@ -142,40 +146,41 @@ export function MobileRuntimeControlsSheet({
     void settle((authorityKey) => onSetPermission(authorityKey, mode));
   };
 
-  const title = view.kind === "root" ? "Task controls"
-    : view.kind === "model" ? "Model options"
-      : view.kind === "permission" ? "Permission mode" : "Enable full access?";
+  const title = mobileMessage(locale, view.kind === "root" ? "controls.title"
+    : view.kind === "model" ? "controls.modelOptions"
+      : view.kind === "permission" ? "controls.permissionMode" : "controls.fullAccessQuestion");
   const subtitle = view.kind === "root" ? controls.backend.displayName || controls.backend.backendId
-    : view.kind === "model" ? activeRoute?.providerName ?? "Current model"
-      : view.kind === "permission" ? "Choose the current task policy" : "This is a high-impact setting";
+    : view.kind === "model" ? activeRoute?.providerName ?? mobileMessage(locale, "controls.currentModel")
+      : mobileMessage(locale, view.kind === "permission" ? "controls.choosePolicy" : "controls.highImpact");
 
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={back}>
     <MobileKeyboardAvoidingView keyboard={keyboard} consumedBottomInset={safeArea.bottom}
       behavior={Platform.OS === "android" ? "height" : undefined} style={styles.modalRoot}>
-      <Pressable accessibilityRole="button" accessibilityLabel={view.kind === "root" ? "Close task controls" : "Back in task controls"}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale,
+        view.kind === "root" ? "controls.close" : "controls.back")}
         disabled={disabled} onPress={back} style={styles.backdrop} />
       <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
         style={[styles.sheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.header}>
-          {view.kind !== "root" && <IconButton label="Back" text="‹" disabled={disabled} colors={colors}
+          {view.kind !== "root" && <IconButton label={mobileMessage(locale, "common.back")} text="‹" disabled={disabled} colors={colors}
             onPress={() => { setView({ kind: "root" }); setSelection(undefined); }} />}
           <View style={styles.headerText}>
             <Text style={[styles.eyebrow, { color: colors.muted }]} numberOfLines={1}>{subtitle}</Text>
             <Text style={[styles.title, { color: colors.ink }]} numberOfLines={2}>{title}</Text>
           </View>
-          <IconButton label="Close task controls" text="×" disabled={disabled} colors={colors} onPress={onClose} />
+          <IconButton label={mobileMessage(locale, "controls.close")} text="×" disabled={disabled} colors={colors} onPress={onClose} />
         </View>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           {view.kind === "root" && <RootControls controls={controls} routes={routes} query={query}
-            disabled={disabled} colors={colors} onQuery={setQuery} onOpenModel={openModel}
+            disabled={disabled} colors={colors} locale={locale} onQuery={setQuery} onOpenModel={openModel}
             onOpenPermission={() => setView({ kind: "permission" })}
             onSetPlanMode={(enabled) => void settle((authorityKey) => onSetPlanMode(authorityKey, enabled))} />}
           {view.kind === "model" && activeRoute && selection && <ModelOptions route={activeRoute}
-            controls={controls} selection={selection} disabled={disabled} colors={colors}
+            controls={controls} selection={selection} disabled={disabled} colors={colors} locale={locale}
             onSelection={setSelection} onApply={applyModel} />}
-          {view.kind === "permission" && <PermissionOptions controls={controls} disabled={disabled}
+          {view.kind === "permission" && <PermissionOptions controls={controls} disabled={disabled} locale={locale}
             colors={colors} onSelect={choosePermission} />}
-          {view.kind === "permission-confirm" && <PermissionConfirmation disabled={disabled} colors={colors}
+          {view.kind === "permission-confirm" && <PermissionConfirmation disabled={disabled} colors={colors} locale={locale}
             onCancel={() => setView({ kind: "permission" })}
             onConfirm={() => void settle((authorityKey) => onSetPermission(authorityKey, PermissionMode.BYPASS_PERMISSIONS))} />}
         </ScrollView>
@@ -184,12 +189,13 @@ export function MobileRuntimeControlsSheet({
   </Modal>;
 }
 
-function RootControls({ controls, routes, query, disabled, colors, onQuery, onOpenModel, onOpenPermission, onSetPlanMode }: {
+function RootControls({ controls, routes, query, disabled, colors, locale, onQuery, onOpenModel, onOpenPermission, onSetPlanMode }: {
   readonly controls: MobileRuntimeControls;
   readonly routes: readonly MobileModelRoute[];
   readonly query: string;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onQuery: (query: string) => void;
   readonly onOpenModel: (route: MobileModelRoute) => void;
   readonly onOpenPermission: () => void;
@@ -200,9 +206,9 @@ function RootControls({ controls, routes, query, disabled, colors, onQuery, onOp
     && (controls.canSetEffort || controls.canSetFastMode);
   let previousProvider = "";
   return <View style={styles.stack}>
-    <SectionTitle label="Model" colors={colors} />
+    <SectionTitle label={mobileMessage(locale, "common.model")} colors={colors} />
     {current ? <Pressable accessibilityRole={configurableCurrent ? "button" : undefined}
-      accessibilityLabel={`Current model ${current.displayName}`}
+      accessibilityLabel={mobileMessage(locale, "controls.currentModelLabel", { name: current.displayName })}
       disabled={disabled || !configurableCurrent}
       onPress={() => current.route && onOpenModel(current.route)}
       style={[styles.currentCard, { borderColor: current.selectable ? colors.accent : colors.border,
@@ -211,16 +217,17 @@ function RootControls({ controls, routes, query, disabled, colors, onQuery, onOp
         <Text style={[styles.rowLabel, { color: colors.ink }]}>{current.displayName}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>{current.providerName} · {current.providerId}/{current.modelId}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>
-          {current.effortId ? `Effort ${current.effortId}` : "Default effort"}{current.fastMode ? " · Fast" : ""}
+          {current.effortId ? mobileMessage(locale, "controls.effortValue", { effort: current.effortId })
+            : mobileMessage(locale, "controls.defaultEffort")}{current.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}
         </Text>
-        {!current.selectable && <Text style={[styles.warning, { color: colors.negative }]}>Current route is no longer selectable.</Text>}
+        {!current.selectable && <Text style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale, "controls.routeUnavailable")}</Text>}
       </View>
-      {configurableCurrent && <Text style={[styles.disclosure, { color: colors.accent }]}>Options</Text>}
-    </Pressable> : <Text style={[styles.body, { color: colors.muted }]}>The Backend has not reported a current model route.</Text>}
+      {configurableCurrent && <Text style={[styles.disclosure, { color: colors.accent }]}>{mobileMessage(locale, "common.options")}</Text>}
+    </Pressable> : <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "controls.noCurrentRoute")}</Text>}
 
     {controls.canSwitchModel && <>
-      <TextInput accessibilityLabel="Search task models" value={query} editable={!disabled}
-        onChangeText={onQuery} placeholder="Search models or providers" placeholderTextColor={colors.muted}
+      <TextInput accessibilityLabel={mobileMessage(locale, "controls.searchModelsLabel")} value={query} editable={!disabled}
+        onChangeText={onQuery} placeholder={mobileMessage(locale, "controls.searchModels")} placeholderTextColor={colors.muted}
         style={[styles.search, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.background }]} />
       {routes.map((route) => {
         const showProvider = route.providerId !== previousProvider;
@@ -234,122 +241,132 @@ function RootControls({ controls, routes, query, disabled, colors, onQuery, onOp
             style={[styles.routeRow, { borderColor: selected ? colors.accent : colors.border }, disabled && styles.disabled]}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: colors.ink }]}>{route.displayName}</Text>
-              <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens)} · {route.modelId}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)} · {route.modelId}</Text>
             </View>
             <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
           </Pressable>
         </View>;
       })}
       {routes.length === 0 && <Text style={[styles.body, { color: colors.muted }]}>
-        {query.trim() ? "No current models match this search." : "No selectable text model is currently advertised."}
+        {mobileMessage(locale, query.trim() ? "controls.noModelMatch" : "controls.noTextModel")}
       </Text>}
     </>}
 
     {controls.canSetPermission && <>
-      <SectionTitle label="Permission" colors={colors} />
-      <Pressable accessibilityRole="button" accessibilityLabel="Change permission mode" disabled={disabled}
+      <SectionTitle label={mobileMessage(locale, "common.permission")} colors={colors} />
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "controls.changePermission")} disabled={disabled}
         onPress={onOpenPermission} style={[styles.settingRow, { borderColor: colors.border }, disabled && styles.disabled]}>
         <View style={styles.flex}>
-          <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobilePermissionModeLabel(controls.session.permissionMode)}</Text>
-          <Text style={[styles.caption, { color: colors.muted }]}>{mobilePermissionModeDescription(controls.session.permissionMode)}</Text>
+          <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobilePermissionModeLabel(controls.session.permissionMode, locale)}</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobilePermissionModeDescription(controls.session.permissionMode, locale)}</Text>
         </View>
-        <Text style={[styles.disclosure, { color: colors.accent }]}>Change</Text>
+        <Text style={[styles.disclosure, { color: colors.accent }]}>{mobileMessage(locale, "common.change")}</Text>
       </Pressable>
     </>}
 
     {controls.canSetPlanMode && <>
-      <SectionTitle label="Plan Mode" colors={colors} />
+      <SectionTitle label={mobileMessage(locale, "controls.planMode")} colors={colors} />
       <View style={[styles.settingRow, { borderColor: colors.border }]}>
         <View style={styles.flex}>
-          <Text style={[styles.rowLabel, { color: colors.ink }]}>Plan before execution</Text>
-          <Text style={[styles.caption, { color: colors.muted }]}>Keep planning separate from the permission policy.</Text>
+          <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "controls.planBefore")}</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "controls.planDescription")}</Text>
         </View>
-        <Switch accessibilityLabel="Plan Mode" accessibilityState={{ disabled }} disabled={disabled}
+        <Switch accessibilityLabel={mobileMessage(locale, "controls.planMode")} accessibilityState={{ disabled }} disabled={disabled}
           value={controls.session.planMode} onValueChange={onSetPlanMode}
           trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface} />
       </View>
     </>}
     {!controls.canSwitchModel && !configurableCurrent && !controls.canSetPermission && !controls.canSetPlanMode
-      && <Text style={[styles.body, { color: colors.muted }]}>This Backend currently advertises no mutable task controls.</Text>}
+      && <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "controls.noneMutable")}</Text>}
   </View>;
 }
 
-function ModelOptions({ route, controls, selection, disabled, colors, onSelection, onApply }: {
+function ModelOptions({ route, controls, selection, disabled, colors, locale, onSelection, onApply }: {
   readonly route: MobileModelRoute;
   readonly controls: MobileRuntimeControls;
   readonly selection: MobileModelControlSelection;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onSelection: (selection: MobileModelControlSelection) => void;
   readonly onApply: () => void;
 }) {
+  let selectionValid = true;
   let validationError: string | undefined;
   try { assertMobileModelSelection(controls, selection); }
-  catch (error) { validationError = errorText(error); }
+  catch {
+    selectionValid = false;
+    const current = controls.currentModel;
+    const unchanged = current?.providerId === selection.providerId && current.modelId === selection.modelId
+      && (current.effortId ?? "") === (selection.effortId ?? "")
+      && (current.fastMode ?? false) === selection.fastMode;
+    if (!unchanged) validationError = mobileMessage(locale, "controls.modelInvalid");
+  }
   return <View style={styles.stack}>
     <View style={[styles.currentCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
       <Text style={[styles.modelTitle, { color: colors.ink }]}>{route.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{route.providerName} · {route.providerId}/{route.modelId}</Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens)}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)}</Text>
     </View>
     {controls.canSetEffort && route.efforts.length > 0 && <>
-      <SectionTitle label="Effort" colors={colors} />
+      <SectionTitle label={mobileMessage(locale, "common.effort")} colors={colors} />
       <View style={styles.choiceStack}>
         {route.efforts.map((effort) => <ChoiceRow key={effort.id} label={effort.label}
-          description={effort.default ? "Backend default" : undefined}
+          description={effort.default ? mobileMessage(locale, "controls.backendDefault") : undefined}
           selected={selection.effortId === effort.id} disabled={disabled} colors={colors}
           onPress={() => onSelection({ ...selection, effortId: effort.id })} />)}
       </View>
     </>}
     {controls.canSetFastMode && <>
-      <SectionTitle label="Fast Mode" colors={colors} />
+      <SectionTitle label={mobileMessage(locale, "controls.fastMode")} colors={colors} />
       <View style={[styles.settingRow, { borderColor: colors.border }]}>
         <View style={styles.flex}>
-          <Text style={[styles.rowLabel, { color: colors.ink }]}>Faster responses</Text>
+          <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "controls.faster")}</Text>
           <Text style={[styles.caption, { color: colors.muted }]}>{route.supportsFastMode
-            ? "Use this model's advertised Fast Mode." : "This model does not advertise Fast Mode."}</Text>
+            ? mobileMessage(locale, "controls.fastSupported") : mobileMessage(locale, "controls.fastUnsupported")}</Text>
         </View>
-        <Switch accessibilityLabel="Fast Mode" accessibilityState={{ disabled: disabled || !route.supportsFastMode }}
+        <Switch accessibilityLabel={mobileMessage(locale, "controls.fastMode")} accessibilityState={{ disabled: disabled || !route.supportsFastMode }}
           disabled={disabled || !route.supportsFastMode} value={selection.fastMode}
           onValueChange={(fastMode) => onSelection({ ...selection, fastMode })}
           trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface} />
       </View>
     </>}
-    {validationError && !/Choose a different model setting/u.test(validationError)
-      && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{validationError}</Text>}
-    <SheetButton label="Apply model settings" disabled={disabled || validationError !== undefined}
+    {validationError && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{validationError}</Text>}
+    <SheetButton label={mobileMessage(locale, "controls.applyModel")} disabled={disabled || !selectionValid}
       colors={colors} onPress={onApply} />
   </View>;
 }
 
-function PermissionOptions({ controls, disabled, colors, onSelect }: {
+function PermissionOptions({ controls, disabled, colors, locale, onSelect }: {
   readonly controls: MobileRuntimeControls;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onSelect: (mode: PermissionMode) => void;
 }) {
   return <View style={styles.choiceStack}>
-    {controls.permissionModes.map((mode) => <ChoiceRow key={mode} label={mobilePermissionModeLabel(mode)}
-      description={mobilePermissionModeDescription(mode)} selected={mode === controls.session.permissionMode}
+    {controls.permissionModes.map((mode) => <ChoiceRow key={mode} label={mobilePermissionModeLabel(mode, locale)}
+      description={mobilePermissionModeDescription(mode, locale)} selected={mode === controls.session.permissionMode}
       disabled={disabled || mode === controls.session.permissionMode} danger={mode === PermissionMode.BYPASS_PERMISSIONS}
       colors={colors} onPress={() => onSelect(mode)} />)}
   </View>;
 }
 
-function PermissionConfirmation({ disabled, colors, onCancel, onConfirm }: {
+function PermissionConfirmation({ disabled, colors, locale, onCancel, onConfirm }: {
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
+  readonly locale: MobileSupportedLocale;
   readonly onCancel: () => void;
   readonly onConfirm: () => void;
 }) {
   return <View style={styles.stack}>
     <View style={[styles.riskCard, { borderColor: colors.negative, backgroundColor: colors.background }]}>
-      <Text style={[styles.modelTitle, { color: colors.negative }]}>Full access removes approval prompts</Text>
-      <Text style={[styles.body, { color: colors.ink }]}>The current Backend may run commands and change files without asking. Enable it only for a workspace and task you trust.</Text>
+      <Text style={[styles.modelTitle, { color: colors.negative }]}>{mobileMessage(locale, "controls.fullAccessTitle")}</Text>
+      <Text style={[styles.body, { color: colors.ink }]}>{mobileMessage(locale, "controls.fullAccessBody")}</Text>
     </View>
     <View style={styles.actions}>
-      <SheetButton label="Cancel" quiet disabled={disabled} colors={colors} onPress={onCancel} />
-      <SheetButton label="Enable full access" danger disabled={disabled} colors={colors} onPress={onConfirm} />
+      <SheetButton label={mobileMessage(locale, "common.cancel")} quiet disabled={disabled} colors={colors} onPress={onCancel} />
+      <SheetButton label={mobileMessage(locale, "controls.enableFullAccess")} danger disabled={disabled} colors={colors} onPress={onConfirm} />
     </View>
   </View>;
 }
@@ -408,8 +425,8 @@ function SheetButton({ label, disabled, quiet, danger, colors, onPress }: {
   </Pressable>;
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : "The task control could not be changed.";
+function errorText(error: unknown, locale: MobileSupportedLocale): string {
+  return error instanceof Error ? error.message : mobileMessage(locale, "controls.changeError");
 }
 
 const styles = StyleSheet.create({

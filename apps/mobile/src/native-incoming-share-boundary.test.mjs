@@ -27,6 +27,7 @@ const moduleConfig = JSON.parse(readFileSync(
 ));
 const bridge = readFileSync(new URL("src/mobile-incoming-share.ts", project), "utf8");
 const surface = readFileSync(new URL("src/App.tsx", project), "utf8");
+const messages = readFileSync(new URL("src/mobile-task-messages.ts", project), "utf8");
 
 describe("iOS incoming-share native boundary", () => {
   it("declares only the bounded iOS file/image target and composes the Joko source as the final dangerous mod", () => {
@@ -172,10 +173,14 @@ describe("iOS incoming-share native boundary", () => {
     expect(surface).toContain("Linking.getInitialURL()");
     expect(surface).toContain("commitMobileIncomingShare({");
     expect(surface).toContain("mobileNewTaskDrafts");
-    expect(surface).toContain("Use with this connection");
-    expect(surface).toContain("Before you continue:");
-    expect(surface).toContain("Add shared files");
-    expect(surface).toContain("Discard claimed share");
+    expect(surface).toContain('"incoming.useConnection"');
+    expect(surface).toContain('"incoming.preview"');
+    expect(surface).toContain('"incoming.add"');
+    expect(surface).toContain('"incoming.discardClaimed"');
+    expect(messages).toContain("Use with this connection");
+    expect(messages).toContain("Before you continue:");
+    expect(messages).toContain("Add shared files");
+    expect(messages).toContain("Discard claimed share");
     expect(surface).toContain("mobileIncomingShareProfileRetired");
     expect(bridge).toContain("saveIfRevision(identity, next, snapshot.revision)");
     expect(bridge).toContain("await draftStore.flush(identity)");

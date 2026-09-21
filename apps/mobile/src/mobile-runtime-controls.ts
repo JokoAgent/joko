@@ -13,6 +13,8 @@ import {
   type Session,
   type Snapshot
 } from "@joko/contracts";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export interface MobileRuntimeOwnerIdentity {
   readonly profileId: string;
@@ -450,29 +452,33 @@ export function assertMobilePlanMode(controls: MobileRuntimeControls, enabled: b
   return enabled;
 }
 
-export function mobilePermissionModeLabel(mode: PermissionMode): string {
+export function mobilePermissionModeLabel(mode: PermissionMode, locale: MobileSupportedLocale): string {
   switch (mode) {
-    case PermissionMode.ASK: return "Ask before actions";
-    case PermissionMode.AUTO: return "Allow safe actions";
-    case PermissionMode.BYPASS_PERMISSIONS: return "Full access";
-    default: return "Unavailable";
+    case PermissionMode.ASK: return mobileMessage(locale, "controls.permission.ask");
+    case PermissionMode.AUTO: return mobileMessage(locale, "controls.permission.auto");
+    case PermissionMode.BYPASS_PERMISSIONS: return mobileMessage(locale, "controls.permission.full");
+    default: return mobileMessage(locale, "controls.permission.unavailable");
   }
 }
 
-export function mobilePermissionModeDescription(mode: PermissionMode): string {
+export function mobilePermissionModeDescription(mode: PermissionMode, locale: MobileSupportedLocale): string {
   switch (mode) {
-    case PermissionMode.ASK: return "Joko asks before actions that need approval.";
-    case PermissionMode.AUTO: return "The Backend may continue with its advertised safe automatic policy.";
-    case PermissionMode.BYPASS_PERMISSIONS: return "The Backend may act without asking. Use only in a workspace you trust.";
-    default: return "This mode is not part of the current public contract.";
+    case PermissionMode.ASK: return mobileMessage(locale, "controls.permission.askDescription");
+    case PermissionMode.AUTO: return mobileMessage(locale, "controls.permission.autoDescription");
+    case PermissionMode.BYPASS_PERMISSIONS: return mobileMessage(locale, "controls.permission.fullDescription");
+    default: return mobileMessage(locale, "controls.permission.unavailableDescription");
   }
 }
 
-export function formatMobileTokenLimit(value: bigint): string {
-  if (value < 1n) return "Context limit unavailable";
-  if (value >= 1_000_000n && value % 1_000_000n === 0n) return `${value / 1_000_000n}M context`;
-  if (value >= 1_000n && value % 1_000n === 0n) return `${value / 1_000n}K context`;
-  return `${value.toString(10)} token context`;
+export function formatMobileTokenLimit(value: bigint, locale: MobileSupportedLocale): string {
+  if (value < 1n) return mobileMessage(locale, "controls.contextUnavailable");
+  if (value >= 1_000_000n && value % 1_000_000n === 0n) {
+    return mobileMessage(locale, "controls.contextMillions", { count: (value / 1_000_000n).toString(10) });
+  }
+  if (value >= 1_000n && value % 1_000n === 0n) {
+    return mobileMessage(locale, "controls.contextThousands", { count: (value / 1_000n).toString(10) });
+  }
+  return mobileMessage(locale, "controls.contextTokens", { count: value.toString(10) });
 }
 
 function positiveRevision(snapshot: Snapshot): boolean {

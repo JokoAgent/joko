@@ -53,6 +53,7 @@ describe("mobile PDF viewer HTML", () => {
   it("embeds the pinned complete offline runtime and a no-network/no-file all-page viewer", () => {
     const html = buildMobilePdfViewerHtml({
       instanceId: "pdf-1",
+      locale: "en",
       title: "Proof <final>",
       background: "#ffffff",
       surface: "#f5f5f5",
@@ -83,12 +84,12 @@ describe("mobile PDF viewer HTML", () => {
   it("rejects incomplete or unpinned embedded resources", () => {
     const runtime = runtimeBundle();
     expect(() => buildMobilePdfViewerHtml({
-      instanceId: "pdf-1", title: "Proof", background: "#ffffff", surface: "#f5f5f5",
+      instanceId: "pdf-1", locale: "en", title: "Proof", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, { ...runtime, version: "5.7.283" })).toThrow(/runtime bundle/u);
     const { ["UniGB-UTF16-H.bcmap"]: _removed, ...missingCMap } = runtime.cMaps;
     expect(() => buildMobilePdfViewerHtml({
-      instanceId: "pdf-1", title: "Proof", background: "#ffffff", surface: "#f5f5f5",
+      instanceId: "pdf-1", locale: "en", title: "Proof", background: "#ffffff", surface: "#f5f5f5",
       ink: "#111111", muted: "#666666", accent: "#3366ff", border: "#dddddd"
     }, { ...runtime, cMaps: missingCMap })).toThrow(/runtime bundle/u);
   });
