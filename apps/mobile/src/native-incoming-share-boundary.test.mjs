@@ -26,6 +26,7 @@ const moduleConfig = JSON.parse(readFileSync(
   "utf8"
 ));
 const bridge = readFileSync(new URL("src/mobile-incoming-share.ts", project), "utf8");
+const nativeIntent = readFileSync(new URL("src/mobile-native-intent.ts", project), "utf8");
 const surface = readFileSync(new URL("src/App.tsx", project), "utf8");
 const messages = readFileSync(new URL("src/mobile-task-messages.ts", project), "utf8");
 
@@ -169,8 +170,12 @@ describe("iOS incoming-share native boundary", () => {
   it("routes cold, warm, foreground, and deep-link discovery only into the retained new-task transaction", () => {
     expect(surface).toContain("void mobileIncomingShare.refresh()");
     expect(surface).toContain('AppState.addEventListener("change"');
-    expect(surface).toContain('Linking.addEventListener("url"');
-    expect(surface).toContain("Linking.getInitialURL()");
+    expect(surface).toContain("installMobileNativeIntentLinking(Linking, offerUrl)");
+    expect(surface).toContain("isMobileIncomingShareUrl(url)");
+    expect(surface).toContain("nativeIntentDeliveryRef.current!.invalidate()");
+    expect(nativeIntent).toContain('source.addEventListener("url"');
+    expect(nativeIntent).toContain("source.getInitialURL()");
+    expect(nativeIntent).toContain("acceptedWarmUrlBeforeInitial");
     expect(surface).toContain("commitMobileIncomingShare({");
     expect(surface).toContain("mobileNewTaskDrafts");
     expect(surface).toContain('"incoming.useConnection"');

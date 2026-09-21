@@ -1,5 +1,6 @@
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileAutomationMessages } from "./mobile-automation-messages";
+import { mobileNativeIntentMessages } from "./mobile-native-intent-messages";
 import { mobileTaskMessages } from "./mobile-task-messages";
 import { mobileVoiceMessages } from "./mobile-voice-messages";
 
@@ -310,6 +311,7 @@ const en = {
   "settings.error": "The Settings action failed.",
   ...mobileTaskMessages.en,
   ...mobileAutomationMessages.en,
+  ...mobileNativeIntentMessages.en,
   ...mobileVoiceMessages.en
 } as const;
 
@@ -623,6 +625,7 @@ const zhCN: MobileMessageCatalog = {
   "settings.error": "设置操作失败。",
   ...mobileTaskMessages["zh-CN"],
   ...mobileAutomationMessages["zh-CN"],
+  ...mobileNativeIntentMessages["zh-CN"],
   ...mobileVoiceMessages["zh-CN"]
 };
 
@@ -933,6 +936,7 @@ const zhTW: MobileMessageCatalog = {
   "settings.error": "設定操作失敗。",
   ...mobileTaskMessages["zh-TW"],
   ...mobileAutomationMessages["zh-TW"],
+  ...mobileNativeIntentMessages["zh-TW"],
   ...mobileVoiceMessages["zh-TW"]
 };
 
@@ -1243,6 +1247,7 @@ const ja: MobileMessageCatalog = {
   "settings.error": "設定操作に失敗しました。",
   ...mobileTaskMessages.ja,
   ...mobileAutomationMessages.ja,
+  ...mobileNativeIntentMessages.ja,
   ...mobileVoiceMessages.ja
 };
 
@@ -1553,6 +1558,7 @@ const ko: MobileMessageCatalog = {
   "settings.error": "설정 작업에 실패했습니다.",
   ...mobileTaskMessages.ko,
   ...mobileAutomationMessages.ko,
+  ...mobileNativeIntentMessages.ko,
   ...mobileVoiceMessages.ko
 };
 

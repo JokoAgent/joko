@@ -15,12 +15,26 @@ import {
   type QueueItem, type Session
 } from "@joko/contracts";
 import { MobileConnectionStage } from "./MobileConnectionStage";
+import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
   MobileClient,
   type MobileQueueEditLease,
   type NearbyMobileNode,
   type SavedMobileConnection
 } from "./mobile-client";
+import {
+  MobileNativeIntentDelivery,
+  MobileExternalIntentFence,
+  executeMobileNativeIntent,
+  isMobileIncomingShareUrl,
+  installMobileNativeIntentLinking,
+  mobileConnectionStageRequired,
+  mobileNativeIntentMessageMatches,
+  parseMobileNativeIntent,
+  projectMobileNativeIntentSnapshot,
+  type MobileNativeIntentMessageFocus,
+  type MobileNativeIntentRecovery
+} from "./mobile-native-intent";
 import {
   mobileConnectionAppIcon,
   mobileConnectionArtworkFrame,
@@ -481,6 +495,9 @@ export function App() {
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
   const [homeSearchFocusRequest, setHomeSearchFocusRequest] = useState(0);
   const [focusTaskComposer, setFocusTaskComposer] = useState(false);
+  const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
+  const [nativeIntentRecovery, setNativeIntentRecovery] = useState<MobileNativeIntentRecovery>();
+  const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus>();
   const [deviceId, setDeviceId] = useState<string>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const homeMenuButtonRef = useRef<View>(null);
@@ -488,6 +505,13 @@ export function App() {
   const openedIncomingShareRef = useRef<string | undefined>(undefined);
   const retiredIncomingShareRef = useRef<string | undefined>(undefined);
   const diagnosticConnectionKeyRef = useRef<string | undefined>(undefined);
+  const nativeIntentDeliveryRef = useRef<MobileNativeIntentDelivery | null>(null);
+  const nativeIntentExecutingRef = useRef(false);
+  const nativeIntentConnectingRef = useRef(false);
+  const externalIntentFenceRef = useRef<MobileExternalIntentFence | null>(null);
+  const appMountedRef = useRef(true);
+  if (nativeIntentDeliveryRef.current === null) nativeIntentDeliveryRef.current = new MobileNativeIntentDelivery();
+  if (externalIntentFenceRef.current === null) externalIntentFenceRef.current = new MobileExternalIntentFence();
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
   const colors = useMemo(() => ({
@@ -498,6 +522,7 @@ export function App() {
   }), [dark]);
 
   useEffect(() => {
+    appMountedRef.current = true;
     void mobileThemePreferences.hydrate();
     void mobileLocalePreferences.hydrate();
     void mobileVoiceDictionary.hydrate();
@@ -539,21 +564,31 @@ export function App() {
       diagnosticsTick = nextTick;
       if (mobileDiagnostics.snapshot.enabled) void mobileDiagnostics.flush().catch(() => undefined);
     }, 2_000);
-    const linking = Linking.addEventListener("url", ({ url }) => {
-      if (/^joko:\/\/expo-sharing(?:[/?#]|$)/iu.test(url)) {
+    const offerUrl = (url: string): boolean => {
+      if (isMobileIncomingShareUrl(url)) {
+        externalIntentFenceRef.current!.offerShare();
+        nativeIntentDeliveryRef.current!.invalidate();
+        if (nativeIntentConnectingRef.current) client.cancel();
         void mobileIncomingShare.refresh().catch(() => undefined);
+        return true;
       }
-    });
-    void Linking.getInitialURL().then((url) => {
-      if (url && /^joko:\/\/expo-sharing(?:[/?#]|$)/iu.test(url)) {
-        void mobileIncomingShare.refresh().catch(() => undefined);
+      const intent = parseMobileNativeIntent(url);
+      if (intent !== undefined && nativeIntentDeliveryRef.current!.offer(url)) {
+        externalIntentFenceRef.current!.offerNative(intent);
+        if (nativeIntentConnectingRef.current) client.cancel();
+        setNativeIntentRevision((value) => value + 1);
       }
-    }).catch(() => undefined);
+      return intent !== undefined;
+    };
+    const removeLinking = installMobileNativeIntentLinking(Linking, offerUrl);
     return () => {
+      appMountedRef.current = false;
+      nativeIntentDeliveryRef.current!.invalidate();
+      if (nativeIntentConnectingRef.current) client.cancel();
       diagnosticsStopped = true;
       clearInterval(diagnosticTimer);
       subscription.remove();
-      linking.remove();
+      removeLinking();
       client.setForeground(false);
       void mobileComposerDrafts.flush().catch(() => undefined);
       void mobileInteractionDrafts.flush().catch(() => undefined);
@@ -561,6 +596,38 @@ export function App() {
       void mobileDiagnostics.flush().catch(() => undefined);
     };
   }, []);
+
+  useEffect(() => {
+    if (!foreground || nativeIntentExecutingRef.current || state.status === "starting" || state.status === "connecting"
+      || theme.status === "loading" || locale.status === "loading") return;
+    const delivery = nativeIntentDeliveryRef.current!;
+    const claim = delivery.take(true);
+    if (!claim) return;
+    nativeIntentExecutingRef.current = true;
+    void executeMobileNativeIntent(claim, delivery, {
+      snapshot: () => projectMobileNativeIntentSnapshot(client.state),
+      connectProfile: async (profileId) => {
+        nativeIntentConnectingRef.current = true;
+        try { await client.connectSaved(profileId); }
+        finally { nativeIntentConnectingRef.current = false; }
+      },
+      selectSession: (sessionId) => client.select(sessionId),
+      loadAround: (eventId) => client.around(eventId),
+      loadOlder: () => client.older(),
+      returnLatest: () => client.latest(),
+      showPage: setPage,
+      showSavedConnections: () => client.setConnectionMode("saved"),
+      showRecovery: setNativeIntentRecovery,
+      clearRecovery: () => setNativeIntentRecovery(undefined),
+      focusMessage: setNativeIntentMessageFocus,
+      clearMessageFocus: () => setNativeIntentMessageFocus(undefined),
+      focusApplication: () => undefined
+    }).finally(() => {
+      delivery.complete(claim);
+      nativeIntentExecutingRef.current = false;
+      if (appMountedRef.current) setNativeIntentRevision((value) => value + 1);
+    });
+  }, [foreground, locale.status, nativeIntentRevision, state.status, theme.status]);
 
   useEffect(() => {
     if (!diagnostics.enabled) {
@@ -575,7 +642,8 @@ export function App() {
 
   useEffect(() => {
     const batch = incomingShare.batch;
-    if (!batch || openedIncomingShareRef.current === batch.batchId || !state.activeProfileId) return;
+    if (!batch || openedIncomingShareRef.current === batch.batchId || !state.activeProfileId
+      || !externalIntentFenceRef.current!.shareMayNavigate()) return;
     openedIncomingShareRef.current = batch.batchId;
     setPage("new");
   }, [incomingShare.batch, state.activeProfileId]);
@@ -601,7 +669,7 @@ export function App() {
   useEffect(() => {
     if (!state.activeProfileId && state.status !== "starting") {
       setMenuOpen(false);
-      if (page !== "connection") setPage("home");
+      if (page !== "connection" && page !== "settings") setPage("home");
     }
     if ((page === "task" || page === "files") && !state.selectedId) setPage("home");
     if (page === "files" && state.status === "connected" && !client.canOpenFiles()) {
@@ -610,6 +678,12 @@ export function App() {
     }
     if (page === "device" && !state.owner?.devices.some((device) => device.deviceId === deviceId)) setPage("devices");
   }, [state.status, state.activeProfileId, state.selectedId, state.owner?.devices, deviceId, page]);
+
+  useEffect(() => {
+    if (nativeIntentMessageFocus && nativeIntentMessageFocus.sessionId !== state.selectedId) {
+      setNativeIntentMessageFocus(undefined);
+    }
+  }, [nativeIntentMessageFocus, state.selectedId]);
 
   const common = { colors, state, locale: locale.effectiveLocale };
   const connectionRequired = !state.activeProfileId;
@@ -628,14 +702,18 @@ export function App() {
           {state.status === "starting" || theme.status === "loading" || locale.status === "loading" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
             <StartupLoading colors={colors} dark={dark} locale={locale.effectiveLocale} />
           </SafeAreaView> :
-            connectionRequired || page === "connection" ? <ConnectionScreen {...common} dark={dark}
+            mobileConnectionStageRequired(state.activeProfileId, page) ? <ConnectionScreen {...common} dark={dark}
               onBack={connectionRequired ? undefined : () => { client.cancel(); setPage("home"); }}
               onConnected={() => setPage("home")} /> :
             <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
               {page === "new" ? <NewTaskScreen {...common} onBack={() => setPage("home")} onCreated={() => setPage("task")} /> :
-                page === "task" ? <TaskScreen {...common} onBack={() => setPage("home")} onHome={() => setPage("home")} onNew={() => setPage("new")}
-                  onFiles={() => { setFocusTaskComposer(false); setPage("files"); }} focusComposer={focusTaskComposer}
-                  onComposerFocused={handleComposerFocused} /> :
+                page === "task" ? <TaskScreen {...common}
+                  onBack={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
+                  onHome={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
+                  onNew={() => { setNativeIntentMessageFocus(undefined); setPage("new"); }}
+                  onFiles={() => { setNativeIntentMessageFocus(undefined); setFocusTaskComposer(false); setPage("files"); }}
+                  focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
+                  messageFocus={nativeIntentMessageFocus} /> :
                 page === "files" ? <FilesScreen {...common} onBack={() => setPage("task")}
                   onAdded={() => {
                     setFocusTaskComposer(true);
@@ -673,6 +751,8 @@ export function App() {
                   onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
             </SafeAreaView>}
         </View>
+        {nativeIntentRecovery && <MobileNativeIntentNotice colors={colors} locale={locale.effectiveLocale}
+          recovery={nativeIntentRecovery} onDismiss={() => setNativeIntentRecovery(undefined)} />}
         <HomeMenu visible={!connectionRequired && menuOpen} colors={colors} state={state}
           locale={locale.effectiveLocale}
           onClose={() => setMenuOpen(false)}
@@ -2575,9 +2655,11 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, focusComposer, onComposerFocused }: ScreenProps & {
+function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, focusComposer, onComposerFocused,
+  messageFocus }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: () => void;
   focusComposer: boolean; onComposerFocused: () => void;
+  messageFocus?: MobileNativeIntentMessageFocus;
 }) {
   const initialDraftIdentity = state.activeProfileId && state.selectedId
     ? { profileId: state.activeProfileId, sessionId: state.selectedId }
@@ -2638,6 +2720,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   const [fileShareBusy, setFileShareBusy] = useState(false);
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [timelinePreviewSource, setTimelinePreviewSource] = useState<MobileTimelineArtifact>();
+  const [messageFocusHighlight, setMessageFocusHighlight] = useState<string>();
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
@@ -2653,6 +2736,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   const composerSelectionRef = useRef(composerSelection);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
+  const timelineListRef = useRef<FlatList<TimelineRow>>(null);
+  const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
   const composerPasteEditableRef = useRef(false);
   const composerComposingRef = useRef(false);
   const composerFocusedRef = useRef(false);
@@ -2745,6 +2831,34 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   const session = state.detail?.sessions.find((item) => item.sessionId === state.selectedId)
     || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
   const rows = timelineRows(state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live]);
+  const activeMessageFocus = messageFocus?.sessionId === state.selectedId ? messageFocus : undefined;
+  const messageFocusIndex = activeMessageFocus === undefined
+    ? -1
+    : rows.findIndex((row) => mobileNativeIntentMessageMatches(activeMessageFocus, row));
+  const messageFocusKey = messageFocus && messageFocusIndex >= 0
+    ? `${messageFocus.requestId}\u001f${messageFocus.messageId}\u001f${messageFocus.messageEventId ?? ""}`
+    : undefined;
+  useEffect(() => {
+    if (messageFocusKey === undefined || messageFocusIndex < 0) {
+      setMessageFocusHighlight(undefined);
+      return;
+    }
+    messageFocusRetryKeyRef.current = undefined;
+    setMessageFocusHighlight(messageFocusKey);
+    const frame = requestAnimationFrame(() => {
+      timelineListRef.current?.scrollToIndex({ index: messageFocusIndex, animated: false, viewPosition: 0.5 });
+    });
+    const highlightTimer = setTimeout(() => {
+      setMessageFocusHighlight((current) => current === messageFocusKey ? undefined : current);
+    }, 3_000);
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(highlightTimer);
+      if (messageFocusRetryRef.current !== undefined) clearTimeout(messageFocusRetryRef.current);
+      messageFocusRetryRef.current = undefined;
+      messageFocusRetryKeyRef.current = undefined;
+    };
+  }, [messageFocusIndex, messageFocusKey]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
   const queueCapabilities = client.taskQueueCapabilities();
@@ -4458,7 +4572,20 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
-    <FlatList data={rows} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+    <FlatList ref={timelineListRef} data={rows} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+      onScrollToIndexFailed={({ averageItemLength, index }) => {
+        if (messageFocusHighlight === undefined || messageFocusKey !== messageFocusHighlight) return;
+        if (messageFocusRetryKeyRef.current === messageFocusKey) return;
+        messageFocusRetryKeyRef.current = messageFocusKey;
+        timelineListRef.current?.scrollToOffset({ offset: Math.max(0, averageItemLength * index), animated: false });
+        if (messageFocusRetryRef.current !== undefined) clearTimeout(messageFocusRetryRef.current);
+        messageFocusRetryRef.current = setTimeout(() => {
+          if (taskMountedRef.current && messageFocusKey === messageFocusHighlight) {
+            timelineListRef.current?.scrollToIndex({ index, animated: false, viewPosition: 0.5 });
+          }
+          messageFocusRetryRef.current = undefined;
+        }, 80);
+      }}
       ListHeaderComponent={<View style={styles.historyActions}>
         {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
         {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
@@ -4467,7 +4594,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
         ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
-      renderItem={({ item }) => <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      renderItem={({ item }) => {
+        const linked = messageFocusHighlight === messageFocusKey && messageFocus !== undefined
+          && mobileNativeIntentMessageMatches(messageFocus, item);
+        return <View accessibilityLiveRegion={linked ? "polite" : undefined}
+          style={[styles.message, linked && styles.messageFocused,
+            { backgroundColor: linked ? colors.brandBackground : colors.surface,
+              borderColor: linked ? colors.accent : colors.border }]}>
+        {linked && <Text style={[styles.caption, { color: colors.accent }]}>
+          {mobileMessage(locale, "intent.linkedMessage", { label: item.label })}
+        </Text>}
         <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
         <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
         {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
@@ -4540,7 +4676,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
               <Text style={[styles.caption, { color: state.status !== "connected" || voice.busy ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
             </Pressable>}
         </View>
-      </View>} />
+      </View>;
+      }} />
     {queueItems.length > 0 && <View style={styles.queueRegion}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList}
@@ -6096,6 +6233,7 @@ const styles = StyleSheet.create({
   devices: { flexGrow: 0, maxHeight: 50 }, deviceList: { paddingHorizontal: 16, gap: 8 },
   deviceChip: { borderWidth: 1, borderRadius: 18, overflow: "hidden", paddingHorizontal: 12, paddingVertical: 8 },
   message: { borderWidth: 1, borderRadius: 14, padding: 14, gap: 6, marginBottom: 8 },
+  messageFocused: { borderWidth: 2 },
   messageImages: { gap: 8, paddingTop: 4 },
   messageImageTile: { minHeight: 58, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8,
     flexDirection: "row", alignItems: "center", gap: 10 },
