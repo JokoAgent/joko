@@ -636,6 +636,7 @@ export function App() {
                     setPage("task");
                   }} /> :
                 page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
+                  locale={locale.effectiveLocale}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
                   theme={theme} locale={locale} diagnostics={diagnostics} client={client}

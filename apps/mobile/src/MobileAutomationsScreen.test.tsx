@@ -25,6 +25,7 @@ import {
 } from "@joko/contracts";
 import { emptyMobileFilesState } from "./workspace-files";
 import type { MobileState } from "./mobile-client";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type {
   MobileAutomationRun,
   MobileAutomationSchedule,
@@ -324,19 +325,31 @@ afterEach(() => {
   native.alert.mockReset();
 });
 
-function mount(state: MobileState, client = mobileClient(), onOpenTask = vi.fn()) {
+function mount(
+  state: MobileState,
+  client = mobileClient(),
+  onOpenTask = vi.fn(),
+  locale: MobileSupportedLocale = "en"
+) {
   const container = document.createElement("div");
   const onBack = vi.fn();
-  const render = (next: MobileState) => createElement(MobileAutomationsScreen, {
+  const render = (next: MobileState, nextLocale: MobileSupportedLocale) => createElement(MobileAutomationsScreen, {
     colors,
     state: next,
+    locale: nextLocale,
     client,
     onBack,
     onOpenTask
   });
   root = createRoot(container);
-  act(() => root!.render(render(state)));
-  return { container, client, onOpenTask, rerender: (next: MobileState) => act(() => root!.render(render(next))) };
+  act(() => root!.render(render(state, locale)));
+  return {
+    container,
+    client,
+    onOpenTask,
+    rerender: (next: MobileState, nextLocale: MobileSupportedLocale = locale) =>
+      act(() => root!.render(render(next, nextLocale)))
+  };
 }
 
 function button(container: HTMLElement, label: string): HTMLButtonElement {
@@ -482,7 +495,7 @@ describe("MobileAutomationsScreen", () => {
     });
     await act(async () => undefined);
     expect(client.loadAutomationWorktree).toHaveBeenCalledWith("target");
-    act(() => button(container, "persistent").click());
+    act(() => button(container, "Persistent task").click());
     await act(async () => button(container, "Create Automation").click());
 
     expect(client.saveAutomation).toHaveBeenCalledWith(expect.objectContaining({
@@ -588,5 +601,90 @@ describe("MobileAutomationsScreen", () => {
     const promote = native.alert.mock.calls[0]?.[2]?.[1] as { onPress?: () => void } | undefined;
     await act(async () => promote?.onPress?.());
     expect(personalClient.promoteAutomation).toHaveBeenCalledWith(dialogueSchedule.scheduleId);
+  });
+
+  it("rerenders list, detail, editor and deletion in all locales without replacing state or repeating authority", async () => {
+    native.width = 900;
+    const client = mobileClient();
+    const connected = mobileState({}, { owner: authoringOwner() });
+    const mounted = mount(connected, client);
+    const locales = [
+      { locale: "en", title: "Automations", open: "Open Automation Project check", edit: "Edit", name: "Automation name" },
+      { locale: "zh-CN", title: "自动化", open: "打开自动化 Project check", edit: "编辑", name: "自动化名称" },
+      { locale: "zh-TW", title: "自動化", open: "開啟自動化 Project check", edit: "編輯", name: "自動化名稱" },
+      { locale: "ja", title: "自動化", open: "自動化 Project check を開く", edit: "編集", name: "自動化名" },
+      { locale: "ko", title: "자동화", open: "자동화 Project check 열기", edit: "편집", name: "자동화 이름" }
+    ] as const;
+
+    for (const expectation of locales) {
+      mounted.rerender(connected, expectation.locale);
+      expect(mounted.container.textContent).toContain(expectation.title);
+      expect(button(mounted.container, expectation.open)).toBeTruthy();
+      expect(button(mounted.container, expectation.edit)).toBeTruthy();
+    }
+    act(() => button(mounted.container, "편집").click());
+    act(() => changeInput(input(mounted.container, "자동화 이름"), "Locale-stable draft"));
+
+    for (const expectation of locales) {
+      mounted.rerender(connected, expectation.locale);
+      expect(input(mounted.container, expectation.name).value).toBe("Locale-stable draft");
+    }
+    expect(client.openAutomations).not.toHaveBeenCalled();
+    expect(client.selectAutomation).not.toHaveBeenCalled();
+    expect(client.refreshAutomations).not.toHaveBeenCalled();
+    expect(client.saveAutomation).not.toHaveBeenCalled();
+    expect(client.runAutomation).not.toHaveBeenCalled();
+    expect(client.loadAutomationWorktree).not.toHaveBeenCalled();
+
+    act(() => root?.unmount());
+    root = undefined;
+    const deleteClient = mobileClient();
+    const deletionState = mobileState({
+      selectedScheduleId: dialogueSchedule.scheduleId,
+      detail: dialogueSchedule
+    }, { owner: authoringOwner() });
+    const deletion = mount(deletionState, deleteClient);
+    act(() => button(deletion.container, "Delete Automation").click());
+    await act(async () => undefined);
+    const deletionLabels = [
+      { locale: "en", title: "Delete Automation", confirm: "Confirm deletion" },
+      { locale: "zh-CN", title: "删除自动化", confirm: "确认删除" },
+      { locale: "zh-TW", title: "刪除自動化", confirm: "確認刪除" },
+      { locale: "ja", title: "自動化を削除", confirm: "削除を確定" },
+      { locale: "ko", title: "자동화 삭제", confirm: "삭제 확인" }
+    ] as const;
+    for (const expectation of deletionLabels) {
+      deletion.rerender(deletionState, expectation.locale);
+      expect(deletion.container.textContent).toContain(expectation.title);
+      expect(deletion.container.textContent).toContain("session-generated");
+      expect(button(deletion.container, expectation.confirm)).toBeTruthy();
+    }
+    expect(deleteClient.prepareAutomationDeletion).toHaveBeenCalledTimes(1);
+    expect(deleteClient.deleteAutomation).not.toHaveBeenCalled();
+  });
+
+  it("applies localized built-in template content while preserving the template's domain settings", async () => {
+    const client = mobileClient();
+    const state = mobileState({
+      schedules: [], selectedScheduleId: undefined, detail: undefined, history: [], historyTotalSize: 0
+    }, { owner: authoringOwner() });
+    const { container } = mount(state, client, vi.fn(), "zh-CN");
+
+    act(() => button(container, "新建").click());
+    act(() => button(container, "领域雷达").click());
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("请输入模板参数：关注主题");
+    act(() => changeInput(input(container, "模板参数"), "智能体安全"));
+    act(() => button(container, "领域雷达").click());
+
+    expect(input(container, "自动化名称").value).toBe("领域雷达");
+    expect(input(container, "计划输入").value).toContain("围绕主题「智能体安全」");
+    await act(async () => button(container, "创建自动化").click());
+    expect(client.saveAutomation).toHaveBeenCalledWith(expect.objectContaining({
+      name: "领域雷达",
+      recurrence: "cron",
+      expression: "0 9 * * 1-5",
+      timeZone: "Asia/Shanghai",
+      inputText: expect.stringContaining("智能体安全")
+    }), undefined);
   });
 });

@@ -36,6 +36,29 @@ import {
   type MobileAutomationTemplateId,
   type MobileAutomationWorktreeProof
 } from "./mobile-automation-authoring";
+import {
+  formatMobileAutomationCost,
+  formatMobileAutomationDate,
+  formatMobileAutomationDuration,
+  mobileAutomationDirectoryAccessLabel,
+  mobileAutomationExecutionModeLabel,
+  mobileAutomationFilterLabel,
+  mobileAutomationMisfireLabel,
+  mobileAutomationOverlapLabel,
+  mobileAutomationPermissionLabel,
+  mobileAutomationPreRunDecisionLabel,
+  mobileAutomationPreRunStatusLabel,
+  mobileAutomationRecurrenceKindLabel,
+  mobileAutomationRecurrenceLabel,
+  mobileAutomationRunStateLabel,
+  mobileAutomationScheduleSourceLabel,
+  mobileAutomationScheduleStateLabel,
+  mobileAutomationSessionModeLabel,
+  mobileAutomationTemplatePresentation,
+  mobileAutomationWorktreeEligibilityLabel
+} from "./mobile-automation-presentation";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import { resolveMobileNewTaskExecutionAuthority } from "./mobile-runtime-controls";
 import { mobileScheduleLocalDateTimeFromEpoch } from "./mobile-schedule-time";
 
@@ -62,12 +85,13 @@ export type MobileAutomationsClient = Pick<MobileClient,
 export interface MobileAutomationsScreenProps {
   readonly colors: MobileAutomationsColors;
   readonly state: MobileState;
+  readonly locale: MobileSupportedLocale;
   readonly client: MobileAutomationsClient;
   readonly onBack: () => void;
   readonly onOpenTask: () => void;
 }
 
-export function MobileAutomationsScreen({ colors, state, client, onBack, onOpenTask }: MobileAutomationsScreenProps) {
+export function MobileAutomationsScreen({ colors, state, locale, client, onBack, onOpenTask }: MobileAutomationsScreenProps) {
   const { width } = useWindowDimensions();
   const [narrowDetail, setNarrowDetail] = useState(false);
   const [localError, setLocalError] = useState("");
@@ -119,61 +143,68 @@ export function MobileAutomationsScreen({ colors, state, client, onBack, onOpenT
 
   const list = <View style={[styles.listPane, wide && styles.wideListPane]}>
     <View style={styles.headerRow}>
-      <Button label="Back" colors={colors} onPress={leave} />
+      <Button label={mobileMessage(locale, "common.back")} colors={colors} onPress={leave} />
       <View style={styles.headerText}>
-        <Text style={[styles.title, { color: colors.ink }]}>Automations</Text>
+        <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "automation.title")}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>
-          {automations.schedules.length} schedules · {unreadTotal} unread runs
+          {mobileMessage(locale, "automation.summary", { schedules: automations.schedules.length, unread: unreadTotal })}
         </Text>
       </View>
-      <Button label="New" colors={colors} disabled={!online || state.busy} onPress={() => openEditor()} />
-      <Button label="Refresh" colors={colors} disabled={state.status !== "connected" || automations.status === "loading"}
+      <Button label={mobileMessage(locale, "common.new")} colors={colors} disabled={!online || state.busy} onPress={() => openEditor()} />
+      <Button label={mobileMessage(locale, "common.refresh")} colors={colors} disabled={state.status !== "connected" || automations.status === "loading"}
         onPress={() => void run(() => client.refreshAutomations())} />
     </View>
     {automations.status === "offline" && <Notice colors={colors}
-      text="Showing verified saved Schedule summaries. Details, run history, and Automation actions require a live Joko connection." />}
+      text={mobileMessage(locale, "automation.offlineSummary")} />}
     {(localError || automations.error) && <Notice colors={colors} danger text={localError || automations.error || ""} />}
     <View accessibilityRole="tablist" style={styles.filterRow}>
       {(["all", "active", "paused"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
-        accessibilityLabel={`${filter[0]!.toUpperCase() + filter.slice(1)} Automations`}
+        accessibilityLabel={mobileMessage(locale, "automation.filter.accessibility", {
+          filter: mobileAutomationFilterLabel(locale, filter)
+        })}
         accessibilityState={{ selected: automations.filter === filter }}
         onPress={() => client.setAutomationFilter(filter)}
         style={[styles.filter, { borderColor: automations.filter === filter ? colors.accent : colors.border,
           backgroundColor: automations.filter === filter ? colors.brandBackground : colors.surface }]}>
-        <Text style={[styles.buttonText, { color: colors.ink }]}>{filter[0]!.toUpperCase() + filter.slice(1)}</Text>
+        <Text style={[styles.buttonText, { color: colors.ink }]}>{mobileAutomationFilterLabel(locale, filter)}</Text>
       </Pressable>)}
     </View>
-    {online && unreadTotal > 0 && <Button label="Mark all runs read" colors={colors} disabled={state.busy}
+    {online && unreadTotal > 0 && <Button label={mobileMessage(locale, "automation.markAllRead")} colors={colors} disabled={state.busy}
       onPress={() => void run(() => client.markAllAutomationRunsRead())} />}
     {automations.status === "loading" && automations.schedules.length === 0
-      ? <Centered colors={colors} label="Loading Automations…" loading />
+      ? <Centered colors={colors} label={mobileMessage(locale, "automation.loading")} loading />
       : groups.length === 0
         ? <View style={styles.emptyState}>
-          <Centered colors={colors} label={automations.filter === "all" ? "No Automations" : `No ${automations.filter} Automations`} />
-          {automations.filter === "all" && <Button label="Create Automation" colors={colors} disabled={!online || state.busy}
+          <Centered colors={colors} label={automations.filter === "all"
+            ? mobileMessage(locale, "automation.empty.all")
+            : automations.filter === "active"
+              ? mobileMessage(locale, "automation.empty.active")
+              : mobileMessage(locale, "automation.empty.paused")} />
+          {automations.filter === "all" && <Button label={mobileMessage(locale, "automation.create")} colors={colors} disabled={!online || state.busy}
             onPress={() => openEditor()} />}
         </View>
         : <ScrollView contentContainerStyle={styles.scheduleList}>
           {groups.map((group) => <View key={group.kind}>
-            <Text style={[styles.section, { color: colors.muted }]}>{group.kind === "project" ? "Project" : "Dialogue"}</Text>
+            <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale,
+              group.kind === "project" ? "common.project" : "common.dialogue")}</Text>
             {group.schedules.map((schedule) => <ScheduleRow key={schedule.scheduleId} schedule={schedule}
-              selected={schedule.scheduleId === automations.selectedScheduleId} colors={colors}
+              selected={schedule.scheduleId === automations.selectedScheduleId} colors={colors} locale={locale}
               onPress={() => select(schedule)} />)}
           </View>)}
         </ScrollView>}
   </View>;
 
-  const detail = <AutomationDetail colors={colors} state={state} schedule={selected} client={client}
+  const detail = <AutomationDetail colors={colors} state={state} schedule={selected} client={client} locale={locale}
     online={online} localError={localError} setLocalError={setLocalError} onRun={run}
     onBack={wide ? undefined : () => setNarrowDetail(false)} onOpenTask={onOpenTask}
     onEdit={openEditor} onDelete={setDeleting} />;
 
   if (editor !== undefined) return <View style={[styles.root, { backgroundColor: colors.background }]}>
-    <AutomationEditor colors={colors} state={state} client={client} initialDraft={editor.draft}
+    <AutomationEditor colors={colors} state={state} client={client} initialDraft={editor.draft} locale={locale}
       schedule={editor.schedule} onClose={() => setEditor(undefined)} />
   </View>;
   if (deleting !== undefined) return <View style={[styles.root, { backgroundColor: colors.background }]}>
-    <AutomationDeletePanel colors={colors} state={state} client={client} schedule={deleting}
+    <AutomationDeletePanel colors={colors} state={state} client={client} schedule={deleting} locale={locale}
       onClose={() => setDeleting(undefined)} />
   </View>;
 
@@ -184,32 +215,36 @@ export function MobileAutomationsScreen({ colors, state, client, onBack, onOpenT
   </View>;
 }
 
-function ScheduleRow({ schedule, selected, colors, onPress }: {
+function ScheduleRow({ schedule, selected, colors, locale, onPress }: {
   readonly schedule: MobileAutomationSchedule;
   readonly selected: boolean;
   readonly colors: MobileAutomationsColors;
+  readonly locale: MobileSupportedLocale;
   readonly onPress: () => void;
 }) {
-  const state = schedule.state === "disabled" ? "Paused" : schedule.state === "running" ? "Running"
-    : schedule.state === "enabled" ? "Active" : schedule.state === "error" ? "Error" : "Deleting";
-  return <Pressable accessibilityRole="button" accessibilityLabel={`Open Automation ${schedule.displayName}`}
+  return <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "automation.schedule.open", {
+    name: schedule.displayName
+  })}
     accessibilityState={{ selected }} onPress={onPress}
     style={[styles.card, { backgroundColor: selected ? colors.brandBackground : colors.surface,
       borderColor: selected ? colors.accent : colors.border }]}>
     <View style={styles.rowBetween}>
       <Text style={[styles.label, styles.flex, { color: colors.ink }]} numberOfLines={1}>{schedule.displayName}</Text>
-      {schedule.unreadRunCount > 0 && <Text accessibilityLabel={`${schedule.unreadRunCount} unread runs`}
+      {schedule.unreadRunCount > 0 && <Text accessibilityLabel={mobileMessage(locale, "automation.schedule.unread", {
+        count: schedule.unreadRunCount
+      })}
         style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{schedule.unreadRunCount}</Text>}
     </View>
-    <Text style={[styles.caption, { color: colors.muted }]}>{state} · {schedule.recurrenceLabel}</Text>
-    <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{schedule.inputText || "No scheduled input"}</Text>
+    <Text style={[styles.caption, { color: colors.muted }]}>{mobileAutomationScheduleStateLabel(locale, schedule.state)} · {mobileAutomationRecurrenceLabel(locale, schedule)}</Text>
+    <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{schedule.inputText || mobileMessage(locale, "automation.schedule.noInput")}</Text>
   </Pressable>;
 }
 
 function AutomationDetail({ colors, state, schedule, client, online, localError, setLocalError, onRun, onBack, onOpenTask,
-  onEdit, onDelete }: {
+  onEdit, onDelete, locale }: {
   readonly colors: MobileAutomationsColors;
   readonly state: MobileState;
+  readonly locale: MobileSupportedLocale;
   readonly schedule?: MobileAutomationSchedule;
   readonly client: MobileAutomationsClient;
   readonly online: boolean;
@@ -222,7 +257,7 @@ function AutomationDetail({ colors, state, schedule, client, online, localError,
   readonly onDelete: (schedule: MobileAutomationSchedule) => void;
 }) {
   const automations = state.automations;
-  if (!schedule) return <Centered colors={colors} label="Select an Automation" />;
+  if (!schedule) return <Centered colors={colors} label={mobileMessage(locale, "automation.select")} />;
   const detail = automations.detail?.scheduleId === schedule.scheduleId ? automations.detail : undefined;
   const pending = state.pending.some((item) => item.scheduleId === schedule.scheduleId
     && item.kind.startsWith("schedule-"));
@@ -233,9 +268,11 @@ function AutomationDetail({ colors, state, schedule, client, online, localError,
     const apply = () => void onRun(() => client.setAutomationEnabled(schedule.scheduleId, enabled));
     if (!enabled && inFlight > 0) {
       Alert.alert(
-        `Pause ${schedule.displayName}?`,
-        `${inFlight} run${inFlight === 1 ? " is" : "s are"} currently in flight. Pausing blocks future triggers and stops in-flight work.`,
-        [{ text: "Keep running", style: "cancel" }, { text: "Pause", style: "destructive", onPress: apply }]
+        mobileMessage(locale, "automation.pause.title", { name: schedule.displayName }),
+        inFlight === 1 ? mobileMessage(locale, "automation.pause.body.one")
+          : mobileMessage(locale, "automation.pause.body.many", { count: inFlight }),
+        [{ text: mobileMessage(locale, "automation.pause.keepRunning"), style: "cancel" },
+          { text: mobileMessage(locale, "automation.action.pause"), style: "destructive", onPress: apply }]
       );
     } else apply();
   };
@@ -243,90 +280,100 @@ function AutomationDetail({ colors, state, schedule, client, online, localError,
     void onRun(() => client.markAutomationRunsRead(schedule.scheduleId));
   };
   const promote = (): void => Alert.alert(
-    "Promote to project Automation?",
-    "This writes the Automation into the project configuration and replaces the personal Schedule.",
-    [{ text: "Cancel", style: "cancel" }, { text: "Promote", onPress: () => void onRun(() => client.promoteAutomation(schedule.scheduleId)) }]
+    mobileMessage(locale, "automation.promote.title"),
+    mobileMessage(locale, "automation.promote.body"),
+    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+      { text: mobileMessage(locale, "automation.promote.confirm"), onPress: () => void onRun(() => client.promoteAutomation(schedule.scheduleId)) }]
   );
   const clone = (): void => {
-    void onRun(() => client.cloneProjectAutomation(schedule.scheduleId, `${schedule.displayName} (copy)`));
+    void onRun(() => client.cloneProjectAutomation(schedule.scheduleId,
+      mobileMessage(locale, "automation.copyName", { name: schedule.displayName })));
   };
   const removeProject = (): void => Alert.alert(
-    "Remove project Automation?",
-    "Remove it from project configuration, with or without keeping a personal copy.",
+    mobileMessage(locale, "automation.removeProject.title"),
+    mobileMessage(locale, "automation.removeProject.body"),
     [
-      { text: "Cancel", style: "cancel" },
-      { text: "Remove", style: "destructive", onPress: () => void onRun(() => client.removeProjectAutomation(schedule.scheduleId, false)) },
-      { text: "Keep personal copy", onPress: () => void onRun(() => client.removeProjectAutomation(schedule.scheduleId, true)) }
+      { text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+      { text: mobileMessage(locale, "automation.removeProject.confirm"), style: "destructive", onPress: () => void onRun(() => client.removeProjectAutomation(schedule.scheduleId, false)) },
+      { text: mobileMessage(locale, "automation.removeProject.keepCopy"), onPress: () => void onRun(() => client.removeProjectAutomation(schedule.scheduleId, true)) }
     ]
   );
   return <ScrollView contentContainerStyle={styles.detail}>
-    {onBack && <Button label="Automation list" colors={colors} onPress={onBack} />}
+    {onBack && <Button label={mobileMessage(locale, "automation.list")} colors={colors} onPress={onBack} />}
     <View style={styles.rowBetween}>
       <View style={styles.flex}>
         <Text style={[styles.title, { color: colors.ink }]}>{schedule.displayName}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{schedule.source === "project" ? "Project Automation" : "Dialogue Automation"}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileAutomationScheduleSourceLabel(locale, schedule.source)}</Text>
       </View>
-      <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{schedule.state}</Text>
+      <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileAutomationScheduleStateLabel(locale, schedule.state)}</Text>
     </View>
-    {!online && <Notice colors={colors} text="Reconnect to load exact details and run history. Automation controls are read-only." />}
+    {!online && <Notice colors={colors} text={mobileMessage(locale, "automation.detail.offline")} />}
     {(localError || automations.error) && <Notice colors={colors} danger text={localError || automations.error || ""} />}
     <View style={styles.actionRow}>
-      <Button label="Run now" colors={colors} disabled={disabled}
+      <Button label={mobileMessage(locale, "automation.action.runNow")} colors={colors} disabled={disabled}
         onPress={() => void onRun(() => client.runAutomation(schedule.scheduleId))} />
-      <Button label={schedule.state === "disabled" ? "Resume" : "Pause"} colors={colors} disabled={disabled}
+      <Button label={schedule.state === "disabled" ? mobileMessage(locale, "automation.action.resume")
+        : mobileMessage(locale, "automation.action.pause")} colors={colors} disabled={disabled}
         onPress={toggle} />
-      <Button label="Refresh" colors={colors} disabled={state.status !== "connected" || automations.status === "loading"}
+      <Button label={mobileMessage(locale, "common.refresh")} colors={colors} disabled={state.status !== "connected" || automations.status === "loading"}
         onPress={() => void onRun(() => client.refreshAutomations(schedule.scheduleId))} />
-      <Button label="Edit" colors={colors} disabled={disabled || detail === undefined} onPress={() => onEdit(detail ?? schedule)} />
+      <Button label={mobileMessage(locale, "common.edit")} colors={colors} disabled={disabled || detail === undefined} onPress={() => onEdit(detail ?? schedule)} />
       {schedule.source === "dialogue"
         ? <>
-          <Button label="Promote to project" colors={colors} disabled={disabled || schedule.sessionMode === "bound"} onPress={promote} />
-          <Button label="Delete Automation" danger colors={colors} disabled={disabled} onPress={() => onDelete(schedule)} />
+          <Button label={mobileMessage(locale, "automation.action.promote")} colors={colors} disabled={disabled || schedule.sessionMode === "bound"} onPress={promote} />
+          <Button label={mobileMessage(locale, "automation.action.delete")} danger colors={colors} disabled={disabled} onPress={() => onDelete(schedule)} />
         </>
         : <>
-          <Button label="Clone personal copy" colors={colors} disabled={disabled} onPress={clone} />
-          <Button label="Reconcile project" colors={colors} disabled={disabled}
+          <Button label={mobileMessage(locale, "automation.action.clone")} colors={colors} disabled={disabled} onPress={clone} />
+          <Button label={mobileMessage(locale, "automation.action.reconcile")} colors={colors} disabled={disabled}
             onPress={() => void onRun(() => client.reconcileProjectAutomations(schedule.targetId))} />
-          <Button label="Remove from project" danger colors={colors} disabled={disabled} onPress={removeProject} />
+          <Button label={mobileMessage(locale, "automation.action.removeProject")} danger colors={colors} disabled={disabled} onPress={removeProject} />
         </>}
     </View>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <Info label="Timing" value={schedule.recurrenceLabel} colors={colors} />
-      <Info label="Task mode" value={schedule.sessionMode} colors={colors} />
-      <Info label="Execution" value={schedule.executionMode} colors={colors} />
-      <Info label="Time zone" value={schedule.timeZone} colors={colors} />
-      <Info label="Overlap" value={schedule.overlapPolicy} colors={colors} />
-      <Info label="Missed run" value={schedule.misfirePolicy} colors={colors} />
-      {schedule.nextTriggerAt !== undefined && <Info label="Next run" value={formatDate(schedule.nextTriggerAt)} colors={colors} />}
-      {schedule.lastTriggeredAt !== undefined && <Info label="Last run" value={formatDate(schedule.lastTriggeredAt)} colors={colors} />}
-      {schedule.projectConfigPath && <Info label="Project source" value={schedule.projectConfigPath} colors={colors} />}
-      {detail && <Text style={[styles.body, { color: colors.ink }]}>{detail.inputText || "No scheduled input"}</Text>}
+      <Info label={mobileMessage(locale, "automation.info.timing")} value={mobileAutomationRecurrenceLabel(locale, schedule)} colors={colors} />
+      <Info label={mobileMessage(locale, "automation.info.taskMode")} value={mobileAutomationSessionModeLabel(locale, schedule.sessionMode)} colors={colors} />
+      <Info label={mobileMessage(locale, "automation.info.execution")} value={mobileAutomationExecutionModeLabel(locale, schedule.executionMode)} colors={colors} />
+      <Info label={mobileMessage(locale, "automation.info.timeZone")} value={schedule.timeZone} colors={colors} />
+      <Info label={mobileMessage(locale, "automation.info.overlap")} value={mobileAutomationOverlapLabel(locale, schedule.overlapPolicy)} colors={colors} />
+      <Info label={mobileMessage(locale, "automation.info.missedRun")} value={mobileAutomationMisfireLabel(locale, schedule.misfirePolicy)} colors={colors} />
+      {schedule.nextTriggerAt !== undefined && <Info label={mobileMessage(locale, "automation.info.nextRun")}
+        value={formatMobileAutomationDate(schedule.nextTriggerAt, locale, schedule.timeZone)} colors={colors} />}
+      {schedule.lastTriggeredAt !== undefined && <Info label={mobileMessage(locale, "automation.info.lastRun")}
+        value={formatMobileAutomationDate(schedule.lastTriggeredAt, locale, schedule.timeZone)} colors={colors} />}
+      {schedule.projectConfigPath && <Info label={mobileMessage(locale, "automation.info.projectSource")} value={schedule.projectConfigPath} colors={colors} />}
+      {detail && <Text style={[styles.body, { color: colors.ink }]}>{detail.inputText || mobileMessage(locale, "automation.schedule.noInput")}</Text>}
     </View>
     <View style={styles.rowBetween}>
-      <Text style={[styles.section, { color: colors.muted }]}>Run history ({automations.history.length}/{automations.historyTotalSize})</Text>
-      {schedule.unreadRunCount > 0 && <Button label="Mark schedule read" colors={colors} compact disabled={disabled}
+      <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "automation.history.title", {
+        loaded: automations.history.length, total: automations.historyTotalSize
+      })}</Text>
+      {schedule.unreadRunCount > 0 && <Button label={mobileMessage(locale, "automation.history.markScheduleRead")} colors={colors} compact disabled={disabled}
         onPress={markScheduleRead} />}
     </View>
     {automations.historyStatus === "loading" && automations.history.length === 0
-      ? <Centered colors={colors} label="Loading run history…" loading />
+      ? <Centered colors={colors} label={mobileMessage(locale, "automation.history.loading")} loading />
       : automations.history.length === 0
-        ? <Centered colors={colors} label={online ? "No runs yet" : "Run history is not cached"} />
+        ? <Centered colors={colors} label={online ? mobileMessage(locale, "automation.history.empty")
+          : mobileMessage(locale, "automation.history.uncached")} />
         : automations.history.map((run) => <RunCard key={run.triggerId} run={run} schedule={schedule}
-          colors={colors} client={client} disabled={disabled} onRun={onRun} onOpenTask={onOpenTask}
+          colors={colors} client={client} disabled={disabled} onRun={onRun} onOpenTask={onOpenTask} locale={locale}
           setLocalError={setLocalError} sessionAvailable={run.sessionId !== undefined
             && state.owner?.sessions.filter((session) => session.sessionId === run.sessionId).length === 1} />)}
-    {automations.historyNextPageToken && <Button label={automations.historyStatus === "loading-more" ? "Loading more…" : "Load more runs"}
+    {automations.historyNextPageToken && <Button label={automations.historyStatus === "loading-more"
+      ? mobileMessage(locale, "automation.history.loadingMore") : mobileMessage(locale, "automation.history.loadMore")}
       colors={colors} disabled={!online || automations.historyStatus !== "ready"}
       onPress={() => void onRun(() => client.loadMoreAutomationHistory())} />}
   </ScrollView>;
 }
 
-function AutomationEditor({ colors, state, client, schedule, initialDraft, onClose }: {
+function AutomationEditor({ colors, state, client, schedule, initialDraft, locale, onClose }: {
   readonly colors: MobileAutomationsColors;
   readonly state: MobileState;
   readonly client: MobileAutomationsClient;
   readonly schedule?: MobileAutomationSchedule;
   readonly initialDraft: MobileAutomationDraft;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
 }) {
   const [draft, setDraft] = useState(initialDraft);
@@ -376,9 +423,10 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, onClo
   const close = (): void => {
     if (!dirty) { onClose(); return; }
     Alert.alert(
-      "Discard Automation draft?",
-      "Your unsaved changes will be lost.",
-      [{ text: "Keep editing", style: "cancel" }, { text: "Discard", style: "destructive", onPress: onClose }]
+      mobileMessage(locale, "automation.editor.discardTitle"),
+      mobileMessage(locale, "automation.editor.discardBody"),
+      [{ text: mobileMessage(locale, "automation.editor.keepEditing"), style: "cancel" },
+        { text: mobileMessage(locale, "common.discard"), style: "destructive", onPress: onClose }]
     );
   };
   const chooseTarget = (targetId: string): void => {
@@ -482,7 +530,21 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, onClo
   };
   const applyTemplate = (templateId: MobileAutomationTemplateId): void => {
     setError("");
-    try { setDraft((current) => applyMobileAutomationTemplate(current, templateId, templateParameter)); }
+    const value = templateParameter.trim();
+    const presentation = mobileAutomationTemplatePresentation(locale, templateId, value);
+    if (presentation.parameter !== undefined && value === "") {
+      setError(mobileMessage(locale, "automation.editor.templateParameterRequired", {
+        label: presentation.parameter.label
+      }));
+      return;
+    }
+    try {
+      setDraft((current) => ({
+        ...applyMobileAutomationTemplate(current, templateId, value),
+        name: presentation.name,
+        inputText: presentation.prompt
+      }));
+    }
     catch (cause) { setError(errorText(cause)); }
   };
   const save = async (): Promise<void> => {
@@ -492,54 +554,59 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, onClo
     try {
       const result = await client.saveAutomation(draft, schedule?.scheduleId);
       if (result === undefined) {
-        setError("The durable save result is unknown. The draft was retained and was not resent.");
+        setError(mobileMessage(locale, "automation.editor.saveUnknown"));
         return;
       }
       onClose();
     } catch (cause) { setError(errorText(cause)); }
     finally { setSaving(false); }
   };
-  const recurrenceLabel = draft.recurrence === "once" ? "Local date and time"
-    : draft.recurrence === "interval" ? "Interval seconds"
-      : "Cron expression";
+  const recurrenceLabel = draft.recurrence === "once" ? mobileMessage(locale, "automation.recurrence.field.once")
+    : draft.recurrence === "interval" ? mobileMessage(locale, "automation.recurrence.field.interval")
+      : mobileMessage(locale, "automation.recurrence.field.cron");
   return <ScrollView contentContainerStyle={styles.editor}>
     <View style={styles.headerRow}>
-      <Button label="Close editor" colors={colors} disabled={saving} onPress={close} />
+      <Button label={mobileMessage(locale, "automation.editor.close")} colors={colors} disabled={saving} onPress={close} />
       <View style={styles.headerText}>
-        <Text style={[styles.title, { color: colors.ink }]}>{schedule ? "Edit Automation" : "New Automation"}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{dirty ? "Unsaved changes" : "No unsaved changes"}</Text>
+        <Text style={[styles.title, { color: colors.ink }]}>{schedule ? mobileMessage(locale, "automation.editor.title.edit")
+          : mobileMessage(locale, "automation.editor.title.new")}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{dirty ? mobileMessage(locale, "automation.editor.dirty")
+          : mobileMessage(locale, "automation.editor.clean")}</Text>
       </View>
-      <Button label={saving ? "Saving…" : "Save"} colors={colors} disabled={!editable}
+      <Button label={saving ? mobileMessage(locale, "common.saving") : mobileMessage(locale, "common.save")} colors={colors} disabled={!editable}
         onPress={() => void save()} />
     </View>
-    {!online && <Notice colors={colors} text="The draft is retained read-only while this device is offline or inactive. Reconnect to save." />}
-    {authoringPending && <Notice colors={colors} text="A related Automation change still has an unknown durable result. This draft remains read-only until its receipt is reconciled." />}
+    {!online && <Notice colors={colors} text={mobileMessage(locale, "automation.editor.offline")} />}
+    {authoringPending && <Notice colors={colors} text={mobileMessage(locale, "automation.editor.pending")} />}
     {(error || state.error) && <Notice colors={colors} danger text={error || state.error || ""} />}
 
-    <EditorSection title="Templates" colors={colors}>
-      <TextInput accessibilityLabel="Template parameter" value={templateParameter} editable={editable}
-        onChangeText={setTemplateParameter} placeholder="Topic or competitors, when required"
+    <EditorSection title={mobileMessage(locale, "automation.editor.templates")} colors={colors}>
+      <TextInput accessibilityLabel={mobileMessage(locale, "automation.editor.templateParameter")} value={templateParameter} editable={editable}
+        onChangeText={setTemplateParameter} placeholder={mobileMessage(locale, "automation.editor.templatePlaceholder")}
         placeholderTextColor={colors.muted} style={[styles.input, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
-      <View style={styles.optionRow}>{mobileAutomationTemplates().map((template) =>
-        <Choice key={template.id} label={template.name} selected={false} colors={colors} disabled={!editable}
-          onPress={() => applyTemplate(template.id)} />)}</View>
+      <View style={styles.optionRow}>{mobileAutomationTemplates().map((template) => {
+        const presentation = mobileAutomationTemplatePresentation(locale, template.id);
+        return <Choice key={template.id} label={presentation.name} selected={false} colors={colors} disabled={!editable}
+          onPress={() => applyTemplate(template.id)} />;
+      })}</View>
     </EditorSection>
 
-    <EditorSection title="Identity and project" colors={colors}>
-      <EditorInput label="Automation name" value={draft.name} colors={colors} editable={editable}
+    <EditorSection title={mobileMessage(locale, "automation.editor.identity")} colors={colors}>
+      <EditorInput label={mobileMessage(locale, "automation.editor.name")} value={draft.name} colors={colors} editable={editable}
         onChange={(value) => set("name", value)} />
-      <Text style={[styles.caption, { color: colors.muted }]}>Project</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.project")}</Text>
       <View style={styles.optionRow}>{targets.map((target) => <Choice key={target.targetId} label={target.displayName}
         selected={draft.targetId === target.targetId} colors={colors}
         disabled={!editable || schedule?.source === "project"} onPress={() => chooseTarget(target.targetId)} />)}</View>
-      <Info label="Backend" value={draft.backendId || "Unavailable"} colors={colors} />
-      <Choice label={draft.enabled ? "Enabled" : "Paused"} selected={draft.enabled} colors={colors} disabled={!editable}
+      <Info label={mobileMessage(locale, "automation.editor.backend")} value={draft.backendId || mobileMessage(locale, "common.unavailable")} colors={colors} />
+      <Choice label={draft.enabled ? mobileMessage(locale, "automation.schedule.state.enabled")
+        : mobileMessage(locale, "automation.schedule.state.disabled")} selected={draft.enabled} colors={colors} disabled={!editable}
         onPress={() => set("enabled", !draft.enabled)} />
     </EditorSection>
 
-    <EditorSection title="Schedule" colors={colors}>
+    <EditorSection title={mobileMessage(locale, "automation.editor.schedule")} colors={colors}>
       <View style={styles.optionRow}>{(["manual", "once", "interval", "cron"] as const).map((value) =>
-        <Choice key={value} label={value} selected={draft.recurrence === value} colors={colors} disabled={!editable}
+        <Choice key={value} label={mobileAutomationRecurrenceKindLabel(locale, value)} selected={draft.recurrence === value} colors={colors} disabled={!editable}
           onPress={() => setDraft((current) => current.recurrence === value ? current : {
             ...current,
             recurrence: value,
@@ -550,121 +617,131 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, onClo
           })} />)}</View>
       {draft.recurrence !== "manual" && <EditorInput label={recurrenceLabel} value={draft.expression} colors={colors}
         editable={editable} onChange={(value) => set("expression", value)} />}
-      <EditorInput label="IANA time zone" value={draft.timeZone} colors={colors} editable={editable}
+      <EditorInput label={mobileMessage(locale, "automation.editor.timeZone")} value={draft.timeZone} colors={colors} editable={editable}
         onChange={(value) => set("timeZone", value)} />
-      <EditorInput label="Expiration (local, optional)" value={draft.expireAtExpression} colors={colors}
+      <EditorInput label={mobileMessage(locale, "automation.editor.expiration")} value={draft.expireAtExpression} colors={colors}
         editable={editable} placeholder="YYYY-MM-DDTHH:mm" onChange={(value) => set("expireAtExpression", value)} />
-      <Text style={[styles.caption, { color: colors.muted }]}>Overlap policy</Text>
-      <View style={styles.optionRow}>{(["queue", "skip"] as const).map((value) => <Choice key={value} label={value}
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.overlapPolicy")}</Text>
+      <View style={styles.optionRow}>{(["queue", "skip"] as const).map((value) => <Choice key={value}
+        label={mobileAutomationOverlapLabel(locale, value)}
         selected={draft.overlapPolicy === value} colors={colors} disabled={!editable} onPress={() => set("overlapPolicy", value)} />)}</View>
-      <Text style={[styles.caption, { color: colors.muted }]}>Missed-run policy</Text>
-      <View style={styles.optionRow}>{(["runOnce", "skip"] as const).map((value) => <Choice key={value} label={value}
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.misfirePolicy")}</Text>
+      <View style={styles.optionRow}>{(["runOnce", "skip"] as const).map((value) => <Choice key={value}
+        label={mobileAutomationMisfireLabel(locale, value)}
         selected={draft.misfirePolicy === value} colors={colors} disabled={!editable} onPress={() => set("misfirePolicy", value)} />)}</View>
     </EditorSection>
 
-    <EditorSection title="Execution" colors={colors}>
-      <View style={styles.optionRow}>{(["agent", "script"] as const).map((value) => <Choice key={value} label={value}
+    <EditorSection title={mobileMessage(locale, "automation.editor.execution")} colors={colors}>
+      <View style={styles.optionRow}>{(["agent", "script"] as const).map((value) => <Choice key={value}
+        label={mobileAutomationExecutionModeLabel(locale, value)}
         selected={draft.executionMode === value} colors={colors} disabled={!editable} onPress={() => chooseExecutionMode(value)} />)}</View>
       {draft.executionMode === "agent" ? <>
-        <EditorInput label="Scheduled input" value={draft.inputText} colors={colors} editable={editable} multiline
+        <EditorInput label={mobileMessage(locale, "automation.editor.scheduledInput")} value={draft.inputText} colors={colors} editable={editable} multiline
           onChange={(value) => set("inputText", value)} />
-        <Text style={[styles.caption, { color: colors.muted }]}>Task mode</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.taskMode")}</Text>
         <View style={styles.optionRow}>{(["fresh", "persistent", "bound"] as const).map((value) => <Choice key={value}
-          label={value} selected={draft.sessionMode === value} colors={colors} disabled={!editable || schedule?.source === "project" && value === "bound"}
+          label={mobileAutomationSessionModeLabel(locale, value)} selected={draft.sessionMode === value} colors={colors}
+          disabled={!editable || schedule?.source === "project" && value === "bound"}
           onPress={() => chooseSessionMode(value)} />)}</View>
         {draft.sessionMode !== "fresh" && <>
-          <Text style={[styles.caption, { color: colors.muted }]}>Task binding</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.taskBinding")}</Text>
           <View style={styles.optionRow}>{sessions.map((session) => <Choice key={session.sessionId} label={session.displayName}
             selected={draft.sessionId === session.sessionId} colors={colors} disabled={!editable}
             onPress={() => set("sessionId", session.sessionId)} />)}</View>
         </>}
-        <Text style={[styles.caption, { color: colors.muted }]}>Model snapshot</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.modelSnapshot")}</Text>
         <View style={styles.optionRow}>
-          <Choice label="Backend default" selected={draft.model === undefined} colors={colors}
+          <Choice label={mobileMessage(locale, "automation.editor.backendDefault")} selected={draft.model === undefined} colors={colors}
             disabled={!editable || execution?.canSelectModel !== true} onPress={() => chooseModel()} />
           {models.map((model) => <Choice key={model.key} label={`${model.providerName} · ${model.displayName}`}
             selected={draft.model?.providerId === model.providerId && draft.model.modelId === model.modelId}
             colors={colors} disabled={!editable || execution?.canSelectModel !== true}
             onPress={() => chooseModel(model.providerId, model.modelId)} />)}
           {draft.model !== undefined && selectedModel === undefined && <Choice
-            label={`${draft.model.providerId} · ${draft.model.modelId} (saved)`} selected colors={colors} disabled
+            label={mobileMessage(locale, "automation.editor.savedModel", {
+              provider: draft.model.providerId, model: draft.model.modelId
+            })} selected colors={colors} disabled
             onPress={() => undefined} />}
         </View>
         {selectedModel && selectedModel.efforts.length > 0 && <>
-          <Text style={[styles.caption, { color: colors.muted }]}>Model effort</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.modelEffort")}</Text>
           <View style={styles.optionRow}>{selectedModel.efforts.map((effort) => <Choice key={effort.id} label={effort.label}
             selected={draft.model?.effortId === effort.id} colors={colors} disabled={!editable || execution?.canSetEffort !== true}
             onPress={() => set("model", { ...draft.model!, effortId: effort.id })} />)}</View>
         </>}
-        {selectedModel?.supportsFastMode && <Choice label="Fast Mode" selected={draft.model?.fastMode === true} colors={colors}
+        {selectedModel?.supportsFastMode && <Choice label={mobileMessage(locale, "controls.fastMode")} selected={draft.model?.fastMode === true} colors={colors}
           disabled={!editable || execution?.canSetFastMode !== true}
           onPress={() => set("model", { ...draft.model!, fastMode: !draft.model!.fastMode })} />}
-        <Text style={[styles.caption, { color: colors.muted }]}>Permission mode</Text>
-        <View style={styles.optionRow}>{permissions.map((value) => <Choice key={value} label={value}
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "controls.permissionMode")}</Text>
+        <View style={styles.optionRow}>{permissions.map((value) => <Choice key={value} label={mobileAutomationPermissionLabel(locale, value)}
           selected={draft.permissionMode === value} colors={colors}
           disabled={!editable || !advertisedPermissions.includes(value)}
           onPress={() => set("permissionMode", value)} />)}</View>
-        {(execution?.canSetPlanMode || draft.planMode) && <Choice label="Plan Mode" selected={draft.planMode} colors={colors}
+        {(execution?.canSetPlanMode || draft.planMode) && <Choice label={mobileMessage(locale, "controls.planMode")} selected={draft.planMode} colors={colors}
           disabled={!editable || execution?.canSetPlanMode !== true}
           onPress={() => set("planMode", !draft.planMode)} />}
         {(selectedTarget?.workspaceKind === "project" || draft.useWorktree) && <>
-          <Choice label="Isolated Worktree" selected={draft.useWorktree} colors={colors}
+          <Choice label={mobileMessage(locale, "automation.editor.worktree")} selected={draft.useWorktree} colors={colors}
             disabled={!editable || !draft.useWorktree && !worktreeCompatible}
             onPress={toggleWorktree} />
           {draft.useWorktree && <>
-            <Button label={worktreeLoading ? "Loading Worktree…" : "Reload Worktree options"} colors={colors}
+            <Button label={worktreeLoading ? mobileMessage(locale, "automation.editor.worktreeLoading")
+              : mobileMessage(locale, "automation.editor.worktreeReload")} colors={colors}
               disabled={!editable || worktreeLoading || !worktreeCompatible} onPress={() => void loadWorktree()} />
-            {worktree && <Text style={[styles.caption, { color: colors.muted }]}>Eligibility: {worktree.eligibility}</Text>}
+            {worktree && <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale,
+              "automation.editor.worktreeEligibility", { state: mobileAutomationWorktreeEligibilityLabel(locale, worktree.eligibility) })}</Text>}
             {worktree && <View style={styles.optionRow}>
-              <Choice label="Default source" selected={draft.worktreeSourceRef === undefined} colors={colors} disabled={!editable}
+              <Choice label={mobileMessage(locale, "automation.editor.defaultSource")} selected={draft.worktreeSourceRef === undefined} colors={colors} disabled={!editable}
                 onPress={() => set("worktreeSourceRef", undefined)} />
               {worktree.sources.map((source) => <Choice key={source.ref} label={source.displayName}
                 selected={draft.worktreeSourceRef === source.ref} colors={colors} disabled={!editable}
                 onPress={() => set("worktreeSourceRef", source.ref)} />)}
             </View>}
-            <Choice label="Refresh remote before run" selected={draft.refreshWorktreeRemote} colors={colors}
+            <Choice label={mobileMessage(locale, "automation.editor.refreshRemote")} selected={draft.refreshWorktreeRemote} colors={colors}
               disabled={!editable || worktree?.canRefreshRemote !== true}
               onPress={() => set("refreshWorktreeRemote", !draft.refreshWorktreeRemote)} />
           </>}
         </>}
         {extraDirectories.length > 0 && <>
-          <Text style={[styles.caption, { color: colors.muted }]}>Extra directories</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.extraDirectories")}</Text>
           <View style={styles.optionRow}>{extraDirectories.map((directory) => {
             const selected = draft.extraDirectoryIds.includes(directory.id);
-            return <Choice key={directory.id} label={`${directory.path} · ${directory.access}`} selected={selected}
+            return <Choice key={directory.id} label={`${directory.path} · ${mobileAutomationDirectoryAccessLabel(locale, directory.access)}`} selected={selected}
               colors={colors} disabled={!editable} onPress={() => set("extraDirectoryIds", selected
                 ? draft.extraDirectoryIds.filter((id) => id !== directory.id)
                 : [...draft.extraDirectoryIds, directory.id])} />;
           })}</View>
         </>}
-        <Choice label="Silent when idle" selected={draft.silentWhenIdle} colors={colors} disabled={!editable}
+        <Choice label={mobileMessage(locale, "automation.editor.silent")} selected={draft.silentWhenIdle} colors={colors} disabled={!editable}
           onPress={() => set("silentWhenIdle", !draft.silentWhenIdle)} />
       </> : <>
-        <EditorInput label="Script command" value={draft.scriptCommand} colors={colors} editable={editable} multiline
+        <EditorInput label={mobileMessage(locale, "automation.editor.scriptCommand")} value={draft.scriptCommand} colors={colors} editable={editable} multiline
           onChange={(value) => set("scriptCommand", value)} />
-        <EditorInput label="Timeout seconds (optional)" value={draft.scriptTimeoutSeconds} colors={colors} editable={editable}
+        <EditorInput label={mobileMessage(locale, "automation.editor.timeout")} value={draft.scriptTimeoutSeconds} colors={colors} editable={editable}
           onChange={(value) => set("scriptTimeoutSeconds", value)} />
-        <Choice label="Allow task dispatch" selected={draft.scriptDispatchSessions} colors={colors} disabled={!editable}
+        <Choice label={mobileMessage(locale, "automation.editor.allowDispatch")} selected={draft.scriptDispatchSessions} colors={colors} disabled={!editable}
           onPress={() => set("scriptDispatchSessions", !draft.scriptDispatchSessions)} />
       </>}
-      <Choice label="Desktop notification" selected={draft.notifyDesktop} colors={colors} disabled={!editable}
+      <Choice label={mobileMessage(locale, "automation.editor.desktopNotification")} selected={draft.notifyDesktop} colors={colors} disabled={!editable}
         onPress={() => set("notifyDesktop", !draft.notifyDesktop)} />
       {draft.preRunHook && <View style={[styles.managedBox, { borderColor: colors.border }]}>
-        <Text style={[styles.label, { color: colors.ink }]}>Managed pre-run hook</Text>
+        <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "automation.editor.managedPreRun")}</Text>
         <Text style={[styles.mono, { color: colors.ink }]}>{draft.preRunHook.command}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>{draft.preRunHook.filePath}</Text>
       </View>}
     </EditorSection>
-    <Button label={saving ? "Saving…" : schedule ? "Save Automation" : "Create Automation"} colors={colors}
+    <Button label={saving ? mobileMessage(locale, "common.saving") : schedule ? mobileMessage(locale, "automation.editor.save")
+      : mobileMessage(locale, "automation.create")} colors={colors}
       disabled={!editable} onPress={() => void save()} />
   </ScrollView>;
 }
 
-function AutomationDeletePanel({ colors, state, client, schedule, onClose }: {
+function AutomationDeletePanel({ colors, state, client, schedule, locale, onClose }: {
   readonly colors: MobileAutomationsColors;
   readonly state: MobileState;
   readonly client: MobileAutomationsClient;
   readonly schedule: MobileAutomationSchedule;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
 }) {
   const [preview, setPreview] = useState<MobileAutomationDeletionPreview>();
@@ -694,7 +771,7 @@ function AutomationDeletePanel({ colors, state, client, schedule, onClose }: {
       if (result === undefined) {
         setPreview(undefined);
         setReceiptUnknown(true);
-        setError("The durable deletion result is unknown. It was not resent.");
+        setError(mobileMessage(locale, "automation.delete.unknown"));
       } else if (result.failures.length > 0) {
         setPreview(undefined);
         setOutcome(result);
@@ -705,31 +782,36 @@ function AutomationDeletePanel({ colors, state, client, schedule, onClose }: {
   };
   return <ScrollView contentContainerStyle={styles.editor}>
     <View style={styles.headerRow}>
-      <Button label="Cancel deletion" colors={colors} disabled={pending} onPress={onClose} />
+      <Button label={mobileMessage(locale, "automation.delete.cancel")} colors={colors} disabled={pending} onPress={onClose} />
       <View style={styles.headerText}>
-        <Text style={[styles.title, { color: colors.ink }]}>Delete Automation</Text>
+        <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "automation.delete.title")}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>{schedule.displayName}</Text>
       </View>
     </View>
-    {!online && <Notice colors={colors} text="Reconnect to refresh the deletion preview and delete this Automation." />}
+    {!online && <Notice colors={colors} text={mobileMessage(locale, "automation.delete.offline")} />}
     {error && <Notice colors={colors} danger text={error} />}
-    {outcome && <Notice colors={colors} text={`The Automation was deleted. ${outcome.completedSessionIds.length} generated tasks were processed; ${outcome.failures.length} failed.`} />}
-    {loading ? <Centered colors={colors} label="Preparing deletion…" loading /> : preview && <>
+    {outcome && <Notice colors={colors} text={mobileMessage(locale, "automation.delete.outcome", {
+      processed: outcome.completedSessionIds.length, failed: outcome.failures.length
+    })} />}
+    {loading ? <Centered colors={colors} label={mobileMessage(locale, "automation.delete.preparing")} loading /> : preview && <>
       <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        <Info label="Generated tasks" value={String(preview.generatedSessionIds.length)} colors={colors} />
-        <Info label="In-flight runs" value={String(preview.inflightCount)} colors={colors} />
+        <Info label={mobileMessage(locale, "automation.delete.generatedTasks")} value={String(preview.generatedSessionIds.length)} colors={colors} />
+        <Info label={mobileMessage(locale, "automation.delete.inflight")} value={String(preview.inflightCount)} colors={colors} />
         {preview.generatedSessionIds.map((sessionId) => <Text key={sessionId} style={[styles.mono, { color: colors.ink }]}>{sessionId}</Text>)}
       </View>
-      <Text style={[styles.caption, { color: colors.muted }]}>Generated-task disposition</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.delete.disposition")}</Text>
       <View style={styles.optionRow}>{(["keep", "archive", "delete"] as const).map((value) => <Choice key={value}
-        label={value === "keep" ? "Keep tasks" : value === "archive" ? "Archive tasks" : "Delete tasks"}
+        label={value === "keep" ? mobileMessage(locale, "automation.delete.keep")
+          : value === "archive" ? mobileMessage(locale, "automation.delete.archive")
+            : mobileMessage(locale, "automation.delete.delete")}
         selected={disposition === value} colors={colors} disabled={pending || !online} onPress={() => setDisposition(value)} />)}</View>
-      <Button label={pending ? "Deleting…" : "Confirm deletion"} danger colors={colors}
+      <Button label={pending ? mobileMessage(locale, "automation.delete.deleting")
+        : mobileMessage(locale, "automation.delete.confirm")} danger colors={colors}
         disabled={pending || !online || preview === undefined} onPress={() => void confirm()} />
     </>}
-    {!loading && preview === undefined && outcome === undefined && !receiptUnknown && <Button label="Retry deletion preview" colors={colors}
+    {!loading && preview === undefined && outcome === undefined && !receiptUnknown && <Button label={mobileMessage(locale, "automation.delete.retry")} colors={colors}
       disabled={!online || pending} onPress={() => void load()} />}
-    {(outcome || receiptUnknown) && <Button label="Close" colors={colors} onPress={onClose} />}
+    {(outcome || receiptUnknown) && <Button label={mobileMessage(locale, "common.close")} colors={colors} onPress={onClose} />}
   </ScrollView>;
 }
 
@@ -777,10 +859,11 @@ function Choice({ label, selected, colors, disabled, onPress }: {
   </Pressable>;
 }
 
-function RunCard({ run, schedule, colors, client, disabled, onRun, onOpenTask, setLocalError, sessionAvailable }: {
+function RunCard({ run, schedule, colors, client, disabled, onRun, onOpenTask, setLocalError, sessionAvailable, locale }: {
   readonly run: MobileAutomationRun;
   readonly schedule: MobileAutomationSchedule;
   readonly colors: MobileAutomationsColors;
+  readonly locale: MobileSupportedLocale;
   readonly client: MobileAutomationsClient;
   readonly disabled: boolean;
   readonly onRun: (action: () => Promise<unknown>) => Promise<void>;
@@ -792,9 +875,9 @@ function RunCard({ run, schedule, colors, client, disabled, onRun, onOpenTask, s
   const terminal = isMobileAutomationRunTerminal(run);
   const restartable = canRestartMobileAutomationRun(run);
   const deleteRun = (): void => Alert.alert(
-    "Delete run history?",
-    "This removes only this terminal run record. Any task created by the run is kept.",
-    [{ text: "Keep", style: "cancel" }, { text: "Delete", style: "destructive",
+    mobileMessage(locale, "automation.run.deleteTitle"),
+    mobileMessage(locale, "automation.run.deleteBody"),
+    [{ text: mobileMessage(locale, "common.keep"), style: "cancel" }, { text: mobileMessage(locale, "common.delete"), style: "destructive",
       onPress: () => void onRun(() => client.deleteAutomationRun(schedule.scheduleId, run.triggerId)) }]
   );
   const openTask = (): void => {
@@ -802,31 +885,37 @@ function RunCard({ run, schedule, colors, client, disabled, onRun, onOpenTask, s
     void client.openAutomationRunTask(schedule.scheduleId, run.triggerId).then(onOpenTask)
       .catch((error) => setLocalError(errorText(error)));
   };
-  return <View accessibilityLabel={`Automation run ${run.state}`}
+  const stateLabel = mobileAutomationRunStateLabel(locale, run.state);
+  return <View accessibilityLabel={mobileMessage(locale, "automation.run.accessibility", { state: stateLabel })}
     style={[styles.card, unread && { borderColor: colors.accent }, { backgroundColor: colors.surface, borderColor: unread ? colors.accent : colors.border }]}>
     <View style={styles.rowBetween}>
       <View style={styles.flex}>
-        <Text style={[styles.label, { color: colors.ink }]}>{runStateLabel(run.state)}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{formatDate(run.triggeredAt)} · {formatDuration(run.durationMs)}</Text>
+        <Text style={[styles.label, { color: colors.ink }]}>{stateLabel}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileAutomationDate(run.triggeredAt, locale)} · {formatMobileAutomationDuration(run.durationMs, locale)}</Text>
       </View>
-      {unread && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>Unread</Text>}
+      {unread && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "automation.run.unread")}</Text>}
     </View>
-    <Text style={[styles.caption, { color: colors.muted }]}>{runCost(run)}</Text>
+    <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileAutomationCost(run, locale)}</Text>
     {run.resultText && <Text style={[styles.body, { color: colors.ink }]}>{run.resultText}</Text>}
     {run.error && <Text accessibilityRole="alert" style={[styles.body, { color: colors.negative }]}>{run.error}</Text>}
     {run.preRun && <View style={[styles.preRun, { borderColor: colors.border }]}>
-      <Text style={[styles.caption, { color: colors.muted }]}>Pre-run: {run.preRun.status} · {run.preRun.decision} · {formatDuration(run.preRun.durationMs)}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.preRun.summary", {
+        status: mobileAutomationPreRunStatusLabel(locale, run.preRun.status),
+        decision: mobileAutomationPreRunDecisionLabel(locale, run.preRun.decision),
+        duration: formatMobileAutomationDuration(run.preRun.durationMs, locale)
+      })}</Text>
       {run.preRun.stdout && <Text style={[styles.mono, { color: colors.ink }]}>{run.preRun.stdout}</Text>}
       {run.preRun.stderr && <Text style={[styles.mono, { color: colors.negative }]}>{run.preRun.stderr}</Text>}
     </View>}
     <View style={styles.actionRow}>
-      {unread && <Button label="Mark read" compact colors={colors} disabled={disabled}
+      {unread && <Button label={mobileMessage(locale, "automation.run.markRead")} compact colors={colors} disabled={disabled}
         onPress={() => void onRun(() => client.markAutomationRunRead(schedule.scheduleId, run.triggerId))} />}
-      {run.sessionId && <Button label={sessionAvailable ? "Open task" : "Task unavailable"} compact colors={colors}
+      {run.sessionId && <Button label={sessionAvailable ? mobileMessage(locale, "automation.run.openTask")
+        : mobileMessage(locale, "automation.run.taskUnavailable")} compact colors={colors}
         disabled={!sessionAvailable} onPress={openTask} />}
-      {restartable && <Button label="Restart" compact colors={colors} disabled={disabled}
+      {restartable && <Button label={mobileMessage(locale, "automation.run.restart")} compact colors={colors} disabled={disabled}
         onPress={() => void onRun(() => client.restartAutomationRun(schedule.scheduleId, run.triggerId))} />}
-      {terminal && <Button label="Delete history" compact danger colors={colors} disabled={disabled} onPress={deleteRun} />}
+      {terminal && <Button label={mobileMessage(locale, "automation.run.deleteHistory")} compact danger colors={colors} disabled={disabled} onPress={deleteRun} />}
     </View>
   </View>;
 }
@@ -871,41 +960,6 @@ function Centered({ label, colors, loading = false }: {
 }) {
   return <View style={styles.centered}>{loading && <ActivityIndicator color={colors.accent} />}
     <Text style={[styles.body, { color: colors.muted }]}>{label}</Text></View>;
-}
-
-function runStateLabel(state: MobileAutomationRun["state"]): string {
-  if (state === "completed") return "Completed";
-  if (state === "failed") return "Failed";
-  if (state === "skipped") return "Skipped";
-  if (state === "aborted") return "Aborted";
-  if (state === "interrupted") return "Interrupted";
-  if (state === "queued") return "Queued";
-  return "Running";
-}
-
-function formatDate(value: number): string {
-  return new Date(value).toLocaleString();
-}
-
-function formatDuration(value: number | undefined): string {
-  if (value === undefined) return "duration unavailable";
-  if (value < 1_000) return `${value} ms`;
-  const seconds = Math.round(value / 100) / 10;
-  if (seconds < 60) return `${seconds} s`;
-  return `${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} s`;
-}
-
-function runCost(run: MobileAutomationRun): string {
-  const cost = run.cost ?? run.estimatedValue;
-  if (cost) {
-    const sign = cost.amountMicros < 0n ? "-" : "";
-    const absolute = cost.amountMicros < 0n ? -cost.amountMicros : cost.amountMicros;
-    const whole = absolute / 1_000_000n;
-    const fraction = (absolute % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "") || "0";
-    return `${cost.approximate ? "≈" : ""}${sign}${whole.toString()}.${fraction} ${cost.currencyCode} · ${run.costAttribution}`;
-  }
-  if (run.zeroCost || run.costAttribution === "zero") return "Zero token cost";
-  return `Cost ${run.costAttribution}`;
 }
 
 function errorText(error: unknown): string {

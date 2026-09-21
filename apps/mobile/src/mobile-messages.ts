@@ -1,4 +1,5 @@
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileAutomationMessages } from "./mobile-automation-messages";
 import { mobileTaskMessages } from "./mobile-task-messages";
 
 const en = {
@@ -306,7 +307,8 @@ const en = {
   "settings.connection.starting": "Starting",
   "settings.connection.none": "Not connected",
   "settings.error": "The Settings action failed.",
-  ...mobileTaskMessages.en
+  ...mobileTaskMessages.en,
+  ...mobileAutomationMessages.en
 } as const;
 
 export type MobileMessageKey = keyof typeof en;
@@ -617,7 +619,8 @@ const zhCN: MobileMessageCatalog = {
   "settings.connection.starting": "正在启动",
   "settings.connection.none": "未连接",
   "settings.error": "设置操作失败。",
-  ...mobileTaskMessages["zh-CN"]
+  ...mobileTaskMessages["zh-CN"],
+  ...mobileAutomationMessages["zh-CN"]
 };
 
 const zhTW: MobileMessageCatalog = {
@@ -925,7 +928,8 @@ const zhTW: MobileMessageCatalog = {
   "settings.connection.starting": "正在啟動",
   "settings.connection.none": "未連線",
   "settings.error": "設定操作失敗。",
-  ...mobileTaskMessages["zh-TW"]
+  ...mobileTaskMessages["zh-TW"],
+  ...mobileAutomationMessages["zh-TW"]
 };
 
 const ja: MobileMessageCatalog = {
@@ -1233,7 +1237,8 @@ const ja: MobileMessageCatalog = {
   "settings.connection.starting": "起動中",
   "settings.connection.none": "未接続",
   "settings.error": "設定操作に失敗しました。",
-  ...mobileTaskMessages.ja
+  ...mobileTaskMessages.ja,
+  ...mobileAutomationMessages.ja
 };
 
 const ko: MobileMessageCatalog = {
@@ -1541,7 +1546,8 @@ const ko: MobileMessageCatalog = {
   "settings.connection.starting": "시작 중",
   "settings.connection.none": "연결되지 않음",
   "settings.error": "설정 작업에 실패했습니다.",
-  ...mobileTaskMessages.ko
+  ...mobileTaskMessages.ko,
+  ...mobileAutomationMessages.ko
 };
 
 const catalogs: Readonly<Record<MobileSupportedLocale, MobileMessageCatalog>> = {
