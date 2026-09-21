@@ -25,6 +25,8 @@ import {
 import {
   MobileNativeIntentDelivery,
   MobileExternalIntentFence,
+  buildMobileMessageDeepLink,
+  buildMobileTaskDeepLink,
   executeMobileNativeIntent,
   isMobileIncomingShareUrl,
   installMobileNativeIntentLinking,
@@ -35,6 +37,11 @@ import {
   type MobileNativeIntentMessageFocus,
   type MobileNativeIntentRecovery
 } from "./mobile-native-intent";
+import {
+  MobileCopyLinkWriter,
+  claimMobileCopyLinkAuthority,
+  mobileCopyLinkAuthorityMatches
+} from "./mobile-copy-link";
 import {
   mobileConnectionAppIcon,
   mobileConnectionArtworkFrame,
@@ -263,6 +270,11 @@ const client = new MobileClient(
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
+const mobileCopyLinks = new MobileCopyLinkWriter({
+  writeText: async (value) => {
+    if (!await Clipboard.setStringAsync(value)) throw new Error("The system clipboard rejected the Joko task link.");
+  }
+});
 const mobileUpdateActions: MobileUpdateActions = {
   onChannelChange: (channel) => mobileUpdates.setChannel(channel),
   onCheck: () => mobileUpdates.manualCheck(),
@@ -1006,9 +1018,14 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<MobileHomeStatusFilter>("active");
   const [localError, setLocalError] = useState("");
+  const [copyNotice, setCopyNotice] = useState("");
+  const [copyBusy, setCopyBusy] = useState(false);
   const [optionsSession, setOptionsSession] = useState<Session>();
   const optionsSessionRef = useRef<Session | undefined>(undefined);
   const optionsGenerationRef = useRef(0);
+  const copyGenerationRef = useRef(0);
+  const copyInFlightRef = useRef(false);
+  const mountedRef = useRef(true);
   const [renameSession, setRenameSession] = useState<Session>();
   const [renameDraft, setRenameDraft] = useState("");
   const searchRef = useRef<TextInput>(null);
@@ -1031,6 +1048,17 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
     if (searchFocusRequest > 0) searchRef.current?.focus();
   }, [searchFocusRequest]);
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      copyGenerationRef.current += 1;
+    };
+  }, []);
+  useEffect(() => {
+    copyGenerationRef.current += 1;
+    setCopyNotice("");
+  }, [state.activeProfileId]);
+  useEffect(() => {
     if (!normalizedSearch) {
       void client.searchHome("", statusFilter);
       return;
@@ -1044,10 +1072,43 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
     setLocalError("");
     void action().catch((error) => setLocalError(errorText(error, locale)));
   };
+  const copySessionLink = async (session: Session): Promise<void> => {
+    if (copyInFlightRef.current || mobileCopyLinks.busy) {
+      setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
+      return;
+    }
+    const authority = claimMobileCopyLinkAuthority(projectMobileNativeIntentSnapshot(client.state), {
+      sessionId: session.sessionId,
+      requiresSelectedSession: false
+    });
+    if (!authority) {
+      setLocalError(mobileMessage(locale, "actions.copyLinkFailed"));
+      return;
+    }
+    const request = ++copyGenerationRef.current;
+    copyInFlightRef.current = true;
+    setCopyBusy(true);
+    setCopyNotice("");
+    setLocalError("");
+    try {
+      const result = await mobileCopyLinks.copy(buildMobileTaskDeepLink(authority.sessionId));
+      if (!mountedRef.current || copyGenerationRef.current !== request) return;
+      if (!mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))) return;
+      if (result === "busy") setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
+      else setCopyNotice(mobileMessage(locale, "actions.taskLinkCopied"));
+    } catch {
+      if (mountedRef.current && copyGenerationRef.current === request) {
+        setLocalError(mobileMessage(locale, "actions.copyLinkFailed"));
+      }
+    } finally {
+      copyInFlightRef.current = false;
+      if (mountedRef.current) setCopyBusy(false);
+    }
+  };
   const togglePin = (session: Session): void => runMutation(() => client.setSessionPinned(session.sessionId, !session.pinned));
   const toggleArchive = (session: Session): void => runMutation(() => client.setSessionArchived(session.sessionId, !session.archived));
   const openOptions = (session: Session): void => {
-    if (state.status !== "connected") return;
+    if (state.status !== "connected" && state.status !== "offline") return;
     optionsGenerationRef.current += 1;
     optionsSessionRef.current = session;
     setOptionsSession(session);
@@ -1058,7 +1119,11 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
     setOptionsSession(undefined);
   };
   const applyOption = (session: Session, action: SessionOption): void => {
-    if (action === "rename") {
+    if (action === "copy-link") {
+      void copySessionLink(session);
+    } else if (state.status !== "connected") {
+      return;
+    } else if (action === "rename") {
       setRenameDraft(session.displayName);
       setRenameSession(session);
     } else if (action === "pin") togglePin(session);
@@ -1071,7 +1136,7 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
     );
   };
   const scheduleOption = (action: SessionOption): void => {
-    if (state.status !== "connected") {
+    if (state.status !== "connected" && (state.status !== "offline" || action !== "copy-link")) {
       closeOptions();
       return;
     }
@@ -1085,12 +1150,14 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
     }));
   };
   useEffect(() => {
-    if (state.status === "connected") return;
-    swipeRegistry.closeOpenRow();
+    if (state.status !== "connected") {
+      swipeRegistry.closeOpenRow();
+      setRenameSession(undefined);
+    }
+    if (state.status === "connected" || state.status === "offline") return;
     optionsGenerationRef.current += 1;
     optionsSessionRef.current = undefined;
     setOptionsSession(undefined);
-    setRenameSession(undefined);
   }, [state.status, swipeRegistry]);
 
   return <View style={styles.fill}>
@@ -1141,6 +1208,9 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
     </View>
     {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
     {localError && <Banner text={localError} colors={colors} />}
+    {copyNotice && <Notice text={copyNotice} colors={colors} locale={locale}
+      dismissAccessibilityLabel={mobileMessage(locale, "actions.dismissCopyNotice")}
+      onDismiss={() => setCopyNotice("")} />}
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
@@ -1170,7 +1240,8 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
           <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
             name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
           })}
-            accessibilityState={{ disabled: state.status !== "connected" }} disabled={state.status !== "connected"}
+            accessibilityState={{ disabled: state.status !== "connected" && state.status !== "offline" }}
+            disabled={state.status !== "connected" && state.status !== "offline"}
             onPress={() => { swipeRegistry.closeOpenRow(); openOptions(item.session); }} style={styles.rowOptions}>
             <Text style={[styles.rowOptionsText, { color: colors.muted }]}>•••</Text>
           </Pressable>
@@ -1179,7 +1250,7 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
       onScrollBeginDrag={() => { swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
-    <Modal visible={state.status === "connected" && optionsSession !== undefined} transparent animationType="none"
+    <Modal visible={(state.status === "connected" || state.status === "offline") && optionsSession !== undefined} transparent animationType="none"
       onRequestClose={closeOptions} statusBarTranslucent>
       <View style={styles.sheetRoot}>
         <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.closeOptions")}
@@ -1187,12 +1258,17 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
         <SafeAreaView accessibilityViewIsModal style={[styles.optionSheet, { backgroundColor: colors.surface, borderColor: colors.border }]} edges={["bottom", "left", "right"]}>
           <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{optionsSession?.displayName
             || mobileMessage(locale, "home.taskOptions")}</Text>
-          <MenuRow label={mobileMessage(locale, "common.rename")} onPress={() => scheduleOption("rename")} colors={colors} />
+          <MenuRow label={mobileMessage(locale, "common.rename")} onPress={() => scheduleOption("rename")} colors={colors}
+            disabled={state.status !== "connected"} />
+          <MenuRow label={mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink")}
+            onPress={() => scheduleOption("copy-link")} colors={colors}
+            disabled={copyBusy} />
           <MenuRow label={mobileMessage(locale, optionsSession?.pinned ? "common.unpin" : "common.pin")}
-            onPress={() => scheduleOption("pin")} colors={colors} />
+            onPress={() => scheduleOption("pin")} colors={colors} disabled={state.status !== "connected"} />
           <MenuRow label={mobileMessage(locale, optionsSession?.archived ? "common.restore" : "common.archive")}
-            onPress={() => scheduleOption("archive")} colors={colors} />
-          <MenuRow label={mobileMessage(locale, "common.deleteTask")} onPress={() => scheduleOption("delete")} colors={colors} />
+            onPress={() => scheduleOption("archive")} colors={colors} disabled={state.status !== "connected"} />
+          <MenuRow label={mobileMessage(locale, "common.deleteTask")} onPress={() => scheduleOption("delete")} colors={colors}
+            disabled={state.status !== "connected"} />
           <Action label={mobileMessage(locale, "common.cancel")} onPress={closeOptions} colors={colors} />
         </SafeAreaView>
       </View>
@@ -1219,7 +1295,7 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
   </View>;
 }
 
-type SessionOption = "rename" | "pin" | "archive" | "delete";
+type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete";
 
 function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
@@ -1257,11 +1333,12 @@ function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMounted
   </MobileDrawer>;
 }
 
-function MenuRow({ label, description, onPress, colors }: {
-  label: string; description?: string; onPress: () => void; colors: Colors;
+function MenuRow({ label, description, onPress, colors, disabled = false }: {
+  label: string; description?: string; onPress: () => void; colors: Colors; disabled?: boolean;
 }) {
-  return <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress}
-    style={[styles.menuRow, { borderColor: colors.border }]}>
+  return <Pressable accessibilityRole="button" accessibilityLabel={label} accessibilityState={{ disabled }}
+    disabled={disabled} onPress={onPress}
+    style={[styles.menuRow, { borderColor: colors.border }, disabled && styles.disabled]}>
     <View style={styles.fill}>
       <Text style={[styles.label, { color: colors.ink }]}>{label}</Text>
       {description && <Text style={[styles.caption, { color: colors.muted }]}>{description}</Text>}
@@ -2750,6 +2827,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   const [pastedImageCount, setPastedImageCount] = useState(0);
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [composerNotice, setComposerNotice] = useState("");
+  const [copyBusy, setCopyBusy] = useState(false);
   const [fileShareBusy, setFileShareBusy] = useState(false);
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [timelinePreviewSource, setTimelinePreviewSource] = useState<MobileTimelineArtifact>();
@@ -2769,6 +2847,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   const composerSelectionRef = useRef(composerSelection);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
+  const copyGenerationRef = useRef(0);
+  const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<TimelineRow>>(null);
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
@@ -2794,6 +2874,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     : undefined;
   const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
   draftIdentityRef.current = draftIdentity;
+  useEffect(() => {
+    copyGenerationRef.current += 1;
+    setComposerNotice("");
+  }, [draftIdentityKey]);
   const imageGallery = useMobileImageGallery(locale, (nextDraft) => {
     const identity = draftIdentityRef.current;
     if (!identity || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
@@ -2979,7 +3063,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const messageActionItems = messageAction
-    ? buildMobileMessageActions(messageAction.row, { canDelete: client.canDeleteMessage(messageAction.row.eventId) })
+    ? buildMobileMessageActions(messageAction.row, {
+      canDelete: client.canDeleteMessage(messageAction.row.eventId),
+      locale,
+      copyDisabled: copyBusy
+    }).filter((item) => state.status === "connected" || item.id === "copy-link")
     : [];
   useEffect(() => mobileComposerDrafts.subscribeErrors((identity, error) => {
     if (!taskMountedRef.current || mobileComposerDraftIdentityKey(identity) !== draftIdentityKey) return;
@@ -3308,6 +3396,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     taskMountedRef.current = true;
     return () => {
       taskMountedRef.current = false;
+      copyGenerationRef.current += 1;
       runtimeCommandAbortRef.current?.abort();
       runtimeCommandAbortRef.current = undefined;
       runtimeCommandRequestRef.current += 1;
@@ -3327,7 +3416,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
   }, []);
 
   const openMessageActions = (row: TimelineRow): void => {
-    if (!state.selectedId || state.status !== "connected" || voice.busy) return;
+    if (!state.selectedId || (state.status !== "connected" && state.status !== "offline")
+      || (state.status === "connected" && voice.busy)) return;
     setMessageAction({ sessionId: state.selectedId, row });
     setMessageActionsVisible(true);
   };
@@ -4355,15 +4445,66 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     setQueueEdit(updated);
     mobileComposerDrafts.save({ profileId: active.profileId, sessionId: active.lease.sessionId }, result.normalDraft);
   };
+  const copyPublicTaskLink = async (message?: TimelineRow): Promise<void> => {
+    if (copyInFlightRef.current || mobileCopyLinks.busy) {
+      setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
+      return;
+    }
+    const initial = projectMobileNativeIntentSnapshot(client.state);
+    const sessionId = initial.selectedSessionId;
+    if (!sessionId || (message !== undefined
+      && (!message.completed || (message.kind !== "user" && message.kind !== "assistant")))) {
+      setLocalError(mobileMessage(locale, "actions.copyLinkFailed"));
+      return;
+    }
+    const authority = claimMobileCopyLinkAuthority(initial, {
+      sessionId,
+      requiresSelectedSession: true,
+      ...(message === undefined ? {} : { messageId: message.id, messageEventId: message.eventId })
+    });
+    if (!authority) {
+      setLocalError(mobileMessage(locale, "actions.copyLinkFailed"));
+      return;
+    }
+    const request = ++copyGenerationRef.current;
+    copyInFlightRef.current = true;
+    setCopyBusy(true);
+    setComposerNotice("");
+    setLocalError("");
+    try {
+      const link = authority.messageId === undefined
+        ? buildMobileTaskDeepLink(authority.sessionId)
+        : buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId);
+      const result = await mobileCopyLinks.copy(link);
+      if (!taskMountedRef.current || copyGenerationRef.current !== request) return;
+      if (!mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))) return;
+      if (result === "busy") setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
+      else setComposerNotice(mobileMessage(locale,
+        authority.messageId === undefined ? "actions.taskLinkCopied" : "actions.messageLinkCopied"));
+    } catch {
+      if (taskMountedRef.current && copyGenerationRef.current === request) {
+        setLocalError(mobileMessage(locale, "actions.copyLinkFailed"));
+      }
+    } finally {
+      copyInFlightRef.current = false;
+      if (taskMountedRef.current) setCopyBusy(false);
+    }
+  };
   const runMessageAction = (action: MobileMessageActionId): void => {
-    if (state.status !== "connected" || voice.busy) return;
     const selected = messageAction;
     setMessageAction(undefined);
-    if (!selected || client.state.selectedId !== selected.sessionId) return;
+    if ((state.status !== "connected" && state.status !== "offline") || !selected) return;
+    if (client.state.selectedId !== selected.sessionId) return;
     const latest = timelineRows(client.state.window
       ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
-      .find((row) => row.eventId === selected.row.eventId && row.completed);
+      .find((row) => row.id === selected.row.id && row.eventId === selected.row.eventId && row.completed
+        && (row.kind === "user" || row.kind === "assistant"));
     if (!latest) return;
+    if (action === "copy-link") {
+      void copyPublicTaskLink(latest);
+      return;
+    }
+    if (state.status !== "connected" || voice.busy) return;
     if (action === "quote-selection") {
       const identity = draftIdentityRef.current;
       const lease = captureMobileQuoteSelection(selected.sessionId, latest);
@@ -4588,6 +4729,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
           disabled={state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
         <Action label={mobileMessage(locale, "task.controls")} onPress={() => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); }} colors={colors} compact
           disabled={state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0} />
+        <Action label={mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink")}
+          onPress={() => void copyPublicTaskLink()} colors={colors} compact
+          disabled={copyBusy || session === undefined || (state.status !== "connected" && state.status !== "offline")} />
         {client.canOpenFiles() && <Action label={mobileMessage(locale, "task.files")} onPress={onFiles} colors={colors} compact
           disabled={state.status !== "connected" || attachmentBusy} />}
         <Action label={mobileMessage(locale, "common.refresh")} onPress={() => void client.refresh()} colors={colors} compact disabled={attachmentBusy} />
@@ -4702,11 +4846,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
             style={styles.inlineTouchAction}>
             <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "task.viewContext")}</Text>
           </Pressable>
-           {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId) }).length > 0
+           {buildMobileMessageActions(item, { canDelete: client.canDeleteMessage(item.eventId), locale, copyDisabled: copyBusy }).length > 0
             && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "task.moreFor", { name: item.label })}
-              disabled={state.status !== "connected" || voice.busy} onPress={() => openMessageActions(item)}
-              style={[styles.inlineTouchAction, (state.status !== "connected" || voice.busy) && styles.disabled]}>
-              <Text style={[styles.caption, { color: state.status !== "connected" || voice.busy ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
+              disabled={(state.status !== "connected" && state.status !== "offline")
+                || (state.status === "connected" && voice.busy)}
+              onPress={() => openMessageActions(item)}
+              style={[styles.inlineTouchAction,
+                ((state.status !== "connected" && state.status !== "offline")
+                  || (state.status === "connected" && voice.busy)) && styles.disabled]}>
+              <Text style={[styles.caption, { color: (state.status !== "connected" && state.status !== "offline")
+                || (state.status === "connected" && voice.busy) ? colors.muted : colors.accent }]}>{mobileMessage(locale, "common.more")}</Text>
             </Pressable>}
         </View>
       </View>;
@@ -5035,7 +5184,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         setTimelinePreviewSource(undefined);
         client.closeTimelinePreview();
       }} />
-    <MobileActionSheet visible={state.status === "connected" && messageActionsVisible} items={messageActionItems} colors={colors} locale={locale}
+    <MobileActionSheet visible={(state.status === "connected" || state.status === "offline") && messageActionsVisible}
+      items={messageActionItems} colors={colors} locale={locale}
       onClose={() => setMessageActionsVisible(false)} onAction={runMessageAction} />
     <MobileCommandHelpSheet visible={state.status === "connected" && commandHelpItems !== undefined} items={commandHelpItems ?? []} locale={locale}
       colors={colors} onClose={() => setCommandHelpItems(undefined)} />
@@ -6039,13 +6189,15 @@ function AutomaticEntryChoice({ checked, disabled, onPress, colors, locale }: {
 function Banner({ text, colors }: { text: string; colors: Colors }) {
   return <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{text}</Text>;
 }
-function Notice({ text, colors, locale, onDismiss }: {
+function Notice({ text, colors, locale, onDismiss, dismissAccessibilityLabel }: {
   text: string; colors: Colors; locale: MobileSupportedLocale; onDismiss: () => void;
+  dismissAccessibilityLabel?: string;
 }) {
   return <View accessibilityLiveRegion="polite"
     style={[styles.connectionNotice, { backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>
     <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>{text}</Text>
-    <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "composer.dismissNotice")} onPress={onDismiss}
+    <Pressable accessibilityRole="button"
+      accessibilityLabel={dismissAccessibilityLabel ?? mobileMessage(locale, "composer.dismissNotice")} onPress={onDismiss}
       style={styles.inlineTouchAction}><Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "common.dismiss")}</Text></Pressable>
   </View>;
 }

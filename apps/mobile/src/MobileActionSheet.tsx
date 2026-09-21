@@ -84,6 +84,7 @@ export function MobileActionSheet({
     onClose();
   };
   const select = (action: MobileMessageActionId): void => {
+    if (items.find((item) => item.id === action)?.disabled) return;
     closingGeneration.current = lifecycle.select(action);
     onClose();
   };
@@ -97,9 +98,11 @@ export function MobileActionSheet({
         <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           {items.map((item) => <View key={item.id}>
             {item.separatorBefore && <View style={[styles.separator, { backgroundColor: colors.border }]} />}
-            <Pressable accessibilityRole="button" accessibilityLabel={item.label} onPress={() => select(item.id)}
-              style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
-              <Text style={[styles.label, { color: item.destructive ? colors.negative : colors.ink }]}>{item.label}</Text>
+            <Pressable accessibilityRole="button" accessibilityLabel={item.label}
+              accessibilityState={{ disabled: item.disabled === true }} disabled={item.disabled}
+              onPress={() => select(item.id)}
+              style={({ pressed }) => [styles.row, item.disabled && styles.disabled, pressed && !item.disabled && styles.pressed]}>
+              <Text style={[styles.label, { color: item.disabled ? colors.muted : item.destructive ? colors.negative : colors.ink }]}>{item.label}</Text>
             </Pressable>
           </View>)}
         </View>
@@ -121,5 +124,6 @@ const styles = StyleSheet.create({
   row: { minHeight: 54, justifyContent: "center", paddingHorizontal: 18 },
   cancel: { minHeight: 54, borderRadius: 18, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center" },
   label: { fontSize: 16, fontWeight: "700" },
+  disabled: { opacity: 0.48 },
   pressed: { opacity: 0.7 }
 });

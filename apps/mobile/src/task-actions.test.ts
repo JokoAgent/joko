@@ -28,21 +28,26 @@ describe("mobile message action sheet", () => {
   };
 
   it("offers only actions backed by the current durable message and capability", () => {
-    expect(buildMobileMessageActions(row, { canDelete: true })).toEqual([
+    expect(buildMobileMessageActions(row, { canDelete: true, locale: "en" })).toEqual([
       { id: "add-to-composer", label: "Add to composer" },
+      { id: "copy-link", label: "Copy message link" },
       { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
     ]);
-    expect(buildMobileMessageActions({ ...row, completed: false }, { canDelete: true })).toEqual([]);
-    expect(buildMobileMessageActions({ ...row, kind: "status" }, { canDelete: true })).toEqual([]);
+    expect(buildMobileMessageActions({ ...row, completed: false }, { canDelete: true, locale: "en" })).toEqual([]);
+    expect(buildMobileMessageActions({ ...row, kind: "status" }, { canDelete: true, locale: "en" })).toEqual([]);
     expect(buildMobileMessageActions({
       ...row,
       kind: "assistant",
       label: "Assistant",
       quoteSource: { sourceMessageId: row.id, sourceEventId: row.eventId, text: row.text }
-    }, { canDelete: true })).toEqual([
+    }, { canDelete: true, locale: "en", copyDisabled: true })).toEqual([
       { id: "add-to-composer", label: "Add to composer" },
       { id: "quote-selection", label: "Quote selection" },
+      { id: "copy-link", label: "Copying link…", disabled: true },
       { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
+    ]);
+    expect(buildMobileMessageActions({ ...row, text: "" }, { canDelete: false, locale: "zh-CN" })).toEqual([
+      { id: "copy-link", label: "复制消息链接" }
     ]);
   });
 

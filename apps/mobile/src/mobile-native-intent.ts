@@ -134,6 +134,20 @@ export function parseMobileNativeIntent(value: unknown): MobileNativeIntent | un
   return undefined;
 }
 
+/** Build the public, portable task handoff. Device-local profile identity is intentionally omitted. */
+export function buildMobileTaskDeepLink(sessionId: string): string {
+  return buildMobileSessionDeepLink({ sessionId });
+}
+
+/** Build a public task handoff anchored to one exact durable message and, when known, its Event. */
+export function buildMobileMessageDeepLink(
+  sessionId: string,
+  messageId: string,
+  messageEventId?: string
+): string {
+  return buildMobileSessionDeepLink({ sessionId, messageId, messageEventId });
+}
+
 /**
  * Buffers only the latest valid navigation before the product is ready. A focus-only handoff never
  * supersedes navigation already being materialized. A later navigation invalidates an active claim.
@@ -348,6 +362,33 @@ function parseSessionIntent(url: URL): Extract<MobileNativeIntent, { readonly ki
     ...(messageId === undefined ? {} : { messageId }),
     ...(messageEventId === undefined ? {} : { messageEventId })
   });
+}
+
+function buildMobileSessionDeepLink(input: {
+  readonly sessionId: string;
+  readonly messageId?: string;
+  readonly messageEventId?: string;
+}): string {
+  if (!boundedIdentity(input.sessionId)
+    || (input.messageId !== undefined && !boundedIdentity(input.messageId))
+    || (input.messageEventId !== undefined && !boundedIdentity(input.messageEventId))
+    || (input.messageEventId !== undefined && input.messageId === undefined)) {
+    throw new Error("A public Joko task link requires bounded task and message identities.");
+  }
+  const query = input.messageId === undefined
+    ? ""
+    : `?message=${encodeURIComponent(input.messageId)}${input.messageEventId === undefined
+      ? "" : `&event=${encodeURIComponent(input.messageEventId)}`}`;
+  const value = `joko://task/${encodeURIComponent(input.sessionId)}${query}`;
+  const parsed = parseMobileNativeIntent(value);
+  if (parsed?.kind !== "session"
+    || parsed.sessionId !== input.sessionId
+    || parsed.profileId !== undefined
+    || parsed.messageId !== input.messageId
+    || parsed.messageEventId !== input.messageEventId) {
+    throw new Error("The public Joko task link exceeds its canonical handoff boundary.");
+  }
+  return value;
 }
 
 function parseFocusIntent(url: URL): Extract<MobileNativeIntent, { readonly kind: "focus" }> | undefined {

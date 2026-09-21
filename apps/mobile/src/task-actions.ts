@@ -13,27 +13,35 @@ import {
 } from "@joko/contracts";
 import type { TimelineRow } from "./timeline";
 import { mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
-export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "delete";
+export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "copy-link" | "delete";
 
 export interface MobileMessageActionItem {
   readonly id: MobileMessageActionId;
   readonly label: string;
   readonly destructive?: boolean;
+  readonly disabled?: boolean;
   readonly separatorBefore?: boolean;
 }
 
 export function buildMobileMessageActions(
   row: TimelineRow,
-  input: { readonly canDelete: boolean }
+  input: { readonly canDelete: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
   if (!row.completed || (row.kind !== "user" && row.kind !== "assistant")) return [];
   const actions: MobileMessageActionItem[] = [];
-  if (row.text.trim()) actions.push({ id: "add-to-composer", label: "Add to composer" });
-  if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: "Quote selection" });
+  if (row.text.trim()) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
+  if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: mobileMessage(input.locale, "actions.quoteSelection") });
+  actions.push({
+    id: "copy-link",
+    label: mobileMessage(input.locale, input.copyDisabled ? "actions.copyingLink" : "actions.copyMessageLink"),
+    ...(input.copyDisabled ? { disabled: true } : {})
+  });
   if (input.canDelete) actions.push({
     id: "delete",
-    label: "Delete message",
+    label: mobileMessage(input.locale, "actions.deleteMessage"),
     destructive: true,
     separatorBefore: actions.length > 0
   });

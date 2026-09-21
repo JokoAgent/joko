@@ -6,6 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   MobileNativeIntentDelivery,
   MobileExternalIntentFence,
+  buildMobileMessageDeepLink,
+  buildMobileTaskDeepLink,
   executeMobileNativeIntent,
   isMobileIncomingShareUrl,
   installMobileNativeIntentLinking,
@@ -22,6 +24,26 @@ import {
 } from "./mobile-native-intent";
 
 describe("mobile public native intents", () => {
+  it("builds portable canonical task and exact message links that round-trip through the public parser", () => {
+    const task = buildMobileTaskDeepLink("task / 一");
+    const message = buildMobileMessageDeepLink("task / 一", "message / 一", "event / 一");
+    expect(task).toBe("joko://task/task%20%2F%20%E4%B8%80");
+    expect(message).toBe("joko://task/task%20%2F%20%E4%B8%80?message=message%20%2F%20%E4%B8%80&event=event%20%2F%20%E4%B8%80");
+    expect(parseMobileNativeIntent(task)).toEqual({ kind: "session", sessionId: "task / 一" });
+    expect(parseMobileNativeIntent(message)).toEqual({
+      kind: "session",
+      sessionId: "task / 一",
+      messageId: "message / 一",
+      messageEventId: "event / 一"
+    });
+  });
+
+  it("refuses invalid identities and encoded links beyond the public budget", () => {
+    expect(() => buildMobileTaskDeepLink(" task")).toThrow(/bounded/u);
+    expect(() => buildMobileMessageDeepLink("task", "", "event")).toThrow(/bounded/u);
+    expect(() => buildMobileMessageDeepLink("😀".repeat(128), "😀".repeat(128), "😀".repeat(128))).toThrow(/canonical/u);
+  });
+
   it("parses the canonical task handoff with bounded profile and message identities", () => {
     expect(parseMobileNativeIntent(
       "joko://task/task%20%2F%20%E4%B8%80?event=event+%2F+%E4%B8%80&message=message+%2F+%E4%B8%80&profile=machine+%2F+%E4%B8%80"
