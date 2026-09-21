@@ -13,6 +13,9 @@ import { MobileThemePreferenceStore } from "./mobile-theme-preference";
 import { MobileDiagnosticsStore } from "./mobile-diagnostics";
 import { MobileLocalePreferenceStore } from "./mobile-locale-preference";
 import { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
+import { MobileUpdateDeviceStore } from "./mobile-update-device-store";
+import { MobileUpdateController } from "./mobile-update-controller";
+import { createMobileUpdateRuntimeEnvironment } from "./mobile-update-runtime";
 
 const plainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
@@ -33,6 +36,11 @@ export const mobileThemePreferences = new MobileThemePreferenceStore(plainStorag
 export const mobileDiagnostics = new MobileDiagnosticsStore(plainStorage, undefined, Date.now, randomUUID);
 export const mobileLocalePreferences = new MobileLocalePreferenceStore(plainStorage);
 export const mobileVoiceDictionary = new MobileVoiceDictionaryStore(plainStorage, Date.now, randomUUID);
+const mobileUpdateRuntime = createMobileUpdateRuntimeEnvironment();
+export const mobileUpdates = new MobileUpdateController({
+  ...mobileUpdateRuntime,
+  deviceStore: new MobileUpdateDeviceStore(plainStorage)
+});
 
 export const mobileStorage = createMobileStorage(
   plainStorage,

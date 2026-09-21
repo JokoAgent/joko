@@ -56,7 +56,8 @@ import {
   mobileLocalePreferences,
   mobileStorage,
   mobileThemePreferences,
-  mobileVoiceDictionary
+  mobileVoiceDictionary,
+  mobileUpdates
 } from "./storage";
 import {
   mobileComposerDraftIdentityKey,
@@ -226,6 +227,11 @@ import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import {
+  MobileForcedUpdateGate,
+  MobileUpdatePrompt,
+  type MobileUpdateActions
+} from "./MobileUpdateSurface";
 import { resolveMobileDarkTheme } from "./mobile-theme-preference";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
@@ -257,6 +263,14 @@ const client = new MobileClient(
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
+const mobileUpdateActions: MobileUpdateActions = {
+  onChannelChange: (channel) => mobileUpdates.setChannel(channel),
+  onCheck: () => mobileUpdates.manualCheck(),
+  onReset: () => mobileUpdates.resetDeviceSettings(),
+  onDismissPrompt: () => mobileUpdates.dismissPrompt(),
+  onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
+  onRecheckForced: () => mobileUpdates.recheckForced()
+};
 type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "settings" | "connections" | "devices" | "device";
 
 interface MobilePhotoLibraryLease {
@@ -490,6 +504,10 @@ export function App() {
     (listener) => mobileVoiceDictionary.subscribe(listener),
     () => mobileVoiceDictionary.snapshot
   );
+  const updates = useSyncExternalStore(
+    (listener) => mobileUpdates.subscribe(listener),
+    () => mobileUpdates.snapshot
+  );
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -526,6 +544,7 @@ export function App() {
     void mobileThemePreferences.hydrate();
     void mobileLocalePreferences.hydrate();
     void mobileVoiceDictionary.hydrate();
+    void mobileUpdates.start(AppState.currentState === "active");
     let diagnosticsStopped = false;
     let diagnosticsState = AppState.currentState;
     let diagnosticsTick = performance.now();
@@ -546,6 +565,7 @@ export function App() {
       diagnosticsTick = performance.now();
       setForeground(foreground);
       client.setForeground(foreground);
+      void mobileUpdates.handleAppStateChange(status);
       mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
       if (foreground) mobileLocalePreferences.refreshSystemLocale();
@@ -685,6 +705,10 @@ export function App() {
     }
   }, [nativeIntentMessageFocus, state.selectedId]);
 
+  useEffect(() => {
+    if (updates.prompt || updates.forced) setMenuOpen(false);
+  }, [updates.forced, updates.prompt]);
+
   const common = { colors, state, locale: locale.effectiveLocale };
   const connectionRequired = !state.activeProfileId;
   const queueHomeMenuAction = (action: () => void): void => {
@@ -697,9 +721,14 @@ export function App() {
     <SafeAreaProvider>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         <StatusBar style={dark ? "light" : "dark"} />
-        <View style={styles.fill} accessibilityElementsHidden={homeDrawerMounted}
-          importantForAccessibility={homeDrawerMounted ? "no-hide-descendants" : "auto"}>
-          {state.status === "starting" || theme.status === "loading" || locale.status === "loading" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
+        {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
+          <MobileForcedUpdateGate colors={colors} locale={locale.effectiveLocale} state={updates}
+            foreground={foreground} actions={mobileUpdateActions} />
+        </SafeAreaView> : <>
+        <View style={styles.fill} accessibilityElementsHidden={homeDrawerMounted || Boolean(updates.prompt)}
+          importantForAccessibility={homeDrawerMounted || updates.prompt ? "no-hide-descendants" : "auto"}>
+          {state.status === "starting" || theme.status === "loading" || locale.status === "loading"
+            || updates.startup === "checking" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
             <StartupLoading colors={colors} dark={dark} locale={locale.effectiveLocale} />
           </SafeAreaView> :
             mobileConnectionStageRequired(state.activeProfileId, page) ? <ConnectionScreen {...common} dark={dark}
@@ -723,7 +752,8 @@ export function App() {
                   locale={locale.effectiveLocale}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
-                  theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary} client={client}
+                  theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
+                  updates={updates} updateActions={mobileUpdateActions} client={client}
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
                   onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
@@ -751,9 +781,9 @@ export function App() {
                   onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
             </SafeAreaView>}
         </View>
-        {nativeIntentRecovery && <MobileNativeIntentNotice colors={colors} locale={locale.effectiveLocale}
+        {!updates.prompt && nativeIntentRecovery && <MobileNativeIntentNotice colors={colors} locale={locale.effectiveLocale}
           recovery={nativeIntentRecovery} onDismiss={() => setNativeIntentRecovery(undefined)} />}
-        <HomeMenu visible={!connectionRequired && menuOpen} colors={colors} state={state}
+        <HomeMenu visible={!updates.prompt && !connectionRequired && menuOpen} colors={colors} state={state}
           locale={locale.effectiveLocale}
           onClose={() => setMenuOpen(false)}
           onMountedChange={setHomeDrawerMounted}
@@ -767,6 +797,9 @@ export function App() {
           onSwitch={() => queueHomeMenuAction(() => { client.setConnectionMode("saved"); setPage("connection"); })}
           onSettings={() => queueHomeMenuAction(() => setPage("settings"))}
           onDevices={() => queueHomeMenuAction(() => setPage("devices"))} />
+        <MobileUpdatePrompt colors={colors} locale={locale.effectiveLocale} state={updates}
+          actions={mobileUpdateActions} />
+        </>}
       </View>
     </SafeAreaProvider>
   );

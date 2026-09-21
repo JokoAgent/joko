@@ -6,6 +6,17 @@
     "version": "0.1.0",
     "orientation": "default",
     "userInterfaceStyle": "automatic",
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    },
+    "updates": {
+      "enabled": false,
+      "checkAutomatically": "NEVER",
+      "fallbackToCacheTimeout": 0,
+      "requestHeaders": {
+        "expo-channel-name": "stable"
+      }
+    },
     "ios": {
       "bundleIdentifier": "app.joko.mobile",
       "supportsTablet": true,

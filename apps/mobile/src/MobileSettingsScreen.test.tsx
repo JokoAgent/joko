@@ -25,6 +25,7 @@ import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 import type { MobileVoiceDictionaryStoreState } from "./mobile-voice-dictionary-store";
+import type { MobileUpdateControllerState } from "./mobile-update-controller";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -229,6 +230,28 @@ const readyVoiceDictionary: MobileVoiceDictionaryStoreState = {
     history: []
   }
 };
+const readyUpdates: MobileUpdateControllerState = {
+  status: "ready",
+  startup: "ready",
+  channel: "stable",
+  betaEnabled: true,
+  channelSaving: false,
+  manualPhase: "idle",
+  pendingRestart: false,
+  running: {
+    appVersion: "0.1.0",
+    runtimeVersion: "runtime-test",
+    updateId: "12345678-aaaa-bbbb-cccc-123456789abc",
+    channel: "stable",
+    createdAt: new Date(2026, 8, 21, 9, 30),
+    isEnabled: true,
+    isEmbeddedLaunch: false,
+    isEmergencyLaunch: false
+  },
+  forcedChecking: false,
+  forcedCheckFailed: false,
+  authorityAvailable: true
+};
 
 let root: Root | undefined;
 
@@ -247,6 +270,7 @@ function mount(options: {
   locale?: MobileLocalePreferenceState;
   diagnostics?: MobileDiagnosticsState;
   voiceDictionary?: MobileVoiceDictionaryStoreState;
+  updates?: MobileUpdateControllerState;
   client?: MobileSettingsClient;
 } = {}) {
   const container = document.createElement("div");
@@ -256,6 +280,9 @@ function mount(options: {
   const onDiagnosticsEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
   const onDiagnosticsClear = vi.fn(async () => undefined);
   const onDiagnosticsExport = vi.fn(async () => undefined);
+  const onChannelChange = vi.fn(async () => undefined);
+  const onCheck = vi.fn(async () => undefined);
+  const onReset = vi.fn(async () => undefined);
   const onBack = vi.fn();
   const onConnections = vi.fn();
   const onDevices = vi.fn();
@@ -265,6 +292,7 @@ function mount(options: {
   let locale = options.locale ?? readyLocale;
   let diagnostics = options.diagnostics ?? readyDiagnostics;
   let voiceDictionary = options.voiceDictionary ?? readyVoiceDictionary;
+  let updates = options.updates ?? readyUpdates;
   const render = () => createElement(MobileSettingsScreen, {
     colors,
     state,
@@ -273,6 +301,8 @@ function mount(options: {
     locale,
     diagnostics,
     voiceDictionary,
+    updates,
+    updateActions: { onChannelChange, onCheck, onReset },
     client,
     onThemeChange,
     onLocaleChange,
@@ -301,18 +331,23 @@ function mount(options: {
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
+    onChannelChange,
+    onCheck,
+    onReset,
     onBack,
     onConnections,
     onDevices,
     rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
       locale?: MobileLocalePreferenceState;
-      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoiceDictionaryStoreState }) => {
+      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoiceDictionaryStoreState;
+      updates?: MobileUpdateControllerState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
       theme = next.theme ?? theme;
       locale = next.locale ?? locale;
       diagnostics = next.diagnostics ?? diagnostics;
       voiceDictionary = next.voiceDictionary ?? voiceDictionary;
+      updates = next.updates ?? updates;
       act(() => root!.render(render()));
     }
   };
@@ -389,6 +424,20 @@ describe("MobileSettingsScreen", () => {
     for (const label of ["システム", "English", "简体中文", "繁體中文", "日本語", "한국어"]) {
       expect(button(mounted.container, label).disabled).toBe(true);
     }
+  });
+
+  it("mounts current update identity and routes channel and manual checks through the update owner", async () => {
+    const mounted = mount();
+    expect(mounted.container.textContent).toContain("Updates");
+    expect(mounted.container.textContent).toContain("runtime-test");
+    expect(mounted.container.textContent).toContain("12345678");
+    await act(async () => button(mounted.container, "Beta").click());
+    await act(async () => button(mounted.container, "Check for updates").click());
+    expect(mounted.onChannelChange).toHaveBeenCalledWith("beta");
+    expect(mounted.onCheck).toHaveBeenCalledOnce();
+
+    mounted.rerender({ updates: { ...readyUpdates, manualOutcome: "up-to-date" } });
+    expect(mounted.container.textContent).toContain("Joko is up to date.");
   });
 
   it("keeps offline and background identity visible while device mutations and receipts are read-only", () => {

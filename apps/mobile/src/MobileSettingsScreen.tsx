@@ -29,6 +29,8 @@ import type {
   MobileVoiceDictionaryEditOutcome,
   MobileVoiceDictionaryStoreState
 } from "./mobile-voice-dictionary-store";
+import { MobileUpdateSettingsSection, type MobileUpdateActions } from "./MobileUpdateSurface";
+import type { MobileUpdateControllerState } from "./mobile-update-controller";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -52,6 +54,8 @@ export interface MobileSettingsScreenProps {
   readonly locale: MobileLocalePreferenceState;
   readonly diagnostics: MobileDiagnosticsState;
   readonly voiceDictionary: MobileVoiceDictionaryStoreState;
+  readonly updates: MobileUpdateControllerState;
+  readonly updateActions: Pick<MobileUpdateActions, "onChannelChange" | "onCheck" | "onReset">;
   readonly client: MobileSettingsClient;
   readonly onThemeChange: (preference: MobileThemePreference) => Promise<void>;
   readonly onLocaleChange: (preference: MobileLocalePreference) => Promise<void>;
@@ -104,7 +108,8 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
 export function MobileSettingsScreen({ colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
   onLocaleChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
   onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange, onVoiceDictionaryAdd,
-  onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, appVersion }: MobileSettingsScreenProps) {
+  onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, updates, updateActions,
+  appVersion }: MobileSettingsScreenProps) {
   const current = resolveMobileSettingsCurrentDevice(state);
   const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
     mobileMessage(locale.effectiveLocale, key, variables);
@@ -373,6 +378,9 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
           )} />}
       </View>
     </View>}
+
+    <MobileUpdateSettingsSection colors={colors} locale={locale.effectiveLocale}
+      state={updates} actions={updateActions} />
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("common.about")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
