@@ -209,6 +209,7 @@ import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-sha
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
+import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import { resolveMobileDarkTheme } from "./mobile-theme-preference";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -5049,7 +5050,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
       if (filesMountedRef.current && fileShareRef.current === controller) setFileShareProgress(progress);
     }, controller.signal).then(() => {
       if (filesMountedRef.current && fileShareRef.current === controller) {
-        setImageOutputNotice("System file sharing completed.");
+        setImageOutputNotice(mobileMessage(locale, "files.shareCompleted"));
       }
     }).catch((error) => {
       if (!controller.signal.aborted && filesMountedRef.current && fileShareRef.current === controller) {
@@ -5064,30 +5065,31 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
     });
   };
   const locationTitle = files.location.kind === "generated"
-    ? "Generated"
-    : files.location.path || files.workspace?.displayName || "Workspace";
+    ? mobileMessage(locale, "files.generated")
+    : files.location.path || files.workspace?.displayName || mobileMessage(locale, "files.workspace");
 
   return <View style={styles.fill}>
     <View style={[styles.header, { borderBottomColor: colors.border }]}>
-      <Back onPress={leave} colors={colors} label="Task" />
+      <Back onPress={leave} colors={colors} label={mobileMessage(locale, "files.task")}
+        accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "files.task") })} />
       <View style={styles.fill}>
-        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>Files</Text>
+        <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{mobileMessage(locale, "files.title")}</Text>
         <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{locationTitle}</Text>
       </View>
-      <Action label={files.status === "loading" ? "Refreshing…" : "Refresh"} compact colors={colors}
+      <Action label={mobileMessage(locale, files.status === "loading" ? "common.refreshing" : "common.refresh")} compact colors={colors}
         disabled={!connected || files.status === "loading" || filesBusy} onPress={() => run(() => client.refreshFiles())} />
     </View>
 
     {files.status === "offline" && <View style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <View style={[styles.statusDot, { backgroundColor: colors.negative }]} />
-      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Offline · showing only the in-memory view already loaded for this task. New reads are paused.</Text>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "files.offline")}</Text>
     </View>}
     {(localError || files.error) && <Banner text={localError || files.error || ""} colors={colors} />}
     {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors} locale={locale}
       onDismiss={() => setImageOutputNotice("")} />}
     {handoffBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
-      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Adding the verified item to this task’s composer…</Text>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "preview.addingVerified")}</Text>
     </View>}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
@@ -5095,66 +5097,53 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
     </View>}
     {galleryOpening && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
-      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Verifying the current image gallery…</Text>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "files.verifyingGallery")}</Text>
     </View>}
-    {files.watchStatus === "error" && files.watchError && <Banner text={`Live file refresh unavailable: ${files.watchError}`} colors={colors} />}
+    {files.watchStatus === "error" && files.watchError
+      && <Banner text={mobileMessage(locale, "files.watchUnavailable", { error: files.watchError })} colors={colors} />}
 
-    <View accessibilityRole="tablist" style={styles.filesTabs}>
-      <ModeTab label="Workspace" selected={files.location.kind === "workspace"}
-        disabled={!connected || filesBusy} onPress={() => run(() => client.openFilesDirectory(""))} colors={colors} />
-      <ModeTab label={`Generated${files.artifacts.length ? ` (${files.artifacts.length})` : ""}`}
-        selected={files.location.kind === "generated"} disabled={!connected || filesBusy} onPress={() => {
-          setLocalError("");
-          try { client.openGeneratedFiles(); } catch (error) { setLocalError(errorText(error)); }
-        }} colors={colors} />
-    </View>
-
-    <View style={styles.filesSearchControls}>
-      <TextInput accessibilityLabel="Search files" placeholder={mode === "name" ? "Search file names" : "Search file contents"}
-        placeholderTextColor={colors.muted} value={query} onChangeText={setQuery} autoCapitalize="none" autoCorrect={false}
-        editable={!filesBusy}
-        style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
-      {files.searchStatus === "searching" && <ActivityIndicator color={colors.accent} />}
-    </View>
-    <View style={styles.filesSearchOptions}>
-      <View accessibilityRole="tablist" style={styles.filesSearchModes}>
-        <ModeTab label="Name" selected={mode === "name"} disabled={filesBusy} onPress={() => setMode("name")} colors={colors} />
-        <ModeTab label="Content" selected={mode === "content"} disabled={filesBusy} onPress={() => setMode("content")} colors={colors} />
-      </View>
-      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: caseSensitive, disabled: filesBusy }}
-        accessibilityLabel="Case-sensitive file search" disabled={filesBusy}
-        onPress={() => setCaseSensitive((value) => !value)} style={[styles.caseChoice, filesBusy && styles.disabled]}>
-        <View style={[styles.choiceBox, { borderColor: caseSensitive ? colors.accent : colors.border,
-          backgroundColor: caseSensitive ? colors.accent : colors.surface }]}>
-          {caseSensitive && <Text style={styles.choiceCheck}>✓</Text>}
-        </View>
-        <Text style={[styles.caption, { color: colors.ink }]}>Match case</Text>
-      </Pressable>
-    </View>
+    <MobileFilesToolbar colors={colors} locale={locale} location={files.location.kind}
+      generatedCount={files.artifacts.length} navigationDisabled={!connected || filesBusy}
+      searchDisabled={filesBusy} searching={files.searchStatus === "searching"}
+      query={query} mode={mode} caseSensitive={caseSensitive}
+      onOpenWorkspace={() => run(() => client.openFilesDirectory(""))}
+      onOpenGenerated={() => {
+        setLocalError("");
+        try { client.openGeneratedFiles(); } catch (error) { setLocalError(errorText(error)); }
+      }}
+      onQueryChange={setQuery} onModeChange={setMode}
+      onToggleCaseSensitive={() => setCaseSensitive((value) => !value)} />
     {files.searchError && searching && <Banner text={files.searchError} colors={colors} />}
     {files.searchTruncated && searching && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>
-      Results are truncated by the node. Refine the literal query to inspect the complete result set.
+      {mobileMessage(locale, "files.resultsTruncated")}
     </Text>}
 
     {files.status === "loading" && files.entries.length === 0 && files.artifacts.length === 0
-      ? <Centered label="Loading the current Workspace and Generated files…" colors={colors} />
+      ? <Centered label={mobileMessage(locale, "files.loading")} colors={colors} />
       : <ScrollView style={styles.fill} contentContainerStyle={styles.filesList} keyboardShouldPersistTaps="handled">
         {searching ? <>
-          <Text style={[styles.section, { color: colors.muted }]}>Search results</Text>
+          <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "files.searchResults")}</Text>
           {files.searchStatus === "ready" && files.searchResults.length === 0
-            && <Text style={[styles.description, { color: colors.muted }]}>No matching files</Text>}
+            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.noMatches")}</Text>}
           {files.searchResults.map((result, index) => <FileSearchResultRow key={fileSearchResultKey(result, index)}
-            result={result} colors={colors} disabled={!connected || filesBusy} onPress={() => openResult(result)}
+            result={result} colors={colors} locale={locale} disabled={!connected || filesBusy} onPress={() => openResult(result)}
             shareDisabled={!shareableFileSearchResult(result)}
             onShare={() => shareFile({ kind: "search-result", result })}
             onAdd={() => addToComposer({ kind: "search-result", result })} />)}
           {files.searchStatus === "ready" && <Text style={[styles.caption, { color: colors.muted }]}>
-            {files.searchResults.length} result{files.searchResults.length === 1 ? "" : "s"}
-            {mode === "content" ? ` across ${files.searchTotalFiles} file${files.searchTotalFiles === 1 ? "" : "s"}` : ""}
+            {mode === "content"
+              ? mobileMessage(locale, files.searchTotalFiles === 1 ? "files.resultAcrossOne" : "files.resultAcrossMany", {
+                results: files.searchResults.length,
+                files: files.searchTotalFiles
+              })
+              : mobileMessage(locale, files.searchResults.length === 1 ? "files.resultOne" : "files.resultMany", {
+                count: files.searchResults.length
+              })}
           </Text>}
         </> : files.location.kind === "generated" ? <>
-          <Text style={[styles.section, { color: colors.muted }]}>Generated by this task</Text>
-          {files.artifacts.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No canonical Generated files are available for this task.</Text>}
+          <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "files.generatedByTask")}</Text>
+          {files.artifacts.length === 0
+            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.generatedEmpty")}</Text>}
           {files.artifacts.map((artifact) => {
             const galleryImage = mobileImageGalleryMediaType(artifact.blob?.mediaType ?? "") !== undefined;
             const model = artifact.blob
@@ -5162,7 +5151,9 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
             const source = { kind: "artifact" as const, artifact };
             return <View key={artifact.artifactId} style={styles.fileActionRow}>
             <Pressable accessibilityRole="button"
-              accessibilityLabel={`${galleryImage ? "Open image gallery for" : "Preview Generated file"} ${artifactTitle(artifact)}`}
+              accessibilityLabel={mobileMessage(locale, galleryImage ? "files.openGalleryFor" : "files.previewGenerated", {
+                name: artifactTitle(artifact)
+              })}
               disabled={!connected || filesBusy}
               onPress={() => galleryImage
                 ? openGallery(source)
@@ -5172,24 +5163,28 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
               <Text style={styles.fileGlyph}>{galleryImage ? "▧" : model ? "⬡" : "◆"}</Text>
               <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{artifactTitle(artifact)}</Text>
                 <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                  {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}` : "Blob unavailable"}
+                  {artifact.blob ? `${artifact.blob.mediaType || "application/octet-stream"} · ${formatByteSize(artifact.blob.byteSize)}`
+                    : mobileMessage(locale, "files.blobUnavailable")}
                 </Text></View>
               <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
             </Pressable>
-            <Action label="Add" accessibilityLabel={`Add Generated file ${artifactTitle(artifact)} to composer`}
+            <Action label={mobileMessage(locale, "common.add")}
+              accessibilityLabel={mobileMessage(locale, "files.addGenerated", { name: artifactTitle(artifact) })}
               compact colors={colors} disabled={!connected || filesBusy}
               onPress={() => addToComposer(source)} />
-            <Action label="Share" accessibilityLabel={`Share Generated file ${artifactTitle(artifact)}`}
+            <Action label={mobileMessage(locale, "common.share")}
+              accessibilityLabel={mobileMessage(locale, "files.shareGenerated", { name: artifactTitle(artifact) })}
               compact colors={colors} disabled={!connected || filesBusy || !shareableBlobSize(artifact.blob?.byteSize)}
               onPress={() => shareFile(source)} />
           </View>})}
         </> : <>
           <View style={styles.sectionHeader}>
-            <Text style={[styles.section, { color: colors.muted }]}>{files.location.path || "Workspace root"}</Text>
-            {files.location.path && <Action label="Up" compact colors={colors} disabled={!connected || filesBusy}
+            <Text style={[styles.section, { color: colors.muted }]}>{files.location.path || mobileMessage(locale, "files.workspaceRoot")}</Text>
+            {files.location.path && <Action label={mobileMessage(locale, "files.up")} compact colors={colors} disabled={!connected || filesBusy}
               onPress={() => run(() => client.openFilesDirectory(workspaceParentPath(files.location.kind === "workspace" ? files.location.path : "")))} />}
           </View>
-          {files.entries.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>This directory is empty.</Text>}
+          {files.entries.length === 0
+            && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "files.directoryEmpty")}</Text>}
           {files.entries.map((entry) => {
             const label = entry.displayName || workspaceBasename(entry.relativePath);
             const galleryImage = entry.kind === FileKind.REGULAR
@@ -5199,7 +5194,8 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
             const source = { kind: "workspace-entry" as const, entry };
             return <View key={entry.relativePath} style={styles.fileActionRow}>
               <Pressable accessibilityRole="button"
-                accessibilityLabel={`${entry.kind === FileKind.DIRECTORY ? "Open directory" : galleryImage ? "Open image gallery for" : "Preview file"} ${label}`}
+                accessibilityLabel={mobileMessage(locale, entry.kind === FileKind.DIRECTORY
+                  ? "files.openDirectory" : galleryImage ? "files.openGalleryFor" : "files.previewFile", { name: label })}
                 disabled={!connected || filesBusy}
                 onPress={() => entry.kind === FileKind.DIRECTORY
                   ? run(() => client.previewWorkspaceEntry(entry))
@@ -5212,16 +5208,21 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
                 <View style={styles.fill}>
                   <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{label}</Text>
                   <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>
-                    {entry.kind === FileKind.DIRECTORY ? "Directory" : `${entry.mediaType || "application/octet-stream"} · ${formatByteSize(entry.revision?.byteSize ?? 0n)}`}
-                    {entry.hidden ? " · hidden" : ""}{entry.ignored ? " · ignored" : ""}
+                    {entry.kind === FileKind.DIRECTORY ? mobileMessage(locale, "files.directory")
+                      : `${entry.mediaType || "application/octet-stream"} · ${formatByteSize(entry.revision?.byteSize ?? 0n)}`}
+                    {entry.hidden ? ` · ${mobileMessage(locale, "files.hidden")}` : ""}
+                    {entry.ignored ? ` · ${mobileMessage(locale, "files.ignored")}` : ""}
                   </Text>
                 </View>
                 <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
               </Pressable>
-              <Action label="Add" accessibilityLabel={`Add ${entry.kind === FileKind.DIRECTORY ? "directory" : "file"} ${label} to composer`}
+              <Action label={mobileMessage(locale, "common.add")}
+                accessibilityLabel={mobileMessage(locale, entry.kind === FileKind.DIRECTORY
+                  ? "files.addDirectory" : "files.addFile", { name: label })}
                 compact colors={colors} disabled={!connected || filesBusy}
                 onPress={() => addToComposer(source)} />
-              <Action label="Share" accessibilityLabel={`Share file ${label}`}
+              <Action label={mobileMessage(locale, "common.share")}
+                accessibilityLabel={mobileMessage(locale, "files.shareFile", { name: label })}
                 compact colors={colors} disabled={!connected || filesBusy || entry.kind !== FileKind.REGULAR
                   || !shareableBlobSize(entry.revision?.byteSize)}
                 onPress={() => shareFile(source)} />
@@ -5266,28 +5267,31 @@ function FilesScreen({ colors, state, locale, onBack, onAdded }: ScreenProps & {
   </View>;
 }
 
-function FileSearchResultRow({ result, colors, disabled, shareDisabled, onPress, onAdd, onShare }: {
-  result: MobileFileSearchResult; colors: Colors; disabled: boolean; shareDisabled: boolean;
+function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, onPress, onAdd, onShare }: {
+  result: MobileFileSearchResult; colors: Colors; locale: MobileSupportedLocale; disabled: boolean; shareDisabled: boolean;
   onPress: () => void; onAdd: () => void; onShare: () => void;
 }) {
   const path = result.kind === "artifact" ? artifactTitle(result.artifact)
     : result.kind === "workspace-content" ? result.match.relativePath : result.relativePath;
   const detail = result.kind === "artifact"
-    ? `Generated · ${result.artifact.blob?.mediaType || "application/octet-stream"}`
+    ? `${mobileMessage(locale, "files.generated")} · ${result.artifact.blob?.mediaType || "application/octet-stream"}`
     : result.kind === "workspace-content"
-      ? result.match.linePreview || "Content match"
-      : "Workspace file";
+      ? result.match.linePreview || mobileMessage(locale, "files.contentMatch")
+      : mobileMessage(locale, "files.workspaceFile");
   return <View style={styles.fileActionRow}>
-    <Pressable accessibilityRole="button" accessibilityLabel={`Preview ${path}`} disabled={disabled} onPress={onPress}
+    <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "files.previewResult", { name: path })}
+      disabled={disabled} onPress={onPress}
       style={[styles.fileRow, styles.fileRowMain, { backgroundColor: colors.surface, borderColor: colors.border }, disabled && styles.disabled]}>
       <Text style={styles.fileGlyph}>{result.kind === "artifact" ? "◆" : "◇"}</Text>
       <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{path}</Text>
         <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>{detail}</Text></View>
       <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
     </Pressable>
-    <Action label="Add" accessibilityLabel={`Add ${path} to composer`} compact colors={colors}
+    <Action label={mobileMessage(locale, "common.add")}
+      accessibilityLabel={mobileMessage(locale, "files.addResult", { name: path })} compact colors={colors}
       disabled={disabled} onPress={onAdd} />
-    <Action label="Share" accessibilityLabel={`Share ${path}`} compact colors={colors}
+    <Action label={mobileMessage(locale, "common.share")}
+      accessibilityLabel={mobileMessage(locale, "files.shareResult", { name: path })} compact colors={colors}
       disabled={disabled || shareDisabled} onPress={onShare} />
   </View>;
 }
@@ -6121,11 +6125,6 @@ const styles = StyleSheet.create({
   drawerTaskRow: { minHeight: 62, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, gap: 2, marginBottom: 7 },
   drawerEmpty: { padding: 20, textAlign: "center" },
   drawerHome: { minHeight: 50, borderTopWidth: 1, alignItems: "center", justifyContent: "center" },
-  filesTabs: { paddingHorizontal: 16, paddingVertical: 8, flexDirection: "row", gap: 8 },
-  filesSearchControls: { minHeight: 52, paddingHorizontal: 16, paddingTop: 4, flexDirection: "row", alignItems: "center", gap: 10 },
-  filesSearchOptions: { paddingHorizontal: 16, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12 },
-  filesSearchModes: { flex: 1, flexDirection: "row", gap: 6 },
-  caseChoice: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 7 },
   filesList: { paddingHorizontal: 16, paddingBottom: 36, gap: 8, flexGrow: 1 },
   fileActionRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   fileRowMain: { flex: 1, minWidth: 0 },
