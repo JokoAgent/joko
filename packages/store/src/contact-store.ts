@@ -783,6 +783,21 @@ export class ContactStore {
     return row === undefined ? undefined : this.getContact(string(row["contact_id"]));
   }
 
+  findIdentitiesByValue(identityValue: string, limitValue = 20): readonly ContactIdentityRecord[] {
+    this.#assertOpen();
+    const limit = boundedInteger(limitValue, 1, 20, "Contact identity match limit");
+    const normalizedValues = [...new Set([
+      normalizeContactIdentityValue(identityValue),
+      normalizeContactIdentityValue(identityValue, "phone")
+    ])];
+    const placeholders = normalizedValues.map(() => "?").join(", ");
+    return (this.#database.prepare(`
+      SELECT * FROM contact_identities
+      WHERE normalized_value IN (${placeholders})
+      ORDER BY created_at, id LIMIT ?
+    `).all(...normalizedValues, limit) as Row[]).map(contactIdentityFromRow);
+  }
+
   #initialize(): void {
     const marker = this.#database.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'contact_schema_version'

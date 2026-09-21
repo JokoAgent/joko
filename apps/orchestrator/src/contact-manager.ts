@@ -90,6 +90,25 @@ export interface ContactVCardExport {
   readonly suggestedFileName: string;
 }
 
+export interface ContactAgentCreateResult {
+  readonly merged: boolean;
+  readonly contact?: ContactProfileRecord;
+  readonly candidates: readonly ContactDuplicateCandidate[];
+  readonly mergedContactId?: string;
+}
+
+export interface ContactGroupMembershipInput {
+  readonly contactId: string;
+  readonly expectedRevision: bigint;
+}
+
+export interface ContactGroupMembershipResult {
+  readonly group: ContactGroupRecord;
+  readonly contacts: readonly ContactProfileRecord[];
+  readonly added: number;
+  readonly removed: number;
+}
+
 export type ContactManagerErrorCode =
   | "CONTACT_IMPORT_INVALID"
   | "CONTACT_IMPORT_EXPIRED"
@@ -128,9 +147,58 @@ export class ContactManager {
   }
   list(options: ContactListOptions): ContactListResult { return this.store.listContacts(options); }
   get(contactId: string): ContactProfileRecord { return this.store.getContact(contactId); }
+  resolveIdentity(platform: string, value: string): ContactProfileRecord | undefined {
+    return this.store.findContactByIdentity(platform, value);
+  }
+  resolveIdentities(value: string, limit: number) {
+    return this.store.findIdentitiesByValue(value, limit);
+  }
   findSimilar(contact: ContactDraft): readonly ContactDuplicateCandidate[] { return this.store.findSimilar(contact); }
   create(input: ContactDraft & { readonly expectedDirectoryRevision: bigint; readonly confirmedNameCandidateIds?: readonly string[] }) {
     return this.store.createContact(input);
+  }
+  createOrEnrichFromAgent(input: Omit<ContactDraft, "source"> & {
+    readonly expectedDirectoryRevision: bigint;
+    readonly allowDuplicate?: boolean;
+  }): ContactAgentCreateResult {
+    return this.store.runInTransaction(() => {
+      const directory = this.store.directoryState();
+      if (directory.revision !== input.expectedDirectoryRevision) {
+        throw new ContactStoreError("CONTACT_DIRECTORY_CHANGED", "The Contacts directory changed; read it again and retry.");
+      }
+      const {
+        expectedDirectoryRevision: _expectedDirectoryRevision,
+        allowDuplicate: _allowDuplicate,
+        ...contact
+      } = input;
+      const draft: ContactDraft = { ...contact, source: "agent" };
+      const candidates = this.store.findSimilar(draft);
+      const exact = candidates.find((candidate) => candidate.matchType === "identity");
+      if (exact !== undefined) {
+        return {
+          merged: true,
+          contact: this.#enrich(exact.contactId, draft),
+          candidates,
+          mergedContactId: exact.contactId
+        };
+      }
+      const names = candidates.filter((candidate) => candidate.matchType === "name");
+      if (names.length > 100) {
+        throw new ContactStoreError("CONTACT_INVALID", "Too many similar contacts require review; refine the contact before creating it.");
+      }
+      const created = this.store.createContact({
+        ...draft,
+        expectedDirectoryRevision: directory.revision,
+        confirmedNameCandidateIds: input.allowDuplicate === true
+          ? names.map((candidate) => candidate.contactId)
+          : []
+      });
+      return {
+        merged: false,
+        ...(created.contact === undefined ? {} : { contact: created.contact }),
+        candidates: created.candidates
+      };
+    });
   }
   update(contactId: string, expectedRevision: bigint, patch: ContactPatch): ContactProfileRecord {
     return this.store.updateContact(contactId, expectedRevision, patch);
@@ -161,6 +229,43 @@ export class ContactManager {
   deleteGroup(groupId: string, expectedRevision: bigint): boolean { return this.store.deleteGroup(groupId, expectedRevision); }
   setGroupMembership(contactId: string, expectedRevision: bigint, groupId: string, member: boolean): ContactProfileRecord {
     return this.store.setGroupMembership(contactId, expectedRevision, groupId, member);
+  }
+  setGroupMembers(input: {
+    readonly groupId: string;
+    readonly expectedGroupRevision: bigint;
+    readonly add: readonly ContactGroupMembershipInput[];
+    readonly remove: readonly ContactGroupMembershipInput[];
+  }): ContactGroupMembershipResult {
+    return this.store.runInTransaction(() => {
+      if (input.add.length + input.remove.length === 0 || input.add.length + input.remove.length > 200) {
+        throw new ContactStoreError("CONTACT_INVALID", "A group membership change must contain between 1 and 200 contacts.");
+      }
+      const ids = [...input.add, ...input.remove].map((entry) => entry.contactId);
+      if (new Set(ids).size !== ids.length) {
+        throw new ContactStoreError("CONTACT_INVALID", "A contact cannot be added and removed in the same group change.");
+      }
+      const group = this.store.listGroups().find((entry) => entry.id === input.groupId);
+      if (group === undefined) throw new ContactStoreError("CONTACT_NOT_FOUND", "The contact group does not exist.");
+      if (group.revision !== input.expectedGroupRevision) {
+        throw new ContactStoreError("CONTACT_CHANGED", "The contact group changed; read it again and retry.");
+      }
+      const contacts: ContactProfileRecord[] = [];
+      let added = 0;
+      let removed = 0;
+      for (const entry of input.add) {
+        const before = this.store.getContact(entry.contactId);
+        contacts.push(this.store.setGroupMembership(entry.contactId, entry.expectedRevision, input.groupId, true));
+        if (!before.groups.some((candidate) => candidate.id === input.groupId)) added += 1;
+      }
+      for (const entry of input.remove) {
+        const before = this.store.getContact(entry.contactId);
+        contacts.push(this.store.setGroupMembership(entry.contactId, entry.expectedRevision, input.groupId, false));
+        if (before.groups.some((candidate) => candidate.id === input.groupId)) removed += 1;
+      }
+      const updated = this.store.listGroups().find((entry) => entry.id === input.groupId);
+      if (updated === undefined) throw new ContactStoreError("CONTACT_NOT_FOUND", "The contact group does not exist.");
+      return { group: updated, contacts, added, removed };
+    });
   }
   addRelation(input: Parameters<ContactStore["addRelation"]>[0]): ContactProfileRecord { return this.store.addRelation(input); }
   updateRelation(input: Parameters<ContactStore["updateRelation"]>[0]): ContactProfileRecord { return this.store.updateRelation(input); }
@@ -229,6 +334,15 @@ export class ContactManager {
       expiresAt: now + PREVIEW_LIFETIME_MS
     });
     this.#previews.set(preview.previewId, preview);
+    return preview;
+  }
+
+  readVCardImportPreview(previewId: string): ContactVCardImportPreview {
+    this.#prunePreviews();
+    const preview = this.#previews.get(previewId);
+    if (preview === undefined) {
+      throw new ContactManagerError("CONTACT_IMPORT_EXPIRED", "The vCard import preview expired. Preview the file again.");
+    }
     return preview;
   }
 

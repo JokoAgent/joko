@@ -163,6 +163,7 @@ import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
 import { ContactManager } from "./contact-manager.js";
+import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -725,6 +726,9 @@ export async function createOrchestratorApplication(
       host: () => sessionHostForHelperTools,
       messageSearch: () => messageSearchForHelperTools
     })
+  );
+  const unregisterContactTools = mcpRouter.registerBridgeToolProvider(
+    new ContactToolBridgeProvider({ store, contacts })
   );
   const unregisterRemoteHostTools = mcpRouter.registerBridgeToolProvider(
     new RemoteHostToolBridgeProvider({ store, registry: remoteHosts, outputRedactor: credentials })
@@ -2015,6 +2019,7 @@ export async function createOrchestratorApplication(
     unregisterAndroidBridge?.();
     unregisterImageGenerationBridge();
     unregisterSessionHelperTools();
+    unregisterContactTools();
     unregisterLspBridge();
     unregisterRemoteHostTools();
     lspBridge.dispose();
@@ -2174,6 +2179,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterAndroidBridge?.());
         await attempt(() => unregisterImageGenerationBridge());
         await attempt(() => unregisterSessionHelperTools());
+        await attempt(() => unregisterContactTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => lspBridge.dispose());

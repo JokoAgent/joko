@@ -221,6 +221,18 @@ describe("Orchestrator application composition", () => {
       "github-copilot"
     ]));
     expect(application.mcpRouter?.list()).toEqual([]);
+    expect(application.mcpRouter?.toolPolicyDeclarations()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "joko-contacts-tools", productDefaultEnabled: true })
+    ]));
+    const contactBridgeTools = application.mcpRouter?.createPiBridgeSnapshot({
+      endpoint: "http://127.0.0.1:4317/internal/mcp",
+      targetId: "workspace-test"
+    }).mcpBridge.tools.filter((tool) => tool.serverId === "joko_contacts");
+    expect(contactBridgeTools?.map((tool) => ({ name: tool.name, permission: tool.requiresPermission }))).toEqual([
+      { name: "call_sensitive_tool", permission: true },
+      { name: "call_tool", permission: false },
+      { name: "list_tools", permission: false }
+    ]);
     expect(application.piResources?.list()).toEqual([]);
     expect(application.skillMarket?.snapshot()).toEqual({ revision: 0n, sources: [], recoveredFromCorruption: false });
     expect(application.skillMarketSync?.listPolicies()).toEqual([]);

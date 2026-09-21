@@ -108,6 +108,9 @@ describe("current-v1 Contacts store", () => {
     }), "CONTACT_IDENTITY_CONFLICT", alice.id);
     expect(store.directoryState().revision).toBe(revisionBeforeConflict);
     expect(store.findContactByIdentity("github", "@ALICE")?.id).toBe(alice.id);
+    expect(store.findIdentitiesByValue("@ALICE")).toEqual([
+      expect.objectContaining({ contactId: alice.id, platform: "github", normalizedValue: "alice" })
+    ]);
 
     const candidates = store.findSimilar({
       kind: "person",
