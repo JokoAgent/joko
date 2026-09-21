@@ -2792,6 +2792,96 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.status).toBe("connected");
   });
 
+  it("renames only the current authoritative mobile device with a body-free durable receipt", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.ACCEPTED,
+      mutation
+    }));
+    vi.mocked(network.waitOperation).mockImplementationOnce(async (_credential, operationId) => create(OperationSchema, {
+      operationId,
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED,
+      result: { payload: { case: "device", value: create(DeviceSchema, {
+        ...device,
+        displayName: "Field phone",
+        version: create(EntityVersionSchema, { revision: create(RevisionSchema, { value: 6n }) })
+      }) } }
+    }));
+
+    expect(await app.renameCurrentDevice(credential.deviceId, "  Field phone  ")).toBe(true);
+
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { kind: EntityKind.DEVICE, id: credential.deviceId }, expectedRevision: { value: 5n } }],
+      payload: { case: "renameDevice", value: { deviceId: credential.deviceId, displayName: "Field phone" } }
+    });
+    expect(saved.pending()).toEqual([]);
+    expect(network.waitOperation).toHaveBeenCalledWith(credential, "operation-1", expect.any(AbortSignal));
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+    await expect(app.renameCurrentDevice(otherCredential.deviceId, "Other phone")).rejects.toThrow(/Only the device/);
+    await expect(app.renameCurrentDevice(credential.deviceId, " ")).rejects.toThrow(/between 1 and 128/);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retains an unknown current-device rename receipt without its display name and reconciles it without replay", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("reply lost"));
+
+    expect(await app.renameCurrentDevice(credential.deviceId, "Private phone label")).toBe(false);
+
+    expect(saved.pending()).toMatchObject([{
+      operationId: "operation-1",
+      kind: "device-rename",
+      targetDeviceId: credential.deviceId,
+      state: "unknown"
+    }]);
+    expect(JSON.stringify(saved.pending())).not.toContain("Private phone label");
+    expect(network.submit).toHaveBeenCalledOnce();
+    vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "operation-1",
+      connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED
+    }));
+
+    await app.reconcile();
+
+    expect(saved.pending()).toEqual([]);
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails current-device rename closed for ambiguous owner identity or a missing Device revision", async () => {
+    const ambiguous = projectedNetwork(create(SnapshotSchema, {
+      ...snapshot,
+      connections: [connection, create(ConnectionSchema, { ...connection })]
+    }));
+    const ambiguousApp = client(ambiguous, memoryStorage(credential).storage);
+    await ambiguousApp.start();
+    expect(ambiguousApp.state.status).toBe("connected");
+    await expect(ambiguousApp.renameCurrentDevice(credential.deviceId, "Renamed"))
+      .rejects.toThrow(/exact current profile, connection, mobile device, server/);
+    expect(ambiguous.submit).not.toHaveBeenCalled();
+
+    const noRevision = projectedNetwork(create(SnapshotSchema, {
+      ...snapshot,
+      devices: [create(DeviceSchema, { ...device, version: undefined })]
+    }));
+    const noRevisionApp = client(noRevision, memoryStorage(credential).storage);
+    await noRevisionApp.start();
+    expect(noRevisionApp.state.status).toBe("connected");
+    await expect(noRevisionApp.renameCurrentDevice(credential.deviceId, "Renamed"))
+      .rejects.toThrow(/Device revision/);
+    expect(noRevision.submit).not.toHaveBeenCalled();
+  });
+
   it("admits only one user mutation while its receipt is being persisted", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);

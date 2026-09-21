@@ -1,0 +1,380 @@
+// @vitest-environment jsdom
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { create } from "@bufbuild/protobuf";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ConnectionSchema,
+  ConnectionState,
+  DeviceKind,
+  DevicePresenceState,
+  DeviceSchema,
+  SnapshotSchema
+} from "@joko/contracts";
+import { emptyMobileAutomationsState } from "./mobile-automation";
+import type { MobileState, SavedMobileConnection } from "./mobile-client";
+import { emptyMobileFilesState } from "./workspace-files";
+import {
+  MobileSettingsScreen,
+  resolveMobileSettingsCurrentDevice,
+  type MobileSettingsClient,
+  type MobileSettingsColors
+} from "./MobileSettingsScreen";
+import type { MobileThemePreferenceState } from "./mobile-theme-preference";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const native = vi.hoisted(() => ({
+  alert: vi.fn(),
+  copied: vi.fn(async (_value: string) => undefined),
+  hardwareBack: undefined as (() => boolean) | undefined
+}));
+
+vi.mock("react-native", async () => {
+  const React = await import("react");
+  const element = (tag: string) => ({ accessibilityLabel, accessibilityRole, accessibilityState, onPress, disabled,
+    selectable: _selectable, contentContainerStyle: _contentContainerStyle, keyboardShouldPersistTaps: _keyboardShouldPersistTaps,
+    accessibilityLiveRegion: _accessibilityLiveRegion, ...props }: Record<string, unknown> & {
+      children?: React.ReactNode;
+      accessibilityLabel?: string;
+      accessibilityRole?: string;
+      accessibilityState?: { selected?: boolean; disabled?: boolean };
+      onPress?: () => void;
+      disabled?: boolean;
+      selectable?: boolean;
+      contentContainerStyle?: unknown;
+      keyboardShouldPersistTaps?: unknown;
+      accessibilityLiveRegion?: unknown;
+    }) => React.createElement(tag, {
+      ...props,
+      ...(accessibilityLabel ? { "aria-label": accessibilityLabel } : {}),
+      ...(accessibilityRole ? { role: accessibilityRole } : {}),
+      ...(accessibilityState?.selected === undefined ? {} : { "aria-checked": accessibilityState.selected }),
+      ...(accessibilityState?.disabled === undefined ? {} : { "aria-disabled": accessibilityState.disabled }),
+      ...(onPress ? { onClick: onPress } : {}),
+      ...(disabled ? { disabled: true } : {}),
+      style: undefined
+    }, props.children);
+  return {
+    Alert: { alert: native.alert },
+    BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
+      native.hardwareBack = handler;
+      return { remove: () => { if (native.hardwareBack === handler) native.hardwareBack = undefined; } };
+    } },
+    Platform: { OS: "android" },
+    Pressable: element("button"),
+    ScrollView: element("div"),
+    StyleSheet: { create: <T,>(value: T) => value },
+    Text: element("span"),
+    TextInput: ({ accessibilityLabel, value, onChangeText, editable = true, ...props }: {
+      accessibilityLabel?: string;
+      value?: string;
+      onChangeText?: (value: string) => void;
+      editable?: boolean;
+    }) => React.createElement("input", {
+      ...props,
+      "aria-label": accessibilityLabel,
+      value,
+      disabled: !editable,
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) => onChangeText?.(event.target.value),
+      style: undefined
+    }),
+    View: element("div")
+  };
+});
+
+vi.mock("expo-clipboard", () => ({ setStringAsync: native.copied }));
+vi.mock("expo-constants", () => ({ default: { expoConfig: { version: "0.1.0-test" } } }));
+
+const colors: MobileSettingsColors = {
+  background: "#fafafa",
+  surface: "#fff",
+  ink: "#111",
+  muted: "#666",
+  border: "#ddd",
+  accent: "#f90",
+  negative: "#b00",
+  brandBackground: "#fff0d0"
+};
+
+const profile: SavedMobileConnection = {
+  profileId: "profile-current",
+  origin: "http://192.168.1.20:4318",
+  serverId: "node-current",
+  connectionId: "connection-current",
+  deviceId: "device-current",
+  displayName: "Field phone",
+  automatic: false,
+  credentialState: "available",
+  pendingOperations: []
+};
+
+const connection = create(ConnectionSchema, {
+  connectionId: profile.connectionId,
+  connectionProfileId: profile.profileId,
+  deviceId: profile.deviceId,
+  state: ConnectionState.CONNECTED,
+  version: { revision: { value: 4n } }
+});
+
+const device = create(DeviceSchema, {
+  deviceId: profile.deviceId,
+  displayName: "Field phone",
+  kind: DeviceKind.MOBILE,
+  platform: "android",
+  appVersion: "0.1.0",
+  connectionIds: [profile.connectionId],
+  presence: DevicePresenceState.ONLINE,
+  version: { revision: { value: 5n } }
+});
+
+function mobileState(patch: Partial<MobileState> = {}): MobileState {
+  return {
+    status: "connected",
+    busy: false,
+    node: {
+      serverId: profile.serverId,
+      displayName: "Joko studio",
+      version: "1.4.0",
+      apiVersion: "joko.v1",
+      health: 1,
+      pairingEnabled: true
+    },
+    origin: profile.origin,
+    saved: [profile],
+    activeProfileId: profile.profileId,
+    connectionMode: "saved",
+    discoveryState: "idle",
+    nearby: [],
+    owner: create(SnapshotSchema, {
+      snapshotId: "owner-current",
+      generation: 1n,
+      server: {
+        serverId: profile.serverId,
+        displayName: "Joko studio",
+        version: "1.4.0",
+        apiVersion: "joko.v1",
+        health: 1,
+        pairingEnabled: true
+      },
+      connections: [connection],
+      devices: [device]
+    }),
+    older: [],
+    live: [],
+    liveStatus: "streaming",
+    historyBusy: false,
+    historyEnd: false,
+    pending: [],
+    homeSearchQuery: "",
+    homeSearchFilter: "active",
+    homeSearchStatus: "idle",
+    homeSearchSessionIds: [],
+    files: emptyMobileFilesState(),
+    automations: emptyMobileAutomationsState(),
+    ...patch
+  };
+}
+
+function mobileClient(patch: Partial<MobileSettingsClient> = {}): MobileSettingsClient {
+  return {
+    renameCurrentDevice: vi.fn(async () => true),
+    reconcile: vi.fn(async () => undefined),
+    dismissUnconfirmed: vi.fn(async () => undefined),
+    ...patch
+  };
+}
+
+const readyTheme: MobileThemePreferenceState = { status: "ready", preference: "system", saving: false };
+
+let root: Root | undefined;
+
+afterEach(() => {
+  act(() => root?.unmount());
+  root = undefined;
+  native.alert.mockReset();
+  native.copied.mockClear();
+  native.hardwareBack = undefined;
+});
+
+function mount(options: {
+  state?: MobileState;
+  foreground?: boolean;
+  theme?: MobileThemePreferenceState;
+  client?: MobileSettingsClient;
+} = {}) {
+  const container = document.createElement("div");
+  const client = options.client ?? mobileClient();
+  const onThemeChange = vi.fn(async () => undefined);
+  const onBack = vi.fn();
+  const onConnections = vi.fn();
+  const onDevices = vi.fn();
+  let state = options.state ?? mobileState();
+  let foreground = options.foreground ?? true;
+  let theme = options.theme ?? readyTheme;
+  const render = () => createElement(MobileSettingsScreen, {
+    colors,
+    state,
+    foreground,
+    theme,
+    client,
+    onThemeChange,
+    onBack,
+    onConnections,
+    onDevices,
+    appVersion: "0.1.0-test"
+  });
+  root = createRoot(container);
+  act(() => root!.render(render()));
+  return {
+    container,
+    client,
+    onThemeChange,
+    onBack,
+    onConnections,
+    onDevices,
+    rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState }) => {
+      state = next.state ?? state;
+      foreground = next.foreground ?? foreground;
+      theme = next.theme ?? theme;
+      act(() => root!.render(render()));
+    }
+  };
+}
+
+function button(container: HTMLElement, label: string): HTMLButtonElement {
+  const match = container.querySelector(`button[aria-label="${label}"]`);
+  if (!(match instanceof HTMLButtonElement)) throw new Error(`Missing button ${label}`);
+  return match;
+}
+
+function input(container: HTMLElement, label: string): HTMLInputElement {
+  const match = container.querySelector(`input[aria-label="${label}"]`);
+  if (!(match instanceof HTMLInputElement)) throw new Error(`Missing input ${label}`);
+  return match;
+}
+
+function changeInput(element: HTMLInputElement, value: string): void {
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(element, value);
+  element.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
+
+describe("MobileSettingsScreen", () => {
+  it("renders exact node/device/about identity, changes theme, copies ID, and navigates", async () => {
+    const mounted = mount();
+
+    expect(mounted.container.textContent).toContain("Joko studio");
+    expect(mounted.container.textContent).toContain("Field phone");
+    expect(mounted.container.textContent).toContain(profile.deviceId);
+    expect(mounted.container.textContent).toContain("1.4.0");
+    expect(mounted.container.textContent).toContain("joko.v1");
+    expect(mounted.container.textContent).toContain("0.1.0-test");
+
+    await act(async () => button(mounted.container, "Dark appearance").click());
+    expect(mounted.onThemeChange).toHaveBeenCalledWith("dark");
+    act(() => button(mounted.container, "Connection settings").click());
+    act(() => button(mounted.container, "All devices").click());
+    act(() => button(mounted.container, "Back to joko").click());
+    expect(mounted.onConnections).toHaveBeenCalledTimes(1);
+    expect(mounted.onDevices).toHaveBeenCalledTimes(1);
+    expect(mounted.onBack).toHaveBeenCalledTimes(1);
+
+    await act(async () => button(mounted.container, "Copy device ID").click());
+    expect(native.copied).toHaveBeenCalledWith(profile.deviceId);
+    expect(mounted.container.textContent).toContain("Device ID copied.");
+  });
+
+  it("keeps offline and background identity visible while device mutations and receipts are read-only", () => {
+    const pending = {
+      operationId: "operation-rename",
+      connectionId: profile.connectionId,
+      kind: "device-rename" as const,
+      targetDeviceId: profile.deviceId,
+      state: "unknown" as const
+    };
+    const mounted = mount({ state: mobileState({ status: "offline", pending: [pending], offlineSnapshotAt: 1_000 }) });
+
+    expect(mounted.container.textContent).toContain("Showing the last verified device identity");
+    expect(button(mounted.container, "Rename this phone").disabled).toBe(true);
+    expect(button(mounted.container, "Check status").disabled).toBe(true);
+    expect(button(mounted.container, "Verify and clear").disabled).toBe(true);
+
+    mounted.rerender({ state: mobileState(), foreground: false });
+    expect(mounted.container.textContent).toContain("Background · read-only");
+    expect(button(mounted.container, "Rename this phone").disabled).toBe(true);
+  });
+
+  it("protects a dirty rename draft and blocks closing or duplicate saves while one request is in flight", async () => {
+    const flight = deferred<boolean>();
+    const client = mobileClient({ renameCurrentDevice: vi.fn(() => flight.promise) });
+    const mounted = mount({ client });
+    act(() => button(mounted.container, "Rename this phone").click());
+    act(() => changeInput(input(mounted.container, "Device name"), "  Field phone two  "));
+
+    act(() => button(mounted.container, "Back to settings").click());
+    expect(native.alert).toHaveBeenCalledWith(
+      "Discard device name changes?",
+      expect.stringContaining("not been saved"),
+      expect.any(Array)
+    );
+    expect(input(mounted.container, "Device name").value).toBe("  Field phone two  ");
+
+    await act(async () => button(mounted.container, "Save name").click());
+    expect(client.renameCurrentDevice).toHaveBeenCalledWith(profile.deviceId, "Field phone two");
+    expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
+    expect(button(mounted.container, "Back to settings").disabled).toBe(true);
+    expect(input(mounted.container, "Device name").disabled).toBe(true);
+    expect(native.hardwareBack?.()).toBe(true);
+    expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
+
+    await act(async () => flight.resolve(true));
+    expect(mounted.container.textContent).toContain("Device name saved.");
+    expect(mounted.container.querySelector('input[aria-label="Device name"]')).toBeNull();
+  });
+
+  it("retains the draft for an unknown result without replay and retires it when ownership changes", async () => {
+    const client = mobileClient({ renameCurrentDevice: vi.fn(async () => false) });
+    const mounted = mount({ client });
+    act(() => button(mounted.container, "Rename this phone").click());
+    act(() => changeInput(input(mounted.container, "Device name"), "Private phone"));
+    await act(async () => button(mounted.container, "Save name").click());
+
+    expect(mounted.container.textContent).toContain("operation receipt was retained");
+    expect(input(mounted.container, "Device name").value).toBe("Private phone");
+    expect(button(mounted.container, "Save name").disabled).toBe(true);
+    act(() => button(mounted.container, "Save name").click());
+    expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
+
+    mounted.rerender({ state: mobileState({ activeProfileId: "another-profile" }) });
+    expect(mounted.container.querySelector('input[aria-label="Device name"]')).toBeNull();
+    expect(mounted.container.textContent).toContain("unfinished device-name draft was retired");
+    expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires one exact active profile, connection, and current mobile device", () => {
+    expect(resolveMobileSettingsCurrentDevice(mobileState())?.device.deviceId).toBe(profile.deviceId);
+    expect(resolveMobileSettingsCurrentDevice(mobileState({ saved: [profile, profile] }))).toBeUndefined();
+    expect(resolveMobileSettingsCurrentDevice(mobileState({ owner: create(SnapshotSchema, {
+      server: { serverId: profile.serverId, apiVersion: "joko.v1" },
+      connections: [connection],
+      devices: [create(DeviceSchema, { ...device, kind: DeviceKind.DESKTOP })]
+    }) }))).toBeUndefined();
+    expect(resolveMobileSettingsCurrentDevice(mobileState({ node: {
+      ...mobileState().node!, serverId: "different-node"
+    } }))).toBeUndefined();
+
+    const withoutRevision = mobileState({ owner: create(SnapshotSchema, {
+      server: { serverId: profile.serverId, apiVersion: "joko.v1" },
+      connections: [connection],
+      devices: [create(DeviceSchema, { ...device, version: undefined })]
+    }) });
+    const mounted = mount({ state: withoutRevision });
+    expect(button(mounted.container, "Rename this phone").disabled).toBe(true);
+  });
+});

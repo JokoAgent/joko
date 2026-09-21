@@ -17,7 +17,7 @@ export interface MobileConnectionIndex {
 export interface PendingOperation {
   readonly operationId: string;
   readonly connectionId: string;
-  readonly kind: "create" | "send" | "logout" | "revoke" | "rename" | "pin" | "archive" | "delete"
+  readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
@@ -389,7 +389,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
-    || !["create", "send", "logout", "revoke", "rename", "pin", "archive", "delete", "message-delete",
+    || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
       "session-branch", "session-shell", "session-reset", "session-review", "schedule-run", "schedule-enable",
@@ -410,7 +410,12 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.triggerId !== undefined && !validReceiptIdentity(record.triggerId)) return false;
   if (record.targetId !== undefined && !validReceiptIdentity(record.targetId)) return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
-  if (record.kind === "revoke" && typeof record.targetDeviceId !== "string") return false;
+  if (["revoke", "device-rename"].includes(String(record.kind)) && typeof record.targetDeviceId !== "string") return false;
+  if (record.kind === "device-rename" && (record.sessionId !== undefined || record.eventId !== undefined
+    || record.queueItemId !== undefined || record.interactionId !== undefined
+    || record.interactionGeneration !== undefined || record.interactionRevision !== undefined
+    || record.interactionDraftKind !== undefined || record.targetConnectionId !== undefined
+    || record.scheduleId !== undefined || record.triggerId !== undefined || record.targetId !== undefined)) return false;
   if (record.kind === "send" && typeof record.sessionId !== "string") return false;
   if (["rename", "pin", "archive", "delete"].includes(String(record.kind)) && typeof record.sessionId !== "string") return false;
   if (record.kind === "message-delete" && (typeof record.sessionId !== "string" || typeof record.eventId !== "string")) return false;

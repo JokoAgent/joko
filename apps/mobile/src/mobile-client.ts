@@ -12,7 +12,7 @@ import {
   OperationPreconditionSchema, OperationState, OperationMutationSchema,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
-  RevisionSchema, RevokeDeviceMutationSchema,
+  RenameDeviceMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
   ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
@@ -4100,6 +4100,60 @@ export class MobileClient {
           reason: "Revoked from Joko mobile"
         }) }
       }), { kind: "revoke", targetDeviceId: deviceId });
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async renameCurrentDevice(deviceId: string, displayName: string): Promise<boolean> {
+    const credential = this.#ready();
+    const value = displayName.trim();
+    if (!value || value.length > 128) throw new Error("Use a device name between 1 and 128 characters.");
+    if (deviceId !== credential.deviceId) throw new Error("Only the device authorizing this mobile connection can be renamed here.");
+    const profiles = this.#profiles.filter((candidate) => candidate.profileId === this.#activeProfileId);
+    const profile = profiles.length === 1 ? profiles[0] : undefined;
+    const owner = this.#state.owner;
+    const connections = owner?.connections.filter((candidate) => candidate.connectionId === credential.connectionId) ?? [];
+    const devices = owner?.devices.filter((candidate) => candidate.deviceId === deviceId) ?? [];
+    const connection = connections.length === 1 ? connections[0] : undefined;
+    const device = devices.length === 1 ? devices[0] : undefined;
+    const revision = device?.version?.revision;
+    if (!profile || !credentialMatchesProfile(credential, profile)
+      || this.#activeProfileId !== credential.profileId || this.#state.activeProfileId !== credential.profileId
+      || this.#state.origin !== credential.origin || this.#state.node?.serverId !== credential.serverId
+      || owner?.server?.serverId !== credential.serverId || owner.server.apiVersion !== this.#state.node.apiVersion
+      || !connection || connection.connectionProfileId !== credential.profileId
+      || connection.deviceId !== credential.deviceId || connection.state !== ConnectionState.CONNECTED
+      || !device || device.revoked || device.kind !== DeviceKind.MOBILE
+      || !device.connectionIds.includes(credential.connectionId)
+      || !revision || revision.value < 1n) {
+      throw new Error("The exact current profile, connection, mobile device, server, and Device revision are required.");
+    }
+    if (this.#state.pending.some((item) => item.kind === "device-rename" && item.targetDeviceId === deviceId)) {
+      throw new Error("A previous change to this device still has an unresolved result.");
+    }
+    if (device.displayName === value) return true;
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, {
+          entity: create(EntityRefSchema, { kind: EntityKind.DEVICE, id: deviceId }),
+          expectedRevision: revision
+        })],
+        payload: { case: "renameDevice", value: create(RenameDeviceMutationSchema, {
+          deviceId,
+          displayName: value
+        }) }
+      }), { kind: "device-rename", targetDeviceId: deviceId });
+      if (!result.definitive) return false;
+      if (!result.accepted) {
+        throw new Error(result.operation?.error?.message || "The device rename was rejected.");
+      }
+      if (result.operation?.state !== OperationState.SUCCEEDED
+        || result.operation.result?.payload.case !== "device"
+        || result.operation.result.payload.value.deviceId !== deviceId
+        || result.operation.result.payload.value.displayName !== value) {
+        throw new Error("The Joko node completed the device rename without the expected Device result.");
+      }
+      return true;
     } finally { this.#releaseMutation(action); }
   }
 
@@ -8614,7 +8668,7 @@ export class MobileClient {
             return;
           }
           if (operation.state === OperationState.SUCCEEDED
-            && ["rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
+            && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
               "session-shell", "session-reset", "session-review"].includes(pending.kind)

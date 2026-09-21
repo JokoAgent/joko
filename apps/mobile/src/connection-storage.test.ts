@@ -324,6 +324,31 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
 
+  it("round-trips a body-free current-device rename receipt", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipt = {
+      operationId: "device-rename",
+      connectionId: first.connectionId,
+      kind: "device-rename" as const,
+      targetDeviceId: first.deviceId,
+      state: "unknown" as const
+    };
+
+    await storage.savePending([receipt]);
+
+    await expect(storage.loadPending()).resolves.toEqual([receipt]);
+    expect(memory.plainValues.get("joko.mobile.pending.v1")).not.toContain("New phone name");
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      receipt,
+      { operationId: "missing-device", connectionId: first.connectionId, kind: "device-rename", state: "unknown" },
+      { ...receipt, operationId: "unexpected-session", sessionId: "session-one" },
+      { ...receipt, operationId: "unexpected-target", targetId: "target-one" },
+      { ...receipt, operationId: "unexpected-interaction", interactionId: "interaction-one" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual([receipt]);
+  });
+
   it("round-trips body-free Automation receipts only with exact Schedule and trigger identities", async () => {
     const memory = drivers();
     const storage = createMobileStorage(memory.plain, memory.secure);

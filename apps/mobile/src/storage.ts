@@ -9,6 +9,7 @@ import { MobileAttachmentFiles } from "./mobile-attachment-files";
 import { MobileAttachmentCamera } from "./mobile-attachment-camera";
 import { MobilePhotoLibrary } from "./mobile-photo-library";
 import { MobileOfflineCache } from "./mobile-offline-cache";
+import { MobileThemePreferenceStore } from "./mobile-theme-preference";
 
 const plainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
@@ -25,6 +26,7 @@ export const mobileAttachmentFiles = new MobileAttachmentFiles();
 export const mobileAttachmentCamera = new MobileAttachmentCamera(mobileAttachmentFiles);
 export const mobilePhotoLibrary = new MobilePhotoLibrary(mobileAttachmentFiles);
 export const mobileOfflineCache = new MobileOfflineCache(plainStorage, Date.now, randomUUID);
+export const mobileThemePreferences = new MobileThemePreferenceStore(plainStorage);
 
 export const mobileStorage = createMobileStorage(
   plainStorage,

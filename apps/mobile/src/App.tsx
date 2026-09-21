@@ -37,7 +37,8 @@ import {
   mobileInteractionDrafts,
   mobileNewTaskDrafts,
   mobileOfflineCache,
-  mobileStorage
+  mobileStorage,
+  mobileThemePreferences
 } from "./storage";
 import {
   mobileComposerDraftIdentityKey,
@@ -205,6 +206,8 @@ import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-sha
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
+import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import { resolveMobileDarkTheme } from "./mobile-theme-preference";
 import {
   commitMobileIncomingShare,
   mobileIncomingShare,
@@ -233,7 +236,7 @@ const client = new MobileClient(
 );
 const runtimeCommandCatalogCache = new MobileRuntimeCommandCatalogCache();
 const mobileComposerImagePaste = new MobileComposerImagePaste(mobileAttachmentFiles);
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "connections" | "devices" | "device";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "settings" | "connections" | "devices" | "device";
 
 interface MobilePhotoLibraryLease {
   readonly controls: MobileAttachmentControls;
@@ -443,6 +446,10 @@ async function performMobileImageOutput(
 
 export function App() {
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
+  const theme = useSyncExternalStore(
+    (listener) => mobileThemePreferences.subscribe(listener),
+    () => mobileThemePreferences.snapshot
+  );
   const incomingShare = useSyncExternalStore(
     (listener) => mobileIncomingShare.subscribe(listener),
     () => mobileIncomingShare.snapshot
@@ -453,12 +460,13 @@ export function App() {
   const [homeSearchFocusRequest, setHomeSearchFocusRequest] = useState(0);
   const [focusTaskComposer, setFocusTaskComposer] = useState(false);
   const [deviceId, setDeviceId] = useState<string>();
+  const [foreground, setForeground] = useState(AppState.currentState === "active");
   const homeMenuButtonRef = useRef<View>(null);
   const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
   const openedIncomingShareRef = useRef<string | undefined>(undefined);
   const retiredIncomingShareRef = useRef<string | undefined>(undefined);
   const scheme = useColorScheme();
-  const dark = scheme === "dark";
+  const dark = resolveMobileDarkTheme(theme.preference, scheme);
   const colors = useMemo(() => ({
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
@@ -467,6 +475,7 @@ export function App() {
   }), [dark]);
 
   useEffect(() => {
+    void mobileThemePreferences.hydrate();
     void mobileImageOutput.maintain().catch(() => undefined);
     void mobileFileShare.maintain().catch(() => undefined);
     void mobileIncomingShare.refresh().catch(() => undefined);
@@ -474,6 +483,7 @@ export function App() {
     void client.start();
     const subscription = AppState.addEventListener("change", (status) => {
       const foreground = status === "active";
+      setForeground(foreground);
       client.setForeground(foreground);
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
       if (!foreground) {
@@ -554,7 +564,7 @@ export function App() {
         <StatusBar style={dark ? "light" : "dark"} />
         <View style={styles.fill} accessibilityElementsHidden={homeDrawerMounted}
           importantForAccessibility={homeDrawerMounted ? "no-hide-descendants" : "auto"}>
-          {state.status === "starting" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
+          {state.status === "starting" || theme.status === "loading" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
             <StartupLoading colors={colors} dark={dark} />
           </SafeAreaView> :
             connectionRequired || page === "connection" ? <ConnectionScreen {...common} dark={dark}
@@ -572,6 +582,10 @@ export function App() {
                   }} /> :
                 page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
+                page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
+                  theme={theme} client={client} onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
+                  onBack={() => setPage("home")} onConnections={() => setPage("connections")}
+                  onDevices={() => setPage("devices")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
                   onSwitch={() => setPage("connection")} /> :
                 page === "devices" ? <DevicesScreen {...common} onBack={() => setPage("home")}
@@ -593,7 +607,7 @@ export function App() {
           onSearch={() => queueHomeMenuAction(() => setHomeSearchFocusRequest((value) => value + 1))}
           onAutomations={() => queueHomeMenuAction(() => setPage("automations"))}
           onSwitch={() => queueHomeMenuAction(() => { client.setConnectionMode("saved"); setPage("connection"); })}
-          onConnections={() => queueHomeMenuAction(() => setPage("connections"))}
+          onSettings={() => queueHomeMenuAction(() => setPage("settings"))}
           onDevices={() => queueHomeMenuAction(() => setPage("devices"))} />
       </View>
     </SafeAreaProvider>
@@ -962,9 +976,9 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
 
 type SessionOption = "rename" | "pin" | "archive" | "delete";
 
-function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onConnections, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
-  onSearch: () => void; onAutomations: () => void; onSwitch: () => void; onConnections: () => void; onDevices: () => void;
+  onSearch: () => void; onAutomations: () => void; onSwitch: () => void; onSettings: () => void; onDevices: () => void;
 }) {
   const { width } = useWindowDimensions();
   const closeRef = useRef<View>(null);
@@ -986,7 +1000,7 @@ function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, 
         <MenuRow label="Automations" description="Schedules, run status, and history" onPress={onAutomations} colors={colors} />
         <MenuRow label="Switch or add Joko node" description="Nearby, saved, and manual connections" onPress={onSwitch} colors={colors} />
         <MenuRow label="Devices" description="Devices authorized by this Joko node" onPress={onDevices} colors={colors} />
-        <MenuRow label="Connection settings" description="Automatic entry and exact server connections" onPress={onConnections} colors={colors} />
+        <MenuRow label="Settings" description="Appearance, current device, connection, and app details" onPress={onSettings} colors={colors} />
         <View style={styles.drawerSpacer} />
       </SafeAreaView>
   </MobileDrawer>;
