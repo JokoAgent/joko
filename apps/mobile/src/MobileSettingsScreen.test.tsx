@@ -21,6 +21,7 @@ import {
   type MobileSettingsColors
 } from "./MobileSettingsScreen";
 import type { MobileThemePreferenceState } from "./mobile-theme-preference";
+import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -38,7 +39,7 @@ vi.mock("react-native", async () => {
       children?: React.ReactNode;
       accessibilityLabel?: string;
       accessibilityRole?: string;
-      accessibilityState?: { selected?: boolean; disabled?: boolean };
+      accessibilityState?: { selected?: boolean; disabled?: boolean; expanded?: boolean };
       onPress?: () => void;
       disabled?: boolean;
       selectable?: boolean;
@@ -64,6 +65,18 @@ vi.mock("react-native", async () => {
     Platform: { OS: "android" },
     Pressable: element("button"),
     ScrollView: element("div"),
+    Switch: ({ accessibilityLabel, value, onValueChange, disabled }: {
+      accessibilityLabel?: string;
+      value?: boolean;
+      onValueChange?: (value: boolean) => void;
+      disabled?: boolean;
+    }) => React.createElement("input", {
+      type: "checkbox",
+      "aria-label": accessibilityLabel,
+      checked: value,
+      disabled,
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) => onValueChange?.(event.currentTarget.checked)
+    }),
     StyleSheet: { create: <T,>(value: T) => value },
     Text: element("span"),
     TextInput: ({ accessibilityLabel, value, onChangeText, editable = true, ...props }: {
@@ -186,6 +199,13 @@ function mobileClient(patch: Partial<MobileSettingsClient> = {}): MobileSettings
 }
 
 const readyTheme: MobileThemePreferenceState = { status: "ready", preference: "system", saving: false };
+const readyDiagnostics: MobileDiagnosticsState = {
+  status: "ready",
+  enabled: false,
+  saving: false,
+  exporting: false,
+  eventCount: 0
+};
 
 let root: Root | undefined;
 
@@ -201,24 +221,33 @@ function mount(options: {
   state?: MobileState;
   foreground?: boolean;
   theme?: MobileThemePreferenceState;
+  diagnostics?: MobileDiagnosticsState;
   client?: MobileSettingsClient;
 } = {}) {
   const container = document.createElement("div");
   const client = options.client ?? mobileClient();
   const onThemeChange = vi.fn(async () => undefined);
+  const onDiagnosticsEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
+  const onDiagnosticsClear = vi.fn(async () => undefined);
+  const onDiagnosticsExport = vi.fn(async () => undefined);
   const onBack = vi.fn();
   const onConnections = vi.fn();
   const onDevices = vi.fn();
   let state = options.state ?? mobileState();
   let foreground = options.foreground ?? true;
   let theme = options.theme ?? readyTheme;
+  let diagnostics = options.diagnostics ?? readyDiagnostics;
   const render = () => createElement(MobileSettingsScreen, {
     colors,
     state,
     foreground,
     theme,
+    diagnostics,
     client,
     onThemeChange,
+    onDiagnosticsEnabledChange,
+    onDiagnosticsClear,
+    onDiagnosticsExport,
     onBack,
     onConnections,
     onDevices,
@@ -230,13 +259,18 @@ function mount(options: {
     container,
     client,
     onThemeChange,
+    onDiagnosticsEnabledChange,
+    onDiagnosticsClear,
+    onDiagnosticsExport,
     onBack,
     onConnections,
     onDevices,
-    rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState }) => {
+    rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
+      diagnostics?: MobileDiagnosticsState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
       theme = next.theme ?? theme;
+      diagnostics = next.diagnostics ?? diagnostics;
       act(() => root!.render(render()));
     }
   };
@@ -308,6 +342,32 @@ describe("MobileSettingsScreen", () => {
     mounted.rerender({ state: mobileState(), foreground: false });
     expect(mounted.container.textContent).toContain("Background · read-only");
     expect(button(mounted.container, "Rename this phone").disabled).toBe(true);
+  });
+
+  it("keeps privacy-bounded local diagnostics folded and confirms toggle, export, and clear actions", async () => {
+    const mounted = mount();
+    expect(mounted.container.textContent).not.toContain("Message text, files, paths");
+
+    act(() => button(mounted.container, "Local diagnostics").click());
+    expect(mounted.container.textContent).toContain("Message text, files, paths, IDs, credentials, raw errors, audio, and transcripts are never included.");
+
+    await act(async () => input(mounted.container, "Record local diagnostics").click());
+    expect(mounted.onDiagnosticsEnabledChange).toHaveBeenCalledWith(true);
+    await act(async () => button(mounted.container, "Export diagnostics").click());
+    expect(mounted.onDiagnosticsExport).toHaveBeenCalledOnce();
+
+    mounted.rerender({ diagnostics: { ...readyDiagnostics, enabled: true, eventCount: 2 } });
+    act(() => button(mounted.container, "Clear diagnostics").click());
+    expect(native.alert).toHaveBeenCalledWith(
+      "Clear local diagnostics?",
+      expect.stringContaining("permanently removes"),
+      expect.any(Array)
+    );
+    const actions = native.alert.mock.calls.at(-1)?.[2] as Array<{ text: string; onPress?: () => void }>;
+    await act(async () => actions.find((action) => action.text === "Clear")?.onPress?.());
+    expect(mounted.onDiagnosticsClear).toHaveBeenCalledOnce();
+    expect(mounted.container.textContent).toContain("Local diagnostics cleared.");
+    expect(mounted.container.textContent).not.toContain("Upload diagnostics");
   });
 
   it("protects a dirty rename draft and blocks closing or duplicate saves while one request is in flight", async () => {

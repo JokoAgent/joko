@@ -5,6 +5,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Switch,
   StyleSheet,
   Text,
   TextInput,
@@ -15,6 +16,7 @@ import Constants from "expo-constants";
 import { ConnectionState, DeviceKind, type Device } from "@joko/contracts";
 import type { MobileClient, MobileState, SavedMobileConnection } from "./mobile-client";
 import type { MobileThemePreference, MobileThemePreferenceState } from "./mobile-theme-preference";
+import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -35,8 +37,12 @@ export interface MobileSettingsScreenProps {
   readonly state: MobileState;
   readonly foreground: boolean;
   readonly theme: MobileThemePreferenceState;
+  readonly diagnostics: MobileDiagnosticsState;
   readonly client: MobileSettingsClient;
   readonly onThemeChange: (preference: MobileThemePreference) => Promise<void>;
+  readonly onDiagnosticsEnabledChange: (enabled: boolean) => Promise<void>;
+  readonly onDiagnosticsClear: () => Promise<void>;
+  readonly onDiagnosticsExport: () => Promise<void>;
   readonly onBack: () => void;
   readonly onConnections: () => void;
   readonly onDevices: () => void;
@@ -73,7 +79,8 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
   };
 }
 
-export function MobileSettingsScreen({ colors, state, foreground, theme, client, onThemeChange, onBack,
+export function MobileSettingsScreen({ colors, state, foreground, theme, diagnostics, client, onThemeChange,
+  onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
   onConnections, onDevices, appVersion = Constants.expoConfig?.version || "Unknown" }: MobileSettingsScreenProps) {
   const current = resolveMobileSettingsCurrentDevice(state);
   const [editor, setEditor] = useState<{ readonly ownerKey: string; readonly original: string; readonly draft: string }>();
@@ -81,6 +88,7 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, client,
   const [renameUnknown, setRenameUnknown] = useState(false);
   const [localError, setLocalError] = useState("");
   const [notice, setNotice] = useState("");
+  const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const saveGeneration = useRef(0);
   const unknownReceiptSeen = useRef(false);
   const currentOwnerKey = current?.ownerKey;
@@ -193,6 +201,17 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, client,
     setLocalError("");
     try { await action(); }
     catch (error) { setLocalError(errorText(error)); }
+  };
+
+  const runDiagnosticsAction = async (action: () => Promise<void>, success: string): Promise<void> => {
+    setLocalError("");
+    setNotice("");
+    try {
+      await action();
+      setNotice(success);
+    } catch (error) {
+      setLocalError(errorText(error));
+    }
   };
 
   if (editor) {
@@ -308,6 +327,65 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, client,
       <InformationRow label="Node" value={state.node?.version || "Unknown"} colors={colors} />
       <InformationRow label="API" value={state.node?.apiVersion || "Unknown"} colors={colors} />
     </View>
+
+    <Text style={[styles.section, { color: colors.muted }]}>Diagnostics</Text>
+    <Pressable accessibilityRole="button" accessibilityLabel="Local diagnostics"
+      accessibilityState={{ expanded: diagnosticsExpanded }}
+      onPress={() => setDiagnosticsExpanded((value) => !value)}
+      style={[styles.navigationRow, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <View style={styles.fill}>
+        <Text style={[styles.label, { color: colors.ink }]}>Local diagnostics</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>
+          {diagnostics.enabled ? `On · ${diagnostics.eventCount} retained events` : "Off · no new events are recorded"}
+        </Text>
+      </View>
+      <Text style={[styles.chevron, { color: colors.muted }]}>{diagnosticsExpanded ? "⌃" : "⌄"}</Text>
+    </Pressable>
+    {diagnosticsExpanded && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <Text style={[styles.description, { color: colors.ink }]}>Device-private diagnostic recording</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>
+        Off by default. Joko keeps at most 500 allowlisted lifecycle, connection-state, and timing events for 7 days.
+        Message text, files, paths, IDs, credentials, raw errors, audio, and transcripts are never included.
+      </Text>
+      <View style={styles.toggleRow}>
+        <View style={styles.fill}>
+          <Text style={[styles.label, { color: colors.ink }]}>Record local diagnostics</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>
+            {diagnostics.status === "loading" ? "Loading device preference…"
+              : diagnostics.enabled ? "Recording allowlisted events on this phone" : "Recording is off"}
+          </Text>
+        </View>
+        <Switch accessibilityLabel="Record local diagnostics" value={diagnostics.enabled}
+          disabled={diagnostics.status === "loading" || diagnostics.saving || diagnostics.exporting}
+          trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface}
+          onValueChange={(value) => void runDiagnosticsAction(
+            () => onDiagnosticsEnabledChange(value),
+            value ? "Local diagnostic recording enabled." : "Local diagnostic recording disabled."
+          )} />
+      </View>
+      <InformationRow label="Retained" value={`${diagnostics.eventCount} / 500 events`} colors={colors} />
+      <InformationRow label="Retention" value="7 days on this phone" colors={colors} />
+      <View style={styles.actionRow}>
+        <Button label={diagnostics.exporting ? "Exporting…" : "Export diagnostics"} colors={colors}
+          disabled={diagnostics.status === "loading" || diagnostics.saving || diagnostics.exporting}
+          onPress={() => void runDiagnosticsAction(onDiagnosticsExport, "Local diagnostics sent to the system share sheet.")} />
+        <Button label="Clear diagnostics" colors={colors}
+          disabled={diagnostics.status === "loading" || diagnostics.saving || diagnostics.exporting
+            || diagnostics.eventCount === 0 && diagnostics.status === "ready"}
+          onPress={() => Alert.alert(
+            "Clear local diagnostics?",
+            "This permanently removes the diagnostic events retained on this phone. Recording stays in its current state.",
+            [
+              { text: "Cancel", style: "cancel" },
+              { text: "Clear", style: "destructive", onPress: () => void runDiagnosticsAction(
+                onDiagnosticsClear,
+                "Local diagnostics cleared."
+              ) }
+            ]
+          )} />
+      </View>
+      {diagnostics.error && <ErrorNotice colors={colors} text={diagnostics.error} />}
+    </View>}
     {notice && <Text accessibilityLiveRegion="polite" style={[styles.noticeText, { color: colors.ink,
       backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>{notice}</Text>}
     {(localError || state.error) && <ErrorNotice colors={colors} text={localError || state.error || ""} />}
@@ -435,6 +513,7 @@ const styles = StyleSheet.create({
   infoLabel: { width: 96, fontSize: 13, lineHeight: 20, fontWeight: "600" },
   infoValue: { flex: 1, fontSize: 14, lineHeight: 20 },
   actionRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingTop: 6 },
+  toggleRow: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 12 },
   button: { minHeight: 46, borderRadius: 12, alignItems: "center", justifyContent: "center",
     paddingHorizontal: 16, paddingVertical: 9 },
   buttonText: { fontSize: 15, fontWeight: "700" },

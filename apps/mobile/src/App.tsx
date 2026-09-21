@@ -7,6 +7,7 @@ import {
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
+import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
@@ -37,6 +38,7 @@ import {
   mobileInteractionDrafts,
   mobileNewTaskDrafts,
   mobileOfflineCache,
+  mobileDiagnostics,
   mobileStorage,
   mobileThemePreferences
 } from "./storage";
@@ -454,6 +456,10 @@ export function App() {
     (listener) => mobileIncomingShare.subscribe(listener),
     () => mobileIncomingShare.snapshot
   );
+  const diagnostics = useSyncExternalStore(
+    (listener) => mobileDiagnostics.subscribe(listener),
+    () => mobileDiagnostics.snapshot
+  );
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -465,6 +471,7 @@ export function App() {
   const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
   const openedIncomingShareRef = useRef<string | undefined>(undefined);
   const retiredIncomingShareRef = useRef<string | undefined>(undefined);
+  const diagnosticConnectionKeyRef = useRef<string | undefined>(undefined);
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
   const colors = useMemo(() => ({
@@ -476,6 +483,15 @@ export function App() {
 
   useEffect(() => {
     void mobileThemePreferences.hydrate();
+    let diagnosticsStopped = false;
+    let diagnosticsState = AppState.currentState;
+    let diagnosticsTick = performance.now();
+    void mobileDiagnostics.hydrate().then(async () => {
+      if (diagnosticsStopped) return;
+      mobileDiagnostics.record("app.started", { state: mobileDiagnosticAppState(diagnosticsState) });
+      await mobileDiagnostics.flush().catch(() => undefined);
+      await mobileDiagnostics.maintainExportCache().catch(() => undefined);
+    });
     void mobileImageOutput.maintain().catch(() => undefined);
     void mobileFileShare.maintain().catch(() => undefined);
     void mobileIncomingShare.refresh().catch(() => undefined);
@@ -483,15 +499,27 @@ export function App() {
     void client.start();
     const subscription = AppState.addEventListener("change", (status) => {
       const foreground = status === "active";
+      diagnosticsState = status;
+      diagnosticsTick = performance.now();
       setForeground(foreground);
       client.setForeground(foreground);
+      mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
       if (!foreground) {
         void mobileComposerDrafts.flush().catch(() => undefined);
         void mobileInteractionDrafts.flush().catch(() => undefined);
         void mobileNewTaskDrafts.flush().catch(() => undefined);
+        void mobileDiagnostics.flush().catch(() => undefined);
       }
     });
+    const diagnosticTimer = setInterval(() => {
+      const nextTick = performance.now();
+      if (diagnosticsState === "active" && nextTick - diagnosticsTick > 3_000) {
+        mobileDiagnostics.record("js.stall", { elapsedMs: Math.min(86_400_000, Math.round(nextTick - diagnosticsTick - 2_000)) });
+      }
+      diagnosticsTick = nextTick;
+      if (mobileDiagnostics.snapshot.enabled) void mobileDiagnostics.flush().catch(() => undefined);
+    }, 2_000);
     const linking = Linking.addEventListener("url", ({ url }) => {
       if (/^joko:\/\/expo-sharing(?:[/?#]|$)/iu.test(url)) {
         void mobileIncomingShare.refresh().catch(() => undefined);
@@ -503,14 +531,28 @@ export function App() {
       }
     }).catch(() => undefined);
     return () => {
+      diagnosticsStopped = true;
+      clearInterval(diagnosticTimer);
       subscription.remove();
       linking.remove();
       client.setForeground(false);
       void mobileComposerDrafts.flush().catch(() => undefined);
       void mobileInteractionDrafts.flush().catch(() => undefined);
       void mobileNewTaskDrafts.flush().catch(() => undefined);
+      void mobileDiagnostics.flush().catch(() => undefined);
     };
   }, []);
+
+  useEffect(() => {
+    if (!diagnostics.enabled) {
+      diagnosticConnectionKeyRef.current = undefined;
+      return;
+    }
+    const key = `${state.status}\u001f${foreground}`;
+    if (diagnosticConnectionKeyRef.current === key) return;
+    diagnosticConnectionKeyRef.current = key;
+    mobileDiagnostics.record("connection.state", { state: state.status, foreground });
+  }, [diagnostics.enabled, foreground, state.status]);
 
   useEffect(() => {
     const batch = incomingShare.batch;
@@ -583,7 +625,14 @@ export function App() {
                 page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
-                  theme={theme} client={client} onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
+                  theme={theme} diagnostics={diagnostics} client={client}
+                  onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
+                  onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
+                  onDiagnosticsClear={() => mobileDiagnostics.clear()}
+                  onDiagnosticsExport={() => mobileDiagnostics.export({
+                    appVersion: Constants.expoConfig?.version || "unknown",
+                    platform: Platform.OS === "android" || Platform.OS === "ios" ? Platform.OS : "unknown"
+                  })}
                   onBack={() => setPage("home")} onConnections={() => setPage("connections")}
                   onDevices={() => setPage("devices")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
@@ -616,6 +665,10 @@ export function App() {
 
 type Colors = { background: string; surface: string; ink: string; muted: string; border: string; accent: string; negative: string; brandBackground: string };
 type ScreenProps = { colors: Colors; state: MobileClient["state"] };
+
+function mobileDiagnosticAppState(value: string): "active" | "inactive" | "background" | "unknown" {
+  return value === "active" || value === "inactive" || value === "background" ? value : "unknown";
+}
 
 function mobileComposerRichTheme(colors: Colors) {
   return {
