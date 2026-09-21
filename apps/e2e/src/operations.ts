@@ -5,10 +5,13 @@ import type { Client } from "@connectrpc/connect";
 import {
   AbortRunMutationSchema,
   ArchiveSessionMutationSchema,
+  CancelQueueItemMutationSchema,
   CloneSessionMutationSchema,
   CompactSessionMutationSchema,
   CreateScheduleMutationSchema,
   CreateSessionMutationSchema,
+  DeleteSessionMutationSchema,
+  DeleteSessionMessageMutationSchema,
   EditQueueItemMutationSchema,
   EventService,
   EntityKind,
@@ -44,6 +47,7 @@ import {
   SendInputMutationSchema,
   SessionExportFormat,
   SetSessionPermissionMutationSchema,
+  SetSessionModelMutationSchema,
   SetSessionPlanModeMutationSchema,
   SetQueueInteractionLockMutationSchema,
   SetQueueItemEditLockMutationSchema,
@@ -220,6 +224,38 @@ export function editQueuedInputMutation(
   });
 }
 
+export function cancelQueuedInputMutation(item: QueueItem): OperationMutation {
+  if (item.version?.revision === undefined) throw new Error("Queue item has no entity version.");
+  return create(OperationMutationSchema, {
+    preconditions: [{
+      entity: { kind: EntityKind.QUEUE_ITEM, id: item.queueItemId },
+      expectedRevision: item.version.revision,
+      expectedGeneration: item.version.generation
+    }],
+    payload: {
+      case: "cancelQueueItem",
+      value: create(CancelQueueItemMutationSchema, { queueItemId: item.queueItemId })
+    }
+  });
+}
+
+export function deleteSessionMessageMutation(
+  sessionId: string,
+  eventId: string,
+  expectedGeneration: bigint
+): OperationMutation {
+  return create(OperationMutationSchema, {
+    preconditions: [{
+      entity: { kind: EntityKind.SESSION, id: sessionId },
+      expectedGeneration
+    }],
+    payload: {
+      case: "deleteSessionMessage",
+      value: create(DeleteSessionMessageMutationSchema, { sessionId, eventId })
+    }
+  });
+}
+
 export function setQueueInteractionLockMutation(
   control: QueueControl,
   lockToken: string,
@@ -322,11 +358,11 @@ export function cloneMutation(sessionId: string, displayName = "Cloned task"): O
   });
 }
 
-export function compactMutation(sessionId: string): OperationMutation {
+export function compactMutation(sessionId: string, customInstructions = "Preserve decisions."): OperationMutation {
   return create(OperationMutationSchema, {
     payload: {
       case: "compactSession",
-      value: create(CompactSessionMutationSchema, { sessionId, customInstructions: "Preserve decisions." })
+      value: create(CompactSessionMutationSchema, { sessionId, customInstructions })
     }
   });
 }
@@ -358,11 +394,36 @@ export function archiveMutation(sessionId: string, archived: boolean): Operation
   });
 }
 
+export function deleteMutation(sessionId: string, deleteNativeSession = false, deleteArtifacts = false): OperationMutation {
+  return create(OperationMutationSchema, {
+    payload: {
+      case: "deleteSession",
+      value: create(DeleteSessionMutationSchema, { sessionId, deleteNativeSession, deleteArtifacts })
+    }
+  });
+}
+
 export function permissionMutation(sessionId: string, permissionMode: PermissionMode): OperationMutation {
   return create(OperationMutationSchema, {
     payload: {
       case: "setSessionPermission",
       value: create(SetSessionPermissionMutationSchema, { sessionId, permissionMode })
+    }
+  });
+}
+
+export function modelMutation(sessionId: string, providerId: string, modelId: string, effortId: string, fastMode: boolean): OperationMutation {
+  return create(OperationMutationSchema, {
+    payload: {
+      case: "setSessionModel",
+      value: create(SetSessionModelMutationSchema, {
+        sessionId,
+        model: create(ModelSelectionSchema, {
+          model: create(ModelKeySchema, { providerId, modelId }),
+          effortId,
+          fastMode
+        })
+      })
     }
   });
 }

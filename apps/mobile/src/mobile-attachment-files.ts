@@ -1,0 +1,441 @@
+import {
+  appendMobileComposerAttachments,
+  assertMobileAttachmentCandidate,
+  MOBILE_MAXIMUM_ATTACHMENT_BYTES,
+  mobileComposerAttachmentStorageIds,
+  mobileAttachmentPickerMediaTypes,
+  normalizeMobileComposerAttachment,
+  type MobileAttachmentPolicy,
+  type MobileComposerAttachment,
+  type MobileLocalComposerAttachment,
+  type MobilePickedAttachmentCandidate
+} from "./mobile-attachments";
+
+export interface MobileAttachmentFileDriver {
+  pick(mediaTypes: readonly string[]): Promise<{
+    readonly canceled: boolean;
+    readonly files: readonly MobilePickedAttachmentCandidate[];
+  }>;
+  stage(profileId: string, attachmentId: string, sourceUri: string): Promise<MobileAttachmentFileSnapshot>;
+  stageBytes(
+    profileId: string,
+    attachmentId: string,
+    bytes: Uint8Array
+  ): Promise<MobileAttachmentFileSnapshot>;
+  read(profileId: string, attachmentId: string): Promise<MobileAttachmentFileSnapshot>;
+  remove(profileId: string, attachmentId: string): Promise<void>;
+  clearProfile(profileId: string): Promise<void>;
+}
+
+export interface MobileAttachmentFileSnapshot {
+  readonly uri: string;
+  readonly byteSize: number;
+  readonly bytes: Uint8Array;
+}
+
+export interface MobileVerifiedAttachmentUpload {
+  readonly uri: string;
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+}
+
+export interface MobileVerifiedAttachmentBytes {
+  readonly bytes: Uint8Array;
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+}
+
+export interface MobileVerifiedOwnedBytes extends MobileAttachmentFileSnapshot {
+  readonly sha256Hex: string;
+}
+
+type DigestBytes = (bytes: Uint8Array) => Promise<string>;
+
+export class MobileAttachmentFiles {
+  constructor(
+    private readonly driver: MobileAttachmentFileDriver = expoMobileAttachmentFileDriver,
+    private readonly digestBytes: DigestBytes = sha256Hex,
+    private readonly now: () => number = Date.now
+  ) {}
+
+  async pickAndStage(
+    profileId: string,
+    current: readonly MobileComposerAttachment[],
+    policy: MobileAttachmentPolicy,
+    newId: () => string,
+    signal?: AbortSignal
+  ): Promise<readonly MobileLocalComposerAttachment[]> {
+    assertProfileId(profileId);
+    signal?.throwIfAborted();
+    const picked = await this.driver.pick(mobileAttachmentPickerMediaTypes(policy));
+    signal?.throwIfAborted();
+    if (picked.canceled) return [];
+    if (picked.files.length === 0) throw new Error("The system picker returned no attachment.");
+    return this.stageCandidates(profileId, current, policy, picked.files, newId, signal);
+  }
+
+  async stageCandidates(
+    profileId: string,
+    current: readonly MobileComposerAttachment[],
+    policy: MobileAttachmentPolicy,
+    candidates: readonly MobilePickedAttachmentCandidate[],
+    newId: () => string,
+    signal?: AbortSignal
+  ): Promise<readonly MobileLocalComposerAttachment[]> {
+    assertProfileId(profileId);
+    signal?.throwIfAborted();
+    if (candidates.length === 0) throw new Error("No attachment was provided for durable staging.");
+    if (current.length + candidates.length > policy.maximumItems) {
+      throw new Error(`A task message can include at most ${policy.maximumItems} attachments.`);
+    }
+    const existingIds = new Set(mobileComposerAttachmentStorageIds(current));
+    const staged: MobileLocalComposerAttachment[] = [];
+    const stagedIds: string[] = [];
+    try {
+      for (const candidate of candidates) {
+        signal?.throwIfAborted();
+        if (!candidate.uri || typeof candidate.uri !== "string") {
+          throw new Error("The system picker returned an unreadable attachment.");
+        }
+        const metadata = assertMobileAttachmentCandidate(candidate, policy);
+        const attachmentId = newId();
+        assertAttachmentId(attachmentId);
+        if (existingIds.has(attachmentId)) throw new Error("The new attachment identity is already in use.");
+        existingIds.add(attachmentId);
+        const snapshot = await this.driver.stage(profileId, attachmentId, candidate.uri);
+        stagedIds.push(attachmentId);
+        signal?.throwIfAborted();
+        assertSnapshot(snapshot);
+        if (snapshot.byteSize !== candidate.byteSize || snapshot.bytes.byteLength !== candidate.byteSize) {
+          throw new Error(`${metadata.fileName} changed while it was being copied into Joko.`);
+        }
+        const sha256Hex = await this.digestBytes(snapshot.bytes);
+        signal?.throwIfAborted();
+        if (!/^[0-9a-f]{64}$/u.test(sha256Hex)) throw new Error("The attachment SHA-256 result is invalid.");
+        staged.push(normalizeMobileComposerAttachment({
+          state: "local",
+          attachmentId,
+          kind: metadata.kind,
+          fileName: metadata.fileName,
+          mediaType: metadata.mediaType,
+          byteSize: snapshot.byteSize,
+          sha256Hex,
+          capturedAtUnixMs: this.now()
+        }) as MobileLocalComposerAttachment);
+      }
+      appendMobileComposerAttachments(current, staged, policy);
+      return staged.map((attachment) => ({ ...attachment }));
+    } catch (error) {
+      await Promise.all(stagedIds.map((attachmentId) => this.driver.remove(profileId, attachmentId)
+        .catch(() => undefined)));
+      throw error;
+    }
+  }
+
+  async verifyForUpload(
+    profileId: string,
+    attachment: MobileLocalComposerAttachment,
+    signal?: AbortSignal
+  ): Promise<MobileVerifiedAttachmentUpload> {
+    assertProfileId(profileId);
+    const exact = normalizeMobileComposerAttachment(attachment);
+    if (exact.state !== "local") throw new Error("Only a staged local attachment can be uploaded.");
+    signal?.throwIfAborted();
+    const snapshot = await this.driver.read(profileId, exact.attachmentId);
+    signal?.throwIfAborted();
+    assertSnapshot(snapshot);
+    if (snapshot.byteSize !== exact.byteSize || snapshot.bytes.byteLength !== exact.byteSize) {
+      throw new Error(`${exact.fileName} changed after it was staged.`);
+    }
+    const sha256Hex = await this.digestBytes(snapshot.bytes);
+    signal?.throwIfAborted();
+    if (sha256Hex !== exact.sha256Hex) throw new Error(`${exact.fileName} failed its staged SHA-256 check.`);
+    return {
+      uri: snapshot.uri,
+      fileName: exact.fileName,
+      mediaType: exact.mediaType,
+      byteSize: exact.byteSize,
+      sha256Hex: exact.sha256Hex
+    };
+  }
+
+  async stageVerifiedBytes(
+    profileId: string,
+    current: readonly MobileComposerAttachment[],
+    policy: MobileAttachmentPolicy,
+    candidate: MobileVerifiedAttachmentBytes,
+    newId: () => string,
+    signal?: AbortSignal
+  ): Promise<MobileLocalComposerAttachment> {
+    assertProfileId(profileId);
+    signal?.throwIfAborted();
+    if (!(candidate.bytes instanceof Uint8Array) || candidate.bytes.byteLength !== candidate.byteSize) {
+      throw new Error("The authenticated attachment bytes do not match their declared size.");
+    }
+    if (!/^[0-9a-f]{64}$/u.test(candidate.sha256Hex)) {
+      throw new Error("The authenticated attachment SHA-256 identity is invalid.");
+    }
+    if (current.length + 1 > policy.maximumItems) {
+      throw new Error(`A task message can include at most ${policy.maximumItems} attachments.`);
+    }
+    const metadata = assertMobileAttachmentCandidate(candidate, policy);
+    const sourceSha256Hex = await this.digestBytes(candidate.bytes);
+    signal?.throwIfAborted();
+    if (sourceSha256Hex !== candidate.sha256Hex) {
+      throw new Error(`${metadata.fileName} failed its authenticated SHA-256 check before staging.`);
+    }
+    const existingIds = new Set(mobileComposerAttachmentStorageIds(current));
+    const attachmentId = newId();
+    assertAttachmentId(attachmentId);
+    if (existingIds.has(attachmentId)) throw new Error("The new attachment identity is already in use.");
+    let staged = false;
+    try {
+      const snapshot = await this.driver.stageBytes(profileId, attachmentId, candidate.bytes);
+      staged = true;
+      signal?.throwIfAborted();
+      assertSnapshot(snapshot);
+      if (snapshot.byteSize !== candidate.byteSize || snapshot.bytes.byteLength !== candidate.byteSize) {
+        throw new Error(`${metadata.fileName} changed while it was being copied into Joko.`);
+      }
+      const stagedSha256Hex = await this.digestBytes(snapshot.bytes);
+      signal?.throwIfAborted();
+      if (stagedSha256Hex !== candidate.sha256Hex) {
+        throw new Error(`${metadata.fileName} failed its staged SHA-256 check.`);
+      }
+      const attachment = normalizeMobileComposerAttachment({
+        state: "local",
+        attachmentId,
+        kind: metadata.kind,
+        fileName: metadata.fileName,
+        mediaType: metadata.mediaType,
+        byteSize: snapshot.byteSize,
+        sha256Hex: stagedSha256Hex,
+        capturedAtUnixMs: this.now()
+      }) as MobileLocalComposerAttachment;
+      appendMobileComposerAttachments(current, [attachment], policy);
+      return { ...attachment };
+    } catch (error) {
+      if (staged) await this.driver.remove(profileId, attachmentId).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async digestOwnedBytes(bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1
+      || bytes.byteLength > MOBILE_MAXIMUM_ATTACHMENT_BYTES) {
+      throw new Error("The owned attachment bytes are invalid.");
+    }
+    signal?.throwIfAborted();
+    const sha256Hex = await this.digestBytes(bytes);
+    signal?.throwIfAborted();
+    if (!/^[0-9a-f]{64}$/u.test(sha256Hex)) throw new Error("The attachment SHA-256 result is invalid.");
+    return sha256Hex;
+  }
+
+  async stageOwnedBytes(
+    profileId: string,
+    storageId: string,
+    bytes: Uint8Array,
+    expectedSha256Hex: string,
+    signal?: AbortSignal
+  ): Promise<MobileVerifiedOwnedBytes> {
+    assertProfileId(profileId);
+    assertAttachmentId(storageId);
+    signal?.throwIfAborted();
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1
+      || bytes.byteLength > MOBILE_MAXIMUM_ATTACHMENT_BYTES || !/^[0-9a-f]{64}$/u.test(expectedSha256Hex)) {
+      throw new Error("The owned image source bytes are invalid.");
+    }
+    const sourceSha256Hex = await this.digestBytes(bytes);
+    signal?.throwIfAborted();
+    if (sourceSha256Hex !== expectedSha256Hex) throw new Error("The owned image source failed its SHA-256 check.");
+    let staged = false;
+    try {
+      const snapshot = await this.driver.stageBytes(profileId, storageId, bytes);
+      staged = true;
+      signal?.throwIfAborted();
+      assertSnapshot(snapshot);
+      if (snapshot.byteSize !== bytes.byteLength) throw new Error("The owned image source changed while it was staged.");
+      const sha256Hex = await this.digestBytes(snapshot.bytes);
+      signal?.throwIfAborted();
+      if (sha256Hex !== expectedSha256Hex) throw new Error("The staged image source failed its SHA-256 check.");
+      return { ...snapshot, bytes: Uint8Array.from(snapshot.bytes), sha256Hex };
+    } catch (error) {
+      if (staged) await this.driver.remove(profileId, storageId).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async readOwnedBytes(
+    profileId: string,
+    storageId: string,
+    expectedByteSize: number,
+    expectedSha256Hex: string,
+    signal?: AbortSignal
+  ): Promise<MobileVerifiedOwnedBytes> {
+    assertProfileId(profileId);
+    assertAttachmentId(storageId);
+    if (!Number.isSafeInteger(expectedByteSize) || expectedByteSize < 1
+      || expectedByteSize > MOBILE_MAXIMUM_ATTACHMENT_BYTES || !/^[0-9a-f]{64}$/u.test(expectedSha256Hex)) {
+      throw new Error("The owned image source identity is invalid.");
+    }
+    signal?.throwIfAborted();
+    const snapshot = await this.driver.read(profileId, storageId);
+    signal?.throwIfAborted();
+    assertSnapshot(snapshot);
+    if (snapshot.byteSize !== expectedByteSize || snapshot.bytes.byteLength !== expectedByteSize) {
+      throw new Error("The owned image source changed after it was staged.");
+    }
+    const sha256Hex = await this.digestBytes(snapshot.bytes);
+    signal?.throwIfAborted();
+    if (sha256Hex !== expectedSha256Hex) throw new Error("The owned image source failed its staged SHA-256 check.");
+    return { ...snapshot, bytes: Uint8Array.from(snapshot.bytes), sha256Hex };
+  }
+
+  async removeOwnedBytes(profileId: string, storageId: string): Promise<void> {
+    assertProfileId(profileId);
+    assertAttachmentId(storageId);
+    await this.driver.remove(profileId, storageId);
+  }
+
+  async removeVisibleBytes(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
+    assertProfileId(profileId);
+    const exact = normalizeMobileComposerAttachment(attachment);
+    if (exact.state === "local") await this.driver.remove(profileId, exact.attachmentId);
+  }
+
+  async removeAnnotationSource(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
+    assertProfileId(profileId);
+    const exact = normalizeMobileComposerAttachment(attachment);
+    if (exact.annotation) await this.driver.remove(profileId, exact.annotation.source.storageId);
+  }
+
+  async remove(profileId: string, attachment: MobileComposerAttachment): Promise<void> {
+    assertProfileId(profileId);
+    const exact = normalizeMobileComposerAttachment(attachment);
+    await Promise.all([
+      ...(exact.state === "local" ? [this.driver.remove(profileId, exact.attachmentId)] : []),
+      ...(exact.annotation ? [this.driver.remove(profileId, exact.annotation.source.storageId)] : [])
+    ]);
+  }
+
+  async clearProfile(profileId: string): Promise<void> {
+    assertProfileId(profileId);
+    await this.driver.clearProfile(profileId);
+  }
+}
+
+const expoMobileAttachmentFileDriver: MobileAttachmentFileDriver = {
+  async pick(mediaTypes) {
+    const { File } = await import("expo-file-system");
+    const result = await File.pickFileAsync({
+      multipleFiles: true,
+      mimeTypes: [...mediaTypes]
+    });
+    if (result.canceled) return { canceled: true, files: [] };
+    return {
+      canceled: false,
+      files: result.result.map((file) => ({
+        uri: file.uri,
+        fileName: file.name,
+        mediaType: file.type || "application/octet-stream",
+        byteSize: file.size
+      }))
+    };
+  },
+  async stage(profileId, attachmentId, sourceUri) {
+    const { Directory, File, Paths } = await import("expo-file-system");
+    const directory = new Directory(Paths.document, attachmentRootDirectory, profileId);
+    directory.create({ idempotent: true, intermediates: true });
+    const destination = new File(directory, attachmentId);
+    if (destination.exists) throw new Error("The new attachment file identity is already in use.");
+    try {
+      await new File(sourceUri).copy(destination);
+      return await expoFileSnapshot(destination);
+    } catch (error) {
+      if (destination.exists) destination.delete();
+      throw error;
+    }
+  },
+  async stageBytes(profileId, attachmentId, bytes) {
+    const { Directory, File, Paths } = await import("expo-file-system");
+    const directory = new Directory(Paths.document, attachmentRootDirectory, profileId);
+    directory.create({ idempotent: true, intermediates: true });
+    const destination = new File(directory, attachmentId);
+    if (destination.exists) throw new Error("The new attachment file identity is already in use.");
+    try {
+      destination.create();
+      destination.write(bytes);
+      return await expoFileSnapshot(destination);
+    } catch (error) {
+      if (destination.exists) destination.delete();
+      throw error;
+    }
+  },
+  async read(profileId, attachmentId) {
+    const { Directory, File, Paths } = await import("expo-file-system");
+    const file = new File(new Directory(Paths.document, attachmentRootDirectory, profileId), attachmentId);
+    if (!file.exists) throw new Error("The staged attachment bytes are no longer available on this device.");
+    return expoFileSnapshot(file);
+  },
+  async remove(profileId, attachmentId) {
+    const { Directory, File, Paths } = await import("expo-file-system");
+    const file = new File(new Directory(Paths.document, attachmentRootDirectory, profileId), attachmentId);
+    if (file.exists) file.delete();
+  },
+  async clearProfile(profileId) {
+    const { Directory, Paths } = await import("expo-file-system");
+    const directory = new Directory(Paths.document, attachmentRootDirectory, profileId);
+    if (directory.exists) directory.delete();
+  }
+};
+
+const attachmentRootDirectory = "joko-mobile-attachments";
+
+async function expoFileSnapshot(file: {
+  readonly uri: string;
+  readonly size: number;
+  bytes(): Promise<Uint8Array>;
+}): Promise<MobileAttachmentFileSnapshot> {
+  const byteSize = file.size;
+  if (!Number.isSafeInteger(byteSize) || byteSize <= 0) throw new Error("The staged attachment has an invalid size.");
+  const bytes = await file.bytes();
+  return { uri: file.uri, byteSize, bytes };
+}
+
+function assertSnapshot(value: MobileAttachmentFileSnapshot): void {
+  if (!value || typeof value !== "object" || typeof value.uri !== "string" || !value.uri
+    || !Number.isSafeInteger(value.byteSize) || value.byteSize <= 0
+    || !(value.bytes instanceof Uint8Array) || value.bytes.byteLength !== value.byteSize) {
+    throw new Error("The staged attachment bytes are invalid.");
+  }
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const { CryptoDigestAlgorithm, digest } = await import("expo-crypto");
+  const value = new Uint8Array(await digest(
+    CryptoDigestAlgorithm.SHA256,
+    Uint8Array.from(bytes).buffer
+  ));
+  return [...value].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function assertProfileId(value: string): void {
+  if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/u.test(value)) {
+    throw new Error("The local Joko connection profile identity is invalid.");
+  }
+}
+
+function assertAttachmentId(value: string): void {
+  if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/u.test(value)) {
+    throw new Error("The local Joko attachment identity is invalid.");
+  }
+}
+
+export const mobileAttachmentFileTesting = {
+  attachmentRootDirectory
+};

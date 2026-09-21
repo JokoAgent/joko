@@ -1,0 +1,71 @@
+{
+  "name": "@joko/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.ts",
+  "expo": {
+    "autolinking": {
+      "android": {
+        "exclude": ["expo-notifications"]
+      }
+    }
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "build:android": "expo export --platform android --output-dir dist/android",
+    "build:ios": "expo export --platform ios --output-dir dist/ios",
+    "build:native:android": "node scripts/build-android-artifacts.mjs",
+    "build:native:ios": "node scripts/build-ios-artifact.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.14.0",
+    "@connectrpc/connect": "2.1.2",
+    "@connectrpc/connect-web": "2.1.2",
+    "@google/model-viewer": "4.3.1",
+    "@joko/brand-assets": "workspace:*",
+    "@joko/contracts": "workspace:*",
+    "@noble/hashes": "2.3.0",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "57.0.17",
+    "expo-application": "57.0.3",
+    "expo-audio": "57.0.4",
+    "expo-build-properties": "57.0.15",
+    "expo-clipboard": "57.0.1",
+    "expo-constants": "57.0.15",
+    "expo-crypto": "57.0.2",
+    "expo-file-system": "57.0.6",
+    "expo-image": "57.0.3",
+    "expo-image-manipulator": "57.0.14",
+    "expo-image-picker": "57.0.14",
+    "expo-media-library": "57.0.4",
+    "expo-network": "~57.0.1",
+    "expo-notifications": "~57.0.15",
+    "expo-modules-core": "57.0.17",
+    "expo-secure-store": "57.0.2",
+    "expo-sharing": "57.0.16",
+    "expo-status-bar": "57.0.1",
+    "expo-updates": "57.0.18",
+    "pdfjs-dist": "5.7.284",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "5.7.0",
+    "react-native-svg": "15.15.4",
+    "react-native-webview": "13.16.1",
+    "three": "0.183.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "esbuild": "0.28.2",
+    "jsdom": "26.1.0",
+    "react-dom": "19.2.3",
+    "sharp": "0.35.3",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

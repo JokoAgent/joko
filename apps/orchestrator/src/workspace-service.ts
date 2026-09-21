@@ -106,6 +106,8 @@ export interface WorkspaceEntryListingOptions {
 
 export interface WorkspaceFilePreview {
   readonly entry: WorkspaceEntryRecord;
+  /** Metadata fence observed for the stable source read, even when entry.revision is upgraded to a content digest. */
+  readonly observedRevision?: string;
   readonly mediaType: string;
   readonly text?: string;
   /**
@@ -646,6 +648,7 @@ export class WorkspaceService {
     }
     const workspace = this.requireWorkspace(workspaceId);
     const resolved = await this.#resolveWorkspacePreviewFile(workspace, path);
+    const observedRevision = metadataFileRevision(resolved.info);
     if (maximumFileBytes !== undefined && (!Number.isSafeInteger(maximumFileBytes) || maximumFileBytes < 1 || resolved.info.size > maximumFileBytes)) {
       throw new WorkspaceFilePreviewError("The file exceeds the complete preview budget.", "unsupported");
     }
@@ -664,6 +667,7 @@ export class WorkspaceService {
       if (resolved.info.size > maximumMediaBytes) {
         return {
           entry: workspaceFileEntry(resolved.path, resolved.info, metadataFileRevision(resolved.info)),
+          observedRevision,
           mediaType,
           truncated: false
         };
@@ -671,6 +675,7 @@ export class WorkspaceService {
       const snapshot = await this.#readWorkspacePreviewSnapshot(workspace, resolved, resolved.info.size);
       return {
         entry: workspaceFileEntry(resolved.path, snapshot.info, workspaceFileContentRevision(snapshot.bytes)),
+        observedRevision: metadataFileRevision(snapshot.info),
         mediaType,
         bytes: snapshot.bytes,
         truncated: false
@@ -679,7 +684,7 @@ export class WorkspaceService {
 
     const metadataEntry = workspaceFileEntry(resolved.path, resolved.info, metadataFileRevision(resolved.info));
     if (!isTextMediaType(mediaType) && mediaType !== "application/octet-stream") {
-      return { entry: metadataEntry, mediaType, truncated: false };
+      return { entry: metadataEntry, observedRevision, mediaType, truncated: false };
     }
 
     // Writable text files receive a content-derived opaque revision. This is
@@ -698,21 +703,23 @@ export class WorkspaceService {
         ? workspaceFileContentRevision(content)
         : metadataFileRevision(snapshot.info)
     );
-    if (content.includes(0)) return { entry, mediaType: "application/octet-stream", truncated: false };
+    const stableObservedRevision = metadataFileRevision(snapshot.info);
+    if (content.includes(0)) return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
     if (content.byteLength === snapshot.info.size) {
       try {
         new TextDecoder("utf-8", { fatal: true }).decode(content);
       } catch {
-        return { entry, mediaType: "application/octet-stream", truncated: false };
+        return { entry, observedRevision: stableObservedRevision, mediaType: "application/octet-stream", truncated: false };
       }
     } else if (mediaType === "application/octet-stream") {
       // An unknown, oversized file cannot be proven to be complete UTF-8
       // within the bounded preview and therefore stays binary/fail-closed.
-      return { entry, mediaType, truncated: false };
+      return { entry, observedRevision: stableObservedRevision, mediaType, truncated: false };
     }
     const visible = content.subarray(0, Math.min(content.byteLength, visibleMaximum));
     return {
       entry,
+      observedRevision: stableObservedRevision,
       mediaType: mediaType === "application/octet-stream" ? "text/plain" : mediaType,
       text: visible.toString("utf8"),
       truncated: snapshot.info.size > visible.byteLength

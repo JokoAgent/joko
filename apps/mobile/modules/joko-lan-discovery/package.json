@@ -1,0 +1,10 @@
+{
+  "name": "@joko/mobile-lan-discovery",
+  "version": "0.1.0",
+  "description": "Joko-owned bounded LAN discovery transport for the native mobile client.",
+  "license": "UNLICENSED",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

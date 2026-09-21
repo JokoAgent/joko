@@ -550,12 +550,24 @@ export function toProtoBackend(record: StoredBackend): ProtoBackendDescriptor {
       }),
     capabilities: message<CapabilityManifest>("joko.v1.CapabilityManifest", {
       schemaVersion: "joko.core.v1",
-      capabilities: [...backend.capabilities.values()].map(toProtoCapability),
+      capabilities: publicBackendCapabilities(backend).map(toProtoCapability),
       revision: toProtoRevision(record.revision)
     }),
     entityVersion: toProtoEntityVersion(record.revision, backend.instanceGeneration, record.updatedAt),
     error: optionalError(backend.error)
   });
+}
+
+const hostOwnedBackendCapabilities: readonly Capability[] = [
+  { key: contract.capabilityNames.queueCancel, supported: true },
+  { key: contract.capabilityNames.queueEdit, supported: true },
+  { key: contract.capabilityNames.queueReorder, supported: true }
+];
+
+function publicBackendCapabilities(backend: BackendDescriptor): readonly Capability[] {
+  const capabilities = new Map(backend.capabilities);
+  for (const capability of hostOwnedBackendCapabilities) capabilities.set(capability.key, capability);
+  return [...capabilities.values()];
 }
 
 export function toProtoTarget(record: StoredTarget): ProtoTarget {
@@ -4258,7 +4270,6 @@ function capabilityReason(support: CapabilitySupport): Capability["reason"] | un
 }
 
 function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | undefined {
-  if (capability.options === undefined || capability.options.length === 0) return undefined;
   let kind: CapabilityOptions["kind"];
   if (capability.key.startsWith("model.")) {
     kind = {
@@ -4269,9 +4280,38 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         switchDuringSession: true,
         supportsEffort: capability.key === "model.effort",
         supportsFastMode: capability.key === "model.fast_mode",
-        effortIds: [...capability.options]
+        effortIds: [...(capability.options ?? [])]
       }
     };
+  } else if (capability.key.startsWith("permission.")) {
+    kind = {
+      case: "permission",
+      value: {
+        $typeName: "joko.v1.PermissionCapabilityOptions",
+        modes: (capability.options ?? []).flatMap((value) =>
+          value === "ask" || value === "auto" || value === "bypassPermissions"
+            ? [toProtoPermissionMode(value)]
+            : []
+        ),
+        mutableDuringSession: true,
+        supportsPerTurnPolicy: false,
+        supportsPlanMode: capability.options?.includes("plan_mode") === true
+      }
+    };
+  } else if (capability.key === "context.usage" || capability.key === "context.compact") {
+    kind = {
+      case: "context",
+      value: {
+        $typeName: "joko.v1.ContextCapabilityOptions",
+        automatic: capability.options?.includes("automatic") === true,
+        manual: capability.key === "context.compact",
+        customInstructions: capability.options?.includes("custom_instructions") === true,
+        reportsBoundary: capability.key === "context.usage",
+        reportsCost: false
+      }
+    };
+  } else if (capability.options === undefined || capability.options.length === 0) {
+    return undefined;
   } else if (capability.key.startsWith("input.")) {
     kind = {
       case: "input",
@@ -4280,21 +4320,6 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         mediaTypes: [...capability.options],
         maximumBytes: 0n,
         maximumItems: 0
-      }
-    };
-  } else if (capability.key.startsWith("permission.")) {
-    kind = {
-      case: "permission",
-      value: {
-        $typeName: "joko.v1.PermissionCapabilityOptions",
-        modes: capability.options.flatMap((value) =>
-          value === "ask" || value === "auto" || value === "bypassPermissions"
-            ? [toProtoPermissionMode(value)]
-            : []
-        ),
-        mutableDuringSession: true,
-        supportsPerTurnPolicy: false,
-        supportsPlanMode: capability.options.includes("plan_mode")
       }
     };
   } else if (capability.key === "runtime.resources") {

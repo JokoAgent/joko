@@ -1,0 +1,17 @@
+{
+  "name": "@joko/brand-assets",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./connection-artwork": "./src/connection-artwork.ts",
+    "./*.svg": "./src/*.svg",
+    "./landing-artwork/*.svg": "./src/landing-artwork/*.svg"
+  },
+  "files": [
+    "src/**"
+  ],
+  "scripts": {
+    "test": "node --test test/brand-assets.test.mjs"
+  }
+}

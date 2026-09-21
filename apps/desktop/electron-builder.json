@@ -27,7 +27,7 @@
   ],
   "directories": {
     "output": "release",
-    "buildResources": "../web/src"
+    "buildResources": "../../packages/brand-assets/src"
   },
   "files": [
     "dist/**/*.js",

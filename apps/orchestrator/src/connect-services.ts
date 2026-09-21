@@ -47,6 +47,7 @@ import type {
   DeviceControlRelationRecord,
   DeviceRecord,
   InteractionRecord,
+  MobilePushRegistrationRecord,
   OperationExecution,
   OperationRecord,
   OperationalStore,
@@ -114,6 +115,12 @@ import type { AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import type { ComputerAutomationSettingsController } from "./computer-automation-settings.js";
 import type { ComputerToolBridgeProvider } from "./computer-tool-bridge.js";
 import { ConnectionAuthenticationError, PairingRequestError, type ConnectionManager } from "./connection-manager.js";
+import {
+  MobilePushInputError,
+  MobilePushTicketError,
+  MobilePushUnavailableError,
+  type MobilePushCoordinator
+} from "./mobile-push.js";
 import type {
   CredentialDescriptor as NativeCredentialDescriptor,
   CredentialKind as NativeCredentialKind,
@@ -494,6 +501,7 @@ interface ConnectServiceDependencies {
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
+  readonly mobilePush?: MobilePushCoordinator;
   readonly refreshPiGeneration?: () => Promise<void>;
   readonly resolveSessionContextDefaults?: SessionContextDefaultsResolver;
   readonly piSettingsDefaults?: OrchestratorApplication["piSettingsDefaults"];
@@ -727,6 +735,9 @@ function toConnectError(error: unknown): ConnectError {
     return new ConnectError(error.message, Code.Aborted);
   }
   if (error instanceof AuthorizationError) return new ConnectError(error.message, Code.Unauthenticated);
+  if (error instanceof MobilePushUnavailableError) return new ConnectError(error.message, Code.Unimplemented);
+  if (error instanceof MobilePushTicketError) return new ConnectError(error.message, Code.PermissionDenied);
+  if (error instanceof MobilePushInputError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof PairingError) return new ConnectError("Pairing failed.", Code.PermissionDenied);
   if (error instanceof SensitiveDataError || error instanceof ProtoMappingError || error instanceof RangeError) {
     return new ConnectError(error.message, Code.InvalidArgument);
@@ -881,6 +892,7 @@ interface HostMutationInput<T> {
   readonly body: unknown;
   readonly commit: (store: OperationalStore) => T;
   readonly precondition?: (store: OperationalStore) => void;
+  readonly preconditionScope?: "claim-and-commit" | "claim";
   readonly effect?: () => Promise<void>;
   readonly sessionLifecycleFenceId?: string;
   readonly targetSessionCreationFenceId?: string;
@@ -1078,6 +1090,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.terminals === undefined ? {} : { terminals: application.terminals }),
     ...(application.voiceInput === undefined ? {} : { voiceInput: application.voiceInput }),
     ...(application.voiceInputSettings === undefined ? {} : { voiceInputSettings: application.voiceInputSettings }),
+    ...(application.mobilePush === undefined ? {} : { mobilePush: application.mobilePush }),
     ...(application.refreshPiGeneration === undefined ? {} : { refreshPiGeneration: application.refreshPiGeneration }),
     ...(application.resolveSessionContextDefaults === undefined
       ? {}
@@ -1215,6 +1228,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
             ? "desktop"
             : request.deviceKind === contract.DeviceKind.SERVICE
               ? "service"
+              : request.deviceKind === contract.DeviceKind.MOBILE
+                ? "mobile"
               : "unspecified",
         platform: request.platform,
         appVersion: request.appVersion
@@ -1292,6 +1307,78 @@ export function createConnectServices(application: OrchestratorApplication): Con
       authenticate(context);
       const device = dependencies.store.getDevice(request.deviceId);
       return { device: deviceFromRecord(device, dependencies.store.listDeviceConnections(device.id), now()) };
+    },
+    getMobilePushCapability: () => {
+      const capability = dependencies.mobilePush?.capability() ?? {
+        supported: false,
+        unavailableReasonCode: "APNS_NOT_CONFIGURED"
+      };
+      return {
+        capability: create(contract.MobilePushCapabilitySchema, {
+          supported: capability.supported,
+          provider: contract.MobilePushProvider.APNS,
+          unavailableReasonCode: capability.unavailableReasonCode ?? ""
+        })
+      };
+    },
+    registerMobilePush: (request, context) => {
+      const connection = authenticate(context);
+      if (request.connectionId !== connection.id || request.deviceId !== connection.deviceId) {
+        throw new ConnectError(
+          "Mobile push may only be registered for the authenticated Connection and its Device.",
+          Code.PermissionDenied
+        );
+      }
+      if (request.provider !== contract.MobilePushProvider.APNS) {
+        throw invalidArgument("provider must be APNs");
+      }
+      const coordinator = dependencies.mobilePush;
+      if (coordinator === undefined) throw new MobilePushUnavailableError("APNS_NOT_CONFIGURED");
+      const registered = coordinator.register({
+        connectionId: connection.id,
+        deviceId: connection.deviceId,
+        expectedDeviceRevision: request.expectedDeviceRevision,
+        environment: nativeMobilePushEnvironment(request.environment),
+        locale: nativeMobilePushLocale(request.locale),
+        deviceToken: request.deviceToken,
+        registrationId: request.registrationId,
+        revocationSecret: request.revocationSecret
+      });
+      return {
+        registration: toProtoMobilePushRegistration(registered.registration),
+        revocationTicket: create(contract.MobilePushRevocationTicketSchema, {
+          serverId: coordinator.serverId,
+          registrationId: registered.registration.id,
+          secret: registered.revocationSecret
+        })
+      };
+    },
+    unregisterMobilePush: (request, context) => {
+      const coordinator = dependencies.mobilePush;
+      if (coordinator === undefined) throw new MobilePushUnavailableError("APNS_NOT_CONFIGURED");
+      if (request.serverId !== coordinator.serverId) throw new MobilePushTicketError();
+      const authorization = context.requestHeader.get("authorization") ?? undefined;
+      let connection: ConnectionRecord | undefined;
+      if (authorization !== undefined) {
+        try { connection = dependencies.connections.authenticate(authorization); }
+        catch { /* The exact revocation ticket remains a valid fallback. */ }
+      }
+      const registration = dependencies.store.findMobilePushRegistration(request.registrationId);
+      if (registration === undefined) return {};
+      if (connection !== undefined && registration.connectionId === connection.id) {
+        coordinator.unregisterAuthenticated(registration.id, connection.id);
+        return {};
+      }
+      if (request.revocationSecret !== "") {
+        coordinator.unregisterWithTicket(request.serverId, registration.id, request.revocationSecret);
+        return {};
+      }
+      throw new ConnectError(
+        connection === undefined
+          ? "Mobile push unregistration requires authentication or its exact revocation ticket."
+          : "The mobile push registration belongs to another Connection.",
+        connection === undefined ? Code.Unauthenticated : Code.PermissionDenied
+      );
     },
     listDeviceControlRelations: (request, context) => {
       authenticate(context);
@@ -2659,15 +2746,28 @@ export function createConnectServices(application: OrchestratorApplication): Con
     },
     readWorkspaceFile: async (request, context) => {
       authenticate(context);
+      if (request.requireBlob && request.maximumBytes === 0n) {
+        throw invalidArgument("A positive complete-file byte limit is required for Blob materialization.");
+      }
+      if (request.requireBlob && request.startByte !== 0n) {
+        throw invalidArgument("Blob materialization must start at byte zero.");
+      }
       const maximum = safeByteCount(request.maximumBytes, 2 * 1024 * 1024);
       const start = safeByteCount(request.startByte, 0);
-      const preview = await dependencies.workspaceService.preview(request.workspaceId, request.relativePath, start + maximum);
-      if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== "" && request.expectedRevision.opaqueRevision !== preview.entry.revision) {
+      const preview = await dependencies.workspaceService.preview(
+        request.workspaceId,
+        request.relativePath,
+        request.requireBlob ? 1 : start + maximum
+      );
+      if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== ""
+        && request.expectedRevision.opaqueRevision !== preview.entry.revision
+        && request.expectedRevision.opaqueRevision !== preview.observedRevision) {
         throw new ConnectError("Workspace file revision changed.", Code.Aborted);
       }
       let materialized: ArtifactRecord | undefined;
-      if (preview.bytes === undefined && preview.text === undefined) {
-        if (preview.entry.size > dependencies.artifactStore.maximumBlobBytes) {
+      if (request.requireBlob || preview.bytes === undefined && preview.text === undefined) {
+        if ((request.requireBlob && preview.entry.size > maximum)
+          || preview.entry.size > dependencies.artifactStore.maximumBlobBytes) {
           throw new ConnectError("Workspace file exceeds the configured Blob download limit.", Code.ResourceExhausted);
         }
         materialized = await dependencies.workspaceService.materializeFile(
@@ -6153,6 +6253,8 @@ function deviceFromRecord(
         ? contract.DeviceKind.DESKTOP
         : record.kind === "service"
           ? contract.DeviceKind.SERVICE
+          : record.kind === "mobile"
+            ? contract.DeviceKind.MOBILE
           : contract.DeviceKind.UNSPECIFIED,
     platform: record.platform,
     appVersion: record.appVersion,
@@ -6163,6 +6265,52 @@ function deviceFromRecord(
     remoteControlEnabled: record.remoteControlEnabled,
     presence: online ? contract.DevicePresenceState.ONLINE : contract.DevicePresenceState.OFFLINE,
     version: toProtoEntityVersion(record.revision, 0, record.lastSeenAt ?? record.revokedAt ?? record.pairedAt)
+  });
+}
+
+function nativeMobilePushEnvironment(
+  value: contract.MobilePushEnvironment
+): MobilePushRegistrationRecord["environment"] {
+  switch (value) {
+    case contract.MobilePushEnvironment.APNS_SANDBOX: return "apns_sandbox";
+    case contract.MobilePushEnvironment.APNS_PRODUCTION: return "apns_production";
+    default: throw invalidArgument("environment is required");
+  }
+}
+
+function nativeMobilePushLocale(value: contract.MobilePushLocale): MobilePushRegistrationRecord["locale"] {
+  switch (value) {
+    case contract.MobilePushLocale.EN: return "en";
+    case contract.MobilePushLocale.ZH_CN: return "zh-CN";
+    case contract.MobilePushLocale.ZH_TW: return "zh-TW";
+    case contract.MobilePushLocale.JA: return "ja";
+    case contract.MobilePushLocale.KO: return "ko";
+    default: throw invalidArgument("locale is required");
+  }
+}
+
+function toProtoMobilePushRegistration(
+  record: MobilePushRegistrationRecord
+): contract.MobilePushRegistration {
+  return create(contract.MobilePushRegistrationSchema, {
+    registrationId: record.id,
+    connectionId: record.connectionId,
+    deviceId: record.deviceId,
+    provider: contract.MobilePushProvider.APNS,
+    environment: record.environment === "apns_sandbox"
+      ? contract.MobilePushEnvironment.APNS_SANDBOX
+      : contract.MobilePushEnvironment.APNS_PRODUCTION,
+    locale: record.locale === "en"
+      ? contract.MobilePushLocale.EN
+      : record.locale === "zh-CN"
+        ? contract.MobilePushLocale.ZH_CN
+        : record.locale === "zh-TW"
+          ? contract.MobilePushLocale.ZH_TW
+          : record.locale === "ja"
+            ? contract.MobilePushLocale.JA
+            : contract.MobilePushLocale.KO,
+    expiresAt: toProtoTimestamp(record.expiresAt),
+    version: toProtoEntityVersion(record.revision, 0, record.updatedAt)
   });
 }
 
@@ -7093,8 +7241,10 @@ function mapWorkspaceEntry(workspaceId: string, item: WorkspaceEntryRecord, medi
 }
 
 function fileRevision(item: WorkspaceEntryRecord): contract.FileRevision {
+  const content = /^sha256:([0-9a-f]{64}):([0-9]+)$/u.exec(item.revision);
+  const contentSize = content === null ? undefined : BigInt(content[2]!);
   return create(contract.FileRevisionSchema, {
-    sha256Hex: "",
+    sha256Hex: content !== null && contentSize === BigInt(item.size) ? content[1]! : "",
     byteSize: BigInt(item.size),
     modifiedAt: toProtoTimestamp(Math.trunc(item.modifiedAt)),
     opaqueRevision: item.revision
@@ -7121,6 +7271,13 @@ async function mapFilePreview(
 ): Promise<contract.FilePreview> {
   let content: contract.FilePreview["content"];
   let byteWindowTruncated = false;
+  const mappedEntry = materialized === undefined
+    ? preview.entry
+    : {
+        ...preview.entry,
+        size: materialized.byteLength,
+        revision: `sha256:${materialized.sha256}:${materialized.byteLength}`
+      };
   if (preview.bytes !== undefined || materialized !== undefined) {
     const record = materialized ?? await artifacts.ingestBytes(preview.bytes!, {
       fileName: basename(preview.entry.path),
@@ -7164,9 +7321,9 @@ async function mapFilePreview(
     };
   }
   return create(contract.FilePreviewSchema, {
-    entry: mapWorkspaceEntry(workspaceId, preview.entry),
+    entry: mapWorkspaceEntry(workspaceId, mappedEntry),
     content,
-    truncated: preview.truncated || byteWindowTruncated
+    truncated: materialized === undefined && (preview.truncated || byteWindowTruncated)
   });
 }
 
@@ -14610,6 +14767,7 @@ async function dispatchMutation(
         operationId,
         connection,
         operationBody: mutation,
+        precondition: (store) => validatePreconditions(store, mutation),
         request: {
           sourceSessionId: payload.value.sourceSessionId,
           ...(payload.value.focus.trim() === "" ? {} : { focus: payload.value.focus }),
@@ -16484,16 +16642,25 @@ async function dispatchMutation(
       }
       return presented(execution);
     }
-    case "triggerSchedule":
+    case "triggerSchedule": {
       dependencies.store.getSchedule(payload.value.scheduleId);
-      return ackOperation(
-        dependencies,
+      // runNow durably advances this Schedule while the Operation effect is in
+      // flight. Its exact revision is therefore fenced when the receipt is
+      // claimed, but cannot be rechecked after the effect against that same
+      // pre-run revision without making every correctly fenced trigger fail.
+      return presented(await host.mutate({
         operationId,
         connection,
-        mutation,
-        payload.case,
-        () => dependencies.scheduleCoordinator.runNow(payload.value.scheduleId, operationId)
-      );
+        kind: payload.case,
+        body: mutation,
+        preconditionScope: "claim",
+        effect: () => dependencies.scheduleCoordinator.runNow(payload.value.scheduleId, operationId),
+        commit: () => ({
+          accepted: true,
+          resultCase: "acknowledgement"
+        } satisfies OperationOutcome)
+      }));
+    }
     case "setScheduleEnabled": {
       const schedule = dependencies.store.getSchedule(payload.value.scheduleId);
       const changedAt = (dependencies.now ?? Date.now)();
@@ -18833,7 +19000,7 @@ async function dispatchMutation(
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.executeUserShell(payload.value.sessionId, {
         command: payload.value.command,
         excludeFromContext: payload.value.excludeFromContext
-      }, operationId).then(() => undefined));
+      }, operationId).then(() => undefined), (store) => validatePreconditions(store, mutation));
     case "abortUserShell":
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.abortUserShell(payload.value.sessionId));
     case "uploadBrowserFile": {

@@ -10,8 +10,10 @@ import {
 export const LAN_DISCOVERY_GROUP = "239.255.77.77";
 export const LAN_DISCOVERY_PORT = 43_180;
 export const LAN_DISCOVERY_PROTOCOL_VERSION = 1;
+export const JOKO_API_VERSION = "joko.v1";
 export const LAN_DISCOVERY_MAX_DATAGRAM_BYTES = 2_048;
 export const LAN_DISCOVERY_NONCE_BYTES = 16;
+export const LAN_DISCOVERY_PEER_TTL_MS = 90_000;
 
 export const LAN_DISCOVERY_MAGIC = "JOKO-ORCHESTRATOR-LAN";
 const MAGIC_BYTES = new TextEncoder().encode(LAN_DISCOVERY_MAGIC);

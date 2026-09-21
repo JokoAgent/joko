@@ -202,12 +202,13 @@ test("LAN discovery performs bounded binary round trips on administratively scop
     displayName: "Local node",
     origin: "http://192.168.10.12:43180",
     version: "1.0.0",
-    apiVersion: "v1",
+    apiVersion: contract.JOKO_API_VERSION,
     pairingEnabled: true,
     lastSeen: 10
   };
   const bytes = contract.encodeLanDiscoveryAnnouncement(nonce, announced);
   assert.ok(bytes.byteLength <= contract.LAN_DISCOVERY_MAX_DATAGRAM_BYTES);
+  assert.equal(contract.JOKO_API_VERSION, "joko.v1");
   assert.deepEqual(contract.decodeLanDiscoveryDatagram(bytes, 20), {
     kind: "announce",
     nonce,

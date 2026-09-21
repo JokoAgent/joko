@@ -18,6 +18,7 @@ interface PackageManifest {
 }
 
 export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet<string>>> = {
+  "@joko/brand-assets": new Set(),
   "@joko/contracts": new Set(),
   "@joko/code-host": new Set(),
   "@joko/core": new Set(),
@@ -45,8 +46,9 @@ export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet
   "@joko/testkit": new Set(["@joko/contracts", "@joko/core", "@joko/store"]),
   "@joko/e2e": new Set(["@joko/adapter-claude-code", "@joko/adapter-pi", "@joko/contracts", "@joko/core", "@joko/orchestrator", "@joko/remote-ssh", "@joko/store", "@joko/testkit", "@joko/tool-browser", "@joko/tool-terminal"]),
   "@joko/orchestrator": new Set(["@joko/code-host", "@joko/contracts", "@joko/core", "@joko/git-safety", "@joko/local-model-runtime", "@joko/outbound-network", "@joko/remote-ssh", "@joko/runtime-governance", "@joko/store", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-dictation-refinement", "@joko/adapter-pi", "@joko/adapter-transcription-openai", "@joko/adapter-transcription-realtime", "@joko/adapter-transcription-scribe", "@joko/adapter-transcription-sauc", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-computer", "@joko/tool-lsp", "@joko/tool-terminal", "@joko/voice-input", "@joko/worktree", "@joko/testkit"]),
-  "@joko/web": new Set(["@joko/contracts"]),
-  "@joko/desktop": new Set(["@joko/contracts", "@joko/web"])
+  "@joko/web": new Set(["@joko/brand-assets", "@joko/contracts"]),
+  "@joko/mobile": new Set(["@joko/brand-assets", "@joko/contracts"]),
+  "@joko/desktop": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/web"])
 };
 
 export interface BoundaryCheckOptions {

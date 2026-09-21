@@ -144,7 +144,7 @@ function providerConfiguration(provider: {
 }
 
 describe("Connect security and protocol audit", () => {
-  it("authenticates every RPC except the explicit credential-free bootstrap calls", async () => {
+  it("authenticates every RPC except the explicit credential-free calls", async () => {
     const registrations: Array<{
       descriptor: { typeName: string; method: Record<string, unknown> };
       implementation: Record<string, unknown>;
@@ -162,7 +162,9 @@ describe("Connect security and protocol audit", () => {
       "joko.v1.ConnectionService/getServerInfo",
       "joko.v1.ConnectionService/listDiscoveredNodes",
       "joko.v1.ConnectionService/beginPairing",
-      "joko.v1.ConnectionService/completePairing"
+      "joko.v1.ConnectionService/completePairing",
+      "joko.v1.ConnectionService/getMobilePushCapability",
+      "joko.v1.ConnectionService/unregisterMobilePush"
     ]);
     const registeredCalls = new Set(registrations.flatMap(({ descriptor }) =>
       Object.keys(descriptor.method).map((methodName) => `${descriptor.typeName}/${methodName}`)

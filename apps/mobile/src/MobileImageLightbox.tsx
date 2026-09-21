@@ -1,0 +1,800 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import {
+  ActivityIndicator,
+  AppState,
+  Modal,
+  PanResponder,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+  type GestureResponderEvent,
+  type LayoutChangeEvent
+} from "react-native";
+import { Image as ExpoImage, type ImageLoadEventData, type ImageProps as ExpoImageProps } from "expo-image";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { SvgXml } from "react-native-svg";
+import type {
+  MobileBurnedImage,
+  MobileComposerImageEditorSession
+} from "./mobile-composer-image-editor";
+import {
+  MOBILE_ANNOTATION_MAX_POINTS,
+  MOBILE_ANNOTATION_MAX_STROKES,
+  MOBILE_ANNOTATION_OUTLINE_COLOR,
+  MOBILE_ANNOTATION_OUTLINE_RATIO,
+  MOBILE_ANNOTATION_STROKE_COLOR,
+  decodeMobileBase64,
+  mobileAnnotationDisplayRect,
+  mobileAnnotationStrokePath,
+  mobileAnnotationStrokeWidth,
+  normalizeMobileAnnotationPoint,
+  shouldAppendMobileAnnotationPoint,
+  type MobileImageAnnotationPoint,
+  type MobileImageAnnotationStroke
+} from "./mobile-image-annotation";
+import {
+  MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS,
+  MOBILE_LIGHTBOX_MAX_SCALE,
+  MOBILE_LIGHTBOX_MIN_SCALE,
+  MOBILE_LIGHTBOX_TAP_DISTANCE,
+  clampMobileImageTransform,
+  mobileAccessibleZoomTransform,
+  mobileContainedImageSize,
+  mobileDoubleTapTransform,
+  mobileLightboxIsTap,
+  mobileLightboxPointerIntent,
+  mobileLightboxSwipePageIndex,
+  mobilePinchTransform,
+  mobileTouchCentroid,
+  mobileTouchDistance,
+  type MobileImageSize,
+  type MobileImageTransform,
+  type MobileLightboxPointerIntent,
+  type MobileTouchPoint
+} from "./mobile-image-lightbox";
+import { useMobileAnnotationBurn } from "./use-mobile-annotation-burn";
+import type { MobileImageGalleryNativeDecode, MobileImageGalleryPageSession } from "./mobile-image-gallery";
+import type { MobileImageOutputAction, MobileImageOutputRenderedImage } from "./mobile-image-output";
+import { mobileImageOutputMediaType } from "./mobile-image-output-format";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
+import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
+
+interface MobileImageLightboxGalleryControls {
+  readonly session: MobileImageGalleryPageSession;
+  readonly busy: boolean;
+  readonly error?: string;
+  readonly onNavigate: (pageIndex: number) => void;
+  readonly onAddOriginal: (signal: AbortSignal) => Promise<void>;
+  readonly onDecoded: (decoded: MobileImageGalleryNativeDecode) => void;
+}
+
+const PreviewImage = ExpoImage as unknown as ComponentType<ExpoImageProps>;
+
+interface MobileImageLightboxProps {
+  readonly session: MobileComposerImageEditorSession;
+  readonly locale: MobileSupportedLocale;
+  readonly gallery?: MobileImageLightboxGalleryControls;
+  readonly onClose: () => void;
+  readonly onSave: (
+    strokes: readonly MobileImageAnnotationStroke[],
+    burned: MobileBurnedImage | undefined,
+    signal: AbortSignal
+  ) => Promise<void>;
+  readonly onOutputAction?: (
+    action: MobileImageOutputAction,
+    decoded: MobileImageGalleryNativeDecode,
+    rendered: MobileImageOutputRenderedImage | undefined,
+    signal: AbortSignal
+  ) => Promise<string | void>;
+  readonly onNativeActivityChange?: (active: boolean) => void;
+}
+
+interface ActiveGesture {
+  mode: MobileLightboxPointerIntent;
+  startedAt: number;
+  start: MobileTouchPoint;
+  last: MobileTouchPoint;
+  initialTransform: MobileImageTransform;
+  initialCentroid: MobileTouchPoint;
+  initialDistance: number;
+}
+
+const initialTransform: MobileImageTransform = { scale: 1, translateX: 0, translateY: 0 };
+const emptySize: MobileImageSize = { width: 0, height: 0 };
+
+export function MobileImageLightbox({
+  session,
+  locale,
+  gallery,
+  onClose,
+  onSave,
+  onOutputAction,
+  onNativeActivityChange
+}: MobileImageLightboxProps) {
+  const initialStrokes = useMemo(() => cloneStrokes(session.initialStrokes), [session.leaseId]);
+  const [strokes, setStrokes] = useState<readonly MobileImageAnnotationStroke[]>(initialStrokes);
+  const [draftStroke, setDraftStroke] = useState<MobileImageAnnotationStroke>();
+  const [annotating, setAnnotating] = useState(false);
+  const [transform, setTransform] = useState<MobileImageTransform>(initialTransform);
+  const [container, setContainer] = useState<MobileImageSize>(emptySize);
+  const [natural, setNatural] = useState<MobileImageSize>(emptySize);
+  const [decoded, setDecoded] = useState<MobileImageGalleryNativeDecode>();
+  const [busy, setBusy] = useState(false);
+  const [outputAction, setOutputAction] = useState<MobileImageOutputAction>();
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const { burnIn, host } = useMobileAnnotationBurn();
+  const strokesRef = useRef(strokes);
+  const draftStrokeRef = useRef(draftStroke);
+  const annotatingRef = useRef(annotating);
+  const transformRef = useRef(transform);
+  const containerRef = useRef(container);
+  const naturalRef = useRef(natural);
+  const decodedRef = useRef(decoded);
+  const gestureRef = useRef<ActiveGesture | undefined>(undefined);
+  const lastTapRef = useRef<{ readonly at: number; readonly point: MobileTouchPoint } | undefined>(undefined);
+  const saveControllerRef = useRef<AbortController | undefined>(undefined);
+  const closedRef = useRef(false);
+  const nativeActivityRef = useRef(false);
+  const sawExpectedInactiveRef = useRef(false);
+  const nativeActivityCallbackRef = useRef(onNativeActivityChange);
+  const galleryRef = useRef(gallery);
+  strokesRef.current = strokes;
+  draftStrokeRef.current = draftStroke;
+  annotatingRef.current = annotating;
+  transformRef.current = transform;
+  containerRef.current = container;
+  naturalRef.current = natural;
+  decodedRef.current = decoded;
+  galleryRef.current = gallery;
+  nativeActivityCallbackRef.current = onNativeActivityChange;
+
+  useEffect(() => {
+    const nextStrokes = cloneStrokes(session.initialStrokes);
+    strokesRef.current = nextStrokes;
+    draftStrokeRef.current = undefined;
+    annotatingRef.current = false;
+    transformRef.current = initialTransform;
+    naturalRef.current = emptySize;
+    gestureRef.current = undefined;
+    lastTapRef.current = undefined;
+    closedRef.current = false;
+    setStrokes(nextStrokes);
+    setDraftStroke(undefined);
+    setAnnotating(false);
+    setTransform(initialTransform);
+    setNatural(emptySize);
+    decodedRef.current = undefined;
+    nativeActivityRef.current = false;
+    sawExpectedInactiveRef.current = false;
+    nativeActivityCallbackRef.current?.(false);
+    setDecoded(undefined);
+    setBusy(false);
+    setOutputAction(undefined);
+    setNotice("");
+    setError("");
+  }, [session.leaseId]);
+
+  const close = useCallback(() => {
+    if (closedRef.current) return;
+    closedRef.current = true;
+    saveControllerRef.current?.abort();
+    if (nativeActivityRef.current) {
+      nativeActivityRef.current = false;
+      nativeActivityCallbackRef.current?.(false);
+    }
+    onClose();
+  }, [onClose]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (status) => {
+      if (status === "active") return;
+      if (nativeActivityRef.current) {
+        sawExpectedInactiveRef.current = true;
+        return;
+      }
+      close();
+    });
+    return () => {
+      subscription.remove();
+      saveControllerRef.current?.abort();
+      if (nativeActivityRef.current) {
+        nativeActivityRef.current = false;
+        nativeActivityCallbackRef.current?.(false);
+      }
+    };
+  }, [close]);
+
+  useEffect(() => {
+    const next = clampMobileImageTransform(transformRef.current, container, natural);
+    transformRef.current = next;
+    setTransform(next);
+  }, [container, natural]);
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => !saveControllerRef.current && galleryRef.current?.busy !== true,
+    onMoveShouldSetPanResponder: () => !saveControllerRef.current && galleryRef.current?.busy !== true,
+    onPanResponderGrant: (event) => {
+      setError("");
+      const points = responderTouches(event);
+      const first = points[0] ?? { x: event.nativeEvent.locationX, y: event.nativeEvent.locationY };
+      const intent = mobileLightboxPointerIntent(annotatingRef.current && session.annotatable, points.length || 1);
+      if (intent === "transform") {
+        const centroid = mobileTouchCentroid(points.slice(0, 2));
+        gestureRef.current = {
+          mode: "transform",
+          startedAt: Date.now(),
+          start: centroid,
+          last: centroid,
+          initialTransform: transformRef.current,
+          initialCentroid: centroid,
+          initialDistance: mobileTouchDistance(points[0]!, points[1]!)
+        };
+        return;
+      }
+      const base: ActiveGesture = {
+        mode: "pan",
+        startedAt: Date.now(),
+        start: first,
+        last: first,
+        initialTransform: transformRef.current,
+        initialCentroid: first,
+        initialDistance: 0
+      };
+      if (intent === "draw") {
+        const point = annotationPoint(first, containerRef.current, naturalRef.current, transformRef.current);
+        const existingPoints = strokePointCount(strokesRef.current);
+        if (!point || strokesRef.current.length >= MOBILE_ANNOTATION_MAX_STROKES
+          || existingPoints >= MOBILE_ANNOTATION_MAX_POINTS) {
+          if (point) setError(mobileMessage(locale, "image.annotationLimit"));
+          gestureRef.current = { ...base, mode: "idle" };
+          return;
+        }
+        const next = { points: [point] };
+        draftStrokeRef.current = next;
+        setDraftStroke(next);
+        gestureRef.current = { ...base, mode: "draw" };
+        return;
+      }
+      gestureRef.current = base;
+    },
+    onPanResponderMove: (event, gestureState) => {
+      const touches = responderTouches(event);
+      let active = gestureRef.current;
+      if (!active) return;
+      if (touches.length >= 2) {
+        const points = touches.slice(0, 2);
+        const centroid = mobileTouchCentroid(points);
+        const distance = mobileTouchDistance(points[0]!, points[1]!);
+        if (active.mode !== "transform") {
+          draftStrokeRef.current = undefined;
+          setDraftStroke(undefined);
+          active = {
+            mode: "transform",
+            startedAt: active.startedAt,
+            start: centroid,
+            last: centroid,
+            initialTransform: transformRef.current,
+            initialCentroid: centroid,
+            initialDistance: distance
+          };
+          gestureRef.current = active;
+          return;
+        }
+        const next = mobilePinchTransform({
+          initial: active.initialTransform,
+          initialCentroid: active.initialCentroid,
+          initialDistance: active.initialDistance,
+          centroid,
+          distance,
+          container: containerRef.current,
+          natural: naturalRef.current
+        });
+        active.last = centroid;
+        transformRef.current = next;
+        setTransform(next);
+        return;
+      }
+      const point = touches[0] ?? {
+        x: active.start.x + gestureState.dx,
+        y: active.start.y + gestureState.dy
+      };
+      active.last = point;
+      if (active.mode === "draw") {
+        const normalized = annotationPoint(point, containerRef.current, naturalRef.current, transformRef.current);
+        const draft = draftStrokeRef.current;
+        if (!normalized || !draft || !shouldAppendMobileAnnotationPoint(draft, normalized)) return;
+        if (strokePointCount(strokesRef.current) + draft.points.length >= MOBILE_ANNOTATION_MAX_POINTS) {
+          setError(mobileMessage(locale, "image.annotationLimit"));
+          return;
+        }
+        const next = { points: [...draft.points, normalized] };
+        draftStrokeRef.current = next;
+        setDraftStroke(next);
+        return;
+      }
+      if (active.mode === "pan") {
+        const next = clampMobileImageTransform({
+          scale: active.initialTransform.scale,
+          translateX: active.initialTransform.translateX + gestureState.dx,
+          translateY: active.initialTransform.translateY + gestureState.dy
+        }, containerRef.current, naturalRef.current);
+        transformRef.current = next;
+        setTransform(next);
+      }
+    },
+    onPanResponderRelease: (_event, gestureState) => {
+      const active = gestureRef.current;
+      gestureRef.current = undefined;
+      if (!active) return;
+      if (active.mode === "draw") {
+        const draft = draftStrokeRef.current;
+        draftStrokeRef.current = undefined;
+        setDraftStroke(undefined);
+        if (draft?.points.length) {
+          const next = [...strokesRef.current, draft];
+          strokesRef.current = next;
+          setStrokes(next);
+        }
+        return;
+      }
+      if (active.mode !== "pan") {
+        lastTapRef.current = undefined;
+        return;
+      }
+      const activeGallery = galleryRef.current;
+      const nextPage = activeGallery ? mobileLightboxSwipePageIndex({
+        currentIndex: activeGallery.session.pageIndex,
+        pageCount: activeGallery.session.pageCount,
+        translationX: gestureState.dx,
+        translationY: gestureState.dy,
+        scale: transformRef.current.scale,
+        annotating: annotatingRef.current
+      }) : undefined;
+      if (nextPage !== undefined && activeGallery) {
+        lastTapRef.current = undefined;
+        strokesRef.current = cloneStrokes(session.initialStrokes);
+        draftStrokeRef.current = undefined;
+        annotatingRef.current = false;
+        transformRef.current = initialTransform;
+        setStrokes(strokesRef.current);
+        setDraftStroke(undefined);
+        setAnnotating(false);
+        setTransform(initialTransform);
+        activeGallery.onNavigate(nextPage);
+        return;
+      }
+      const now = Date.now();
+      const distance = Math.hypot(gestureState.dx, gestureState.dy);
+      if (!mobileLightboxIsTap(active.startedAt, now, distance)) {
+        lastTapRef.current = undefined;
+        return;
+      }
+      const tap = active.last;
+      const previous = lastTapRef.current;
+      if (previous && now - previous.at <= MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS
+        && Math.hypot(tap.x - previous.point.x, tap.y - previous.point.y) <= MOBILE_LIGHTBOX_TAP_DISTANCE * 2) {
+        const next = mobileDoubleTapTransform(
+          transformRef.current,
+          tap,
+          containerRef.current,
+          naturalRef.current
+        );
+        transformRef.current = next;
+        setTransform(next);
+        lastTapRef.current = undefined;
+      } else {
+        lastTapRef.current = { at: now, point: tap };
+      }
+    },
+    onPanResponderTerminate: () => {
+      gestureRef.current = undefined;
+      draftStrokeRef.current = undefined;
+      setDraftStroke(undefined);
+      lastTapRef.current = undefined;
+    }
+  }), [locale, session.annotatable, session.initialStrokes]);
+
+  const displayed = mobileContainedImageSize(container, natural);
+  const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
+  const dirty = !annotationStrokesEqual(strokes, initialStrokes);
+  const interactionBusy = busy || gallery?.busy === true;
+  const visibleError = error || gallery?.error || "";
+  const drawingReady = decoded !== undefined && natural.width > 0 && natural.height > 0
+    && container.width > 0 && container.height > 0;
+  const outputReady = drawingReady && decoded?.isAnimated === false
+    && mobileImageOutputMediaType(session.sourceMediaType) !== undefined;
+  const updateContainer = (event: LayoutChangeEvent): void => {
+    const next = {
+      width: event.nativeEvent.layout.width,
+      height: event.nativeEvent.layout.height
+    };
+    containerRef.current = next;
+    setContainer(next);
+  };
+  const zoom = (delta: number): void => {
+    const next = mobileAccessibleZoomTransform(
+      transformRef.current,
+      delta,
+      containerRef.current,
+      naturalRef.current
+    );
+    transformRef.current = next;
+    setTransform(next);
+  };
+  const resetTransform = (): void => {
+    transformRef.current = initialTransform;
+    setTransform(initialTransform);
+  };
+  const undo = (): void => {
+    const next = strokesRef.current.slice(0, -1);
+    strokesRef.current = next;
+    draftStrokeRef.current = undefined;
+    setDraftStroke(undefined);
+    setStrokes(next);
+    setError("");
+  };
+  const discard = (): void => {
+    const next = cloneStrokes(initialStrokes);
+    strokesRef.current = next;
+    draftStrokeRef.current = undefined;
+    setDraftStroke(undefined);
+    setStrokes(next);
+    setAnnotating(false);
+    setError("");
+  };
+  const navigate = (pageIndex: number): void => {
+    if (!gallery || interactionBusy || pageIndex < 0 || pageIndex >= gallery.session.pageCount
+      || pageIndex === gallery.session.pageIndex) return;
+    const next = cloneStrokes(session.initialStrokes);
+    strokesRef.current = next;
+    draftStrokeRef.current = undefined;
+    annotatingRef.current = false;
+    transformRef.current = initialTransform;
+    setStrokes(next);
+    setDraftStroke(undefined);
+    setAnnotating(false);
+    setTransform(initialTransform);
+    setError("");
+    gallery.onNavigate(pageIndex);
+  };
+  const addOriginal = async (): Promise<void> => {
+    if (!gallery || saveControllerRef.current || !gallery.session.addable || !drawingReady) return;
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setError("");
+    try {
+      await gallery.onAddOriginal(controller.signal);
+      controller.signal.throwIfAborted();
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+      close();
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.galleryAddError"));
+      }
+    } finally {
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+    }
+  };
+  const save = async (): Promise<void> => {
+    if (saveControllerRef.current || !dirty || gallery?.busy) return;
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setError("");
+    try {
+      const exactStrokes = cloneStrokes(strokesRef.current);
+      let burned: MobileBurnedImage | undefined;
+      if (exactStrokes.length > 0) {
+        const result = await burnIn({
+          base64: session.sourceBase64,
+          mediaType: session.sourceMediaType,
+          strokes: exactStrokes
+        });
+        controller.signal.throwIfAborted();
+        burned = {
+          bytes: decodeMobileBase64(result.base64, session.maximumBytes),
+          mediaType: result.mediaType,
+          width: result.width,
+          height: result.height
+        };
+      }
+      await onSave(exactStrokes, burned, controller.signal);
+      controller.signal.throwIfAborted();
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+      close();
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.annotationSaveError"));
+      }
+    } finally {
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+      }
+    }
+  };
+  const output = async (action: MobileImageOutputAction): Promise<void> => {
+    const exactDecoded = decodedRef.current;
+    if (!onOutputAction || saveControllerRef.current || !exactDecoded || !outputReady || gallery?.busy) return;
+    const controller = new AbortController();
+    saveControllerRef.current = controller;
+    setBusy(true);
+    setOutputAction(action);
+    setNotice("");
+    setError("");
+    const invokesNativeUi = action === "save" || action === "share";
+    try {
+      const exactStrokes = cloneStrokes(strokesRef.current);
+      const sourceMediaType = session.sourceMediaType.trim().toLowerCase();
+      const requiresRender = exactStrokes.length > 0
+        || action === "copy" && sourceMediaType !== "image/jpeg" && sourceMediaType !== "image/png";
+      let rendered: MobileImageOutputRenderedImage | undefined;
+      if (requiresRender) {
+        const result = await burnIn({
+          base64: session.sourceBase64,
+          mediaType: session.sourceMediaType,
+          strokes: exactStrokes
+        });
+        controller.signal.throwIfAborted();
+        rendered = {
+          bytes: decodeMobileBase64(result.base64, MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES),
+          mediaType: result.mediaType,
+          width: result.width,
+          height: result.height
+        };
+      }
+      if (invokesNativeUi) {
+        nativeActivityRef.current = true;
+        sawExpectedInactiveRef.current = false;
+        nativeActivityCallbackRef.current?.(true);
+      }
+      const message = await onOutputAction(action, exactDecoded, rendered, controller.signal);
+      controller.signal.throwIfAborted();
+      setNotice(message || imageOutputSuccessMessage(action, locale));
+    } catch (failure) {
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.outputError"));
+      }
+    } finally {
+      if (invokesNativeUi && nativeActivityRef.current) {
+        nativeActivityRef.current = false;
+        nativeActivityCallbackRef.current?.(false);
+      }
+      if (saveControllerRef.current === controller) {
+        saveControllerRef.current = undefined;
+        setBusy(false);
+        setOutputAction(undefined);
+      }
+      if (sawExpectedInactiveRef.current) close();
+    }
+  };
+
+  return <Modal visible animationType="fade" presentationStyle="fullScreen" statusBarTranslucent
+    onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
+    <SafeAreaView style={styles.root} edges={["top", "right", "bottom", "left"]}>
+      <View style={styles.header}>
+        <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
+        <View style={styles.heading}>
+          <Text numberOfLines={1} style={styles.fileName}>{session.fileName}</Text>
+          <Text style={styles.meta}>{gallery
+            ? mobileMessage(locale, "image.galleryMeta", {
+              source: gallery.session.sourceLabel,
+              index: gallery.session.pageIndex + 1,
+              count: gallery.session.pageCount,
+              scale: transform.scale.toFixed(1)
+            })
+            : mobileMessage(locale, "image.zoomMeta", { scale: transform.scale.toFixed(1) })}</Text>
+        </View>
+      </View>
+      <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: session.fileName })}
+        style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
+        {displayed.width > 0 && displayed.height > 0 && <View pointerEvents="none" style={[
+          styles.imagePosition,
+          {
+            width: displayed.width,
+            height: displayed.height,
+            left: (container.width - displayed.width) / 2 + transform.translateX,
+            top: (container.height - displayed.height) / 2 + transform.translateY
+          }
+        ]}>
+          <View style={[styles.imageScale, { transform: [{ scale: transform.scale }] }]}>
+            <PreviewImage accessible={false} source={{ uri: session.previewUri }} contentFit="fill" style={styles.image}
+              onLoad={(event: ImageLoadEventData) => {
+                const { width, height, mediaType, isAnimated } = event.source;
+                try {
+                  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+                    throw new Error(mobileMessage(locale, "image.decoderDimensions"));
+                  }
+                  if (gallery) {
+                    if (width !== gallery.session.expectedWidthPixels || height !== gallery.session.expectedHeightPixels
+                      || isAnimated === true) {
+                      throw new Error(mobileMessage(locale, "image.galleryMetadata"));
+                    }
+                    gallery.onDecoded({ width, height, mediaType, isAnimated });
+                  }
+                  const next = { width, height };
+                  naturalRef.current = next;
+                  setNatural(next);
+                  const exactDecoded = { width, height, mediaType, isAnimated };
+                  decodedRef.current = exactDecoded;
+                  setDecoded(exactDecoded);
+                  setError("");
+                } catch (failure) {
+                  decodedRef.current = undefined;
+                  setDecoded(undefined);
+                  setError(failure instanceof Error ? failure.message : mobileMessage(locale, "image.verifyError"));
+                }
+              }}
+              onError={() => {
+                decodedRef.current = undefined;
+                setDecoded(undefined);
+                setError(mobileMessage(locale, "image.displayError"));
+              }} />
+            {natural.width > 0 && natural.height > 0 && paths.length > 0 && <View
+              pointerEvents="none" style={styles.annotation}>
+              <SvgXml xml={annotationSvgXml(paths, natural)} width="100%" height="100%" />
+            </View>}
+          </View>
+        </View>}
+        {!drawingReady && !error && <View pointerEvents="none" style={styles.loading}>
+          <ActivityIndicator color="#ff9800" />
+        </View>}
+      </View>
+      {visibleError !== "" && <Text accessibilityRole="alert" style={styles.error}>{visibleError}</Text>}
+      {notice !== "" && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
+      <View style={styles.toolbar}>
+        {gallery && <ToolButton label={mobileMessage(locale, "image.previous")} onPress={() => navigate(gallery.session.pageIndex - 1)}
+          disabled={interactionBusy || gallery.session.pageIndex === 0} />}
+        {gallery && <Text accessibilityLiveRegion="polite" style={styles.pageCount}>
+          {gallery.session.pageIndex + 1} / {gallery.session.pageCount}
+        </Text>}
+        {gallery && <ToolButton label={mobileMessage(locale, "image.next")} onPress={() => navigate(gallery.session.pageIndex + 1)}
+          disabled={interactionBusy || gallery.session.pageIndex + 1 >= gallery.session.pageCount} />}
+        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
+          onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
+        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
+          onPress={() => void output("save")} disabled={interactionBusy || !outputReady} />}
+        {onOutputAction && <ToolButton label={mobileMessage(locale, outputAction === "share" ? "image.sharing" : "image.share")}
+          onPress={() => void output("share")} disabled={interactionBusy || !outputReady} />}
+        <ToolButton label={mobileMessage(locale, "image.zoomOut")} onPress={() => zoom(-0.5)}
+          disabled={interactionBusy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />
+        <ToolButton label={mobileMessage(locale, "image.zoomIn")} onPress={() => zoom(0.5)}
+          disabled={interactionBusy || transform.scale >= MOBILE_LIGHTBOX_MAX_SCALE} />
+        <ToolButton label={mobileMessage(locale, "image.reset")} onPress={resetTransform}
+          disabled={interactionBusy || transform.scale === 1 && transform.translateX === 0 && transform.translateY === 0} />
+        {gallery && gallery.session.addable && <ToolButton label={mobileMessage(locale, busy ? "image.adding" : "image.addOriginal")}
+          onPress={() => void addOriginal()} disabled={interactionBusy || !drawingReady} emphasized />}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, "image.annotate")} selected={annotating}
+          onPress={() => { setAnnotating((value) => !value); setError(""); }} disabled={interactionBusy || !drawingReady} />}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, "image.undo")} onPress={undo} disabled={interactionBusy || strokes.length === 0} />}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, "common.discard")} onPress={discard} disabled={interactionBusy || !dirty} />}
+        {session.annotatable && <ToolButton label={mobileMessage(locale, busy ? "common.saving" : gallery ? "image.addMarked" : "common.save")}
+          onPress={() => void save()} disabled={interactionBusy || !dirty || !drawingReady} emphasized />}
+      </View>
+      {annotating && <Text accessibilityLiveRegion="polite" style={styles.hint}>
+        {mobileMessage(locale, "image.drawHint")}
+      </Text>}
+      {host}
+    </SafeAreaView>
+  </Modal>;
+}
+
+function ToolButton({ label, disabled, selected, emphasized, onPress }: {
+  readonly label: string;
+  readonly disabled: boolean;
+  readonly selected?: boolean;
+  readonly emphasized?: boolean;
+  readonly onPress: () => void;
+}) {
+  return <Pressable accessibilityRole="button" accessibilityLabel={label}
+    accessibilityState={{ disabled, selected }} disabled={disabled} onPress={onPress}
+    style={[styles.toolButton, selected && styles.toolSelected, emphasized && styles.toolEmphasized,
+      disabled && styles.disabled]}>
+    <Text style={[styles.toolText, emphasized && styles.toolEmphasizedText]}>{label}</Text>
+  </Pressable>;
+}
+
+function responderTouches(event: GestureResponderEvent): MobileTouchPoint[] {
+  return [...event.nativeEvent.touches].map((touch) => ({
+    x: touch.locationX,
+    y: touch.locationY
+  }));
+}
+
+function annotationPoint(
+  point: MobileImageAnnotationPoint,
+  container: MobileImageSize,
+  natural: MobileImageSize,
+  transform: MobileImageTransform
+): MobileImageAnnotationPoint | undefined {
+  const rect = mobileAnnotationDisplayRect({
+    containerWidth: container.width,
+    containerHeight: container.height,
+    naturalWidth: natural.width,
+    naturalHeight: natural.height,
+    translateX: transform.translateX,
+    translateY: transform.translateY,
+    scale: transform.scale
+  });
+  return rect ? normalizeMobileAnnotationPoint(point, rect) : undefined;
+}
+
+function strokePointCount(strokes: readonly MobileImageAnnotationStroke[]): number {
+  return strokes.reduce((count, stroke) => count + stroke.points.length, 0);
+}
+
+function imageOutputSuccessMessage(action: MobileImageOutputAction, locale: MobileSupportedLocale): string {
+  return mobileMessage(locale, action === "copy" ? "image.copied"
+    : action === "save" ? "image.saved" : "image.shared");
+}
+
+function cloneStrokes(strokes: readonly MobileImageAnnotationStroke[]): MobileImageAnnotationStroke[] {
+  return strokes.map((stroke) => ({ points: stroke.points.map((point) => ({ ...point })) }));
+}
+
+function annotationStrokesEqual(
+  left: readonly MobileImageAnnotationStroke[],
+  right: readonly MobileImageAnnotationStroke[]
+): boolean {
+  return left.length === right.length && left.every((stroke, index) => {
+    const other = right[index];
+    return other !== undefined && stroke.points.length === other.points.length
+      && stroke.points.every((point, pointIndex) => {
+        const candidate = other.points[pointIndex];
+        return candidate !== undefined && point.x === candidate.x && point.y === candidate.y;
+      });
+  });
+}
+
+function annotationSvgXml(
+  strokes: readonly MobileImageAnnotationStroke[],
+  natural: MobileImageSize
+): string {
+  const strokeWidth = mobileAnnotationStrokeWidth(natural.width, natural.height);
+  const paths = strokes.map((stroke) => {
+    const path = mobileAnnotationStrokePath(stroke, natural.width, natural.height);
+    return `<path d="${path}" fill="none" stroke="${MOBILE_ANNOTATION_OUTLINE_COLOR}" stroke-linecap="round" stroke-linejoin="round" stroke-width="${strokeWidth * MOBILE_ANNOTATION_OUTLINE_RATIO}"/>`
+      + `<path d="${path}" fill="none" stroke="${MOBILE_ANNOTATION_STROKE_COLOR}" stroke-linecap="round" stroke-linejoin="round" stroke-width="${strokeWidth}"/>`;
+  }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${natural.width} ${natural.height}">${paths}</svg>`;
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: "#050607" },
+  header: { minHeight: 64, paddingHorizontal: 12, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 12 },
+  heading: { flex: 1, minWidth: 0 },
+  fileName: { color: "#f7f6f3", fontSize: 16, lineHeight: 21, fontWeight: "700" },
+  meta: { color: "#adb6b7", fontSize: 12, lineHeight: 17 },
+  canvas: { flex: 1, overflow: "hidden" },
+  imagePosition: { position: "absolute" },
+  imageScale: { flex: 1 },
+  image: { position: "absolute", inset: 0 },
+  annotation: { position: "absolute", inset: 0 },
+  loading: { position: "absolute", inset: 0, alignItems: "center", justifyContent: "center" },
+  error: { color: "#ff9c87", paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
+  notice: { color: "#9ed7ad", paddingHorizontal: 16, paddingVertical: 8, fontSize: 14, lineHeight: 20 },
+  toolbar: { minHeight: 64, paddingHorizontal: 10, paddingVertical: 8, flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 8 },
+  pageCount: { color: "#f7f6f3", minHeight: 44, minWidth: 52, textAlign: "center", textAlignVertical: "center",
+    paddingHorizontal: 6, paddingVertical: 12, fontSize: 14, lineHeight: 18, fontWeight: "700" },
+  toolButton: { minHeight: 44, borderWidth: 1, borderColor: "#566064", borderRadius: 22,
+    paddingHorizontal: 14, alignItems: "center", justifyContent: "center", backgroundColor: "#171b1e" },
+  toolSelected: { borderColor: "#ff9800", backgroundColor: "#3c2b14" },
+  toolEmphasized: { borderColor: "#ff9800", backgroundColor: "#ff9800" },
+  toolText: { color: "#f7f6f3", fontSize: 14, lineHeight: 18, fontWeight: "700" },
+  toolEmphasizedText: { color: "#2b2316" },
+  disabled: { opacity: 0.45 },
+  hint: { color: "#adb6b7", paddingHorizontal: 16, paddingBottom: 8, textAlign: "center", fontSize: 12, lineHeight: 17 }
+});

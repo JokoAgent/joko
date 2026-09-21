@@ -64,8 +64,10 @@ function webImportErrors(displayedPath: string, source: string): readonly string
   const errors: string[] = [];
   for (const match of source.matchAll(IMPORT_SPECIFIER_PATTERN)) {
     const specifier = match[1];
-    if (specifier?.startsWith("@joko/") === true && specifier !== "@joko/contracts") {
-      errors.push(`${displayedPath}: Web UI may import only @joko/contracts from workspace packages (found ${specifier})`);
+    if (specifier?.startsWith("@joko/") === true
+      && specifier !== "@joko/contracts"
+      && !specifier.startsWith("@joko/brand-assets/")) {
+      errors.push(`${displayedPath}: Web UI may import only generated contracts or inert brand assets from workspace packages (found ${specifier})`);
     }
   }
   return errors;
