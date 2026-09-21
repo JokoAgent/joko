@@ -1,6 +1,8 @@
 node_modules/
+/.pnpm/
 dist/
 .vite/
+.expo/
 coverage/
 *.tsbuildinfo
 .runtime/

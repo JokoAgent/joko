@@ -15,6 +15,8 @@ import {
   HistoryMaintenance,
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
+  DurableReviewEvidenceProvider,
+  ReviewCoordinator,
   ScheduleCoordinator,
   SessionHost,
   SessionWorktreeCoordinator,
@@ -44,7 +46,7 @@ export interface FixtureOptions {
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
   readonly terminals?: OrchestratorApplication["terminals"];
-  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserSettings" | "browserState">>;
+  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserSettings" | "browserState" | "voiceInput">>;
 }
 
 export class InstrumentedFakeAdapter extends FakeBackendAdapter {
@@ -229,6 +231,12 @@ export class OrchestratorE2eFixture {
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
       worktrees: sessionWorktrees
     });
+    const reviewCoordinator = new ReviewCoordinator({
+      store,
+      runtime: sessionHost,
+      evidence: new DurableReviewEvidenceProvider({ store, workspaces, workspaceChanges, artifacts })
+    });
+    await reviewCoordinator.reconcileStartup();
     await sessionHost.initialize();
     const historyMaintenance = new HistoryMaintenance({
       store,
@@ -325,6 +333,7 @@ export class OrchestratorE2eFixture {
       workspaceChanges,
       sessionWorktrees,
       sessionHost,
+      reviewCoordinator,
       scheduler,
       get adapters() {
         return backendInstances.availableAdapters();
@@ -344,6 +353,7 @@ export class OrchestratorE2eFixture {
         auxiliaryServices?.sshKeys?.close();
         await auxiliaryServices?.remoteHosts?.close();
         await auxiliaryServices?.browser?.stop();
+        await auxiliaryServices?.voiceInput?.close();
         await lanDiscovery.stop();
         await options.terminals?.dispose();
         await sessionHost.dispose();

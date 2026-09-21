@@ -12,8 +12,10 @@ const workspaceRoot = join(fixtureRoot, "workspace");
 const dataDirectory = join(fixtureRoot, "orchestrator-data");
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const explicitCodexExecutable = join(fixtureRoot, "codex.exe");
+const apnsPrivateKey = join(fixtureRoot, "AuthKey_TEST123456.p8");
 mkdirSync(workspaceRoot, { recursive: true });
 writeFileSync(explicitCodexExecutable, "", { flag: "wx" });
+writeFileSync(apnsPrivateKey, "private-key-fixture", { flag: "wx" });
 
 afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
@@ -117,6 +119,33 @@ describe("Orchestrator network configuration", () => {
       codexExecutable: realpathSync.native(explicitCodexExecutable),
       claudeCodeExecutable: "D:/tools/claude.exe"
     });
+  });
+
+  it("enables APNs only from one complete bounded credential configuration", () => {
+    expect(loadConfig(base).mobilePush).toBeUndefined();
+    expect(loadConfig({
+      ...base,
+      JOKO_APNS_TEAM_ID: "TEAM123456",
+      JOKO_APNS_KEY_ID: "KEYS123456",
+      JOKO_APNS_PRIVATE_KEY: apnsPrivateKey,
+      JOKO_APNS_TOPIC: "app.joko.mobile"
+    }).mobilePush).toEqual({
+      apns: {
+        teamId: "TEAM123456",
+        keyId: "KEYS123456",
+        privateKeyPath: resolve(apnsPrivateKey),
+        topic: "app.joko.mobile"
+      }
+    });
+    expect(() => loadConfig({ ...base, JOKO_APNS_TEAM_ID: "TEAM123456" }))
+      .toThrow(/must be configured together/u);
+    expect(() => loadConfig({
+      ...base,
+      JOKO_APNS_TEAM_ID: "TEAM123456",
+      JOKO_APNS_KEY_ID: "KEYS123456",
+      JOKO_APNS_PRIVATE_KEY: apnsPrivateKey,
+      JOKO_APNS_TOPIC: "invalid/topic"
+    })).toThrow(/JOKO_APNS_TOPIC is invalid/u);
   });
 
   it("canonicalizes a default-scheme port without rejecting its own origin", () => {

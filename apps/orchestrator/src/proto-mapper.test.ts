@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { ProviderApiCompatibility, ProviderConfigurationField } from "@joko/contracts";
+import { CapabilitySupport, PermissionMode, ProviderApiCompatibility, ProviderConfigurationField, capabilityNames } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
@@ -116,6 +116,41 @@ describe("proto mapper", () => {
     expect(toProtoBackend({ ...stored, descriptor: withoutProviderSupport }).providerRuntimeSupport).toBeUndefined();
   });
 
+  it("adds Host-owned Queue controls to the public capability manifest", () => {
+    const stored: StoredBackend = {
+      descriptor: {
+        id: "backend-queue-controls",
+        adapterKind: "queue-runtime",
+        instanceGeneration: 1,
+        displayName: "Queue runtime",
+        version: "1.0.0",
+        health: "healthy",
+        installationState: "installed",
+        authenticationState: "authenticated",
+        capabilities: new Map([[capabilityNames.queueEdit, {
+          key: capabilityNames.queueEdit,
+          supported: false,
+          reason: "not_implemented"
+        }]]),
+        models: [],
+        tools: [],
+        diagnostics: []
+      },
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 3n
+    };
+
+    const capabilities = toProtoBackend(stored).capabilities?.capabilities;
+    expect(capabilities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: capabilityNames.queueCancel, support: CapabilitySupport.SUPPORTED }),
+      expect.objectContaining({ name: capabilityNames.queueEdit, support: CapabilitySupport.SUPPORTED }),
+      expect.objectContaining({ name: capabilityNames.queueReorder, support: CapabilitySupport.SUPPORTED })
+    ]));
+    expect(capabilities?.filter((capability) => capability.name === capabilityNames.queueEdit)).toHaveLength(1);
+    expect(stored.descriptor.capabilities.get(capabilityNames.queueEdit)?.supported).toBe(false);
+  });
+
   it("preserves exact runtime resource kinds in the public Backend capability manifest", () => {
     const stored: StoredBackend = {
       descriptor: {
@@ -148,6 +183,77 @@ describe("proto mapper", () => {
         reportsResources: true,
         resourceKinds: ["extension", "skill", "prompt", "package"]
       }
+    });
+  });
+
+  it("projects typed model, permission, and context control options without requiring unrelated string options", () => {
+    const stored: StoredBackend = {
+      descriptor: {
+        id: "backend-runtime-controls",
+        adapterKind: "runtime-controls",
+        instanceGeneration: 1,
+        displayName: "Runtime controls",
+        version: "1.0.0",
+        health: "healthy",
+        installationState: "installed",
+        authenticationState: "authenticated",
+        capabilities: new Map([
+          [capabilityNames.modelList, { key: capabilityNames.modelList, supported: true }],
+          [capabilityNames.modelSwitch, { key: capabilityNames.modelSwitch, supported: true }],
+          [capabilityNames.modelEffort, { key: capabilityNames.modelEffort, supported: true }],
+          [capabilityNames.modelFastMode, { key: capabilityNames.modelFastMode, supported: true }],
+          [capabilityNames.permissionModes, {
+            key: capabilityNames.permissionModes,
+            supported: true,
+            options: ["ask", "auto", "bypassPermissions"]
+          }],
+          [capabilityNames.permissionChange, { key: capabilityNames.permissionChange, supported: true }],
+          [capabilityNames.contextUsage, { key: capabilityNames.contextUsage, supported: true }],
+          [capabilityNames.contextCompact, { key: capabilityNames.contextCompact, supported: true }]
+        ]),
+        models: [],
+        tools: [],
+        diagnostics: []
+      },
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 3n
+    };
+
+    const capabilities = new Map((toProtoBackend(stored).capabilities?.capabilities ?? []).map((capability) => [
+      capability.name,
+      capability
+    ]));
+    expect(capabilities.get(capabilityNames.modelList)?.options?.kind).toMatchObject({
+      case: "model",
+      value: { providerAware: true, switchDuringSession: true, supportsEffort: false, supportsFastMode: false }
+    });
+    expect(capabilities.get(capabilityNames.modelEffort)?.options?.kind).toMatchObject({
+      case: "model",
+      value: { supportsEffort: true }
+    });
+    expect(capabilities.get(capabilityNames.modelFastMode)?.options?.kind).toMatchObject({
+      case: "model",
+      value: { supportsFastMode: true }
+    });
+    expect(capabilities.get(capabilityNames.permissionModes)?.options?.kind).toMatchObject({
+      case: "permission",
+      value: {
+        modes: [PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS],
+        mutableDuringSession: true
+      }
+    });
+    expect(capabilities.get(capabilityNames.permissionChange)?.options?.kind).toMatchObject({
+      case: "permission",
+      value: { modes: [], mutableDuringSession: true }
+    });
+    expect(capabilities.get(capabilityNames.contextUsage)?.options?.kind).toMatchObject({
+      case: "context",
+      value: { reportsBoundary: true, manual: false, automatic: false }
+    });
+    expect(capabilities.get(capabilityNames.contextCompact)?.options?.kind).toMatchObject({
+      case: "context",
+      value: { reportsBoundary: false, manual: true, customInstructions: false }
     });
   });
 

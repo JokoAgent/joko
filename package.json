@@ -18,6 +18,8 @@
     "build:desktop:staged": "pnpm --filter @joko/web build && pnpm stage:desktop:orchestrator-runtime && pnpm --filter @joko/desktop build",
     "build:desktop:unpacked": "pnpm build:desktop:staged && pnpm --filter @joko/desktop package:dir",
     "build:desktop:distribution": "pnpm build:desktop:staged && pnpm --filter @joko/desktop package:artifacts",
+    "build:mobile:android": "pnpm --filter @joko/mobile build:native:android",
+    "build:mobile:ios": "pnpm --filter @joko/mobile build:native:ios",
     "test:desktop:host": "pnpm --filter @joko/desktop test:electron-host",
     "test:desktop:artifact": "pnpm --filter @joko/desktop test:packaged-artifact",
     "test:backend:real:probe": "pnpm test:backend:real:probe:codex && pnpm test:backend:real:probe:claude-code",

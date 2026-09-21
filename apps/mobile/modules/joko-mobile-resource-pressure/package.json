@@ -1,0 +1,9 @@
+{
+  "name": "@joko/mobile-resource-pressure",
+  "version": "0.1.0",
+  "description": "Joko-owned native mobile memory-pressure signal bridge.",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

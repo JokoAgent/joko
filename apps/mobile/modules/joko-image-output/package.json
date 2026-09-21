@@ -1,0 +1,9 @@
+{
+  "name": "@joko/mobile-image-output",
+  "version": "0.1.0",
+  "description": "Joko-owned Android photo-library output for verified mobile images.",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

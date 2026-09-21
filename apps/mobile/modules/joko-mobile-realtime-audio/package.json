@@ -1,0 +1,9 @@
+{
+  "name": "@joko/mobile-realtime-audio",
+  "version": "0.1.0",
+  "description": "Joko-owned foreground-only PCM microphone capture for native voice input.",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

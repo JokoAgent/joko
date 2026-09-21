@@ -12,9 +12,14 @@ afterEach(() => {
 });
 
 describe("source policy boundaries", () => {
-  it("allows the generated contracts as the Web UI workspace dependency", () => {
+  it("allows generated contracts and inert brand assets as Web UI workspace dependencies", () => {
     const root = fixture();
-    source(root, "apps/web/src/view.ts", 'import type { Snapshot } from "@joko/contracts";\nexport type View = Snapshot;\n');
+    source(root, "apps/web/src/view.ts", [
+      'import type { Snapshot } from "@joko/contracts";',
+      'import iconUrl from "@joko/brand-assets/icon-light.svg?url";',
+      'export type View = Snapshot;',
+      'void iconUrl;'
+    ].join("\n"));
 
     expect(checkSourcePolicy({ workspaceRoot: root })).toEqual([]);
   });
@@ -24,7 +29,7 @@ describe("source policy boundaries", () => {
     source(root, "apps/web/src/view.ts", 'import { Store } from "@joko/store";\nvoid Store;\n');
 
     expect(checkSourcePolicy({ workspaceRoot: root })).toEqual([
-      expect.stringContaining("Web UI may import only @joko/contracts")
+      expect.stringContaining("Web UI may import only generated contracts or inert brand assets")
     ]);
   });
 });

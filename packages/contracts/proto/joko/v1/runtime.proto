@@ -120,6 +120,7 @@ enum DeviceKind {
   DEVICE_KIND_WEB = 1;
   DEVICE_KIND_DESKTOP = 2;
   DEVICE_KIND_SERVICE = 3;
+  DEVICE_KIND_MOBILE = 4;
 }
 
 message PairingChallenge {

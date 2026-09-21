@@ -8041,6 +8041,37 @@ describe("SessionHost", () => {
     });
   });
 
+  it("can fence an effect at claim when that effect necessarily advances the fenced entity", async () => {
+    const fixture = await createFixture();
+    const initial = fixture.store.setSetting("service", "global", "claim-fence", { owner: "initial" });
+    let checks = 0;
+
+    const completed = await fixture.host.mutate({
+      operationId: "claim-only-effect-fence",
+      connection: fixture.connection,
+      kind: "claim_only_effect",
+      body: { expectedRevision: initial.revision.toString() },
+      preconditionScope: "claim",
+      precondition: (store) => {
+        checks += 1;
+        const current = store.getSetting("service", "global", "claim-fence");
+        if (current.revision !== initial.revision) {
+          throw new RevisionConflictError("Setting", "claim-fence", initial.revision, current.revision);
+        }
+      },
+      effect: async () => {
+        fixture.store.setSetting("service", "global", "claim-fence", { owner: "effect" });
+      },
+      commit: () => ({ applied: true })
+    });
+
+    expect(completed).toMatchObject({ replayed: false, value: { applied: true } });
+    expect(checks).toBe(1);
+    expect(fixture.store.getSetting("service", "global", "claim-fence").value)
+      .toEqual({ owner: "effect" });
+    expect(fixture.store.getOperation("claim-only-effect-fence").status).toBe("completed");
+  });
+
   it("rejects a Target deletion effect before workspace mutation while product-task creation is in flight", async () => {
     const adapter = new GatedFakeAdapter();
     const fixture = await createFixture(adapter);

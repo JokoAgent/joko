@@ -1,0 +1,9 @@
+{
+  "name": "@joko/incoming-share",
+  "version": "0.1.0",
+  "description": "Joko-owned native inbox for external file and image shares.",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

@@ -2708,7 +2708,7 @@ export interface RemoteConnectionView {
 export interface DeviceView {
   readonly id: string;
   readonly name: string;
-  readonly kind: "web" | "desktop" | "service" | "unknown";
+  readonly kind: "web" | "desktop" | "service" | "mobile" | "unknown";
   readonly platform: string;
   readonly appVersion: string;
   readonly revoked: boolean;

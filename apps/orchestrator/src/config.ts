@@ -36,6 +36,14 @@ export interface OrchestratorConfig {
     readonly executablePath: string;
     readonly headless: boolean;
   };
+  readonly mobilePush?: {
+    readonly apns: {
+      readonly teamId: string;
+      readonly keyId: string;
+      readonly privateKeyPath: string;
+      readonly topic: string;
+    };
+  };
   readonly corsOrigins: readonly string[];
 }
 
@@ -85,6 +93,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     .map((origin) => validateCorsOrigin(origin, allowInsecureLan));
   const browserExecutable = discoverBrowserExecutable(environment);
   const codexExecutable = discoverCodexExecutable(environment);
+  const mobilePush = readMobilePushConfig(environment);
   return {
     host,
     port,
@@ -124,7 +133,38 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
             headless: environment.JOKO_BROWSER_HEADLESS === "1"
           }
         }),
+    ...(mobilePush === undefined ? {} : { mobilePush }),
     corsOrigins
+  };
+}
+
+function readMobilePushConfig(environment: NodeJS.ProcessEnv): OrchestratorConfig["mobilePush"] {
+  const values = {
+    teamId: environment.JOKO_APNS_TEAM_ID?.trim(),
+    keyId: environment.JOKO_APNS_KEY_ID?.trim(),
+    privateKeyPath: environment.JOKO_APNS_PRIVATE_KEY?.trim(),
+    topic: environment.JOKO_APNS_TOPIC?.trim()
+  };
+  const configured = Object.values(values).filter((value) => value !== undefined && value !== "");
+  if (configured.length === 0) return undefined;
+  if (configured.length !== Object.keys(values).length) {
+    throw new Error("JOKO_APNS_TEAM_ID, JOKO_APNS_KEY_ID, JOKO_APNS_PRIVATE_KEY, and JOKO_APNS_TOPIC must be configured together.");
+  }
+  if (!/^[A-Z0-9]{10}$/u.test(values.teamId!) || !/^[A-Z0-9]{10}$/u.test(values.keyId!)) {
+    throw new Error("APNs Team ID and Key ID must be ten uppercase ASCII letters or digits.");
+  }
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$/u.test(values.topic!)) {
+    throw new Error("JOKO_APNS_TOPIC is invalid.");
+  }
+  const privateKeyPath = resolve(values.privateKeyPath!);
+  if (!existsSync(privateKeyPath)) throw new Error("The configured APNs private key does not exist.");
+  return {
+    apns: {
+      teamId: values.teamId!,
+      keyId: values.keyId!,
+      privateKeyPath,
+      topic: values.topic!
+    }
   };
 }
 

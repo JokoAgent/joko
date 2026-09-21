@@ -32,6 +32,7 @@
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@joko/brand-assets": "workspace:*",
     "@joko/web": "workspace:*",
     "@types/node": "24.12.4",
     "electron": "43.6.0",

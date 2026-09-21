@@ -60,9 +60,9 @@
   --purple: #6a5591;
   --purple-soft: #eeeaf5;
   --avatar-icon-bg: #ffffff;
-  --assistant-avatar: url("./avatar-light.svg");
-  --loading-illustration: url("./loading-light.svg");
-  --app-icon: url("./icon-light.svg");
+  --assistant-avatar: url("../../../packages/brand-assets/src/avatar-light.svg");
+  --loading-illustration: url("../../../packages/brand-assets/src/loading-light.svg");
+  --app-icon: url("../../../packages/brand-assets/src/icon-light.svg");
   --connection-bg-start: #fef9ef;
   --connection-bg-mid: #faf0e4;
   --connection-bg-end: #f5f4f3;
@@ -119,9 +119,9 @@
   --purple: #b19add;
   --purple-soft: #302840;
   --avatar-icon-bg: #000000;
-  --assistant-avatar: url("./avatar-dark.svg");
-  --loading-illustration: url("./loading-dark.svg");
-  --app-icon: url("./icon-dark.svg");
+  --assistant-avatar: url("../../../packages/brand-assets/src/avatar-dark.svg");
+  --loading-illustration: url("../../../packages/brand-assets/src/loading-dark.svg");
+  --app-icon: url("../../../packages/brand-assets/src/icon-dark.svg");
   --connection-bg-start: #17130e;
   --connection-bg-mid: #15120f;
   --connection-bg-end: #0d0d0d;
@@ -169,9 +169,9 @@
     --purple: #b19add;
     --purple-soft: #302840;
     --avatar-icon-bg: #000000;
-    --assistant-avatar: url("./avatar-dark.svg");
-    --loading-illustration: url("./loading-dark.svg");
-    --app-icon: url("./icon-dark.svg");
+    --assistant-avatar: url("../../../packages/brand-assets/src/avatar-dark.svg");
+    --loading-illustration: url("../../../packages/brand-assets/src/loading-dark.svg");
+    --app-icon: url("../../../packages/brand-assets/src/icon-dark.svg");
     --connection-bg-start: #17130e;
     --connection-bg-mid: #15120f;
     --connection-bg-end: #0d0d0d;

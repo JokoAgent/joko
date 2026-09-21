@@ -34,6 +34,14 @@ describe("device control gateway", () => {
           appVersion: "1.0.0",
           remoteControlEnabled: false,
           presence: DevicePresenceState.OFFLINE
+        },
+        {
+          deviceId: "phone",
+          displayName: "Phone",
+          kind: DeviceKind.MOBILE,
+          platform: "android",
+          appVersion: "0.1.0",
+          presence: DevicePresenceState.ONLINE
         }
       ],
       deviceControlRelations: [{
@@ -69,6 +77,16 @@ describe("device control gateway", () => {
         revoked: false,
         remoteControlEnabled: false,
         presence: "offline"
+      },
+      {
+        id: "phone",
+        name: "Phone",
+        kind: "mobile",
+        platform: "android",
+        appVersion: "0.1.0",
+        revoked: false,
+        remoteControlEnabled: false,
+        presence: "online"
       }
     ]);
     expect(projected.deviceControlRelations).toEqual([{
