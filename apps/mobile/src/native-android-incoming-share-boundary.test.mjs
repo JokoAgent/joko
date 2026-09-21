@@ -89,6 +89,9 @@ describe("Android incoming-share native boundary", () => {
     expect(store).toContain("digestFile(destination) == expectedDigest");
     expect(store).toContain("writeNewFileAtomically(File(stagingDirectory, MANIFEST_NAME)");
     expect(store).toContain("Os.link(temporary.path, target.path)");
+    expect(store).toContain("OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW");
+    expect(store).toContain("OsConstants.S_ISDIR(Os.fstat(descriptor).st_mode)");
+    expect(store).not.toContain("OsConstants.O_DIRECTORY");
     expect(store).toContain("Os.fsync(descriptor)");
     expect(store).toContain("stagingDirectory.renameTo(finalDirectory)");
     expect(store).toContain("batchDirectories(root).firstOrNull()");

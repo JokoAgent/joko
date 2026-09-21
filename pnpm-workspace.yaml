@@ -2,6 +2,12 @@ packages:
   - apps/*
   - packages/*
 
+# Keep native Windows builds below Ninja's legacy path ceiling. The virtual
+# package path is repeated in CMake object paths, so both the store location
+# and individual directory names must remain short.
+virtualStoreDir: .pnpm
+virtualStoreDirMaxLength: 32
+
 minimumReleaseAge: 10080
 
 minimumReleaseAgeExclude:

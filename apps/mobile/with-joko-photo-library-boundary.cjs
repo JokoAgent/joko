@@ -14,7 +14,11 @@ function enforceAndroidSystemPhotoPickerBoundary(manifest) {
   const writePermission = "android.permission.WRITE_EXTERNAL_STORAGE";
   const permissions = (manifest.manifest["uses-permission"] ?? [])
     .filter((permission) => permission?.$?.["android:name"] !== writePermission);
-  permissions.push({ $: { "android:name": writePermission, "android:maxSdkVersion": "28" } });
+  permissions.push({ $: {
+    "android:name": writePermission,
+    "android:maxSdkVersion": "28",
+    "tools:replace": "android:maxSdkVersion"
+  } });
   manifest.manifest["uses-permission"] = permissions;
   return manifest;
 }

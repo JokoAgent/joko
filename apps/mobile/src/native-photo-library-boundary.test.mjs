@@ -32,7 +32,8 @@ describe("native photo-library config boundary", () => {
       { $: { "android:name": "android.permission.INTERNET" } },
       { $: {
         "android:name": "android.permission.WRITE_EXTERNAL_STORAGE",
-        "android:maxSdkVersion": "28"
+        "android:maxSdkVersion": "28",
+        "tools:replace": "android:maxSdkVersion"
       } }
     ]);
   });

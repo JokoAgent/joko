@@ -19,6 +19,7 @@
     },
     "ios": {
       "bundleIdentifier": "app.joko.mobile",
+      "buildNumber": "1",
       "supportsTablet": true,
       "entitlements": {
         "aps-environment": "production",
@@ -35,6 +36,7 @@
     },
     "android": {
       "package": "app.joko.mobile",
+      "versionCode": 1,
       "blockedPermissions": [
         "android.permission.ACCESS_MEDIA_LOCATION",
         "android.permission.READ_EXTERNAL_STORAGE",

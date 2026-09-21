@@ -941,8 +941,11 @@ internal object IncomingShareStore {
   }
 
   private fun syncDirectory(directory: File) {
-    val descriptor = Os.open(directory.path, OsConstants.O_RDONLY or OsConstants.O_DIRECTORY, 0)
+    val descriptor = Os.open(directory.path, OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW, 0)
     try {
+      require(OsConstants.S_ISDIR(Os.fstat(descriptor).st_mode)) {
+        "The Android incoming-share sync path is not a directory."
+      }
       Os.fsync(descriptor)
     } finally {
       Os.close(descriptor)

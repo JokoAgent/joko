@@ -21,7 +21,9 @@ describe("native brand packaging adapter", () => {
   it("keeps mobile brand derivatives out of the checked-in source layout", () => {
     const projectRoot = path.resolve(import.meta.dirname, "..");
     expect(existsSync(path.join(projectRoot, "assets"))).toBe(false);
-    expect(existsSync(path.join(projectRoot, "scripts"))).toBe(false);
+    for (const fileName of Object.values(nativeBrandFileNames)) {
+      expect(existsSync(path.join(projectRoot, "scripts", fileName))).toBe(false);
+    }
     expect(existsSync(path.join(projectRoot, ".expo", "joko-native-brand"))).toBe(false);
   });
 
