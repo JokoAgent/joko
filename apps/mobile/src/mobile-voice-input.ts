@@ -7,6 +7,10 @@ import {
   type VoiceInputCapabilityProfile as ProtoVoiceInputCapabilityProfile,
   type VoiceInputSession as ProtoVoiceInputSession
 } from "@joko/contracts";
+import type {
+  MobileVoiceDictionaryAdviceDraft,
+  MobileVoiceDictionaryLearningAction
+} from "./mobile-voice-dictionary";
 
 const TERMINAL_POLL_INTERVAL_MS = 180;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -60,12 +64,27 @@ export interface MobileVoiceSession {
   readonly stallWarning: boolean;
 }
 
+export interface MobileVoiceRefinementContext {
+  readonly instructions?: string;
+  readonly dictionaryTerms: readonly string[];
+}
+
 export interface MobileVoiceTransport {
   readonly profileId: string;
   readonly surfaceOwnerKey: string;
   isCurrent(): boolean;
   getCapabilities(signal?: AbortSignal): Promise<MobileVoiceCapability>;
-  start(requestId: string, mimeType: string, locale?: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
+  adviseVoiceInputDictionaryEdit(
+    draft: MobileVoiceDictionaryAdviceDraft,
+    signal?: AbortSignal
+  ): Promise<{ readonly actions: readonly MobileVoiceDictionaryLearningAction[] }>;
+  start(
+    requestId: string,
+    mimeType: string,
+    locale?: string,
+    refinement?: MobileVoiceRefinementContext,
+    signal?: AbortSignal
+  ): Promise<MobileVoiceSession>;
   append(
     voiceInputId: string,
     chunkSequence: bigint,
@@ -141,6 +160,8 @@ export interface MobileVoiceRunOptions {
   readonly capture: MobileVoiceCaptureRuntime;
   readonly requestId: () => string;
   readonly locale?: string;
+  readonly refinement?: MobileVoiceRefinementContext;
+  readonly onCapability?: (capability: MobileVoiceCapability) => void;
   readonly onUpdate?: (update: MobileVoiceRunUpdate) => void;
   readonly onCaptureStopped?: () => void;
   readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
@@ -153,6 +174,8 @@ export class MobileVoiceInputRun {
   readonly #capture: MobileVoiceCaptureRuntime;
   readonly #requestId: () => string;
   readonly #locale: string | undefined;
+  readonly #refinement: MobileVoiceRefinementContext | undefined;
+  readonly #onCapability: (capability: MobileVoiceCapability) => void;
   readonly #onUpdate: (update: MobileVoiceRunUpdate) => void;
   readonly #onCaptureStopped: () => void;
   readonly #setTimer: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
@@ -181,6 +204,8 @@ export class MobileVoiceInputRun {
     this.#capture = options.capture;
     this.#requestId = options.requestId;
     this.#locale = options.locale;
+    this.#refinement = options.refinement;
+    this.#onCapability = options.onCapability ?? (() => undefined);
     this.#onUpdate = options.onUpdate ?? (() => undefined);
     this.#onCaptureStopped = options.onCaptureStopped ?? (() => undefined);
     this.#setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
@@ -210,6 +235,8 @@ export class MobileVoiceInputRun {
       this.#assertOwner();
       const capability = await this.#transport.getCapabilities(abort.signal);
       if (!this.#isCurrent(generation, abort)) throw new MobileVoiceRunError("cancelled");
+      try { this.#onCapability(capability); }
+      catch { /* Local capability observation cannot fail microphone capture. */ }
       if (!supportsMobileVoiceCapture(capability, this.#capture.isAvailable())) {
         throw new MobileVoiceRunError("unsupported");
       }
@@ -224,7 +251,8 @@ export class MobileVoiceInputRun {
       const requestId = this.#requestId();
       if (!IDENTIFIER_PATTERN.test(requestId)) throw new MobileVoiceRunError("serviceUnavailable");
       const locale = capability.supportsLocale ? normalizeMobileVoiceLocale(this.#locale, capability) : undefined;
-      const sessionPromise = this.#transport.start(requestId, "audio/pcm", locale, abort.signal).then(async (session) => {
+      const refinement = capability.supportsRefinement ? this.#refinement : undefined;
+      const sessionPromise = this.#transport.start(requestId, "audio/pcm", locale, refinement, abort.signal).then(async (session) => {
         if (!this.#isCurrent(generation, abort)) {
           await this.#transport.cancel(session.id).catch(() => undefined);
           throw new MobileVoiceRunError("cancelled");

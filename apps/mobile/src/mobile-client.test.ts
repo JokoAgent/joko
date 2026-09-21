@@ -971,6 +971,7 @@ function fakeNetwork(): MobileNetwork {
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
     uploadBlob: vi.fn(async () => { throw new Error("No Blob upload fixture was configured."); }),
     getVoiceInputCapabilities: vi.fn(async () => { throw new Error("No Voice capability fixture was configured."); }),
+    adviseVoiceInputDictionaryEdit: vi.fn(async () => ({ actions: [] })),
     startVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
     appendVoiceAudio: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
     stopVoiceInput: vi.fn(async () => { throw new Error("No Voice session fixture was configured."); }),
@@ -2003,14 +2004,24 @@ describe("native mobile connection and operation ownership", () => {
     expect(newTaskVoice).toBeDefined();
     expect(newTaskVoice?.isCurrent()).toBe(true);
     await expect(newTaskVoice!.getCapabilities()).resolves.toBe(voiceCapability);
-    await expect(newTaskVoice!.start("request-one", "audio/pcm", "en-US")).resolves.toBe(voiceSession);
+    const refinement = { instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit"] };
+    await expect(newTaskVoice!.start("request-one", "audio/pcm", "en-US", refinement)).resolves.toBe(voiceSession);
     expect(network.startVoiceInput).toHaveBeenCalledWith(
       credential,
       "request-one",
       "audio/pcm",
       "en-US",
+      refinement,
       undefined
     );
+    const adviceDraft = {
+      beforeText: "voice kit",
+      afterText: "VoiceKit",
+      existingEntries: [],
+      existingCandidates: []
+    };
+    await expect(newTaskVoice!.adviseVoiceInputDictionaryEdit(adviceDraft)).resolves.toEqual({ actions: [] });
+    expect(network.adviseVoiceInputDictionaryEdit).toHaveBeenCalledWith(credential, adviceDraft, undefined);
 
     await app.select("session");
     const taskVoice = app.taskVoiceTransport();

@@ -24,6 +24,11 @@ import {
   type MobileSupportedLocale
 } from "./mobile-locale-preference";
 import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
+import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
+import type {
+  MobileVoiceDictionaryEditOutcome,
+  MobileVoiceDictionaryStoreState
+} from "./mobile-voice-dictionary-store";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -46,12 +51,20 @@ export interface MobileSettingsScreenProps {
   readonly theme: MobileThemePreferenceState;
   readonly locale: MobileLocalePreferenceState;
   readonly diagnostics: MobileDiagnosticsState;
+  readonly voiceDictionary: MobileVoiceDictionaryStoreState;
   readonly client: MobileSettingsClient;
   readonly onThemeChange: (preference: MobileThemePreference) => Promise<void>;
   readonly onLocaleChange: (preference: MobileLocalePreference) => Promise<void>;
   readonly onDiagnosticsEnabledChange: (enabled: boolean) => Promise<void>;
   readonly onDiagnosticsClear: () => Promise<void>;
   readonly onDiagnosticsExport: () => Promise<void>;
+  readonly onVoiceDictionaryRetry: () => Promise<void>;
+  readonly onVoiceDictionaryReset: () => Promise<void>;
+  readonly onVoiceInstructionsChange: (value: string) => Promise<void>;
+  readonly onVoiceAutoLearningChange: (enabled: boolean) => Promise<void>;
+  readonly onVoiceDictionaryAdd: (value: string) => Promise<void>;
+  readonly onVoiceDictionaryEdit: (id: string, text: string, aliases: string) => Promise<MobileVoiceDictionaryEditOutcome>;
+  readonly onVoiceDictionaryDelete: (id: string) => Promise<void>;
   readonly onBack: () => void;
   readonly onConnections: () => void;
   readonly onDevices: () => void;
@@ -88,9 +101,10 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
   };
 }
 
-export function MobileSettingsScreen({ colors, state, foreground, theme, locale, diagnostics, client, onThemeChange,
+export function MobileSettingsScreen({ colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
   onLocaleChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
-  onConnections, onDevices, appVersion }: MobileSettingsScreenProps) {
+  onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange, onVoiceDictionaryAdd,
+  onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, appVersion }: MobileSettingsScreenProps) {
   const current = resolveMobileSettingsCurrentDevice(state);
   const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
     mobileMessage(locale.effectiveLocale, key, variables);
@@ -101,6 +115,7 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
   const [localError, setLocalError] = useState("");
   const [notice, setNotice] = useState("");
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
   const saveGeneration = useRef(0);
   const unknownReceiptSeen = useRef(false);
   const currentOwnerKey = current?.ownerKey;
@@ -232,6 +247,13 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
     }
   };
 
+  if (voiceOpen) return <MobileVoiceDictionaryScreen colors={colors} locale={locale.effectiveLocale}
+    state={voiceDictionary} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
+    onReset={onVoiceDictionaryReset}
+    onSetInstructions={onVoiceInstructionsChange} onSetAutoLearning={onVoiceAutoLearningChange}
+    onAddTerm={onVoiceDictionaryAdd} onEditEntry={onVoiceDictionaryEdit}
+    onDeleteEntry={onVoiceDictionaryDelete} />;
+
   if (editor) {
     const editable = canRename && editor.ownerKey === currentOwnerKey;
     return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}
@@ -286,6 +308,10 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, locale,
         onPress={() => void changeLocale(preference)} />)}
     </View>
     {locale.error && <ErrorNotice colors={colors} text={t("settings.language.error")} />}
+
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.voice.title")}</Text>
+    <NavigationRow label={t("settings.voice.title")} description={t("settings.voice.navigation")}
+      colors={colors} onPress={() => { setLocalError(""); setNotice(""); setVoiceOpen(true); }} />
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.currentNode")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>

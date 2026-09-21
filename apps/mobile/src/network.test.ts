@@ -17,6 +17,10 @@ import {
   SessionResourceSchema,
   TextFilePreviewSchema,
   TransferDirection,
+  VoiceInputDictionaryEntrySource,
+  VoiceInputDictionaryLearningActionType,
+  VoiceInputDictionaryLearningConfidence,
+  VoiceInputDictionaryTermType,
   WorkspaceEntrySchema,
   WorkspaceSearchMatchSchema
 } from "@joko/contracts";
@@ -37,8 +41,96 @@ import {
   collectWorkspaceSearchPages,
   downloadVerifiedBlob,
   uploadVerifiedBlob,
-  validateScheduleHistoryPage
+  validateScheduleHistoryPage,
+  mobileVoiceNetworkTesting
 } from "./network";
+
+describe("mobile voice ephemeral requests", () => {
+  it("projects device-local evidence and refinement without adding a durable shape", () => {
+    expect(mobileVoiceNetworkTesting.adviceRequest({
+      beforeText: "voice kit",
+      afterText: "VoiceKit",
+      rawTranscriptText: "voice kid",
+      locale: "en-US",
+      existingEntries: [{ term: "Existing", source: "automatic", frequency: 2,
+        aliases: [{ text: "existing", count: 1 }] }],
+      existingCandidates: [{ term: "Candidate", evidenceCount: 3, aliases: [] }]
+    })).toEqual({
+      beforeText: "voice kit",
+      afterText: "VoiceKit",
+      rawTranscriptText: "voice kid",
+      locale: "en-US",
+      existingEntries: [{ term: "Existing", source: VoiceInputDictionaryEntrySource.AUTOMATIC, frequency: 2,
+        aliases: [{ text: "existing", count: 1 }] }],
+      existingCandidates: [{ term: "Candidate", evidenceCount: 3, aliases: [] }]
+    });
+    expect(mobileVoiceNetworkTesting.startRequest("request", "audio/pcm", "en-US", {
+      instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
+    })).toEqual({
+      requestId: "request", mimeType: "audio/pcm", locale: "en-US",
+      refinementInstructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit", "Joko"]
+    });
+    expect(mobileVoiceNetworkTesting.startRequest("request", "audio/pcm", undefined, undefined))
+      .toEqual({ requestId: "request", mimeType: "audio/pcm", dictionaryTerms: [] });
+  });
+
+  it("fails closed on malformed or unspecified advisor actions", () => {
+    expect(mobileVoiceNetworkTesting.projectAction({
+      action: VoiceInputDictionaryLearningActionType.ADD_ENTRY,
+      term: " VoiceKit ",
+      aliases: [" voice kit "],
+      termType: VoiceInputDictionaryTermType.PRODUCT_NAME,
+      confidence: VoiceInputDictionaryLearningConfidence.HIGH
+    })).toEqual({
+      action: "addEntry", term: "VoiceKit", aliases: ["voice kit"], type: "productName", confidence: "high"
+    });
+    expect(() => mobileVoiceNetworkTesting.projectAction({
+      action: VoiceInputDictionaryLearningActionType.UNSPECIFIED,
+      term: "VoiceKit",
+      aliases: ["voice kit"],
+      termType: VoiceInputDictionaryTermType.PRODUCT_NAME,
+      confidence: VoiceInputDictionaryLearningConfidence.HIGH
+    })).toThrow(/unspecified voice dictionary action/i);
+    expect(() => mobileVoiceNetworkTesting.projectAction({
+      action: VoiceInputDictionaryLearningActionType.ADD_ENTRY,
+      term: "VoiceKit",
+      aliases: [],
+      termType: VoiceInputDictionaryTermType.PRODUCT_NAME,
+      confidence: VoiceInputDictionaryLearningConfidence.HIGH
+    })).toThrow(/invalid voice dictionary aliases/i);
+    expect(() => mobileVoiceNetworkTesting.projectAction({
+      action: 99 as VoiceInputDictionaryLearningActionType,
+      term: "VoiceKit",
+      aliases: ["voice kit"],
+      termType: VoiceInputDictionaryTermType.PRODUCT_NAME,
+      confidence: VoiceInputDictionaryLearningConfidence.HIGH
+    })).toThrow(/invalid voice dictionary action/i);
+    expect(() => mobileVoiceNetworkTesting.adviceRequest({
+      beforeText: "b".repeat(2_001), afterText: "VoiceKit", existingEntries: [], existingCandidates: []
+    })).toThrow(/ephemeral request limit/i);
+  });
+
+  it("accepts only bounded advisor actions grounded in the exact correction", () => {
+    const draft = {
+      beforeText: "Use voice kit today", afterText: "Use VoiceKit today",
+      rawTranscriptText: "use voice kid today", existingEntries: [], existingCandidates: []
+    } as const;
+    const action = {
+      action: VoiceInputDictionaryLearningActionType.ADD_ENTRY,
+      term: "VoiceKit",
+      aliases: ["voice kit"],
+      termType: VoiceInputDictionaryTermType.PRODUCT_NAME,
+      confidence: VoiceInputDictionaryLearningConfidence.HIGH
+    } as const;
+    expect(mobileVoiceNetworkTesting.projectAdvice([action], draft)).toMatchObject([{ term: "VoiceKit" }]);
+    expect(() => mobileVoiceNetworkTesting.projectAdvice([{ ...action, term: "Other" }], draft))
+      .toThrow(/ungrounded voice dictionary evidence/i);
+    expect(() => mobileVoiceNetworkTesting.projectAdvice([{ ...action, aliases: ["unheard"] }], draft))
+      .toThrow(/ungrounded voice dictionary evidence/i);
+    expect(() => mobileVoiceNetworkTesting.projectAdvice([action, action, action, action], draft))
+      .toThrow(/too many voice dictionary actions/i);
+  });
+});
 
 function matches(count: number, offset = 0) {
   return Array.from({ length: count }, (_, index) => create(SessionMessageSearchMatchSchema, {

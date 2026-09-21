@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState } from "react-native";
 import {
   cloneMobileComposerDraft,
@@ -26,6 +26,13 @@ import {
   prewarmMobileRealtimeAudio
 } from "./mobile-realtime-audio";
 import { playMobileVoiceInputEndCue } from "./mobile-voice-cue";
+import { mobileVoiceDictionary } from "./storage";
+import {
+  MobileVoiceDictionaryLearningController,
+  createMobileVoiceInsertedEditTracker
+} from "./mobile-voice-dictionary-learning";
+import { mobileVoiceDictionaryTermsForRefinement } from "./mobile-voice-dictionary";
+import type { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
 
 export interface UseMobileVoiceInputOptions {
   readonly transport?: MobileVoiceTransport;
@@ -38,6 +45,8 @@ export interface UseMobileVoiceInputOptions {
   readonly requestId: () => string;
   readonly capture?: MobileVoiceCaptureRuntime;
   readonly locale?: string;
+  readonly isComposing?: boolean;
+  readonly dictionaryStore?: MobileVoiceDictionaryStore;
 }
 
 export interface MobileVoiceInputBinding {
@@ -56,6 +65,7 @@ export interface MobileVoiceInputBinding {
 
 export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): MobileVoiceInputBinding {
   const capture = options.capture ?? mobileVoiceCaptureRuntime;
+  const dictionaryStore = options.dictionaryStore ?? mobileVoiceDictionary;
   const [available, setAvailable] = useState(false);
   const [checking, setChecking] = useState(false);
   const [state, setState] = useState<MobileVoiceRunState>("idle");
@@ -70,10 +80,26 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   const onErrorRef = useRef(options.onError);
   const requestIdRef = useRef(options.requestId);
   const localeRef = useRef(options.locale);
+  const composingRef = useRef(options.isComposing ?? false);
   const runRef = useRef<MobileVoiceInputRun | undefined>(undefined);
   const insertionRef = useRef<MobileVoiceDraftInsertionContext | undefined>(undefined);
   const baseDraftRef = useRef<MobileComposerDraft | undefined>(undefined);
   const baseSelectionRef = useRef<MobileComposerSelection | undefined>(undefined);
+  const usageSessionRef = useRef<string | undefined>(undefined);
+  const refinementSupportedRef = useRef(false);
+  const learning = useMemo(() => new MobileVoiceDictionaryLearningController({
+    store: dictionaryStore,
+    readAdvisor: () => {
+      const transport = transportRef.current;
+      return transport?.isCurrent() ? transport : undefined;
+    },
+    readOwnerKey: () => {
+      const transport = transportRef.current;
+      return transport?.isCurrent() ? transport.surfaceOwnerKey : undefined;
+    },
+    readLocale: () => localeRef.current,
+    readDraftText: () => readDraftRef.current().text
+  }), [dictionaryStore]);
   const ownerKey = options.transport?.surfaceOwnerKey;
   transportRef.current = options.transport;
   enabledRef.current = options.enabled;
@@ -84,6 +110,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   onErrorRef.current = options.onError;
   requestIdRef.current = options.requestId;
   localeRef.current = options.locale;
+  composingRef.current = options.isComposing ?? false;
 
   const rollbackInsertion = useCallback((persist = false): void => {
     const context = insertionRef.current;
@@ -134,6 +161,10 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     setState(update.state);
     setError(update.error);
     const session = update.session;
+    if (session !== undefined && usageSessionRef.current !== session.id) {
+      usageSessionRef.current = session.id;
+      void dictionaryStore.recordVoiceStart().catch(() => undefined);
+    }
     const terminal = session?.outcome !== undefined || session?.state === "done" || session?.state === "error";
     const keepTranscript = session?.outcome === "success" || session?.failure?.transcriptKept === true;
     const transcript = session?.result?.text ?? session?.draft?.text;
@@ -148,6 +179,23 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
           const caret = context.insertion.end;
           writeDraftRef.current(current, { start: caret, end: caret }, true);
         }
+        const finalDraft = readDraftRef.current();
+        const dictionary = dictionaryStore.snapshot;
+        const tracker = refinementSupportedRef.current && dictionary.status === "ready"
+          && isMobileVoiceInsertionIntact(finalDraft.text, context.insertion)
+          ? createMobileVoiceInsertedEditTracker({
+            ownerKey: expectedOwnerKey,
+            ...(localeRef.current === undefined ? {} : { locale: localeRef.current }),
+            draft: finalDraft.text,
+            start: context.insertion.start,
+            end: context.insertion.end,
+            insertedText: context.insertion.text,
+            beforeText: session?.result?.text ?? session?.draft?.text ?? context.insertion.text,
+            ...(session?.result?.rawTranscriptText === undefined
+              ? {} : { rawTranscriptText: session.result.rawTranscriptText }),
+            dictionaryRevision: dictionary.document.dictionaryRevision
+          }) : undefined;
+        if (tracker) learning.track(tracker);
       }
       // A kept terminal transcript is ordinary composer content. Retire the
       // temporary rollback range so a later voice run cannot remove it.
@@ -156,10 +204,17 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       baseSelectionRef.current = undefined;
     }
     if (update.state === "cancelled" || (update.state === "error" && !terminal) || (terminal && !keepTranscript)) {
+      learning.clear();
       rollbackInsertion(false);
     }
     if (update.error !== undefined) onErrorRef.current(update.error.message);
-  }, [applyTranscript, rollbackInsertion]);
+  }, [applyTranscript, dictionaryStore, learning, rollbackInsertion]);
+
+  useEffect(() => {
+    learning.observe(readDraftRef.current().text, composingRef.current);
+  });
+
+  useEffect(() => () => learning.dispose(), [learning]);
 
   useEffect(() => {
     const transport = options.transport;
@@ -193,9 +248,12 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       void run.dispose();
     }
     rollbackInsertion(false);
+    learning.clear();
+    usageSessionRef.current = undefined;
+    refinementSupportedRef.current = false;
     setState("idle");
     setError(undefined);
-  }, [ownerKey, options.draftOwnerKey, options.enabled, rollbackInsertion]);
+  }, [learning, ownerKey, options.draftOwnerKey, options.enabled, rollbackInsertion]);
 
   useEffect(() => {
     if (state !== "listening") { setElapsedSeconds(0); return; }
@@ -227,20 +285,34 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     if (!transport || !draftOwnerKey || !enabledRef.current || !available || runRef.current?.currentState === "starting"
       || runRef.current?.currentState === "listening" || runRef.current?.currentState === "submitting") return;
     rollbackInsertion(false);
+    learning.clear();
+    usageSessionRef.current = undefined;
+    refinementSupportedRef.current = false;
+    await dictionaryStore.hydrate().catch(() => undefined);
+    if (transportRef.current !== transport || !transport.isCurrent()
+      || draftOwnerKeyRef.current !== draftOwnerKey || !enabledRef.current) return;
     baseDraftRef.current = cloneMobileComposerDraft(readDraftRef.current());
     baseSelectionRef.current = { ...readSelectionRef.current() };
     setError(undefined);
+    const dictionary = dictionaryStore.snapshot;
+    const refinement = dictionary.status === "ready" ? {
+      ...(dictionary.document.refinementInstructions === ""
+        ? {} : { instructions: dictionary.document.refinementInstructions }),
+      dictionaryTerms: mobileVoiceDictionaryTermsForRefinement(dictionary.document.dictionary)
+    } : undefined;
     const run = new MobileVoiceInputRun({
       transport,
       capture,
       requestId: () => requestIdRef.current(),
       locale: localeRef.current,
+      ...(refinement === undefined ? {} : { refinement }),
+      onCapability: (capability) => { refinementSupportedRef.current = capability.supportsRefinement; },
       onCaptureStopped: playMobileVoiceInputEndCue,
       onUpdate: (update) => handleUpdate(update, transport.surfaceOwnerKey, draftOwnerKey)
     });
     runRef.current = run;
     await run.start().catch(() => undefined);
-  }, [available, capture, handleUpdate, rollbackInsertion]);
+  }, [available, capture, dictionaryStore, handleUpdate, learning, rollbackInsertion]);
 
   const stop = useCallback(async (): Promise<void> => {
     await runRef.current?.stop().catch(() => undefined);
@@ -250,8 +322,9 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     const run = runRef.current;
     if (!run) return;
     await run.cancel();
+    learning.clear();
     rollbackInsertion(false);
-  }, [rollbackInsertion]);
+  }, [learning, rollbackInsertion]);
 
   const toggle = useCallback(async (): Promise<void> => {
     const current = runRef.current?.currentState;

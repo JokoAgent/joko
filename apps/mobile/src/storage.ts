@@ -12,6 +12,7 @@ import { MobileOfflineCache } from "./mobile-offline-cache";
 import { MobileThemePreferenceStore } from "./mobile-theme-preference";
 import { MobileDiagnosticsStore } from "./mobile-diagnostics";
 import { MobileLocalePreferenceStore } from "./mobile-locale-preference";
+import { MobileVoiceDictionaryStore } from "./mobile-voice-dictionary-store";
 
 const plainStorage = {
   getItem: (key: string) => AsyncStorage.getItem(key),
@@ -31,6 +32,7 @@ export const mobileOfflineCache = new MobileOfflineCache(plainStorage, Date.now,
 export const mobileThemePreferences = new MobileThemePreferenceStore(plainStorage);
 export const mobileDiagnostics = new MobileDiagnosticsStore(plainStorage, undefined, Date.now, randomUUID);
 export const mobileLocalePreferences = new MobileLocalePreferenceStore(plainStorage);
+export const mobileVoiceDictionary = new MobileVoiceDictionaryStore(plainStorage, Date.now, randomUUID);
 
 export const mobileStorage = createMobileStorage(
   plainStorage,

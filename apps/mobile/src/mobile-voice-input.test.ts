@@ -119,9 +119,40 @@ describe("MobileVoiceInputRun", () => {
       "request-locale",
       "audio/pcm",
       "zh-TW",
+      undefined,
       expect.any(AbortSignal)
     );
     await run.cancel();
+  });
+
+  it("sends bounded refinement context only when the exact capability supports it", async () => {
+    const refinement = { instructions: "Keep commands verbatim.", dictionaryTerms: ["VoiceKit"] };
+    const supported = fakeTransport();
+    const supportedRun = new MobileVoiceInputRun({
+      transport: supported,
+      capture: fakeCapture(),
+      requestId: () => "request-refinement",
+      refinement
+    });
+    await supportedRun.start();
+    expect(supported.start).toHaveBeenCalledWith(
+      "request-refinement", "audio/pcm", undefined, refinement, expect.any(AbortSignal)
+    );
+    await supportedRun.cancel();
+
+    const unsupported = fakeTransport();
+    unsupported.getCapabilities.mockResolvedValue({ ...capability, supportsRefinement: false });
+    const unsupportedRun = new MobileVoiceInputRun({
+      transport: unsupported,
+      capture: fakeCapture(),
+      requestId: () => "request-no-refinement",
+      refinement
+    });
+    await unsupportedRun.start();
+    expect(unsupported.start).toHaveBeenCalledWith(
+      "request-no-refinement", "audio/pcm", undefined, undefined, expect.any(AbortSignal)
+    );
+    await unsupportedRun.cancel();
   });
 
   it("keeps startup-stop race safe and fences stop behind the exact next sequence", async () => {
@@ -439,6 +470,7 @@ function voiceSession(patch: Partial<MobileVoiceSession> = {}): MobileVoiceSessi
 
 type FakeVoiceTransport = MobileVoiceTransport & {
   getCapabilities: ReturnType<typeof vi.fn>;
+  adviseVoiceInputDictionaryEdit: ReturnType<typeof vi.fn>;
   start: ReturnType<typeof vi.fn>;
   append: ReturnType<typeof vi.fn>;
   stop: ReturnType<typeof vi.fn>;
@@ -452,6 +484,7 @@ function fakeTransport(isCurrent: () => boolean = () => true): FakeVoiceTranspor
     surfaceOwnerKey: "owner-one",
     isCurrent,
     getCapabilities: vi.fn(async () => capability),
+    adviseVoiceInputDictionaryEdit: vi.fn(async () => ({ actions: [] })),
     start: vi.fn(async () => voiceSession()),
     append: vi.fn(),
     stop: vi.fn(async () => voiceSession({ state: "done", outcome: "noSpeech" })),

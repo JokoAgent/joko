@@ -23,6 +23,8 @@ import {
 import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
+import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
+import type { MobileVoiceDictionaryStoreState } from "./mobile-voice-dictionary-store";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -213,6 +215,20 @@ const readyDiagnostics: MobileDiagnosticsState = {
   exporting: false,
   eventCount: 0
 };
+const readyVoiceDictionary: MobileVoiceDictionaryStoreState = {
+  status: "ready",
+  saving: false,
+  document: {
+    version: 1,
+    revision: 0,
+    dictionaryRevision: 0,
+    refinementInstructions: "",
+    autoLearningEnabled: true,
+    dictionary: EMPTY_MOBILE_VOICE_DICTIONARY,
+    usage: { voiceStarts: 0, correctionObservations: 0, lastVoiceStartedAt: null, lastCorrectionAt: null },
+    history: []
+  }
+};
 
 let root: Root | undefined;
 
@@ -230,6 +246,7 @@ function mount(options: {
   theme?: MobileThemePreferenceState;
   locale?: MobileLocalePreferenceState;
   diagnostics?: MobileDiagnosticsState;
+  voiceDictionary?: MobileVoiceDictionaryStoreState;
   client?: MobileSettingsClient;
 } = {}) {
   const container = document.createElement("div");
@@ -247,6 +264,7 @@ function mount(options: {
   let theme = options.theme ?? readyTheme;
   let locale = options.locale ?? readyLocale;
   let diagnostics = options.diagnostics ?? readyDiagnostics;
+  let voiceDictionary = options.voiceDictionary ?? readyVoiceDictionary;
   const render = () => createElement(MobileSettingsScreen, {
     colors,
     state,
@@ -254,12 +272,20 @@ function mount(options: {
     theme,
     locale,
     diagnostics,
+    voiceDictionary,
     client,
     onThemeChange,
     onLocaleChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
+    onVoiceDictionaryRetry: vi.fn(async () => undefined),
+    onVoiceDictionaryReset: vi.fn(async () => undefined),
+    onVoiceInstructionsChange: vi.fn(async () => undefined),
+    onVoiceAutoLearningChange: vi.fn(async () => undefined),
+    onVoiceDictionaryAdd: vi.fn(async () => undefined),
+    onVoiceDictionaryEdit: vi.fn(async () => "updated" as const),
+    onVoiceDictionaryDelete: vi.fn(async () => undefined),
     onBack,
     onConnections,
     onDevices,
@@ -280,12 +306,13 @@ function mount(options: {
     onDevices,
     rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
       locale?: MobileLocalePreferenceState;
-      diagnostics?: MobileDiagnosticsState }) => {
+      diagnostics?: MobileDiagnosticsState; voiceDictionary?: MobileVoiceDictionaryStoreState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
       theme = next.theme ?? theme;
       locale = next.locale ?? locale;
       diagnostics = next.diagnostics ?? diagnostics;
+      voiceDictionary = next.voiceDictionary ?? voiceDictionary;
       act(() => root!.render(render()));
     }
   };
@@ -324,6 +351,11 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.container.textContent).toContain("1.4.0");
     expect(mounted.container.textContent).toContain("joko.v1");
     expect(mounted.container.textContent).toContain("0.1.0-test");
+
+    act(() => button(mounted.container, "Voice input").click());
+    expect(mounted.container.textContent).toContain("These instructions, entries, correction evidence");
+    act(() => button(mounted.container, "Back to Voice input").click());
+    expect(mounted.container.textContent).toContain("Settings");
 
     await act(async () => button(mounted.container, "Dark appearance").click());
     expect(mounted.onThemeChange).toHaveBeenCalledWith("dark");

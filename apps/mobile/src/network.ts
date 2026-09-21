@@ -2,7 +2,10 @@ import { Code, ConnectError, createClient, type Interceptor, type Transport } fr
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, OperationService, OperationState,
-  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, WorktreeEligibility, WorktreeService,
+  ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService,
+  VoiceInputDictionaryEntrySource, VoiceInputDictionaryLearningActionType,
+  VoiceInputDictionaryLearningConfidence, VoiceInputDictionaryTermType,
+  WorktreeEligibility, WorktreeService,
   TransferDirection, WorkspaceEntryListingPolicy, WorkspaceFileChangeKind, WorkspaceService,
   JOKO_API_VERSION, SessionMessageSearchSemanticMode, SessionMessageSearchSessionStatus,
   isPrivateLanDiscoveryHost, validateDiscoveredNode,
@@ -25,6 +28,12 @@ import {
   type MobileVoiceCapability,
   type MobileVoiceSession
 } from "./mobile-voice-input";
+import {
+  MAXIMUM_MOBILE_VOICE_ADVICE_TEXT_CHARACTERS,
+  type MobileVoiceDictionaryAdviceDraft,
+  type MobileVoiceDictionaryLearningAction
+} from "./mobile-voice-dictionary";
+import type { MobileVoiceRefinementContext } from "./mobile-voice-input";
 
 export interface PairedCredential {
   readonly profileId: string;
@@ -77,7 +86,10 @@ export interface MobileNetwork {
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
   getVoiceInputCapabilities(credential: PairedCredential, signal?: AbortSignal): Promise<MobileVoiceCapability>;
-  startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
+  adviseVoiceInputDictionaryEdit(credential: PairedCredential, draft: MobileVoiceDictionaryAdviceDraft,
+    signal?: AbortSignal): Promise<{ readonly actions: readonly MobileVoiceDictionaryLearningAction[] }>;
+  startVoiceInput(credential: PairedCredential, requestId: string, mimeType: string, locale?: string,
+    refinement?: MobileVoiceRefinementContext, signal?: AbortSignal): Promise<MobileVoiceSession>;
   appendVoiceAudio(credential: PairedCredential, voiceInputId: string, chunkSequence: bigint, audio: Uint8Array, durationMs: number, voiced: boolean, signal?: AbortSignal): Promise<MobileVoiceSession>;
   stopVoiceInput(credential: PairedCredential, voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<MobileVoiceSession>;
   cancelVoiceInput(credential: PairedCredential, voiceInputId: string, signal?: AbortSignal): Promise<MobileVoiceSession>;
@@ -1236,9 +1248,14 @@ export const mobileNetwork: MobileNetwork = {
       .getVoiceInputCapabilities({}, options(signal));
     return projectMobileVoiceCapability(response.profile);
   },
-  async startVoiceInput(credential, requestId, mimeType, locale, signal) {
+  async adviseVoiceInputDictionaryEdit(credential, draft, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
-      .startVoiceInput({ requestId, mimeType, ...(locale === undefined ? {} : { locale }) }, options(signal));
+      .adviseVoiceInputDictionaryEdit(mobileVoiceDictionaryAdviceRequest(draft), options(signal));
+    return Object.freeze({ actions: projectMobileVoiceDictionaryAdvice(response.actions, draft) });
+  },
+  async startVoiceInput(credential, requestId, mimeType, locale, refinement, signal) {
+    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+      .startVoiceInput(mobileVoiceStartRequest(requestId, mimeType, locale, refinement), options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async appendVoiceAudio(credential, voiceInputId, chunkSequence, audio, durationMs, voiced, signal) {
@@ -1321,4 +1338,136 @@ export const mobileNetwork: MobileNetwork = {
     }
     return response.operation;
   }
+};
+
+function mobileVoiceDictionaryAdviceRequest(draft: MobileVoiceDictionaryAdviceDraft) {
+  if (draft.beforeText.length > MAXIMUM_MOBILE_VOICE_ADVICE_TEXT_CHARACTERS
+    || draft.afterText.length > MAXIMUM_MOBILE_VOICE_ADVICE_TEXT_CHARACTERS
+    || (draft.rawTranscriptText?.length ?? 0) > MAXIMUM_MOBILE_VOICE_ADVICE_TEXT_CHARACTERS) {
+    throw new Error("The voice dictionary correction evidence exceeds the ephemeral request limit.");
+  }
+  return {
+    beforeText: draft.beforeText,
+    afterText: draft.afterText,
+    ...(draft.rawTranscriptText === undefined ? {} : { rawTranscriptText: draft.rawTranscriptText }),
+    ...(draft.locale === undefined ? {} : { locale: draft.locale }),
+    existingEntries: draft.existingEntries.map((entry) => ({
+      term: entry.term,
+      source: entry.source === "automatic"
+        ? VoiceInputDictionaryEntrySource.AUTOMATIC : VoiceInputDictionaryEntrySource.MANUAL,
+      frequency: entry.frequency,
+      aliases: entry.aliases.map((alias) => ({ text: alias.text, count: alias.count }))
+    })),
+    existingCandidates: draft.existingCandidates.map((candidate) => ({
+      term: candidate.term,
+      evidenceCount: candidate.evidenceCount,
+      aliases: candidate.aliases.map((alias) => ({ text: alias.text, count: alias.count }))
+    }))
+  };
+}
+
+interface MobileVoiceDictionaryWireAction {
+  readonly action: VoiceInputDictionaryLearningActionType;
+  readonly term: string;
+  readonly aliases: readonly string[];
+  readonly termType: VoiceInputDictionaryTermType;
+  readonly confidence: VoiceInputDictionaryLearningConfidence;
+}
+
+function projectMobileVoiceDictionaryAdvice(
+  values: readonly MobileVoiceDictionaryWireAction[],
+  draft: MobileVoiceDictionaryAdviceDraft
+): readonly MobileVoiceDictionaryLearningAction[] {
+  if (values.length > 3) throw new Error("The Joko node returned too many voice dictionary actions.");
+  const actions = values.map(projectMobileVoiceDictionaryAction);
+  const beforeEvidence = learningEvidenceKey(`${draft.beforeText}\n${draft.rawTranscriptText ?? ""}`);
+  const afterEvidence = learningEvidenceKey(draft.afterText);
+  if (actions.some((action) => !afterEvidence.includes(learningEvidenceKey(action.term))
+    || action.aliases.some((alias) => !beforeEvidence.includes(learningEvidenceKey(alias))))) {
+    throw new Error("The Joko node returned ungrounded voice dictionary evidence.");
+  }
+  return Object.freeze(actions);
+}
+
+function mobileVoiceStartRequest(
+  requestId: string,
+  mimeType: string,
+  locale: string | undefined,
+  refinement: MobileVoiceRefinementContext | undefined
+) {
+  return {
+    requestId,
+    mimeType,
+    ...(locale === undefined ? {} : { locale }),
+    ...(refinement?.instructions === undefined ? {} : { refinementInstructions: refinement.instructions }),
+    dictionaryTerms: [...(refinement?.dictionaryTerms ?? [])]
+  };
+}
+
+function projectMobileVoiceDictionaryAction(value: MobileVoiceDictionaryWireAction): MobileVoiceDictionaryLearningAction {
+  const term = value.term.replace(/\s+/gu, " ").trim();
+  if (!term || term.length > 120 || /[\u0000-\u001f\u007f]/u.test(term)) {
+    throw new Error("The Joko node returned an invalid voice dictionary term.");
+  }
+  const aliases = value.aliases.map((alias) => alias.replace(/\s+/gu, " ").trim());
+  const aliasKeys = aliases.map((alias) => alias.toLocaleLowerCase());
+  if (aliases.length === 0 || aliases.length > 5
+    || aliases.some((alias) => !alias || alias.length > 120 || /[\u0000-\u001f\u007f]/u.test(alias))
+    || aliasKeys.some((key) => key === term.toLocaleLowerCase())
+    || new Set(aliasKeys).size !== aliasKeys.length) {
+    throw new Error("The Joko node returned invalid voice dictionary aliases.");
+  }
+  return Object.freeze({
+    action: mobileVoiceDictionaryAction(value.action),
+    term,
+    aliases: Object.freeze(aliases),
+    type: mobileVoiceDictionaryTermType(value.termType),
+    confidence: value.confidence === VoiceInputDictionaryLearningConfidence.HIGH ? "high"
+      : value.confidence === VoiceInputDictionaryLearningConfidence.MEDIUM ? "medium"
+        : (() => { throw new Error("The Joko node returned unspecified voice dictionary confidence."); })()
+  });
+}
+
+function mobileVoiceDictionaryAction(
+  value: VoiceInputDictionaryLearningActionType
+): MobileVoiceDictionaryLearningAction["action"] {
+  switch (value) {
+    case VoiceInputDictionaryLearningActionType.ADD_CANDIDATE: return "addCandidate";
+    case VoiceInputDictionaryLearningActionType.ADD_ENTRY: return "addEntry";
+    case VoiceInputDictionaryLearningActionType.UPDATE_ENTRY: return "updateEntry";
+    case VoiceInputDictionaryLearningActionType.UNSPECIFIED:
+      throw new Error("The Joko node returned an unspecified voice dictionary action.");
+    default:
+      throw new Error("The Joko node returned an invalid voice dictionary action.");
+  }
+}
+
+function mobileVoiceDictionaryTermType(
+  value: VoiceInputDictionaryTermType
+): MobileVoiceDictionaryLearningAction["type"] {
+  switch (value) {
+    case VoiceInputDictionaryTermType.PRODUCT_NAME: return "productName";
+    case VoiceInputDictionaryTermType.PROJECT_NAME: return "projectName";
+    case VoiceInputDictionaryTermType.TECHNICAL_TERM: return "technicalTerm";
+    case VoiceInputDictionaryTermType.PERSON_NAME: return "personName";
+    case VoiceInputDictionaryTermType.TEAM_NAME: return "teamName";
+    case VoiceInputDictionaryTermType.CODE_NAME: return "codeName";
+    case VoiceInputDictionaryTermType.PHRASE: return "phrase";
+    case VoiceInputDictionaryTermType.OTHER: return "other";
+    case VoiceInputDictionaryTermType.UNSPECIFIED:
+      throw new Error("The Joko node returned an unspecified voice dictionary term type.");
+    default:
+      throw new Error("The Joko node returned an invalid voice dictionary term type.");
+  }
+}
+
+function learningEvidenceKey(value: string): string {
+  return value.replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+}
+
+export const mobileVoiceNetworkTesting = {
+  adviceRequest: mobileVoiceDictionaryAdviceRequest,
+  startRequest: mobileVoiceStartRequest,
+  projectAction: projectMobileVoiceDictionaryAction,
+  projectAdvice: projectMobileVoiceDictionaryAdvice
 };

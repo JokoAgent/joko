@@ -41,7 +41,8 @@ import {
   mobileDiagnostics,
   mobileLocalePreferences,
   mobileStorage,
-  mobileThemePreferences
+  mobileThemePreferences,
+  mobileVoiceDictionary
 } from "./storage";
 import {
   mobileComposerDraftIdentityKey,
@@ -471,6 +472,10 @@ export function App() {
     (listener) => mobileLocalePreferences.subscribe(listener),
     () => mobileLocalePreferences.snapshot
   );
+  const voiceDictionary = useSyncExternalStore(
+    (listener) => mobileVoiceDictionary.subscribe(listener),
+    () => mobileVoiceDictionary.snapshot
+  );
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -495,6 +500,7 @@ export function App() {
   useEffect(() => {
     void mobileThemePreferences.hydrate();
     void mobileLocalePreferences.hydrate();
+    void mobileVoiceDictionary.hydrate();
     let diagnosticsStopped = false;
     let diagnosticsState = AppState.currentState;
     let diagnosticsTick = performance.now();
@@ -639,7 +645,7 @@ export function App() {
                   locale={locale.effectiveLocale}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
-                  theme={theme} locale={locale} diagnostics={diagnostics} client={client}
+                  theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary} client={client}
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
                   onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
@@ -648,6 +654,13 @@ export function App() {
                     appVersion: Constants.expoConfig?.version || "unknown",
                     platform: Platform.OS === "android" || Platform.OS === "ios" ? Platform.OS : "unknown"
                   })}
+                  onVoiceDictionaryRetry={() => mobileVoiceDictionary.retryHydrate()}
+                  onVoiceDictionaryReset={() => mobileVoiceDictionary.reset()}
+                  onVoiceInstructionsChange={(value) => mobileVoiceDictionary.setRefinementInstructions(value)}
+                  onVoiceAutoLearningChange={(enabled) => mobileVoiceDictionary.setAutoLearningEnabled(enabled)}
+                  onVoiceDictionaryAdd={(value) => mobileVoiceDictionary.addManualTerm(value)}
+                  onVoiceDictionaryEdit={(id, text, aliases) => mobileVoiceDictionary.editEntry(id, text, aliases)}
+                  onVoiceDictionaryDelete={(id) => mobileVoiceDictionary.deleteEntry(id)}
                   onBack={() => setPage("home")} onConnections={() => setPage("connections")}
                   onDevices={() => setPage("devices")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
@@ -1355,6 +1368,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const [composerAtomId, setComposerAtomId] = useState<string>();
   const [composerHeight, setComposerHeight] = useState(132);
+  const [composerComposing, setComposerComposing] = useState(false);
   const mountedRef = useRef(true);
   const composerInputRef = useRef<MobileComposerRichInputHandle>(null);
   const profileId = state.activeProfileId;
@@ -1566,6 +1580,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     },
     onError: setError,
     locale,
+    isComposing: composerComposing,
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error, locale);
@@ -2471,6 +2486,8 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
           replaceInput(result.draft, result.selection);
         }}
         onError={setError}
+        onBlur={() => setComposerComposing(false)}
+        onCompositionChange={setComposerComposing}
         onHeightChange={(nextHeight) => setComposerHeight(Math.max(132, Math.min(260, nextHeight)))}
         onOpenAtom={setComposerAtomId}
         onPasteImages={(request) => { void pasteClipboardImages(request); }}
@@ -3199,6 +3216,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
     },
     onError: setLocalError,
     locale,
+    isComposing: composerComposing,
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error, locale);

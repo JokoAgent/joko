@@ -6794,8 +6794,10 @@ export class MobileClient {
       surfaceOwnerKey,
       isCurrent,
       getCapabilities: (signal) => owned(() => this.network.getVoiceInputCapabilities(credential, signal)),
-      start: (requestId, mimeType, locale, signal) => owned(() =>
-        this.network.startVoiceInput(credential, requestId, mimeType, locale, signal)),
+      adviseVoiceInputDictionaryEdit: (draft, signal) => owned(() =>
+        this.network.adviseVoiceInputDictionaryEdit(credential, draft, signal)),
+      start: (requestId, mimeType, locale, refinement, signal) => owned(() =>
+        this.network.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal)),
       append: (voiceInputId, chunkSequence, audio, durationMs, voiced, signal) => owned(() =>
         this.network.appendVoiceAudio(
           credential,
