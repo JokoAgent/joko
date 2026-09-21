@@ -67,6 +67,10 @@ import {
   ContactService,
   ContactSource as ProtoContactSource,
   ContactStatus as ProtoContactStatus,
+  ContactSyncErrorCode,
+  ContactSyncPeerState,
+  ContactSyncPhase,
+  ContactSyncRoute,
   ContactVCardImportDecisionKind,
   ContactVCardImportDisposition,
   ContactVCardImportOutcome,
@@ -313,6 +317,7 @@ import {
   type ContactProfile as ProtoContactProfile,
   type ContactRelation as ProtoContactRelation,
   type ContactSummary as ProtoContactSummary,
+  type ContactSyncStatus as ProtoContactSyncStatus,
   type ContactVCardImportPreviewEntry as ProtoContactVCardImportPreviewEntry,
   type CollaborationDirectory as ProtoCollaborationDirectory,
   type ContextUsage as ProtoContextUsage,
@@ -505,6 +510,7 @@ import type {
   ContactRelationView,
   ContactSourceView,
   ContactStatusView,
+  ContactSyncStatusView,
   ContactSummaryView,
   ContactVCardExportView,
   ContactVCardImportDecisionKindView,
@@ -6049,6 +6055,52 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const response = await createClient(ContactService, scope.transport).exportContactsVCard({ contactIds: [...contactIds] }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return { text: response.vcardText, contactCount: response.contactCount, suggestedFileName: response.suggestedFileName };
+  }
+
+  async getContactSyncStatus(signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).getContactSyncStatus({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async setContactSyncEnabled(expectedConfigurationRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).setContactSyncEnabled({
+      expectedConfigurationRevision: { value: expectedConfigurationRevision },
+      enabled
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async grantContactSyncPeer(nodeId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).grantContactSyncPeer({
+      nodeId,
+      expectedFingerprint
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async revokeContactSyncPeer(peerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).revokeContactSyncPeer({
+      peerId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async syncContactsNow(peerId?: string, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).syncContactsNow({
+      ...(peerId === undefined ? {} : { peerId })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
   }
 
   async getRemoteHostCapabilities(
@@ -16324,6 +16376,107 @@ function mapContactDirectory(value: ProtoContactDirectory | undefined): ContactD
     pending: value.pending,
     groups: value.groups
   };
+}
+
+function mapContactSyncStatus(value: ProtoContactSyncStatus | undefined): ContactSyncStatusView {
+  if (value === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value.nodeId) ||
+    !/^[a-f0-9]{64}$/u.test(value.fingerprint)) {
+    throw new GatewayError("Orchestrator returned an invalid Contacts sync status.");
+  }
+  const phase = value.phase === ContactSyncPhase.OFF ? "off" as const
+    : value.phase === ContactSyncPhase.WAITING ? "waiting" as const
+      : value.phase === ContactSyncPhase.SYNCING ? "syncing" as const
+        : value.phase === ContactSyncPhase.UP_TO_DATE ? "upToDate" as const
+          : value.phase === ContactSyncPhase.ERROR ? "error" as const
+            : undefined;
+  if (phase === undefined) throw new GatewayError("Orchestrator returned an unknown Contacts sync phase.");
+  const errorCode = value.errorCode === undefined ? undefined
+    : value.errorCode === ContactSyncErrorCode.IDENTITY_UNAVAILABLE ? "identityUnavailable" as const
+      : value.errorCode === ContactSyncErrorCode.PEER_IDENTITY_CHANGED ? "peerIdentityChanged" as const
+        : value.errorCode === ContactSyncErrorCode.SYNC_FAILED ? "syncFailed" as const
+          : undefined;
+  if (value.errorCode !== undefined && errorCode === undefined) {
+    throw new GatewayError("Orchestrator returned an unknown Contacts sync error.");
+  }
+  const lastRoute = value.lastRoute === undefined ? undefined
+    : value.lastRoute === ContactSyncRoute.LAN ? "lan" as const : undefined;
+  if (value.lastRoute !== undefined && lastRoute === undefined) throw new GatewayError("Orchestrator returned an unknown Contacts sync route.");
+  const peers = value.peers.map((peer) => {
+    const state = peer.state === ContactSyncPeerState.PENDING ? "pending" as const
+      : peer.state === ContactSyncPeerState.ACTIVE ? "active" as const : undefined;
+    const route = peer.lastRoute === undefined ? undefined
+      : peer.lastRoute === ContactSyncRoute.LAN ? "lan" as const : undefined;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(peer.peerId) || !validContactSyncDisplayName(peer.displayName) ||
+      !/^[a-f0-9]{64}$/u.test(peer.fingerprint) || state === undefined ||
+      (peer.lastRoute !== undefined && route === undefined)) {
+      throw new GatewayError("Orchestrator returned an invalid Contacts sync peer.");
+    }
+    const lastSyncAt = peer.lastSyncAt === undefined ? undefined
+      : requiredContactTimestamp(peer.lastSyncAt, "Contacts sync peer completion");
+    if ((lastSyncAt === undefined) !== (route === undefined) || (state === "active") !== (lastSyncAt !== undefined)) {
+      throw new GatewayError("Orchestrator returned an incomplete Contacts sync peer.");
+    }
+    return {
+      peerId: peer.peerId,
+      revision: requiredContactRevision(peer.revision, "Contacts sync peer"),
+      displayName: peer.displayName,
+      fingerprint: peer.fingerprint,
+      online: peer.online,
+      state,
+      grantedAt: requiredContactTimestamp(peer.grantedAt, "Contacts sync peer grant"),
+      ...(lastSyncAt === undefined ? {} : { lastSyncAt }),
+      ...(route === undefined ? {} : { lastRoute: route })
+    };
+  });
+  const candidates = value.candidates.map((candidate) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(candidate.nodeId) || !validContactSyncDisplayName(candidate.displayName) ||
+      !/^[a-f0-9]{64}$/u.test(candidate.fingerprint) || candidate.granted && candidate.keyChanged) {
+      throw new GatewayError("Orchestrator returned an invalid Contacts sync candidate.");
+    }
+    return {
+      nodeId: candidate.nodeId,
+      displayName: candidate.displayName,
+      fingerprint: candidate.fingerprint,
+      seenAt: requiredContactTimestamp(candidate.seenAt, "Contacts sync candidate observation"),
+      granted: candidate.granted,
+      keyChanged: candidate.keyChanged
+    };
+  });
+  if (new Set(peers.map((peer) => peer.peerId)).size !== peers.length ||
+    new Set(candidates.map((candidate) => candidate.nodeId)).size !== candidates.length ||
+    value.onlinePeerCount !== peers.filter((peer) => peer.online).length) {
+    throw new GatewayError("Orchestrator returned inconsistent Contacts sync peers.");
+  }
+  const lastSyncAt = value.lastSyncAt === undefined ? undefined
+    : requiredContactTimestamp(value.lastSyncAt, "Contacts sync completion");
+  const hasLastSyncIdentity = value.lastSyncPeerId !== undefined && value.lastSyncPeerName !== undefined;
+  if ((lastSyncAt === undefined) !== !hasLastSyncIdentity || (lastSyncAt === undefined) !== (lastRoute === undefined) ||
+    hasLastSyncIdentity && (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value.lastSyncPeerId!) ||
+      !validContactSyncDisplayName(value.lastSyncPeerName!))) {
+    throw new GatewayError("Orchestrator returned an incomplete Contacts sync completion.");
+  }
+  return {
+    available: value.available,
+    configurationRevision: requiredContactRevision(value.configurationRevision, "Contacts sync configuration"),
+    nodeId: value.nodeId,
+    fingerprint: value.fingerprint,
+    enabled: value.enabled,
+    phase,
+    onlinePeerCount: value.onlinePeerCount,
+    ...(errorCode === undefined ? {} : { errorCode }),
+    ...(lastSyncAt === undefined ? {} : {
+      lastSyncAt,
+      lastSyncPeerId: value.lastSyncPeerId!,
+      lastSyncPeerName: value.lastSyncPeerName!,
+      lastRoute: lastRoute!
+    }),
+    peers,
+    candidates
+  };
+}
+
+function validContactSyncDisplayName(value: string): boolean {
+  return value === value.trim() && value.length >= 1 && value.length <= 100 && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function mapContactMutation(contact: ProtoContactProfile | undefined, directory: ProtoContactDirectory | undefined): ContactMutationView {

@@ -24,15 +24,25 @@ import {
   type ContactVCardImportDecision,
   type ContactVCardImportPreviewEntry
 } from "./contact-manager.js";
+import {
+  ContactSyncManager,
+  ContactSyncManagerError,
+  type ContactSyncStatus
+} from "./contact-sync-manager.js";
 import { fromProtoRevision, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
 
 export function createContactConnectService(
   manager: ContactManager | undefined,
-  authenticate: (context: HandlerContext) => unknown
+  authenticate: (context: HandlerContext) => unknown,
+  syncManager?: ContactSyncManager
 ): ServiceImpl<typeof contract.ContactService> {
   const owner = (): ContactManager => {
     if (manager === undefined) throw new ConnectError("Contacts are unavailable.", Code.Unimplemented);
     return manager;
+  };
+  const syncOwner = (): ContactSyncManager => {
+    if (syncManager === undefined) throw new ConnectError("Contacts device sync is unavailable.", Code.Unimplemented);
+    return syncManager;
   };
   return {
     getContactDirectory: (_request, context) => {
@@ -318,8 +328,88 @@ export function createContactConnectService(
           suggestedFileName: result.suggestedFileName
         });
       });
+    },
+    getContactSyncStatus: (_request, context) => {
+      authenticate(context);
+      return contactSyncRpc(async () => create(contract.GetContactSyncStatusResponseSchema, {
+        status: toProtoSyncStatus(syncOwner().status())
+      }));
+    },
+    setContactSyncEnabled: (request, context) => {
+      authenticate(context);
+      return contactSyncRpc(async () => create(contract.SetContactSyncEnabledResponseSchema, {
+        status: toProtoSyncStatus(await syncOwner().setEnabled(
+          fromProtoRevision(request.expectedConfigurationRevision, "expected_configuration_revision"),
+          request.enabled
+        ))
+      }));
+    },
+    grantContactSyncPeer: (request, context) => {
+      authenticate(context);
+      return contactSyncRpc(async () => create(contract.GrantContactSyncPeerResponseSchema, {
+        status: toProtoSyncStatus(await syncOwner().grantCandidate(request.nodeId, request.expectedFingerprint))
+      }));
+    },
+    revokeContactSyncPeer: (request, context) => {
+      authenticate(context);
+      return contactSyncRpc(async () => create(contract.RevokeContactSyncPeerResponseSchema, {
+        status: toProtoSyncStatus(syncOwner().revokePeer(
+          request.peerId,
+          fromProtoRevision(request.expectedRevision, "expected_revision")
+        ))
+      }));
+    },
+    syncContactsNow: (request, context) => {
+      authenticate(context);
+      return contactSyncRpc(async () => create(contract.SyncContactsNowResponseSchema, {
+        status: toProtoSyncStatus(await syncOwner().syncNow(request.peerId))
+      }));
     }
   };
+}
+
+function toProtoSyncStatus(value: ContactSyncStatus): contract.ContactSyncStatus {
+  return create(contract.ContactSyncStatusSchema, {
+    available: value.available,
+    configurationRevision: toProtoRevision(value.configurationRevision),
+    nodeId: value.nodeId,
+    fingerprint: value.fingerprint,
+    enabled: value.enabled,
+    phase: value.phase === "off" ? contract.ContactSyncPhase.OFF
+      : value.phase === "waiting" ? contract.ContactSyncPhase.WAITING
+        : value.phase === "syncing" ? contract.ContactSyncPhase.SYNCING
+          : value.phase === "up_to_date" ? contract.ContactSyncPhase.UP_TO_DATE
+            : contract.ContactSyncPhase.ERROR,
+    onlinePeerCount: value.onlinePeerCount,
+    ...(value.errorCode === undefined ? {} : {
+      errorCode: value.errorCode === "identity_unavailable" ? contract.ContactSyncErrorCode.IDENTITY_UNAVAILABLE
+        : value.errorCode === "peer_identity_changed" ? contract.ContactSyncErrorCode.PEER_IDENTITY_CHANGED
+          : contract.ContactSyncErrorCode.SYNC_FAILED
+    }),
+    ...(value.lastSyncAt === undefined ? {} : { lastSyncAt: toProtoTimestamp(value.lastSyncAt) }),
+    ...(value.lastSyncPeerId === undefined ? {} : { lastSyncPeerId: value.lastSyncPeerId }),
+    ...(value.lastSyncPeerName === undefined ? {} : { lastSyncPeerName: value.lastSyncPeerName }),
+    ...(value.lastRoute === undefined ? {} : { lastRoute: contract.ContactSyncRoute.LAN }),
+    peers: value.peers.map((peer) => create(contract.ContactSyncPeerSchema, {
+      peerId: peer.peerId,
+      revision: toProtoRevision(peer.revision),
+      displayName: peer.displayName,
+      fingerprint: peer.fingerprint,
+      online: peer.online,
+      state: peer.state === "active" ? contract.ContactSyncPeerState.ACTIVE : contract.ContactSyncPeerState.PENDING,
+      grantedAt: toProtoTimestamp(peer.grantedAt),
+      ...(peer.lastSyncAt === undefined ? {} : { lastSyncAt: toProtoTimestamp(peer.lastSyncAt) }),
+      ...(peer.lastRoute === undefined ? {} : { lastRoute: contract.ContactSyncRoute.LAN })
+    })),
+    candidates: value.candidates.map((candidate) => create(contract.ContactSyncCandidateSchema, {
+      nodeId: candidate.nodeId,
+      displayName: candidate.displayName,
+      fingerprint: candidate.fingerprint,
+      seenAt: toProtoTimestamp(candidate.seenAt),
+      granted: candidate.granted,
+      keyChanged: candidate.keyChanged
+    }))
+  });
 }
 
 function toProtoDirectory(value: ContactDirectoryState): contract.ContactDirectory {
@@ -562,13 +652,32 @@ function contactRpc<T>(effect: () => T): T {
     }
     if (error instanceof ContactStoreError) {
       const code = error.code === "CONTACT_INVALID" ? Code.InvalidArgument
-        : error.code === "CONTACT_NOT_FOUND" ? Code.NotFound
-          : error.code === "CONTACT_CHANGED" || error.code === "CONTACT_DIRECTORY_CHANGED" ? Code.Aborted
+        : error.code === "CONTACT_NOT_FOUND" || error.code === "CONTACT_SYNC_PEER_NOT_FOUND" ? Code.NotFound
+          : error.code === "CONTACT_CHANGED" || error.code === "CONTACT_DIRECTORY_CHANGED" || error.code === "CONTACT_SYNC_CHANGED" ? Code.Aborted
             : error.code === "CONTACT_IDENTITY_CONFLICT" || error.code === "CONTACT_ALREADY_EXISTS" ? Code.AlreadyExists
               : Code.Unavailable;
       throw new ConnectError(error.message, code);
     }
     throw new ConnectError("The contact operation failed.", Code.Internal);
+  }
+}
+
+async function contactSyncRpc<T>(effect: () => Promise<T>): Promise<T> {
+  try {
+    return await effect();
+  } catch (error) {
+    if (error instanceof ConnectError) throw error;
+    if (error instanceof ContactSyncManagerError) {
+      const code = error.code === "NOT_FOUND" ? Code.NotFound
+        : error.code === "CONFLICT" ? Code.Aborted
+          : error.code === "DISABLED" ? Code.FailedPrecondition
+            : Code.Unavailable;
+      throw new ConnectError(error.message, code);
+    }
+    if (error instanceof ContactStoreError) {
+      return contactRpc(() => { throw error; });
+    }
+    throw new ConnectError("The Contacts sync operation failed.", Code.Internal);
   }
 }
 

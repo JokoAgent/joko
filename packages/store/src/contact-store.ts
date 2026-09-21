@@ -21,10 +21,25 @@ import type {
   ContactRelationRecord,
   ContactSource,
   ContactStatus,
+  ContactSyncConfigurationRecord,
+  ContactSyncPeerRecord,
   ContactSummaryRecord,
   RelatedContactRecord
 } from "./contact-types.js";
 import { ContactStoreError } from "./contact-types.js";
+import {
+  captureContactSnapshot,
+  createEmptyContactSnapshot,
+  createEmptyContactSyncState,
+  isValidContactDataSnapshot,
+  isValidContactSyncState,
+  materializeContactSyncState,
+  mergeContactSyncStates,
+  stableContactSyncJson,
+  contactMembershipSyncId,
+  type ContactDataSnapshot,
+  type ContactSyncState
+} from "./contact-sync.js";
 
 type Row = Record<string, unknown>;
 
@@ -143,6 +158,36 @@ CREATE TABLE contact_relations (
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   UNIQUE(from_contact_id, to_contact_id, relation),
   CHECK(from_contact_id <> to_contact_id)
+) STRICT;
+
+CREATE TABLE contact_sync_configuration (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
+  node_id TEXT NOT NULL UNIQUE,
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  public_key TEXT NOT NULL,
+  sealed_private_key TEXT NOT NULL,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
+) STRICT;
+
+CREATE TABLE contact_sync_peers (
+  peer_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
+  display_name TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64),
+  granted_at INTEGER NOT NULL CHECK (granted_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= granted_at),
+  last_sync_at INTEGER CHECK (last_sync_at IS NULL OR last_sync_at >= 0),
+  last_route TEXT CHECK (last_route IS NULL OR last_route = 'lan')
+) STRICT;
+
+CREATE TABLE contact_sync_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  node_id TEXT NOT NULL,
+  state_json TEXT NOT NULL,
+  projection_json TEXT NOT NULL
 ) STRICT;
 
 CREATE VIRTUAL TABLE contact_search_fts USING fts5(
@@ -798,6 +843,353 @@ export class ContactStore {
     `).all(...normalizedValues, limit) as Row[]).map(contactIdentityFromRow);
   }
 
+  contactSyncConfiguration(): ContactSyncConfigurationRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT * FROM contact_sync_configuration WHERE singleton = 1").get() as Row | undefined;
+    return row === undefined ? undefined : contactSyncConfigurationFromRow(row);
+  }
+
+  initializeContactSyncConfiguration(input: {
+    readonly nodeId: string;
+    readonly publicKey: string;
+    readonly sealedPrivateKey: string;
+  }): ContactSyncConfigurationRecord {
+    return this.#write(() => {
+      const nodeId = entityId(input.nodeId, "Contacts sync node ID");
+      const publicKey = contactSyncPublicKey(input.publicKey);
+      const sealedPrivateKey = contactSyncSealedPrivateKey(input.sealedPrivateKey);
+      const existing = this.contactSyncConfiguration();
+      if (existing !== undefined) {
+        if (existing.nodeId !== nodeId || existing.publicKey !== publicKey) {
+          throw new ContactStoreError("CONTACT_SYNC_CHANGED", "The Contacts sync identity changed unexpectedly.");
+        }
+        return existing;
+      }
+      const at = this.#now();
+      this.#database.prepare(`
+        INSERT INTO contact_sync_configuration(
+          singleton, revision, node_id, enabled, public_key, sealed_private_key, created_at, updated_at
+        ) VALUES (1, 1, ?, 0, ?, ?, ?, ?)
+      `).run(nodeId, publicKey, sealedPrivateKey, at, at);
+      return this.contactSyncConfiguration()!;
+    });
+  }
+
+  setContactSyncEnabled(expectedRevision: bigint, enabled: boolean): ContactSyncConfigurationRecord {
+    return this.#write(() => {
+      const current = this.contactSyncConfiguration();
+      if (current === undefined) throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts sync identity is unavailable.");
+      assertExpectedSyncRevision(current.revision, expectedRevision, "Contacts sync configuration");
+      if (current.enabled === enabled) return current;
+      const revision = nextRevision(current.revision, "Contacts sync configuration");
+      this.#database.prepare(`
+        UPDATE contact_sync_configuration SET revision = ?, enabled = ?, updated_at = ? WHERE singleton = 1
+      `).run(revision, enabled ? 1 : 0, this.#now());
+      return this.contactSyncConfiguration()!;
+    });
+  }
+
+  listContactSyncPeers(): readonly ContactSyncPeerRecord[] {
+    this.#assertOpen();
+    return (this.#database.prepare(`
+      SELECT * FROM contact_sync_peers ORDER BY display_name COLLATE NOCASE, peer_id
+    `).all() as Row[]).map(contactSyncPeerFromRow);
+  }
+
+  contactSyncPeer(peerIdValue: string): ContactSyncPeerRecord | undefined {
+    this.#assertOpen();
+    const peerId = entityId(peerIdValue, "Contacts sync peer ID");
+    const row = this.#database.prepare("SELECT * FROM contact_sync_peers WHERE peer_id = ?").get(peerId) as Row | undefined;
+    return row === undefined ? undefined : contactSyncPeerFromRow(row);
+  }
+
+  grantContactSyncPeer(input: {
+    readonly peerId: string;
+    readonly displayName: string;
+    readonly publicKey: string;
+    readonly fingerprint: string;
+  }): ContactSyncPeerRecord {
+    return this.#write(() => {
+      const configuration = this.contactSyncConfiguration();
+      if (configuration === undefined) throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts sync identity is unavailable.");
+      const peerId = entityId(input.peerId, "Contacts sync peer ID");
+      if (peerId === configuration.nodeId) throw invalid("A Contacts sync node cannot grant itself.");
+      const displayName = text(input.displayName, 1, MAX_DISPLAY_NAME, "Contacts sync peer name");
+      const publicKey = contactSyncPublicKey(input.publicKey);
+      const fingerprint = contactSyncFingerprint(input.fingerprint);
+      if (contactSyncPublicKeyFingerprint(publicKey) !== fingerprint) throw invalid("The Contacts sync peer fingerprint does not match its public key.");
+      const existing = this.contactSyncPeer(peerId);
+      if (existing !== undefined) {
+        if (existing.publicKey !== publicKey || existing.fingerprint !== fingerprint) {
+          throw new ContactStoreError("CONTACT_SYNC_CHANGED", "The Contacts sync peer key changed. Revoke the old grant before trusting a new key.");
+        }
+        if (existing.displayName === displayName) return existing;
+        const revision = nextRevision(existing.revision, "Contacts sync peer");
+        this.#database.prepare(`
+          UPDATE contact_sync_peers SET revision = ?, display_name = ?, updated_at = ? WHERE peer_id = ?
+        `).run(revision, displayName, this.#now(), peerId);
+        return this.contactSyncPeer(peerId)!;
+      }
+      const at = this.#now();
+      this.#database.prepare(`
+        INSERT INTO contact_sync_peers(
+          peer_id, revision, display_name, public_key, fingerprint, granted_at, updated_at, last_sync_at, last_route
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, NULL, NULL)
+      `).run(peerId, displayName, publicKey, fingerprint, at, at);
+      return this.contactSyncPeer(peerId)!;
+    });
+  }
+
+  revokeContactSyncPeer(peerIdValue: string, expectedRevision: bigint): boolean {
+    return this.#write(() => {
+      const peerId = entityId(peerIdValue, "Contacts sync peer ID");
+      const current = this.contactSyncPeer(peerId);
+      if (current === undefined) throw new ContactStoreError("CONTACT_SYNC_PEER_NOT_FOUND", `Contacts sync peer ${peerId} was not found.`);
+      assertExpectedSyncRevision(current.revision, expectedRevision, "Contacts sync peer");
+      return this.#database.prepare("DELETE FROM contact_sync_peers WHERE peer_id = ?").run(peerId).changes === 1;
+    });
+  }
+
+  recordContactSyncSuccess(peerIdValue: string, route: "lan", atValue = this.#now()): ContactSyncPeerRecord {
+    return this.#write(() => {
+      const peerId = entityId(peerIdValue, "Contacts sync peer ID");
+      const at = boundedInteger(atValue, 0, MAX_SAFE_REVISION, "Contacts sync completion time");
+      if (route !== "lan") throw invalid("Contacts sync route is invalid.");
+      if (this.contactSyncPeer(peerId) === undefined) {
+        throw new ContactStoreError("CONTACT_SYNC_PEER_NOT_FOUND", `Contacts sync peer ${peerId} was not found.`);
+      }
+      this.#database.prepare(`
+        UPDATE contact_sync_peers SET last_sync_at = ?, last_route = ? WHERE peer_id = ?
+      `).run(at, route, peerId);
+      return this.contactSyncPeer(peerId)!;
+    });
+  }
+
+  readContactSyncState(nodeIdValue: string): {
+    readonly state: ContactSyncState;
+    readonly materialized: boolean;
+  } {
+    return this.#write(() => {
+      const nodeId = entityId(nodeIdValue, "Contacts sync node ID");
+      const row = this.#readContactSyncRow();
+      if (row === undefined) {
+        const current = this.#readContactSnapshot();
+        const captured = captureContactSnapshot(createEmptyContactSyncState(), createEmptyContactSnapshot(), current, nodeId);
+        this.#assertPersistableContactSyncState(captured.state);
+        this.#database.prepare(`
+          INSERT INTO contact_sync_state(singleton, node_id, state_json, projection_json) VALUES (1, ?, ?, ?)
+        `).run(nodeId, JSON.stringify(captured.state), JSON.stringify(current));
+        return { state: captured.state, materialized: false };
+      }
+      return this.#reconcileContactSyncRow(row, nodeId);
+    });
+  }
+
+  mergeContactSyncState(nodeIdValue: string, remoteValue: unknown): {
+    readonly state: ContactSyncState;
+    readonly changed: boolean;
+    readonly materialized: boolean;
+  } {
+    if (!isValidContactSyncState(remoteValue)) throw invalid("The remote Contacts sync state is invalid.");
+    return this.#write(() => {
+      const nodeId = entityId(nodeIdValue, "Contacts sync node ID");
+      let row = this.#readContactSyncRow();
+      if (row === undefined) {
+        this.readContactSyncState(nodeId);
+        row = this.#readContactSyncRow();
+      }
+      if (row === undefined) throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts sync state could not be initialized.");
+      const local = this.#reconcileContactSyncRow(row, nodeId);
+      const merged = mergeContactSyncStates(local.state, remoteValue);
+      this.#assertPersistableContactSyncState(merged);
+      const projection = materializeContactSyncState(merged);
+      if (!isValidContactDataSnapshot(projection)) throw invalid("The merged Contacts projection is invalid.");
+      const current = this.#readContactSnapshot();
+      const stateChanged = stableContactSyncJson(merged) !== stableContactSyncJson(local.state);
+      const projectionChanged = stableContactSyncJson(projection) !== stableContactSyncJson(current);
+      if (projectionChanged) this.#writeContactSnapshot(projection);
+      if (stateChanged || projectionChanged) this.#updateContactSyncRow(nodeId, merged, projection);
+      return {
+        state: merged,
+        changed: stateChanged || projectionChanged,
+        materialized: local.materialized || projectionChanged
+      };
+    });
+  }
+
+  #readContactSyncRow(): Row | undefined {
+    return this.#database.prepare(`
+      SELECT node_id, state_json, projection_json FROM contact_sync_state WHERE singleton = 1
+    `).get() as Row | undefined;
+  }
+
+  #reconcileContactSyncRow(row: Row, nodeId: string): {
+    readonly state: ContactSyncState;
+    readonly materialized: boolean;
+  } {
+    if (string(row["node_id"]) !== nodeId) {
+      throw new ContactStoreError("CONTACT_SYNC_CHANGED", "The Contacts sync state belongs to another node identity.");
+    }
+    const state = this.#parseContactSyncState(string(row["state_json"]));
+    const previous = this.#parseContactSnapshot(string(row["projection_json"]));
+    const current = this.#readContactSnapshot();
+    const captured = captureContactSnapshot(state, previous, current, nodeId);
+    this.#assertPersistableContactSyncState(captured.state);
+    const projection = materializeContactSyncState(captured.state);
+    if (!isValidContactDataSnapshot(projection)) {
+      throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The stored Contacts sync state produced an invalid projection.");
+    }
+    const materialized = stableContactSyncJson(projection) !== stableContactSyncJson(current);
+    const projectionChanged = stableContactSyncJson(projection) !== stableContactSyncJson(previous);
+    if (materialized) this.#writeContactSnapshot(projection);
+    if (captured.changed || projectionChanged || materialized) this.#updateContactSyncRow(nodeId, captured.state, projection);
+    return { state: captured.state, materialized };
+  }
+
+  #parseContactSyncState(json: string): ContactSyncState {
+    try {
+      const value: unknown = JSON.parse(json);
+      if (isValidContactSyncState(value)) return value;
+    } catch {}
+    throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The stored Contacts sync state is invalid.");
+  }
+
+  #parseContactSnapshot(json: string): ContactDataSnapshot {
+    try {
+      const value: unknown = JSON.parse(json);
+      if (isValidContactDataSnapshot(value)) return value;
+    } catch {}
+    throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The stored Contacts sync projection is invalid.");
+  }
+
+  #updateContactSyncRow(nodeId: string, state: ContactSyncState, projection: ContactDataSnapshot): void {
+    this.#assertPersistableContactSyncState(state);
+    this.#database.prepare(`
+      UPDATE contact_sync_state SET node_id = ?, state_json = ?, projection_json = ? WHERE singleton = 1
+    `).run(nodeId, JSON.stringify(state), JSON.stringify(projection));
+  }
+
+  #assertPersistableContactSyncState(state: ContactSyncState): void {
+    if (!isValidContactSyncState(state)) throw invalid("The Contacts sync state exceeds the current-v1 limits.");
+  }
+
+  #readContactSnapshot(): ContactDataSnapshot {
+    const contacts = (this.#database.prepare("SELECT * FROM contacts ORDER BY id").all() as Row[]).map((row) => ({
+      id: string(row["id"]),
+      kind: contactKind(row["kind"]),
+      displayName: string(row["display_name"]),
+      aliases: aliases(row["aliases_json"]),
+      summary: string(row["summary"]),
+      narrative: string(row["narrative"]),
+      agentNotes: string(row["agent_notes"]),
+      status: contactStatus(row["status"]),
+      source: contactSource(row["source"]),
+      createdAt: integer(row["created_at"]),
+      updatedAt: integer(row["updated_at"])
+    }));
+    const identities = (this.#database.prepare("SELECT * FROM contact_identities ORDER BY id").all() as Row[]).map((row) => ({
+      id: string(row["id"]),
+      contactId: string(row["contact_id"]),
+      platform: string(row["platform"]),
+      value: string(row["value"]),
+      normalizedValue: string(row["normalized_value"]),
+      label: string(row["label"]),
+      note: string(row["note"]),
+      createdAt: integer(row["created_at"])
+    }));
+    const events = (this.#database.prepare("SELECT * FROM contact_events ORDER BY id").all() as Row[]).map((row) => ({
+      id: string(row["id"]),
+      contactId: string(row["contact_id"]),
+      date: string(row["event_date"]),
+      text: string(row["text"]),
+      source: string(row["source"]),
+      createdAt: integer(row["created_at"])
+    }));
+    const groups = (this.#database.prepare("SELECT * FROM contact_groups ORDER BY id").all() as Row[]).map((row) => ({
+      id: string(row["id"]),
+      name: string(row["name"]),
+      description: string(row["description"]),
+      createdAt: integer(row["created_at"]),
+      updatedAt: integer(row["updated_at"])
+    }));
+    const memberships = (this.#database.prepare(`
+      SELECT group_id, contact_id FROM contact_group_members ORDER BY group_id, contact_id
+    `).all() as Row[]).map((row) => {
+      const groupId = string(row["group_id"]);
+      const contactId = string(row["contact_id"]);
+      return { id: contactMembershipSyncId(groupId, contactId), groupId, contactId };
+    });
+    const relations = (this.#database.prepare("SELECT * FROM contact_relations ORDER BY id").all() as Row[]).map((row) => ({
+      id: string(row["id"]),
+      fromContactId: string(row["from_contact_id"]),
+      toContactId: string(row["to_contact_id"]),
+      relation: string(row["relation"]),
+      note: string(row["note"]),
+      createdAt: integer(row["created_at"])
+    }));
+    const snapshot: ContactDataSnapshot = { contacts, identities, events, groups, memberships, relations };
+    if (!isValidContactDataSnapshot(snapshot)) {
+      throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts database cannot be represented by the sync format.");
+    }
+    return snapshot;
+  }
+
+  #writeContactSnapshot(snapshot: ContactDataSnapshot): void {
+    if (!isValidContactDataSnapshot(snapshot)) throw invalid("The Contacts sync projection is invalid.");
+    const revision = this.#advanceDirectoryRevision();
+    this.#database.exec(`
+      DELETE FROM contact_search_fts;
+      DELETE FROM contacts;
+      DELETE FROM contact_groups;
+    `);
+    const insertContact = this.#database.prepare(`
+      INSERT INTO contacts(
+        id, revision, kind, display_name, aliases_json, summary, narrative, agent_notes,
+        status, source, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const contact of snapshot.contacts) {
+      insertContact.run(contact.id, revision, contact.kind, contact.displayName, JSON.stringify(contact.aliases),
+        contact.summary, contact.narrative, contact.agentNotes, contact.status, contact.source,
+        contact.createdAt, contact.updatedAt);
+    }
+    const insertGroup = this.#database.prepare(`
+      INSERT INTO contact_groups(id, revision, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    for (const group of snapshot.groups) {
+      insertGroup.run(group.id, revision, group.name, group.description, group.createdAt, group.updatedAt);
+    }
+    const insertIdentity = this.#database.prepare(`
+      INSERT INTO contact_identities(
+        id, contact_id, revision, platform, value, normalized_value, label, note, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const identity of snapshot.identities) {
+      insertIdentity.run(identity.id, identity.contactId, revision, identity.platform, identity.value,
+        identity.normalizedValue, identity.label, identity.note, identity.createdAt);
+    }
+    const insertEvent = this.#database.prepare(`
+      INSERT INTO contact_events(id, contact_id, revision, event_date, text, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const event of snapshot.events) {
+      insertEvent.run(event.id, event.contactId, revision, event.date, event.text, event.source, event.createdAt);
+    }
+    const insertMembership = this.#database.prepare(`
+      INSERT INTO contact_group_members(group_id, contact_id) VALUES (?, ?)
+    `);
+    for (const membership of snapshot.memberships) insertMembership.run(membership.groupId, membership.contactId);
+    const insertRelation = this.#database.prepare(`
+      INSERT INTO contact_relations(
+        id, revision, from_contact_id, to_contact_id, relation, note, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const relation of snapshot.relations) {
+      insertRelation.run(relation.id, revision, relation.fromContactId, relation.toContactId,
+        relation.relation, relation.note, relation.createdAt);
+    }
+    for (const contact of snapshot.contacts) this.#rebuildSearch(contact.id);
+  }
+
   #initialize(): void {
     const marker = this.#database.prepare(`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'contact_schema_version'
@@ -958,6 +1350,73 @@ export class ContactStore {
   #assertOpen(): void {
     if (this.#closed) throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts store is closed.");
   }
+}
+
+function contactSyncConfigurationFromRow(row: Row): ContactSyncConfigurationRecord {
+  return {
+    revision: bigint(row["revision"]),
+    nodeId: entityId(row["node_id"], "Contacts sync node ID"),
+    enabled: integer(row["enabled"]) === 1,
+    publicKey: contactSyncPublicKey(string(row["public_key"])),
+    sealedPrivateKey: contactSyncSealedPrivateKey(string(row["sealed_private_key"])),
+    createdAt: integer(row["created_at"]),
+    updatedAt: integer(row["updated_at"])
+  };
+}
+
+function contactSyncPeerFromRow(row: Row): ContactSyncPeerRecord {
+  const lastSyncAt = nullableInteger(row["last_sync_at"]);
+  const route = row["last_route"];
+  if (route !== null && route !== "lan") throw invalid("Stored Contacts sync route is invalid.");
+  return {
+    peerId: entityId(row["peer_id"], "Contacts sync peer ID"),
+    revision: bigint(row["revision"]),
+    displayName: text(row["display_name"], 1, MAX_DISPLAY_NAME, "Contacts sync peer name"),
+    publicKey: contactSyncPublicKey(string(row["public_key"])),
+    fingerprint: contactSyncFingerprint(string(row["fingerprint"])),
+    grantedAt: integer(row["granted_at"]),
+    updatedAt: integer(row["updated_at"]),
+    ...(lastSyncAt === undefined ? {} : { lastSyncAt }),
+    ...(route === null ? {} : { lastRoute: route })
+  };
+}
+
+function contactSyncPublicKey(value: unknown): string {
+  if (typeof value !== "string" || value.length < 40 || value.length > 1_024 || value !== value.trim()) {
+    throw invalid("Contacts sync public key is invalid.");
+  }
+  let decoded: Buffer;
+  try { decoded = Buffer.from(value, "base64"); } catch { throw invalid("Contacts sync public key is invalid."); }
+  if (decoded.byteLength < 32 || decoded.byteLength > 768 || decoded.toString("base64") !== value) {
+    throw invalid("Contacts sync public key is invalid.");
+  }
+  return value;
+}
+
+function contactSyncSealedPrivateKey(value: unknown): string {
+  return text(value, 2, 8_192, "Sealed Contacts sync private key");
+}
+
+function contactSyncFingerprint(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) throw invalid("Contacts sync fingerprint is invalid.");
+  return value;
+}
+
+export function contactSyncPublicKeyFingerprint(publicKeyValue: string): string {
+  const publicKey = contactSyncPublicKey(publicKeyValue);
+  return createHash("sha256").update(Buffer.from(publicKey, "base64")).digest("hex");
+}
+
+function assertExpectedSyncRevision(actual: bigint, expected: bigint, label: string): void {
+  if (expected < 1n) throw invalid(`${label} revision is invalid.`);
+  if (actual !== expected) throw new ContactStoreError("CONTACT_SYNC_CHANGED", `${label} changed concurrently.`);
+}
+
+function nextRevision(current: bigint, label: string): number {
+  if (current < 1n || current >= BigInt(MAX_SAFE_REVISION)) {
+    throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", `${label} revision space is exhausted.`);
+  }
+  return Number(current + 1n);
 }
 
 export function normalizeContactPlatform(value: string): string {
@@ -1273,6 +1732,10 @@ function integer(value: unknown): number {
 
 function nullableCount(value: unknown): number {
   return value === null ? 0 : integer(value);
+}
+
+function nullableInteger(value: unknown): number | undefined {
+  return value === null ? undefined : integer(value);
 }
 
 function bigint(value: unknown): bigint {

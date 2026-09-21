@@ -5,9 +5,12 @@ import {
   Download,
   FileUp,
   Link2,
+  MonitorSmartphone,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
+  ShieldCheck,
   Trash2,
   UserRound,
   UsersRound
@@ -28,6 +31,9 @@ import type {
   ContactProfileView,
   ContactRelationView,
   ContactStatusView,
+  ContactSyncCandidateView,
+  ContactSyncPeerView,
+  ContactSyncStatusView,
   ContactSummaryView,
   ContactVCardImportDecisionKindView,
   ContactVCardImportDecisionView,
@@ -66,6 +72,10 @@ export function ContactsSettings({ controller, locale, t }: {
 }): JSX.Element {
   const ownerKey = controller.state.activeProfile?.id ?? "disconnected";
   const [directory, setDirectory] = useState<ContactDirectoryView>();
+  const [syncStatus, setSyncStatus] = useState<ContactSyncStatusView>();
+  const [syncError, setSyncError] = useState<string>();
+  const [candidateToGrant, setCandidateToGrant] = useState<ContactSyncCandidateView>();
+  const [peerToRevoke, setPeerToRevoke] = useState<ContactSyncPeerView>();
   const [groups, setGroups] = useState<readonly ContactGroupView[]>([]);
   const [page, setPage] = useState<ContactListPageView>({ contacts: [], total: 0 });
   const [profile, setProfile] = useState<ContactProfileView>();
@@ -125,6 +135,34 @@ export function ContactsSettings({ controller, locale, t }: {
     });
     return () => abort.abort();
   }, [controller, listOptions, ownerKey, reloadToken, t]);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    let loadingSync = false;
+    const load = async (): Promise<void> => {
+      if (loadingSync || abort.signal.aborted) return;
+      loadingSync = true;
+      try {
+        const value = await controller.getContactSyncStatus(abort.signal);
+        if (!abort.signal.aborted) {
+          setSyncStatus(value);
+          setSyncError(undefined);
+        }
+      } catch (reason) {
+        if (!abort.signal.aborted) setSyncError(errorMessage(reason, t("contacts.syncLoadFailed")));
+      } finally {
+        loadingSync = false;
+      }
+    };
+    setSyncStatus(undefined);
+    setSyncError(undefined);
+    void load();
+    const timer = setInterval(() => void load(), 5_000);
+    return () => {
+      clearInterval(timer);
+      abort.abort();
+    };
+  }, [controller, ownerKey, t]);
 
   useEffect(() => {
     if (selectedId === undefined) {
@@ -328,6 +366,47 @@ export function ContactsSettings({ controller, locale, t }: {
     downloadText(exported.text, exported.suggestedFileName, "text/vcard;charset=utf-8", fileInputRef.current?.ownerDocument ?? document);
   };
 
+  const toggleContactSync = async (): Promise<void> => {
+    if (syncStatus === undefined) return;
+    const next = await run("sync-toggle", () => controller.setContactSyncEnabled(
+      syncStatus.configurationRevision,
+      !syncStatus.enabled
+    ));
+    if (next !== undefined) setSyncStatus(next);
+  };
+
+  const grantContactSyncCandidate = async (): Promise<void> => {
+    if (candidateToGrant === undefined) return;
+    const next = await run("sync-grant", () => controller.grantContactSyncPeer(
+      candidateToGrant.nodeId,
+      candidateToGrant.fingerprint
+    ));
+    if (next !== undefined) {
+      setSyncStatus(next);
+      setCandidateToGrant(undefined);
+    }
+  };
+
+  const revokeContactSyncPeer = async (): Promise<void> => {
+    if (peerToRevoke === undefined) return;
+    const next = await run("sync-revoke", () => controller.revokeContactSyncPeer(
+      peerToRevoke.peerId,
+      peerToRevoke.revision
+    ));
+    if (next !== undefined) {
+      setSyncStatus(next);
+      setPeerToRevoke(undefined);
+    }
+  };
+
+  const syncContactsNow = async (): Promise<void> => {
+    const next = await run("sync-now", () => controller.syncContactsNow());
+    if (next !== undefined) {
+      setSyncStatus(next);
+      refresh(profile?.id);
+    }
+  };
+
   const loadMore = async (): Promise<void> => {
     if (page.nextPageOffset === undefined) return;
     const next = await run("contact-more", () => controller.listContacts({ ...listOptions, pageOffset: page.nextPageOffset }));
@@ -371,6 +450,17 @@ export function ContactsSettings({ controller, locale, t }: {
         }}
       />
     </div>
+    <ContactSyncPanel
+      status={syncStatus}
+      error={syncError}
+      busy={busy}
+      locale={locale}
+      t={t}
+      onToggle={() => void toggleContactSync()}
+      onSync={() => void syncContactsNow()}
+      onGrant={setCandidateToGrant}
+      onRevoke={setPeerToRevoke}
+    />
     <div className="contacts-workbench">
       <aside className="contacts-catalog" aria-label={t("contacts.directory")}>
         <form className="contacts-search" onSubmit={(event) => { event.preventDefault(); setAppliedQuery(query); }}>
@@ -507,7 +597,125 @@ export function ContactsSettings({ controller, locale, t }: {
       onClose={() => setMergeConfirmation(undefined)}
       onConfirm={() => void mergeContacts()}
     />
+    <ConfirmDialog
+      open={candidateToGrant !== undefined}
+      title={t("contacts.syncGrantTitle")}
+      body={t("contacts.syncGrantBody", {
+        name: candidateToGrant?.displayName ?? "",
+        fingerprint: formatFingerprint(candidateToGrant?.fingerprint ?? "")
+      })}
+      confirm={t("contacts.syncGrant")}
+      busy={busy === "sync-grant"}
+      t={t}
+      onClose={() => setCandidateToGrant(undefined)}
+      onConfirm={() => void grantContactSyncCandidate()}
+    />
+    <ConfirmDialog
+      open={peerToRevoke !== undefined}
+      title={t("contacts.syncRevokeTitle")}
+      body={t("contacts.syncRevokeBody", { name: peerToRevoke?.displayName ?? "" })}
+      confirm={t("contacts.syncRevoke")}
+      busy={busy === "sync-revoke"}
+      danger
+      t={t}
+      onClose={() => setPeerToRevoke(undefined)}
+      onConfirm={() => void revokeContactSyncPeer()}
+    />
   </section>;
+}
+
+function ContactSyncPanel({ status, error, busy, locale, t, onToggle, onSync, onGrant, onRevoke }: {
+  readonly status?: ContactSyncStatusView;
+  readonly error?: string;
+  readonly busy?: string;
+  readonly locale: Locale;
+  readonly t: Translator;
+  readonly onToggle: () => void;
+  readonly onSync: () => void;
+  readonly onGrant: (candidate: ContactSyncCandidateView) => void;
+  readonly onRevoke: (peer: ContactSyncPeerView) => void;
+}): JSX.Element {
+  const candidates = status?.candidates.filter((candidate) => !candidate.granted || candidate.keyChanged) ?? [];
+  const working = busy?.startsWith("sync-") === true;
+  return <section className="contacts-sync-card settings-card" aria-label={t("contacts.syncTitle")}>
+    <header className="contacts-sync-card__header">
+      <span className="contacts-sync-card__icon"><ShieldCheck aria-hidden="true" /></span>
+      <div>
+        <strong>{t("contacts.syncTitle")}</strong>
+        <span>{t("contacts.syncBody")}</span>
+      </div>
+      {status === undefined ? <Spinner /> : <span className={cx("contacts-sync-card__phase", `is-${status.phase}`)}>
+        {contactSyncPhaseLabel(status.phase, t)}
+      </span>}
+      <Button onClick={onSync} disabled={status?.available !== true || status.enabled !== true ||
+        (status.phase !== "error" && status.onlinePeerCount === 0) || working}>
+        <RefreshCw aria-hidden="true" />{status?.phase === "error" ? t("common.retry") : t("contacts.syncNow")}
+      </Button>
+      <SwitchControl
+        aria-label={t("contacts.syncEnable")}
+        checked={status?.enabled === true}
+        disabled={status === undefined || !status.available || working}
+        onChange={onToggle}
+      />
+    </header>
+    {(error !== undefined || status?.errorCode !== undefined || status?.available === false) && <p className="contacts-sync-card__error" role="status">
+      {error ?? contactSyncErrorLabel(status?.errorCode, t)}
+    </p>}
+    {status !== undefined && <>
+      <div className="contacts-sync-card__summary">
+        <span><small>{t("contacts.syncThisDevice")}</small><code>{formatFingerprint(status.fingerprint)}</code></span>
+        <span><small>{t("contacts.syncOnline")}</small><strong>{t("contacts.syncOnlineCount", { count: status.onlinePeerCount })}</strong></span>
+        <span><small>{t("contacts.syncLast")}</small><strong>{status.lastSyncAt === undefined
+          ? t("contacts.syncNever")
+          : t("contacts.syncLastValue", {
+            device: status.lastSyncPeerName ?? t("contacts.syncUnknownDevice"),
+            date: formatContactDate(status.lastSyncAt, locale)
+          })}</strong></span>
+        <span><small>{t("contacts.syncRoute")}</small><strong>{status.lastRoute === "lan" ? t("contacts.syncRouteLan") : "—"}</strong></span>
+      </div>
+      {status.enabled && <div className="contacts-sync-card__columns">
+        <div>
+          <h3>{t("contacts.syncTrustedDevices")}</h3>
+          {status.peers.length === 0 ? <p>{t("contacts.syncNoPeers")}</p> : <div className="contacts-sync-list">
+            {status.peers.map((peer) => <article key={peer.peerId}>
+              <MonitorSmartphone aria-hidden="true" />
+              <span><strong>{peer.displayName}</strong><small>{peer.online ? t("contacts.syncPeerOnline") : t("contacts.syncPeerOffline")} · {peer.state === "active" ? t("contacts.syncPeerActive") : t("contacts.syncPeerPending")}</small><code>{formatFingerprint(peer.fingerprint)}</code></span>
+              <Button tone="ghost" onClick={() => onRevoke(peer)} disabled={working}>{t("contacts.syncRevoke")}</Button>
+            </article>)}
+          </div>}
+        </div>
+        <div>
+          <h3>{t("contacts.syncNearbyDevices")}</h3>
+          {candidates.length === 0 ? <p>{t("contacts.syncNoCandidates")}</p> : <div className="contacts-sync-list">
+            {candidates.map((candidate) => <article key={`${candidate.nodeId}:${candidate.fingerprint}`} className={cx(candidate.keyChanged && "is-warning")}>
+              <MonitorSmartphone aria-hidden="true" />
+              <span><strong>{candidate.displayName}</strong><small>{candidate.keyChanged ? t("contacts.syncKeyChanged") : t("contacts.syncCandidateHint")}</small><code>{formatFingerprint(candidate.fingerprint)}</code></span>
+              <Button tone="ghost" onClick={() => onGrant(candidate)} disabled={working || candidate.keyChanged}>{t("contacts.syncGrant")}</Button>
+            </article>)}
+          </div>}
+        </div>
+      </div>}
+    </>}
+  </section>;
+}
+
+function contactSyncPhaseLabel(phase: ContactSyncStatusView["phase"], t: Translator): string {
+  if (phase === "off") return t("contacts.syncPhaseOff");
+  if (phase === "waiting") return t("contacts.syncPhaseWaiting");
+  if (phase === "syncing") return t("contacts.syncPhaseSyncing");
+  if (phase === "upToDate") return t("contacts.syncPhaseUpToDate");
+  return t("contacts.syncPhaseError");
+}
+
+function contactSyncErrorLabel(error: ContactSyncStatusView["errorCode"], t: Translator): string {
+  if (error === "identityUnavailable") return t("contacts.syncErrorIdentity");
+  if (error === "peerIdentityChanged") return t("contacts.syncErrorPeerKey");
+  if (error === "syncFailed") return t("contacts.syncErrorFailed");
+  return t("contacts.syncUnavailable");
+}
+
+function formatFingerprint(value: string): string {
+  return value.toUpperCase().match(/.{1,4}/gu)?.join(" ") ?? value;
 }
 
 function ImportResultDialog({ result, t, onClose, onOpen }: {

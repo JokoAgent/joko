@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createContactConnectService } from "./contact-connect-service.js";
 import { ContactManager } from "./contact-manager.js";
+import type { ContactSyncManager, ContactSyncStatus } from "./contact-sync-manager.js";
 import { mkdtempSync } from "./test-paths.js";
 
 const cleanups: Array<() => void> = [];
@@ -204,7 +205,95 @@ describe("ContactService", () => {
       Code.Unimplemented
     );
   });
+
+  it("authenticates and maps device-sync status, grants, revocation, and manual retry", async () => {
+    const fixture = createFixture();
+    const status = contactSyncStatus();
+    const sync = {
+      status: vi.fn(() => status),
+      setEnabled: vi.fn(async () => status),
+      grantCandidate: vi.fn(async () => status),
+      revokePeer: vi.fn(() => status),
+      syncNow: vi.fn(async () => status)
+    };
+    const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
+    const service = createContactConnectService(fixture.manager, authenticate, sync as unknown as ContactSyncManager);
+    const callContext = context();
+
+    const current = await service.getContactSyncStatus(create(contract.GetContactSyncStatusRequestSchema), callContext);
+    expect(current.status).toMatchObject({
+      available: true,
+      configurationRevision: { value: 9n },
+      nodeId: "node-local",
+      fingerprint: "a".repeat(64),
+      enabled: true,
+      phase: contract.ContactSyncPhase.UP_TO_DATE,
+      onlinePeerCount: 1,
+      lastSyncPeerId: "node-peer",
+      lastSyncPeerName: "Nearby Joko",
+      lastRoute: contract.ContactSyncRoute.LAN,
+      peers: [expect.objectContaining({
+        peerId: "node-peer",
+        revision: expect.objectContaining({ value: 3n }),
+        state: contract.ContactSyncPeerState.ACTIVE,
+        online: true,
+        lastRoute: contract.ContactSyncRoute.LAN
+      })],
+      candidates: [expect.objectContaining({ nodeId: "node-new", granted: false, keyChanged: false })]
+    });
+    await service.setContactSyncEnabled(create(contract.SetContactSyncEnabledRequestSchema, {
+      expectedConfigurationRevision: revision(9n), enabled: false
+    }), callContext);
+    await service.grantContactSyncPeer(create(contract.GrantContactSyncPeerRequestSchema, {
+      nodeId: "node-new", expectedFingerprint: "c".repeat(64)
+    }), callContext);
+    await service.revokeContactSyncPeer(create(contract.RevokeContactSyncPeerRequestSchema, {
+      peerId: "node-peer", expectedRevision: revision(3n)
+    }), callContext);
+    await service.syncContactsNow(create(contract.SyncContactsNowRequestSchema, { peerId: "node-peer" }), callContext);
+
+    expect(sync.setEnabled).toHaveBeenCalledWith(9n, false);
+    expect(sync.grantCandidate).toHaveBeenCalledWith("node-new", "c".repeat(64));
+    expect(sync.revokePeer).toHaveBeenCalledWith("node-peer", 3n);
+    expect(sync.syncNow).toHaveBeenCalledWith("node-peer");
+    expect(authenticate).toHaveBeenCalledTimes(5);
+  });
 });
+
+function contactSyncStatus(): ContactSyncStatus {
+  return {
+    available: true,
+    configurationRevision: 9n,
+    nodeId: "node-local",
+    fingerprint: "a".repeat(64),
+    enabled: true,
+    phase: "up_to_date",
+    onlinePeerCount: 1,
+    lastSyncAt: 4_000,
+    lastSyncPeerId: "node-peer",
+    lastSyncPeerName: "Nearby Joko",
+    lastRoute: "lan",
+    peers: [{
+      peerId: "node-peer",
+      revision: 3n,
+      displayName: "Nearby Joko",
+      fingerprint: "b".repeat(64),
+      online: true,
+      state: "active",
+      grantedAt: 2_000,
+      lastSyncAt: 4_000,
+      lastRoute: "lan"
+    }],
+    candidates: [{
+      nodeId: "node-new",
+      displayName: "New Joko",
+      fingerprint: "c".repeat(64),
+      seenAt: 5_000,
+      granted: false,
+      keyChanged: false
+    }]
+  };
+}
 
 function createFixture(): { readonly store: ContactStore; readonly manager: ContactManager } {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-contact-connect-"));

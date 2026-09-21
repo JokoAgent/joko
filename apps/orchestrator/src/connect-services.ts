@@ -1206,7 +1206,8 @@ export function createConnectServices(application: OrchestratorApplication): Con
   );
   const contact = createContactConnectService(
     application.contacts,
-    (context) => authenticate(context)
+    (context) => authenticate(context),
+    application.contactSync
   );
   const worktree = createWorktreeConnectService(
     dependencies.sessionWorktrees,

@@ -6,6 +6,9 @@ import {
   ContactRelationDirection,
   ContactSource,
   ContactStatus,
+  ContactSyncPeerState,
+  ContactSyncPhase,
+  ContactSyncRoute,
   ContactVCardImportDisposition,
   ContactVCardImportOutcome
 } from "@joko/contracts";
@@ -86,13 +89,33 @@ describe("Contact gateway", () => {
     await expect(gateway.exportContactsVCard(["contact-one"], signal)).resolves.toEqual({
       text: "BEGIN:VCARD\r\nEND:VCARD\r\n", contactCount: 1, suggestedFileName: "contacts.vcf"
     });
+    await expect(gateway.getContactSyncStatus(signal)).resolves.toMatchObject({
+      available: true,
+      configurationRevision: 9n,
+      nodeId: "node-local",
+      fingerprint: "a".repeat(64),
+      enabled: true,
+      phase: "upToDate",
+      onlinePeerCount: 1,
+      lastSyncAt: 4_000,
+      lastSyncPeerId: "node-peer",
+      lastSyncPeerName: "Nearby Joko",
+      lastRoute: "lan",
+      peers: [{ peerId: "node-peer", revision: 3n, state: "active", online: true, lastRoute: "lan" }],
+      candidates: [{ nodeId: "node-new", granted: false, keyChanged: false }]
+    });
+    await gateway.setContactSyncEnabled(9n, false, signal);
+    await gateway.grantContactSyncPeer("node-new", "c".repeat(64), signal);
+    await gateway.revokeContactSyncPeer("node-peer", 3n, signal);
+    await gateway.syncContactsNow("node-peer", signal);
 
     const expectedMethods = [
       "getContactDirectory", "setContactDirectoryEnabled", "listContacts", "getContact", "findSimilarContacts", "createContact", "updateContact",
       "confirmContact", "deleteContact", "addContactIdentity", "removeContactIdentity", "appendContactEvent",
       "removeContactEvent", "listContactGroups", "createContactGroup", "updateContactGroup", "deleteContactGroup",
       "setContactGroupMembership", "addContactRelation", "updateContactRelation", "removeContactRelation",
-      "scanContactDuplicates", "mergeContacts", "previewContactVCardImport", "commitContactVCardImport", "exportContactsVCard"
+      "scanContactDuplicates", "mergeContacts", "previewContactVCardImport", "commitContactVCardImport", "exportContactsVCard",
+      "getContactSyncStatus", "setContactSyncEnabled", "grantContactSyncPeer", "revokeContactSyncPeer", "syncContactsNow"
     ];
     expect(requests.filter((entry) => expectedMethods.includes(entry.method)).map((entry) => entry.method)).toEqual(expectedMethods);
     expect(requests.find((entry) => entry.method === "listContacts")?.input).toMatchObject({
@@ -118,7 +141,37 @@ describe("Contact gateway", () => {
         expectedOrganizationTargetRevision: { value: 4n }
       }]
     });
+    expect(requests.find((entry) => entry.method === "setContactSyncEnabled")?.input).toEqual({
+      expectedConfigurationRevision: { value: 9n }, enabled: false
+    });
+    expect(requests.find((entry) => entry.method === "grantContactSyncPeer")?.input).toEqual({
+      nodeId: "node-new", expectedFingerprint: "c".repeat(64)
+    });
+    expect(requests.find((entry) => entry.method === "revokeContactSyncPeer")?.input).toEqual({
+      peerId: "node-peer", expectedRevision: { value: 3n }
+    });
+    expect(requests.find((entry) => entry.method === "syncContactsNow")?.input).toEqual({ peerId: "node-peer" });
     expect(requests.filter((entry) => expectedMethods.includes(entry.method)).every((entry) => entry.signal instanceof AbortSignal && !entry.signal.aborted)).toBe(true);
+    gateway.disconnect();
+  });
+
+  it("fails closed when sync completion or online counts are inconsistent", async () => {
+    const transport = {
+      unary: vi.fn(async (method: any) => response(method, create(method.output,
+        method.localName === "getContactSyncStatus"
+          ? { status: { ...syncStatus(), onlinePeerCount: 0 } }
+          : contactResponse(method.localName)))),
+      stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway(
+      { id: "profile", deviceId: "device", name: "Node", origin: "https://service.example", serverId: "node" },
+      "fixture-auth",
+      {},
+      () => transport
+    );
+    await gateway.connect();
+
+    await expect(gateway.getContactSyncStatus()).rejects.toThrow(/inconsistent Contacts sync peers/iu);
     gateway.disconnect();
   });
 });
@@ -142,6 +195,40 @@ function summary(id = "contact-one", kind = ContactKind.PERSON) {
   };
 }
 function group() { return { contactGroupId: "group-one", revision: revision(4n), name: "Pioneers", description: "Computing pioneers", memberCount: 1, createdAt: timestamp(1n), updatedAt: timestamp(2n) }; }
+function syncStatus() {
+  return {
+    available: true,
+    configurationRevision: revision(9n),
+    nodeId: "node-local",
+    fingerprint: "a".repeat(64),
+    enabled: true,
+    phase: ContactSyncPhase.UP_TO_DATE,
+    onlinePeerCount: 1,
+    lastSyncAt: timestamp(4n),
+    lastSyncPeerId: "node-peer",
+    lastSyncPeerName: "Nearby Joko",
+    lastRoute: ContactSyncRoute.LAN,
+    peers: [{
+      peerId: "node-peer",
+      revision: revision(3n),
+      displayName: "Nearby Joko",
+      fingerprint: "b".repeat(64),
+      online: true,
+      state: ContactSyncPeerState.ACTIVE,
+      grantedAt: timestamp(2n),
+      lastSyncAt: timestamp(4n),
+      lastRoute: ContactSyncRoute.LAN
+    }],
+    candidates: [{
+      nodeId: "node-new",
+      displayName: "New Joko",
+      fingerprint: "c".repeat(64),
+      seenAt: timestamp(5n),
+      granted: false,
+      keyChanged: false
+    }]
+  };
+}
 function profile() {
   return {
     summary: summary(), narrative: "Mathematician", agentNotes: "Private note",
@@ -178,6 +265,9 @@ function contactResponse(method: string): object {
     directory: directory()
   };
   if (method === "exportContactsVCard") return { vcardText: "BEGIN:VCARD\r\nEND:VCARD\r\n", contactCount: 1, suggestedFileName: "contacts.vcf" };
+  if (["getContactSyncStatus", "setContactSyncEnabled", "grantContactSyncPeer", "revokeContactSyncPeer", "syncContactsNow"].includes(method)) {
+    return { status: syncStatus() };
+  }
   throw new Error(`Unexpected RPC ${method}`);
 }
 function response(method: any, message: any, stream = false): any { return { stream, service: method.parent, method, header: new Headers(), trailer: new Headers(), message }; }

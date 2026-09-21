@@ -178,7 +178,7 @@ test("voice input remains an ephemeral capability surface", () => {
   assert.equal(fieldNames(contract.SnapshotSchema).has("voice_input"), false);
 });
 
-test("Contacts exposes revision-fenced local authority without device or credential fields", () => {
+test("Contacts exposes revision-fenced local and explicit device-sync authority without secret transport fields", () => {
   assert.deepEqual([...methodNames(contract.ContactService)], [
     "getContactDirectory",
     "setContactDirectoryEnabled",
@@ -205,7 +205,12 @@ test("Contacts exposes revision-fenced local authority without device or credent
     "mergeContacts",
     "previewContactVCardImport",
     "commitContactVCardImport",
-    "exportContactsVCard"
+    "exportContactsVCard",
+    "getContactSyncStatus",
+    "setContactSyncEnabled",
+    "grantContactSyncPeer",
+    "revokeContactSyncPeer",
+    "syncContactsNow"
   ]);
   assertNoFields([
     contract.ContactDirectorySchema,
@@ -213,10 +218,18 @@ test("Contacts exposes revision-fenced local authority without device or credent
     contract.ContactProfileSchema,
     contract.ContactIdentitySchema,
     contract.ContactVCardImportPreviewEntrySchema,
-    contract.ExportContactsVCardResponseSchema
+    contract.ExportContactsVCardResponseSchema,
+    contract.ContactSyncStatusSchema,
+    contract.ContactSyncPeerSchema,
+    contract.ContactSyncCandidateSchema,
+    contract.GrantContactSyncPeerRequestSchema,
+    contract.RevokeContactSyncPeerRequestSchema,
+    contract.SyncContactsNowRequestSchema
   ], [
     "absolute_path", "database_path", "credential", "credential_reference_id",
-    "device_contact_id", "system_contact_id", "permission_token"
+    "device_contact_id", "system_contact_id", "permission_token", "public_key", "private_key",
+    "sealed_private_key", "proof", "challenge", "ciphertext", "state_json", "projection_json",
+    "address", "port"
   ]);
   assert.equal(field(contract.ContactPatchSchema, "display_name").proto.proto3Optional, true);
   assert.equal(field(contract.ContactVCardImportDecisionSchema, "target_contact_id").proto.proto3Optional, true);

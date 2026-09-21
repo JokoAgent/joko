@@ -16,6 +16,40 @@
 .contacts-directory-card__stats strong { font-size: var(--text-16); font-variant-numeric: tabular-nums; }
 .contacts-directory-card__stats small { color: var(--text-faint); font-size: var(--text-10); }
 
+.contacts-sync-card { flex: 0 0 auto; display: grid; gap: 12px; padding: 13px 14px; }
+.contacts-sync-card__header { display: grid; grid-template-columns: auto minmax(180px, 1fr) auto auto auto; align-items: center; gap: 10px; }
+.contacts-sync-card__header > div { min-width: 0; display: grid; gap: 2px; }
+.contacts-sync-card__header strong { font-size: var(--text-12); font-weight: 600; }
+.contacts-sync-card__header > div > span { color: var(--text-soft); font-size: var(--text-10); line-height: 1.4; }
+.contacts-sync-card__header .button { min-height: 30px; gap: 5px; }
+.contacts-sync-card__header .button svg { width: 13px; height: 13px; }
+.contacts-sync-card__icon { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid color-mix(in srgb, var(--accent-edge) 32%, var(--line)); border-radius: 10px; background: color-mix(in srgb, var(--accent) 9%, var(--surface)); color: var(--accent-strong); }
+.contacts-sync-card__icon svg { width: 16px; height: 16px; }
+.contacts-sync-card__phase { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; background: var(--surface); color: var(--text-soft); font-size: var(--text-9); white-space: nowrap; }
+.contacts-sync-card__phase.is-syncing { border-color: color-mix(in srgb, var(--accent-edge) 45%, var(--line)); color: var(--accent-strong); }
+.contacts-sync-card__phase.is-upToDate { border-color: color-mix(in srgb, var(--green) 40%, var(--line)); color: var(--green); }
+.contacts-sync-card__phase.is-error { border-color: color-mix(in srgb, var(--red) 42%, var(--line)); color: var(--red); }
+.contacts-sync-card__error { margin: 0; border-radius: 8px; padding: 7px 9px; background: color-mix(in srgb, var(--red) 8%, var(--surface)); color: var(--red); font-size: var(--text-10); line-height: 1.45; }
+.contacts-sync-card__summary { display: grid; grid-template-columns: minmax(150px, 1.2fr) repeat(3, minmax(100px, 1fr)); gap: 8px; }
+.contacts-sync-card__summary > span { min-width: 0; display: grid; gap: 3px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: color-mix(in srgb, var(--surface) 74%, transparent); }
+.contacts-sync-card__summary small { color: var(--text-faint); font-size: var(--text-9); }
+.contacts-sync-card__summary strong, .contacts-sync-card__summary code { overflow: hidden; color: var(--text-soft); font-size: var(--text-10); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.contacts-sync-card__summary code, .contacts-sync-list code { font-family: var(--font-mono); letter-spacing: .02em; }
+.contacts-sync-card__columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.contacts-sync-card__columns > div { min-width: 0; }
+.contacts-sync-card__columns h3 { margin: 0 0 6px; color: var(--text-soft); font-size: var(--text-10); font-weight: 600; }
+.contacts-sync-card__columns p { margin: 0; border: 1px dashed var(--line); border-radius: 8px; padding: 10px; color: var(--text-faint); font-size: var(--text-10); }
+.contacts-sync-list { display: grid; gap: 6px; }
+.contacts-sync-list article { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; background: var(--surface); }
+.contacts-sync-list article.is-warning { border-color: color-mix(in srgb, var(--orange) 45%, var(--line)); }
+.contacts-sync-list article > svg { width: 15px; height: 15px; color: var(--text-faint); }
+.contacts-sync-list article > span { min-width: 0; display: grid; gap: 1px; }
+.contacts-sync-list strong, .contacts-sync-list small, .contacts-sync-list code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contacts-sync-list strong { font-size: var(--text-10); font-weight: 550; }
+.contacts-sync-list small { color: var(--text-soft); font-size: var(--text-9); }
+.contacts-sync-list code { color: var(--text-faint); font-size: var(--text-8); }
+.contacts-sync-list .button { min-height: 27px; padding: 3px 7px; font-size: var(--text-9); }
+
 .contacts-workbench { min-height: 420px; flex: 1; display: grid; grid-template-columns: minmax(260px, 34%) minmax(0, 1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); }
 .contacts-catalog { min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 78%, var(--surface-raised)); }
 .contacts-search { margin: 10px 10px 7px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 9px; padding: 0 4px 0 9px; background: var(--surface-raised); }
@@ -134,6 +168,9 @@
   .contacts-settings__header-actions { justify-content: flex-start; }
   .contacts-directory-card { align-items: flex-start; flex-wrap: wrap; }
   .contacts-directory-card__stats { order: 3; width: 100%; justify-content: flex-start; }
+  .contacts-sync-card__header { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+  .contacts-sync-card__phase { grid-column: 2; justify-self: start; }
+  .contacts-sync-card__summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .contacts-workbench { grid-template-columns: minmax(220px, 40%) minmax(0, 1fr); }
   .contacts-filters { grid-template-columns: 1fr; }
   .contacts-catalog__meta { flex-wrap: wrap; }
@@ -146,6 +183,10 @@
 
 @media (max-width: 720px) {
   .contacts-settings { height: auto; min-height: 100%; }
+  .contacts-sync-card__header { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .contacts-sync-card__phase { grid-column: 2; }
+  .contacts-sync-card__header .button { grid-column: 2; justify-self: start; }
+  .contacts-sync-card__summary, .contacts-sync-card__columns { grid-template-columns: 1fr; }
   .contacts-workbench { min-height: 720px; grid-template-columns: 1fr; grid-template-rows: minmax(280px, 42vh) minmax(420px, auto); overflow: visible; }
   .contacts-catalog { border-right: 0; border-bottom: 1px solid var(--line); }
   .contacts-list { max-height: 42vh; }

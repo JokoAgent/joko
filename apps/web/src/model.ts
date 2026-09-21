@@ -439,6 +439,47 @@ export interface ContactDirectoryView {
   readonly groups: number;
 }
 
+export type ContactSyncPhaseView = "off" | "waiting" | "syncing" | "upToDate" | "error";
+export type ContactSyncErrorCodeView = "identityUnavailable" | "peerIdentityChanged" | "syncFailed";
+
+export interface ContactSyncPeerView {
+  readonly peerId: string;
+  readonly revision: bigint;
+  readonly displayName: string;
+  readonly fingerprint: string;
+  readonly online: boolean;
+  readonly state: "pending" | "active";
+  readonly grantedAt: number;
+  readonly lastSyncAt?: number;
+  readonly lastRoute?: "lan";
+}
+
+export interface ContactSyncCandidateView {
+  readonly nodeId: string;
+  readonly displayName: string;
+  readonly fingerprint: string;
+  readonly seenAt: number;
+  readonly granted: boolean;
+  readonly keyChanged: boolean;
+}
+
+export interface ContactSyncStatusView {
+  readonly available: boolean;
+  readonly configurationRevision: bigint;
+  readonly nodeId: string;
+  readonly fingerprint: string;
+  readonly enabled: boolean;
+  readonly phase: ContactSyncPhaseView;
+  readonly onlinePeerCount: number;
+  readonly errorCode?: ContactSyncErrorCodeView;
+  readonly lastSyncAt?: number;
+  readonly lastSyncPeerId?: string;
+  readonly lastSyncPeerName?: string;
+  readonly lastRoute?: "lan";
+  readonly peers: readonly ContactSyncPeerView[];
+  readonly candidates: readonly ContactSyncCandidateView[];
+}
+
 export interface ContactDraftView {
   readonly kind: ContactKindView;
   readonly displayName: string;
@@ -5075,6 +5116,11 @@ export interface OperationApi {
   previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
   commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
   exportContactsVCard(contactIds?: readonly string[], signal?: AbortSignal): Promise<ContactVCardExportView>;
+  getContactSyncStatus(signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  setContactSyncEnabled(expectedConfigurationRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  grantContactSyncPeer(nodeId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  revokeContactSyncPeer(peerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  syncContactsNow(peerId?: string, signal?: AbortSignal): Promise<ContactSyncStatusView>;
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
   watchRemoteHosts(targetId: string, signal?: AbortSignal): AsyncIterable<readonly RemoteHostView[]>;

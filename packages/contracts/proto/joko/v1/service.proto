@@ -220,6 +220,11 @@ service ContactService {
   rpc PreviewContactVCardImport(PreviewContactVCardImportRequest) returns (PreviewContactVCardImportResponse);
   rpc CommitContactVCardImport(CommitContactVCardImportRequest) returns (CommitContactVCardImportResponse);
   rpc ExportContactsVCard(ExportContactsVCardRequest) returns (ExportContactsVCardResponse);
+  rpc GetContactSyncStatus(GetContactSyncStatusRequest) returns (GetContactSyncStatusResponse);
+  rpc SetContactSyncEnabled(SetContactSyncEnabledRequest) returns (SetContactSyncEnabledResponse);
+  rpc GrantContactSyncPeer(GrantContactSyncPeerRequest) returns (GrantContactSyncPeerResponse);
+  rpc RevokeContactSyncPeer(RevokeContactSyncPeerRequest) returns (RevokeContactSyncPeerResponse);
+  rpc SyncContactsNow(SyncContactsNowRequest) returns (SyncContactsNowResponse);
 }
 
 // Orchestrator-node-owned local inference runtimes. Shared clients discover every

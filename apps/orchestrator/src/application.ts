@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
-import { userInfo } from "node:os";
+import { hostname, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -163,6 +163,7 @@ import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
 import { ContactManager } from "./contact-manager.js";
+import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
@@ -348,6 +349,8 @@ export interface OrchestratorApplication {
   readonly collaboration?: CollaborationManager;
   /** Node-local structured authority for people and organizations. */
   readonly contacts?: ContactManager;
+  /** Explicitly granted, encrypted node-to-node Contacts convergence owner. */
+  readonly contactSync?: ContactSyncManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -532,6 +535,29 @@ export async function createOrchestratorApplication(
   const baseSettings = await loadJsonFile<PiManagedSettings>(config.piSettingsFile, {});
   const settings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", "settings.pi.pi")?.value);
   const credentialVault = await CredentialVault.open(join(config.dataDirectory, "credentials", "master.key"));
+  let lastContactSyncDiagnosticAt = 0;
+  const contactSync = new ContactSyncManager({
+    store: contactStore,
+    vault: credentialVault,
+    nodeId: serverId,
+    displayName: contactSyncDisplayName(),
+    logger: {
+      debug: () => undefined,
+      warn: () => {
+        const at = Date.now();
+        if (at - lastContactSyncDiagnosticAt < 5 * 60_000) return;
+        lastContactSyncDiagnosticAt = at;
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "contacts-sync",
+          code: "CONTACTS_SYNC_UNAVAILABLE",
+          message: "Contacts device sync encountered a secure transport failure.",
+          details: {}
+        });
+      }
+    }
+  });
+  await contactSync.initialize().catch(() => undefined);
   const mobilePushProvider = dependencies.mobilePushProvider ?? (config.mobilePush === undefined
     ? undefined
     : new ApnsMobilePushProvider({
@@ -2038,6 +2064,7 @@ export async function createOrchestratorApplication(
     await remoteBackendRuntimeSetup.close().catch(() => undefined);
     await remoteHosts.close().catch(() => undefined);
     runtimeActivity.close();
+    contactSync.close();
     contacts.close();
     contactStore.close();
     store.close();
@@ -2090,6 +2117,7 @@ export async function createOrchestratorApplication(
     skillPublication,
     collaboration,
     contacts,
+    contactSync,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -2195,6 +2223,7 @@ export async function createOrchestratorApplication(
         await attempt(() => remoteHosts.close());
         await attempt(() => workspaces.close());
         await attempt(() => runtimeActivity.close());
+        await attempt(() => contactSync.close());
         await attempt(() => contacts.close());
         await attempt(() => contactStore.close());
         await attempt(() => store.close());
@@ -2204,6 +2233,13 @@ export async function createOrchestratorApplication(
       return closePromise;
     }
   };
+}
+
+function contactSyncDisplayName(): string {
+  const value = hostname().trim();
+  return value.length >= 1 && value.length <= 90 && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? `${value} · Joko`
+    : "Joko";
 }
 
 function createClaudeCodeCredentialPort(

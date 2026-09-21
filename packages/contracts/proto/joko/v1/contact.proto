@@ -50,6 +50,33 @@ enum ContactVCardImportDecisionKind {
   CONTACT_V_CARD_IMPORT_DECISION_KIND_SKIP = 3;
 }
 
+enum ContactSyncPhase {
+  CONTACT_SYNC_PHASE_UNSPECIFIED = 0;
+  CONTACT_SYNC_PHASE_OFF = 1;
+  CONTACT_SYNC_PHASE_WAITING = 2;
+  CONTACT_SYNC_PHASE_SYNCING = 3;
+  CONTACT_SYNC_PHASE_UP_TO_DATE = 4;
+  CONTACT_SYNC_PHASE_ERROR = 5;
+}
+
+enum ContactSyncErrorCode {
+  CONTACT_SYNC_ERROR_CODE_UNSPECIFIED = 0;
+  CONTACT_SYNC_ERROR_CODE_IDENTITY_UNAVAILABLE = 1;
+  CONTACT_SYNC_ERROR_CODE_PEER_IDENTITY_CHANGED = 2;
+  CONTACT_SYNC_ERROR_CODE_SYNC_FAILED = 3;
+}
+
+enum ContactSyncPeerState {
+  CONTACT_SYNC_PEER_STATE_UNSPECIFIED = 0;
+  CONTACT_SYNC_PEER_STATE_PENDING = 1;
+  CONTACT_SYNC_PEER_STATE_ACTIVE = 2;
+}
+
+enum ContactSyncRoute {
+  CONTACT_SYNC_ROUTE_UNSPECIFIED = 0;
+  CONTACT_SYNC_ROUTE_LAN = 1;
+}
+
 message ContactIdentity {
   string contact_identity_id = 1;
   string contact_id = 2;
@@ -128,6 +155,85 @@ message ContactDirectory {
   uint32 organizations = 5;
   uint32 pending = 6;
   uint32 groups = 7;
+}
+
+message ContactSyncPeer {
+  string peer_id = 1;
+  Revision revision = 2;
+  string display_name = 3;
+  string fingerprint = 4;
+  bool online = 5;
+  ContactSyncPeerState state = 6;
+  google.protobuf.Timestamp granted_at = 7;
+  optional google.protobuf.Timestamp last_sync_at = 8;
+  optional ContactSyncRoute last_route = 9;
+}
+
+message ContactSyncCandidate {
+  string node_id = 1;
+  string display_name = 2;
+  string fingerprint = 3;
+  google.protobuf.Timestamp seen_at = 4;
+  bool granted = 5;
+  bool key_changed = 6;
+}
+
+message ContactSyncStatus {
+  bool available = 1;
+  Revision configuration_revision = 2;
+  string node_id = 3;
+  string fingerprint = 4;
+  bool enabled = 5;
+  ContactSyncPhase phase = 6;
+  uint32 online_peer_count = 7;
+  optional ContactSyncErrorCode error_code = 8;
+  optional google.protobuf.Timestamp last_sync_at = 9;
+  optional string last_sync_peer_id = 10;
+  optional string last_sync_peer_name = 11;
+  optional ContactSyncRoute last_route = 12;
+  repeated ContactSyncPeer peers = 13;
+  repeated ContactSyncCandidate candidates = 14;
+}
+
+message GetContactSyncStatusRequest {}
+
+message GetContactSyncStatusResponse {
+  ContactSyncStatus status = 1;
+}
+
+message SetContactSyncEnabledRequest {
+  Revision expected_configuration_revision = 1;
+  bool enabled = 2;
+}
+
+message SetContactSyncEnabledResponse {
+  ContactSyncStatus status = 1;
+}
+
+message GrantContactSyncPeerRequest {
+  string node_id = 1;
+  string expected_fingerprint = 2;
+}
+
+message GrantContactSyncPeerResponse {
+  ContactSyncStatus status = 1;
+}
+
+message RevokeContactSyncPeerRequest {
+  string peer_id = 1;
+  Revision expected_revision = 2;
+}
+
+message RevokeContactSyncPeerResponse {
+  ContactSyncStatus status = 1;
+}
+
+message SyncContactsNowRequest {
+  optional string peer_id = 1;
+}
+
+message SyncContactsNowResponse {
+  ContactSyncStatus status = 1;
 }
 
 message ContactIdentityInput {

@@ -149,6 +149,28 @@ export interface ContactMergeResult {
   readonly movedRelations: number;
 }
 
+export interface ContactSyncConfigurationRecord {
+  readonly revision: bigint;
+  readonly nodeId: string;
+  readonly enabled: boolean;
+  readonly publicKey: string;
+  readonly sealedPrivateKey: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ContactSyncPeerRecord {
+  readonly peerId: string;
+  readonly revision: bigint;
+  readonly displayName: string;
+  readonly publicKey: string;
+  readonly fingerprint: string;
+  readonly grantedAt: number;
+  readonly updatedAt: number;
+  readonly lastSyncAt?: number;
+  readonly lastRoute?: "lan";
+}
+
 export type ContactStoreErrorCode =
   | "CONTACT_INVALID"
   | "CONTACT_NOT_FOUND"
@@ -156,6 +178,8 @@ export type ContactStoreErrorCode =
   | "CONTACT_IDENTITY_CONFLICT"
   | "CONTACT_ALREADY_EXISTS"
   | "CONTACT_DIRECTORY_CHANGED"
+  | "CONTACT_SYNC_CHANGED"
+  | "CONTACT_SYNC_PEER_NOT_FOUND"
   | "CONTACT_STORE_UNAVAILABLE";
 
 export class ContactStoreError extends Error {

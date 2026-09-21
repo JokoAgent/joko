@@ -2334,6 +2334,14 @@ export function useAppController(): AppController {
     commitContactVCardImport: (previewId, expectedDirectoryRevision, decisions, signal) =>
       gateway().commitContactVCardImport(previewId, expectedDirectoryRevision, decisions, signal),
     exportContactsVCard: (contactIds, signal) => gateway().exportContactsVCard(contactIds, signal),
+    getContactSyncStatus: (signal) => gateway().getContactSyncStatus(signal),
+    setContactSyncEnabled: (expectedConfigurationRevision, enabled, signal) =>
+      gateway().setContactSyncEnabled(expectedConfigurationRevision, enabled, signal),
+    grantContactSyncPeer: (nodeId, expectedFingerprint, signal) =>
+      gateway().grantContactSyncPeer(nodeId, expectedFingerprint, signal),
+    revokeContactSyncPeer: (peerId, expectedRevision, signal) =>
+      gateway().revokeContactSyncPeer(peerId, expectedRevision, signal),
+    syncContactsNow: (peerId, signal) => gateway().syncContactsNow(peerId, signal),
     ...remoteHostApi,
     ...mcpApi,
     updatePiSettings: (backendId, patch) => gateway().updatePiSettings(backendId, patch),
