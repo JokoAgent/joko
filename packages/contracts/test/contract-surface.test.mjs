@@ -178,6 +178,50 @@ test("voice input remains an ephemeral capability surface", () => {
   assert.equal(fieldNames(contract.SnapshotSchema).has("voice_input"), false);
 });
 
+test("Contacts exposes revision-fenced local authority without device or credential fields", () => {
+  assert.deepEqual([...methodNames(contract.ContactService)], [
+    "getContactDirectory",
+    "setContactDirectoryEnabled",
+    "listContacts",
+    "getContact",
+    "findSimilarContacts",
+    "createContact",
+    "updateContact",
+    "confirmContact",
+    "deleteContact",
+    "addContactIdentity",
+    "removeContactIdentity",
+    "appendContactEvent",
+    "removeContactEvent",
+    "listContactGroups",
+    "createContactGroup",
+    "updateContactGroup",
+    "deleteContactGroup",
+    "setContactGroupMembership",
+    "addContactRelation",
+    "updateContactRelation",
+    "removeContactRelation",
+    "scanContactDuplicates",
+    "mergeContacts",
+    "previewContactVCardImport",
+    "commitContactVCardImport",
+    "exportContactsVCard"
+  ]);
+  assertNoFields([
+    contract.ContactDirectorySchema,
+    contract.ContactSummarySchema,
+    contract.ContactProfileSchema,
+    contract.ContactIdentitySchema,
+    contract.ContactVCardImportPreviewEntrySchema,
+    contract.ExportContactsVCardResponseSchema
+  ], [
+    "absolute_path", "database_path", "credential", "credential_reference_id",
+    "device_contact_id", "system_contact_id", "permission_token"
+  ]);
+  assert.equal(field(contract.ContactPatchSchema, "display_name").proto.proto3Optional, true);
+  assert.equal(field(contract.ContactVCardImportDecisionSchema, "target_contact_id").proto.proto3Optional, true);
+});
+
 test("discovery metadata is a closed public allowlist", () => {
   assert.deepEqual(fields(contract.DiscoveredNodeSchema).map((candidate) => candidate.name), [
     "server_id", "display_name", "origin", "version", "api_version", "pairing_enabled", "last_seen"

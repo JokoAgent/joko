@@ -19,6 +19,7 @@ export * from "./browser-tool-bridge.js";
 export * from "./config.js";
 export * from "./connection-manager.js";
 export * from "./collaboration-manager.js";
+export * from "./contact-manager.js";
 export * from "./credential-manager.js";
 export * from "./credential-vault.js";
 export * from "./diagnostics-bundle.js";

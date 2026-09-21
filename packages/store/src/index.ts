@@ -1,4 +1,8 @@
 export * from "./errors.js";
+export { CONTACT_SCHEMA_BASELINE_ID, ContactStore, normalizeContactIdentityValue, normalizeContactPlatform } from "./contact-store.js";
+export type { ContactListOptions, ContactStoreOptions } from "./contact-store.js";
+export { ContactStoreError } from "./contact-types.js";
+export type * from "./contact-types.js";
 export {
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   OperationalStore

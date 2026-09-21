@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/contact.proto";
 import "joko/v1/event.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
@@ -188,6 +189,37 @@ service CredentialService {
 
 service SettingsService {
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+}
+
+// Authenticated, node-local contact authority. Device address-book access is
+// exposed separately because operating-system permission is not implied here.
+service ContactService {
+  rpc GetContactDirectory(GetContactDirectoryRequest) returns (GetContactDirectoryResponse);
+  rpc SetContactDirectoryEnabled(SetContactDirectoryEnabledRequest) returns (SetContactDirectoryEnabledResponse);
+  rpc ListContacts(ListContactsRequest) returns (ListContactsResponse);
+  rpc GetContact(GetContactRequest) returns (GetContactResponse);
+  rpc FindSimilarContacts(FindSimilarContactsRequest) returns (FindSimilarContactsResponse);
+  rpc CreateContact(CreateContactRequest) returns (CreateContactResponse);
+  rpc UpdateContact(UpdateContactRequest) returns (UpdateContactResponse);
+  rpc ConfirmContact(ConfirmContactRequest) returns (ConfirmContactResponse);
+  rpc DeleteContact(DeleteContactRequest) returns (DeleteContactResponse);
+  rpc AddContactIdentity(AddContactIdentityRequest) returns (AddContactIdentityResponse);
+  rpc RemoveContactIdentity(RemoveContactIdentityRequest) returns (RemoveContactIdentityResponse);
+  rpc AppendContactEvent(AppendContactEventRequest) returns (AppendContactEventResponse);
+  rpc RemoveContactEvent(RemoveContactEventRequest) returns (RemoveContactEventResponse);
+  rpc ListContactGroups(ListContactGroupsRequest) returns (ListContactGroupsResponse);
+  rpc CreateContactGroup(CreateContactGroupRequest) returns (CreateContactGroupResponse);
+  rpc UpdateContactGroup(UpdateContactGroupRequest) returns (UpdateContactGroupResponse);
+  rpc DeleteContactGroup(DeleteContactGroupRequest) returns (DeleteContactGroupResponse);
+  rpc SetContactGroupMembership(SetContactGroupMembershipRequest) returns (SetContactGroupMembershipResponse);
+  rpc AddContactRelation(AddContactRelationRequest) returns (AddContactRelationResponse);
+  rpc UpdateContactRelation(UpdateContactRelationRequest) returns (UpdateContactRelationResponse);
+  rpc RemoveContactRelation(RemoveContactRelationRequest) returns (RemoveContactRelationResponse);
+  rpc ScanContactDuplicates(ScanContactDuplicatesRequest) returns (ScanContactDuplicatesResponse);
+  rpc MergeContacts(MergeContactsRequest) returns (MergeContactsResponse);
+  rpc PreviewContactVCardImport(PreviewContactVCardImportRequest) returns (PreviewContactVCardImportResponse);
+  rpc CommitContactVCardImport(CommitContactVCardImportRequest) returns (CommitContactVCardImportResponse);
+  rpc ExportContactsVCard(ExportContactsVCardRequest) returns (ExportContactsVCardResponse);
 }
 
 // Orchestrator-node-owned local inference runtimes. Shared clients discover every

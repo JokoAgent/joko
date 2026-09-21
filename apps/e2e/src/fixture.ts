@@ -10,6 +10,7 @@ import {
   BackendInstanceRegistry,
   BlobTransferCoordinator,
   ConnectionManager,
+  ContactManager,
   LanDiscoveryService,
   DurableWorkspaceRunCapture,
   HistoryMaintenance,
@@ -27,7 +28,7 @@ import {
   type BackendInstanceFactory,
   type OrchestratorConfig
 } from "@joko/orchestrator";
-import { OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore } from "@joko/store";
 import {
   FakeBackendAdapter,
   PI_LIKE_PROFILE,
@@ -318,6 +319,8 @@ export class OrchestratorE2eFixture {
       await backendInstances.refresh(backendId);
     };
     const auxiliaryServices = await options.createAuxiliaryServices?.(store, dataDirectory, artifacts);
+    const contactStore = new ContactStore(join(dataDirectory, "contacts.db"));
+    const contacts = new ContactManager(contactStore);
     const application: OrchestratorApplication = {
       config,
       store,
@@ -343,6 +346,7 @@ export class OrchestratorE2eFixture {
       holdSubagentSmartRoutingDispatch: () => undefined,
       refreshSubagentSmartRouting: restartBackend,
       browserActivity: [],
+      contacts,
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
       async close() {
@@ -356,6 +360,8 @@ export class OrchestratorE2eFixture {
         await auxiliaryServices?.voiceInput?.close();
         await lanDiscovery.stop();
         await options.terminals?.dispose();
+        contacts.close();
+        contactStore.close();
         await sessionHost.dispose();
         sessionWorktrees.dispose();
         store.close();

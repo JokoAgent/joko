@@ -394,6 +394,7 @@ import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
 import type { TerminalProvider } from "@joko/tool-terminal";
 import { createManagedModelRuntimeConnectService } from "./managed-model-runtime-connect-service.js";
+import { createContactConnectService } from "./contact-connect-service.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
@@ -667,6 +668,7 @@ export interface ConnectServiceSet {
   readonly historyMaintenance: ServiceImpl<typeof contract.HistoryMaintenanceService>;
   readonly credential: ServiceImpl<typeof contract.CredentialService>;
   readonly settings: ServiceImpl<typeof contract.SettingsService>;
+  readonly contact: ServiceImpl<typeof contract.ContactService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
   readonly extension: ServiceImpl<typeof contract.ExtensionService>;
@@ -997,6 +999,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.HistoryMaintenanceService, withConnectErrors(services.historyMaintenance));
   router.service(contract.CredentialService, withConnectErrors(services.credential));
   router.service(contract.SettingsService, withConnectErrors(services.settings));
+  router.service(contract.ContactService, withConnectErrors(services.contact));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
   router.service(contract.ExtensionService, withConnectErrors(services.extension));
@@ -1199,6 +1202,10 @@ export function createConnectServices(application: OrchestratorApplication): Con
   }));
   const managedModelRuntime = createManagedModelRuntimeConnectService(
     dependencies.managedModelRuntime,
+    (context) => authenticate(context)
+  );
+  const contact = createContactConnectService(
+    application.contacts,
     (context) => authenticate(context)
   );
   const worktree = createWorktreeConnectService(
@@ -4804,7 +4811,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, contact, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {

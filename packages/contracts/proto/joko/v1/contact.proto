@@ -1,0 +1,510 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+enum ContactKind {
+  CONTACT_KIND_UNSPECIFIED = 0;
+  CONTACT_KIND_PERSON = 1;
+  CONTACT_KIND_ORGANIZATION = 2;
+}
+
+enum ContactStatus {
+  CONTACT_STATUS_UNSPECIFIED = 0;
+  CONTACT_STATUS_CONFIRMED = 1;
+  CONTACT_STATUS_PENDING = 2;
+}
+
+enum ContactSource {
+  CONTACT_SOURCE_UNSPECIFIED = 0;
+  CONTACT_SOURCE_MANUAL = 1;
+  CONTACT_SOURCE_AGENT = 2;
+  CONTACT_SOURCE_IMPORT = 3;
+}
+
+enum ContactDuplicateMatchType {
+  CONTACT_DUPLICATE_MATCH_TYPE_UNSPECIFIED = 0;
+  CONTACT_DUPLICATE_MATCH_TYPE_IDENTITY = 1;
+  CONTACT_DUPLICATE_MATCH_TYPE_NAME = 2;
+}
+
+enum ContactRelationDirection {
+  CONTACT_RELATION_DIRECTION_UNSPECIFIED = 0;
+  CONTACT_RELATION_DIRECTION_OUTGOING = 1;
+  CONTACT_RELATION_DIRECTION_INCOMING = 2;
+}
+
+enum ContactVCardImportDisposition {
+  CONTACT_V_CARD_IMPORT_DISPOSITION_UNSPECIFIED = 0;
+  CONTACT_V_CARD_IMPORT_DISPOSITION_CREATE = 1;
+  CONTACT_V_CARD_IMPORT_DISPOSITION_AUTO_ENRICH = 2;
+  CONTACT_V_CARD_IMPORT_DISPOSITION_NEEDS_REVIEW = 3;
+}
+
+enum ContactVCardImportDecisionKind {
+  CONTACT_V_CARD_IMPORT_DECISION_KIND_UNSPECIFIED = 0;
+  CONTACT_V_CARD_IMPORT_DECISION_KIND_CREATE = 1;
+  CONTACT_V_CARD_IMPORT_DECISION_KIND_MERGE = 2;
+  CONTACT_V_CARD_IMPORT_DECISION_KIND_SKIP = 3;
+}
+
+message ContactIdentity {
+  string contact_identity_id = 1;
+  string contact_id = 2;
+  Revision revision = 3;
+  string platform = 4;
+  string value = 5;
+  string normalized_value = 6;
+  string label = 7;
+  string note = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+message ContactEvent {
+  string contact_event_id = 1;
+  string contact_id = 2;
+  Revision revision = 3;
+  string date = 4;
+  string text = 5;
+  string source = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message ContactGroup {
+  string contact_group_id = 1;
+  Revision revision = 2;
+  string name = 3;
+  string description = 4;
+  uint32 member_count = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message ContactRelation {
+  string contact_relation_id = 1;
+  Revision revision = 2;
+  string from_contact_id = 3;
+  string to_contact_id = 4;
+  string relation = 5;
+  string note = 6;
+  google.protobuf.Timestamp created_at = 7;
+  ContactRelationDirection direction = 8;
+  string related_contact_id = 9;
+  string related_display_name = 10;
+  ContactKind related_kind = 11;
+}
+
+message ContactSummary {
+  string contact_id = 1;
+  Revision revision = 2;
+  ContactKind kind = 3;
+  string display_name = 4;
+  repeated string aliases = 5;
+  string summary = 6;
+  ContactStatus status = 7;
+  ContactSource source = 8;
+  uint32 identity_count = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message ContactProfile {
+  ContactSummary summary = 1;
+  string narrative = 2;
+  string agent_notes = 3;
+  repeated ContactIdentity identities = 4;
+  repeated ContactEvent events = 5;
+  repeated ContactGroup groups = 6;
+  repeated ContactRelation relations = 7;
+}
+
+message ContactDirectory {
+  uint32 format = 1;
+  Revision revision = 2;
+  bool enabled = 3;
+  uint32 people = 4;
+  uint32 organizations = 5;
+  uint32 pending = 6;
+  uint32 groups = 7;
+}
+
+message ContactIdentityInput {
+  string platform = 1;
+  string value = 2;
+  string label = 3;
+  string note = 4;
+}
+
+message ContactEventInput {
+  string date = 1;
+  string text = 2;
+  string source = 3;
+}
+
+message ContactDraft {
+  ContactKind kind = 1;
+  string display_name = 2;
+  repeated string aliases = 3;
+  string summary = 4;
+  string narrative = 5;
+  string agent_notes = 6;
+  ContactStatus status = 7;
+  ContactSource source = 8;
+  repeated ContactIdentityInput identities = 9;
+}
+
+message ContactAliasList {
+  repeated string values = 1;
+}
+
+message ContactPatch {
+  optional ContactKind kind = 1;
+  optional string display_name = 2;
+  ContactAliasList aliases = 3;
+  optional string summary = 4;
+  optional string narrative = 5;
+  optional string agent_notes = 6;
+  optional ContactStatus status = 7;
+}
+
+message ContactDuplicateCandidate {
+  ContactDuplicateMatchType match_type = 1;
+  string contact_id = 2;
+  string display_name = 3;
+  ContactKind kind = 4;
+  ContactStatus status = 5;
+  string summary = 6;
+  optional string matched_platform = 7;
+  optional string matched_value = 8;
+}
+
+message ContactDuplicatePair {
+  ContactSummary first = 1;
+  ContactSummary second = 2;
+}
+
+message GetContactDirectoryRequest {}
+
+message GetContactDirectoryResponse {
+  ContactDirectory directory = 1;
+}
+
+message SetContactDirectoryEnabledRequest {
+  Revision expected_directory_revision = 1;
+  bool enabled = 2;
+}
+
+message SetContactDirectoryEnabledResponse {
+  ContactDirectory directory = 1;
+}
+
+message ListContactsRequest {
+  optional string query = 1;
+  optional ContactKind kind = 2;
+  optional ContactStatus status = 3;
+  optional string contact_group_id = 4;
+  uint32 page_size = 5;
+  uint32 page_offset = 6;
+}
+
+message ListContactsResponse {
+  repeated ContactSummary contacts = 1;
+  uint32 total = 2;
+  optional uint32 next_page_offset = 3;
+}
+
+message GetContactRequest {
+  string contact_id = 1;
+}
+
+message GetContactResponse {
+  ContactProfile contact = 1;
+}
+
+message FindSimilarContactsRequest {
+  ContactDraft contact = 1;
+}
+
+message FindSimilarContactsResponse {
+  repeated ContactDuplicateCandidate candidates = 1;
+}
+
+message CreateContactRequest {
+  Revision expected_directory_revision = 1;
+  ContactDraft contact = 2;
+  repeated string confirmed_name_candidate_ids = 3;
+}
+
+message CreateContactResponse {
+  ContactProfile contact = 1;
+  repeated ContactDuplicateCandidate candidates = 2;
+  ContactDirectory directory = 3;
+}
+
+message UpdateContactRequest {
+  string contact_id = 1;
+  Revision expected_revision = 2;
+  ContactPatch patch = 3;
+}
+
+message UpdateContactResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message ConfirmContactRequest {
+  string contact_id = 1;
+  Revision expected_revision = 2;
+}
+
+message ConfirmContactResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message DeleteContactRequest {
+  string contact_id = 1;
+  Revision expected_revision = 2;
+}
+
+message DeleteContactResponse {
+  ContactDirectory directory = 1;
+}
+
+message AddContactIdentityRequest {
+  string contact_id = 1;
+  Revision expected_contact_revision = 2;
+  ContactIdentityInput identity = 3;
+}
+
+message AddContactIdentityResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message RemoveContactIdentityRequest {
+  string contact_id = 1;
+  Revision expected_contact_revision = 2;
+  string contact_identity_id = 3;
+}
+
+message RemoveContactIdentityResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message AppendContactEventRequest {
+  string contact_id = 1;
+  Revision expected_contact_revision = 2;
+  ContactEventInput event = 3;
+}
+
+message AppendContactEventResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message RemoveContactEventRequest {
+  string contact_id = 1;
+  Revision expected_contact_revision = 2;
+  string contact_event_id = 3;
+}
+
+message RemoveContactEventResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message ListContactGroupsRequest {}
+
+message ListContactGroupsResponse {
+  repeated ContactGroup groups = 1;
+}
+
+message CreateContactGroupRequest {
+  Revision expected_directory_revision = 1;
+  string name = 2;
+  string description = 3;
+}
+
+message CreateContactGroupResponse {
+  ContactGroup group = 1;
+  ContactDirectory directory = 2;
+}
+
+message UpdateContactGroupRequest {
+  string contact_group_id = 1;
+  Revision expected_revision = 2;
+  string name = 3;
+  string description = 4;
+}
+
+message UpdateContactGroupResponse {
+  ContactGroup group = 1;
+  ContactDirectory directory = 2;
+}
+
+message DeleteContactGroupRequest {
+  string contact_group_id = 1;
+  Revision expected_revision = 2;
+}
+
+message DeleteContactGroupResponse {
+  ContactDirectory directory = 1;
+}
+
+message SetContactGroupMembershipRequest {
+  string contact_id = 1;
+  Revision expected_contact_revision = 2;
+  string contact_group_id = 3;
+  bool member = 4;
+}
+
+message SetContactGroupMembershipResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message AddContactRelationRequest {
+  string from_contact_id = 1;
+  Revision expected_from_revision = 2;
+  string to_contact_id = 3;
+  string relation = 4;
+  string note = 5;
+}
+
+message AddContactRelationResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message UpdateContactRelationRequest {
+  string owner_contact_id = 1;
+  Revision expected_owner_revision = 2;
+  string contact_relation_id = 3;
+  Revision expected_relation_revision = 4;
+  string relation = 5;
+  string note = 6;
+}
+
+message UpdateContactRelationResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message RemoveContactRelationRequest {
+  string owner_contact_id = 1;
+  Revision expected_owner_revision = 2;
+  string contact_relation_id = 3;
+}
+
+message RemoveContactRelationResponse {
+  ContactProfile contact = 1;
+  ContactDirectory directory = 2;
+}
+
+message ScanContactDuplicatesRequest {
+  uint32 limit = 1;
+}
+
+message ScanContactDuplicatesResponse {
+  repeated ContactDuplicatePair pairs = 1;
+  ContactDirectory directory = 2;
+}
+
+message MergeContactsRequest {
+  string target_contact_id = 1;
+  Revision expected_target_revision = 2;
+  string merged_contact_id = 3;
+  Revision expected_merged_revision = 4;
+}
+
+message MergeContactsResponse {
+  ContactProfile target = 1;
+  string merged_contact_id = 2;
+  uint32 moved_identities = 3;
+  uint32 moved_events = 4;
+  uint32 moved_relations = 5;
+  ContactDirectory directory = 6;
+}
+
+message PreviewContactVCardImportRequest {
+  string vcard_text = 1;
+}
+
+message ContactVCardImportPreviewEntry {
+  string entry_id = 1;
+  ContactDraft contact = 2;
+  ContactVCardImportDisposition disposition = 3;
+  optional string existing_contact_id = 4;
+  repeated ContactDuplicateCandidate candidates = 5;
+  optional string existing_entry_id = 6;
+  repeated string similar_entry_ids = 7;
+  optional string organization_name = 8;
+  optional string title = 9;
+  repeated string groups = 10;
+  optional string organization_contact_id = 11;
+  repeated ContactDuplicateCandidate organization_candidates = 12;
+}
+
+message PreviewContactVCardImportResponse {
+  string preview_id = 1;
+  Revision directory_revision = 2;
+  repeated ContactVCardImportPreviewEntry entries = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message ContactVCardImportDecision {
+  string entry_id = 1;
+  ContactVCardImportDecisionKind decision = 2;
+  optional string target_contact_id = 3;
+  Revision expected_target_revision = 4;
+  repeated string confirmed_name_candidate_ids = 5;
+  optional string target_entry_id = 6;
+  optional ContactVCardImportDecisionKind organization_decision = 7;
+  optional string organization_target_contact_id = 8;
+  Revision expected_organization_target_revision = 9;
+  optional string organization_target_entry_id = 10;
+  repeated string confirmed_organization_candidate_ids = 11;
+}
+
+message CommitContactVCardImportRequest {
+  string preview_id = 1;
+  Revision expected_directory_revision = 2;
+  repeated ContactVCardImportDecision decisions = 3;
+}
+
+enum ContactVCardImportOutcome {
+  CONTACT_V_CARD_IMPORT_OUTCOME_UNSPECIFIED = 0;
+  CONTACT_V_CARD_IMPORT_OUTCOME_CREATED = 1;
+  CONTACT_V_CARD_IMPORT_OUTCOME_ENRICHED = 2;
+  CONTACT_V_CARD_IMPORT_OUTCOME_SKIPPED = 3;
+}
+
+message ContactVCardImportEntryResult {
+  string entry_id = 1;
+  string display_name = 2;
+  ContactVCardImportOutcome outcome = 3;
+  optional string contact_id = 4;
+}
+
+message CommitContactVCardImportResponse {
+  uint32 created = 1;
+  uint32 enriched = 2;
+  uint32 skipped = 3;
+  repeated string contact_ids = 4;
+  ContactDirectory directory = 5;
+  repeated ContactVCardImportEntryResult entries = 6;
+}
+
+message ExportContactsVCardRequest {
+  repeated string contact_ids = 1;
+}
+
+message ExportContactsVCardResponse {
+  string vcard_text = 1;
+  uint32 contact_count = 2;
+  string suggested_file_name = 3;
+}

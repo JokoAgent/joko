@@ -2292,6 +2292,48 @@ export function useAppController(): AppController {
     saveProviderCredentialSurface: (backendId, providerId, surfaceId, secret) => gateway().saveProviderCredentialSurface(backendId, providerId, surfaceId, secret),
     clearProviderCredentialSurface: (backendId, providerId, surfaceId) => gateway().clearProviderCredentialSurface(backendId, providerId, surfaceId),
     deleteCredential: (credentialId) => gateway().deleteCredential(credentialId),
+    getContactDirectory: (signal) => gateway().getContactDirectory(signal),
+    setContactDirectoryEnabled: (expectedRevision, enabled, signal) =>
+      gateway().setContactDirectoryEnabled(expectedRevision, enabled, signal),
+    listContacts: (options, signal) => gateway().listContacts(options, signal),
+    getContact: (contactId, signal) => gateway().getContact(contactId, signal),
+    findSimilarContacts: (contact, signal) => gateway().findSimilarContacts(contact, signal),
+    createContact: (expectedDirectoryRevision, contact, confirmedNameCandidateIds, signal) =>
+      gateway().createContact(expectedDirectoryRevision, contact, confirmedNameCandidateIds, signal),
+    updateContact: (contactId, expectedRevision, patch, signal) =>
+      gateway().updateContact(contactId, expectedRevision, patch, signal),
+    confirmContact: (contactId, expectedRevision, signal) => gateway().confirmContact(contactId, expectedRevision, signal),
+    deleteContact: (contactId, expectedRevision, signal) => gateway().deleteContact(contactId, expectedRevision, signal),
+    addContactIdentity: (contactId, expectedContactRevision, identity, signal) =>
+      gateway().addContactIdentity(contactId, expectedContactRevision, identity, signal),
+    removeContactIdentity: (contactId, expectedContactRevision, contactIdentityId, signal) =>
+      gateway().removeContactIdentity(contactId, expectedContactRevision, contactIdentityId, signal),
+    appendContactEvent: (contactId, expectedContactRevision, event, signal) =>
+      gateway().appendContactEvent(contactId, expectedContactRevision, event, signal),
+    removeContactEvent: (contactId, expectedContactRevision, contactEventId, signal) =>
+      gateway().removeContactEvent(contactId, expectedContactRevision, contactEventId, signal),
+    listContactGroups: (signal) => gateway().listContactGroups(signal),
+    createContactGroup: (expectedDirectoryRevision, name, description, signal) =>
+      gateway().createContactGroup(expectedDirectoryRevision, name, description, signal),
+    updateContactGroup: (contactGroupId, expectedRevision, name, description, signal) =>
+      gateway().updateContactGroup(contactGroupId, expectedRevision, name, description, signal),
+    deleteContactGroup: (contactGroupId, expectedRevision, signal) =>
+      gateway().deleteContactGroup(contactGroupId, expectedRevision, signal),
+    setContactGroupMembership: (contactId, expectedContactRevision, contactGroupId, member, signal) =>
+      gateway().setContactGroupMembership(contactId, expectedContactRevision, contactGroupId, member, signal),
+    addContactRelation: (fromContactId, expectedFromRevision, toContactId, relation, note, signal) =>
+      gateway().addContactRelation(fromContactId, expectedFromRevision, toContactId, relation, note, signal),
+    updateContactRelation: (ownerContactId, expectedOwnerRevision, contactRelationId, expectedRelationRevision, relation, note, signal) =>
+      gateway().updateContactRelation(ownerContactId, expectedOwnerRevision, contactRelationId, expectedRelationRevision, relation, note, signal),
+    removeContactRelation: (ownerContactId, expectedOwnerRevision, contactRelationId, signal) =>
+      gateway().removeContactRelation(ownerContactId, expectedOwnerRevision, contactRelationId, signal),
+    scanContactDuplicates: (limit, signal) => gateway().scanContactDuplicates(limit, signal),
+    mergeContacts: (targetContactId, expectedTargetRevision, mergedContactId, expectedMergedRevision, signal) =>
+      gateway().mergeContacts(targetContactId, expectedTargetRevision, mergedContactId, expectedMergedRevision, signal),
+    previewContactVCardImport: (vcardText, signal) => gateway().previewContactVCardImport(vcardText, signal),
+    commitContactVCardImport: (previewId, expectedDirectoryRevision, decisions, signal) =>
+      gateway().commitContactVCardImport(previewId, expectedDirectoryRevision, decisions, signal),
+    exportContactsVCard: (contactIds, signal) => gateway().exportContactsVCard(contactIds, signal),
     ...remoteHostApi,
     ...mcpApi,
     updatePiSettings: (backendId, patch) => gateway().updatePiSettings(backendId, patch),

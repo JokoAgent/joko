@@ -350,6 +350,229 @@ export interface RemoteHostCapabilitiesView {
   readonly backendRuntimeSetup: boolean;
 }
 
+export type ContactKindView = "person" | "organization";
+export type ContactStatusView = "confirmed" | "pending";
+export type ContactSourceView = "manual" | "agent" | "import";
+
+export interface ContactIdentityInputView {
+  readonly platform: string;
+  readonly value: string;
+  readonly label: string;
+  readonly note: string;
+}
+
+export interface ContactEventInputView {
+  readonly date: string;
+  readonly text: string;
+  readonly source: string;
+}
+
+export interface ContactIdentityView extends ContactIdentityInputView {
+  readonly id: string;
+  readonly contactId: string;
+  readonly revision: bigint;
+  readonly normalizedValue: string;
+  readonly createdAt: number;
+}
+
+export interface ContactEventView extends ContactEventInputView {
+  readonly id: string;
+  readonly contactId: string;
+  readonly revision: bigint;
+  readonly createdAt: number;
+}
+
+export interface ContactGroupView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly name: string;
+  readonly description: string;
+  readonly memberCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ContactRelationView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly fromContactId: string;
+  readonly toContactId: string;
+  readonly relation: string;
+  readonly note: string;
+  readonly createdAt: number;
+  readonly direction: "outgoing" | "incoming";
+  readonly relatedContactId: string;
+  readonly relatedDisplayName: string;
+  readonly relatedKind: ContactKindView;
+}
+
+export interface ContactSummaryView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: ContactKindView;
+  readonly displayName: string;
+  readonly aliases: readonly string[];
+  readonly summary: string;
+  readonly status: ContactStatusView;
+  readonly source: ContactSourceView;
+  readonly identityCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ContactProfileView extends ContactSummaryView {
+  readonly narrative: string;
+  readonly agentNotes: string;
+  readonly identities: readonly ContactIdentityView[];
+  readonly events: readonly ContactEventView[];
+  readonly groups: readonly ContactGroupView[];
+  readonly relations: readonly ContactRelationView[];
+}
+
+export interface ContactDirectoryView {
+  readonly format: number;
+  readonly revision: bigint;
+  readonly enabled: boolean;
+  readonly people: number;
+  readonly organizations: number;
+  readonly pending: number;
+  readonly groups: number;
+}
+
+export interface ContactDraftView {
+  readonly kind: ContactKindView;
+  readonly displayName: string;
+  readonly aliases: readonly string[];
+  readonly summary: string;
+  readonly narrative: string;
+  readonly agentNotes: string;
+  readonly status: ContactStatusView;
+  readonly source: ContactSourceView;
+  readonly identities: readonly ContactIdentityInputView[];
+}
+
+export interface ContactPatchView {
+  readonly kind?: ContactKindView;
+  readonly displayName?: string;
+  readonly aliases?: readonly string[];
+  readonly summary?: string;
+  readonly narrative?: string;
+  readonly agentNotes?: string;
+  readonly status?: ContactStatusView;
+}
+
+export interface ContactDuplicateCandidateView {
+  readonly matchType: "identity" | "name";
+  readonly contactId: string;
+  readonly displayName: string;
+  readonly kind: ContactKindView;
+  readonly status: ContactStatusView;
+  readonly summary: string;
+  readonly matchedPlatform?: string;
+  readonly matchedValue?: string;
+}
+
+export interface ContactDuplicatePairView {
+  readonly first: ContactSummaryView;
+  readonly second: ContactSummaryView;
+}
+
+export interface ContactListOptionsView {
+  readonly query?: string;
+  readonly kind?: ContactKindView;
+  readonly status?: ContactStatusView;
+  readonly groupId?: string;
+  readonly pageSize?: number;
+  readonly pageOffset?: number;
+}
+
+export interface ContactListPageView {
+  readonly contacts: readonly ContactSummaryView[];
+  readonly total: number;
+  readonly nextPageOffset?: number;
+}
+
+export interface ContactMutationView {
+  readonly contact: ContactProfileView;
+  readonly directory: ContactDirectoryView;
+}
+
+export interface ContactCreateResultView {
+  readonly contact?: ContactProfileView;
+  readonly candidates: readonly ContactDuplicateCandidateView[];
+  readonly directory: ContactDirectoryView;
+}
+
+export interface ContactMergeResultView {
+  readonly target: ContactProfileView;
+  readonly mergedContactId: string;
+  readonly movedIdentities: number;
+  readonly movedEvents: number;
+  readonly movedRelations: number;
+  readonly directory: ContactDirectoryView;
+}
+
+export type ContactVCardImportDispositionView = "create" | "autoEnrich" | "needsReview";
+export type ContactVCardImportDecisionKindView = "create" | "merge" | "skip";
+
+export interface ContactVCardImportPreviewEntryView {
+  readonly entryId: string;
+  readonly contact: ContactDraftView;
+  readonly disposition: ContactVCardImportDispositionView;
+  readonly existingContactId?: string;
+  readonly candidates: readonly ContactDuplicateCandidateView[];
+  readonly existingEntryId?: string;
+  readonly similarEntryIds: readonly string[];
+  readonly organizationName?: string;
+  readonly title?: string;
+  readonly groups: readonly string[];
+  readonly organizationContactId?: string;
+  readonly organizationCandidates: readonly ContactDuplicateCandidateView[];
+}
+
+export interface ContactVCardImportPreviewView {
+  readonly previewId: string;
+  readonly directoryRevision: bigint;
+  readonly entries: readonly ContactVCardImportPreviewEntryView[];
+  readonly expiresAt: number;
+}
+
+export interface ContactVCardImportDecisionView {
+  readonly entryId: string;
+  readonly decision: ContactVCardImportDecisionKindView;
+  readonly targetContactId?: string;
+  readonly expectedTargetRevision?: bigint;
+  readonly confirmedNameCandidateIds?: readonly string[];
+  readonly targetEntryId?: string;
+  readonly organizationDecision?: ContactVCardImportDecisionKindView;
+  readonly organizationTargetContactId?: string;
+  readonly expectedOrganizationTargetRevision?: bigint;
+  readonly organizationTargetEntryId?: string;
+  readonly confirmedOrganizationCandidateIds?: readonly string[];
+}
+
+export interface ContactVCardImportResultView {
+  readonly created: number;
+  readonly enriched: number;
+  readonly skipped: number;
+  readonly contactIds: readonly string[];
+  readonly entries: readonly ContactVCardImportEntryResultView[];
+  readonly directory: ContactDirectoryView;
+}
+
+export interface ContactVCardImportEntryResultView {
+  readonly entryId: string;
+  readonly displayName: string;
+  readonly outcome: "created" | "enriched" | "skipped";
+  readonly contactId?: string;
+}
+
+export interface ContactVCardExportView {
+  readonly text: string;
+  readonly contactCount: number;
+  readonly suggestedFileName: string;
+}
+
 export type RemoteBackendRuntimeStateView = "probing" | "notInstalled" | "installing" | "ready" | "failed" | "outcomeUnknown";
 export type RemoteBackendRuntimeInstallPhaseView = "probing" | "downloading" | "installing" | "validating" | "complete" | "failed" | "outcomeUnknown";
 export type RemoteBackendRuntimeFailureCodeView = "aborted" | "authorityChanged" | "hostNotReady" | "notSupported" | "probeFailed" | "installFailed" | "uninstallFailed" | "busy";
@@ -4826,6 +5049,32 @@ export interface OperationApi {
   clearProviderCredentialSurface(backendId: string, providerId: string, surfaceId: string): Promise<void>;
   saveCredential(draft: CredentialDraft, signal?: AbortSignal): Promise<void>;
   deleteCredential(credentialId: string): Promise<void>;
+  getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView>;
+  setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView>;
+  listContacts(options?: ContactListOptionsView, signal?: AbortSignal): Promise<ContactListPageView>;
+  getContact(contactId: string, signal?: AbortSignal): Promise<ContactProfileView>;
+  findSimilarContacts(contact: ContactDraftView, signal?: AbortSignal): Promise<readonly ContactDuplicateCandidateView[]>;
+  createContact(expectedDirectoryRevision: bigint, contact: ContactDraftView, confirmedNameCandidateIds?: readonly string[], signal?: AbortSignal): Promise<ContactCreateResultView>;
+  updateContact(contactId: string, expectedRevision: bigint, patch: ContactPatchView, signal?: AbortSignal): Promise<ContactMutationView>;
+  confirmContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactMutationView>;
+  deleteContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView>;
+  addContactIdentity(contactId: string, expectedContactRevision: bigint, identity: ContactIdentityInputView, signal?: AbortSignal): Promise<ContactMutationView>;
+  removeContactIdentity(contactId: string, expectedContactRevision: bigint, contactIdentityId: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  appendContactEvent(contactId: string, expectedContactRevision: bigint, event: ContactEventInputView, signal?: AbortSignal): Promise<ContactMutationView>;
+  removeContactEvent(contactId: string, expectedContactRevision: bigint, contactEventId: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  listContactGroups(signal?: AbortSignal): Promise<readonly ContactGroupView[]>;
+  createContactGroup(expectedDirectoryRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }>;
+  updateContactGroup(contactGroupId: string, expectedRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }>;
+  deleteContactGroup(contactGroupId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView>;
+  setContactGroupMembership(contactId: string, expectedContactRevision: bigint, contactGroupId: string, member: boolean, signal?: AbortSignal): Promise<ContactMutationView>;
+  addContactRelation(fromContactId: string, expectedFromRevision: bigint, toContactId: string, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  updateContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, expectedRelationRevision: bigint, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  removeContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  scanContactDuplicates(limit?: number, signal?: AbortSignal): Promise<{ readonly pairs: readonly ContactDuplicatePairView[]; readonly directory: ContactDirectoryView }>;
+  mergeContacts(targetContactId: string, expectedTargetRevision: bigint, mergedContactId: string, expectedMergedRevision: bigint, signal?: AbortSignal): Promise<ContactMergeResultView>;
+  previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
+  commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
+  exportContactsVCard(contactIds?: readonly string[], signal?: AbortSignal): Promise<ContactVCardExportView>;
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
   watchRemoteHosts(targetId: string, signal?: AbortSignal): AsyncIterable<readonly RemoteHostView[]>;

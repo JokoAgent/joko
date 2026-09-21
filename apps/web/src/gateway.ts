@@ -61,6 +61,15 @@ import {
   ContextRebuildReason,
   CompositeArgumentKind,
   ConnectionService,
+  ContactDuplicateMatchType,
+  ContactKind as ProtoContactKind,
+  ContactRelationDirection,
+  ContactService,
+  ContactSource as ProtoContactSource,
+  ContactStatus as ProtoContactStatus,
+  ContactVCardImportDecisionKind,
+  ContactVCardImportDisposition,
+  ContactVCardImportOutcome,
   CredentialKind,
   CredentialService,
   DeviceKind,
@@ -295,6 +304,16 @@ import {
   type BrowserProvider,
   type BrowserTransfer,
   type Connection,
+  type ContactDirectory as ProtoContactDirectory,
+  type ContactDraft as ProtoContactDraft,
+  type ContactDuplicateCandidate as ProtoContactDuplicateCandidate,
+  type ContactGroup as ProtoContactGroup,
+  type ContactIdentity as ProtoContactIdentity,
+  type ContactEvent as ProtoContactEvent,
+  type ContactProfile as ProtoContactProfile,
+  type ContactRelation as ProtoContactRelation,
+  type ContactSummary as ProtoContactSummary,
+  type ContactVCardImportPreviewEntry as ProtoContactVCardImportPreviewEntry,
   type CollaborationDirectory as ProtoCollaborationDirectory,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
@@ -466,6 +485,34 @@ import type {
   BrowserView,
   ComposerDraft,
   ConnectionProfile,
+  ContactCreateResultView,
+  ContactDirectoryView,
+  ContactDraftView,
+  ContactDuplicateCandidateView,
+  ContactDuplicatePairView,
+  ContactEventInputView,
+  ContactEventView,
+  ContactGroupView,
+  ContactIdentityInputView,
+  ContactIdentityView,
+  ContactKindView,
+  ContactListOptionsView,
+  ContactListPageView,
+  ContactMergeResultView,
+  ContactMutationView,
+  ContactPatchView,
+  ContactProfileView,
+  ContactRelationView,
+  ContactSourceView,
+  ContactStatusView,
+  ContactSummaryView,
+  ContactVCardExportView,
+  ContactVCardImportDecisionKindView,
+  ContactVCardImportDecisionView,
+  ContactVCardImportDispositionView,
+  ContactVCardImportPreviewEntryView,
+  ContactVCardImportPreviewView,
+  ContactVCardImportResultView,
   CredentialDraft,
   DeviceControlRelationView,
   DeviceView,
@@ -5709,6 +5756,299 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async deleteCredential(credentialId: string): Promise<void> {
     await this.submit({ case: "deleteCredential", value: { credentialReferenceId: credentialId } }, true);
+  }
+
+  async getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).getContactDirectory({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).setContactDirectoryEnabled({
+      expectedDirectoryRevision: { value: expectedRevision }, enabled
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async listContacts(options: ContactListOptionsView = {}, signal?: AbortSignal): Promise<ContactListPageView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).listContacts({
+      ...(options.query === undefined ? {} : { query: options.query }),
+      ...(options.kind === undefined ? {} : { kind: protoContactKind(options.kind) }),
+      ...(options.status === undefined ? {} : { status: protoContactStatus(options.status) }),
+      ...(options.groupId === undefined ? {} : { contactGroupId: options.groupId }),
+      pageSize: options.pageSize ?? 100,
+      pageOffset: options.pageOffset ?? 0
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      contacts: response.contacts.map(mapContactSummary),
+      total: response.total,
+      ...(response.nextPageOffset === undefined ? {} : { nextPageOffset: response.nextPageOffset })
+    };
+  }
+
+  async getContact(contactId: string, signal?: AbortSignal): Promise<ContactProfileView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).getContact({ contactId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactProfile(response.contact);
+  }
+
+  async findSimilarContacts(contact: ContactDraftView, signal?: AbortSignal): Promise<readonly ContactDuplicateCandidateView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).findSimilarContacts({ contact: protoContactDraft(contact) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.candidates.map(mapContactDuplicateCandidate);
+  }
+
+  async createContact(
+    expectedDirectoryRevision: bigint,
+    contact: ContactDraftView,
+    confirmedNameCandidateIds: readonly string[] = [],
+    signal?: AbortSignal
+  ): Promise<ContactCreateResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).createContact({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      contact: protoContactDraft(contact),
+      confirmedNameCandidateIds: [...confirmedNameCandidateIds]
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      ...(response.contact === undefined ? {} : { contact: mapContactProfile(response.contact) }),
+      candidates: response.candidates.map(mapContactDuplicateCandidate),
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async updateContact(contactId: string, expectedRevision: bigint, patch: ContactPatchView, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).updateContact({
+      contactId, expectedRevision: { value: expectedRevision }, patch: protoContactPatch(patch)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async confirmContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).confirmContact({
+      contactId, expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async deleteContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).deleteContact({
+      contactId, expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async addContactIdentity(contactId: string, expectedContactRevision: bigint, identity: ContactIdentityInputView, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).addContactIdentity({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, identity: protoContactIdentityInput(identity)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async removeContactIdentity(contactId: string, expectedContactRevision: bigint, contactIdentityId: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).removeContactIdentity({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, contactIdentityId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async appendContactEvent(contactId: string, expectedContactRevision: bigint, event: ContactEventInputView, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).appendContactEvent({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, event: protoContactEventInput(event)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async removeContactEvent(contactId: string, expectedContactRevision: bigint, contactEventId: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).removeContactEvent({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, contactEventId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async listContactGroups(signal?: AbortSignal): Promise<readonly ContactGroupView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).listContactGroups({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.groups.map(mapContactGroup);
+  }
+
+  async createContactGroup(expectedDirectoryRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).createContactGroup({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision }, name, description
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { group: mapContactGroup(response.group), directory: mapContactDirectory(response.directory) };
+  }
+
+  async updateContactGroup(contactGroupId: string, expectedRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).updateContactGroup({
+      contactGroupId, expectedRevision: { value: expectedRevision }, name, description
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { group: mapContactGroup(response.group), directory: mapContactDirectory(response.directory) };
+  }
+
+  async deleteContactGroup(contactGroupId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).deleteContactGroup({
+      contactGroupId, expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async setContactGroupMembership(contactId: string, expectedContactRevision: bigint, contactGroupId: string, member: boolean, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).setContactGroupMembership({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, contactGroupId, member
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async addContactRelation(fromContactId: string, expectedFromRevision: bigint, toContactId: string, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).addContactRelation({
+      fromContactId, expectedFromRevision: { value: expectedFromRevision }, toContactId, relation, note
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async updateContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, expectedRelationRevision: bigint, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).updateContactRelation({
+      ownerContactId,
+      expectedOwnerRevision: { value: expectedOwnerRevision },
+      contactRelationId,
+      expectedRelationRevision: { value: expectedRelationRevision },
+      relation,
+      note
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async removeContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).removeContactRelation({
+      ownerContactId, expectedOwnerRevision: { value: expectedOwnerRevision }, contactRelationId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async scanContactDuplicates(limit = 100, signal?: AbortSignal): Promise<{ readonly pairs: readonly ContactDuplicatePairView[]; readonly directory: ContactDirectoryView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).scanContactDuplicates({ limit }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      pairs: response.pairs.map((pair) => ({ first: mapContactSummary(pair.first), second: mapContactSummary(pair.second) })),
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async mergeContacts(targetContactId: string, expectedTargetRevision: bigint, mergedContactId: string, expectedMergedRevision: bigint, signal?: AbortSignal): Promise<ContactMergeResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).mergeContacts({
+      targetContactId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      mergedContactId,
+      expectedMergedRevision: { value: expectedMergedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      target: mapContactProfile(response.target),
+      mergedContactId: response.mergedContactId,
+      movedIdentities: response.movedIdentities,
+      movedEvents: response.movedEvents,
+      movedRelations: response.movedRelations,
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).previewContactVCardImport({ vcardText }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      previewId: response.previewId,
+      directoryRevision: requiredContactRevision(response.directoryRevision, "vCard preview directory"),
+      entries: response.entries.map(mapContactVCardImportPreviewEntry),
+      expiresAt: requiredContactTimestamp(response.expiresAt, "vCard preview expiry")
+    };
+  }
+
+  async commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).commitContactVCardImport({
+      previewId,
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      decisions: decisions.map(protoContactVCardImportDecision)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const entries = response.entries.map((entry) => {
+      const outcome = entry.outcome === ContactVCardImportOutcome.CREATED ? "created" as const
+        : entry.outcome === ContactVCardImportOutcome.ENRICHED ? "enriched" as const
+          : entry.outcome === ContactVCardImportOutcome.SKIPPED ? "skipped" as const
+            : undefined;
+      if (entry.entryId.trim() === "" || entry.displayName.trim() === "" || outcome === undefined
+        || (outcome === "skipped") !== (entry.contactId === undefined)) {
+        throw new GatewayError("Orchestrator returned an invalid Contact vCard entry result.");
+      }
+      return {
+        entryId: entry.entryId,
+        displayName: entry.displayName,
+        outcome,
+        ...(entry.contactId === undefined ? {} : { contactId: entry.contactId })
+      };
+    });
+    if (response.created !== entries.filter((entry) => entry.outcome === "created").length
+      || response.enriched !== entries.filter((entry) => entry.outcome === "enriched").length
+      || response.skipped !== entries.filter((entry) => entry.outcome === "skipped").length) {
+      throw new GatewayError("Orchestrator returned inconsistent Contact vCard import totals.");
+    }
+    return {
+      created: response.created,
+      enriched: response.enriched,
+      skipped: response.skipped,
+      contactIds: response.contactIds,
+      entries,
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async exportContactsVCard(contactIds: readonly string[] = [], signal?: AbortSignal): Promise<ContactVCardExportView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).exportContactsVCard({ contactIds: [...contactIds] }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { text: response.vcardText, contactCount: response.contactCount, suggestedFileName: response.suggestedFileName };
   }
 
   async getRemoteHostCapabilities(
@@ -15798,6 +16138,283 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
     }
   }
   return attachments;
+}
+
+function requiredContactRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 1n) throw new GatewayError(`Orchestrator returned an invalid ${label} revision.`);
+  return value.value;
+}
+
+function requiredContactTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  if (value === undefined) throw new GatewayError(`Orchestrator returned no ${label} timestamp.`);
+  const mapped = timestampMs(value);
+  if (!Number.isSafeInteger(mapped) || mapped < 0) throw new GatewayError(`Orchestrator returned an invalid ${label} timestamp.`);
+  return mapped;
+}
+
+function protoContactKind(value: ContactKindView): ProtoContactKind {
+  return value === "person" ? ProtoContactKind.PERSON : ProtoContactKind.ORGANIZATION;
+}
+
+function contactKind(value: ProtoContactKind): ContactKindView {
+  if (value === ProtoContactKind.PERSON) return "person";
+  if (value === ProtoContactKind.ORGANIZATION) return "organization";
+  throw new GatewayError("Orchestrator returned an unknown Contact kind.");
+}
+
+function protoContactStatus(value: ContactStatusView): ProtoContactStatus {
+  return value === "confirmed" ? ProtoContactStatus.CONFIRMED : ProtoContactStatus.PENDING;
+}
+
+function contactStatus(value: ProtoContactStatus): ContactStatusView {
+  if (value === ProtoContactStatus.CONFIRMED) return "confirmed";
+  if (value === ProtoContactStatus.PENDING) return "pending";
+  throw new GatewayError("Orchestrator returned an unknown Contact status.");
+}
+
+function protoContactSource(value: ContactSourceView): ProtoContactSource {
+  if (value === "manual") return ProtoContactSource.MANUAL;
+  if (value === "agent") return ProtoContactSource.AGENT;
+  return ProtoContactSource.IMPORT;
+}
+
+function contactSource(value: ProtoContactSource): ContactSourceView {
+  if (value === ProtoContactSource.MANUAL) return "manual";
+  if (value === ProtoContactSource.AGENT) return "agent";
+  if (value === ProtoContactSource.IMPORT) return "import";
+  throw new GatewayError("Orchestrator returned an unknown Contact source.");
+}
+
+function protoContactIdentityInput(value: ContactIdentityInputView) {
+  return { platform: value.platform, value: value.value, label: value.label, note: value.note };
+}
+
+function protoContactEventInput(value: ContactEventInputView) {
+  return { date: value.date, text: value.text, source: value.source };
+}
+
+function protoContactDraft(value: ContactDraftView) {
+  return {
+    kind: protoContactKind(value.kind),
+    displayName: value.displayName,
+    aliases: [...value.aliases],
+    summary: value.summary,
+    narrative: value.narrative,
+    agentNotes: value.agentNotes,
+    status: protoContactStatus(value.status),
+    source: protoContactSource(value.source),
+    identities: value.identities.map(protoContactIdentityInput)
+  };
+}
+
+function protoContactPatch(value: ContactPatchView) {
+  return {
+    ...(value.kind === undefined ? {} : { kind: protoContactKind(value.kind) }),
+    ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
+    ...(value.aliases === undefined ? {} : { aliases: { values: [...value.aliases] } }),
+    ...(value.summary === undefined ? {} : { summary: value.summary }),
+    ...(value.narrative === undefined ? {} : { narrative: value.narrative }),
+    ...(value.agentNotes === undefined ? {} : { agentNotes: value.agentNotes }),
+    ...(value.status === undefined ? {} : { status: protoContactStatus(value.status) })
+  };
+}
+
+function mapContactIdentity(value: ProtoContactIdentity): ContactIdentityView {
+  return {
+    id: value.contactIdentityId,
+    contactId: value.contactId,
+    revision: requiredContactRevision(value.revision, "Contact identity"),
+    platform: value.platform,
+    value: value.value,
+    normalizedValue: value.normalizedValue,
+    label: value.label,
+    note: value.note,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact identity creation")
+  };
+}
+
+function mapContactEvent(value: ProtoContactEvent): ContactEventView {
+  return {
+    id: value.contactEventId,
+    contactId: value.contactId,
+    revision: requiredContactRevision(value.revision, "Contact event"),
+    date: value.date,
+    text: value.text,
+    source: value.source,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact event creation")
+  };
+}
+
+function mapContactGroup(value: ProtoContactGroup | undefined): ContactGroupView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact group.");
+  return {
+    id: value.contactGroupId,
+    revision: requiredContactRevision(value.revision, "Contact group"),
+    name: value.name,
+    description: value.description,
+    memberCount: value.memberCount,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact group creation"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Contact group update")
+  };
+}
+
+function mapContactRelation(value: ProtoContactRelation): ContactRelationView {
+  const direction = value.direction === ContactRelationDirection.OUTGOING
+    ? "outgoing"
+    : value.direction === ContactRelationDirection.INCOMING
+      ? "incoming"
+      : undefined;
+  if (direction === undefined) throw new GatewayError("Orchestrator returned an unknown Contact relation direction.");
+  return {
+    id: value.contactRelationId,
+    revision: requiredContactRevision(value.revision, "Contact relation"),
+    fromContactId: value.fromContactId,
+    toContactId: value.toContactId,
+    relation: value.relation,
+    note: value.note,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact relation creation"),
+    direction,
+    relatedContactId: value.relatedContactId,
+    relatedDisplayName: value.relatedDisplayName,
+    relatedKind: contactKind(value.relatedKind)
+  };
+}
+
+function mapContactSummary(value: ProtoContactSummary | undefined): ContactSummaryView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact summary.");
+  return {
+    id: value.contactId,
+    revision: requiredContactRevision(value.revision, "Contact"),
+    kind: contactKind(value.kind),
+    displayName: value.displayName,
+    aliases: value.aliases,
+    summary: value.summary,
+    status: contactStatus(value.status),
+    source: contactSource(value.source),
+    identityCount: value.identityCount,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact creation"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Contact update")
+  };
+}
+
+function mapContactProfile(value: ProtoContactProfile | undefined): ContactProfileView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact profile.");
+  return {
+    ...mapContactSummary(value.summary),
+    narrative: value.narrative,
+    agentNotes: value.agentNotes,
+    identities: value.identities.map(mapContactIdentity),
+    events: value.events.map(mapContactEvent),
+    groups: value.groups.map(mapContactGroup),
+    relations: value.relations.map(mapContactRelation)
+  };
+}
+
+function mapContactDirectory(value: ProtoContactDirectory | undefined): ContactDirectoryView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact directory state.");
+  return {
+    format: value.format,
+    revision: requiredContactRevision(value.revision, "Contact directory"),
+    enabled: value.enabled,
+    people: value.people,
+    organizations: value.organizations,
+    pending: value.pending,
+    groups: value.groups
+  };
+}
+
+function mapContactMutation(contact: ProtoContactProfile | undefined, directory: ProtoContactDirectory | undefined): ContactMutationView {
+  return { contact: mapContactProfile(contact), directory: mapContactDirectory(directory) };
+}
+
+function mapContactDuplicateCandidate(value: ProtoContactDuplicateCandidate): ContactDuplicateCandidateView {
+  const matchType = value.matchType === ContactDuplicateMatchType.IDENTITY
+    ? "identity"
+    : value.matchType === ContactDuplicateMatchType.NAME
+      ? "name"
+      : undefined;
+  if (matchType === undefined) throw new GatewayError("Orchestrator returned an unknown Contact duplicate match type.");
+  return {
+    matchType,
+    contactId: value.contactId,
+    displayName: value.displayName,
+    kind: contactKind(value.kind),
+    status: contactStatus(value.status),
+    summary: value.summary,
+    ...(value.matchedPlatform === undefined ? {} : { matchedPlatform: value.matchedPlatform }),
+    ...(value.matchedValue === undefined ? {} : { matchedValue: value.matchedValue })
+  };
+}
+
+function contactVCardImportDisposition(value: ContactVCardImportDisposition): ContactVCardImportDispositionView {
+  if (value === ContactVCardImportDisposition.CREATE) return "create";
+  if (value === ContactVCardImportDisposition.AUTO_ENRICH) return "autoEnrich";
+  if (value === ContactVCardImportDisposition.NEEDS_REVIEW) return "needsReview";
+  throw new GatewayError("Orchestrator returned an unknown Contact vCard import disposition.");
+}
+
+function protoContactVCardImportDecisionKind(value: ContactVCardImportDecisionKindView): ContactVCardImportDecisionKind {
+  if (value === "create") return ContactVCardImportDecisionKind.CREATE;
+  if (value === "merge") return ContactVCardImportDecisionKind.MERGE;
+  return ContactVCardImportDecisionKind.SKIP;
+}
+
+function mapProtoContactDraft(value: ProtoContactDraft | undefined): ContactDraftView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact vCard draft.");
+  return {
+    kind: contactKind(value.kind),
+    displayName: value.displayName,
+    aliases: value.aliases,
+    summary: value.summary,
+    narrative: value.narrative,
+    agentNotes: value.agentNotes,
+    status: contactStatus(value.status),
+    source: contactSource(value.source),
+    identities: value.identities.map((identity) => ({
+      platform: identity.platform,
+      value: identity.value,
+      label: identity.label,
+      note: identity.note
+    }))
+  };
+}
+
+function mapContactVCardImportPreviewEntry(value: ProtoContactVCardImportPreviewEntry): ContactVCardImportPreviewEntryView {
+  return {
+    entryId: value.entryId,
+    contact: mapProtoContactDraft(value.contact),
+    disposition: contactVCardImportDisposition(value.disposition),
+    ...(value.existingContactId === undefined ? {} : { existingContactId: value.existingContactId }),
+    candidates: value.candidates.map(mapContactDuplicateCandidate),
+    ...(value.existingEntryId === undefined ? {} : { existingEntryId: value.existingEntryId }),
+    similarEntryIds: value.similarEntryIds,
+    ...(value.organizationName === undefined ? {} : { organizationName: value.organizationName }),
+    ...(value.title === undefined ? {} : { title: value.title }),
+    groups: value.groups,
+    ...(value.organizationContactId === undefined ? {} : { organizationContactId: value.organizationContactId }),
+    organizationCandidates: value.organizationCandidates.map(mapContactDuplicateCandidate)
+  };
+}
+
+function protoContactVCardImportDecision(value: ContactVCardImportDecisionView) {
+  return {
+    entryId: value.entryId,
+    decision: protoContactVCardImportDecisionKind(value.decision),
+    ...(value.targetContactId === undefined ? {} : { targetContactId: value.targetContactId }),
+    ...(value.expectedTargetRevision === undefined ? {} : { expectedTargetRevision: { value: value.expectedTargetRevision } }),
+    confirmedNameCandidateIds: [...(value.confirmedNameCandidateIds ?? [])],
+    ...(value.targetEntryId === undefined ? {} : { targetEntryId: value.targetEntryId }),
+    ...(value.organizationDecision === undefined ? {} : { organizationDecision: protoContactVCardImportDecisionKind(value.organizationDecision) }),
+    ...(value.organizationTargetContactId === undefined ? {} : { organizationTargetContactId: value.organizationTargetContactId }),
+    ...(value.expectedOrganizationTargetRevision === undefined
+      ? {}
+      : { expectedOrganizationTargetRevision: { value: value.expectedOrganizationTargetRevision } }),
+    ...(value.organizationTargetEntryId === undefined ? {} : { organizationTargetEntryId: value.organizationTargetEntryId }),
+    confirmedOrganizationCandidateIds: [...(value.confirmedOrganizationCandidateIds ?? [])]
+  };
 }
 
 function asRecord(value: unknown): Record<string, any> {

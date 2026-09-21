@@ -53,7 +53,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -162,6 +162,7 @@ import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
+import { ContactManager } from "./contact-manager.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -344,6 +345,8 @@ export interface OrchestratorApplication {
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
   readonly collaboration?: CollaborationManager;
+  /** Node-local structured authority for people and organizations. */
+  readonly contacts?: ContactManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -437,6 +440,14 @@ export async function createOrchestratorApplication(
   ]);
 
   const store = new OperationalStore(config.databasePath);
+  let contactStore: ContactStore;
+  try {
+    contactStore = new ContactStore(join(config.dataDirectory, "contacts.db"));
+  } catch (error) {
+    store.close();
+    throw error;
+  }
+  const contacts = new ContactManager(contactStore);
   let backendInstances!: BackendInstanceRegistry;
   let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
   const subagentModels = new SubagentModelSettings({
@@ -2022,6 +2033,8 @@ export async function createOrchestratorApplication(
     await remoteBackendRuntimeSetup.close().catch(() => undefined);
     await remoteHosts.close().catch(() => undefined);
     runtimeActivity.close();
+    contacts.close();
+    contactStore.close();
     store.close();
     throw error;
   }
@@ -2071,6 +2084,7 @@ export async function createOrchestratorApplication(
     skillMarketSync,
     skillPublication,
     collaboration,
+    contacts,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -2175,6 +2189,8 @@ export async function createOrchestratorApplication(
         await attempt(() => remoteHosts.close());
         await attempt(() => workspaces.close());
         await attempt(() => runtimeActivity.close());
+        await attempt(() => contacts.close());
+        await attempt(() => contactStore.close());
         await attempt(() => store.close());
         if (failures.length === 1) throw failures[0];
         if (failures.length > 1) throw new AggregateError(failures, "Some Orchestrator owners could not finish shutdown.");

@@ -146,6 +146,7 @@ describe("Personalization visual harness", () => {
       "settings-tab-voice",
       "settings-tab-shortcuts",
       "settings-tab-import",
+      "settings-tab-contacts",
       "settings-tab-connections",
       "settings-tab-tools",
       "settings-tab-automation",
@@ -307,7 +308,7 @@ describe("Personalization visual harness", () => {
 
     const page = required(container.querySelector<HTMLElement>(".settings-page"));
     expect(page.dataset.mobileMode).toBe("index");
-    expect(container.querySelectorAll('.settings-nav [role="tab"]')).toHaveLength(10);
+    expect(container.querySelectorAll('.settings-nav [role="tab"]')).toHaveLength(11);
 
     await act(async () => required(container.querySelector<HTMLButtonElement>("#settings-tab-providers")).click());
     await flushFrame();
