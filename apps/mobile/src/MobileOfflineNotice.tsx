@@ -1,9 +1,12 @@
 import { StyleSheet, Text, View } from "react-native";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 
 export interface MobileOfflineNoticeProps {
   readonly cachedAt: number;
   readonly now?: number;
+  readonly locale: MobileSupportedLocale;
   readonly colors: {
     readonly surface: string;
     readonly border: string;
@@ -12,12 +15,13 @@ export interface MobileOfflineNoticeProps {
   };
 }
 
-export function MobileOfflineNotice({ cachedAt, now = Date.now(), colors }: MobileOfflineNoticeProps) {
+export function MobileOfflineNotice({ cachedAt, now = Date.now(), locale, colors }: MobileOfflineNoticeProps) {
+  const age = mobileOfflineAgeLabel(cachedAt, now, locale);
   return <View accessibilityRole="alert" accessibilityLiveRegion="polite"
     style={[styles.notice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
     <View style={[styles.dot, { backgroundColor: colors.negative }]} />
     <Text style={[styles.text, { color: colors.muted }]}>
-      {mobileOfflineAgeLabel(cachedAt, now)} · this task is read-only until Joko reconnects
+      {mobileMessage(locale, "offline.taskReadOnly", { age })}
     </Text>
   </View>;
 }

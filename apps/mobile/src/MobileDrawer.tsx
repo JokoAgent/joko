@@ -4,12 +4,15 @@ import {
 } from "react-native";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { shouldClaimHorizontalSwipe, shouldCloseDrawer } from "./home-navigation";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export interface MobileDrawerProps {
   readonly visible: boolean;
   readonly width: number;
   readonly backgroundColor: string;
   readonly borderColor: string;
+  readonly locale: MobileSupportedLocale;
   readonly onClose: () => void;
   readonly onClosed?: () => void;
   readonly onMountedChange?: (mounted: boolean) => void;
@@ -24,6 +27,7 @@ export function MobileDrawer({
   width,
   backgroundColor,
   borderColor,
+  locale,
   onClose,
   onClosed,
   onMountedChange,
@@ -106,7 +110,8 @@ export function MobileDrawer({
   if (!mounted) return null;
   return <Modal transparent visible onRequestClose={onClose} statusBarTranslucent animationType="none">
     <View style={styles.root} testID={testID}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Close drawer" onPress={onClose} style={styles.backdrop} />
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.closeDrawer")}
+        onPress={onClose} style={styles.backdrop} />
       <Animated.View
         accessibilityViewIsModal
         importantForAccessibility="yes"

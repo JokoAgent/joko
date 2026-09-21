@@ -3,11 +3,14 @@ import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import type { Session } from "@joko/contracts";
 import { resolveSwipeRelease, shouldClaimHorizontalSwipe, type SwipeRowRegistry } from "./home-navigation";
 import { useReducedMotion } from "./MobileDrawer";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 export interface SwipeableSessionRowProps {
   readonly session: Session;
   readonly registry: SwipeRowRegistry;
   readonly colors: { readonly surface: string; readonly ink: string; readonly accent: string; readonly negative: string };
+  readonly locale: MobileSupportedLocale;
   readonly onTogglePin: (session: Session) => void;
   readonly onArchive: (session: Session) => void;
   readonly onShowOptions: (session: Session) => void;
@@ -22,6 +25,7 @@ export function SwipeableSessionRow({
   session,
   registry,
   colors,
+  locale,
   onTogglePin,
   onArchive,
   onShowOptions,
@@ -88,25 +92,29 @@ export function SwipeableSessionRow({
 
   return <View style={styles.shell}>
     <View style={styles.leftActions}>
-      <Pressable accessibilityRole="button" accessibilityLabel={session.pinned ? "Unpin task" : "Pin task"}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale,
+        session.pinned ? "home.swipe.unpinTask" : "home.swipe.pinTask")}
         accessibilityState={{ disabled }} disabled={disabled}
         onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onTogglePin(session); })}
         style={[styles.roundAction, { backgroundColor: colors.accent }]}>
-        <Text style={[styles.actionText, styles.darkText]}>{session.pinned ? "Unpin" : "Pin"}</Text>
+        <Text style={[styles.actionText, styles.darkText]}>{mobileMessage(locale,
+          session.pinned ? "common.unpin" : "common.pin")}</Text>
       </Pressable>
     </View>
     <View style={styles.rightActions}>
-      <Pressable accessibilityRole="button" accessibilityLabel="Task options"
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.swipe.options")}
         accessibilityState={{ disabled }} disabled={disabled}
         onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onShowOptions(session); })}
         style={[styles.roundAction, { backgroundColor: colors.surface }]}>
-        <Text style={[styles.actionText, { color: colors.ink }]}>More</Text>
+        <Text style={[styles.actionText, { color: colors.ink }]}>{mobileMessage(locale, "common.more")}</Text>
       </Pressable>
-      <Pressable accessibilityRole="button" accessibilityLabel={session.archived ? "Restore task" : "Archive task"}
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale,
+        session.archived ? "home.swipe.restoreTask" : "home.swipe.archiveTask")}
         accessibilityState={{ disabled }} disabled={disabled}
         onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onArchive(session); })}
         style={[styles.roundAction, { backgroundColor: colors.negative }]}>
-        <Text style={[styles.actionText, styles.lightText]}>{session.archived ? "Restore" : "Archive"}</Text>
+        <Text style={[styles.actionText, styles.lightText]}>{mobileMessage(locale,
+          session.archived ? "common.restore" : "common.archive")}</Text>
       </Pressable>
     </View>
     <Animated.View {...panResponder.panHandlers} style={{ transform: [{ translateX }] }}>

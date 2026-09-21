@@ -17,6 +17,13 @@ import { ConnectionState, DeviceKind, type Device } from "@joko/contracts";
 import type { MobileClient, MobileState, SavedMobileConnection } from "./mobile-client";
 import type { MobileThemePreference, MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
+import {
+  MOBILE_SUPPORTED_LOCALES,
+  type MobileLocalePreference,
+  type MobileLocalePreferenceState,
+  type MobileSupportedLocale
+} from "./mobile-locale-preference";
+import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
 
 export interface MobileSettingsColors {
   readonly background: string;
@@ -37,9 +44,11 @@ export interface MobileSettingsScreenProps {
   readonly state: MobileState;
   readonly foreground: boolean;
   readonly theme: MobileThemePreferenceState;
+  readonly locale: MobileLocalePreferenceState;
   readonly diagnostics: MobileDiagnosticsState;
   readonly client: MobileSettingsClient;
   readonly onThemeChange: (preference: MobileThemePreference) => Promise<void>;
+  readonly onLocaleChange: (preference: MobileLocalePreference) => Promise<void>;
   readonly onDiagnosticsEnabledChange: (enabled: boolean) => Promise<void>;
   readonly onDiagnosticsClear: () => Promise<void>;
   readonly onDiagnosticsExport: () => Promise<void>;
@@ -79,10 +88,13 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
   };
 }
 
-export function MobileSettingsScreen({ colors, state, foreground, theme, diagnostics, client, onThemeChange,
-  onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
-  onConnections, onDevices, appVersion = Constants.expoConfig?.version || "Unknown" }: MobileSettingsScreenProps) {
+export function MobileSettingsScreen({ colors, state, foreground, theme, locale, diagnostics, client, onThemeChange,
+  onLocaleChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
+  onConnections, onDevices, appVersion }: MobileSettingsScreenProps) {
   const current = resolveMobileSettingsCurrentDevice(state);
+  const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
+    mobileMessage(locale.effectiveLocale, key, variables);
+  const resolvedAppVersion = appVersion || Constants.expoConfig?.version || t("common.unknown");
   const [editor, setEditor] = useState<{ readonly ownerKey: string; readonly original: string; readonly draft: string }>();
   const [savingName, setSavingName] = useState(false);
   const [renameUnknown, setRenameUnknown] = useState(false);
@@ -111,8 +123,8 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
     setRenameUnknown(false);
     unknownReceiptSeen.current = false;
     setEditor(undefined);
-    setLocalError("The active Joko node or current device changed. The unfinished device-name draft was retired.");
-  }, [currentOwnerKey, editor]);
+    setLocalError(t("settings.rename.ownerChanged"));
+  }, [currentOwnerKey, editor, locale.effectiveLocale]);
 
   useEffect(() => {
     if (!renameUnknown || !editor) return;
@@ -125,9 +137,9 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
     unknownReceiptSeen.current = false;
     if (current.device.displayName === editor.draft.trim()) {
       setEditor(undefined);
-      setNotice("Device name saved.");
+      setNotice(t("settings.rename.saved"));
     }
-  }, [current, editor, pendingRename, renameUnknown]);
+  }, [current, editor, locale.effectiveLocale, pendingRename, renameUnknown]);
 
   const discardEditor = (): void => {
     if (savingName) return;
@@ -142,11 +154,11 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
       return;
     }
     Alert.alert(
-      "Discard device name changes?",
-      "The edited device name has not been saved.",
+      t("settings.rename.discardTitle"),
+      t("settings.rename.discardBody"),
       [
-        { text: "Keep editing", style: "cancel" },
-        { text: "Discard", style: "destructive", onPress: discardEditor }
+        { text: t("settings.rename.keepEditing"), style: "cancel" },
+        { text: t("settings.rename.discard"), style: "destructive", onPress: discardEditor }
       ]
     );
   };
@@ -158,13 +170,13 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
       return true;
     });
     return () => subscription.remove();
-  }, [editor, savingName]);
+  }, [editor, savingName, locale.effectiveLocale]);
 
   const saveName = async (): Promise<void> => {
     if (!editor || !current || editor.ownerKey !== current.ownerKey || !canRename) return;
     const value = editor.draft.trim();
     if (!value || value.length > 128) {
-      setLocalError("Use a device name between 1 and 128 characters.");
+      setLocalError(t("settings.rename.invalid"));
       return;
     }
     const generation = ++saveGeneration.current;
@@ -177,15 +189,15 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
       if (!confirmed) {
         setRenameUnknown(true);
         unknownReceiptSeen.current = pendingRename !== undefined;
-        setLocalError("The server result is unknown. The operation receipt was retained and the name was not sent again.");
+        setLocalError(t("settings.rename.unknown"));
         return;
       }
       setRenameUnknown(false);
       unknownReceiptSeen.current = false;
       setEditor(undefined);
-      setNotice("Device name saved.");
+      setNotice(t("settings.rename.saved"));
     } catch (error) {
-      if (saveGeneration.current === generation) setLocalError(errorText(error));
+      if (saveGeneration.current === generation) setLocalError(errorText(error, locale.effectiveLocale));
     } finally {
       if (saveGeneration.current === generation) setSavingName(false);
     }
@@ -194,13 +206,19 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
   const changeTheme = async (preference: MobileThemePreference): Promise<void> => {
     setLocalError("");
     try { await onThemeChange(preference); }
-    catch (error) { setLocalError(errorText(error)); }
+    catch { setLocalError(t("settings.theme.error")); }
+  };
+
+  const changeLocale = async (preference: MobileLocalePreference): Promise<void> => {
+    setLocalError("");
+    try { await onLocaleChange(preference); }
+    catch { setLocalError(t("settings.language.error")); }
   };
 
   const runReceiptAction = async (action: () => Promise<void>): Promise<void> => {
     setLocalError("");
     try { await action(); }
-    catch (error) { setLocalError(errorText(error)); }
+    catch (error) { setLocalError(errorText(error, locale.effectiveLocale)); }
   };
 
   const runDiagnosticsAction = async (action: () => Promise<void>, success: string): Promise<void> => {
@@ -209,8 +227,8 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
     try {
       await action();
       setNotice(success);
-    } catch (error) {
-      setLocalError(errorText(error));
+    } catch {
+      setLocalError(t("settings.diagnostics.error"));
     }
   };
 
@@ -218,27 +236,28 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
     const editable = canRename && editor.ownerKey === currentOwnerKey;
     return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}
       keyboardShouldPersistTaps="handled">
-      <BackButton label="Settings" disabled={savingName} onPress={requestCloseEditor} colors={colors} />
-      <Text style={[styles.title, { color: colors.ink }]}>Device name</Text>
+      <BackButton label={t("settings.title")} language={locale.effectiveLocale}
+        disabled={savingName} onPress={requestCloseEditor} colors={colors} />
+      <Text style={[styles.title, { color: colors.ink }]}>{t("settings.rename.title")}</Text>
       <Text style={[styles.description, { color: colors.muted }]}>
-        This name identifies the current phone on this Joko node. It is sent only when you save.
+        {t("settings.rename.description")}
       </Text>
       {!online && <Notice colors={colors} text={foreground
-        ? "Reconnect to this exact Joko node to rename the current device."
-        : "Return Joko to the foreground to rename the current device."} />}
+        ? t("settings.rename.reconnect")
+        : t("settings.rename.foreground")} />}
       <View style={styles.field}>
-        <Text style={[styles.caption, { color: colors.muted }]}>Device name</Text>
-        <TextInput accessibilityLabel="Device name" value={editor.draft} editable={editable}
+        <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.rename.title")}</Text>
+        <TextInput accessibilityLabel={t("settings.rename.title")} value={editor.draft} editable={editable}
           onChangeText={(draft) => setEditor((value) => value ? { ...value, draft } : value)}
-          maxLength={128} autoCorrect={false} placeholder="Device name" placeholderTextColor={colors.muted}
+          maxLength={128} autoCorrect={false} placeholder={t("settings.rename.title")} placeholderTextColor={colors.muted}
           style={[styles.input, !editable && styles.disabled,
             { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
       </View>
       <Text style={[styles.caption, { color: colors.muted }]}>{editor.draft.trim().length}/128</Text>
       {(localError || state.error) && <ErrorNotice colors={colors} text={localError || state.error || ""} />}
       <View style={styles.actionRow}>
-        <Button label="Cancel" colors={colors} disabled={savingName} onPress={requestCloseEditor} />
-        <Button label={savingName ? "Saving…" : "Save name"} colors={colors}
+        <Button label={t("common.cancel")} colors={colors} disabled={savingName} onPress={requestCloseEditor} />
+        <Button label={savingName ? t("settings.rename.saving") : t("settings.rename.save")} colors={colors}
           disabled={!editable || !editor.draft.trim() || editor.draft.trim().length > 128
             || editor.draft.trim() === editor.original}
           onPress={() => void saveName()} />
@@ -247,41 +266,50 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
   }
 
   return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}>
-    <BackButton label="Joko" onPress={onBack} colors={colors} />
-    <Text style={[styles.title, { color: colors.ink }]}>Settings</Text>
+    <BackButton label="Joko" language={locale.effectiveLocale} onPress={onBack} colors={colors} />
+    <Text style={[styles.title, { color: colors.ink }]}>{t("settings.title")}</Text>
 
-    <Text style={[styles.section, { color: colors.muted }]}>Appearance</Text>
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.appearance")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       {(["system", "light", "dark"] as const).map((preference) => <ThemeChoice key={preference}
-        preference={preference} selected={theme.preference === preference} colors={colors}
+        preference={preference} selected={theme.preference === preference} colors={colors} language={locale.effectiveLocale}
         disabled={theme.status === "loading" || theme.saving}
         onPress={() => void changeTheme(preference)} />)}
     </View>
-    {theme.error && <ErrorNotice colors={colors} text={theme.error} />}
+    {theme.error && <ErrorNotice colors={colors} text={t("settings.theme.error")} />}
 
-    <Text style={[styles.section, { color: colors.muted }]}>Current Joko node</Text>
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.language")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <InformationRow label="Name" value={state.node?.displayName || "Unavailable"} colors={colors} />
-      <InformationRow label="Address" value={state.origin || "Unavailable"} colors={colors} selectable />
-      <InformationRow label="Status" value={connectionLabel(state.status, foreground)} colors={colors} />
-      <InformationRow label="Node version" value={state.node?.version || "Unknown"} colors={colors} />
-      <InformationRow label="API version" value={state.node?.apiVersion || "Unknown"} colors={colors} />
+      {(["system", ...MOBILE_SUPPORTED_LOCALES] as const).map((preference) => <LanguageChoice key={preference}
+        preference={preference} selected={locale.preference === preference} effective={locale.effectiveLocale}
+        language={locale.effectiveLocale} colors={colors} disabled={locale.status === "loading" || locale.saving}
+        onPress={() => void changeLocale(preference)} />)}
     </View>
-    <NavigationRow label="Connection settings" description="Automatic entry and exact saved connections"
+    {locale.error && <ErrorNotice colors={colors} text={t("settings.language.error")} />}
+
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.currentNode")}</Text>
+    <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <InformationRow label={t("common.name")} value={state.node?.displayName || t("common.unavailable")} colors={colors} />
+      <InformationRow label={t("common.address")} value={state.origin || t("common.unavailable")} colors={colors} selectable />
+      <InformationRow label={t("common.status")} value={connectionLabel(state.status, foreground, locale.effectiveLocale)} colors={colors} />
+      <InformationRow label={t("settings.nodeVersion")} value={state.node?.version || t("common.unknown")} colors={colors} />
+      <InformationRow label={t("common.apiVersion")} value={state.node?.apiVersion || t("common.unknown")} colors={colors} />
+    </View>
+    <NavigationRow label={t("settings.connectionSettings")} description={t("settings.connectionSettingsDescription")}
       colors={colors} onPress={onConnections} />
 
-    <Text style={[styles.section, { color: colors.muted }]}>This phone</Text>
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.thisPhone")}</Text>
     {current ? <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <InformationRow label="Name" value={current.device.displayName} colors={colors} />
-      <InformationRow label="Platform" value={current.device.platform || platformLabel()} colors={colors} />
-      <InformationRow label="App version" value={current.device.appVersion || "Unknown"} colors={colors} />
-      <InformationRow label="Device ID" value={current.device.deviceId} colors={colors} selectable />
+      <InformationRow label={t("common.name")} value={current.device.displayName} colors={colors} />
+      <InformationRow label={t("common.platform")} value={current.device.platform || platformLabel()} colors={colors} />
+      <InformationRow label={t("settings.appVersion")} value={current.device.appVersion || t("common.unknown")} colors={colors} />
+      <InformationRow label={t("settings.deviceId")} value={current.device.deviceId} colors={colors} selectable />
       <View style={styles.actionRow}>
-        <Button label="Copy device ID" colors={colors} onPress={() => {
-          void Clipboard.setStringAsync(current.device.deviceId).then(() => setNotice("Device ID copied."))
-            .catch((error) => setLocalError(errorText(error)));
+        <Button label={t("settings.copyDeviceId")} colors={colors} onPress={() => {
+          void Clipboard.setStringAsync(current.device.deviceId).then(() => setNotice(t("settings.deviceIdCopied")))
+            .catch((error) => setLocalError(errorText(error, locale.effectiveLocale)));
         }} />
-        <Button label="Rename this phone" colors={colors} disabled={!canRename} onPress={() => {
+        <Button label={t("settings.renamePhone")} colors={colors} disabled={!canRename} onPress={() => {
           setLocalError("");
           setNotice("");
           setRenameUnknown(false);
@@ -290,29 +318,29 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
         }} />
       </View>
     </View> : <Notice colors={colors}
-      text="The current phone cannot be matched exactly to the active saved profile and authenticated node snapshot." />}
+      text={t("settings.deviceMismatch")} />}
     {!online && current && <Notice colors={colors} text={foreground
-      ? "Showing the last verified device identity. Reconnect to rename it."
-      : "Showing the last verified device identity. Device changes are read-only in the background."} />}
-    <NavigationRow label="All devices" description="Inspect devices authorized by this Joko node"
+      ? t("settings.identityReconnect")
+      : t("settings.identityBackground")} />}
+    <NavigationRow label={t("settings.allDevices")} description={t("settings.allDevicesDescription")}
       colors={colors} onPress={onDevices} />
 
     {pendingRename && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Text style={[styles.warning, { color: colors.negative }]}>
-        {pendingRename.state === "unknown" ? "Device-name result unknown" : "Awaiting durable device-name result"}
+        {pendingRename.state === "unknown" ? t("settings.receipt.unknown") : t("settings.receipt.awaiting")}
         {` · ${pendingRename.operationId}`}
       </Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>The name is never sent again automatically.</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.receipt.noReplay")}</Text>
       <View style={styles.actionRow}>
-        <Button label="Check status" colors={colors} disabled={!online || state.busy}
+        <Button label={t("settings.receipt.check")} colors={colors} disabled={!online || state.busy}
           onPress={() => void runReceiptAction(() => client.reconcile())} />
-        {pendingRename.state === "unknown" && <Button label="Verify and clear" colors={colors}
+        {pendingRename.state === "unknown" && <Button label={t("settings.receipt.verify")} colors={colors}
           disabled={!online || state.busy} onPress={() => Alert.alert(
-            "Clear this receipt?",
-            "Joko will first verify that the current node has no operation with this ID. It will not repeat the rename.",
+            t("settings.receipt.clearTitle"),
+            t("settings.receipt.clearBody"),
             [
-              { text: "Keep checking", style: "cancel" },
-              { text: "Verify and clear", onPress: () => void runReceiptAction(
+              { text: t("settings.receipt.keepChecking"), style: "cancel" },
+              { text: t("settings.receipt.verify"), onPress: () => void runReceiptAction(
                 () => client.dismissUnconfirmed(pendingRename.operationId)
               ) }
             ]
@@ -320,71 +348,71 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
       </View>
     </View>}
 
-    <Text style={[styles.section, { color: colors.muted }]}>About</Text>
+    <Text style={[styles.section, { color: colors.muted }]}>{t("common.about")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <InformationRow label="Joko app" value={appVersion} colors={colors} />
-      <InformationRow label="Platform" value={platformLabel()} colors={colors} />
-      <InformationRow label="Node" value={state.node?.version || "Unknown"} colors={colors} />
-      <InformationRow label="API" value={state.node?.apiVersion || "Unknown"} colors={colors} />
+      <InformationRow label={t("settings.jokoApp")} value={resolvedAppVersion} colors={colors} />
+      <InformationRow label={t("common.platform")} value={platformLabel()} colors={colors} />
+      <InformationRow label={t("common.node")} value={state.node?.version || t("common.unknown")} colors={colors} />
+      <InformationRow label={t("common.api")} value={state.node?.apiVersion || t("common.unknown")} colors={colors} />
     </View>
 
-    <Text style={[styles.section, { color: colors.muted }]}>Diagnostics</Text>
-    <Pressable accessibilityRole="button" accessibilityLabel="Local diagnostics"
+    <Text style={[styles.section, { color: colors.muted }]}>{t("settings.diagnostics")}</Text>
+    <Pressable accessibilityRole="button" accessibilityLabel={t("settings.diagnostics.local")}
       accessibilityState={{ expanded: diagnosticsExpanded }}
       onPress={() => setDiagnosticsExpanded((value) => !value)}
       style={[styles.navigationRow, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <View style={styles.fill}>
-        <Text style={[styles.label, { color: colors.ink }]}>Local diagnostics</Text>
+        <Text style={[styles.label, { color: colors.ink }]}>{t("settings.diagnostics.local")}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>
-          {diagnostics.enabled ? `On · ${diagnostics.eventCount} retained events` : "Off · no new events are recorded"}
+          {diagnostics.enabled ? t("settings.diagnostics.on", { count: diagnostics.eventCount }) : t("settings.diagnostics.off")}
         </Text>
       </View>
       <Text style={[styles.chevron, { color: colors.muted }]}>{diagnosticsExpanded ? "⌃" : "⌄"}</Text>
     </Pressable>
     {diagnosticsExpanded && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <Text style={[styles.description, { color: colors.ink }]}>Device-private diagnostic recording</Text>
+      <Text style={[styles.description, { color: colors.ink }]}>{t("settings.diagnostics.recordingTitle")}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>
-        Off by default. Joko keeps at most 500 allowlisted lifecycle, connection-state, and timing events for 7 days.
-        Message text, files, paths, IDs, credentials, raw errors, audio, and transcripts are never included.
+        {t("settings.diagnostics.privacy")}
       </Text>
       <View style={styles.toggleRow}>
         <View style={styles.fill}>
-          <Text style={[styles.label, { color: colors.ink }]}>Record local diagnostics</Text>
+          <Text style={[styles.label, { color: colors.ink }]}>{t("settings.diagnostics.record")}</Text>
           <Text style={[styles.caption, { color: colors.muted }]}>
-            {diagnostics.status === "loading" ? "Loading device preference…"
-              : diagnostics.enabled ? "Recording allowlisted events on this phone" : "Recording is off"}
+            {diagnostics.status === "loading" ? t("settings.diagnostics.loading")
+              : diagnostics.enabled ? t("settings.diagnostics.recording") : t("settings.diagnostics.notRecording")}
           </Text>
         </View>
-        <Switch accessibilityLabel="Record local diagnostics" value={diagnostics.enabled}
+        <Switch accessibilityLabel={t("settings.diagnostics.record")} value={diagnostics.enabled}
           disabled={diagnostics.status === "loading" || diagnostics.saving || diagnostics.exporting}
           trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface}
           onValueChange={(value) => void runDiagnosticsAction(
             () => onDiagnosticsEnabledChange(value),
-            value ? "Local diagnostic recording enabled." : "Local diagnostic recording disabled."
+            value ? t("settings.diagnostics.enabled") : t("settings.diagnostics.disabled")
           )} />
       </View>
-      <InformationRow label="Retained" value={`${diagnostics.eventCount} / 500 events`} colors={colors} />
-      <InformationRow label="Retention" value="7 days on this phone" colors={colors} />
+      <InformationRow label={t("settings.diagnostics.retained")}
+        value={t("settings.diagnostics.retainedValue", { count: diagnostics.eventCount })} colors={colors} />
+      <InformationRow label={t("settings.diagnostics.retention")} value={t("settings.diagnostics.retentionValue")} colors={colors} />
       <View style={styles.actionRow}>
-        <Button label={diagnostics.exporting ? "Exporting…" : "Export diagnostics"} colors={colors}
+        <Button label={diagnostics.exporting ? t("settings.diagnostics.exporting") : t("settings.diagnostics.export")} colors={colors}
           disabled={diagnostics.status === "loading" || diagnostics.saving || diagnostics.exporting}
-          onPress={() => void runDiagnosticsAction(onDiagnosticsExport, "Local diagnostics sent to the system share sheet.")} />
-        <Button label="Clear diagnostics" colors={colors}
+          onPress={() => void runDiagnosticsAction(onDiagnosticsExport, t("settings.diagnostics.exported"))} />
+        <Button label={t("settings.diagnostics.clear")} colors={colors}
           disabled={diagnostics.status === "loading" || diagnostics.saving || diagnostics.exporting
             || diagnostics.eventCount === 0 && diagnostics.status === "ready"}
           onPress={() => Alert.alert(
-            "Clear local diagnostics?",
-            "This permanently removes the diagnostic events retained on this phone. Recording stays in its current state.",
+            t("settings.diagnostics.clearTitle"),
+            t("settings.diagnostics.clearBody"),
             [
-              { text: "Cancel", style: "cancel" },
-              { text: "Clear", style: "destructive", onPress: () => void runDiagnosticsAction(
+              { text: t("common.cancel"), style: "cancel" },
+              { text: t("common.clear"), style: "destructive", onPress: () => void runDiagnosticsAction(
                 onDiagnosticsClear,
-                "Local diagnostics cleared."
+                t("settings.diagnostics.cleared")
               ) }
             ]
           )} />
       </View>
-      {diagnostics.error && <ErrorNotice colors={colors} text={diagnostics.error} />}
+      {diagnostics.error && <ErrorNotice colors={colors} text={t("settings.diagnostics.error")} />}
     </View>}
     {notice && <Text accessibilityLiveRegion="polite" style={[styles.noticeText, { color: colors.ink,
       backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>{notice}</Text>}
@@ -392,16 +420,21 @@ export function MobileSettingsScreen({ colors, state, foreground, theme, diagnos
   </ScrollView>;
 }
 
-function ThemeChoice({ preference, selected, disabled, colors, onPress }: {
+function ThemeChoice({ preference, selected, disabled, colors, language, onPress }: {
   readonly preference: MobileThemePreference;
   readonly selected: boolean;
   readonly disabled: boolean;
   readonly colors: MobileSettingsColors;
+  readonly language: MobileSupportedLocale;
   readonly onPress: () => void;
 }) {
-  const label = preference === "system" ? "System" : preference === "light" ? "Light" : "Dark";
-  const description = preference === "system" ? "Follow this phone's appearance" : `Always use ${label.toLocaleLowerCase()} appearance`;
-  return <Pressable accessibilityRole="radio" accessibilityLabel={`${label} appearance`}
+  const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
+    mobileMessage(language, key, variables);
+  const label = t(preference === "system" ? "settings.theme.system"
+    : preference === "light" ? "settings.theme.light" : "settings.theme.dark");
+  const description = t(preference === "system" ? "settings.theme.systemDescription"
+    : preference === "light" ? "settings.theme.lightDescription" : "settings.theme.darkDescription");
+  return <Pressable accessibilityRole="radio" accessibilityLabel={t("settings.theme.accessibility", { label })}
     accessibilityState={{ selected, disabled }} disabled={disabled} onPress={onPress}
     style={[styles.choice, disabled && styles.disabled]}>
     <View style={[styles.radio, { borderColor: selected ? colors.accent : colors.border }]}>
@@ -412,6 +445,43 @@ function ThemeChoice({ preference, selected, disabled, colors, onPress }: {
       <Text style={[styles.caption, { color: colors.muted }]}>{description}</Text>
     </View>
   </Pressable>;
+}
+
+function LanguageChoice({ preference, selected, effective, disabled, colors, language, onPress }: {
+  readonly preference: MobileLocalePreference;
+  readonly selected: boolean;
+  readonly effective: MobileSupportedLocale;
+  readonly disabled: boolean;
+  readonly colors: MobileSettingsColors;
+  readonly language: MobileSupportedLocale;
+  readonly onPress: () => void;
+}) {
+  const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
+    mobileMessage(language, key, variables);
+  const label = mobileLocaleLabel(language, preference);
+  const description = preference === "system"
+    ? t("settings.language.systemDescription", { language: mobileLocaleLabel(language, effective) })
+    : t("settings.language.explicitDescription", { language: label });
+  return <Pressable accessibilityRole="radio" accessibilityLabel={label}
+    accessibilityState={{ selected, disabled }} disabled={disabled} onPress={onPress}
+    style={[styles.choice, disabled && styles.disabled]}>
+    <View style={[styles.radio, { borderColor: selected ? colors.accent : colors.border }]}>
+      {selected && <View style={[styles.radioDot, { backgroundColor: colors.accent }]} />}
+    </View>
+    <View style={styles.fill}>
+      <Text style={[styles.label, { color: colors.ink }]}>{label}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{description}</Text>
+    </View>
+  </Pressable>;
+}
+
+function mobileLocaleLabel(language: MobileSupportedLocale, locale: MobileLocalePreference): string {
+  const key: MobileMessageKey = locale === "system" ? "settings.language.system"
+    : locale === "en" ? "settings.language.en"
+      : locale === "zh-CN" ? "settings.language.zh-CN"
+        : locale === "zh-TW" ? "settings.language.zh-TW"
+          : locale === "ja" ? "settings.language.ja" : "settings.language.ko";
+  return mobileMessage(language, key);
 }
 
 function NavigationRow({ label, description, colors, onPress }: {
@@ -430,13 +500,14 @@ function NavigationRow({ label, description, colors, onPress }: {
   </Pressable>;
 }
 
-function BackButton({ label, disabled, onPress, colors }: {
+function BackButton({ label, language, disabled, onPress, colors }: {
   readonly label: string;
+  readonly language: MobileSupportedLocale;
   readonly disabled?: boolean;
   readonly onPress: () => void;
   readonly colors: MobileSettingsColors;
 }) {
-  return <Pressable accessibilityRole="button" accessibilityLabel={`Back to ${label.toLocaleLowerCase()}`}
+  return <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(language, "common.backTo", { label })}
     accessibilityState={{ disabled }} disabled={disabled} onPress={onPress}
     style={[styles.back, disabled && styles.disabled]}>
     <Text style={[styles.backText, { color: colors.accent }]}>‹  {label}</Text>
@@ -477,21 +548,25 @@ function ErrorNotice({ text, colors }: { readonly text: string; readonly colors:
   return <Text accessibilityRole="alert" style={[styles.error, { color: colors.negative }]}>{text}</Text>;
 }
 
-function connectionLabel(status: MobileState["status"], foreground: boolean): string {
-  if (!foreground) return "Background · read-only";
-  if (status === "connected") return "Connected";
-  if (status === "connecting") return "Reconnecting";
-  if (status === "revoked") return "Revoked";
-  if (status === "offline") return "Offline";
-  return status === "starting" ? "Starting" : "Not connected";
+function connectionLabel(
+  status: MobileState["status"],
+  foreground: boolean,
+  language: MobileSupportedLocale
+): string {
+  if (!foreground) return mobileMessage(language, "settings.connection.background");
+  if (status === "connected") return mobileMessage(language, "settings.connection.connected");
+  if (status === "connecting") return mobileMessage(language, "settings.connection.reconnecting");
+  if (status === "revoked") return mobileMessage(language, "settings.connection.revoked");
+  if (status === "offline") return mobileMessage(language, "settings.connection.offline");
+  return mobileMessage(language, status === "starting" ? "settings.connection.starting" : "settings.connection.none");
 }
 
 function platformLabel(): string {
   return Platform.OS === "ios" ? "iOS" : Platform.OS === "android" ? "Android" : Platform.OS;
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : "The Settings action failed.";
+function errorText(error: unknown, language: MobileSupportedLocale): string {
+  return error instanceof Error && error.message ? error.message : mobileMessage(language, "settings.error");
 }
 
 const styles = StyleSheet.create({

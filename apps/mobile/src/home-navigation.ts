@@ -22,6 +22,11 @@ export interface BuildMobileHomeSectionsOptions {
   readonly statusFilter: MobileHomeStatusFilter;
   readonly query: string;
   readonly messageSessionIds?: ReadonlySet<string>;
+  readonly labels: {
+    readonly dialogue: string;
+    readonly project: string;
+    readonly pinned: string;
+  };
 }
 
 export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions): MobileHomeSection[] {
@@ -45,15 +50,15 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
     const project = workspace?.kind === WorkspaceKind.USER_PROJECT;
     return {
       session,
-      targetName: target?.displayName || "Dialogue",
+      targetName: target?.displayName || options.labels.dialogue,
       groupKind: project ? "project" : "dialogue",
       groupKey: project ? `project:${session.targetId}` : "dialogue",
-      groupTitle: project ? target?.displayName || workspace.displayName || "Project" : "Dialogue"
+      groupTitle: project ? target?.displayName || workspace.displayName || options.labels.project : options.labels.dialogue
     };
   });
   const sections: MobileHomeSection[] = [];
   const pinned = sortHomeItems(items.filter((item) => item.session.pinned));
-  if (pinned.length > 0) sections.push({ key: "pinned", kind: "pinned", title: "Pinned", items: pinned });
+  if (pinned.length > 0) sections.push({ key: "pinned", kind: "pinned", title: options.labels.pinned, items: pinned });
 
   const groups = new Map<string, { kind: "dialogue" | "project"; title: string; items: MobileHomeSessionItem[] }>();
   for (const item of items) {

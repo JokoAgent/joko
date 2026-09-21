@@ -300,10 +300,11 @@ describe("current-v1 mobile offline content cache", () => {
   });
 
   it("formats a bounded, non-authoritative saved-content age", () => {
-    expect(mobileOfflineAgeLabel(10_000, 10_500)).toBe("Saved offline just now");
-    expect(mobileOfflineAgeLabel(10_000, 130_000)).toBe("Saved offline 2 min ago");
-    expect(mobileOfflineAgeLabel(10_000, 7_210_000)).toBe("Saved offline 2 hr ago");
-    expect(mobileOfflineAgeLabel(10_000, 172_810_000)).toBe("Saved offline 2 days ago");
-    expect(mobileOfflineAgeLabel(Number.NaN, 10_000)).toBe("Saved offline");
+    expect(mobileOfflineAgeLabel(10_000, 10_500, "en")).toBe("Saved offline just now");
+    expect(mobileOfflineAgeLabel(10_000, 130_000, "en")).toBe("Saved offline 2 min ago");
+    expect(mobileOfflineAgeLabel(10_000, 7_210_000, "en")).toBe("Saved offline 2 hr ago");
+    expect(mobileOfflineAgeLabel(10_000, 172_810_000, "en")).toBe("Saved offline 2 days ago");
+    expect(mobileOfflineAgeLabel(Number.NaN, 10_000, "en")).toBe("Saved offline");
+    expect(mobileOfflineAgeLabel(10_000, 130_000, "zh-CN")).toBe("2 分钟前保存离线副本");
   });
 });

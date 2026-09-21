@@ -16,6 +16,8 @@ import {
   resolveConnectionSurface,
   type ConnectionStageBox
 } from "./connection-surface";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 
 interface StageColors {
   readonly brandBackground: string;
@@ -28,6 +30,7 @@ interface MobileConnectionStageProps {
   readonly artworkSource: string;
   readonly iconSource: string;
   readonly colors: StageColors;
+  readonly locale: MobileSupportedLocale;
   readonly onArtworkPress: () => void;
   readonly onIconPress: () => void;
   readonly children: ReactNode;
@@ -38,6 +41,7 @@ export function MobileConnectionStage({
   artworkSource,
   iconSource,
   colors,
+  locale,
   onArtworkPress,
   onIconPress,
   children
@@ -60,12 +64,14 @@ export function MobileConnectionStage({
       frame={hero}
       artworkId={artworkId}
       artworkSource={artworkSource}
+      locale={locale}
       onPress={onArtworkPress}
     />
     <BrandLockup
       frame={lockup}
       iconSource={iconSource}
       colors={colors}
+      locale={locale}
       onPress={onIconPress}
     />
     <KeyboardAvoidingView
@@ -94,17 +100,19 @@ function Hero({
   frame,
   artworkId,
   artworkSource,
+  locale,
   onPress
 }: {
   readonly frame: ConnectionStageBox;
   readonly artworkId: string;
   readonly artworkSource: string;
+  readonly locale: MobileSupportedLocale;
   readonly onPress: () => void;
 }) {
   return <Pressable
     accessibilityRole="button"
-    accessibilityLabel={`Change Joko illustration, ${artworkId}`}
-    accessibilityHint="Switches between the two poses in this illustration group."
+    accessibilityLabel={mobileMessage(locale, "connection.stage.changeIllustration", { id: artworkId })}
+    accessibilityHint={mobileMessage(locale, "connection.stage.poseHint")}
     onPress={onPress}
     style={[styles.hero, frameStyle(frame)]}
   >
@@ -116,11 +124,13 @@ function BrandLockup({
   frame,
   iconSource,
   colors,
+  locale,
   onPress
 }: {
   readonly frame: ConnectionStageBox;
   readonly iconSource: string;
   readonly colors: StageColors;
+  readonly locale: MobileSupportedLocale;
   readonly onPress: () => void;
 }) {
   const iconSize = Math.min(frame.height * 0.76, frame.width * 0.23);
@@ -129,8 +139,8 @@ function BrandLockup({
   return <View style={[styles.lockup, frameStyle(frame), { gap: Math.max(6, frame.height * 0.08) }]}>
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel="Show the next Joko illustration"
-      accessibilityHint="Changes the illustration group and returns it to its first pose."
+      accessibilityLabel={mobileMessage(locale, "connection.stage.nextIllustration")}
+      accessibilityHint={mobileMessage(locale, "connection.stage.groupHint")}
       onPress={onPress}
       style={{ width: iconSize, height: iconSize }}
     >
@@ -146,7 +156,7 @@ function BrandLockup({
         maxFontSizeMultiplier={1.3}
         numberOfLines={1}
         style={[styles.brandSubtitle, { color: colors.muted, fontSize: subtitleSize, lineHeight: subtitleSize * 1.3 }]}
-      >Your work, wherever you are.</Text>
+      >{mobileMessage(locale, "connection.stage.subtitle")}</Text>
     </View>
   </View>;
 }

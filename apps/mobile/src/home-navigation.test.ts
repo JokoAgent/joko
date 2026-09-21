@@ -38,9 +38,11 @@ const snapshot = create(SnapshotSchema, {
   ]
 });
 
+const labels = { dialogue: "Dialogue", project: "Project", pinned: "Pinned" } as const;
+
 describe("mobile Home presentation", () => {
   it("keeps pinned tasks separate and groups active Dialogue and project tasks in stable recent order", () => {
-    const sections = buildMobileHomeSections({ snapshot, statusFilter: "active", query: "" });
+    const sections = buildMobileHomeSections({ snapshot, statusFilter: "active", query: "", labels });
     expect(sections.map((section) => [section.key, section.items.map((item) => item.session.sessionId)])).toEqual([
       ["pinned", ["pinned"]],
       ["project:project", ["project-new", "same-a", "same-b"]],
@@ -49,19 +51,30 @@ describe("mobile Home presentation", () => {
   });
 
   it("filters active, archived and all without hiding current message-search matches", () => {
-    expect(buildMobileHomeSections({ snapshot, statusFilter: "archived", query: "", messageSessionIds: new Set() })
+    expect(buildMobileHomeSections({ snapshot, statusFilter: "archived", query: "", messageSessionIds: new Set(), labels })
       .flatMap((section) => section.items.map((item) => item.session.sessionId))).toEqual(["archived"]);
-    expect(buildMobileHomeSections({ snapshot, statusFilter: "all", query: "old", messageSessionIds: new Set() })
+    expect(buildMobileHomeSections({ snapshot, statusFilter: "all", query: "old", messageSessionIds: new Set(), labels })
       .flatMap((section) => section.items.map((item) => item.session.sessionId))).toEqual(["archived"]);
-    expect(buildMobileHomeSections({ snapshot, statusFilter: "active", query: "message text", messageSessionIds: new Set(["dialogue", "missing"]) })
+    expect(buildMobileHomeSections({ snapshot, statusFilter: "active", query: "message text", messageSessionIds: new Set(["dialogue", "missing"]), labels })
       .flatMap((section) => section.items.map((item) => item.session.sessionId))).toEqual(["dialogue"]);
   });
 
   it("matches task and target display names locally", () => {
-    expect(buildMobileHomeSections({ snapshot, statusFilter: "active", query: "joko SOURCE" })
+    expect(buildMobileHomeSections({ snapshot, statusFilter: "active", query: "joko SOURCE", labels })
       .flatMap((section) => section.items.map((item) => item.session.sessionId))).toEqual([
       "pinned", "project-new", "same-a", "same-b"
     ]);
+  });
+
+  it("projects caller-owned localized fallback section labels", () => {
+    const localized = buildMobileHomeSections({
+      snapshot,
+      statusFilter: "active",
+      query: "",
+      labels: { dialogue: "对话", project: "项目", pinned: "已置顶" }
+    });
+    expect(localized.find((section) => section.key === "pinned")?.title).toBe("已置顶");
+    expect(localized.find((section) => section.key === "dialogue")?.title).toBe("对话");
   });
 });
 

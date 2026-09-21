@@ -35,6 +35,7 @@ describe("MobileOfflineNotice", () => {
     act(() => root!.render(createElement(MobileOfflineNotice, {
       cachedAt: 10_000,
       now: 130_000,
+      locale: "en",
       colors: { surface: "#fff", border: "#ddd", muted: "#555", negative: "#a00" }
     })));
 

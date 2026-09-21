@@ -5,6 +5,7 @@ const project = new URL("../", import.meta.url);
 const diagnostics = readFileSync(new URL("src/mobile-diagnostics.ts", project), "utf8");
 const app = readFileSync(new URL("src/App.tsx", project), "utf8");
 const settings = readFileSync(new URL("src/MobileSettingsScreen.tsx", project), "utf8");
+const messages = readFileSync(new URL("src/mobile-messages.ts", project), "utf8");
 
 describe("mobile local diagnostics native boundary", () => {
   it("records only explicit app lifecycle, connection-state, and bounded stall events", () => {
@@ -31,11 +32,15 @@ describe("mobile local diagnostics native boundary", () => {
   });
 
   it("exposes explicit opt-in, retention, clear, and export without a diagnostic upload action", () => {
-    expect(settings).toContain("Off by default.");
-    expect(settings).toContain("Message text, files, paths, IDs, credentials, raw errors, audio, and transcripts are never included.");
-    expect(settings).toContain('accessibilityLabel="Record local diagnostics"');
-    expect(settings).toContain('"Clear local diagnostics?"');
-    expect(settings).toContain('"Export diagnostics"');
+    expect(messages).toContain("Off by default.");
+    expect(messages).toContain("Message text, files, paths, IDs, credentials, raw errors, audio, and transcripts are never included.");
+    expect(messages).toContain('"settings.diagnostics.clearTitle": "Clear local diagnostics?"');
+    expect(messages).toContain('"settings.diagnostics.export": "Export diagnostics"');
+    expect(settings).toContain('accessibilityLabel={t("settings.diagnostics.record")}');
+    expect(settings).toContain('t("settings.diagnostics.privacy")');
+    expect(settings).toContain('t("settings.diagnostics.clearTitle")');
+    expect(settings).toContain('t("settings.diagnostics.export")');
     expect(settings).not.toMatch(/uploadDiagnostics|Upload diagnostics/iu);
+    expect(messages).not.toMatch(/uploadDiagnostics|Upload diagnostics/iu);
   });
 });

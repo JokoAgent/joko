@@ -39,6 +39,7 @@ import {
   mobileNewTaskDrafts,
   mobileOfflineCache,
   mobileDiagnostics,
+  mobileLocalePreferences,
   mobileStorage,
   mobileThemePreferences
 } from "./storage";
@@ -210,6 +211,8 @@ import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import { resolveMobileDarkTheme } from "./mobile-theme-preference";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import {
   commitMobileIncomingShare,
   mobileIncomingShare,
@@ -460,6 +463,10 @@ export function App() {
     (listener) => mobileDiagnostics.subscribe(listener),
     () => mobileDiagnostics.snapshot
   );
+  const locale = useSyncExternalStore(
+    (listener) => mobileLocalePreferences.subscribe(listener),
+    () => mobileLocalePreferences.snapshot
+  );
   const [page, setPage] = useState<Page>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
@@ -483,6 +490,7 @@ export function App() {
 
   useEffect(() => {
     void mobileThemePreferences.hydrate();
+    void mobileLocalePreferences.hydrate();
     let diagnosticsStopped = false;
     let diagnosticsState = AppState.currentState;
     let diagnosticsTick = performance.now();
@@ -505,6 +513,7 @@ export function App() {
       client.setForeground(foreground);
       mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
+      if (foreground) mobileLocalePreferences.refreshSystemLocale();
       if (!foreground) {
         void mobileComposerDrafts.flush().catch(() => undefined);
         void mobileInteractionDrafts.flush().catch(() => undefined);
@@ -592,7 +601,7 @@ export function App() {
     if (page === "device" && !state.owner?.devices.some((device) => device.deviceId === deviceId)) setPage("devices");
   }, [state.status, state.activeProfileId, state.selectedId, state.owner?.devices, deviceId, page]);
 
-  const common = { colors, state };
+  const common = { colors, state, locale: locale.effectiveLocale };
   const connectionRequired = !state.activeProfileId;
   const queueHomeMenuAction = (action: () => void): void => {
     if (pendingHomeMenuActionRef.current) return;
@@ -606,8 +615,8 @@ export function App() {
         <StatusBar style={dark ? "light" : "dark"} />
         <View style={styles.fill} accessibilityElementsHidden={homeDrawerMounted}
           importantForAccessibility={homeDrawerMounted ? "no-hide-descendants" : "auto"}>
-          {state.status === "starting" || theme.status === "loading" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
-            <StartupLoading colors={colors} dark={dark} />
+          {state.status === "starting" || theme.status === "loading" || locale.status === "loading" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
+            <StartupLoading colors={colors} dark={dark} locale={locale.effectiveLocale} />
           </SafeAreaView> :
             connectionRequired || page === "connection" ? <ConnectionScreen {...common} dark={dark}
               onBack={connectionRequired ? undefined : () => { client.cancel(); setPage("home"); }}
@@ -625,8 +634,9 @@ export function App() {
                 page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
-                  theme={theme} diagnostics={diagnostics} client={client}
+                  theme={theme} locale={locale} diagnostics={diagnostics} client={client}
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
+                  onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
                   onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
                   onDiagnosticsClear={() => mobileDiagnostics.clear()}
                   onDiagnosticsExport={() => mobileDiagnostics.export({
@@ -646,6 +656,7 @@ export function App() {
             </SafeAreaView>}
         </View>
         <HomeMenu visible={!connectionRequired && menuOpen} colors={colors} state={state}
+          locale={locale.effectiveLocale}
           onClose={() => setMenuOpen(false)}
           onMountedChange={setHomeDrawerMounted}
           onClosed={() => {
@@ -664,7 +675,15 @@ export function App() {
 }
 
 type Colors = { background: string; surface: string; ink: string; muted: string; border: string; accent: string; negative: string; brandBackground: string };
-type ScreenProps = { colors: Colors; state: MobileClient["state"] };
+type ScreenProps = { colors: Colors; state: MobileClient["state"]; locale: MobileSupportedLocale };
+
+function mobileHomeSectionLabels(locale: MobileSupportedLocale) {
+  return {
+    dialogue: mobileMessage(locale, "home.section.dialogue"),
+    project: mobileMessage(locale, "home.section.project"),
+    pinned: mobileMessage(locale, "home.section.pinned")
+  };
+}
 
 function mobileDiagnosticAppState(value: string): "active" | "inactive" | "background" | "unknown" {
   return value === "active" || value === "inactive" || value === "background" ? value : "unknown";
@@ -682,7 +701,7 @@ function mobileComposerRichTheme(colors: Colors) {
   };
 }
 
-function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenProps & {
+function ConnectionScreen({ colors, state, locale, dark, onBack, onConnected }: ScreenProps & {
   dark: boolean; onBack?: () => void; onConnected: () => void;
 }) {
   const [origin, setOrigin] = useState(state.candidate?.origin ?? "");
@@ -699,11 +718,11 @@ function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenPr
   const appIcon = mobileConnectionAppIcon(theme);
   const inspect = async () => {
     setLocalError("");
-    try { await client.inspect(origin); setInspected(true); } catch (error) { setLocalError(errorText(error)); setInspected(false); }
+    try { await client.inspect(origin); setInspected(true); } catch (error) { setLocalError(errorText(error, locale)); setInspected(false); }
   };
   const pair = async () => {
     setLocalError("");
-    try { await client.pair(origin, code, deviceName, newAutomatic); setCode(""); onConnected(); } catch (error) { setLocalError(errorText(error)); }
+    try { await client.pair(origin, code, deviceName, newAutomatic); setCode(""); onConnected(); } catch (error) { setLocalError(errorText(error, locale)); }
   };
   useEffect(() => {
     if (state.busy || state.connectionAttemptError) return;
@@ -715,7 +734,7 @@ function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenPr
     setCode("");
     setInspected(false);
     setLocalError("");
-    void client.inspectNearby(node).then(() => setInspected(true)).catch((error) => setLocalError(errorText(error)));
+    void client.inspectNearby(node).then(() => setInspected(true)).catch((error) => setLocalError(errorText(error, locale)));
   };
   const selectMode = (mode: MobileClient["state"]["connectionMode"]) => {
     setInspected(false);
@@ -724,100 +743,123 @@ function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenPr
     client.setConnectionMode(mode);
   };
   const forget = (profile: SavedMobileConnection) => Alert.alert(
-    `Forget ${profile.displayName}?`,
-    "This removes only this device's protected credential. It does not log out the server connection. Any unconfirmed operation warning for this connection will no longer be recoverable here.",
-    [{ text: "Keep", style: "cancel" }, { text: "Forget", style: "destructive", onPress: () => {
+    mobileMessage(locale, "connection.forgetTitle", { name: profile.displayName }),
+    mobileMessage(locale, "connection.forgetBody"),
+    [{ text: mobileMessage(locale, "common.keep"), style: "cancel" },
+      { text: mobileMessage(locale, "common.forget"), style: "destructive", onPress: () => {
       setLocalError("");
-      void client.forgetConnection(profile.profileId).catch((error) => setLocalError(errorText(error)));
+      void client.forgetConnection(profile.profileId).catch((error) => setLocalError(errorText(error, locale)));
     } }]
   );
   return <MobileConnectionStage
     artworkId={artwork.id}
     artworkSource={artwork.source}
     iconSource={appIcon}
+    locale={locale}
     colors={{ brandBackground: colors.brandBackground, ink: colors.ink, muted: colors.muted }}
     onArtworkPress={() => setArtworkVariant((current) => current === "base" ? "alt" : "base")}
     onIconPress={() => { setArtworkGroupIndex((current) => nextConnectionArtworkGroupIndex(current)); setArtworkVariant("base"); }}
   >
-    {onBack && !state.busy && <Back label="Joko" onPress={onBack} colors={colors} />}
-    <Text style={[styles.title, { color: colors.ink }]}>Connect to a Joko node</Text>
-    <Text style={[styles.description, { color: colors.muted }]}>Choose a nearby node, use an exact saved connection, or add an address manually. Pairing grants this device revocable access.</Text>
+    {onBack && !state.busy && <Back label="Joko" accessibilityLabel={mobileMessage(locale, "common.backTo", { label: "Joko" })}
+      onPress={onBack} colors={colors} />}
+    <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "connection.title")}</Text>
+    <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.description")}</Text>
     <View style={[styles.modeTabs, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <ModeTab label="Nearby" selected={state.connectionMode === "nearby"} onPress={() => selectMode("nearby")} colors={colors} />
-      <ModeTab label={`Saved${state.saved.length ? ` (${state.saved.length})` : ""}`} selected={state.connectionMode === "saved"} onPress={() => selectMode("saved")} colors={colors} />
-      <ModeTab label="Add" selected={state.connectionMode === "add"} onPress={() => selectMode("add")} colors={colors} />
+      <ModeTab label={mobileMessage(locale, "connection.mode.nearby")} selected={state.connectionMode === "nearby"}
+        onPress={() => selectMode("nearby")} colors={colors} />
+      <ModeTab label={state.saved.length
+        ? mobileMessage(locale, "connection.mode.savedCount", { count: state.saved.length })
+        : mobileMessage(locale, "connection.mode.saved")} selected={state.connectionMode === "saved"}
+        onPress={() => selectMode("saved")} colors={colors} />
+      <ModeTab label={mobileMessage(locale, "connection.mode.add")} selected={state.connectionMode === "add"}
+        onPress={() => selectMode("add")} colors={colors} />
     </View>
-    {state.status === "revoked" && <Banner text={state.error || "This device needs to pair again."} colors={colors} />}
+    {state.status === "revoked" && <Banner text={state.error || mobileMessage(locale, "connection.repair")} colors={colors} />}
     {state.automaticProfileId && <View style={[styles.notice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <View style={styles.fill}><Text style={[styles.caption, { color: colors.muted }]}>Automatic entry</Text>
-        <Text style={[styles.label, { color: colors.ink }]}>{state.saved.find((item) => item.profileId === state.automaticProfileId)?.displayName || "Missing saved connection"}</Text></View>
-      <Action label="Turn off" compact disabled={state.busy}
-        onPress={() => void client.disableAutomaticEntry().catch((error) => setLocalError(errorText(error)))} colors={colors} />
+      <View style={styles.fill}><Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.automaticEntry")}</Text>
+        <Text style={[styles.label, { color: colors.ink }]}>{state.saved.find((item) => item.profileId === state.automaticProfileId)?.displayName
+          || mobileMessage(locale, "connection.missingSaved")}</Text></View>
+      <Action label={mobileMessage(locale, "common.turnOff")} compact disabled={state.busy}
+        onPress={() => void client.disableAutomaticEntry().catch((error) => setLocalError(errorText(error, locale)))} colors={colors} />
     </View>}
     {state.connectionMode === "nearby" && <>
-      <View style={styles.sectionHeader}><Text style={[styles.section, { color: colors.muted }]}>Nearby Joko nodes</Text>
-        <Action label={state.discoveryState === "refreshing" ? "Refreshing…" : "Refresh"} compact
+      <View style={styles.sectionHeader}><Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connection.nearbyTitle")}</Text>
+        <Action label={mobileMessage(locale, state.discoveryState === "refreshing" ? "common.refreshing" : "common.refresh")} compact
           disabled={state.busy || state.discoveryState === "refreshing"} onPress={() => void client.refreshNearby()} colors={colors} /></View>
       {state.discoveryState === "refreshing" && state.nearby.length === 0 && <ActivityIndicator color={colors.accent} />}
       {state.discoveryError && <Banner text={state.discoveryError} colors={colors} />}
-      {state.discoveryState !== "refreshing" && state.nearby.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No nearby nodes answered. Check Wi-Fi and local-network permission, then refresh or use Add.</Text>}
+      {state.discoveryState !== "refreshing" && state.nearby.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.nearbyEmpty")}</Text>}
       {state.nearby.map((nearby) => <Pressable key={`${nearby.serverId}:${nearby.origin}`} accessibilityRole="button"
-        accessibilityLabel={`Pair with ${nearby.displayName}`} onPress={() => selectNearby(nearby)}
+        accessibilityLabel={mobileMessage(locale, "connection.pairWith", { name: nearby.displayName })} onPress={() => selectNearby(nearby)}
         style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.fill}><Text style={[styles.label, { color: colors.ink }]}>{nearby.displayName}</Text>
           <Text selectable style={[styles.caption, { color: colors.muted }]}>{nearby.origin}</Text>
-          <Text style={[styles.caption, { color: colors.muted }]}>{nearby.pairingEnabled ? "Pairing available" : "Pairing closed"} · v{nearby.version || "unknown"}</Text></View>
+          <Text style={[styles.caption, { color: colors.muted }]}>{nearby.pairingEnabled
+            ? mobileMessage(locale, "connection.pairingAvailable") : mobileMessage(locale, "connection.pairingClosed")} · v{nearby.version
+              || mobileMessage(locale, "common.unknown")}</Text></View>
         <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
       </Pressable>)}
     </>}
     {state.connectionMode === "saved" && <>
-      <View style={styles.sectionHeader}><Text style={[styles.section, { color: colors.muted }]}>Saved connections</Text>
-        <Action label="Recheck" compact disabled={state.busy || state.saved.some((profile) => profile.credentialState === "checking")}
+      <View style={styles.sectionHeader}><Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connection.savedTitle")}</Text>
+        <Action label={mobileMessage(locale, "connection.recheck")} compact disabled={state.busy || state.saved.some((profile) => profile.credentialState === "checking")}
           onPress={() => void client.refreshSaved()} colors={colors} /></View>
-      {state.saved.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>No saved connections. Use Nearby or Add to pair this device.</Text>}
+      {state.saved.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.savedEmpty")}</Text>}
       {state.saved.map((profile) => {
         const automatic = savedAutomaticChoices[profile.profileId] ?? profile.automatic;
         return <View key={profile.profileId} style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.statusTitle}><Text style={[styles.label, { color: colors.ink }]}>{profile.displayName}</Text>
-          {profile.automatic && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>Automatic</Text>}</View>
+          {profile.automatic && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "connection.automaticEntry")}</Text>}</View>
         <Text selectable style={[styles.caption, { color: colors.muted }]}>{profile.origin}</Text>
-        <Text selectable style={[styles.caption, { color: colors.muted }]}>Identity: {profile.serverId}</Text>
-        <Text style={[styles.caption, { color: profile.credentialState === "available" ? colors.muted : colors.negative }]}>{savedStatus(profile)}</Text>
+        <Text selectable style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.identity", { id: profile.serverId })}</Text>
+        <Text style={[styles.caption, { color: profile.credentialState === "available" ? colors.muted : colors.negative }]}>{savedStatus(profile, locale)}</Text>
         {profile.error && <Text accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>{profile.error}</Text>}
-        <SavedPendingOperations profile={profile} colors={colors} />
+        <SavedPendingOperations profile={profile} colors={colors} locale={locale} />
         <AutomaticEntryChoice checked={automatic} disabled={state.busy || state.status === "connecting"}
-          onPress={() => setSavedAutomaticChoices((choices) => ({ ...choices, [profile.profileId]: !automatic }))} colors={colors} />
+          onPress={() => setSavedAutomaticChoices((choices) => ({ ...choices, [profile.profileId]: !automatic }))}
+          colors={colors} locale={locale} />
         <View style={styles.actionRow}>
-          <Action label={state.status === "connecting" ? "Connecting…" : "Connect"} onPress={() => {
+          <Action label={mobileMessage(locale, state.status === "connecting" ? "common.connecting" : "common.connect")} onPress={() => {
             setLocalError("");
             void client.connectSaved(profile.profileId, automatic).then(() => {
               if (client.state.activeProfileId === profile.profileId) onConnected();
-            }).catch((error) => setLocalError(errorText(error)));
+            }).catch((error) => setLocalError(errorText(error, locale)));
           }} colors={colors} disabled={state.busy || state.status === "connecting" || profile.credentialState === "checking"} />
-          <Action label="Forget" onPress={() => forget(profile)} colors={colors} danger disabled={state.busy} />
+          <Action label={mobileMessage(locale, "common.forget")} onPress={() => forget(profile)} colors={colors} danger disabled={state.busy} />
         </View>
       </View>;
       })}
     </>}
     {state.connectionMode === "add" && <>
-      <AutomaticEntryChoice checked={newAutomatic} disabled={state.busy || state.status === "connecting"} onPress={() => setNewAutomatic((value) => !value)} colors={colors} />
-      <Field label="Joko node address" value={origin} onChange={(value) => { setOrigin(value); setInspected(false); client.cancel(); }} placeholder="http://192.168.1.20:4318" colors={colors} autoCapitalize="none" keyboardType="url" />
-      {origin.trim().startsWith("http://") && <Text style={[styles.warning, { color: colors.negative }]}>Local HTTP is not encrypted. Pair only on a trusted private network; anyone on that network may observe traffic.</Text>}
-      <Action label={state.busy ? "Checking…" : "Check node identity"} onPress={inspect} colors={colors} disabled={state.busy || !origin.trim()} />
+      <AutomaticEntryChoice checked={newAutomatic} disabled={state.busy || state.status === "connecting"}
+        onPress={() => setNewAutomatic((value) => !value)} colors={colors} locale={locale} />
+      <Field label={mobileMessage(locale, "connection.address")} value={origin}
+        onChange={(value) => { setOrigin(value); setInspected(false); client.cancel(); }}
+        placeholder="http://192.168.1.20:4318" colors={colors} autoCapitalize="none" keyboardType="url" />
+      {origin.trim().startsWith("http://") && <Text style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale, "connection.httpWarning")}</Text>}
+      <Action label={mobileMessage(locale, state.busy ? "connection.checking" : "connection.checkIdentity")}
+        onPress={inspect} colors={colors} disabled={state.busy || !origin.trim()} />
       {inspected && state.candidate && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <Text style={[styles.label, { color: colors.ink }]}>{state.candidate.node.displayName}</Text>
-        <Text selectable style={[styles.caption, { color: colors.muted }]}>Identity: {state.candidate.node.serverId}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>v{state.candidate.node.version || "unknown"} · API {state.candidate.node.apiVersion} · {state.candidate.node.pairingEnabled ? "Pairing available" : "Pairing is closed"}</Text>
+        <Text selectable style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.identity", { id: state.candidate.node.serverId })}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.candidateSummary", {
+          version: state.candidate.node.version || mobileMessage(locale, "common.unknown"),
+          api: state.candidate.node.apiVersion,
+          pairing: mobileMessage(locale, state.candidate.node.pairingEnabled ? "connection.pairingAvailable" : "connection.pairingClosed")
+        })}</Text>
       </View>}
       {inspected && state.candidate?.node.pairingEnabled && <>
-        <Field label="Device name" value={deviceName} onChange={setDeviceName} placeholder="My phone" colors={colors} />
-        <Action label={state.busy ? "Requesting…" : "Request pairing"} onPress={() => {
-          setLocalError(""); void client.requestPairing(origin, deviceName).catch((error) => setLocalError(errorText(error)));
+        <Field label={mobileMessage(locale, "connection.deviceName")} value={deviceName} onChange={setDeviceName}
+          placeholder={mobileMessage(locale, "connection.devicePlaceholder")} colors={colors} />
+        <Action label={mobileMessage(locale, state.busy ? "connection.requesting" : "connection.requestPairing")} onPress={() => {
+          setLocalError(""); void client.requestPairing(origin, deviceName).catch((error) => setLocalError(errorText(error, locale)));
         }} colors={colors} disabled={state.busy || !deviceName.trim()} />
         {state.challenge && <>
-          <Text style={[styles.description, { color: colors.muted }]}>Ask the Joko node owner for the code issued for this exact request. Enter it before it expires.</Text>
-          <Field label="Pairing code" value={code} onChange={setCode} placeholder="Code shown on the Joko node" colors={colors} keyboardType="number-pad" />
-          <Action label={state.busy ? "Pairing…" : "Pair this device"} onPress={pair} colors={colors} disabled={state.busy || !code.trim()} />
+          <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connection.challenge")}</Text>
+          <Field label={mobileMessage(locale, "connection.pairingCode")} value={code} onChange={setCode}
+            placeholder={mobileMessage(locale, "connection.pairingCodePlaceholder")} colors={colors} keyboardType="number-pad" />
+          <Action label={mobileMessage(locale, state.busy ? "connection.pairing" : "connection.pairDevice")}
+            onPress={pair} colors={colors} disabled={state.busy || !code.trim()} />
         </>}
       </>}
     </>}
@@ -826,7 +868,7 @@ function ConnectionScreen({ colors, state, dark, onBack, onConnected }: ScreenPr
   </MobileConnectionStage>;
 }
 
-function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef, searchFocusRequest }: ScreenProps & {
+function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuButtonRef, searchFocusRequest }: ScreenProps & {
   onNew: () => void; onSelect: () => void; onMenu: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
 }) {
@@ -849,8 +891,9 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
     snapshot: state.owner,
     statusFilter,
     query: search,
-    messageSessionIds: currentMessageIds
-  }), [currentMessageIds, search, state.owner, statusFilter]);
+    messageSessionIds: currentMessageIds,
+    labels: mobileHomeSectionLabels(locale)
+  }), [currentMessageIds, locale, search, state.owner, statusFilter]);
   const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
 
   useEffect(() => {
@@ -868,7 +911,7 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
   const runMutation = (action: () => Promise<boolean>): void => {
     if (state.status !== "connected") return;
     setLocalError("");
-    void action().catch((error) => setLocalError(errorText(error)));
+    void action().catch((error) => setLocalError(errorText(error, locale)));
   };
   const togglePin = (session: Session): void => runMutation(() => client.setSessionPinned(session.sessionId, !session.pinned));
   const toggleArchive = (session: Session): void => runMutation(() => client.setSessionArchived(session.sessionId, !session.archived));
@@ -890,9 +933,10 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
     } else if (action === "pin") togglePin(session);
     else if (action === "archive") toggleArchive(session);
     else Alert.alert(
-      `Delete ${session.displayName || "this task"}?`,
-      "This removes the Joko task. Its native Backend session and artifacts are kept.",
-      [{ text: "Cancel", style: "cancel" }, { text: "Delete task", style: "destructive", onPress: () => runMutation(() => client.deleteSession(session.sessionId)) }]
+      mobileMessage(locale, "home.deleteTitle", { name: session.displayName || mobileMessage(locale, "home.untitledTask") }),
+      mobileMessage(locale, "home.deleteBody"),
+      [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+        { text: mobileMessage(locale, "common.deleteTask"), style: "destructive", onPress: () => runMutation(() => client.deleteSession(session.sessionId)) }]
     );
   };
   const scheduleOption = (action: SessionOption): void => {
@@ -920,15 +964,15 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
 
   return <View style={styles.fill}>
     <View style={styles.homeHeader}>
-      <Pressable ref={menuButtonRef} accessibilityRole="button" accessibilityLabel="Open menu" onPress={onMenu}
+      <Pressable ref={menuButtonRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openMenu")} onPress={onMenu}
         style={[styles.headerIconButton, { borderColor: colors.border, backgroundColor: colors.surface }]}>
         <Text style={[styles.headerIcon, { color: colors.ink }]}>☰</Text>
       </Pressable>
       <View style={styles.homeTitle}>
         <Text style={[styles.homeTitleText, { color: colors.ink }]} numberOfLines={1}>{state.node?.displayName || "Joko"}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>Tasks</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "common.tasks")}</Text>
       </View>
-      <Action label="New" onPress={onNew} colors={colors} compact disabled={state.status !== "connected"} />
+      <Action label={mobileMessage(locale, "common.new")} onPress={onNew} colors={colors} compact disabled={state.status !== "connected"} />
     </View>
     {(state.status === "connecting" || state.status === "offline") && <View
       accessibilityRole="alert"
@@ -936,17 +980,22 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
     >
       <View style={[styles.statusDot, { backgroundColor: state.status === "connecting" ? colors.accent : colors.negative }]} />
       <View style={styles.fill}>
-        <Text style={[styles.label, { color: colors.ink }]}>{state.status === "connecting" ? "Reconnecting to this Joko node" : "This Joko node is offline"}</Text>
+        <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
+          state.status === "connecting" ? "home.reconnecting" : "home.offline")}</Text>
         {state.offlineSnapshotAt !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>
-          {mobileOfflineAgeLabel(state.offlineSnapshotAt, Date.now())} · read-only
+          {mobileMessage(locale, "home.offlineSummary", {
+            age: mobileOfflineAgeLabel(state.offlineSnapshotAt, Date.now(), locale)
+          })}
         </Text>}
         {state.error && <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>{state.error}</Text>}
       </View>
-      {state.status === "offline" && <Action label="Retry" onPress={() => void client.refresh()} colors={colors} compact />}
+      {state.status === "offline" && <Action label={mobileMessage(locale, "common.retry")}
+        onPress={() => void client.refresh()} colors={colors} compact />}
     </View>}
     {state.status === "connected" && state.error && <Banner text={state.error} colors={colors} />}
     <View style={styles.searchRow}>
-      <TextInput ref={searchRef} accessibilityLabel="Search tasks and messages" placeholder="Search tasks and messages"
+      <TextInput ref={searchRef} accessibilityLabel={mobileMessage(locale, "home.search")}
+        placeholder={mobileMessage(locale, "home.search")}
         placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
         style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
       {state.homeSearchStatus === "searching" && normalizedSearch && <ActivityIndicator color={colors.accent} />}
@@ -956,33 +1005,40 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
         accessibilityState={{ selected: filter === statusFilter }} onPress={() => setStatusFilter(filter)}
         style={[styles.filterChip, { borderColor: filter === statusFilter ? colors.accent : colors.border,
           backgroundColor: filter === statusFilter ? colors.brandBackground : colors.surface }]}>
-        <Text style={[styles.caption, { color: colors.ink }]}>{filter[0]!.toUpperCase() + filter.slice(1)}</Text>
+        <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.filter.${filter}`)}</Text>
       </Pressable>)}
     </View>
     {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
     {localError && <Banner text={localError} colors={colors} />}
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
-      colors={colors} disabled={state.status !== "connected"} onError={setLocalError} />
+      colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
       renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
-      ListEmptyComponent={<Centered label={state.offlineSnapshotAt !== undefined ? "No tasks in the saved offline copy" : state.status !== "connected" ? "Reconnect to load tasks" : normalizedSearch ? "No matching tasks or messages" : statusFilter === "archived" ? "No archived tasks" : "No tasks yet"} colors={colors} />}
-      renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors}
+      ListEmptyComponent={<Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
+        ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
+          ? "home.empty.search" : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
+      renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
         onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
         disabled={state.status !== "connected"}>
         <View style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={`Open task ${item.session.displayName || "Untitled"}`}
+          <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
+            name: item.session.displayName || mobileMessage(locale, "home.untitled")
+          })}
             onPress={() => {
               if (swipeRegistry.closeOpenRow()) return;
               setLocalError("");
-              void client.select(item.session.sessionId).then(onSelect).catch((error) => setLocalError(errorText(error)));
+              void client.select(item.session.sessionId).then(onSelect).catch((error) => setLocalError(errorText(error, locale)));
             }} style={styles.sessionRowBody}>
             <View style={styles.fill}><View style={styles.statusTitle}>
-              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName || "Untitled task"}</Text>
-              {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>Pinned</Text>}
+              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName
+                || mobileMessage(locale, "home.untitledTask")}</Text>
+              {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
             </View>
-              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state)}</Text></View>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state, locale)}</Text></View>
           </Pressable>
-          <Pressable accessibilityRole="button" accessibilityLabel={`Options for ${item.session.displayName || "task"}`}
+          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
+            name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
+          })}
             accessibilityState={{ disabled: state.status !== "connected" }} disabled={state.status !== "connected"}
             onPress={() => { swipeRegistry.closeOpenRow(); openOptions(item.session); }} style={styles.rowOptions}>
             <Text style={[styles.rowOptionsText, { color: colors.muted }]}>•••</Text>
@@ -995,14 +1051,18 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
     <Modal visible={state.status === "connected" && optionsSession !== undefined} transparent animationType="none"
       onRequestClose={closeOptions} statusBarTranslucent>
       <View style={styles.sheetRoot}>
-        <Pressable accessibilityRole="button" accessibilityLabel="Close task options" onPress={closeOptions} style={styles.modalBackdrop} />
+        <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.closeOptions")}
+          onPress={closeOptions} style={styles.modalBackdrop} />
         <SafeAreaView accessibilityViewIsModal style={[styles.optionSheet, { backgroundColor: colors.surface, borderColor: colors.border }]} edges={["bottom", "left", "right"]}>
-          <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{optionsSession?.displayName || "Task options"}</Text>
-          <MenuRow label="Rename" onPress={() => scheduleOption("rename")} colors={colors} />
-          <MenuRow label={optionsSession?.pinned ? "Unpin" : "Pin"} onPress={() => scheduleOption("pin")} colors={colors} />
-          <MenuRow label={optionsSession?.archived ? "Restore" : "Archive"} onPress={() => scheduleOption("archive")} colors={colors} />
-          <MenuRow label="Delete task" onPress={() => scheduleOption("delete")} colors={colors} />
-          <Action label="Cancel" onPress={closeOptions} colors={colors} />
+          <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{optionsSession?.displayName
+            || mobileMessage(locale, "home.taskOptions")}</Text>
+          <MenuRow label={mobileMessage(locale, "common.rename")} onPress={() => scheduleOption("rename")} colors={colors} />
+          <MenuRow label={mobileMessage(locale, optionsSession?.pinned ? "common.unpin" : "common.pin")}
+            onPress={() => scheduleOption("pin")} colors={colors} />
+          <MenuRow label={mobileMessage(locale, optionsSession?.archived ? "common.restore" : "common.archive")}
+            onPress={() => scheduleOption("archive")} colors={colors} />
+          <MenuRow label={mobileMessage(locale, "common.deleteTask")} onPress={() => scheduleOption("delete")} colors={colors} />
+          <Action label={mobileMessage(locale, "common.cancel")} onPress={closeOptions} colors={colors} />
         </SafeAreaView>
       </View>
     </Modal>
@@ -1010,11 +1070,12 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
       onRequestClose={() => setRenameSession(undefined)} statusBarTranslucent>
       <View style={styles.dialogRoot}>
         <View accessibilityViewIsModal style={[styles.renameDialog, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <Text style={[styles.title, { color: colors.ink }]}>Rename task</Text>
-          <Field label="Task name" value={renameDraft} onChange={setRenameDraft} placeholder="Task name" colors={colors} />
+          <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "home.renameTitle")}</Text>
+          <Field label={mobileMessage(locale, "home.taskName")} value={renameDraft} onChange={setRenameDraft}
+            placeholder={mobileMessage(locale, "home.taskName")} colors={colors} />
           <View style={styles.actionRow}>
-            <Action label="Cancel" onPress={() => setRenameSession(undefined)} colors={colors} />
-            <Action label="Rename" disabled={state.status !== "connected" || !renameDraft.trim() || state.busy} onPress={() => {
+            <Action label={mobileMessage(locale, "common.cancel")} onPress={() => setRenameSession(undefined)} colors={colors} />
+            <Action label={mobileMessage(locale, "common.rename")} disabled={state.status !== "connected" || !renameDraft.trim() || state.busy} onPress={() => {
               const target = renameSession;
               if (!target) return;
               setRenameSession(undefined);
@@ -1029,7 +1090,7 @@ function SessionsScreen({ colors, state, onNew, onSelect, onMenu, menuButtonRef,
 
 type SessionOption = "rename" | "pin" | "archive" | "delete";
 
-function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onSettings, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
   onSearch: () => void; onAutomations: () => void; onSwitch: () => void; onSettings: () => void; onDevices: () => void;
 }) {
@@ -1037,23 +1098,29 @@ function HomeMenu({ visible, colors, state, onClose, onClosed, onMountedChange, 
   const closeRef = useRef<View>(null);
   return <MobileDrawer visible={visible} width={Math.min(380, width * 0.84)} backgroundColor={colors.surface}
     borderColor={colors.border} onClose={onClose} onClosed={onClosed} onMountedChange={onMountedChange}
-    initialFocusRef={closeRef} testID="home.drawer">
+    initialFocusRef={closeRef} locale={locale} testID="home.drawer">
       <SafeAreaView style={styles.homeDrawer} edges={["top", "bottom", "left"]}>
         <View style={styles.drawerHeading}>
           <View style={styles.drawerTitleRow}><View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]}>Joko</Text>
             <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>
-              {state.node?.displayName || "Joko node"}{state.origin ? `\n${state.origin}` : ""}
+              {state.node?.displayName || mobileMessage(locale, "home.menu.nodeFallback")}{state.origin ? `\n${state.origin}` : ""}
             </Text></View>
-            <Pressable ref={closeRef} accessibilityRole="button" accessibilityLabel="Close menu" onPress={onClose} style={styles.drawerClose}>
+            <Pressable ref={closeRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.menu.close")}
+              onPress={onClose} style={styles.drawerClose}>
               <Text style={[styles.headerIcon, { color: colors.ink }]}>×</Text>
             </Pressable>
           </View>
         </View>
-        <MenuRow label="Search" description="Find tasks and message text" onPress={onSearch} colors={colors} />
-        <MenuRow label="Automations" description="Schedules, run status, and history" onPress={onAutomations} colors={colors} />
-        <MenuRow label="Switch or add Joko node" description="Nearby, saved, and manual connections" onPress={onSwitch} colors={colors} />
-        <MenuRow label="Devices" description="Devices authorized by this Joko node" onPress={onDevices} colors={colors} />
-        <MenuRow label="Settings" description="Appearance, current device, connection, and app details" onPress={onSettings} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "common.search")} description={mobileMessage(locale, "home.menu.searchDescription")}
+          onPress={onSearch} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "home.menu.automations")}
+          description={mobileMessage(locale, "home.menu.automationsDescription")} onPress={onAutomations} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "home.menu.switch")} description={mobileMessage(locale, "home.menu.switchDescription")}
+          onPress={onSwitch} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "common.devices")} description={mobileMessage(locale, "home.menu.devicesDescription")}
+          onPress={onDevices} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "settings.title")} description={mobileMessage(locale, "home.menu.settingsDescription")}
+          onPress={onSettings} colors={colors} />
         <View style={styles.drawerSpacer} />
       </SafeAreaView>
   </MobileDrawer>;
@@ -1072,97 +1139,105 @@ function MenuRow({ label, description, onPress, colors }: {
   </Pressable>;
 }
 
-function ConnectionsScreen({ colors, state, onBack, onSwitch }: ScreenProps & { onBack: () => void; onSwitch: () => void }) {
+function ConnectionsScreen({ colors, state, locale, onBack, onSwitch }: ScreenProps & { onBack: () => void; onSwitch: () => void }) {
   const [localError, setLocalError] = useState("");
   const currentConnectionId = state.saved.find((profile) => profile.profileId === state.activeProfileId)?.connectionId;
   const logout = (connectionId: string, name: string) => Alert.alert(
-    `Log out ${name}?`,
-    "Joko will first log out this exact server connection. Its local protected credential is removed only after the server confirms success.",
-    [{ text: "Cancel", style: "cancel" }, { text: "Log out", style: "destructive", onPress: () => {
+    mobileMessage(locale, "connections.logoutTitle", { name }),
+    mobileMessage(locale, "connections.logoutBody"),
+    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+      { text: mobileMessage(locale, "common.logOut"), style: "destructive", onPress: () => {
       setLocalError("");
-      void client.logoutConnection(connectionId).catch((error) => setLocalError(errorText(error)));
+      void client.logoutConnection(connectionId).catch((error) => setLocalError(errorText(error, locale)));
     } }]
   );
   const forget = (profile: SavedMobileConnection) => Alert.alert(
-    `Forget ${profile.displayName}?`,
-    "This is local-only and does not log out the server connection.",
-    [{ text: "Cancel", style: "cancel" }, { text: "Forget", style: "destructive", onPress: () => {
+    mobileMessage(locale, "connections.forgetTitle", { name: profile.displayName }),
+    mobileMessage(locale, "connections.forgetBody"),
+    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+      { text: mobileMessage(locale, "common.forget"), style: "destructive", onPress: () => {
       setLocalError("");
-      void client.forgetConnection(profile.profileId).catch((error) => setLocalError(errorText(error)));
+      void client.forgetConnection(profile.profileId).catch((error) => setLocalError(errorText(error, locale)));
     } }]
   );
   return <ScrollView contentContainerStyle={styles.screen} keyboardShouldPersistTaps="handled">
-    <Back label="Joko" onPress={onBack} colors={colors} />
-    <Text style={[styles.title, { color: colors.ink }]}>Connection settings</Text>
-    <Text style={[styles.description, { color: colors.muted }]}>Local saved nodes and server-issued connections are separate. Forget changes only this phone; Log out is confirmed by the current Joko node first.</Text>
-    <Text style={[styles.section, { color: colors.muted }]}>Current Joko node</Text>
+    <Back label="Joko" accessibilityLabel={mobileMessage(locale, "common.backTo", { label: "Joko" })}
+      onPress={onBack} colors={colors} />
+    <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "connections.title")}</Text>
+    <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "connections.description")}</Text>
+    <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connections.currentNode")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <Text style={[styles.label, { color: colors.ink }]}>{state.node?.displayName || "Joko node"}</Text>
-      <Text selectable style={[styles.caption, { color: colors.muted }]}>{state.origin || "Address unavailable"}</Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>{state.status === "connected" ? "Connected" : state.status === "connecting" ? "Reconnecting" : "Offline"}</Text>
-      <Action label="Switch or add Joko node" colors={colors} onPress={onSwitch} />
+      <Text style={[styles.label, { color: colors.ink }]}>{state.node?.displayName || mobileMessage(locale, "connections.nodeFallback")}</Text>
+      <Text selectable style={[styles.caption, { color: colors.muted }]}>{state.origin || mobileMessage(locale, "connections.addressUnavailable")}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, state.status === "connected"
+        ? "connections.state.connected" : state.status === "connecting" ? "settings.connection.reconnecting" : "settings.connection.offline")}</Text>
+      <Action label={mobileMessage(locale, "connections.switch")} colors={colors} onPress={onSwitch} />
     </View>
     {state.automaticProfileId && <View style={[styles.notice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <View style={styles.fill}><Text style={[styles.caption, { color: colors.muted }]}>Automatic entry</Text>
-        <Text style={[styles.label, { color: colors.ink }]}>{state.saved.find((profile) => profile.profileId === state.automaticProfileId)?.displayName || "Missing saved connection"}</Text></View>
-      <Action label="Turn off" compact colors={colors} disabled={state.busy}
-        onPress={() => void client.disableAutomaticEntry().catch((error) => setLocalError(errorText(error)))} />
+      <View style={styles.fill}><Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.automaticEntry")}</Text>
+        <Text style={[styles.label, { color: colors.ink }]}>{state.saved.find((profile) => profile.profileId === state.automaticProfileId)?.displayName
+          || mobileMessage(locale, "connection.missingSaved")}</Text></View>
+      <Action label={mobileMessage(locale, "common.turnOff")} compact colors={colors} disabled={state.busy}
+        onPress={() => void client.disableAutomaticEntry().catch((error) => setLocalError(errorText(error, locale)))} />
     </View>}
-    {!state.automaticProfileId && state.status === "connected" && <Action label="Use current connection automatically" colors={colors}
-      onPress={() => void client.setAutomaticEntryForActive(true).catch((error) => setLocalError(errorText(error)))} />}
-    <Text style={[styles.section, { color: colors.muted }]}>Saved on this phone</Text>
+    {!state.automaticProfileId && state.status === "connected" && <Action label={mobileMessage(locale, "connections.useCurrentAutomatically")} colors={colors}
+      onPress={() => void client.setAutomaticEntryForActive(true).catch((error) => setLocalError(errorText(error, locale)))} />}
+    <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connections.savedOnPhone")}</Text>
     {state.saved.map((profile) => <View key={profile.profileId} style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <View style={styles.statusTitle}><Text style={[styles.label, { color: colors.ink }]}>{profile.displayName}</Text>
-        {profile.profileId === state.activeProfileId && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>Current</Text>}</View>
+        {profile.profileId === state.activeProfileId && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.current")}</Text>}</View>
       <Text selectable style={[styles.caption, { color: colors.muted }]}>{profile.origin}</Text>
-      <Text selectable style={[styles.caption, { color: colors.muted }]}>Profile: {profile.profileId}</Text>
-      <SavedPendingOperations profile={profile} colors={colors} />
-      <Action label="Forget locally" colors={colors} danger disabled={state.busy} onPress={() => forget(profile)} />
+      <Text selectable style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connections.profile", { id: profile.profileId })}</Text>
+      <SavedPendingOperations profile={profile} colors={colors} locale={locale} />
+      <Action label={mobileMessage(locale, "connections.forgetLocally")} colors={colors} danger disabled={state.busy} onPress={() => forget(profile)} />
     </View>)}
-    <Text style={[styles.section, { color: colors.muted }]}>Connections issued by this node</Text>
+    <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "connections.issuedByNode")}</Text>
     {(state.owner?.connections ?? []).map((connection) => {
       const device = state.owner?.devices.find((candidate) => candidate.deviceId === connection.deviceId);
-      const name = connection.displayName || device?.displayName || "Joko connection";
+      const name = connection.displayName || device?.displayName || mobileMessage(locale, "connections.fallbackName");
       return <View key={connection.connectionId} style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={styles.statusTitle}><Text style={[styles.label, { color: colors.ink }]}>{name}</Text>
-          {connection.connectionId === currentConnectionId && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>Current</Text>}</View>
-        <Text style={[styles.caption, { color: colors.muted }]}>{connectionStateLabel(connection.state)} · {device?.platform || "unknown platform"}</Text>
-        <Text selectable style={[styles.caption, { color: colors.muted }]}>Connection: {connection.connectionId}</Text>
-        {connection.state === ConnectionState.CONNECTED && <Action label="Log out" colors={colors} danger disabled={state.busy || state.status !== "connected"}
+          {connection.connectionId === currentConnectionId && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.current")}</Text>}</View>
+        <Text style={[styles.caption, { color: colors.muted }]}>{connectionStateLabel(connection.state, locale)} · {device?.platform
+          || mobileMessage(locale, "common.unknownPlatform")}</Text>
+        <Text selectable style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connections.connection", { id: connection.connectionId })}</Text>
+        {connection.state === ConnectionState.CONNECTED && <Action label={mobileMessage(locale, "common.logOut")} colors={colors} danger disabled={state.busy || state.status !== "connected"}
           onPress={() => logout(connection.connectionId, name)} />}
       </View>;
     })}
     <PendingReceipts items={state.pending.filter((item) => item.kind === "logout")} colors={colors}
-      disabled={state.status !== "connected"} onError={setLocalError} />
+      locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     {(localError || state.error) && <Banner text={localError || state.error || ""} colors={colors} />}
   </ScrollView>;
 }
 
-function DevicesScreen({ colors, state, onBack, onDevice }: ScreenProps & {
+function DevicesScreen({ colors, state, locale, onBack, onDevice }: ScreenProps & {
   onBack: () => void; onDevice: (deviceId: string) => void;
 }) {
   const devices = state.owner?.devices ?? [];
   const currentDeviceId = state.saved.find((profile) => profile.profileId === state.activeProfileId)?.deviceId;
   return <View style={styles.fill}>
     <View style={styles.stackHeader}>
-      <Back label="Joko" onPress={onBack} colors={colors} />
-      <Text style={[styles.title, { color: colors.ink }]}>Devices</Text>
+      <Back label="Joko" accessibilityLabel={mobileMessage(locale, "common.backTo", { label: "Joko" })}
+        onPress={onBack} colors={colors} />
+      <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "common.devices")}</Text>
     </View>
     {state.status !== "connected" && <View style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <View style={[styles.statusDot, { backgroundColor: state.status === "connecting" ? colors.accent : colors.negative }]} />
-      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>Showing the last authoritative device list from this Joko node while it reconnects.</Text>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "devices.reconnecting")}</Text>
     </View>}
     <FlatList data={devices} keyExtractor={(device) => device.deviceId} contentContainerStyle={styles.list}
-      ListEmptyComponent={<Centered label="No authorized devices are available on this Joko node" colors={colors} />}
+      ListEmptyComponent={<Centered label={mobileMessage(locale, "devices.empty")} colors={colors} />}
       renderItem={({ item: device }) => {
-        return <Pressable accessibilityRole="button" accessibilityLabel={`Open device ${device.displayName}`}
+        return <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "devices.open", { name: device.displayName })}
           onPress={() => onDevice(device.deviceId)} style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <View style={styles.fill}>
             <View style={styles.statusTitle}>
               <Text style={[styles.label, { color: colors.ink }]}>{device.displayName}</Text>
-              {device.deviceId === currentDeviceId && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>This phone</Text>}
+              {device.deviceId === currentDeviceId && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "devices.thisPhone")}</Text>}
             </View>
-            <Text style={[styles.caption, { color: colors.muted }]}>{deviceStatusLabel(device.revoked, device.presence)} · {device.platform || "unknown platform"}</Text>
+            <Text style={[styles.caption, { color: colors.muted }]}>{deviceStatusLabel(device.revoked, device.presence, locale)} · {device.platform
+              || mobileMessage(locale, "common.unknownPlatform")}</Text>
           </View>
           <Text style={[styles.chevron, { color: colors.muted }]}>›</Text>
         </Pressable>;
@@ -1170,69 +1245,81 @@ function DevicesScreen({ colors, state, onBack, onDevice }: ScreenProps & {
   </View>;
 }
 
-function DeviceScreen({ colors, state, deviceId, onBack }: ScreenProps & { deviceId: string; onBack: () => void }) {
+function DeviceScreen({ colors, state, locale, deviceId, onBack }: ScreenProps & { deviceId: string; onBack: () => void }) {
   const [localError, setLocalError] = useState("");
   const device = state.owner?.devices.find((candidate) => candidate.deviceId === deviceId);
   const activeDeviceId = state.saved.find((profile) => profile.profileId === state.activeProfileId)?.deviceId;
-  if (!device) return <View style={styles.screen}><Back label="Devices" onPress={onBack} colors={colors} />
-    <Text style={[styles.description, { color: colors.muted }]}>This device is no longer present in the current node snapshot.</Text></View>;
+  if (!device) return <View style={styles.screen}><Back label={mobileMessage(locale, "common.devices")} onPress={onBack} colors={colors}
+    accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.devices") })} />
+    <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "devices.missing")}</Text></View>;
   const revoke = () => Alert.alert(
-    `Revoke ${device.displayName}?`,
-    "Every connection owned by this exact device will lose access. Joko removes matching local profiles only after the server confirms the revoke.",
-    [{ text: "Cancel", style: "cancel" }, { text: "Revoke device", style: "destructive", onPress: () => {
+    mobileMessage(locale, "devices.revokeTitle", { name: device.displayName }),
+    mobileMessage(locale, "devices.revokeBody"),
+    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+      { text: mobileMessage(locale, "common.revokeDevice"), style: "destructive", onPress: () => {
       setLocalError("");
-      void client.revokeDevice(device.deviceId).catch((error) => setLocalError(errorText(error)));
+      void client.revokeDevice(device.deviceId).catch((error) => setLocalError(errorText(error, locale)));
     } }]
   );
   return <ScrollView contentContainerStyle={styles.screen}>
-    <Back label="Devices" onPress={onBack} colors={colors} />
+    <Back label={mobileMessage(locale, "common.devices")} onPress={onBack} colors={colors}
+      accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.devices") })} />
     <Text style={[styles.title, { color: colors.ink }]}>{device.displayName}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      <InformationRow label="Status" value={deviceStatusLabel(device.revoked, device.presence)} colors={colors} />
-      <InformationRow label="Kind" value={deviceKindLabel(device.kind)} colors={colors} />
-      <InformationRow label="Platform" value={device.platform || "Unknown"} colors={colors} />
-      <InformationRow label="App version" value={device.appVersion || "Unknown"} colors={colors} />
-      <InformationRow label="Last seen" value={timestampLabel(device.lastSeenAt)} colors={colors} />
-      <InformationRow label="Device ID" value={device.deviceId} colors={colors} selectable />
+      <InformationRow label={mobileMessage(locale, "common.status")} value={deviceStatusLabel(device.revoked, device.presence, locale)} colors={colors} />
+      <InformationRow label={mobileMessage(locale, "devices.kind")} value={deviceKindLabel(device.kind, locale)} colors={colors} />
+      <InformationRow label={mobileMessage(locale, "common.platform")} value={device.platform || mobileMessage(locale, "common.unknown")} colors={colors} />
+      <InformationRow label={mobileMessage(locale, "settings.appVersion")} value={device.appVersion || mobileMessage(locale, "common.unknown")} colors={colors} />
+      <InformationRow label={mobileMessage(locale, "devices.lastSeen")} value={timestampLabel(device.lastSeenAt, locale)} colors={colors} />
+      <InformationRow label={mobileMessage(locale, "settings.deviceId")} value={device.deviceId} colors={colors} selectable />
     </View>
     {device.deviceId === activeDeviceId
-      ? <Text style={[styles.description, { color: colors.muted }]}>This is the device authorizing the current connection. Log out its exact connection instead of revoking it from itself.</Text>
-      : !device.revoked && <Action label="Revoke device" colors={colors} danger disabled={state.busy || state.status !== "connected"} onPress={revoke} />}
+      ? <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "devices.currentConnection")}</Text>
+      : !device.revoked && <Action label={mobileMessage(locale, "common.revokeDevice")} colors={colors} danger
+        disabled={state.busy || state.status !== "connected"} onPress={revoke} />}
     <PendingReceipts items={state.pending.filter((item) => item.kind === "revoke" && item.targetDeviceId === device.deviceId)}
-      colors={colors} disabled={state.status !== "connected"} onError={setLocalError} />
+      colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     {(localError || state.error) && <Banner text={localError || state.error || ""} colors={colors} />}
   </ScrollView>;
 }
 
-function PendingReceipts({ items, colors, disabled = false, onError }: {
-  items: MobileClient["state"]["pending"]; colors: Colors; disabled?: boolean; onError: (message: string) => void;
+function PendingReceipts({ items, colors, locale, disabled = false, onError }: {
+  items: MobileClient["state"]["pending"]; colors: Colors; locale: MobileSupportedLocale;
+  disabled?: boolean; onError: (message: string) => void;
 }) {
   return <>{items.map((item) => <View key={item.operationId} style={styles.pendingReceipt}>
     <Text style={[styles.warning, { color: colors.negative }]}>
-      {item.state === "unknown" ? "Server result unknown" : "Awaiting durable server result"} · {item.operationId}
+      {mobileMessage(locale, item.state === "unknown" ? "receipt.resultUnknown" : "receipt.awaiting")} · {item.operationId}
     </Text>
     <View style={styles.actionRow}>
-      <Action label="Check status" compact colors={colors} disabled={disabled}
-        onPress={() => void client.reconcile().catch((error) => onError(errorText(error)))} />
-      {item.state === "unknown" && <Action label="Verify and clear" compact colors={colors} disabled={disabled} onPress={() => Alert.alert(
-        "Clear this receipt?",
-        "Joko will first verify that the current node has no operation with this ID. It will never repeat the destructive action automatically.",
-        [{ text: "Keep checking", style: "cancel" }, { text: "Verify and clear", onPress: () => {
-          void client.dismissUnconfirmed(item.operationId).catch((error) => onError(errorText(error)));
+      <Action label={mobileMessage(locale, "receipt.check")} compact colors={colors} disabled={disabled}
+        onPress={() => void client.reconcile().catch((error) => onError(errorText(error, locale)))} />
+      {item.state === "unknown" && <Action label={mobileMessage(locale, "receipt.verify")} compact colors={colors}
+        disabled={disabled} onPress={() => Alert.alert(
+        mobileMessage(locale, "receipt.clearTitle"),
+        mobileMessage(locale, "receipt.clearBody"),
+        [{ text: mobileMessage(locale, "receipt.keepChecking"), style: "cancel" },
+          { text: mobileMessage(locale, "receipt.verify"), onPress: () => {
+          void client.dismissUnconfirmed(item.operationId).catch((error) => onError(errorText(error, locale)));
         } }]
       )} />}
     </View>
   </View>)}</>;
 }
 
-function SavedPendingOperations({ profile, colors }: { profile: SavedMobileConnection; colors: Colors }) {
+function SavedPendingOperations({ profile, colors, locale }: {
+  profile: SavedMobileConnection; colors: Colors; locale: MobileSupportedLocale;
+}) {
   if (profile.pendingOperations.length === 0) return null;
   return <Text accessibilityRole="alert" selectable style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
-    Retained operation {profile.pendingOperations.length === 1 ? "receipt" : "receipts"}: {profile.pendingOperations.map((item) => item.operationId).join(", ")}. Connect this exact saved profile to check the server result; forgetting it clears these local receipts.
+    {mobileMessage(locale, "connection.retainedOperations", {
+      count: profile.pendingOperations.length,
+      ids: profile.pendingOperations.map((item) => item.operationId).join(", ")
+    })}
   </Text>;
 }
 
-function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onBack: () => void; onCreated: () => void }) {
+function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps & { onBack: () => void; onCreated: () => void }) {
   const incomingShareState = useSyncExternalStore(
     (listener) => mobileIncomingShare.subscribe(listener),
     () => mobileIncomingShare.snapshot
@@ -1473,6 +1560,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
       });
     },
     onError: setError,
+    locale,
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error);
@@ -2381,7 +2469,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
     {(error || state.error) && <Banner text={error || state.error || ""} colors={colors} />}
     {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors}
       onDismiss={() => setImageOutputNotice("")} />}
-    <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors}
+    <PendingReceipts items={state.pending.filter((item) => item.kind === "create")} colors={colors} locale={locale}
       disabled={state.status !== "connected"} onError={setError} />
     {(pendingCreate || retained !== undefined) && <Action label="Check retained status" onPress={() => {
       setError("");
@@ -2438,7 +2526,7 @@ function NewTaskScreen({ colors, state, onBack, onCreated }: ScreenProps & { onB
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusComposer, onComposerFocused }: ScreenProps & {
+function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, focusComposer, onComposerFocused }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: () => void;
   focusComposer: boolean; onComposerFocused: () => void;
 }) {
@@ -3078,6 +3166,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       });
     },
     onError: setLocalError,
+    locale,
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error);
@@ -4288,7 +4377,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       </Pressable> : <Back onPress={onBack} colors={colors} />}
       <View style={styles.fill}>
         <Text style={[styles.title, { color: colors.ink }]} numberOfLines={1}>{session?.displayName || "Task"}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state) : "Loading…"}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{session ? sessionState(session.state, locale) : "Loading…"}</Text>
       </View>
       <View style={styles.headerActions}>
         <Action label="Branches"
@@ -4309,7 +4398,7 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
         : state.liveStatus === "polling" ? "Snapshot updates · live stream unavailable" : "Updates paused"}
     </Text>
     {state.status === "offline" && state.offlineSnapshotAt !== undefined
-      && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} colors={colors} />}
+      && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} locale={locale} colors={colors} />}
     {state.error && <Banner text={state.error} colors={colors} />}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
@@ -4771,14 +4860,15 @@ function TaskScreen({ colors, state, onBack, onHome, onNew, onFiles, focusCompos
       onClose={() => setCatalogMentionsVisible(false)}
       onLoad={(surfaceOwnerKey, signal) => client.listTaskCatalogMentionCatalog(surfaceOwnerKey, signal)}
       onSelect={insertCatalogMention} />
-    <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface} borderColor={colors.border}
+    <MobileDrawer visible={drawerOpen} width={drawerWidthRef.current} backgroundColor={colors.surface}
+      borderColor={colors.border} locale={locale}
       onClose={() => setDrawerOpen(false)} onMountedChange={setDrawerMounted} initialFocusRef={drawerCloseRef}
       onClosed={() => {
         const action = pendingDrawerActionRef.current;
         pendingDrawerActionRef.current = undefined;
         if (action) action(); else focusNative(drawerMenuRef);
       }} testID="task.drawer">
-      <TaskListDrawer colors={colors} state={state} closeButtonRef={drawerCloseRef} onClose={() => setDrawerOpen(false)}
+      <TaskListDrawer colors={colors} state={state} locale={locale} closeButtonRef={drawerCloseRef} onClose={() => setDrawerOpen(false)}
         onSelect={(sessionId) => {
           if (sessionId === state.selectedId) { setDrawerOpen(false); return; }
           queueDrawerAction(() => {
@@ -5360,7 +5450,7 @@ function formatMobileFileShareProgress(progress: MobileFileShareProgress | undef
   return `${verb} ${formatByteSize(BigInt(progress.bytesCompleted))} of ${formatByteSize(BigInt(progress.totalBytes))}…`;
 }
 
-function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNew, onHome }: ScreenProps & {
+function TaskListDrawer({ colors, state, locale, closeButtonRef, onClose, onSelect, onNew, onHome }: ScreenProps & {
   closeButtonRef: RefObject<View | null>; onClose: () => void; onSelect: (sessionId: string) => void;
   onNew: () => void; onHome: () => void;
 }) {
@@ -5375,8 +5465,9 @@ function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNe
     snapshot: state.owner,
     statusFilter,
     query: search,
-    messageSessionIds: currentMessageIds
-  }).map((section) => ({ ...section, data: section.items })), [currentMessageIds, search, state.owner, statusFilter]);
+    messageSessionIds: currentMessageIds,
+    labels: mobileHomeSectionLabels(locale)
+  }).map((section) => ({ ...section, data: section.items })), [currentMessageIds, locale, search, state.owner, statusFilter]);
   useEffect(() => {
     if (!normalizedSearch) {
       void client.searchHome("", statusFilter);
@@ -5387,15 +5478,17 @@ function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNe
   }, [normalizedSearch, state.activeProfileId, state.owner?.snapshotId, state.owner?.revision?.value, statusFilter]);
   return <SafeAreaView style={styles.taskDrawer} edges={["top", "bottom", "left"]}>
     <View style={styles.drawerTitleRow}>
-      <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]}>Tasks</Text>
-        <Text style={[styles.caption, { color: colors.muted }]}>Switch without leaving this task screen</Text></View>
-      <Pressable ref={closeButtonRef} accessibilityRole="button" accessibilityLabel="Close task list" onPress={onClose} style={styles.drawerClose}>
+      <View style={styles.fill}><Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "common.tasks")}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "home.drawerSubtitle")}</Text></View>
+      <Pressable ref={closeButtonRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.closeTaskList")}
+        onPress={onClose} style={styles.drawerClose}>
         <Text style={[styles.headerIcon, { color: colors.ink }]}>×</Text>
       </Pressable>
     </View>
-    <Action label="New task" onPress={onNew} colors={colors} disabled={state.status !== "connected"} />
+    <Action label={mobileMessage(locale, "common.newTask")} onPress={onNew} colors={colors} disabled={state.status !== "connected"} />
     <View style={styles.searchRow}>
-      <TextInput accessibilityLabel="Search tasks and messages" placeholder="Search tasks and messages" placeholderTextColor={colors.muted}
+      <TextInput accessibilityLabel={mobileMessage(locale, "home.search")} placeholder={mobileMessage(locale, "home.search")}
+        placeholderTextColor={colors.muted}
         value={search} onChangeText={setSearch} style={[styles.input, styles.searchInput,
           { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]} />
       {state.homeSearchStatus === "searching" && normalizedSearch && <ActivityIndicator color={colors.accent} />}
@@ -5405,25 +5498,28 @@ function TaskListDrawer({ colors, state, closeButtonRef, onClose, onSelect, onNe
         accessibilityState={{ selected: filter === statusFilter }} onPress={() => setStatusFilter(filter)}
         style={[styles.filterChip, { borderColor: filter === statusFilter ? colors.accent : colors.border,
           backgroundColor: filter === statusFilter ? colors.brandBackground : colors.background }]}>
-        <Text style={[styles.caption, { color: colors.ink }]}>{filter[0]!.toUpperCase() + filter.slice(1)}</Text>
+        <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.filter.${filter}`)}</Text>
       </Pressable>)}
     </View>
     {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
     <SectionList sections={sections} keyExtractor={(item) => item.session.sessionId} style={styles.fill}
       renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
-      ListEmptyComponent={<Text style={[styles.description, styles.drawerEmpty, { color: colors.muted }]}>No matching tasks</Text>}
+      ListEmptyComponent={<Text style={[styles.description, styles.drawerEmpty, { color: colors.muted }]}>{mobileMessage(locale, "home.noMatching")}</Text>}
       renderItem={({ item }) => <Pressable accessibilityRole="button"
         accessibilityState={{ selected: item.session.sessionId === state.selectedId }}
-        accessibilityLabel={`Open task ${item.session.displayName || "Untitled"}`} onPress={() => onSelect(item.session.sessionId)}
+        accessibilityLabel={mobileMessage(locale, "home.openTask", {
+          name: item.session.displayName || mobileMessage(locale, "home.untitled")
+        })} onPress={() => onSelect(item.session.sessionId)}
         style={[styles.drawerTaskRow, { borderColor: item.session.sessionId === state.selectedId ? colors.accent : colors.border,
           backgroundColor: colors.background }]}>
-        <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName || "Untitled task"}</Text>
-        <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state)}</Text>
+        <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName
+          || mobileMessage(locale, "home.untitledTask")}</Text>
+        <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state, locale)}</Text>
       </Pressable>}
       contentContainerStyle={styles.drawerList} />
-    <Pressable accessibilityRole="button" accessibilityLabel="Go to Home" onPress={onHome}
+    <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.goHome")} onPress={onHome}
       style={[styles.drawerHome, { borderColor: colors.border }]}>
-      <Text style={[styles.label, { color: colors.accent }]}>Home</Text>
+      <Text style={[styles.label, { color: colors.accent }]}>{mobileMessage(locale, "common.home")}</Text>
     </Pressable>
   </SafeAreaView>;
 }
@@ -5586,10 +5682,10 @@ function Action({ label, accessibilityLabel = label, onPress, colors, disabled, 
   </Pressable>;
 }
 
-function Back({ onPress, colors, label = "Tasks", disabled }: {
-  onPress: () => void; colors: Colors; label?: string; disabled?: boolean;
+function Back({ onPress, colors, label = "Tasks", accessibilityLabel, disabled }: {
+  onPress: () => void; colors: Colors; label?: string; accessibilityLabel?: string; disabled?: boolean;
 }) {
-  return <Pressable accessibilityRole="button" accessibilityLabel={`Back to ${label.toLocaleLowerCase()}`}
+  return <Pressable accessibilityRole="button" accessibilityLabel={accessibilityLabel ?? `Back to ${label.toLocaleLowerCase()}`}
     accessibilityState={{ disabled }} disabled={disabled} onPress={onPress} style={[styles.back, disabled && styles.disabled]}>
     <Text style={[styles.backText, { color: colors.accent }]}>‹  {label}</Text>
   </Pressable>;
@@ -5615,18 +5711,18 @@ function Field({ label, value, onChange, placeholder, colors, autoCapitalize, ke
         { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
   </View>;
 }
-function AutomaticEntryChoice({ checked, disabled, onPress, colors }: {
-  checked: boolean; disabled: boolean; onPress: () => void; colors: Colors;
+function AutomaticEntryChoice({ checked, disabled, onPress, colors, locale }: {
+  checked: boolean; disabled: boolean; onPress: () => void; colors: Colors; locale: MobileSupportedLocale;
 }) {
   return <Pressable accessibilityRole="checkbox" accessibilityState={{ checked, disabled }}
-    accessibilityLabel="Remember this node and enter it automatically next time"
+    accessibilityLabel={mobileMessage(locale, "connection.remember.accessibility")}
     disabled={disabled} onPress={onPress} style={[styles.choice, disabled && styles.disabled]}>
     <View style={[styles.choiceBox, { borderColor: checked ? colors.accent : colors.border, backgroundColor: checked ? colors.accent : colors.surface }]}>
       {checked && <Text style={styles.choiceCheck}>✓</Text>}
     </View>
     <View style={styles.fill}>
-      <Text style={[styles.label, { color: colors.ink }]}>Enter this node automatically next time</Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>Off by default on mobile. The saved credential remains available when this is off.</Text>
+      <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "connection.remember.title")}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "connection.remember.description")}</Text>
     </View>
   </Pressable>;
 }
@@ -5645,19 +5741,22 @@ function Notice({ text, colors, onDismiss }: { text: string; colors: Colors; onD
 function Centered({ label, colors }: { label: string; colors: Colors }) {
   return <View style={styles.center}><ActivityIndicator color={colors.accent} /><Text style={[styles.description, { color: colors.muted }]}>{label}</Text></View>;
 }
-function StartupLoading({ colors, dark }: { colors: Colors; dark: boolean }) {
-  return <View accessibilityRole="progressbar" accessibilityLabel="Loading Joko" style={styles.startupLoading}>
+function StartupLoading({ colors, dark, locale }: { colors: Colors; dark: boolean; locale: MobileSupportedLocale }) {
+  const label = mobileMessage(locale, "shell.loading");
+  return <View accessibilityRole="progressbar" accessibilityLabel={label} style={styles.startupLoading}>
     <View style={styles.loadingArtwork} accessible={false}>
       <SvgXml xml={mobileLoadingIllustration(dark ? "dark" : "light")} width="100%" height="100%" preserveAspectRatio="xMidYMid meet" />
     </View>
-    <Text style={[styles.description, { color: colors.muted }]}>Loading Joko…</Text>
+    <Text style={[styles.description, { color: colors.muted }]}>{label}</Text>
   </View>;
 }
 function focusNative(ref: RefObject<View | null>): void {
   const node = ref.current ? findNodeHandle(ref.current) : null;
   if (node !== null) setTimeout(() => AccessibilityInfo.setAccessibilityFocus(node), 0);
 }
-function errorText(error: unknown): string { return error instanceof Error ? error.message : "The Joko node is unavailable."; }
+function errorText(error: unknown, locale?: MobileSupportedLocale): string {
+  return error instanceof Error ? error.message : locale ? mobileMessage(locale, "common.error") : "The Joko node is unavailable.";
+}
 
 function sameMobileAttachmentControls(
   left: MobileAttachmentControls | undefined,
@@ -5710,48 +5809,48 @@ function boundedComposerSelection(
   const end = Math.max(start, Math.min(Math.max(selection.start, selection.end), textLength));
   return { start, end };
 }
-function savedStatus(profile: SavedMobileConnection): string {
+function savedStatus(profile: SavedMobileConnection, locale: MobileSupportedLocale): string {
   switch (profile.credentialState) {
-    case "checking": return "Checking identity and protected credential…";
-    case "available": return "Ready on this device";
-    case "missing": return "Protected credential is missing";
-    case "unreadable": return "Protected credential is damaged";
-    case "unavailable": return "Protected storage is unavailable";
-    case "identity-conflict": return "Address now identifies a different node";
-    case "offline": return "Node could not be reached";
-    default: return "Not checked yet";
+    case "checking": return mobileMessage(locale, "connection.status.checking");
+    case "available": return mobileMessage(locale, "connection.status.available");
+    case "missing": return mobileMessage(locale, "connection.status.missing");
+    case "unreadable": return mobileMessage(locale, "connection.status.unreadable");
+    case "unavailable": return mobileMessage(locale, "connection.status.unavailable");
+    case "identity-conflict": return mobileMessage(locale, "connection.status.identityConflict");
+    case "offline": return mobileMessage(locale, "connection.status.offline");
+    default: return mobileMessage(locale, "connection.status.unchecked");
   }
 }
-function connectionStateLabel(value: ConnectionState): string {
+function connectionStateLabel(value: ConnectionState, locale: MobileSupportedLocale): string {
   switch (value) {
-    case ConnectionState.PAIRING: return "Pairing";
-    case ConnectionState.CONNECTED: return "Connected";
-    case ConnectionState.DISCONNECTED: return "Disconnected";
-    case ConnectionState.REVOKED: return "Revoked";
-    case ConnectionState.LOGGED_OUT: return "Logged out";
-    default: return "Unknown";
+    case ConnectionState.PAIRING: return mobileMessage(locale, "connections.state.pairing");
+    case ConnectionState.CONNECTED: return mobileMessage(locale, "connections.state.connected");
+    case ConnectionState.DISCONNECTED: return mobileMessage(locale, "connections.state.disconnected");
+    case ConnectionState.REVOKED: return mobileMessage(locale, "connections.state.revoked");
+    case ConnectionState.LOGGED_OUT: return mobileMessage(locale, "connections.state.loggedOut");
+    default: return mobileMessage(locale, "connections.state.unknown");
   }
 }
-function deviceKindLabel(value: DeviceKind): string {
+function deviceKindLabel(value: DeviceKind, locale: MobileSupportedLocale): string {
   switch (value) {
-    case DeviceKind.WEB: return "Web";
-    case DeviceKind.DESKTOP: return "Desktop";
-    case DeviceKind.SERVICE: return "Service";
-    case DeviceKind.MOBILE: return "Mobile";
-    default: return "Unknown";
+    case DeviceKind.WEB: return mobileMessage(locale, "devices.kind.web");
+    case DeviceKind.DESKTOP: return mobileMessage(locale, "devices.kind.desktop");
+    case DeviceKind.SERVICE: return mobileMessage(locale, "devices.kind.service");
+    case DeviceKind.MOBILE: return mobileMessage(locale, "devices.kind.mobile");
+    default: return mobileMessage(locale, "devices.kind.unknown");
   }
 }
-function deviceStatusLabel(revoked: boolean, presence: DevicePresenceState): string {
-  if (revoked) return "Revoked";
-  if (presence === DevicePresenceState.ONLINE) return "Online";
-  if (presence === DevicePresenceState.OFFLINE) return "Offline";
-  return "Unknown";
+function deviceStatusLabel(revoked: boolean, presence: DevicePresenceState, locale: MobileSupportedLocale): string {
+  if (revoked) return mobileMessage(locale, "devices.status.revoked");
+  if (presence === DevicePresenceState.ONLINE) return mobileMessage(locale, "devices.status.online");
+  if (presence === DevicePresenceState.OFFLINE) return mobileMessage(locale, "devices.status.offline");
+  return mobileMessage(locale, "devices.status.unknown");
 }
-function timestampLabel(value: { readonly seconds: bigint; readonly nanos: number } | undefined): string {
-  if (value === undefined) return "Never";
+function timestampLabel(value: { readonly seconds: bigint; readonly nanos: number } | undefined, locale: MobileSupportedLocale): string {
+  if (value === undefined) return mobileMessage(locale, "common.never");
   const milliseconds = Number(value.seconds) * 1_000 + value.nanos / 1_000_000;
-  if (!Number.isFinite(milliseconds)) return "Unknown";
-  return new Date(milliseconds).toLocaleString();
+  if (!Number.isFinite(milliseconds)) return mobileMessage(locale, "common.unknown");
+  return new Date(milliseconds).toLocaleString(locale);
 }
 function formatByteSize(value: bigint): string {
   if (value < 0n) return "unknown size";
@@ -5762,7 +5861,22 @@ function formatByteSize(value: bigint): string {
   while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
   return `${unit === 0 ? Math.trunc(size) : size.toFixed(size >= 10 ? 1 : 2)} ${units[unit]}`;
 }
-function sessionState(value: number): string { return ["Unknown", "Creating", "Idle", "Running", "Waiting", "Detached", "Recovering", "Archived", "Closing", "Closed", "Error"][value] || "Unknown"; }
+function sessionState(value: number, locale: MobileSupportedLocale): string {
+  const key = [
+    "home.state.unknown",
+    "home.state.creating",
+    "home.state.idle",
+    "home.state.running",
+    "home.state.waiting",
+    "home.state.detached",
+    "home.state.recovering",
+    "home.state.archived",
+    "home.state.closing",
+    "home.state.closed",
+    "home.state.error"
+  ] as const;
+  return mobileMessage(locale, key[value] ?? "home.state.unknown");
+}
 function queueState(value: QueueItemState): string {
   switch (value) {
     case QueueItemState.ACCEPTED: return "Queued";

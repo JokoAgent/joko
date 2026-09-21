@@ -105,6 +105,25 @@ describe("mobile voice protocol projection", () => {
 });
 
 describe("MobileVoiceInputRun", () => {
+  it("sends the selected BCP47 locale when the voice capability accepts one", async () => {
+    const transport = fakeTransport();
+    const run = new MobileVoiceInputRun({
+      transport,
+      capture: fakeCapture(),
+      requestId: () => "request-locale",
+      locale: "zh-TW"
+    });
+
+    await run.start();
+    expect(transport.start).toHaveBeenCalledWith(
+      "request-locale",
+      "audio/pcm",
+      "zh-TW",
+      expect.any(AbortSignal)
+    );
+    await run.cancel();
+  });
+
   it("keeps startup-stop race safe and fences stop behind the exact next sequence", async () => {
     let resolveStart!: (session: MobileVoiceSession) => void;
     const pendingStart = new Promise<MobileVoiceSession>((resolve) => { resolveStart = resolve; });

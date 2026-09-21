@@ -7,6 +7,8 @@ import {
   type Snapshot
 } from "@joko/contracts";
 import type { MobileConnectionProfile } from "./connection-storage";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileMessage } from "./mobile-messages";
 import type { NodeIdentity } from "./network";
 
 export interface MobileOfflineCacheStorage {
@@ -282,18 +284,20 @@ export class MobileOfflineCache {
   }
 }
 
-export function mobileOfflineAgeLabel(cachedAt: number, now: number): string {
+export function mobileOfflineAgeLabel(cachedAt: number, now: number, locale: MobileSupportedLocale): string {
   if (!Number.isSafeInteger(cachedAt) || cachedAt < 0 || !Number.isSafeInteger(now) || now < 0) {
-    return "Saved offline";
+    return mobileMessage(locale, "offline.saved");
   }
   const age = Math.max(0, now - cachedAt);
-  if (age < 60_000) return "Saved offline just now";
+  if (age < 60_000) return mobileMessage(locale, "offline.justNow");
   const minutes = Math.floor(age / 60_000);
-  if (minutes < 60) return `Saved offline ${minutes} min ago`;
+  if (minutes < 60) return mobileMessage(locale, "offline.minutes", { count: minutes });
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `Saved offline ${hours} hr ago`;
+  if (hours < 24) return mobileMessage(locale, "offline.hours", { count: hours });
   const days = Math.floor(hours / 24);
-  return `Saved offline ${days} day${days === 1 ? "" : "s"} ago`;
+  return days === 1
+    ? mobileMessage(locale, "offline.day")
+    : mobileMessage(locale, "offline.days", { count: days });
 }
 
 function readManifest(raw: string, profile: MobileConnectionProfile): CacheManifest {

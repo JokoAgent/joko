@@ -22,6 +22,7 @@ import {
 } from "./MobileSettingsScreen";
 import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
+import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -199,6 +200,12 @@ function mobileClient(patch: Partial<MobileSettingsClient> = {}): MobileSettings
 }
 
 const readyTheme: MobileThemePreferenceState = { status: "ready", preference: "system", saving: false };
+const readyLocale: MobileLocalePreferenceState = {
+  status: "ready",
+  preference: "system",
+  effectiveLocale: "en",
+  saving: false
+};
 const readyDiagnostics: MobileDiagnosticsState = {
   status: "ready",
   enabled: false,
@@ -221,12 +228,14 @@ function mount(options: {
   state?: MobileState;
   foreground?: boolean;
   theme?: MobileThemePreferenceState;
+  locale?: MobileLocalePreferenceState;
   diagnostics?: MobileDiagnosticsState;
   client?: MobileSettingsClient;
 } = {}) {
   const container = document.createElement("div");
   const client = options.client ?? mobileClient();
   const onThemeChange = vi.fn(async () => undefined);
+  const onLocaleChange = vi.fn(async () => undefined);
   const onDiagnosticsEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
   const onDiagnosticsClear = vi.fn(async () => undefined);
   const onDiagnosticsExport = vi.fn(async () => undefined);
@@ -236,15 +245,18 @@ function mount(options: {
   let state = options.state ?? mobileState();
   let foreground = options.foreground ?? true;
   let theme = options.theme ?? readyTheme;
+  let locale = options.locale ?? readyLocale;
   let diagnostics = options.diagnostics ?? readyDiagnostics;
   const render = () => createElement(MobileSettingsScreen, {
     colors,
     state,
     foreground,
     theme,
+    locale,
     diagnostics,
     client,
     onThemeChange,
+    onLocaleChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
@@ -259,6 +271,7 @@ function mount(options: {
     container,
     client,
     onThemeChange,
+    onLocaleChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
@@ -266,10 +279,12 @@ function mount(options: {
     onConnections,
     onDevices,
     rerender: (next: { state?: MobileState; foreground?: boolean; theme?: MobileThemePreferenceState;
+      locale?: MobileLocalePreferenceState;
       diagnostics?: MobileDiagnosticsState }) => {
       state = next.state ?? state;
       foreground = next.foreground ?? foreground;
       theme = next.theme ?? theme;
+      locale = next.locale ?? locale;
       diagnostics = next.diagnostics ?? diagnostics;
       act(() => root!.render(render()));
     }
@@ -314,7 +329,7 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.onThemeChange).toHaveBeenCalledWith("dark");
     act(() => button(mounted.container, "Connection settings").click());
     act(() => button(mounted.container, "All devices").click());
-    act(() => button(mounted.container, "Back to joko").click());
+    act(() => button(mounted.container, "Back to Joko").click());
     expect(mounted.onConnections).toHaveBeenCalledTimes(1);
     expect(mounted.onDevices).toHaveBeenCalledTimes(1);
     expect(mounted.onBack).toHaveBeenCalledTimes(1);
@@ -322,6 +337,26 @@ describe("MobileSettingsScreen", () => {
     await act(async () => button(mounted.container, "Copy device ID").click());
     expect(native.copied).toHaveBeenCalledWith(profile.deviceId);
     expect(mounted.container.textContent).toContain("Device ID copied.");
+  });
+
+  it("offers every supported language, publishes a selection, and rerenders the mounted surface", async () => {
+    const mounted = mount();
+    const languageLabels = ["System", "English", "简体中文", "繁體中文", "日本語", "한국어"];
+    for (const label of languageLabels) expect(button(mounted.container, label)).not.toBeNull();
+
+    await act(async () => button(mounted.container, "日本語").click());
+    expect(mounted.onLocaleChange).toHaveBeenCalledWith("ja");
+
+    mounted.rerender({ locale: { status: "ready", preference: "ja", effectiveLocale: "ja", saving: false } });
+    expect(mounted.container.textContent).toContain("設定");
+    expect(mounted.container.textContent).toContain("言語");
+    expect(mounted.container.textContent).toContain("ローカル診断");
+    expect(button(mounted.container, "日本語").getAttribute("aria-checked")).toBe("true");
+
+    mounted.rerender({ locale: { status: "ready", preference: "ja", effectiveLocale: "ja", saving: true } });
+    for (const label of ["システム", "English", "简体中文", "繁體中文", "日本語", "한국어"]) {
+      expect(button(mounted.container, label).disabled).toBe(true);
+    }
   });
 
   it("keeps offline and background identity visible while device mutations and receipts are read-only", () => {
@@ -377,7 +412,7 @@ describe("MobileSettingsScreen", () => {
     act(() => button(mounted.container, "Rename this phone").click());
     act(() => changeInput(input(mounted.container, "Device name"), "  Field phone two  "));
 
-    act(() => button(mounted.container, "Back to settings").click());
+    act(() => button(mounted.container, "Back to Settings").click());
     expect(native.alert).toHaveBeenCalledWith(
       "Discard device name changes?",
       expect.stringContaining("not been saved"),
@@ -388,7 +423,7 @@ describe("MobileSettingsScreen", () => {
     await act(async () => button(mounted.container, "Save name").click());
     expect(client.renameCurrentDevice).toHaveBeenCalledWith(profile.deviceId, "Field phone two");
     expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
-    expect(button(mounted.container, "Back to settings").disabled).toBe(true);
+    expect(button(mounted.container, "Back to Settings").disabled).toBe(true);
     expect(input(mounted.container, "Device name").disabled).toBe(true);
     expect(native.hardwareBack?.()).toBe(true);
     expect(client.renameCurrentDevice).toHaveBeenCalledTimes(1);
