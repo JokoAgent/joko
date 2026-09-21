@@ -10,6 +10,7 @@ import {
   ExtensionService,
   InteractionService,
   OperationService,
+  PartnerService,
   PiService,
   PortableSessionService,
   QueueService,
@@ -32,6 +33,7 @@ export interface E2eClients {
   readonly event: Client<typeof EventService>;
   readonly extension: Client<typeof ExtensionService>;
   readonly operation: Client<typeof OperationService>;
+  readonly partner: Client<typeof PartnerService>;
   readonly backend: Client<typeof BackendService>;
   readonly target: Client<typeof TargetService>;
   readonly session: Client<typeof SessionService>;
@@ -79,6 +81,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     event: createClient(EventService, transport),
     extension: createClient(ExtensionService, transport),
     operation: createClient(OperationService, transport),
+    partner: createClient(PartnerService, transport),
     backend: createClient(BackendService, transport),
     target: createClient(TargetService, transport),
     session: createClient(SessionService, transport),

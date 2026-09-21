@@ -166,6 +166,7 @@ import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
+import { PartnerToolBridgeProvider } from "./partner-tool-provider.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -1283,8 +1284,12 @@ export async function createOrchestratorApplication(
     store: partnerStore,
     operationalStore: store,
     sessionHost,
+    workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes")
   });
+  const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
+    new PartnerToolBridgeProvider({ store, partners })
+  );
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
     const result = backendLifecycleTail.catch(() => undefined).then(action);
@@ -1392,6 +1397,10 @@ export async function createOrchestratorApplication(
           // race the next replacement.
           piReplacementRefreshRoute = undefined;
         }
+        // A persisted Partner delivery may have been waiting for this Backend.
+        // Reconcile only after the replacement is published and admissions are
+        // open again; stable operations make this replay idempotent.
+        await partners.recoverPending();
       } catch (error) {
         if (replacementRoute !== undefined && piReplacementRefreshRoute !== undefined) {
           return await refreshRetainedPi(error);
@@ -2066,6 +2075,7 @@ export async function createOrchestratorApplication(
     unregisterImageGenerationBridge();
     unregisterSessionHelperTools();
     unregisterContactTools();
+    unregisterPartnerTools();
     unregisterLspBridge();
     unregisterRemoteHostTools();
     lspBridge.dispose();
@@ -2230,6 +2240,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterImageGenerationBridge());
         await attempt(() => unregisterSessionHelperTools());
         await attempt(() => unregisterContactTools());
+        await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => lspBridge.dispose());

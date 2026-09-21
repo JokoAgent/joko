@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { PiManagedProvider, PiManagedSettings } from "@joko/adapter-pi";
 import {
   createOrchestratorApplication,
+  createInternalServer,
   createPublicServer,
   type OrchestratorApplication,
   type OrchestratorConfig
@@ -29,10 +30,31 @@ export interface CapturedProviderRequest {
   readonly body: Readonly<Record<string, unknown>>;
 }
 
+export type RealPiProviderReply =
+  | { readonly kind: "text"; readonly text: string }
+  | {
+      readonly kind: "tool";
+      readonly name: string;
+      readonly arguments: Readonly<Record<string, unknown>>;
+      readonly callId?: string;
+    };
+
+export type RealPiProviderResponder = (input: {
+  readonly request: CapturedProviderRequest;
+  readonly requestNumber: number;
+}) => RealPiProviderReply | Promise<RealPiProviderReply>;
+
 export interface RealPiSystemFixtureOptions {
+  readonly rootDirectory?: string;
+  readonly keepRoot?: boolean;
+  readonly webDirectory?: string;
+  readonly port?: number;
+  readonly internalPort?: number;
+  readonly enableInternalServer?: boolean;
   readonly holdProviderResponses?: boolean;
   readonly piSettings?: PiManagedSettings;
   readonly overflowRequestNumbers?: readonly number[];
+  readonly providerResponder?: RealPiProviderResponder;
   readonly providerUsage?: {
     readonly promptTokens: number;
     readonly completionTokens: number;
@@ -52,10 +74,12 @@ export class RealPiSystemFixture {
   readonly anonymous: E2eClients;
   readonly providerRequests: CapturedProviderRequest[];
   readonly #publicServer: Awaited<ReturnType<typeof createPublicServer>>;
+  readonly #internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   readonly #providerServer: Server;
   readonly #pairingCodes: ReadonlyMap<string, string>;
   readonly #removePairingListener: () => void;
   readonly #providerResponseGate: ProviderResponseGate | undefined;
+  readonly #removeRootOnClose: boolean;
   #closed = false;
 
   private constructor(input: {
@@ -64,27 +88,33 @@ export class RealPiSystemFixture {
     readonly baseUrl: string;
     readonly application: OrchestratorApplication;
     readonly publicServer: Awaited<ReturnType<typeof createPublicServer>>;
+    readonly internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
     readonly providerServer: Server;
     readonly providerRequests: CapturedProviderRequest[];
     readonly pairingCodes: ReadonlyMap<string, string>;
     readonly removePairingListener: () => void;
     readonly providerResponseGate: ProviderResponseGate | undefined;
+    readonly removeRootOnClose: boolean;
   }) {
     this.rootDirectory = input.rootDirectory;
     this.workspaceDirectory = input.workspaceDirectory;
     this.baseUrl = input.baseUrl;
     this.application = input.application;
     this.#publicServer = input.publicServer;
+    this.#internalServer = input.internalServer;
     this.#providerServer = input.providerServer;
     this.providerRequests = input.providerRequests;
     this.#pairingCodes = input.pairingCodes;
     this.#removePairingListener = input.removePairingListener;
     this.#providerResponseGate = input.providerResponseGate;
+    this.#removeRootOnClose = input.removeRootOnClose;
     this.anonymous = createE2eClients(input.baseUrl, undefined, 60_000);
   }
 
   static async start(options: RealPiSystemFixtureOptions = {}): Promise<RealPiSystemFixture> {
-    const requestedRoot = await mkdtemp(join(tmpdir(), "joko-real-pi-system-e2e-"));
+    const ownsRoot = options.rootDirectory === undefined;
+    const requestedRoot = options.rootDirectory ?? await mkdtemp(join(tmpdir(), "joko-real-pi-system-e2e-"));
+    await mkdir(requestedRoot, { recursive: true });
     const rootDirectory = process.env.GITHUB_ACTIONS === "true"
       ? await realpath(requestedRoot)
       : requestedRoot;
@@ -94,6 +124,7 @@ export class RealPiSystemFixture {
     let providerServer: Server | undefined;
     let application: OrchestratorApplication | undefined;
     let publicServer: Awaited<ReturnType<typeof createPublicServer>> | undefined;
+    let internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
     let removePairingListener: (() => void) | undefined;
     const providerResponseGate = options.holdProviderResponses === true
       ? new ProviderResponseGate()
@@ -112,9 +143,13 @@ export class RealPiSystemFixture {
         providerRequests,
         providerResponseGate,
         options.providerUsage,
-        options.overflowRequestNumbers
+        options.overflowRequestNumbers,
+        options.providerResponder
       );
       const providerAddress = providerServer.address() as AddressInfo;
+      const internalPort = options.enableInternalServer === true
+        ? options.internalPort ?? await availableLoopbackPort()
+        : options.internalPort ?? 4317;
       const provider: PiManagedProvider = {
         id: REAL_PI_PROVIDER_ID,
         baseUrl: `http://127.0.0.1:${providerAddress.port}/v1`,
@@ -130,9 +165,9 @@ export class RealPiSystemFixture {
       const config: OrchestratorConfig = {
         host: "127.0.0.1",
         port: 0,
-        internalPort: 4317,
+        internalPort,
         publicOrigin: "http://127.0.0.1",
-        internalOrigin: "http://127.0.0.1:4317",
+        internalOrigin: `http://127.0.0.1:${internalPort}`,
         dataDirectory,
         databasePath: join(dataDirectory, "orchestrator.db"),
         allowInsecureLoopback: true,
@@ -147,7 +182,7 @@ export class RealPiSystemFixture {
           trusted: false
         },
         artifactDirectory: join(dataDirectory, "artifacts"),
-        webDirectory: join(rootDirectory, "web-not-used-by-connect-e2e"),
+        webDirectory: options.webDirectory ?? join(rootDirectory, "web-not-used-by-connect-e2e"),
         corsOrigins: []
       };
       application = await createOrchestratorApplication(config);
@@ -167,6 +202,12 @@ export class RealPiSystemFixture {
       });
       await application.refreshPiGeneration();
 
+      if (options.enableInternalServer === true) {
+        internalServer = await createInternalServer(application);
+        internalServer.log.level = "silent";
+        await internalServer.listen({ host: "127.0.0.1", port: internalPort });
+      }
+
       const pairingCodes = new Map<string, string>();
       removePairingListener = application.connections.onPairingIssued((challenge) => {
         pairingCodes.set(challenge.id, challenge.code);
@@ -174,7 +215,7 @@ export class RealPiSystemFixture {
       application.connections.openPairingWindow();
       publicServer = await createPublicServer(application);
       publicServer.log.level = "silent";
-      await publicServer.listen({ host: "127.0.0.1", port: 0 });
+      await publicServer.listen({ host: "127.0.0.1", port: options.port ?? 0 });
       const orchestratorAddress = publicServer.server.address();
       if (orchestratorAddress === null || typeof orchestratorAddress === "string") {
         throw new Error("Orchestrator did not expose an ephemeral TCP port.");
@@ -185,18 +226,23 @@ export class RealPiSystemFixture {
         baseUrl: `http://127.0.0.1:${orchestratorAddress.port}`,
         application,
         publicServer,
+        internalServer,
         providerServer,
         providerRequests,
         pairingCodes,
         removePairingListener,
-        providerResponseGate
+        providerResponseGate,
+        removeRootOnClose: ownsRoot && options.keepRoot !== true
       });
     } catch (error) {
       removePairingListener?.();
       await publicServer?.close().catch(() => undefined);
+      await internalServer?.close().catch(() => undefined);
       await application?.close().catch(() => undefined);
       if (providerServer !== undefined) await closeHttpServer(providerServer).catch(() => undefined);
-      await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+      if (ownsRoot) {
+        await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -228,19 +274,28 @@ export class RealPiSystemFixture {
     return createE2eClients(this.baseUrl, authKey, 60_000);
   }
 
+  pairingCode(challengeId: string): string {
+    const code = this.#pairingCodes.get(challengeId);
+    if (code === undefined) throw new Error(`The trusted pairing observer did not receive challenge ${challengeId}.`);
+    return code;
+  }
+
   releaseProviderResponses(): void {
     this.#providerResponseGate?.release();
   }
 
-  async close(): Promise<void> {
+  async close(options: { readonly removeRoot?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     this.#providerResponseGate?.release();
     this.#removePairingListener();
     await this.#publicServer.close();
+    await this.#internalServer?.close();
     await this.application.close();
     await closeHttpServer(this.#providerServer);
-    await rm(this.rootDirectory, { recursive: true, force: true, maxRetries: 3 });
+    if (options.removeRoot ?? this.#removeRootOnClose) {
+      await rm(this.rootDirectory, { recursive: true, force: true, maxRetries: 3 });
+    }
   }
 }
 
@@ -248,7 +303,8 @@ async function startLocalProvider(
   requests: CapturedProviderRequest[],
   responseGate?: ProviderResponseGate,
   usage: RealPiSystemFixtureOptions["providerUsage"] = { promptTokens: 7, completionTokens: 3 },
-  overflowRequestNumbers: readonly number[] = []
+  overflowRequestNumbers: readonly number[] = [],
+  responder?: RealPiProviderResponder
 ): Promise<Server> {
   const overflowRequests = new Set(overflowRequestNumbers);
   const server = createServer((request, response) => {
@@ -274,7 +330,8 @@ async function startLocalProvider(
         response.writeHead(400).end();
         return;
       }
-      requests.push({ method: request.method ?? "", url: request.url ?? "", headers: request.headers, body });
+      const captured = { method: request.method ?? "", url: request.url ?? "", headers: request.headers, body };
+      requests.push(captured);
       await responseGate?.wait();
       if (overflowRequests.has(requests.length)) {
         response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
@@ -287,24 +344,46 @@ async function startLocalProvider(
         }));
         return;
       }
+      let reply: RealPiProviderReply;
+      try {
+        reply = responder === undefined
+          ? { kind: "text", text: REAL_PI_RESPONSE_TEXT }
+          : await responder({ request: captured, requestNumber: requests.length });
+      } catch (error) {
+        response.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : "Provider responder failed." } }));
+        return;
+      }
       response.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",
         connection: "keep-alive"
       });
+      const id = `joko-real-pi-${requests.length}`;
+      const delta = reply.kind === "text"
+        ? { role: "assistant", content: reply.text }
+        : {
+            role: "assistant",
+            tool_calls: [{
+              index: 0,
+              id: reply.callId ?? `call-${requests.length}`,
+              type: "function",
+              function: { name: reply.name, arguments: JSON.stringify(reply.arguments) }
+            }]
+          };
       response.write(`data: ${JSON.stringify({
-        id: `joko-real-pi-${requests.length}`,
+        id,
         object: "chat.completion.chunk",
         created: 1,
         model: REAL_PI_MODEL_ID,
-        choices: [{ index: 0, delta: { role: "assistant", content: REAL_PI_RESPONSE_TEXT }, finish_reason: null }]
+        choices: [{ index: 0, delta, finish_reason: null }]
       })}\n\n`);
       response.write(`data: ${JSON.stringify({
-        id: `joko-real-pi-${requests.length}`,
+        id,
         object: "chat.completion.chunk",
         created: 1,
         model: REAL_PI_MODEL_ID,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        choices: [{ index: 0, delta: {}, finish_reason: reply.kind === "tool" ? "tool_calls" : "stop" }],
         usage: {
           prompt_tokens: usage.promptTokens,
           completion_tokens: usage.completionTokens,
@@ -349,4 +428,23 @@ async function closeHttpServer(server: Server): Promise<void> {
     server.close((error) => error === undefined ? resolvePromise() : reject(error));
   });
   server.closeAllConnections();
+}
+
+async function availableLoopbackPort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolvePromise, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      probe.off("error", reject);
+      resolvePromise();
+    });
+  });
+  const address = probe.address();
+  if (address === null || typeof address === "string") {
+    await closeHttpServer(probe).catch(() => undefined);
+    throw new Error("The internal MCP bridge probe did not expose a TCP port.");
+  }
+  const port = address.port;
+  await closeHttpServer(probe);
+  return port;
 }

@@ -240,6 +240,14 @@ service PartnerService {
   rpc SetPartnerLifecycle(SetPartnerLifecycleRequest) returns (SetPartnerLifecycleResponse);
   rpc RetryPartnerInitialization(RetryPartnerInitializationRequest) returns (RetryPartnerInitializationResponse);
   rpc UpdatePartnerDefaults(UpdatePartnerDefaultsRequest) returns (UpdatePartnerDefaultsResponse);
+  rpc ListPartnerSessions(ListPartnerSessionsRequest) returns (ListPartnerSessionsResponse);
+  rpc MarkPartnerRead(MarkPartnerReadRequest) returns (MarkPartnerReadResponse);
+  rpc ListPartnerPrivateThreads(ListPartnerPrivateThreadsRequest) returns (ListPartnerPrivateThreadsResponse);
+  rpc GetPartnerPrivateThread(GetPartnerPrivateThreadRequest) returns (GetPartnerPrivateThreadResponse);
+  rpc MarkPartnerPrivateThreadRead(MarkPartnerPrivateThreadReadRequest) returns (MarkPartnerPrivateThreadReadResponse);
+  rpc ListPartnerDelegations(ListPartnerDelegationsRequest) returns (ListPartnerDelegationsResponse);
+  rpc GetPartnerDelegation(GetPartnerDelegationRequest) returns (GetPartnerDelegationResponse);
+  rpc CancelPartnerDelegation(CancelPartnerDelegationRequest) returns (CancelPartnerDelegationResponse);
 }
 
 // Orchestrator-node-owned local inference runtimes. Shared clients discover every

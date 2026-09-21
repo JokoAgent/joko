@@ -2306,6 +2306,18 @@ export function useAppController(): AppController {
       gateway().retryPartnerInitialization(partnerId, expectedRevision, signal),
     updatePartnerDefaults: (expectedDirectoryRevision, capabilities, signal) =>
       gateway().updatePartnerDefaults(expectedDirectoryRevision, capabilities, signal),
+    listPartnerSessions: (partnerId, signal) => gateway().listPartnerSessions(partnerId, signal),
+    markPartnerRead: (partnerId, throughCursor, signal) => gateway().markPartnerRead(partnerId, throughCursor, signal),
+    listPartnerPrivateThreads: (partnerId, signal) => gateway().listPartnerPrivateThreads(partnerId, signal),
+    getPartnerPrivateThread: (partnerId, threadId, signal) =>
+      gateway().getPartnerPrivateThread(partnerId, threadId, signal),
+    markPartnerPrivateThreadRead: (partnerId, threadId, throughSequence, signal) =>
+      gateway().markPartnerPrivateThreadRead(partnerId, threadId, throughSequence, signal),
+    listPartnerDelegations: (partnerId, signal) => gateway().listPartnerDelegations(partnerId, signal),
+    getPartnerDelegation: (partnerId, delegationId, signal) =>
+      gateway().getPartnerDelegation(partnerId, delegationId, signal),
+    cancelPartnerDelegation: (partnerId, delegationId, expectedRevision, signal) =>
+      gateway().cancelPartnerDelegation(partnerId, delegationId, expectedRevision, signal),
     getContactDirectory: (signal) => gateway().getContactDirectory(signal),
     setContactDirectoryEnabled: (expectedRevision, enabled, signal) =>
       gateway().setContactDirectoryEnabled(expectedRevision, enabled, signal),

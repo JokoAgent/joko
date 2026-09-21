@@ -16,7 +16,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/partner.proto.
  */
 export const file_joko_v1_partner: GenFile = /*@__PURE__*/
-  fileDesc("ChVqb2tvL3YxL3BhcnRuZXIucHJvdG8SB2pva28udjEigQEKEVBhcnRuZXJNb2RlbFJvdXRlEhIKCmJhY2tlbmRfaWQYASABKAkSEwoLcHJvdmlkZXJfaWQYAiABKAkSEAoIbW9kZWxfaWQYAyABKAkSEwoGZWZmb3J0GAQgASgJSACIAQESEQoJZmFzdF9tb2RlGAUgASgIQgkKB19lZmZvcnQiPwoRUGFydG5lck1vZGVsQ2hhaW4SKgoGcm91dGVzGAEgAygLMhouam9rby52MS5QYXJ0bmVyTW9kZWxSb3V0ZSKLAQoTUGFydG5lckNhcGFiaWxpdGllcxIvCgttb2RlbF9jaGFpbhgBIAMoCzIaLmpva28udjEuUGFydG5lck1vZGVsUm91dGUSMAoPcGVybWlzc2lvbl9tb2RlGAIgASgOMhcuam9rby52MS5QZXJtaXNzaW9uTW9kZRIRCglwbGFuX21vZGUYAyABKAgiagoPUGFydG5lclRlbXBsYXRlEhMKC3RlbXBsYXRlX2lkGAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIXCg9pZGVudGl0eV9zb3VyY2UYBCABKAki2gUKDlBhcnRuZXJQcm9maWxlEhIKCnBhcnRuZXJfaWQYASABKAkSIwoIcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhcKD3Byb2ZpbGVfdmVyc2lvbhgDIAEoBBIUCgxkaXNwbGF5X25hbWUYBCABKAkSDgoGYXZhdGFyGAUgASgJEhcKD2lkZW50aXR5X3NvdXJjZRgGIAEoCRITCgt0ZW1wbGF0ZV9pZBgHIAEoCRIsCglsaWZlY3ljbGUYCCABKA4yGS5qb2tvLnYxLlBhcnRuZXJMaWZlY3ljbGUSQQoUaW5pdGlhbGl6YXRpb25fc3RhdGUYCSABKA4yIy5qb2tvLnYxLlBhcnRuZXJJbml0aWFsaXphdGlvblN0YXRlEjkKEGludml0YXRpb25fc3RhZ2UYCiABKA4yHy5qb2tvLnYxLlBhcnRuZXJJbnZpdGF0aW9uU3RhZ2USTwoZaW5pdGlhbGl6YXRpb25fZXJyb3JfY29kZRgLIAEoDjInLmpva28udjEuUGFydG5lckluaXRpYWxpemF0aW9uRXJyb3JDb2RlSACIAQESFgoOaG9tZV90YXJnZXRfaWQYDCABKAkSIQoUY2Fub25pY2FsX3Nlc3Npb25faWQYDSABKAlIAYgBARIyCgxjYXBhYmlsaXRpZXMYDiABKAsyHC5qb2tvLnYxLlBhcnRuZXJDYXBhYmlsaXRpZXMSLgoKY3JlYXRlZF9hdBgPIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgQIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASHwoXdXNlc19kaXJlY3RvcnlfZGVmYXVsdHMYESABKAhCHAoaX2luaXRpYWxpemF0aW9uX2Vycm9yX2NvZGVCFwoVX2Nhbm9uaWNhbF9zZXNzaW9uX2lkIskCChBQYXJ0bmVyRGlyZWN0b3J5EiMKCHJldmlzaW9uGAEgASgLMhEuam9rby52MS5SZXZpc2lvbhIUCgxhY3RpdmVfY291bnQYAiABKA0SFgoOYXJjaGl2ZWRfY291bnQYAyABKA0SEwoLZXJyb3JfY291bnQYBCABKA0SLgoKdXBkYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASKwoJdGVtcGxhdGVzGAYgAygLMhguam9rby52MS5QYXJ0bmVyVGVtcGxhdGUSFgoOYXZhdGFyX3ByZXNldHMYByADKAkSPwoUZGVmYXVsdF9jYXBhYmlsaXRpZXMYCCABKAsyHC5qb2tvLnYxLlBhcnRuZXJDYXBhYmlsaXRpZXNIAIgBAUIXChVfZGVmYXVsdF9jYXBhYmlsaXRpZXMitwEKDFBhcnRuZXJEcmFmdBIUCgxkaXNwbGF5X25hbWUYASABKAkSDgoGYXZhdGFyGAIgASgJEhcKD2lkZW50aXR5X3NvdXJjZRgDIAEoCRITCgt0ZW1wbGF0ZV9pZBgEIAEoCRIyCgxjYXBhYmlsaXRpZXMYBSABKAsyHC5qb2tvLnYxLlBhcnRuZXJDYXBhYmlsaXRpZXMSHwoXdXNlc19kaXJlY3RvcnlfZGVmYXVsdHMYBiABKAgihQMKDFBhcnRuZXJQYXRjaBIZCgxkaXNwbGF5X25hbWUYASABKAlIAIgBARITCgZhdmF0YXIYAiABKAlIAYgBARIcCg9pZGVudGl0eV9zb3VyY2UYAyABKAlIAogBARI0Cgttb2RlbF9jaGFpbhgEIAEoCzIaLmpva28udjEuUGFydG5lck1vZGVsQ2hhaW5IA4gBARI1Cg9wZXJtaXNzaW9uX21vZGUYBSABKA4yFy5qb2tvLnYxLlBlcm1pc3Npb25Nb2RlSASIAQESFgoJcGxhbl9tb2RlGAYgASgISAWIAQESJAoXdXNlc19kaXJlY3RvcnlfZGVmYXVsdHMYByABKAhIBogBAUIPCg1fZGlzcGxheV9uYW1lQgkKB19hdmF0YXJCEgoQX2lkZW50aXR5X3NvdXJjZUIOCgxfbW9kZWxfY2hhaW5CEgoQX3Blcm1pc3Npb25fbW9kZUIMCgpfcGxhbl9tb2RlQhoKGF91c2VzX2RpcmVjdG9yeV9kZWZhdWx0cyIcChpHZXRQYXJ0bmVyRGlyZWN0b3J5UmVxdWVzdCJLChtHZXRQYXJ0bmVyRGlyZWN0b3J5UmVzcG9uc2USLAoJZGlyZWN0b3J5GAEgASgLMhkuam9rby52MS5QYXJ0bmVyRGlyZWN0b3J5IlYKE0xpc3RQYXJ0bmVyc1JlcXVlc3QSMQoJbGlmZWN5Y2xlGAEgASgOMhkuam9rby52MS5QYXJ0bmVyTGlmZWN5Y2xlSACIAQFCDAoKX2xpZmVjeWNsZSJvChRMaXN0UGFydG5lcnNSZXNwb25zZRIpCghwYXJ0bmVycxgBIAMoCzIXLmpva28udjEuUGFydG5lclByb2ZpbGUSLAoJZGlyZWN0b3J5GAIgASgLMhkuam9rby52MS5QYXJ0bmVyRGlyZWN0b3J5IicKEUdldFBhcnRuZXJSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkiPgoSR2V0UGFydG5lclJlc3BvbnNlEigKB3BhcnRuZXIYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJQcm9maWxlInQKFENyZWF0ZVBhcnRuZXJSZXF1ZXN0EjYKG2V4cGVjdGVkX2RpcmVjdG9yeV9yZXZpc2lvbhgBIAEoCzIRLmpva28udjEuUmV2aXNpb24SJAoFZHJhZnQYAiABKAsyFS5qb2tvLnYxLlBhcnRuZXJEcmFmdCJvChVDcmVhdGVQYXJ0bmVyUmVzcG9uc2USKAoHcGFydG5lchgBIAEoCzIXLmpva28udjEuUGFydG5lclByb2ZpbGUSLAoJZGlyZWN0b3J5GAIgASgLMhkuam9rby52MS5QYXJ0bmVyRGlyZWN0b3J5In4KFFVwZGF0ZVBhcnRuZXJSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEiQKBXBhdGNoGAMgASgLMhUuam9rby52MS5QYXJ0bmVyUGF0Y2gibwoVVXBkYXRlUGFydG5lclJlc3BvbnNlEigKB3BhcnRuZXIYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJQcm9maWxlEiwKCWRpcmVjdG9yeRgCIAEoCzIZLmpva28udjEuUGFydG5lckRpcmVjdG9yeSKMAQoaU2V0UGFydG5lckxpZmVjeWNsZVJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SLAoJbGlmZWN5Y2xlGAMgASgOMhkuam9rby52MS5QYXJ0bmVyTGlmZWN5Y2xlInUKG1NldFBhcnRuZXJMaWZlY3ljbGVSZXNwb25zZRIoCgdwYXJ0bmVyGAEgASgLMhcuam9rby52MS5QYXJ0bmVyUHJvZmlsZRIsCglkaXJlY3RvcnkYAiABKAsyGS5qb2tvLnYxLlBhcnRuZXJEaXJlY3RvcnkiZQohUmV0cnlQYXJ0bmVySW5pdGlhbGl6YXRpb25SZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uInwKIlJldHJ5UGFydG5lckluaXRpYWxpemF0aW9uUmVzcG9uc2USKAoHcGFydG5lchgBIAEoCzIXLmpva28udjEuUGFydG5lclByb2ZpbGUSLAoJZGlyZWN0b3J5GAIgASgLMhkuam9rby52MS5QYXJ0bmVyRGlyZWN0b3J5IooBChxVcGRhdGVQYXJ0bmVyRGVmYXVsdHNSZXF1ZXN0EjYKG2V4cGVjdGVkX2RpcmVjdG9yeV9yZXZpc2lvbhgBIAEoCzIRLmpva28udjEuUmV2aXNpb24SMgoMY2FwYWJpbGl0aWVzGAIgASgLMhwuam9rby52MS5QYXJ0bmVyQ2FwYWJpbGl0aWVzIoEBCh1VcGRhdGVQYXJ0bmVyRGVmYXVsdHNSZXNwb25zZRIsCglkaXJlY3RvcnkYASABKAsyGS5qb2tvLnYxLlBhcnRuZXJEaXJlY3RvcnkSMgoRYWZmZWN0ZWRfcGFydG5lcnMYAiADKAsyFy5qb2tvLnYxLlBhcnRuZXJQcm9maWxlKpIBChBQYXJ0bmVyTGlmZWN5Y2xlEiEKHVBBUlRORVJfTElGRUNZQ0xFX1VOU1BFQ0lGSUVEEAASHAoYUEFSVE5FUl9MSUZFQ1lDTEVfQUNUSVZFEAESHgoaUEFSVE5FUl9MSUZFQ1lDTEVfQVJDSElWRUQQAhIdChlQQVJUTkVSX0xJRkVDWUNMRV9ERUxFVEVEEAMqxAEKGlBhcnRuZXJJbml0aWFsaXphdGlvblN0YXRlEiwKKFBBUlRORVJfSU5JVElBTElaQVRJT05fU1RBVEVfVU5TUEVDSUZJRUQQABIoCiRQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX1NUQVRFX1BFTkRJTkcQARImCiJQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX1NUQVRFX1JFQURZEAISJgoiUEFSVE5FUl9JTklUSUFMSVpBVElPTl9TVEFURV9FUlJPUhADKu4CCh5QYXJ0bmVySW5pdGlhbGl6YXRpb25FcnJvckNvZGUSMQotUEFSVE5FUl9JTklUSUFMSVpBVElPTl9FUlJPUl9DT0RFX1VOU1BFQ0lGSUVEEAASNgoyUEFSVE5FUl9JTklUSUFMSVpBVElPTl9FUlJPUl9DT0RFX0hPTUVfVU5BVkFJTEFCTEUQARI3CjNQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX0VSUk9SX0NPREVfTU9ERUxfVU5BVkFJTEFCTEUQAhI5CjVQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX0VSUk9SX0NPREVfU0VTU0lPTl9VTkFWQUlMQUJMRRADEjMKL1BBUlRORVJfSU5JVElBTElaQVRJT05fRVJST1JfQ09ERV9TVEFURV9DSEFOR0VEEAQSOAo0UEFSVE5FUl9JTklUSUFMSVpBVElPTl9FUlJPUl9DT0RFX0FWQVRBUl9VTkFWQUlMQUJMRRAFKvkBChZQYXJ0bmVySW52aXRhdGlvblN0YWdlEigKJFBBUlRORVJfSU5WSVRBVElPTl9TVEFHRV9VTlNQRUNJRklFRBAAEiEKHVBBUlRORVJfSU5WSVRBVElPTl9TVEFHRV9IT01FEAESIwofUEFSVE5FUl9JTlZJVEFUSU9OX1NUQUdFX0FWQVRBUhACEiQKIFBBUlRORVJfSU5WSVRBVElPTl9TVEFHRV9TRVNTSU9OEAMSIgoeUEFSVE5FUl9JTlZJVEFUSU9OX1NUQUdFX1JFQURZEAQSIwofUEFSVE5FUl9JTlZJVEFUSU9OX1NUQUdFX0ZBSUxFRBAFYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common]);
+  fileDesc("ChVqb2tvL3YxL3BhcnRuZXIucHJvdG8SB2pva28udjEigQEKEVBhcnRuZXJNb2RlbFJvdXRlEhIKCmJhY2tlbmRfaWQYASABKAkSEwoLcHJvdmlkZXJfaWQYAiABKAkSEAoIbW9kZWxfaWQYAyABKAkSEwoGZWZmb3J0GAQgASgJSACIAQESEQoJZmFzdF9tb2RlGAUgASgIQgkKB19lZmZvcnQiPwoRUGFydG5lck1vZGVsQ2hhaW4SKgoGcm91dGVzGAEgAygLMhouam9rby52MS5QYXJ0bmVyTW9kZWxSb3V0ZSKLAQoTUGFydG5lckNhcGFiaWxpdGllcxIvCgttb2RlbF9jaGFpbhgBIAMoCzIaLmpva28udjEuUGFydG5lck1vZGVsUm91dGUSMAoPcGVybWlzc2lvbl9tb2RlGAIgASgOMhcuam9rby52MS5QZXJtaXNzaW9uTW9kZRIRCglwbGFuX21vZGUYAyABKAgiagoPUGFydG5lclRlbXBsYXRlEhMKC3RlbXBsYXRlX2lkGAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIXCg9pZGVudGl0eV9zb3VyY2UYBCABKAkihgYKDlBhcnRuZXJQcm9maWxlEhIKCnBhcnRuZXJfaWQYASABKAkSIwoIcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhcKD3Byb2ZpbGVfdmVyc2lvbhgDIAEoBBIUCgxkaXNwbGF5X25hbWUYBCABKAkSDgoGYXZhdGFyGAUgASgJEhcKD2lkZW50aXR5X3NvdXJjZRgGIAEoCRITCgt0ZW1wbGF0ZV9pZBgHIAEoCRIsCglsaWZlY3ljbGUYCCABKA4yGS5qb2tvLnYxLlBhcnRuZXJMaWZlY3ljbGUSQQoUaW5pdGlhbGl6YXRpb25fc3RhdGUYCSABKA4yIy5qb2tvLnYxLlBhcnRuZXJJbml0aWFsaXphdGlvblN0YXRlEjkKEGludml0YXRpb25fc3RhZ2UYCiABKA4yHy5qb2tvLnYxLlBhcnRuZXJJbnZpdGF0aW9uU3RhZ2USTwoZaW5pdGlhbGl6YXRpb25fZXJyb3JfY29kZRgLIAEoDjInLmpva28udjEuUGFydG5lckluaXRpYWxpemF0aW9uRXJyb3JDb2RlSACIAQESFgoOaG9tZV90YXJnZXRfaWQYDCABKAkSIQoUY2Fub25pY2FsX3Nlc3Npb25faWQYDSABKAlIAYgBARIyCgxjYXBhYmlsaXRpZXMYDiABKAsyHC5qb2tvLnYxLlBhcnRuZXJDYXBhYmlsaXRpZXMSLgoKY3JlYXRlZF9hdBgPIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgQIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASHwoXdXNlc19kaXJlY3RvcnlfZGVmYXVsdHMYESABKAgSKgoIYWN0aXZpdHkYEiABKAsyGC5qb2tvLnYxLlBhcnRuZXJBY3Rpdml0eUIcChpfaW5pdGlhbGl6YXRpb25fZXJyb3JfY29kZUIXChVfY2Fub25pY2FsX3Nlc3Npb25faWQi+gIKD1BhcnRuZXJBY3Rpdml0eRISCgpwYXJ0bmVyX2lkGAEgASgJEhoKEnVucmVhZF9yZXBseV9jb3VudBgCIAEoBBIzChNsYXRlc3RfcmVwbHlfY3Vyc29yGAMgASgLMhEuam9rby52MS5SZXZpc2lvbkgAiAEBEjgKD2xhdGVzdF9yZXBseV9hdBgEIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIAYgBARIWCg5hcnRpZmFjdF9jb3VudBgFIAEoBBIfChdhY3RpdmVfZGVsZWdhdGlvbl9jb3VudBgGIAEoBBIuChNyZWFkX3Rocm91Z2hfY3Vyc29yGAcgASgLMhEuam9rby52MS5SZXZpc2lvbhIzCg9yZWFkX3VwZGF0ZWRfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQhYKFF9sYXRlc3RfcmVwbHlfY3Vyc29yQhIKEF9sYXRlc3RfcmVwbHlfYXQivwMKDlBhcnRuZXJTZXNzaW9uEhIKCnNlc3Npb25faWQYASABKAkSEgoKcGFydG5lcl9pZBgCIAEoCRIpCgRyb2xlGAMgASgOMhsuam9rby52MS5QYXJ0bmVyU2Vzc2lvblJvbGUSFwoPcHJvZmlsZV92ZXJzaW9uGAQgASgEEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQESGgoNZGVsZWdhdGlvbl9pZBgGIAEoCUgBiAEBEhQKDGRpc3BsYXlfbmFtZRgHIAEoCRIRCglhdmFpbGFibGUYCCABKAgSEQoJcmVhZF9vbmx5GAkgASgIEhAKCGFyY2hpdmVkGAogASgIEg8KB2RlbGV0ZWQYCyABKAgSLgoKY3JlYXRlZF9hdBgMIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASOQoQbGFzdF9hY3Rpdml0eV9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIAogBAUIUChJfcGFyZW50X3Nlc3Npb25faWRCEAoOX2RlbGVnYXRpb25faWRCEwoRX2xhc3RfYWN0aXZpdHlfYXQisgQKFFBhcnRuZXJQcml2YXRlVGhyZWFkEhEKCXRocmVhZF9pZBgBIAEoCRIYChBmaXJzdF9wYXJ0bmVyX2lkGAIgASgJEhkKEXNlY29uZF9wYXJ0bmVyX2lkGAMgASgJEjMKBnN0YXR1cxgEIAEoDjIjLmpva28udjEuUGFydG5lclByaXZhdGVUaHJlYWRTdGF0dXMSQwoMY2xvc2VfcmVhc29uGAUgASgOMiguam9rby52MS5QYXJ0bmVyUHJpdmF0ZVRocmVhZENsb3NlUmVhc29uSACIAQESFQoNbWVzc2FnZV9jb3VudBgGIAEoDRIUCgxtYXhfbWVzc2FnZXMYByABKA0SLgoKZXhwaXJlc19hdBgIIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASNgoNYmxvY2tlZF91bnRpbBgJIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIAYgBARIuCgpjcmVhdGVkX2F0GAogASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIyCgljbG9zZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wSAKIAQFCDwoNX2Nsb3NlX3JlYXNvbkIQCg5fYmxvY2tlZF91bnRpbEIMCgpfY2xvc2VkX2F0ItkCChVQYXJ0bmVyUHJpdmF0ZU1lc3NhZ2USEgoKbWVzc2FnZV9pZBgBIAEoCRIRCgl0aHJlYWRfaWQYAiABKAkSEAoIc2VxdWVuY2UYAyABKAQSGQoRc2VuZGVyX3BhcnRuZXJfaWQYBCABKAkSHAoUcmVjaXBpZW50X3BhcnRuZXJfaWQYBSABKAkSDwoHY29udGVudBgGIAEoCRJFCg9kZWxpdmVyeV9zdGF0dXMYByABKA4yLC5qb2tvLnYxLlBhcnRuZXJQcml2YXRlTWVzc2FnZURlbGl2ZXJ5U3RhdHVzEi4KCmNyZWF0ZWRfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjUKDGRlbGl2ZXJlZF9hdBgJIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIAIgBAUIPCg1fZGVsaXZlcmVkX2F0IpABCh1QYXJ0bmVyUHJpdmF0ZVRocmVhZFJlYWRTdGF0ZRIRCgl0aHJlYWRfaWQYASABKAkSEgoKcGFydG5lcl9pZBgCIAEoCRIYChB0aHJvdWdoX3NlcXVlbmNlGAMgASgEEi4KCnVwZGF0ZWRfYXQYBCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIr0FChFQYXJ0bmVyRGVsZWdhdGlvbhIVCg1kZWxlZ2F0aW9uX2lkGAEgASgJEiMKCHJldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIcChRyZXF1ZXN0ZXJfcGFydG5lcl9pZBgDIAEoCRIZChF0YXJnZXRfcGFydG5lcl9pZBgEIAEoCRIZChFwYXJlbnRfc2Vzc2lvbl9pZBgFIAEoCRIeChZ0YXJnZXRfcHJvZmlsZV92ZXJzaW9uGAYgASgEEg0KBXRpdGxlGAcgASgJEhEKCW9iamVjdGl2ZRgIIAEoCRIwCgZzdGF0dXMYCSABKA4yIC5qb2tvLnYxLlBhcnRuZXJEZWxlZ2F0aW9uU3RhdHVzEh0KEGNoaWxkX3Nlc3Npb25faWQYCiABKAlIAIgBARITCgZydW5faWQYCyABKAlIAYgBARIbCg5yZXN1bHRfc3VtbWFyeRgMIAEoCUgCiAEBEhIKBWVycm9yGA0gASgJSAOIAQESFgoOYXJ0aWZhY3RfY291bnQYDiABKAQSLgoKY3JlYXRlZF9hdBgPIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgQIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMwoKc3RhcnRlZF9hdBgRIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIBIgBARI1Cgxjb21wbGV0ZWRfYXQYEiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wSAWIAQFCEwoRX2NoaWxkX3Nlc3Npb25faWRCCQoHX3J1bl9pZEIRCg9fcmVzdWx0X3N1bW1hcnlCCAoGX2Vycm9yQg0KC19zdGFydGVkX2F0Qg8KDV9jb21wbGV0ZWRfYXQiyQIKEFBhcnRuZXJEaXJlY3RvcnkSIwoIcmV2aXNpb24YASABKAsyES5qb2tvLnYxLlJldmlzaW9uEhQKDGFjdGl2ZV9jb3VudBgCIAEoDRIWCg5hcmNoaXZlZF9jb3VudBgDIAEoDRITCgtlcnJvcl9jb3VudBgEIAEoDRIuCgp1cGRhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIrCgl0ZW1wbGF0ZXMYBiADKAsyGC5qb2tvLnYxLlBhcnRuZXJUZW1wbGF0ZRIWCg5hdmF0YXJfcHJlc2V0cxgHIAMoCRI/ChRkZWZhdWx0X2NhcGFiaWxpdGllcxgIIAEoCzIcLmpva28udjEuUGFydG5lckNhcGFiaWxpdGllc0gAiAEBQhcKFV9kZWZhdWx0X2NhcGFiaWxpdGllcyK3AQoMUGFydG5lckRyYWZ0EhQKDGRpc3BsYXlfbmFtZRgBIAEoCRIOCgZhdmF0YXIYAiABKAkSFwoPaWRlbnRpdHlfc291cmNlGAMgASgJEhMKC3RlbXBsYXRlX2lkGAQgASgJEjIKDGNhcGFiaWxpdGllcxgFIAEoCzIcLmpva28udjEuUGFydG5lckNhcGFiaWxpdGllcxIfChd1c2VzX2RpcmVjdG9yeV9kZWZhdWx0cxgGIAEoCCKFAwoMUGFydG5lclBhdGNoEhkKDGRpc3BsYXlfbmFtZRgBIAEoCUgAiAEBEhMKBmF2YXRhchgCIAEoCUgBiAEBEhwKD2lkZW50aXR5X3NvdXJjZRgDIAEoCUgCiAEBEjQKC21vZGVsX2NoYWluGAQgASgLMhouam9rby52MS5QYXJ0bmVyTW9kZWxDaGFpbkgDiAEBEjUKD3Blcm1pc3Npb25fbW9kZRgFIAEoDjIXLmpva28udjEuUGVybWlzc2lvbk1vZGVIBIgBARIWCglwbGFuX21vZGUYBiABKAhIBYgBARIkChd1c2VzX2RpcmVjdG9yeV9kZWZhdWx0cxgHIAEoCEgGiAEBQg8KDV9kaXNwbGF5X25hbWVCCQoHX2F2YXRhckISChBfaWRlbnRpdHlfc291cmNlQg4KDF9tb2RlbF9jaGFpbkISChBfcGVybWlzc2lvbl9tb2RlQgwKCl9wbGFuX21vZGVCGgoYX3VzZXNfZGlyZWN0b3J5X2RlZmF1bHRzIhwKGkdldFBhcnRuZXJEaXJlY3RvcnlSZXF1ZXN0IksKG0dldFBhcnRuZXJEaXJlY3RvcnlSZXNwb25zZRIsCglkaXJlY3RvcnkYASABKAsyGS5qb2tvLnYxLlBhcnRuZXJEaXJlY3RvcnkiVgoTTGlzdFBhcnRuZXJzUmVxdWVzdBIxCglsaWZlY3ljbGUYASABKA4yGS5qb2tvLnYxLlBhcnRuZXJMaWZlY3ljbGVIAIgBAUIMCgpfbGlmZWN5Y2xlIm8KFExpc3RQYXJ0bmVyc1Jlc3BvbnNlEikKCHBhcnRuZXJzGAEgAygLMhcuam9rby52MS5QYXJ0bmVyUHJvZmlsZRIsCglkaXJlY3RvcnkYAiABKAsyGS5qb2tvLnYxLlBhcnRuZXJEaXJlY3RvcnkiJwoRR2V0UGFydG5lclJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCSI+ChJHZXRQYXJ0bmVyUmVzcG9uc2USKAoHcGFydG5lchgBIAEoCzIXLmpva28udjEuUGFydG5lclByb2ZpbGUidAoUQ3JlYXRlUGFydG5lclJlcXVlc3QSNgobZXhwZWN0ZWRfZGlyZWN0b3J5X3JldmlzaW9uGAEgASgLMhEuam9rby52MS5SZXZpc2lvbhIkCgVkcmFmdBgCIAEoCzIVLmpva28udjEuUGFydG5lckRyYWZ0Im8KFUNyZWF0ZVBhcnRuZXJSZXNwb25zZRIoCgdwYXJ0bmVyGAEgASgLMhcuam9rby52MS5QYXJ0bmVyUHJvZmlsZRIsCglkaXJlY3RvcnkYAiABKAsyGS5qb2tvLnYxLlBhcnRuZXJEaXJlY3RvcnkifgoUVXBkYXRlUGFydG5lclJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SJAoFcGF0Y2gYAyABKAsyFS5qb2tvLnYxLlBhcnRuZXJQYXRjaCJvChVVcGRhdGVQYXJ0bmVyUmVzcG9uc2USKAoHcGFydG5lchgBIAEoCzIXLmpva28udjEuUGFydG5lclByb2ZpbGUSLAoJZGlyZWN0b3J5GAIgASgLMhkuam9rby52MS5QYXJ0bmVyRGlyZWN0b3J5IowBChpTZXRQYXJ0bmVyTGlmZWN5Y2xlUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIsCglsaWZlY3ljbGUYAyABKA4yGS5qb2tvLnYxLlBhcnRuZXJMaWZlY3ljbGUidQobU2V0UGFydG5lckxpZmVjeWNsZVJlc3BvbnNlEigKB3BhcnRuZXIYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJQcm9maWxlEiwKCWRpcmVjdG9yeRgCIAEoCzIZLmpva28udjEuUGFydG5lckRpcmVjdG9yeSJlCiFSZXRyeVBhcnRuZXJJbml0aWFsaXphdGlvblJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24ifAoiUmV0cnlQYXJ0bmVySW5pdGlhbGl6YXRpb25SZXNwb25zZRIoCgdwYXJ0bmVyGAEgASgLMhcuam9rby52MS5QYXJ0bmVyUHJvZmlsZRIsCglkaXJlY3RvcnkYAiABKAsyGS5qb2tvLnYxLlBhcnRuZXJEaXJlY3RvcnkiigEKHFVwZGF0ZVBhcnRuZXJEZWZhdWx0c1JlcXVlc3QSNgobZXhwZWN0ZWRfZGlyZWN0b3J5X3JldmlzaW9uGAEgASgLMhEuam9rby52MS5SZXZpc2lvbhIyCgxjYXBhYmlsaXRpZXMYAiABKAsyHC5qb2tvLnYxLlBhcnRuZXJDYXBhYmlsaXRpZXMigQEKHVVwZGF0ZVBhcnRuZXJEZWZhdWx0c1Jlc3BvbnNlEiwKCWRpcmVjdG9yeRgBIAEoCzIZLmpva28udjEuUGFydG5lckRpcmVjdG9yeRIyChFhZmZlY3RlZF9wYXJ0bmVycxgCIAMoCzIXLmpva28udjEuUGFydG5lclByb2ZpbGUiMAoaTGlzdFBhcnRuZXJTZXNzaW9uc1JlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCSJIChtMaXN0UGFydG5lclNlc3Npb25zUmVzcG9uc2USKQoIc2Vzc2lvbnMYASADKAsyFy5qb2tvLnYxLlBhcnRuZXJTZXNzaW9uIlcKFk1hcmtQYXJ0bmVyUmVhZFJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIpCg50aHJvdWdoX2N1cnNvchgCIAEoCzIRLmpva28udjEuUmV2aXNpb24iRQoXTWFya1BhcnRuZXJSZWFkUmVzcG9uc2USKgoIYWN0aXZpdHkYASABKAsyGC5qb2tvLnYxLlBhcnRuZXJBY3Rpdml0eSI2CiBMaXN0UGFydG5lclByaXZhdGVUaHJlYWRzUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJIlMKIUxpc3RQYXJ0bmVyUHJpdmF0ZVRocmVhZHNSZXNwb25zZRIuCgd0aHJlYWRzGAEgAygLMh0uam9rby52MS5QYXJ0bmVyUHJpdmF0ZVRocmVhZCJHCh5HZXRQYXJ0bmVyUHJpdmF0ZVRocmVhZFJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIRCgl0aHJlYWRfaWQYAiABKAki0gEKH0dldFBhcnRuZXJQcml2YXRlVGhyZWFkUmVzcG9uc2USLQoGdGhyZWFkGAEgASgLMh0uam9rby52MS5QYXJ0bmVyUHJpdmF0ZVRocmVhZBIwCghtZXNzYWdlcxgCIAMoCzIeLmpva28udjEuUGFydG5lclByaXZhdGVNZXNzYWdlEj8KCnJlYWRfc3RhdGUYAyABKAsyJi5qb2tvLnYxLlBhcnRuZXJQcml2YXRlVGhyZWFkUmVhZFN0YXRlSACIAQFCDQoLX3JlYWRfc3RhdGUiZgojTWFya1BhcnRuZXJQcml2YXRlVGhyZWFkUmVhZFJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIRCgl0aHJlYWRfaWQYAiABKAkSGAoQdGhyb3VnaF9zZXF1ZW5jZRgDIAEoBCJiCiRNYXJrUGFydG5lclByaXZhdGVUaHJlYWRSZWFkUmVzcG9uc2USOgoKcmVhZF9zdGF0ZRgBIAEoCzImLmpva28udjEuUGFydG5lclByaXZhdGVUaHJlYWRSZWFkU3RhdGUiMwodTGlzdFBhcnRuZXJEZWxlZ2F0aW9uc1JlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCSJRCh5MaXN0UGFydG5lckRlbGVnYXRpb25zUmVzcG9uc2USLwoLZGVsZWdhdGlvbnMYASADKAsyGi5qb2tvLnYxLlBhcnRuZXJEZWxlZ2F0aW9uIkgKG0dldFBhcnRuZXJEZWxlZ2F0aW9uUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEhUKDWRlbGVnYXRpb25faWQYAiABKAkiTgocR2V0UGFydG5lckRlbGVnYXRpb25SZXNwb25zZRIuCgpkZWxlZ2F0aW9uGAEgASgLMhouam9rby52MS5QYXJ0bmVyRGVsZWdhdGlvbiJ5Ch5DYW5jZWxQYXJ0bmVyRGVsZWdhdGlvblJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRIVCg1kZWxlZ2F0aW9uX2lkGAIgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbiJRCh9DYW5jZWxQYXJ0bmVyRGVsZWdhdGlvblJlc3BvbnNlEi4KCmRlbGVnYXRpb24YASABKAsyGi5qb2tvLnYxLlBhcnRuZXJEZWxlZ2F0aW9uKpIBChBQYXJ0bmVyTGlmZWN5Y2xlEiEKHVBBUlRORVJfTElGRUNZQ0xFX1VOU1BFQ0lGSUVEEAASHAoYUEFSVE5FUl9MSUZFQ1lDTEVfQUNUSVZFEAESHgoaUEFSVE5FUl9MSUZFQ1lDTEVfQVJDSElWRUQQAhIdChlQQVJUTkVSX0xJRkVDWUNMRV9ERUxFVEVEEAMqxAEKGlBhcnRuZXJJbml0aWFsaXphdGlvblN0YXRlEiwKKFBBUlRORVJfSU5JVElBTElaQVRJT05fU1RBVEVfVU5TUEVDSUZJRUQQABIoCiRQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX1NUQVRFX1BFTkRJTkcQARImCiJQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX1NUQVRFX1JFQURZEAISJgoiUEFSVE5FUl9JTklUSUFMSVpBVElPTl9TVEFURV9FUlJPUhADKu4CCh5QYXJ0bmVySW5pdGlhbGl6YXRpb25FcnJvckNvZGUSMQotUEFSVE5FUl9JTklUSUFMSVpBVElPTl9FUlJPUl9DT0RFX1VOU1BFQ0lGSUVEEAASNgoyUEFSVE5FUl9JTklUSUFMSVpBVElPTl9FUlJPUl9DT0RFX0hPTUVfVU5BVkFJTEFCTEUQARI3CjNQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX0VSUk9SX0NPREVfTU9ERUxfVU5BVkFJTEFCTEUQAhI5CjVQQVJUTkVSX0lOSVRJQUxJWkFUSU9OX0VSUk9SX0NPREVfU0VTU0lPTl9VTkFWQUlMQUJMRRADEjMKL1BBUlRORVJfSU5JVElBTElaQVRJT05fRVJST1JfQ09ERV9TVEFURV9DSEFOR0VEEAQSOAo0UEFSVE5FUl9JTklUSUFMSVpBVElPTl9FUlJPUl9DT0RFX0FWQVRBUl9VTkFWQUlMQUJMRRAFKvkBChZQYXJ0bmVySW52aXRhdGlvblN0YWdlEigKJFBBUlRORVJfSU5WSVRBVElPTl9TVEFHRV9VTlNQRUNJRklFRBAAEiEKHVBBUlRORVJfSU5WSVRBVElPTl9TVEFHRV9IT01FEAESIwofUEFSVE5FUl9JTlZJVEFUSU9OX1NUQUdFX0FWQVRBUhACEiQKIFBBUlRORVJfSU5WSVRBVElPTl9TVEFHRV9TRVNTSU9OEAMSIgoeUEFSVE5FUl9JTlZJVEFUSU9OX1NUQUdFX1JFQURZEAQSIwofUEFSVE5FUl9JTlZJVEFUSU9OX1NUQUdFX0ZBSUxFRBAFKqUBChJQYXJ0bmVyU2Vzc2lvblJvbGUSJAogUEFSVE5FUl9TRVNTSU9OX1JPTEVfVU5TUEVDSUZJRUQQABIiCh5QQVJUTkVSX1NFU1NJT05fUk9MRV9DQU5PTklDQUwQARIgChxQQVJUTkVSX1NFU1NJT05fUk9MRV9ISVNUT1JZEAISIwofUEFSVE5FUl9TRVNTSU9OX1JPTEVfREVMRUdBVElPThADKp8BChpQYXJ0bmVyUHJpdmF0ZVRocmVhZFN0YXR1cxItCilQQVJUTkVSX1BSSVZBVEVfVEhSRUFEX1NUQVRVU19VTlNQRUNJRklFRBAAEigKJFBBUlRORVJfUFJJVkFURV9USFJFQURfU1RBVFVTX0FDVElWRRABEigKJFBBUlRORVJfUFJJVkFURV9USFJFQURfU1RBVFVTX0NMT1NFRBACKsMBCh9QYXJ0bmVyUHJpdmF0ZVRocmVhZENsb3NlUmVhc29uEjMKL1BBUlRORVJfUFJJVkFURV9USFJFQURfQ0xPU0VfUkVBU09OX1VOU1BFQ0lGSUVEEAASNQoxUEFSVE5FUl9QUklWQVRFX1RIUkVBRF9DTE9TRV9SRUFTT05fTUVTU0FHRV9MSU1JVBABEjQKMFBBUlRORVJfUFJJVkFURV9USFJFQURfQ0xPU0VfUkVBU09OX0lETEVfVElNRU9VVBACKv4BCiNQYXJ0bmVyUHJpdmF0ZU1lc3NhZ2VEZWxpdmVyeVN0YXR1cxI3CjNQQVJUTkVSX1BSSVZBVEVfTUVTU0FHRV9ERUxJVkVSWV9TVEFUVVNfVU5TUEVDSUZJRUQQABIzCi9QQVJUTkVSX1BSSVZBVEVfTUVTU0FHRV9ERUxJVkVSWV9TVEFUVVNfUEVORElORxABEjUKMVBBUlRORVJfUFJJVkFURV9NRVNTQUdFX0RFTElWRVJZX1NUQVRVU19ERUxJVkVSRUQQAhIyCi5QQVJUTkVSX1BSSVZBVEVfTUVTU0FHRV9ERUxJVkVSWV9TVEFUVVNfRkFJTEVEEAMqgAMKF1BhcnRuZXJEZWxlZ2F0aW9uU3RhdHVzEikKJVBBUlRORVJfREVMRUdBVElPTl9TVEFUVVNfVU5TUEVDSUZJRUQQABInCiNQQVJUTkVSX0RFTEVHQVRJT05fU1RBVFVTX1BSRVBBUklORxABEiQKIFBBUlRORVJfREVMRUdBVElPTl9TVEFUVVNfUVVFVUVEEAISJQohUEFSVE5FUl9ERUxFR0FUSU9OX1NUQVRVU19SVU5OSU5HEAMSJQohUEFSVE5FUl9ERUxFR0FUSU9OX1NUQVRVU19XQUlUSU5HEAQSJwojUEFSVE5FUl9ERUxFR0FUSU9OX1NUQVRVU19DT01QTEVURUQQBRIkCiBQQVJUTkVSX0RFTEVHQVRJT05fU1RBVFVTX0ZBSUxFRBAGEicKI1BBUlRORVJfREVMRUdBVElPTl9TVEFUVVNfQ0FOQ0VMTEVEEAcSJQohUEFSVE5FUl9ERUxFR0FUSU9OX1NUQVRVU19VTktOT1dOEAhiBnByb3RvMw", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common]);
 
 /**
  * @generated from message joko.v1.PartnerModelRoute
@@ -219,6 +219,11 @@ export type PartnerProfile = Message<"joko.v1.PartnerProfile"> & {
    * @generated from field: bool uses_directory_defaults = 17;
    */
   usesDirectoryDefaults: boolean;
+
+  /**
+   * @generated from field: joko.v1.PartnerActivity activity = 18;
+   */
+  activity?: PartnerActivity | undefined;
 };
 
 /**
@@ -227,6 +232,398 @@ export type PartnerProfile = Message<"joko.v1.PartnerProfile"> & {
  */
 export const PartnerProfileSchema: GenMessage<PartnerProfile> = /*@__PURE__*/
   messageDesc(file_joko_v1_partner, 4);
+
+/**
+ * @generated from message joko.v1.PartnerActivity
+ */
+export type PartnerActivity = Message<"joko.v1.PartnerActivity"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: uint64 unread_reply_count = 2;
+   */
+  unreadReplyCount: bigint;
+
+  /**
+   * @generated from field: optional joko.v1.Revision latest_reply_cursor = 3;
+   */
+  latestReplyCursor?: Revision | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp latest_reply_at = 4;
+   */
+  latestReplyAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: uint64 artifact_count = 5;
+   */
+  artifactCount: bigint;
+
+  /**
+   * @generated from field: uint64 active_delegation_count = 6;
+   */
+  activeDelegationCount: bigint;
+
+  /**
+   * @generated from field: joko.v1.Revision read_through_cursor = 7;
+   */
+  readThroughCursor?: Revision | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp read_updated_at = 8;
+   */
+  readUpdatedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerActivity.
+ * Use `create(PartnerActivitySchema)` to create a new message.
+ */
+export const PartnerActivitySchema: GenMessage<PartnerActivity> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 5);
+
+/**
+ * @generated from message joko.v1.PartnerSession
+ */
+export type PartnerSession = Message<"joko.v1.PartnerSession"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string partner_id = 2;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: joko.v1.PartnerSessionRole role = 3;
+   */
+  role: PartnerSessionRole;
+
+  /**
+   * @generated from field: uint64 profile_version = 4;
+   */
+  profileVersion: bigint;
+
+  /**
+   * @generated from field: optional string parent_session_id = 5;
+   */
+  parentSessionId?: string | undefined;
+
+  /**
+   * @generated from field: optional string delegation_id = 6;
+   */
+  delegationId?: string | undefined;
+
+  /**
+   * @generated from field: string display_name = 7;
+   */
+  displayName: string;
+
+  /**
+   * @generated from field: bool available = 8;
+   */
+  available: boolean;
+
+  /**
+   * @generated from field: bool read_only = 9;
+   */
+  readOnly: boolean;
+
+  /**
+   * @generated from field: bool archived = 10;
+   */
+  archived: boolean;
+
+  /**
+   * @generated from field: bool deleted = 11;
+   */
+  deleted: boolean;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 12;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp last_activity_at = 13;
+   */
+  lastActivityAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerSession.
+ * Use `create(PartnerSessionSchema)` to create a new message.
+ */
+export const PartnerSessionSchema: GenMessage<PartnerSession> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 6);
+
+/**
+ * @generated from message joko.v1.PartnerPrivateThread
+ */
+export type PartnerPrivateThread = Message<"joko.v1.PartnerPrivateThread"> & {
+  /**
+   * @generated from field: string thread_id = 1;
+   */
+  threadId: string;
+
+  /**
+   * @generated from field: string first_partner_id = 2;
+   */
+  firstPartnerId: string;
+
+  /**
+   * @generated from field: string second_partner_id = 3;
+   */
+  secondPartnerId: string;
+
+  /**
+   * @generated from field: joko.v1.PartnerPrivateThreadStatus status = 4;
+   */
+  status: PartnerPrivateThreadStatus;
+
+  /**
+   * @generated from field: optional joko.v1.PartnerPrivateThreadCloseReason close_reason = 5;
+   */
+  closeReason?: PartnerPrivateThreadCloseReason | undefined;
+
+  /**
+   * @generated from field: uint32 message_count = 6;
+   */
+  messageCount: number;
+
+  /**
+   * @generated from field: uint32 max_messages = 7;
+   */
+  maxMessages: number;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expires_at = 8;
+   */
+  expiresAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp blocked_until = 9;
+   */
+  blockedUntil?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 10;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 11;
+   */
+  updatedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp closed_at = 12;
+   */
+  closedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPrivateThread.
+ * Use `create(PartnerPrivateThreadSchema)` to create a new message.
+ */
+export const PartnerPrivateThreadSchema: GenMessage<PartnerPrivateThread> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 7);
+
+/**
+ * @generated from message joko.v1.PartnerPrivateMessage
+ */
+export type PartnerPrivateMessage = Message<"joko.v1.PartnerPrivateMessage"> & {
+  /**
+   * @generated from field: string message_id = 1;
+   */
+  messageId: string;
+
+  /**
+   * @generated from field: string thread_id = 2;
+   */
+  threadId: string;
+
+  /**
+   * @generated from field: uint64 sequence = 3;
+   */
+  sequence: bigint;
+
+  /**
+   * @generated from field: string sender_partner_id = 4;
+   */
+  senderPartnerId: string;
+
+  /**
+   * @generated from field: string recipient_partner_id = 5;
+   */
+  recipientPartnerId: string;
+
+  /**
+   * @generated from field: string content = 6;
+   */
+  content: string;
+
+  /**
+   * @generated from field: joko.v1.PartnerPrivateMessageDeliveryStatus delivery_status = 7;
+   */
+  deliveryStatus: PartnerPrivateMessageDeliveryStatus;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 8;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp delivered_at = 9;
+   */
+  deliveredAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPrivateMessage.
+ * Use `create(PartnerPrivateMessageSchema)` to create a new message.
+ */
+export const PartnerPrivateMessageSchema: GenMessage<PartnerPrivateMessage> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 8);
+
+/**
+ * @generated from message joko.v1.PartnerPrivateThreadReadState
+ */
+export type PartnerPrivateThreadReadState = Message<"joko.v1.PartnerPrivateThreadReadState"> & {
+  /**
+   * @generated from field: string thread_id = 1;
+   */
+  threadId: string;
+
+  /**
+   * @generated from field: string partner_id = 2;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: uint64 through_sequence = 3;
+   */
+  throughSequence: bigint;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 4;
+   */
+  updatedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPrivateThreadReadState.
+ * Use `create(PartnerPrivateThreadReadStateSchema)` to create a new message.
+ */
+export const PartnerPrivateThreadReadStateSchema: GenMessage<PartnerPrivateThreadReadState> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 9);
+
+/**
+ * @generated from message joko.v1.PartnerDelegation
+ */
+export type PartnerDelegation = Message<"joko.v1.PartnerDelegation"> & {
+  /**
+   * @generated from field: string delegation_id = 1;
+   */
+  delegationId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision revision = 2;
+   */
+  revision?: Revision | undefined;
+
+  /**
+   * @generated from field: string requester_partner_id = 3;
+   */
+  requesterPartnerId: string;
+
+  /**
+   * @generated from field: string target_partner_id = 4;
+   */
+  targetPartnerId: string;
+
+  /**
+   * @generated from field: string parent_session_id = 5;
+   */
+  parentSessionId: string;
+
+  /**
+   * @generated from field: uint64 target_profile_version = 6;
+   */
+  targetProfileVersion: bigint;
+
+  /**
+   * @generated from field: string title = 7;
+   */
+  title: string;
+
+  /**
+   * @generated from field: string objective = 8;
+   */
+  objective: string;
+
+  /**
+   * @generated from field: joko.v1.PartnerDelegationStatus status = 9;
+   */
+  status: PartnerDelegationStatus;
+
+  /**
+   * @generated from field: optional string child_session_id = 10;
+   */
+  childSessionId?: string | undefined;
+
+  /**
+   * @generated from field: optional string run_id = 11;
+   */
+  runId?: string | undefined;
+
+  /**
+   * @generated from field: optional string result_summary = 12;
+   */
+  resultSummary?: string | undefined;
+
+  /**
+   * @generated from field: optional string error = 13;
+   */
+  error?: string | undefined;
+
+  /**
+   * @generated from field: uint64 artifact_count = 14;
+   */
+  artifactCount: bigint;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 15;
+   */
+  createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 16;
+   */
+  updatedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp started_at = 17;
+   */
+  startedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: optional google.protobuf.Timestamp completed_at = 18;
+   */
+  completedAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerDelegation.
+ * Use `create(PartnerDelegationSchema)` to create a new message.
+ */
+export const PartnerDelegationSchema: GenMessage<PartnerDelegation> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 10);
 
 /**
  * @generated from message joko.v1.PartnerDirectory
@@ -278,7 +675,7 @@ export type PartnerDirectory = Message<"joko.v1.PartnerDirectory"> & {
  * Use `create(PartnerDirectorySchema)` to create a new message.
  */
 export const PartnerDirectorySchema: GenMessage<PartnerDirectory> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 5);
+  messageDesc(file_joko_v1_partner, 11);
 
 /**
  * @generated from message joko.v1.PartnerDraft
@@ -320,7 +717,7 @@ export type PartnerDraft = Message<"joko.v1.PartnerDraft"> & {
  * Use `create(PartnerDraftSchema)` to create a new message.
  */
 export const PartnerDraftSchema: GenMessage<PartnerDraft> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 6);
+  messageDesc(file_joko_v1_partner, 12);
 
 /**
  * @generated from message joko.v1.PartnerPatch
@@ -367,7 +764,7 @@ export type PartnerPatch = Message<"joko.v1.PartnerPatch"> & {
  * Use `create(PartnerPatchSchema)` to create a new message.
  */
 export const PartnerPatchSchema: GenMessage<PartnerPatch> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 7);
+  messageDesc(file_joko_v1_partner, 13);
 
 /**
  * @generated from message joko.v1.GetPartnerDirectoryRequest
@@ -380,7 +777,7 @@ export type GetPartnerDirectoryRequest = Message<"joko.v1.GetPartnerDirectoryReq
  * Use `create(GetPartnerDirectoryRequestSchema)` to create a new message.
  */
 export const GetPartnerDirectoryRequestSchema: GenMessage<GetPartnerDirectoryRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 8);
+  messageDesc(file_joko_v1_partner, 14);
 
 /**
  * @generated from message joko.v1.GetPartnerDirectoryResponse
@@ -397,7 +794,7 @@ export type GetPartnerDirectoryResponse = Message<"joko.v1.GetPartnerDirectoryRe
  * Use `create(GetPartnerDirectoryResponseSchema)` to create a new message.
  */
 export const GetPartnerDirectoryResponseSchema: GenMessage<GetPartnerDirectoryResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 9);
+  messageDesc(file_joko_v1_partner, 15);
 
 /**
  * @generated from message joko.v1.ListPartnersRequest
@@ -414,7 +811,7 @@ export type ListPartnersRequest = Message<"joko.v1.ListPartnersRequest"> & {
  * Use `create(ListPartnersRequestSchema)` to create a new message.
  */
 export const ListPartnersRequestSchema: GenMessage<ListPartnersRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 10);
+  messageDesc(file_joko_v1_partner, 16);
 
 /**
  * @generated from message joko.v1.ListPartnersResponse
@@ -436,7 +833,7 @@ export type ListPartnersResponse = Message<"joko.v1.ListPartnersResponse"> & {
  * Use `create(ListPartnersResponseSchema)` to create a new message.
  */
 export const ListPartnersResponseSchema: GenMessage<ListPartnersResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 11);
+  messageDesc(file_joko_v1_partner, 17);
 
 /**
  * @generated from message joko.v1.GetPartnerRequest
@@ -453,7 +850,7 @@ export type GetPartnerRequest = Message<"joko.v1.GetPartnerRequest"> & {
  * Use `create(GetPartnerRequestSchema)` to create a new message.
  */
 export const GetPartnerRequestSchema: GenMessage<GetPartnerRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 12);
+  messageDesc(file_joko_v1_partner, 18);
 
 /**
  * @generated from message joko.v1.GetPartnerResponse
@@ -470,7 +867,7 @@ export type GetPartnerResponse = Message<"joko.v1.GetPartnerResponse"> & {
  * Use `create(GetPartnerResponseSchema)` to create a new message.
  */
 export const GetPartnerResponseSchema: GenMessage<GetPartnerResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 13);
+  messageDesc(file_joko_v1_partner, 19);
 
 /**
  * @generated from message joko.v1.CreatePartnerRequest
@@ -492,7 +889,7 @@ export type CreatePartnerRequest = Message<"joko.v1.CreatePartnerRequest"> & {
  * Use `create(CreatePartnerRequestSchema)` to create a new message.
  */
 export const CreatePartnerRequestSchema: GenMessage<CreatePartnerRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 14);
+  messageDesc(file_joko_v1_partner, 20);
 
 /**
  * @generated from message joko.v1.CreatePartnerResponse
@@ -514,7 +911,7 @@ export type CreatePartnerResponse = Message<"joko.v1.CreatePartnerResponse"> & {
  * Use `create(CreatePartnerResponseSchema)` to create a new message.
  */
 export const CreatePartnerResponseSchema: GenMessage<CreatePartnerResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 15);
+  messageDesc(file_joko_v1_partner, 21);
 
 /**
  * @generated from message joko.v1.UpdatePartnerRequest
@@ -541,7 +938,7 @@ export type UpdatePartnerRequest = Message<"joko.v1.UpdatePartnerRequest"> & {
  * Use `create(UpdatePartnerRequestSchema)` to create a new message.
  */
 export const UpdatePartnerRequestSchema: GenMessage<UpdatePartnerRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 16);
+  messageDesc(file_joko_v1_partner, 22);
 
 /**
  * @generated from message joko.v1.UpdatePartnerResponse
@@ -563,7 +960,7 @@ export type UpdatePartnerResponse = Message<"joko.v1.UpdatePartnerResponse"> & {
  * Use `create(UpdatePartnerResponseSchema)` to create a new message.
  */
 export const UpdatePartnerResponseSchema: GenMessage<UpdatePartnerResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 17);
+  messageDesc(file_joko_v1_partner, 23);
 
 /**
  * @generated from message joko.v1.SetPartnerLifecycleRequest
@@ -590,7 +987,7 @@ export type SetPartnerLifecycleRequest = Message<"joko.v1.SetPartnerLifecycleReq
  * Use `create(SetPartnerLifecycleRequestSchema)` to create a new message.
  */
 export const SetPartnerLifecycleRequestSchema: GenMessage<SetPartnerLifecycleRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 18);
+  messageDesc(file_joko_v1_partner, 24);
 
 /**
  * @generated from message joko.v1.SetPartnerLifecycleResponse
@@ -612,7 +1009,7 @@ export type SetPartnerLifecycleResponse = Message<"joko.v1.SetPartnerLifecycleRe
  * Use `create(SetPartnerLifecycleResponseSchema)` to create a new message.
  */
 export const SetPartnerLifecycleResponseSchema: GenMessage<SetPartnerLifecycleResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 19);
+  messageDesc(file_joko_v1_partner, 25);
 
 /**
  * @generated from message joko.v1.RetryPartnerInitializationRequest
@@ -634,7 +1031,7 @@ export type RetryPartnerInitializationRequest = Message<"joko.v1.RetryPartnerIni
  * Use `create(RetryPartnerInitializationRequestSchema)` to create a new message.
  */
 export const RetryPartnerInitializationRequestSchema: GenMessage<RetryPartnerInitializationRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 20);
+  messageDesc(file_joko_v1_partner, 26);
 
 /**
  * @generated from message joko.v1.RetryPartnerInitializationResponse
@@ -656,7 +1053,7 @@ export type RetryPartnerInitializationResponse = Message<"joko.v1.RetryPartnerIn
  * Use `create(RetryPartnerInitializationResponseSchema)` to create a new message.
  */
 export const RetryPartnerInitializationResponseSchema: GenMessage<RetryPartnerInitializationResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 21);
+  messageDesc(file_joko_v1_partner, 27);
 
 /**
  * @generated from message joko.v1.UpdatePartnerDefaultsRequest
@@ -678,7 +1075,7 @@ export type UpdatePartnerDefaultsRequest = Message<"joko.v1.UpdatePartnerDefault
  * Use `create(UpdatePartnerDefaultsRequestSchema)` to create a new message.
  */
 export const UpdatePartnerDefaultsRequestSchema: GenMessage<UpdatePartnerDefaultsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 22);
+  messageDesc(file_joko_v1_partner, 28);
 
 /**
  * @generated from message joko.v1.UpdatePartnerDefaultsResponse
@@ -700,7 +1097,324 @@ export type UpdatePartnerDefaultsResponse = Message<"joko.v1.UpdatePartnerDefaul
  * Use `create(UpdatePartnerDefaultsResponseSchema)` to create a new message.
  */
 export const UpdatePartnerDefaultsResponseSchema: GenMessage<UpdatePartnerDefaultsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner, 23);
+  messageDesc(file_joko_v1_partner, 29);
+
+/**
+ * @generated from message joko.v1.ListPartnerSessionsRequest
+ */
+export type ListPartnerSessionsRequest = Message<"joko.v1.ListPartnerSessionsRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerSessionsRequest.
+ * Use `create(ListPartnerSessionsRequestSchema)` to create a new message.
+ */
+export const ListPartnerSessionsRequestSchema: GenMessage<ListPartnerSessionsRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 30);
+
+/**
+ * @generated from message joko.v1.ListPartnerSessionsResponse
+ */
+export type ListPartnerSessionsResponse = Message<"joko.v1.ListPartnerSessionsResponse"> & {
+  /**
+   * @generated from field: repeated joko.v1.PartnerSession sessions = 1;
+   */
+  sessions: PartnerSession[];
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerSessionsResponse.
+ * Use `create(ListPartnerSessionsResponseSchema)` to create a new message.
+ */
+export const ListPartnerSessionsResponseSchema: GenMessage<ListPartnerSessionsResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 31);
+
+/**
+ * @generated from message joko.v1.MarkPartnerReadRequest
+ */
+export type MarkPartnerReadRequest = Message<"joko.v1.MarkPartnerReadRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision through_cursor = 2;
+   */
+  throughCursor?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.MarkPartnerReadRequest.
+ * Use `create(MarkPartnerReadRequestSchema)` to create a new message.
+ */
+export const MarkPartnerReadRequestSchema: GenMessage<MarkPartnerReadRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 32);
+
+/**
+ * @generated from message joko.v1.MarkPartnerReadResponse
+ */
+export type MarkPartnerReadResponse = Message<"joko.v1.MarkPartnerReadResponse"> & {
+  /**
+   * @generated from field: joko.v1.PartnerActivity activity = 1;
+   */
+  activity?: PartnerActivity | undefined;
+};
+
+/**
+ * Describes the message joko.v1.MarkPartnerReadResponse.
+ * Use `create(MarkPartnerReadResponseSchema)` to create a new message.
+ */
+export const MarkPartnerReadResponseSchema: GenMessage<MarkPartnerReadResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 33);
+
+/**
+ * @generated from message joko.v1.ListPartnerPrivateThreadsRequest
+ */
+export type ListPartnerPrivateThreadsRequest = Message<"joko.v1.ListPartnerPrivateThreadsRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerPrivateThreadsRequest.
+ * Use `create(ListPartnerPrivateThreadsRequestSchema)` to create a new message.
+ */
+export const ListPartnerPrivateThreadsRequestSchema: GenMessage<ListPartnerPrivateThreadsRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 34);
+
+/**
+ * @generated from message joko.v1.ListPartnerPrivateThreadsResponse
+ */
+export type ListPartnerPrivateThreadsResponse = Message<"joko.v1.ListPartnerPrivateThreadsResponse"> & {
+  /**
+   * @generated from field: repeated joko.v1.PartnerPrivateThread threads = 1;
+   */
+  threads: PartnerPrivateThread[];
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerPrivateThreadsResponse.
+ * Use `create(ListPartnerPrivateThreadsResponseSchema)` to create a new message.
+ */
+export const ListPartnerPrivateThreadsResponseSchema: GenMessage<ListPartnerPrivateThreadsResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 35);
+
+/**
+ * @generated from message joko.v1.GetPartnerPrivateThreadRequest
+ */
+export type GetPartnerPrivateThreadRequest = Message<"joko.v1.GetPartnerPrivateThreadRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: string thread_id = 2;
+   */
+  threadId: string;
+};
+
+/**
+ * Describes the message joko.v1.GetPartnerPrivateThreadRequest.
+ * Use `create(GetPartnerPrivateThreadRequestSchema)` to create a new message.
+ */
+export const GetPartnerPrivateThreadRequestSchema: GenMessage<GetPartnerPrivateThreadRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 36);
+
+/**
+ * @generated from message joko.v1.GetPartnerPrivateThreadResponse
+ */
+export type GetPartnerPrivateThreadResponse = Message<"joko.v1.GetPartnerPrivateThreadResponse"> & {
+  /**
+   * @generated from field: joko.v1.PartnerPrivateThread thread = 1;
+   */
+  thread?: PartnerPrivateThread | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.PartnerPrivateMessage messages = 2;
+   */
+  messages: PartnerPrivateMessage[];
+
+  /**
+   * @generated from field: optional joko.v1.PartnerPrivateThreadReadState read_state = 3;
+   */
+  readState?: PartnerPrivateThreadReadState | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetPartnerPrivateThreadResponse.
+ * Use `create(GetPartnerPrivateThreadResponseSchema)` to create a new message.
+ */
+export const GetPartnerPrivateThreadResponseSchema: GenMessage<GetPartnerPrivateThreadResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 37);
+
+/**
+ * @generated from message joko.v1.MarkPartnerPrivateThreadReadRequest
+ */
+export type MarkPartnerPrivateThreadReadRequest = Message<"joko.v1.MarkPartnerPrivateThreadReadRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: string thread_id = 2;
+   */
+  threadId: string;
+
+  /**
+   * @generated from field: uint64 through_sequence = 3;
+   */
+  throughSequence: bigint;
+};
+
+/**
+ * Describes the message joko.v1.MarkPartnerPrivateThreadReadRequest.
+ * Use `create(MarkPartnerPrivateThreadReadRequestSchema)` to create a new message.
+ */
+export const MarkPartnerPrivateThreadReadRequestSchema: GenMessage<MarkPartnerPrivateThreadReadRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 38);
+
+/**
+ * @generated from message joko.v1.MarkPartnerPrivateThreadReadResponse
+ */
+export type MarkPartnerPrivateThreadReadResponse = Message<"joko.v1.MarkPartnerPrivateThreadReadResponse"> & {
+  /**
+   * @generated from field: joko.v1.PartnerPrivateThreadReadState read_state = 1;
+   */
+  readState?: PartnerPrivateThreadReadState | undefined;
+};
+
+/**
+ * Describes the message joko.v1.MarkPartnerPrivateThreadReadResponse.
+ * Use `create(MarkPartnerPrivateThreadReadResponseSchema)` to create a new message.
+ */
+export const MarkPartnerPrivateThreadReadResponseSchema: GenMessage<MarkPartnerPrivateThreadReadResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 39);
+
+/**
+ * @generated from message joko.v1.ListPartnerDelegationsRequest
+ */
+export type ListPartnerDelegationsRequest = Message<"joko.v1.ListPartnerDelegationsRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerDelegationsRequest.
+ * Use `create(ListPartnerDelegationsRequestSchema)` to create a new message.
+ */
+export const ListPartnerDelegationsRequestSchema: GenMessage<ListPartnerDelegationsRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 40);
+
+/**
+ * @generated from message joko.v1.ListPartnerDelegationsResponse
+ */
+export type ListPartnerDelegationsResponse = Message<"joko.v1.ListPartnerDelegationsResponse"> & {
+  /**
+   * @generated from field: repeated joko.v1.PartnerDelegation delegations = 1;
+   */
+  delegations: PartnerDelegation[];
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerDelegationsResponse.
+ * Use `create(ListPartnerDelegationsResponseSchema)` to create a new message.
+ */
+export const ListPartnerDelegationsResponseSchema: GenMessage<ListPartnerDelegationsResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 41);
+
+/**
+ * @generated from message joko.v1.GetPartnerDelegationRequest
+ */
+export type GetPartnerDelegationRequest = Message<"joko.v1.GetPartnerDelegationRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: string delegation_id = 2;
+   */
+  delegationId: string;
+};
+
+/**
+ * Describes the message joko.v1.GetPartnerDelegationRequest.
+ * Use `create(GetPartnerDelegationRequestSchema)` to create a new message.
+ */
+export const GetPartnerDelegationRequestSchema: GenMessage<GetPartnerDelegationRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 42);
+
+/**
+ * @generated from message joko.v1.GetPartnerDelegationResponse
+ */
+export type GetPartnerDelegationResponse = Message<"joko.v1.GetPartnerDelegationResponse"> & {
+  /**
+   * @generated from field: joko.v1.PartnerDelegation delegation = 1;
+   */
+  delegation?: PartnerDelegation | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetPartnerDelegationResponse.
+ * Use `create(GetPartnerDelegationResponseSchema)` to create a new message.
+ */
+export const GetPartnerDelegationResponseSchema: GenMessage<GetPartnerDelegationResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 43);
+
+/**
+ * @generated from message joko.v1.CancelPartnerDelegationRequest
+ */
+export type CancelPartnerDelegationRequest = Message<"joko.v1.CancelPartnerDelegationRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: string delegation_id = 2;
+   */
+  delegationId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision expected_revision = 3;
+   */
+  expectedRevision?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.CancelPartnerDelegationRequest.
+ * Use `create(CancelPartnerDelegationRequestSchema)` to create a new message.
+ */
+export const CancelPartnerDelegationRequestSchema: GenMessage<CancelPartnerDelegationRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 44);
+
+/**
+ * @generated from message joko.v1.CancelPartnerDelegationResponse
+ */
+export type CancelPartnerDelegationResponse = Message<"joko.v1.CancelPartnerDelegationResponse"> & {
+  /**
+   * @generated from field: joko.v1.PartnerDelegation delegation = 1;
+   */
+  delegation?: PartnerDelegation | undefined;
+};
+
+/**
+ * Describes the message joko.v1.CancelPartnerDelegationResponse.
+ * Use `create(CancelPartnerDelegationResponseSchema)` to create a new message.
+ */
+export const CancelPartnerDelegationResponseSchema: GenMessage<CancelPartnerDelegationResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner, 45);
 
 /**
  * @generated from enum joko.v1.PartnerLifecycle
@@ -845,4 +1559,174 @@ export enum PartnerInvitationStage {
  */
 export const PartnerInvitationStageSchema: GenEnum<PartnerInvitationStage> = /*@__PURE__*/
   enumDesc(file_joko_v1_partner, 3);
+
+/**
+ * @generated from enum joko.v1.PartnerSessionRole
+ */
+export enum PartnerSessionRole {
+  /**
+   * @generated from enum value: PARTNER_SESSION_ROLE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PARTNER_SESSION_ROLE_CANONICAL = 1;
+   */
+  CANONICAL = 1,
+
+  /**
+   * @generated from enum value: PARTNER_SESSION_ROLE_HISTORY = 2;
+   */
+  HISTORY = 2,
+
+  /**
+   * @generated from enum value: PARTNER_SESSION_ROLE_DELEGATION = 3;
+   */
+  DELEGATION = 3,
+}
+
+/**
+ * Describes the enum joko.v1.PartnerSessionRole.
+ */
+export const PartnerSessionRoleSchema: GenEnum<PartnerSessionRole> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner, 4);
+
+/**
+ * @generated from enum joko.v1.PartnerPrivateThreadStatus
+ */
+export enum PartnerPrivateThreadStatus {
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_THREAD_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_THREAD_STATUS_ACTIVE = 1;
+   */
+  ACTIVE = 1,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_THREAD_STATUS_CLOSED = 2;
+   */
+  CLOSED = 2,
+}
+
+/**
+ * Describes the enum joko.v1.PartnerPrivateThreadStatus.
+ */
+export const PartnerPrivateThreadStatusSchema: GenEnum<PartnerPrivateThreadStatus> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner, 5);
+
+/**
+ * @generated from enum joko.v1.PartnerPrivateThreadCloseReason
+ */
+export enum PartnerPrivateThreadCloseReason {
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_THREAD_CLOSE_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_THREAD_CLOSE_REASON_MESSAGE_LIMIT = 1;
+   */
+  MESSAGE_LIMIT = 1,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_THREAD_CLOSE_REASON_IDLE_TIMEOUT = 2;
+   */
+  IDLE_TIMEOUT = 2,
+}
+
+/**
+ * Describes the enum joko.v1.PartnerPrivateThreadCloseReason.
+ */
+export const PartnerPrivateThreadCloseReasonSchema: GenEnum<PartnerPrivateThreadCloseReason> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner, 6);
+
+/**
+ * @generated from enum joko.v1.PartnerPrivateMessageDeliveryStatus
+ */
+export enum PartnerPrivateMessageDeliveryStatus {
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_PENDING = 1;
+   */
+  PENDING = 1,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_DELIVERED = 2;
+   */
+  DELIVERED = 2,
+
+  /**
+   * @generated from enum value: PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_FAILED = 3;
+   */
+  FAILED = 3,
+}
+
+/**
+ * Describes the enum joko.v1.PartnerPrivateMessageDeliveryStatus.
+ */
+export const PartnerPrivateMessageDeliveryStatusSchema: GenEnum<PartnerPrivateMessageDeliveryStatus> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner, 7);
+
+/**
+ * @generated from enum joko.v1.PartnerDelegationStatus
+ */
+export enum PartnerDelegationStatus {
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_PREPARING = 1;
+   */
+  PREPARING = 1,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_QUEUED = 2;
+   */
+  QUEUED = 2,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_RUNNING = 3;
+   */
+  RUNNING = 3,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_WAITING = 4;
+   */
+  WAITING = 4,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_COMPLETED = 5;
+   */
+  COMPLETED = 5,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_FAILED = 6;
+   */
+  FAILED = 6,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_CANCELLED = 7;
+   */
+  CANCELLED = 7,
+
+  /**
+   * @generated from enum value: PARTNER_DELEGATION_STATUS_UNKNOWN = 8;
+   */
+  UNKNOWN = 8,
+}
+
+/**
+ * Describes the enum joko.v1.PartnerDelegationStatus.
+ */
+export const PartnerDelegationStatusSchema: GenEnum<PartnerDelegationStatus> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner, 8);
 

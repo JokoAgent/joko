@@ -38,6 +38,44 @@ enum PartnerInvitationStage {
   PARTNER_INVITATION_STAGE_FAILED = 5;
 }
 
+enum PartnerSessionRole {
+  PARTNER_SESSION_ROLE_UNSPECIFIED = 0;
+  PARTNER_SESSION_ROLE_CANONICAL = 1;
+  PARTNER_SESSION_ROLE_HISTORY = 2;
+  PARTNER_SESSION_ROLE_DELEGATION = 3;
+}
+
+enum PartnerPrivateThreadStatus {
+  PARTNER_PRIVATE_THREAD_STATUS_UNSPECIFIED = 0;
+  PARTNER_PRIVATE_THREAD_STATUS_ACTIVE = 1;
+  PARTNER_PRIVATE_THREAD_STATUS_CLOSED = 2;
+}
+
+enum PartnerPrivateThreadCloseReason {
+  PARTNER_PRIVATE_THREAD_CLOSE_REASON_UNSPECIFIED = 0;
+  PARTNER_PRIVATE_THREAD_CLOSE_REASON_MESSAGE_LIMIT = 1;
+  PARTNER_PRIVATE_THREAD_CLOSE_REASON_IDLE_TIMEOUT = 2;
+}
+
+enum PartnerPrivateMessageDeliveryStatus {
+  PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_UNSPECIFIED = 0;
+  PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_PENDING = 1;
+  PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_DELIVERED = 2;
+  PARTNER_PRIVATE_MESSAGE_DELIVERY_STATUS_FAILED = 3;
+}
+
+enum PartnerDelegationStatus {
+  PARTNER_DELEGATION_STATUS_UNSPECIFIED = 0;
+  PARTNER_DELEGATION_STATUS_PREPARING = 1;
+  PARTNER_DELEGATION_STATUS_QUEUED = 2;
+  PARTNER_DELEGATION_STATUS_RUNNING = 3;
+  PARTNER_DELEGATION_STATUS_WAITING = 4;
+  PARTNER_DELEGATION_STATUS_COMPLETED = 5;
+  PARTNER_DELEGATION_STATUS_FAILED = 6;
+  PARTNER_DELEGATION_STATUS_CANCELLED = 7;
+  PARTNER_DELEGATION_STATUS_UNKNOWN = 8;
+}
+
 message PartnerModelRoute {
   string backend_id = 1;
   string provider_id = 2;
@@ -81,6 +119,89 @@ message PartnerProfile {
   google.protobuf.Timestamp created_at = 15;
   google.protobuf.Timestamp updated_at = 16;
   bool uses_directory_defaults = 17;
+  PartnerActivity activity = 18;
+}
+
+message PartnerActivity {
+  string partner_id = 1;
+  uint64 unread_reply_count = 2;
+  optional Revision latest_reply_cursor = 3;
+  optional google.protobuf.Timestamp latest_reply_at = 4;
+  uint64 artifact_count = 5;
+  uint64 active_delegation_count = 6;
+  Revision read_through_cursor = 7;
+  google.protobuf.Timestamp read_updated_at = 8;
+}
+
+message PartnerSession {
+  string session_id = 1;
+  string partner_id = 2;
+  PartnerSessionRole role = 3;
+  uint64 profile_version = 4;
+  optional string parent_session_id = 5;
+  optional string delegation_id = 6;
+  string display_name = 7;
+  bool available = 8;
+  bool read_only = 9;
+  bool archived = 10;
+  bool deleted = 11;
+  google.protobuf.Timestamp created_at = 12;
+  optional google.protobuf.Timestamp last_activity_at = 13;
+}
+
+message PartnerPrivateThread {
+  string thread_id = 1;
+  string first_partner_id = 2;
+  string second_partner_id = 3;
+  PartnerPrivateThreadStatus status = 4;
+  optional PartnerPrivateThreadCloseReason close_reason = 5;
+  uint32 message_count = 6;
+  uint32 max_messages = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  optional google.protobuf.Timestamp blocked_until = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  optional google.protobuf.Timestamp closed_at = 12;
+}
+
+message PartnerPrivateMessage {
+  string message_id = 1;
+  string thread_id = 2;
+  uint64 sequence = 3;
+  string sender_partner_id = 4;
+  string recipient_partner_id = 5;
+  string content = 6;
+  PartnerPrivateMessageDeliveryStatus delivery_status = 7;
+  google.protobuf.Timestamp created_at = 8;
+  optional google.protobuf.Timestamp delivered_at = 9;
+}
+
+message PartnerPrivateThreadReadState {
+  string thread_id = 1;
+  string partner_id = 2;
+  uint64 through_sequence = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+message PartnerDelegation {
+  string delegation_id = 1;
+  Revision revision = 2;
+  string requester_partner_id = 3;
+  string target_partner_id = 4;
+  string parent_session_id = 5;
+  uint64 target_profile_version = 6;
+  string title = 7;
+  string objective = 8;
+  PartnerDelegationStatus status = 9;
+  optional string child_session_id = 10;
+  optional string run_id = 11;
+  optional string result_summary = 12;
+  optional string error = 13;
+  uint64 artifact_count = 14;
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+  optional google.protobuf.Timestamp started_at = 17;
+  optional google.protobuf.Timestamp completed_at = 18;
 }
 
 message PartnerDirectory {
@@ -186,4 +307,77 @@ message UpdatePartnerDefaultsRequest {
 message UpdatePartnerDefaultsResponse {
   PartnerDirectory directory = 1;
   repeated PartnerProfile affected_partners = 2;
+}
+
+message ListPartnerSessionsRequest {
+  string partner_id = 1;
+}
+
+message ListPartnerSessionsResponse {
+  repeated PartnerSession sessions = 1;
+}
+
+message MarkPartnerReadRequest {
+  string partner_id = 1;
+  Revision through_cursor = 2;
+}
+
+message MarkPartnerReadResponse {
+  PartnerActivity activity = 1;
+}
+
+message ListPartnerPrivateThreadsRequest {
+  string partner_id = 1;
+}
+
+message ListPartnerPrivateThreadsResponse {
+  repeated PartnerPrivateThread threads = 1;
+}
+
+message GetPartnerPrivateThreadRequest {
+  string partner_id = 1;
+  string thread_id = 2;
+}
+
+message GetPartnerPrivateThreadResponse {
+  PartnerPrivateThread thread = 1;
+  repeated PartnerPrivateMessage messages = 2;
+  optional PartnerPrivateThreadReadState read_state = 3;
+}
+
+message MarkPartnerPrivateThreadReadRequest {
+  string partner_id = 1;
+  string thread_id = 2;
+  uint64 through_sequence = 3;
+}
+
+message MarkPartnerPrivateThreadReadResponse {
+  PartnerPrivateThreadReadState read_state = 1;
+}
+
+message ListPartnerDelegationsRequest {
+  string partner_id = 1;
+}
+
+message ListPartnerDelegationsResponse {
+  repeated PartnerDelegation delegations = 1;
+}
+
+message GetPartnerDelegationRequest {
+  string partner_id = 1;
+  string delegation_id = 2;
+}
+
+message GetPartnerDelegationResponse {
+  PartnerDelegation delegation = 1;
+}
+
+message CancelPartnerDelegationRequest {
+  string partner_id = 1;
+  string delegation_id = 2;
+  Revision expected_revision = 3;
+}
+
+message CancelPartnerDelegationResponse {
+  PartnerDelegation delegation = 1;
 }

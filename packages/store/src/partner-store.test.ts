@@ -178,6 +178,179 @@ describe("PartnerStore", () => {
     database.close();
     expect(() => new PartnerStore(fixture.path)).toThrowError(PartnerStoreError);
   });
+
+  it("preserves canonical Session history and advances read state monotonically", () => {
+    const store = memoryStore(["partner-one"]);
+    const ready = readyPartner(store, "partner-one", "Aster", "session-one");
+    const replaced = store.replaceCanonicalSession({
+      partnerId: ready.id,
+      expectedRevision: ready.revision,
+      expectedProfileVersion: ready.profileVersion,
+      expectedCanonicalSessionId: "session-one",
+      sessionId: "session-two"
+    });
+
+    expect(store.listSessionLinks(ready.id)).toEqual([
+      expect.objectContaining({ sessionId: "session-two", partnerId: ready.id, role: "canonical" }),
+      expect.objectContaining({ sessionId: "session-one", partnerId: ready.id, role: "history" })
+    ]);
+    expect(store.findPartnerBySession("session-one")?.id).toBe(ready.id);
+    expect(store.findPartnerBySession("session-two")?.id).toBe(ready.id);
+    expect(replaced.canonicalSessionId).toBe("session-two");
+    expect(store.markRead(ready.id, 8n).throughCursor).toBe(8n);
+    expect(store.markRead(ready.id, 3n).throughCursor).toBe(8n);
+  });
+
+  it("reserves bounded private messages before delivery and releases failed reservations", () => {
+    let now = 10_000;
+    const ids = ["thread-one", "message-one", "message-two", "message-three", "thread-two", "message-four"];
+    const store = new PartnerStore(":memory:", {
+      now: () => now,
+      idFactory: () => ids.shift() ?? "fallback-id"
+    });
+    cleanups.push(async () => store.close());
+    const first = readyPartner(store, "partner-one", "Aster", "session-one");
+    const second = readyPartner(store, "partner-two", "Beryl", "session-two");
+
+    const firstMessage = store.reservePrivateMessage({
+      senderPartnerId: first.id,
+      recipientPartnerId: second.id,
+      senderSessionId: "session-one",
+      recipientSessionId: "session-two",
+      content: "Please inspect the failing boundary."
+    });
+    expect(firstMessage).toMatchObject({
+      remainingMessages: 11,
+      conversationEnded: false,
+      message: { deliveryStatus: "pending", sequence: 1 },
+      thread: { status: "active", messageCount: 1, maxMessages: 12 }
+    });
+    expect(store.listPendingPrivateMessages()).toHaveLength(1);
+    expect(store.markPrivateMessageDelivered(firstMessage.message.id, "run-one"))
+      .toMatchObject({ deliveryStatus: "delivered", runId: "run-one" });
+
+    const secondMessage = store.reservePrivateMessage({
+      senderPartnerId: first.id,
+      recipientPartnerId: second.id,
+      senderSessionId: "session-one",
+      recipientSessionId: "session-two",
+      content: "One additional detail."
+    });
+    expectStoreError(() => store.reservePrivateMessage({
+      senderPartnerId: first.id,
+      recipientPartnerId: second.id,
+      senderSessionId: "session-one",
+      recipientSessionId: "session-two",
+      content: "This third consecutive message must wait."
+    }), "PARTNER_PRIVATE_WAIT");
+    expect(store.markPrivateMessageFailed(secondMessage.message.id, "Target queue rejected the input."))
+      .toMatchObject({ deliveryStatus: "failed" });
+    expect(store.getPrivateThread(firstMessage.thread.id, first.id).messages).toHaveLength(1);
+
+    expect(store.markPrivateThreadRead(firstMessage.thread.id, first.id, 1).throughSequence).toBe(1);
+    expect(store.markPrivateThreadRead(firstMessage.thread.id, first.id, 0).throughSequence).toBe(1);
+    now += 15 * 60_000;
+    expect(store.listPrivateThreads(first.id)).toContainEqual(expect.objectContaining({
+      id: firstMessage.thread.id,
+      status: "closed",
+      closeReason: "idle_timeout"
+    }));
+    const afterIdle = store.reservePrivateMessage({
+      senderPartnerId: second.id,
+      recipientPartnerId: first.id,
+      senderSessionId: "session-two",
+      recipientSessionId: "session-one",
+      content: "Starting a fresh round after the idle boundary."
+    });
+    expect(afterIdle.thread.id).not.toBe(firstMessage.thread.id);
+    expect(store.getPrivateThread(firstMessage.thread.id).thread).toMatchObject({
+      status: "closed",
+      closeReason: "idle_timeout"
+    });
+  });
+
+  it("replays a stable private-message reservation without consuming another slot", () => {
+    const store = memoryStore(["thread-one", "unused"]);
+    const first = readyPartner(store, "partner-one", "Aster", "session-one");
+    const second = readyPartner(store, "partner-two", "Beryl", "session-two");
+    const input = {
+      id: "message-stable",
+      senderPartnerId: first.id,
+      recipientPartnerId: second.id,
+      senderSessionId: "session-one",
+      recipientSessionId: "session-two",
+      content: "Deliver this exactly once."
+    } as const;
+
+    const reserved = store.reservePrivateMessage(input);
+    const replay = store.reservePrivateMessage(input);
+
+    expect(replay).toEqual(reserved);
+    expect(store.getPrivateThread(reserved.thread.id, first.id).messages).toEqual([reserved.message]);
+    expectStoreError(() => store.reservePrivateMessage({ ...input, content: "Different body." }), "PARTNER_INVALID");
+  });
+
+  it("persists revision-fenced delegation recovery and target Session ownership", () => {
+    const store = memoryStore(["generated"]);
+    const requester = readyPartner(store, "partner-one", "Aster", "session-one");
+    const target = readyPartner(store, "partner-two", "Beryl", "session-two");
+    const created = store.createDelegation({
+      id: "delegation-one",
+      requesterPartnerId: requester.id,
+      targetPartnerId: target.id,
+      parentSessionId: "session-one",
+      title: "Inspect retry safety",
+      objective: "Inspect the retry path and report concrete evidence."
+    });
+    expect(store.listRecoverableDelegations()).toEqual([created]);
+    const bound = store.bindDelegationSession(created.id, created.revision, "session-child");
+    expect(store.getSessionLink("session-child")).toMatchObject({
+      partnerId: target.id,
+      role: "delegation",
+      delegationId: created.id,
+      parentSessionId: "session-one"
+    });
+    expectStoreError(
+      () => store.transitionDelegation({ delegationId: created.id, expectedRevision: created.revision, status: "queued" }),
+      "PARTNER_DELEGATION_CHANGED"
+    );
+    expectStoreError(
+      () => store.transitionDelegation({ delegationId: bound.id, expectedRevision: bound.revision, status: "queued" }),
+      "PARTNER_INVALID"
+    );
+    const queued = store.transitionDelegation({
+      delegationId: bound.id,
+      expectedRevision: bound.revision,
+      status: "queued",
+      runId: "run-child"
+    });
+    const running = store.transitionDelegation({
+      delegationId: queued.id,
+      expectedRevision: queued.revision,
+      status: "running"
+    });
+    const completed = store.transitionDelegation({
+      delegationId: running.id,
+      expectedRevision: running.revision,
+      status: "completed",
+      resultSummary: "The retry path is idempotent."
+    });
+    expect(completed).toMatchObject({
+      status: "completed",
+      childSessionId: "session-child",
+      runId: "run-child",
+      resultSummary: "The retry path is idempotent."
+    });
+    expect(store.createDelegation({
+      id: "delegation-one",
+      requesterPartnerId: requester.id,
+      targetPartnerId: target.id,
+      parentSessionId: "session-one",
+      title: "Inspect retry safety",
+      objective: "Inspect the retry path and report concrete evidence."
+    })).toEqual(completed);
+    expect(store.listRecoverableDelegations()).toEqual([]);
+  });
 });
 
 function capabilities(): PartnerCapabilitiesRecord {
@@ -201,6 +374,27 @@ function draft(displayName: string) {
     capabilities: capabilities(),
     usesDirectoryDefaults: false
   } as const;
+}
+
+function readyPartner(
+  store: PartnerStore,
+  id: string,
+  displayName: string,
+  sessionId: string
+) {
+  const created = store.createPartner({
+    expectedDirectoryRevision: store.directoryState().revision,
+    id,
+    homeTargetId: `home-${id}`,
+    ...draft(displayName)
+  });
+  const bound = store.bindCanonicalSession({
+    partnerId: created.id,
+    expectedRevision: created.revision,
+    expectedProfileVersion: created.profileVersion,
+    sessionId
+  });
+  return store.markReady(bound.id, bound.revision);
 }
 
 function memoryStore(ids: string[]): PartnerStore {

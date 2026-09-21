@@ -244,22 +244,43 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "updatePartner",
     "setPartnerLifecycle",
     "retryPartnerInitialization",
-    "updatePartnerDefaults"
+    "updatePartnerDefaults",
+    "listPartnerSessions",
+    "markPartnerRead",
+    "listPartnerPrivateThreads",
+    "getPartnerPrivateThread",
+    "markPartnerPrivateThreadRead",
+    "listPartnerDelegations",
+    "getPartnerDelegation",
+    "cancelPartnerDelegation"
   ]);
   assertNoFields([
     contract.PartnerDirectorySchema,
     contract.PartnerProfileSchema,
     contract.PartnerTemplateSchema,
     contract.PartnerDraftSchema,
-    contract.PartnerPatchSchema
+    contract.PartnerPatchSchema,
+    contract.PartnerActivitySchema,
+    contract.PartnerSessionSchema,
+    contract.PartnerPrivateThreadSchema,
+    contract.PartnerPrivateMessageSchema,
+    contract.PartnerPrivateThreadReadStateSchema,
+    contract.PartnerDelegationSchema
   ], [
     "absolute_path", "workspace_root", "database_path", "credential", "credential_reference_id",
-    "auth_key", "operation_id", "raw_error", "error_message"
+    "auth_key", "operation_id", "create_operation_id", "enqueue_operation_id", "raw_error", "error_message",
+    "sender_session_id", "recipient_session_id"
   ]);
   assert.equal(field(contract.PartnerProfileSchema, "canonical_session_id").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "display_name").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "permission_mode").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "uses_directory_defaults").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerSessionSchema, "delegation_id").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPrivateThreadSchema, "close_reason").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPrivateMessageSchema, "delivered_at").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerDelegationSchema, "child_session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerDelegationSchema, "result_summary").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerDelegationSchema, "error").proto.proto3Optional, true);
 });
 
 test("discovery metadata is a closed public allowlist", () => {

@@ -1,9 +1,14 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
+  PartnerDelegationStatus,
   PartnerInitializationState,
   PartnerInvitationStage,
   PartnerLifecycle,
+  PartnerPrivateMessageDeliveryStatus,
+  PartnerPrivateThreadCloseReason,
+  PartnerPrivateThreadStatus,
+  PartnerSessionRole,
   PermissionMode
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -50,8 +55,36 @@ describe("Partner gateway", () => {
       permissionMode: "ask",
       planMode: false
     }, signal);
+    await expect(gateway.listPartnerSessions("partner-one", signal)).resolves.toEqual([
+      expect.objectContaining({ sessionId: "session-one", role: "canonical", readOnly: false })
+    ]);
+    await expect(gateway.markPartnerRead("partner-one", 12n, signal)).resolves.toMatchObject({
+      readThroughCursor: 12n,
+      unreadReplyCount: 0
+    });
+    await expect(gateway.listPartnerPrivateThreads("partner-one", signal)).resolves.toEqual([
+      expect.objectContaining({ id: "thread-one", status: "closed", closeReason: "messageLimit" })
+    ]);
+    await expect(gateway.getPartnerPrivateThread("partner-one", "thread-one", signal)).resolves.toMatchObject({
+      thread: { id: "thread-one" },
+      messages: [{ id: "message-one", deliveryStatus: "delivered" }]
+    });
+    await expect(gateway.markPartnerPrivateThreadRead("partner-one", "thread-one", 1, signal))
+      .resolves.toMatchObject({ throughSequence: 1 });
+    await expect(gateway.listPartnerDelegations("partner-one", signal)).resolves.toEqual([
+      expect.objectContaining({ id: "delegation-one", status: "running" })
+    ]);
+    await expect(gateway.getPartnerDelegation("partner-one", "delegation-one", signal))
+      .resolves.toMatchObject({ id: "delegation-one", childSessionId: "session-child" });
+    await expect(gateway.cancelPartnerDelegation("partner-one", "delegation-one", 3n, signal))
+      .resolves.toMatchObject({ id: "delegation-one" });
 
-    const methods = ["getPartnerDirectory", "listPartners", "getPartner", "createPartner", "updatePartner", "setPartnerLifecycle", "retryPartnerInitialization", "updatePartnerDefaults"];
+    const methods = [
+      "getPartnerDirectory", "listPartners", "getPartner", "createPartner", "updatePartner",
+      "setPartnerLifecycle", "retryPartnerInitialization", "updatePartnerDefaults",
+      "listPartnerSessions", "markPartnerRead", "listPartnerPrivateThreads", "getPartnerPrivateThread",
+      "markPartnerPrivateThreadRead", "listPartnerDelegations", "getPartnerDelegation", "cancelPartnerDelegation"
+    ];
     expect(requests.filter((entry) => methods.includes(entry.method)).map((entry) => entry.method)).toEqual(methods);
     expect(requests.find((entry) => entry.method === "listPartners")?.input).toEqual({ lifecycle: PartnerLifecycle.ACTIVE });
     expect(requests.find((entry) => entry.method === "createPartner")?.input).toMatchObject({
@@ -98,6 +131,44 @@ describe("Partner gateway", () => {
     await expect(gateway.listPartners()).rejects.toThrow(/incomplete Partner profile/iu);
     gateway.disconnect();
   });
+
+  it("fails closed when private-thread or delegation ownership drifts", async () => {
+    let mode: "thread" | "delegation" | "state" = "thread";
+    const transport = partnerTransport((method) => {
+      if (method === "getPartnerPrivateThread" && mode === "thread") {
+        return {
+          thread: privateThread(),
+          messages: [{ ...privateMessage(), senderPartnerId: "partner-other" }],
+          readState: privateReadState()
+        };
+      }
+      if (method === "listPartnerDelegations" && mode === "delegation") {
+        return { delegations: [{ ...delegation(), requesterPartnerId: "partner-other" }] };
+      }
+      if (method === "getPartnerDelegation" && mode === "state") {
+        return {
+          delegation: {
+            ...delegation(),
+            status: PartnerDelegationStatus.COMPLETED,
+            completedAt: timestamp(6n)
+          }
+        };
+      }
+      return partnerResponse(method);
+    });
+    const gateway = connectedGateway(transport);
+    await gateway.connect();
+
+    await expect(gateway.getPartnerPrivateThread("partner-one", "thread-one"))
+      .rejects.toThrow(/mismatched Partner private thread/iu);
+    mode = "delegation";
+    await expect(gateway.listPartnerDelegations("partner-one"))
+      .rejects.toThrow(/owned by another Partner/iu);
+    mode = "state";
+    await expect(gateway.getPartnerDelegation("partner-one", "delegation-one"))
+      .rejects.toThrow(/inconsistent Partner delegation/iu);
+    gateway.disconnect();
+  });
 });
 
 function connectedGateway(transport: Transport) {
@@ -128,6 +199,15 @@ function partnerResponse(method: string): object {
   if (method === "listPartners") return { partners: [profile()], directory: directory() };
   if (method === "getPartner") return { partner: profile() };
   if (method === "updatePartnerDefaults") return { directory: directory(), affectedPartners: [profile()] };
+  if (method === "listPartnerSessions") return { sessions: [partnerSession()] };
+  if (method === "markPartnerRead") return { activity: activity(12n, 0n) };
+  if (method === "listPartnerPrivateThreads") return { threads: [privateThread()] };
+  if (method === "getPartnerPrivateThread") {
+    return { thread: privateThread(), messages: [privateMessage()], readState: privateReadState() };
+  }
+  if (method === "markPartnerPrivateThreadRead") return { readState: privateReadState() };
+  if (method === "listPartnerDelegations") return { delegations: [delegation()] };
+  if (method === "getPartnerDelegation" || method === "cancelPartnerDelegation") return { delegation: delegation() };
   if (["createPartner", "updatePartner", "setPartnerLifecycle", "retryPartnerInitialization"].includes(method)) {
     return { partner: profile(), directory: directory() };
   }
@@ -172,7 +252,91 @@ function profile() {
     capabilities: capabilities(),
     createdAt: timestamp(1n),
     updatedAt: timestamp(3n),
-    usesDirectoryDefaults: true
+    usesDirectoryDefaults: true,
+    activity: activity(4n, 2n)
+  };
+}
+function activity(readThrough = 4n, unread = 2n) {
+  return {
+    partnerId: "partner-one",
+    unreadReplyCount: unread,
+    latestReplyCursor: revision(12n),
+    latestReplyAt: timestamp(6n),
+    artifactCount: 3n,
+    activeDelegationCount: 1n,
+    readThroughCursor: revision(readThrough),
+    readUpdatedAt: timestamp(5n)
+  };
+}
+function partnerSession() {
+  return {
+    sessionId: "session-one",
+    partnerId: "partner-one",
+    role: PartnerSessionRole.CANONICAL,
+    profileVersion: 2n,
+    displayName: "Aster",
+    available: true,
+    readOnly: false,
+    archived: false,
+    deleted: false,
+    createdAt: timestamp(1n),
+    lastActivityAt: timestamp(6n)
+  };
+}
+function privateThread() {
+  return {
+    threadId: "thread-one",
+    firstPartnerId: "partner-one",
+    secondPartnerId: "partner-two",
+    status: PartnerPrivateThreadStatus.CLOSED,
+    closeReason: PartnerPrivateThreadCloseReason.MESSAGE_LIMIT,
+    messageCount: 1,
+    maxMessages: 12,
+    expiresAt: timestamp(20n),
+    blockedUntil: timestamp(20n),
+    createdAt: timestamp(2n),
+    updatedAt: timestamp(3n),
+    closedAt: timestamp(3n)
+  };
+}
+function privateMessage() {
+  return {
+    messageId: "message-one",
+    threadId: "thread-one",
+    sequence: 1n,
+    senderPartnerId: "partner-one",
+    recipientPartnerId: "partner-two",
+    content: "Please inspect the boundary.",
+    deliveryStatus: PartnerPrivateMessageDeliveryStatus.DELIVERED,
+    createdAt: timestamp(2n),
+    deliveredAt: timestamp(2n)
+  };
+}
+function privateReadState() {
+  return {
+    threadId: "thread-one",
+    partnerId: "partner-one",
+    throughSequence: 1n,
+    updatedAt: timestamp(4n)
+  };
+}
+function delegation() {
+  return {
+    delegationId: "delegation-one",
+    revision: revision(3n),
+    requesterPartnerId: "partner-one",
+    targetPartnerId: "partner-two",
+    parentSessionId: "session-one",
+    targetProfileVersion: 2n,
+    title: "Inspect retry safety",
+    objective: "Inspect the retry boundary.",
+    status: PartnerDelegationStatus.RUNNING,
+    childSessionId: "session-child",
+    runId: "run-child",
+    artifactCount: 2n,
+    createdAt: timestamp(4n),
+    updatedAt: timestamp(5n),
+    startedAt: timestamp(5n)
   };
 }
 function response(method: any, message: any, stream = false): any {

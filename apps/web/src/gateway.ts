@@ -77,7 +77,12 @@ import {
   PartnerInitializationErrorCode,
   PartnerInitializationState,
   PartnerInvitationStage,
+  PartnerDelegationStatus,
   PartnerLifecycle,
+  PartnerPrivateMessageDeliveryStatus,
+  PartnerPrivateThreadCloseReason,
+  PartnerPrivateThreadStatus,
+  PartnerSessionRole,
   PartnerService,
   CredentialKind,
   CredentialService,
@@ -325,8 +330,14 @@ import {
   type ContactSyncStatus as ProtoContactSyncStatus,
   type ContactVCardImportPreviewEntry as ProtoContactVCardImportPreviewEntry,
   type PartnerCapabilities as ProtoPartnerCapabilities,
+  type PartnerActivity as ProtoPartnerActivity,
+  type PartnerDelegation as ProtoPartnerDelegation,
   type PartnerDirectory as ProtoPartnerDirectory,
+  type PartnerPrivateMessage as ProtoPartnerPrivateMessage,
+  type PartnerPrivateThread as ProtoPartnerPrivateThread,
+  type PartnerPrivateThreadReadState as ProtoPartnerPrivateThreadReadState,
   type PartnerProfile as ProtoPartnerProfile,
+  type PartnerSession as ProtoPartnerSession,
   type CollaborationDirectory as ProtoCollaborationDirectory,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
@@ -568,6 +579,9 @@ import type {
   ManagedModelRuntimeView,
   OperationApi,
   PartnerCapabilitiesView,
+  PartnerActivityView,
+  PartnerDelegationStatusView,
+  PartnerDelegationView,
   PartnerDefaultsMutationView,
   PartnerDirectoryView,
   PartnerDraftView,
@@ -579,7 +593,16 @@ import type {
   PartnerModelRouteView,
   PartnerMutationView,
   PartnerPatchView,
+  PartnerPrivateMessageDeliveryStatusView,
+  PartnerPrivateMessageView,
+  PartnerPrivateThreadCloseReasonView,
+  PartnerPrivateThreadDetailView,
+  PartnerPrivateThreadReadStateView,
+  PartnerPrivateThreadStatusView,
+  PartnerPrivateThreadView,
   PartnerProfileView,
+  PartnerSessionRoleView,
+  PartnerSessionView,
   PermissionArgumentView,
   PermissionMode,
   PermissionSubjectView,
@@ -5893,6 +5916,163 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       directory: mapPartnerDirectory(response.directory),
       affectedPartners: response.affectedPartners.map(mapPartnerProfile)
     };
+  }
+
+  async listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerSessions(
+      { partnerId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const sessions = response.sessions.map(mapPartnerSession);
+    if (sessions.some((session) => session.partnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a Partner task owned by another profile.");
+    }
+    return sessions;
+  }
+
+  async markPartnerRead(
+    partnerId: string,
+    throughCursor: bigint,
+    signal?: AbortSignal
+  ): Promise<PartnerActivityView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).markPartnerRead({
+      partnerId,
+      throughCursor: { value: throughCursor }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const activity = mapPartnerActivity(response.activity);
+    if (activity.partnerId !== partnerId || activity.readThroughCursor < throughCursor) {
+      throw new GatewayError("Orchestrator returned activity owned by another Partner.");
+    }
+    return activity;
+  }
+
+  async listPartnerPrivateThreads(
+    partnerId: string,
+    signal?: AbortSignal
+  ): Promise<readonly PartnerPrivateThreadView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerPrivateThreads(
+      { partnerId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const threads = response.threads.map(mapPartnerPrivateThread);
+    if (threads.some((thread) => thread.firstPartnerId !== partnerId && thread.secondPartnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a private thread owned by other Partners.");
+    }
+    return threads;
+  }
+
+  async getPartnerPrivateThread(
+    partnerId: string,
+    threadId: string,
+    signal?: AbortSignal
+  ): Promise<PartnerPrivateThreadDetailView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerPrivateThread(
+      { partnerId, threadId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const thread = mapPartnerPrivateThread(response.thread);
+    const messages = response.messages.map(mapPartnerPrivateMessage);
+    const readState = response.readState === undefined ? undefined : mapPartnerPrivateReadState(response.readState);
+    let previousSequence = 0;
+    if (thread.id !== threadId
+      || (thread.firstPartnerId !== partnerId && thread.secondPartnerId !== partnerId)
+      || thread.messageCount !== messages.length
+      || messages.some((message) => {
+        const participantsMatch = message.senderPartnerId === thread.firstPartnerId
+          && message.recipientPartnerId === thread.secondPartnerId
+          || message.senderPartnerId === thread.secondPartnerId
+          && message.recipientPartnerId === thread.firstPartnerId;
+        const valid = message.threadId === thread.id && participantsMatch && message.sequence > previousSequence;
+        previousSequence = message.sequence;
+        return !valid;
+      })
+      || (readState !== undefined && (
+        readState.threadId !== thread.id || readState.partnerId !== partnerId
+        || readState.throughSequence > (messages.at(-1)?.sequence ?? 0)
+      ))) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner private thread.");
+    }
+    return { thread, messages, ...(readState === undefined ? {} : { readState }) };
+  }
+
+  async markPartnerPrivateThreadRead(
+    partnerId: string,
+    threadId: string,
+    throughSequence: number,
+    signal?: AbortSignal
+  ): Promise<PartnerPrivateThreadReadStateView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).markPartnerPrivateThreadRead({
+      partnerId,
+      threadId,
+      throughSequence: BigInt(throughSequence)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const readState = mapPartnerPrivateReadState(response.readState);
+    if (readState.partnerId !== partnerId || readState.threadId !== threadId
+      || readState.throughSequence < throughSequence) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner private read state.");
+    }
+    return readState;
+  }
+
+  async listPartnerDelegations(
+    partnerId: string,
+    signal?: AbortSignal
+  ): Promise<readonly PartnerDelegationView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerDelegations(
+      { partnerId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const delegations = response.delegations.map(mapPartnerDelegation);
+    if (delegations.some((delegation) => delegation.requesterPartnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a delegation owned by another Partner.");
+    }
+    return delegations;
+  }
+
+  async getPartnerDelegation(
+    partnerId: string,
+    delegationId: string,
+    signal?: AbortSignal
+  ): Promise<PartnerDelegationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerDelegation(
+      { partnerId, delegationId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const delegation = mapPartnerDelegation(response.delegation);
+    if (delegation.id !== delegationId
+      || (delegation.requesterPartnerId !== partnerId && delegation.targetPartnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner delegation.");
+    }
+    return delegation;
+  }
+
+  async cancelPartnerDelegation(
+    partnerId: string,
+    delegationId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<PartnerDelegationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).cancelPartnerDelegation({
+      partnerId,
+      delegationId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const delegation = mapPartnerDelegation(response.delegation);
+    if (delegation.id !== delegationId || delegation.requesterPartnerId !== partnerId) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner delegation cancellation.");
+    }
+    return delegation;
   }
 
   async getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView> {
@@ -16442,6 +16622,10 @@ function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfi
     || (initializationState === "ready" && value.canonicalSessionId === undefined)) {
     throw new GatewayError("Orchestrator returned an inconsistent Partner initialization state.");
   }
+  const activity = mapPartnerActivity(value.activity);
+  if (activity.partnerId !== value.partnerId) {
+    throw new GatewayError("Orchestrator returned Partner activity owned by another profile.");
+  }
   return {
     id: value.partnerId,
     revision: requiredPartnerRevision(value.revision, "Partner"),
@@ -16459,8 +16643,235 @@ function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfi
     capabilities: mapPartnerCapabilities(value.capabilities),
     usesDirectoryDefaults: value.usesDirectoryDefaults,
     createdAt: requiredContactTimestamp(value.createdAt, "Partner creation"),
-    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner update")
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner update"),
+    activity
   };
+}
+
+function mapPartnerActivity(value: ProtoPartnerActivity | undefined): PartnerActivityView {
+  if (value === undefined || value.partnerId.trim() === "") {
+    throw new GatewayError("Orchestrator returned an incomplete Partner activity summary.");
+  }
+  if ((value.latestReplyCursor === undefined) !== (value.latestReplyAt === undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner latest reply.");
+  }
+  return {
+    partnerId: value.partnerId,
+    unreadReplyCount: safePartnerCount(value.unreadReplyCount, "Partner unread reply count"),
+    ...(value.latestReplyCursor === undefined
+      ? {}
+      : { latestReplyCursor: partnerCursor(value.latestReplyCursor, "Partner latest reply cursor") }),
+    ...(value.latestReplyAt === undefined
+      ? {}
+      : { latestReplyAt: requiredContactTimestamp(value.latestReplyAt, "Partner latest reply") }),
+    artifactCount: safePartnerCount(value.artifactCount, "Partner Artifact count"),
+    activeDelegationCount: safePartnerCount(value.activeDelegationCount, "Partner active delegation count"),
+    readThroughCursor: partnerCursor(value.readThroughCursor, "Partner read cursor"),
+    readUpdatedAt: requiredContactTimestamp(value.readUpdatedAt, "Partner read update")
+  };
+}
+
+function mapPartnerSession(value: ProtoPartnerSession): PartnerSessionView {
+  if (value.sessionId.trim() === "" || value.partnerId.trim() === "" || value.displayName.trim() === ""
+    || value.profileVersion < 1n || value.parentSessionId?.trim() === "" || value.delegationId?.trim() === "") {
+    throw new GatewayError("Orchestrator returned an incomplete Partner task link.");
+  }
+  const role: PartnerSessionRoleView = value.role === PartnerSessionRole.CANONICAL ? "canonical"
+    : value.role === PartnerSessionRole.HISTORY ? "history"
+      : value.role === PartnerSessionRole.DELEGATION ? "delegation"
+        : (() => { throw new GatewayError("Orchestrator returned an unknown Partner task role."); })();
+  if ((role === "delegation") !== (value.parentSessionId !== undefined)
+    || (role === "delegation") !== (value.delegationId !== undefined)
+    || (role !== "canonical" && !value.readOnly)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner task link.");
+  }
+  return {
+    sessionId: value.sessionId,
+    partnerId: value.partnerId,
+    role,
+    profileVersion: value.profileVersion,
+    ...(value.parentSessionId === undefined ? {} : { parentSessionId: value.parentSessionId }),
+    ...(value.delegationId === undefined ? {} : { delegationId: value.delegationId }),
+    displayName: value.displayName,
+    available: value.available,
+    readOnly: value.readOnly,
+    archived: value.archived,
+    deleted: value.deleted,
+    createdAt: requiredContactTimestamp(value.createdAt, "Partner task creation"),
+    ...(value.lastActivityAt === undefined
+      ? {}
+      : { lastActivityAt: requiredContactTimestamp(value.lastActivityAt, "Partner task activity") })
+  };
+}
+
+function mapPartnerPrivateThread(value: ProtoPartnerPrivateThread | undefined): PartnerPrivateThreadView {
+  if (value === undefined || value.threadId.trim() === "" || value.firstPartnerId.trim() === ""
+    || value.secondPartnerId.trim() === "" || value.firstPartnerId === value.secondPartnerId
+    || value.messageCount > value.maxMessages || value.maxMessages < 1) {
+    throw new GatewayError("Orchestrator returned an invalid Partner private thread.");
+  }
+  const status: PartnerPrivateThreadStatusView = value.status === PartnerPrivateThreadStatus.ACTIVE ? "active"
+    : value.status === PartnerPrivateThreadStatus.CLOSED ? "closed"
+      : (() => { throw new GatewayError("Orchestrator returned an unknown Partner private thread status."); })();
+  const closeReason: PartnerPrivateThreadCloseReasonView | undefined = value.closeReason === undefined
+    ? undefined
+    : value.closeReason === PartnerPrivateThreadCloseReason.MESSAGE_LIMIT ? "messageLimit"
+      : value.closeReason === PartnerPrivateThreadCloseReason.IDLE_TIMEOUT ? "idleTimeout"
+        : (() => { throw new GatewayError("Orchestrator returned an unknown Partner private thread close reason."); })();
+  const expiresAt = requiredContactTimestamp(value.expiresAt, "Partner private thread expiry");
+  const blockedUntil = value.blockedUntil === undefined
+    ? undefined
+    : requiredContactTimestamp(value.blockedUntil, "Partner private thread cooldown");
+  const createdAt = requiredContactTimestamp(value.createdAt, "Partner private thread creation");
+  const updatedAt = requiredContactTimestamp(value.updatedAt, "Partner private thread update");
+  const closedAt = value.closedAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.closedAt, "Partner private thread closure");
+  if ((status === "active") !== (closeReason === undefined)
+    || (status === "active") !== (closedAt === undefined)
+    || (closeReason === "messageLimit") !== (blockedUntil !== undefined)
+    || updatedAt < createdAt || expiresAt < createdAt
+    || (closedAt !== undefined && closedAt < createdAt)
+    || (blockedUntil !== undefined && blockedUntil < createdAt)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner private thread.");
+  }
+  return {
+    id: value.threadId,
+    firstPartnerId: value.firstPartnerId,
+    secondPartnerId: value.secondPartnerId,
+    status,
+    ...(closeReason === undefined ? {} : { closeReason }),
+    messageCount: value.messageCount,
+    maxMessages: value.maxMessages,
+    expiresAt,
+    ...(blockedUntil === undefined ? {} : { blockedUntil }),
+    createdAt,
+    updatedAt,
+    ...(closedAt === undefined ? {} : { closedAt })
+  };
+}
+
+function mapPartnerPrivateMessage(value: ProtoPartnerPrivateMessage): PartnerPrivateMessageView {
+  if (value.messageId.trim() === "" || value.threadId.trim() === "" || value.senderPartnerId.trim() === ""
+    || value.recipientPartnerId.trim() === "" || value.senderPartnerId === value.recipientPartnerId
+    || value.content.trim() === "" || value.sequence < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Partner private message.");
+  }
+  const deliveryStatus: PartnerPrivateMessageDeliveryStatusView =
+    value.deliveryStatus === PartnerPrivateMessageDeliveryStatus.PENDING ? "pending"
+      : value.deliveryStatus === PartnerPrivateMessageDeliveryStatus.DELIVERED ? "delivered"
+        : value.deliveryStatus === PartnerPrivateMessageDeliveryStatus.FAILED ? "failed"
+          : (() => { throw new GatewayError("Orchestrator returned an unknown Partner message state."); })();
+  const createdAt = requiredContactTimestamp(value.createdAt, "Partner private message creation");
+  const deliveredAt = value.deliveredAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.deliveredAt, "Partner private message delivery");
+  if ((deliveryStatus === "delivered") !== (deliveredAt !== undefined)
+    || (deliveredAt !== undefined && deliveredAt < createdAt)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner private message.");
+  }
+  return {
+    id: value.messageId,
+    threadId: value.threadId,
+    sequence: safePartnerCount(value.sequence, "Partner private message sequence"),
+    senderPartnerId: value.senderPartnerId,
+    recipientPartnerId: value.recipientPartnerId,
+    content: value.content,
+    deliveryStatus,
+    createdAt,
+    ...(deliveredAt === undefined ? {} : { deliveredAt })
+  };
+}
+
+function mapPartnerPrivateReadState(
+  value: ProtoPartnerPrivateThreadReadState | undefined
+): PartnerPrivateThreadReadStateView {
+  if (value === undefined || value.threadId.trim() === "" || value.partnerId.trim() === "") {
+    throw new GatewayError("Orchestrator returned an invalid Partner private read state.");
+  }
+  return {
+    threadId: value.threadId,
+    partnerId: value.partnerId,
+    throughSequence: safePartnerCount(value.throughSequence, "Partner private read sequence"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner private read update")
+  };
+}
+
+function mapPartnerDelegation(value: ProtoPartnerDelegation | undefined): PartnerDelegationView {
+  if (value === undefined || value.delegationId.trim() === "" || value.requesterPartnerId.trim() === ""
+    || value.targetPartnerId.trim() === "" || value.parentSessionId.trim() === ""
+    || value.requesterPartnerId === value.targetPartnerId
+    || value.targetProfileVersion < 1n || value.title.trim() === "" || value.objective.trim() === ""
+    || value.childSessionId?.trim() === "" || value.runId?.trim() === ""
+    || value.resultSummary?.trim() === "" || value.error?.trim() === "") {
+    throw new GatewayError("Orchestrator returned an incomplete Partner delegation.");
+  }
+  const status = partnerDelegationStatus(value.status);
+  const createdAt = requiredContactTimestamp(value.createdAt, "Partner delegation creation");
+  const updatedAt = requiredContactTimestamp(value.updatedAt, "Partner delegation update");
+  const startedAt = value.startedAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.startedAt, "Partner delegation start");
+  const completedAt = value.completedAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.completedAt, "Partner delegation completion");
+  const dispatched = status === "queued" || status === "running" || status === "waiting" || status === "completed";
+  const terminal = status === "completed" || status === "failed" || status === "cancelled";
+  if (updatedAt < createdAt
+    || (startedAt !== undefined && startedAt < createdAt)
+    || (completedAt !== undefined && completedAt < createdAt)
+    || (dispatched && (value.childSessionId === undefined || value.runId === undefined))
+    || (terminal !== (completedAt !== undefined))
+    || ((status === "running" || status === "waiting" || status === "completed") && startedAt === undefined)
+    || ((status === "completed") !== (value.resultSummary !== undefined))
+    || (status === "failed" && value.error === undefined)
+    || (status !== "failed" && status !== "unknown" && value.error !== undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner delegation.");
+  }
+  return {
+    id: value.delegationId,
+    revision: requiredPartnerRevision(value.revision, "Partner delegation"),
+    requesterPartnerId: value.requesterPartnerId,
+    targetPartnerId: value.targetPartnerId,
+    parentSessionId: value.parentSessionId,
+    targetProfileVersion: value.targetProfileVersion,
+    title: value.title,
+    objective: value.objective,
+    status,
+    ...(value.childSessionId === undefined ? {} : { childSessionId: value.childSessionId }),
+    ...(value.runId === undefined ? {} : { runId: value.runId }),
+    ...(value.resultSummary === undefined ? {} : { resultSummary: value.resultSummary }),
+    ...(value.error === undefined ? {} : { error: value.error }),
+    artifactCount: safePartnerCount(value.artifactCount, "Partner delegation Artifact count"),
+    createdAt,
+    updatedAt,
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(completedAt === undefined ? {} : { completedAt })
+  };
+}
+
+function partnerDelegationStatus(value: PartnerDelegationStatus): PartnerDelegationStatusView {
+  if (value === PartnerDelegationStatus.PREPARING) return "preparing";
+  if (value === PartnerDelegationStatus.QUEUED) return "queued";
+  if (value === PartnerDelegationStatus.RUNNING) return "running";
+  if (value === PartnerDelegationStatus.WAITING) return "waiting";
+  if (value === PartnerDelegationStatus.COMPLETED) return "completed";
+  if (value === PartnerDelegationStatus.FAILED) return "failed";
+  if (value === PartnerDelegationStatus.CANCELLED) return "cancelled";
+  if (value === PartnerDelegationStatus.UNKNOWN) return "unknown";
+  throw new GatewayError("Orchestrator returned an unknown Partner delegation status.");
+}
+
+function partnerCursor(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 0n) throw new GatewayError(`Orchestrator returned an invalid ${label}.`);
+  return value.value;
+}
+
+function safePartnerCount(value: bigint, label: string): number {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new GatewayError(`Orchestrator returned an invalid ${label}.`);
+  }
+  return Number(value);
 }
 
 function mapPartnerDirectory(value: ProtoPartnerDirectory | undefined): PartnerDirectoryView {

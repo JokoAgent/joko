@@ -8,10 +8,14 @@ import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import {
   emptySnapshot,
+  type ArtifactView,
   type AppSnapshot,
+  type PartnerDelegationView,
   type PartnerDirectoryView,
   type PartnerMutationView,
-  type PartnerProfileView
+  type PartnerPrivateThreadView,
+  type PartnerProfileView,
+  type PartnerSessionView
 } from "../model.js";
 import { PartnersPage } from "./PartnersPage.js";
 
@@ -73,6 +77,13 @@ describe("PartnersPage", () => {
     const getPartner = vi.fn(async () => current);
     const view = await mount({ partners: [partner()], focusPartnerId: "partner-one", updatePartner, getPartner });
     const dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    const activityTab = button(dialog, "partners.activity");
+    await act(async () => {
+      activityTab.focus();
+      activityTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      await settle();
+    });
+    expect(document.activeElement).toBe(button(dialog, "partners.profileSettings"));
     const name = required(dialog.querySelector<HTMLInputElement>("input[required]"));
     await act(async () => {
       setNativeValue(name, "Local draft");
@@ -105,6 +116,126 @@ describe("PartnersPage", () => {
     expect(host.textContent).toContain("New owner");
     expect(host.textContent).not.toContain("Old owner");
   });
+
+  it("advances the durable unread cursor before opening the canonical task", async () => {
+    const current = partner({
+      activity: {
+        partnerId: "partner-one",
+        unreadReplyCount: 2,
+        latestReplyCursor: 9n,
+        latestReplyAt: 9_000,
+        artifactCount: 0,
+        activeDelegationCount: 0,
+        readThroughCursor: 4n,
+        readUpdatedAt: 4_000
+      }
+    });
+    const markPartnerRead = vi.fn(async () => ({
+      ...current.activity,
+      unreadReplyCount: 0,
+      readThroughCursor: 9n,
+      readUpdatedAt: 10_000
+    }));
+    const view = await mount({
+      partners: [current],
+      controllerOverrides: { markPartnerRead }
+    });
+
+    await act(async () => { button(view.host, "partners.openTask").click(); await settle(); });
+
+    expect(markPartnerRead).toHaveBeenCalledWith(current.id, 9n);
+    expect(view.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "session-one" });
+    expect(view.host.textContent).not.toContain("partners.unreadReplies");
+  });
+
+  it("shows durable history, private reads, delegated work, and source-attributed files", async () => {
+    const source = partner({
+      activity: {
+        partnerId: "partner-one",
+        unreadReplyCount: 2,
+        latestReplyCursor: 9n,
+        latestReplyAt: 9_000,
+        artifactCount: 1,
+        activeDelegationCount: 1,
+        readThroughCursor: 4n,
+        readUpdatedAt: 4_000
+      }
+    });
+    const target = partner({
+      id: "partner-two",
+      displayName: "Nova",
+      homeTargetId: "partner-home-two",
+      canonicalSessionId: "session-two",
+      activity: {
+        partnerId: "partner-two",
+        unreadReplyCount: 0,
+        artifactCount: 0,
+        activeDelegationCount: 0,
+        readThroughCursor: 0n,
+        readUpdatedAt: 0
+      }
+    });
+    const sessions: readonly PartnerSessionView[] = [
+      partnerSession("session-one", "canonical", "Aster task", false),
+      partnerSession("session-old", "history", "Historical task", true)
+    ];
+    const thread = privateThread();
+    const delegation = partnerDelegation();
+    const artifact: ArtifactView = {
+      id: "artifact-one",
+      blobId: "blob-one",
+      sourceSessionId: "session-old",
+      sourceRevealAvailable: true,
+      title: "Report",
+      kind: "file",
+      fileName: "report.txt",
+      mediaType: "text/plain",
+      byteSize: 12
+    };
+    const markThreadRead = vi.fn(async () => ({ threadId: thread.id, partnerId: source.id, throughSequence: 1, updatedAt: 8_000 }));
+    const cancelDelegation = vi.fn(async () => ({ ...delegation, revision: 2n, status: "cancelled" as const, completedAt: 9_000 }));
+    const view = await mount({
+      partners: [source, target],
+      focusPartnerId: source.id,
+      getPartner: vi.fn(async () => source),
+      controllerOverrides: {
+        listPartnerSessions: vi.fn(async () => sessions),
+        listPartnerPrivateThreads: vi.fn(async () => [thread]),
+        listPartnerDelegations: vi.fn(async () => [delegation]),
+        listSessionArtifacts: vi.fn(async (sessionId: string) => sessionId === "session-old" ? [artifact] : []),
+        getPartnerPrivateThread: vi.fn(async () => ({
+          thread,
+          messages: [{
+            id: "message-one",
+            threadId: thread.id,
+            sequence: 1,
+            senderPartnerId: target.id,
+            recipientPartnerId: source.id,
+            content: "Private result",
+            deliveryStatus: "delivered" as const,
+            createdAt: 7_000,
+            deliveredAt: 7_100
+          }]
+        })),
+        markPartnerPrivateThreadRead: markThreadRead,
+        cancelPartnerDelegation: cancelDelegation
+      }
+    });
+
+    expect(view.host.textContent).toContain("Historical task");
+    expect(view.host.textContent).toContain("partners.readOnly");
+    expect(view.host.textContent).toContain("Report");
+    expect(view.host.textContent).toContain("partners.delegationState.running");
+
+    const privateConversation = required(view.host.querySelector<HTMLButtonElement>(".partner-private-list button"));
+    await act(async () => { privateConversation.click(); await settle(); });
+    expect(view.host.textContent).toContain("Private result");
+    expect(markThreadRead).toHaveBeenCalledWith(source.id, thread.id, 1, expect.any(AbortSignal));
+
+    await act(async () => { button(view.host, "partners.stopDelegation").click(); await settle(); });
+    expect(cancelDelegation).toHaveBeenCalledWith(source.id, delegation.id, 1n);
+    expect(view.host.textContent).toContain("partners.delegationState.cancelled");
+  });
 });
 
 async function mount(overrides: {
@@ -114,6 +245,7 @@ async function mount(overrides: {
   readonly updatePartner?: AppController["updatePartner"];
   readonly getPartner?: AppController["getPartner"];
   readonly setPartnerLifecycle?: AppController["setPartnerLifecycle"];
+  readonly controllerOverrides?: Partial<AppController>;
 }) {
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host); roots.push(root);
@@ -124,7 +256,8 @@ async function mount(overrides: {
     ...(overrides.createPartner === undefined ? {} : { createPartner: overrides.createPartner }),
     ...(overrides.updatePartner === undefined ? {} : { updatePartner: overrides.updatePartner }),
     ...(overrides.getPartner === undefined ? {} : { getPartner: overrides.getPartner }),
-    ...(overrides.setPartnerLifecycle === undefined ? {} : { setPartnerLifecycle: overrides.setPartnerLifecycle })
+    ...(overrides.setPartnerLifecycle === undefined ? {} : { setPartnerLifecycle: overrides.setPartnerLifecycle }),
+    ...overrides.controllerOverrides
   });
   await act(async () => { root.render(page(app, snapshot(), overrides.focusPartnerId)); await settle(); });
   return { host, navigate };
@@ -141,10 +274,22 @@ function controller(overrides: Record<string, unknown> = {}, owner = "owner-one"
     listPartners: vi.fn(async () => ({ partners: [], directory: directory() })),
     createPartner: vi.fn(),
     updatePartner: vi.fn(),
-    getPartner: vi.fn(),
+    getPartner: vi.fn(async () => partner()),
     setPartnerLifecycle: vi.fn(),
     retryPartnerInitialization: vi.fn(),
     updatePartnerDefaults: vi.fn(),
+    listPartnerSessions: vi.fn(async () => []),
+    markPartnerRead: vi.fn(async () => partner().activity),
+    listPartnerPrivateThreads: vi.fn(async () => []),
+    getPartnerPrivateThread: vi.fn(async () => ({ thread: privateThread(), messages: [] })),
+    markPartnerPrivateThreadRead: vi.fn(async () => ({ threadId: "thread-one", partnerId: "partner-one", throughSequence: 0, updatedAt: 0 })),
+    listPartnerDelegations: vi.fn(async () => []),
+    getPartnerDelegation: vi.fn(async () => partnerDelegation()),
+    cancelPartnerDelegation: vi.fn(async () => ({ ...partnerDelegation(), status: "cancelled" as const })),
+    listSessionArtifacts: vi.fn(async () => []),
+    copyArtifactFile: vi.fn(),
+    openArtifactFile: vi.fn(),
+    revealArtifactSource: vi.fn(),
     ...overrides
   } as unknown as AppController;
 }
@@ -198,7 +343,65 @@ function partner(overrides: Partial<PartnerProfileView> = {}): PartnerProfileVie
     id: "partner-one", revision: 8n, profileVersion: 2n, displayName: "Aster", avatar: "orbit",
     identitySource: "You are Aster.", templateId: "general", lifecycle: "active", initializationState: "ready", invitationStage: "ready",
     homeTargetId: "partner-home-one", canonicalSessionId: "session-one", capabilities: capabilities(), usesDirectoryDefaults: true,
+    activity: {
+      partnerId: "partner-one",
+      unreadReplyCount: 0,
+      artifactCount: 0,
+      activeDelegationCount: 0,
+      readThroughCursor: 0n,
+      readUpdatedAt: 0
+    },
     createdAt: 1_000, updatedAt: 3_000, ...overrides
+  };
+}
+
+function partnerSession(sessionId: string, role: PartnerSessionView["role"], displayName: string, readOnly: boolean): PartnerSessionView {
+  return {
+    sessionId,
+    partnerId: "partner-one",
+    role,
+    profileVersion: role === "history" ? 1n : 2n,
+    displayName,
+    available: true,
+    readOnly,
+    archived: false,
+    deleted: false,
+    createdAt: 1_000,
+    lastActivityAt: 7_000
+  };
+}
+
+function privateThread(): PartnerPrivateThreadView {
+  return {
+    id: "thread-one",
+    firstPartnerId: "partner-one",
+    secondPartnerId: "partner-two",
+    status: "active",
+    messageCount: 1,
+    maxMessages: 12,
+    expiresAt: 60_000,
+    createdAt: 1_000,
+    updatedAt: 7_000
+  };
+}
+
+function partnerDelegation(): PartnerDelegationView {
+  return {
+    id: "delegation-one",
+    revision: 1n,
+    requesterPartnerId: "partner-one",
+    targetPartnerId: "partner-two",
+    parentSessionId: "session-one",
+    targetProfileVersion: 2n,
+    title: "Research",
+    objective: "Find the durable answer",
+    status: "running",
+    childSessionId: "delegated-session",
+    runId: "run-one",
+    artifactCount: 0,
+    createdAt: 2_000,
+    updatedAt: 4_000,
+    startedAt: 3_000
   };
 }
 

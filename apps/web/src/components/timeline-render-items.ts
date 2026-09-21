@@ -1,4 +1,5 @@
 import type { SessionView, TimelineItemView } from "../model.js";
+import { readPartnerDelegationCardData } from "./partner-delegation-card-data.js";
 
 /** History-window guard: a larger interval is treated as missing history. */
 export const TIMELINE_WORK_HISTORY_GAP_MS = 30 * 60 * 1_000;
@@ -59,7 +60,9 @@ export interface TimelineRenderProjectionOptions {
  * run-complete / stopped / retry notices omit it and remain visible boundaries.
  */
 export function isTimelineWorkActivity(item: TimelineItemView): boolean {
-  return item.inlinePlan === undefined && (item.kind === "tool"
+  return item.inlinePlan === undefined
+    && (item.tool === undefined || readPartnerDelegationCardData(item.tool) === undefined)
+    && (item.kind === "tool"
     || item.kind === "toolResult"
     || item.kind === "thinking"
     || (item.kind === "status" && item.streaming !== undefined));

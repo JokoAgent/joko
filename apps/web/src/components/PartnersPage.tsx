@@ -13,7 +13,7 @@ import {
   Trash2,
   UserRoundPlus
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 
 import type { AppController } from "../controller.js";
@@ -22,16 +22,23 @@ import type {
   BackendView,
   ModelView,
   PartnerCapabilitiesView,
+  ArtifactView,
+  PartnerDelegationView,
   PartnerDirectoryView,
   PartnerDraftView,
   PartnerLifecycleView,
   PartnerModelRouteView,
   PartnerMutationView,
   PartnerPatchView,
+  PartnerPrivateThreadDetailView,
+  PartnerPrivateThreadView,
   PartnerProfileView,
+  PartnerSessionView,
   PartnerTemplateView
 } from "../model.js";
-import { Button, CheckboxControl, IconButton, Modal, Pill, SelectControl, Spinner, cx } from "./ui.js";
+import { NativeFileActionsMenu } from "./NativeFileCopyMenu.js";
+import { formatPartnerDuration, partnerDelegationActive } from "./PartnerDelegationInlineCard.js";
+import { Button, CheckboxControl, IconButton, Modal, Pill, SelectControl, Spinner, cx, formatBytes } from "./ui.js";
 import type { Translator } from "./types.js";
 import "./partners-page.css";
 
@@ -141,6 +148,30 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
       if (ownerRef.current === ownerKey) setPending(partner.id, false);
     }
   };
+  const openTask = async (partner: PartnerProfileView): Promise<void> => {
+    if (partner.canonicalSessionId === undefined) return;
+    const expectedOwner = ownerRef.current;
+    setActionError(undefined);
+    if (partner.activity.unreadReplyCount > 0 && partner.activity.latestReplyCursor !== undefined) {
+      try {
+        const activity = await latestControllerRef.current.markPartnerRead(
+          partner.id,
+          partner.activity.latestReplyCursor
+        );
+        if (ownerRef.current === ownerKey) {
+          setCatalog((current) => current === undefined ? current : ({
+            ...current,
+            partners: current.partners.map((candidate) =>
+              candidate.id === partner.id ? { ...candidate, activity } : candidate)
+          }));
+        }
+      } catch (error) {
+        if (ownerRef.current === ownerKey) setActionError(errorMessage(error, t("partners.markReadFailed")));
+      }
+    }
+    if (ownerRef.current !== expectedOwner) return;
+    latestControllerRef.current.navigate({ kind: "session", sessionId: partner.canonicalSessionId });
+  };
 
   const selected = catalog?.partners.find((partner) => partner.id === focusPartnerId);
   const visible = catalog?.partners.filter((partner) => partner.lifecycle === (showArchived ? "archived" : "active")) ?? [];
@@ -176,7 +207,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
           pending={pendingIds.has(partner.id)}
           t={t}
           onEdit={() => controller.navigate({ kind: "partners", partnerId: partner.id })}
-          onOpen={() => partner.canonicalSessionId === undefined ? undefined : controller.navigate({ kind: "session", sessionId: partner.canonicalSessionId })}
+          onOpen={() => void openTask(partner)}
           onRetry={() => void retryInitialization(partner)}
           onArchive={() => void mutateLifecycle(partner, partner.lifecycle === "archived" ? "active" : "archived")}
           onDelete={() => setDeletePartner(partner)}
@@ -214,6 +245,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
     {catalog !== undefined && selected !== undefined && <PartnerSettingsDialog
       key={`${ownerKey}\u0000${selected.id}`}
       partner={selected}
+      partners={catalog.partners}
       directory={catalog.directory}
       snapshot={snapshot}
       controller={controller}
@@ -221,6 +253,10 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
       t={t}
       onClose={() => controller.navigate({ kind: "partners" })}
       onUpdated={mergeMutation}
+      onActivityUpdated={(profile) => setCatalog((current) => current === undefined ? current : ({
+        ...current,
+        partners: upsertPartner(current.partners, profile)
+      }))}
     />}
     <DeletePartnerDialog partner={deletePartner} pending={deletePartner === undefined ? false : pendingIds.has(deletePartner.id)} t={t} onClose={() => setDeletePartner(undefined)} onDelete={() => {
       const partner = deletePartner;
@@ -245,6 +281,11 @@ function PartnerCard({ partner, pending, t, onEdit, onOpen, onRetry, onArchive, 
   return <article className={cx("partner-card", partner.lifecycle === "archived" && "is-archived")} data-partner-id={partner.id}>
     <header><PartnerAvatar preset={partner.avatar} /><div><h2>{partner.displayName}</h2><p>{primary.providerId} · {primary.modelId}</p></div><Pill tone={statusTone}>{t(`partners.state.${partner.initializationState}`)}</Pill></header>
     <p className="partner-card__identity">{firstIdentityLine(partner.identitySource)}</p>
+    <div className="partner-card__activity" aria-label={t("partners.activitySummary")}>
+      {partner.activity.unreadReplyCount > 0 && <Pill tone="accent">{t("partners.unreadReplies", { count: partner.activity.unreadReplyCount })}</Pill>}
+      <span>{t("partners.artifactCount", { count: partner.activity.artifactCount })}</span>
+      <span>{t("partners.activeDelegationCount", { count: partner.activity.activeDelegationCount })}</span>
+    </div>
     <dl><div><dt>{t("partners.profileVersion")}</dt><dd>{partner.profileVersion.toString()}</dd></div><div><dt>{t("partners.modelRoutes")}</dt><dd>{partner.capabilities.modelChain.length}</dd></div><div><dt>{t("partners.settingsSource")}</dt><dd>{t(partner.usesDirectoryDefaults ? "partners.sharedDefaults" : "partners.customSettings")}</dd></div></dl>
     {partner.initializationState === "error" && <div className="partner-card__error" role="alert"><CircleAlert aria-hidden="true" /><span><strong>{t("partners.preparationFailed")}</strong><small>{t(`partners.error.${partner.initializationErrorCode ?? "stateChanged"}`)}</small></span></div>}
     <footer>
@@ -350,8 +391,9 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
   return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}><div className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value)} onClick={() => void save()}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
-function PartnerSettingsDialog({ partner, directory, snapshot, controller, ownerKey, t, onClose, onUpdated }: {
+function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, onClose, onUpdated, onActivityUpdated }: {
   readonly partner: PartnerProfileView;
+  readonly partners: readonly PartnerProfileView[];
   readonly directory: PartnerDirectoryView;
   readonly snapshot: AppSnapshot;
   readonly controller: AppController;
@@ -359,6 +401,7 @@ function PartnerSettingsDialog({ partner, directory, snapshot, controller, owner
   readonly t: Translator;
   readonly onClose: () => void;
   readonly onUpdated: (result: PartnerMutationView) => void;
+  readonly onActivityUpdated: (partner: PartnerProfileView) => void;
 }): JSX.Element {
   const [baseline, setBaseline] = useState(partner);
   const [draft, setDraft] = useState<PartnerEditorDraft>(() => editorDraft(partner));
@@ -368,6 +411,8 @@ function PartnerSettingsDialog({ partner, directory, snapshot, controller, owner
   const [saved, setSaved] = useState(true);
   const [saveError, setSaveError] = useState<string>();
   const [conflict, setConflict] = useState(false);
+  const [section, setSection] = useState<"profile" | "activity">("activity");
+  const tabsId = useId();
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
   const aliveRef = useRef(0);
@@ -419,8 +464,19 @@ function PartnerSettingsDialog({ partner, directory, snapshot, controller, owner
     }
   };
   const status = conflict ? t("partners.conflict") : saveError !== undefined ? t("partners.notSaved") : saving ? t("partners.saving") : dirty ? t("partners.unsaved") : saved ? t("partners.saved") : t("partners.unsaved");
-  return <Modal open title={t("partners.settingsTitle", { name: partner.displayName })} description={t("partners.settingsBody")} size="large" onClose={onClose}>
-    <div className="partner-editor">
+  return <Modal open title={t("partners.workspaceTitle", { name: partner.displayName })} description={section === "profile" ? t("partners.settingsBody") : t("partners.workspaceBody")} size="large" onClose={onClose}>
+    <div className="partner-workspace">
+      <div className="segmented partner-workspace__tabs" role="tablist" aria-label={t("partners.workspaceSections")} onKeyDown={(event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const next = event.key === "ArrowRight" || event.key === "End" ? "profile" : "activity";
+        setSection(next);
+        event.currentTarget.querySelector<HTMLButtonElement>(`[data-partner-section="${next}"]`)?.focus();
+      }}>
+        <button id={`${tabsId}-activity-tab`} data-partner-section="activity" type="button" role="tab" aria-controls={`${tabsId}-activity-panel`} aria-selected={section === "activity"} tabIndex={section === "activity" ? 0 : -1} className={cx("segmented__item", section === "activity" && "is-active")} onClick={() => setSection("activity")}>{t("partners.activity")}</button>
+        <button id={`${tabsId}-profile-tab`} data-partner-section="profile" type="button" role="tab" aria-controls={`${tabsId}-profile-panel`} aria-selected={section === "profile"} tabIndex={section === "profile" ? 0 : -1} className={cx("segmented__item", section === "profile" && "is-active")} onClick={() => setSection("profile")}>{t("partners.profileSettings")}</button>
+      </div>
+      {section === "profile" ? <div id={`${tabsId}-profile-panel`} role="tabpanel" aria-labelledby={`${tabsId}-profile-tab`} className="partner-editor">
       <div className="partner-editor__status"><Pill tone={conflict || saveError !== undefined ? "danger" : saving || dirty ? "warning" : "success"}>{status}</Pill><span>{t("partners.profileVersionValue", { version: baseline.profileVersion.toString() })}</span></div>
       {(conflict || saveError !== undefined) && <div className="partner-conflict" role="alert"><CircleAlert aria-hidden="true" /><div><strong>{conflict ? t("partners.conflictTitle") : t("partners.saveFailed")}</strong><p>{conflict ? t("partners.conflictBody") : saveError}</p></div><div><Button onClick={() => void reconcile(false)}>{t("partners.reload")}</Button><Button tone="primary" onClick={() => void reconcile(true)}>{t("common.retry")}</Button></div></div>}
       {!valid && <p className="partner-editor__validation" role="alert">{t("partners.invalidDraft")}</p>}
@@ -429,8 +485,329 @@ function PartnerSettingsDialog({ partner, directory, snapshot, controller, owner
       <label className="check-row"><CheckboxControl checked={draft.usesDirectoryDefaults} disabled={directory.defaultCapabilities === undefined} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? directory.defaultCapabilities ?? current.capabilities : current.capabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{directory.defaultCapabilities === undefined ? t("partners.defaultsMissing") : t("partners.useDefaultsHelp")}</small></span></label>
       {!draft.usesDirectoryDefaults && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={saving} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
       <div className="partner-editor__footer"><span>{t("partners.updatedAt", { time: new Date(baseline.updatedAt).toLocaleString() })}</span>{baseline.canonicalSessionId !== undefined && <Button onClick={() => controller.navigate({ kind: "session", sessionId: baseline.canonicalSessionId })}><MessageSquare aria-hidden="true" />{t("partners.openTask")}</Button>}</div>
+      </div> : <div id={`${tabsId}-activity-panel`} role="tabpanel" aria-labelledby={`${tabsId}-activity-tab`}><PartnerActivityPanel partner={partner} partners={partners} controller={controller} ownerKey={ownerKey} t={t} onPartnerUpdated={onActivityUpdated} /></div>}
     </div>
   </Modal>;
+}
+
+interface PartnerArtifactItem {
+  readonly sessionId: string;
+  readonly sessionTitle: string;
+  readonly artifact: ArtifactView;
+}
+
+interface PartnerActivityData {
+  readonly sessions: readonly PartnerSessionView[];
+  readonly threads: readonly PartnerPrivateThreadView[];
+  readonly delegations: readonly PartnerDelegationView[];
+  readonly artifacts: readonly PartnerArtifactItem[];
+  readonly artifactFailures: number;
+}
+
+function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, onPartnerUpdated }: {
+  readonly partner: PartnerProfileView;
+  readonly partners: readonly PartnerProfileView[];
+  readonly controller: AppController;
+  readonly ownerKey: string;
+  readonly t: Translator;
+  readonly onPartnerUpdated: (partner: PartnerProfileView) => void;
+}): JSX.Element {
+  const [data, setData] = useState<PartnerActivityData>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [selectedThreadId, setSelectedThreadId] = useState<string>();
+  const [threadDetail, setThreadDetail] = useState<PartnerPrivateThreadDetailView>();
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [threadError, setThreadError] = useState<string>();
+  const [threadReload, setThreadReload] = useState(0);
+  const [cancellingId, setCancellingId] = useState<string>();
+  const [actionError, setActionError] = useState<string>();
+  const ownerRef = useRef(ownerKey);
+  ownerRef.current = ownerKey;
+  const requestRef = useRef(0);
+
+  const load = (quiet = false, externalSignal?: AbortSignal): void => {
+    const request = ++requestRef.current;
+    const expectedOwner = ownerRef.current;
+    if (!quiet) setLoading(true);
+    setError(undefined);
+    void Promise.all([
+      controller.getPartner(partner.id, externalSignal),
+      controller.listPartnerSessions(partner.id, externalSignal),
+      controller.listPartnerPrivateThreads(partner.id, externalSignal),
+      controller.listPartnerDelegations(partner.id, externalSignal)
+    ]).then(async ([profile, sessions, threads, delegations]) => {
+      const sessionTitles = new Map(sessions.map((session) => [session.sessionId, session.displayName]));
+      for (const delegation of delegations) {
+        if (delegation.childSessionId !== undefined) sessionTitles.set(delegation.childSessionId, delegation.title);
+      }
+      const sessionIds = [...new Set([
+        ...sessions.filter((session) => session.available && !session.deleted).map((session) => session.sessionId),
+        ...delegations.flatMap((delegation) => delegation.childSessionId === undefined ? [] : [delegation.childSessionId])
+      ])];
+      const artifactGroups = await Promise.all(sessionIds.map(async (sessionId) => {
+        try {
+          const artifacts = await controller.listSessionArtifacts(sessionId, externalSignal);
+          return { sessionId, artifacts } as const;
+        } catch (caught) {
+          if (externalSignal?.aborted === true) throw caught;
+          return { sessionId, artifacts: undefined } as const;
+        }
+      }));
+      if (request !== requestRef.current || expectedOwner !== ownerRef.current || externalSignal?.aborted === true) return;
+      const next: PartnerActivityData = {
+        sessions,
+        threads,
+        delegations,
+        artifacts: artifactGroups.flatMap((group) => group.artifacts?.map((artifact) => ({
+          sessionId: group.sessionId,
+          sessionTitle: sessionTitles.get(group.sessionId) ?? t("partners.unavailableTask"),
+          artifact
+        })) ?? []),
+        artifactFailures: artifactGroups.filter((group) => group.artifacts === undefined).length
+      };
+      setData(next);
+      setSelectedThreadId((current) => current !== undefined && threads.some((thread) => thread.id === current)
+        ? current
+        : threads[0]?.id);
+      onPartnerUpdated(profile);
+    }).catch((caught: unknown) => {
+      if (externalSignal?.aborted === true || request !== requestRef.current || expectedOwner !== ownerRef.current) return;
+      setError(errorMessage(caught, t("partners.activityLoadFailed")));
+    }).finally(() => {
+      if (request === requestRef.current && expectedOwner === ownerRef.current && externalSignal?.aborted !== true) {
+        setLoading(false);
+      }
+    });
+  };
+
+  useEffect(() => {
+    const abort = new AbortController();
+    load(false, abort.signal);
+    return () => {
+      requestRef.current += 1;
+      abort.abort();
+    };
+  }, [ownerKey, partner.id]);
+
+  const hasLiveDelegation = data?.delegations.some((delegation) => partnerDelegationActive(delegation.status)) === true;
+  useEffect(() => {
+    if (!hasLiveDelegation) return;
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => load(true, abort.signal), 2_000);
+    return () => {
+      window.clearTimeout(timer);
+      abort.abort();
+    };
+  }, [hasLiveDelegation, data?.delegations.map((delegation) => `${delegation.id}:${delegation.revision}`).join("|")]);
+
+  useEffect(() => {
+    if (selectedThreadId === undefined) {
+      setThreadDetail(undefined);
+      setThreadError(undefined);
+      return;
+    }
+    const abort = new AbortController();
+    const expectedOwner = ownerRef.current;
+    setThreadLoading(true);
+    setThreadError(undefined);
+    void controller.getPartnerPrivateThread(partner.id, selectedThreadId, abort.signal).then(async (detail) => {
+      if (abort.signal.aborted || expectedOwner !== ownerRef.current) return;
+      const lastSequence = detail.messages.at(-1)?.sequence ?? 0;
+      const through = detail.readState?.throughSequence ?? 0;
+      if (lastSequence > through) {
+        const readState = await controller.markPartnerPrivateThreadRead(
+          partner.id,
+          selectedThreadId,
+          lastSequence,
+          abort.signal
+        );
+        if (abort.signal.aborted || expectedOwner !== ownerRef.current) return;
+        setThreadDetail({ ...detail, readState });
+      } else {
+        setThreadDetail(detail);
+      }
+    }).catch((caught: unknown) => {
+      if (!abort.signal.aborted && expectedOwner === ownerRef.current) {
+        setThreadError(errorMessage(caught, t("partners.privateThreadLoadFailed")));
+      }
+    }).finally(() => {
+      if (!abort.signal.aborted && expectedOwner === ownerRef.current) setThreadLoading(false);
+    });
+    return () => abort.abort();
+  }, [ownerKey, partner.id, selectedThreadId, threadReload]);
+
+  useEffect(() => {
+    if (threadDetail?.messages.some((message) => message.deliveryStatus === "pending") !== true) return;
+    const timer = window.setTimeout(() => setThreadReload((current) => current + 1), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [threadDetail]);
+
+  const cancelDelegation = async (delegation: PartnerDelegationView): Promise<void> => {
+    const expectedOwner = ownerRef.current;
+    setCancellingId(delegation.id);
+    setActionError(undefined);
+    try {
+      const updated = await controller.cancelPartnerDelegation(
+        partner.id,
+        delegation.id,
+        delegation.revision
+      );
+      if (expectedOwner !== ownerRef.current) return;
+      setData((current) => current === undefined ? current : ({
+        ...current,
+        delegations: current.delegations.map((candidate) => candidate.id === updated.id ? updated : candidate)
+      }));
+      onPartnerUpdated(await controller.getPartner(partner.id));
+    } catch (caught) {
+      if (expectedOwner === ownerRef.current) {
+        setActionError(errorMessage(caught, t("partners.cancelDelegationFailed")));
+        load(true);
+      }
+    } finally {
+      if (expectedOwner === ownerRef.current) setCancellingId(undefined);
+    }
+  };
+
+  const openPartnerSession = async (session: PartnerSessionView): Promise<void> => {
+    const expectedOwner = ownerRef.current;
+    setActionError(undefined);
+    if (session.role === "canonical" && partner.activity.unreadReplyCount > 0
+      && partner.activity.latestReplyCursor !== undefined) {
+      try {
+        const activity = await controller.markPartnerRead(partner.id, partner.activity.latestReplyCursor);
+        if (ownerRef.current === ownerKey) onPartnerUpdated({ ...partner, activity });
+      } catch (caught) {
+        if (ownerRef.current === ownerKey) {
+          setActionError(errorMessage(caught, t("partners.markReadFailed")));
+        }
+      }
+    }
+    if (ownerRef.current !== expectedOwner) return;
+    controller.navigate({ kind: "session", sessionId: session.sessionId });
+  };
+
+  if (loading && data === undefined) return <div className="partner-workspace-state"><Spinner /><p>{t("partners.activityLoading")}</p></div>;
+  if (error !== undefined && data === undefined) return <div className="partner-workspace-state" role="alert"><CircleAlert aria-hidden="true" /><p>{error}</p><Button onClick={() => load()}>{t("common.retry")}</Button></div>;
+  if (data === undefined) return <div className="partner-workspace-state"><Spinner /></div>;
+
+  const histories = data.sessions.filter((session) => session.role === "history");
+  const canonical = data.sessions.find((session) => session.role === "canonical");
+  const actions = {
+    copyFile: controller.copyArtifactFile,
+    openFile: controller.openArtifactFile,
+    revealSource: controller.revealArtifactSource
+  };
+  return <div className="partner-activity">
+    <div className="partner-activity__summary" aria-label={t("partners.activitySummary")}>
+      <div><strong>{partner.activity.unreadReplyCount}</strong><span>{t("partners.unread")}</span></div>
+      <div><strong>{data.artifacts.length}</strong><span>{t("partners.artifacts")}</span></div>
+      <div><strong>{data.delegations.filter((delegation) => partnerDelegationActive(delegation.status)).length}</strong><span>{t("partners.activeDelegations")}</span></div>
+      <Button tone="ghost" onClick={() => load()} disabled={loading}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
+    </div>
+    {(error !== undefined || actionError !== undefined) && <p className="partner-editor__error" role="alert">{actionError ?? error}</p>}
+
+    <section className="partner-activity__section" aria-labelledby="partner-tasks-heading">
+      <header><div><h3 id="partner-tasks-heading">{t("partners.tasks")}</h3><p>{t("partners.tasksBody")}</p></div></header>
+      <div className="partner-task-list">
+        {canonical !== undefined && <PartnerTaskRow session={canonical} t={t} onOpen={() => void openPartnerSession(canonical)} />}
+        {histories.map((session) => <PartnerTaskRow key={session.sessionId} session={session} t={t} onOpen={() => void openPartnerSession(session)} />)}
+        {canonical === undefined && histories.length === 0 && <p className="partner-activity__empty">{t("partners.noTasks")}</p>}
+      </div>
+    </section>
+
+    <section className="partner-activity__section" aria-labelledby="partner-private-heading">
+      <header><div><h3 id="partner-private-heading">{t("partners.privateConversations")}</h3><p>{t("partners.privateConversationsBody")}</p></div></header>
+      {data.threads.length === 0 ? <p className="partner-activity__empty">{t("partners.noPrivateConversations")}</p> : <div className="partner-private-layout">
+        <div className="partner-private-list" role="list">{data.threads.map((thread) => {
+          const other = partnerById(partners, thread.firstPartnerId === partner.id ? thread.secondPartnerId : thread.firstPartnerId);
+          return <button type="button" role="listitem" key={thread.id} className={cx(selectedThreadId === thread.id && "is-selected")} onClick={() => setSelectedThreadId(thread.id)}>
+            <span><strong>{other?.displayName ?? t("partners.unknownPartner")}</strong><small>{new Date(thread.updatedAt).toLocaleString()}</small></span>
+            <span>{t(`partners.privateState.${thread.status}`)} · {thread.messageCount}/{thread.maxMessages}</span>
+          </button>;
+        })}</div>
+        <div className="partner-private-thread" aria-live="polite">
+          {threadLoading ? <Spinner /> : threadError !== undefined ? <div role="alert"><p>{threadError}</p><Button onClick={() => setThreadReload((current) => current + 1)}>{t("common.retry")}</Button></div>
+            : threadDetail === undefined ? <p>{t("partners.selectPrivateConversation")}</p>
+              : <>{threadDetail.messages.map((message) => {
+                const sender = partnerById(partners, message.senderPartnerId);
+                return <article key={message.id} className={cx("partner-private-message", message.senderPartnerId === partner.id && "is-own")}>
+                  <header><strong>{sender?.displayName ?? t("partners.unknownPartner")}</strong><span><time dateTime={new Date(message.createdAt).toISOString()}>{new Date(message.createdAt).toLocaleString()}</time>{message.deliveryStatus !== "delivered" && <> · {t(`partners.privateDelivery.${message.deliveryStatus}`)}</>}</span></header>
+                  <p>{message.content}</p>
+                </article>;
+              })}{threadDetail.messages.length === 0 && <p>{t("partners.noPrivateMessages")}</p>}
+              {threadDetail.thread.status === "closed" && <p className="partner-private-thread__closed">{t(`partners.privateClose.${threadDetail.thread.closeReason ?? "idleTimeout"}`)}</p>}
+              {threadDetail.thread.blockedUntil !== undefined && threadDetail.thread.blockedUntil > Date.now() && <p className="partner-private-thread__closed">{t("partners.privateBlockedUntil", { time: new Date(threadDetail.thread.blockedUntil).toLocaleString() })}</p>}</>}
+        </div>
+      </div>}
+    </section>
+
+    <section className="partner-activity__section" aria-labelledby="partner-delegations-heading">
+      <header><div><h3 id="partner-delegations-heading">{t("partners.delegations")}</h3><p>{t("partners.delegationsBody")}</p></div></header>
+      <div className="partner-collaboration-list">{data.delegations.map((delegation) => <PartnerCollaborationCard
+        key={delegation.id}
+        delegation={delegation}
+        target={partnerById(partners, delegation.targetPartnerId)}
+        cancelling={cancellingId === delegation.id}
+        controller={controller}
+        t={t}
+        onCancel={() => void cancelDelegation(delegation)}
+      />)}{data.delegations.length === 0 && <p className="partner-activity__empty">{t("partners.noDelegations")}</p>}</div>
+    </section>
+
+    <section className="partner-activity__section" aria-labelledby="partner-artifacts-heading">
+      <header><div><h3 id="partner-artifacts-heading">{t("partners.artifacts")}</h3><p>{t("partners.artifactsBody")}</p></div></header>
+      {data.artifactFailures > 0 && <p className="partner-activity__warning" role="status">{t("partners.artifactsPartial", { count: data.artifactFailures })}</p>}
+      <div className="partner-artifact-list">{data.artifacts.map(({ artifact, sessionId, sessionTitle }) => <article key={`${sessionId}:${artifact.id}`}>
+        <div><strong>{artifact.title || artifact.fileName}</strong><small>{sessionTitle} · {formatBytes(artifact.byteSize)}</small></div>
+        <NativeFileActionsMenu actions={actions} artifactId={artifact.id} blobId={artifact.blobId} name={artifact.fileName} byteSize={artifact.byteSize} {...(artifact.sourceSessionId === undefined ? {} : { sourceSessionId: artifact.sourceSessionId })} sourceRevealAvailable={artifact.sourceRevealAvailable} ownerKey={`${ownerKey}:${sessionId}:${artifact.id}`} t={t} />
+      </article>)}{data.artifacts.length === 0 && <p className="partner-activity__empty">{t("partners.noArtifacts")}</p>}</div>
+    </section>
+  </div>;
+}
+
+function PartnerTaskRow({ session, t, onOpen }: {
+  readonly session: PartnerSessionView;
+  readonly t: Translator;
+  readonly onOpen: () => void;
+}): JSX.Element {
+  return <article className="partner-task-row">
+    <div><strong>{session.displayName}</strong><small>{t(`partners.sessionRole.${session.role}`)} · {session.lastActivityAt === undefined ? t("common.unknown") : new Date(session.lastActivityAt).toLocaleString()}</small></div>
+    {session.readOnly && <Pill>{t("partners.readOnly")}</Pill>}
+    <Button onClick={onOpen} disabled={!session.available || session.deleted}>{t("partners.openTask")}</Button>
+  </article>;
+}
+
+function PartnerCollaborationCard({ delegation, target, cancelling, controller, t, onCancel }: {
+  readonly delegation: PartnerDelegationView;
+  readonly target?: PartnerProfileView;
+  readonly cancelling: boolean;
+  readonly controller: AppController;
+  readonly t: Translator;
+  readonly onCancel: () => void;
+}): JSX.Element {
+  const terminal = !partnerDelegationActive(delegation.status);
+  const tone = delegation.status === "completed" ? "success"
+    : delegation.status === "failed" ? "danger"
+      : delegation.status === "unknown" || delegation.status === "waiting" ? "warning"
+        : delegation.status === "running" ? "accent" : "neutral";
+  const end = delegation.completedAt ?? Date.now();
+  return <article className={cx("partner-collaboration-card", `is-${delegation.status}`)}>
+    <header><div><strong>{delegation.title}</strong><small>{t("partners.delegatedTo", { name: target?.displayName ?? t("partners.unknownPartner") })}</small></div><Pill tone={tone}>{t(`partners.delegationState.${delegation.status}`)}</Pill></header>
+    <p className="partner-collaboration-card__objective">{delegation.objective}</p>
+    <dl><div><dt>{t("partners.duration")}</dt><dd>{formatPartnerDuration(Math.max(0, end - (delegation.startedAt ?? delegation.createdAt)), t)}</dd></div><div><dt>{t("partners.artifacts")}</dt><dd>{delegation.artifactCount}</dd></div><div><dt>{t("partners.profileVersion")}</dt><dd>{delegation.targetProfileVersion.toString()}</dd></div></dl>
+    {delegation.status === "unknown" && <p className="partner-collaboration-card__warning" role="status">{t("partners.delegationUnknownBody")}</p>}
+    {delegation.resultSummary !== undefined && <div className="partner-collaboration-card__result"><strong>{t("partners.delegationResult")}</strong><p>{delegation.resultSummary}</p></div>}
+    {delegation.error !== undefined && <p className="partner-collaboration-card__error" role="alert">{delegation.error}</p>}
+    <footer>
+      {delegation.childSessionId !== undefined && <Button onClick={() => controller.navigate({ kind: "session", sessionId: delegation.childSessionId! })}>{t("partners.openDelegatedTask")}</Button>}
+      {!terminal && <Button tone="ghost" disabled={cancelling} onClick={onCancel}>{cancelling ? t("common.working") : t("partners.stopDelegation")}</Button>}
+    </footer>
+  </article>;
+}
+
+function partnerById(partners: readonly PartnerProfileView[], partnerId: string): PartnerProfileView | undefined {
+  return partners.find((partner) => partner.id === partnerId);
 }
 
 function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: {

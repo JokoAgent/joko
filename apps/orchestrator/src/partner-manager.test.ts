@@ -6,14 +6,15 @@ import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import {
   OperationalStore,
   PartnerStore,
+  PartnerStoreError,
   type PartnerCapabilitiesRecord,
   type PartnerProfileRecord
 } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
-import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
+import { PartnerManager, partnerSessionRuntimeFallback, type PartnerManagerOptions } from "./partner-manager.js";
 import { SessionHost } from "./session-host.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -60,6 +61,16 @@ describe("PartnerManager", () => {
     expect(created.canonicalSessionId).toBeDefined();
     const target = fixture.operationalStore.getTarget(created.homeTargetId).descriptor;
     expect(target).toMatchObject({ backendId: PI_LIKE_PROFILE.id, managed: true, trusted: true });
+    expect(fixture.operationalStore.getTarget(created.homeTargetId).metadata).toMatchObject({
+      kind: "partner_home",
+      partnerId: created.id,
+      workspaceId: created.homeTargetId
+    });
+    expect(fixture.registerWorkspace).toHaveBeenCalledWith(expect.objectContaining({
+      id: created.homeTargetId,
+      displayName: "Aster home",
+      trusted: true
+    }));
     const session = fixture.operationalStore.getSession(created.canonicalSessionId!).descriptor;
     expect(session).toMatchObject({
       backendId: PI_LIKE_PROFILE.id,
@@ -160,6 +171,7 @@ describe("PartnerManager", () => {
       store: fixture.partnerStore,
       operationalStore: fixture.operationalStore,
       sessionHost: fixture.sessionHost,
+      workspaceService: fixture.workspaceService,
       homesRoot: fixture.homesRoot
     });
     const ready = await resumedManager.retryInitialization(failed.id, failed.revision);
@@ -186,6 +198,10 @@ describe("PartnerManager", () => {
     expect(fixture.operationalStore.getSession(recovered.canonicalSessionId!).descriptor.targetId)
       .toBe(recovered.homeTargetId);
     expect(fixture.operationalStore.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(1);
+    expect(fixture.partnerStore.listSessionLinks(recovered.id)).toEqual([
+      expect.objectContaining({ sessionId: recovered.canonicalSessionId, role: "canonical" }),
+      expect.objectContaining({ sessionId: "missing-session", role: "history" })
+    ]);
   });
 
   it("applies directory defaults only to inheriting partners and preserves lifecycle Session isolation", async () => {
@@ -291,6 +307,131 @@ describe("PartnerManager", () => {
       currentHop: 0
     })).toEqual({ owned: false });
   });
+
+  it("delivers bounded private messages through canonical tasks and owns unread state", async () => {
+    const fixture = await createFixture();
+    const sender = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Aster"));
+    const recipient = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Beryl"));
+
+    const delivered = await fixture.manager.sendPrivateMessage({
+      callerSessionId: sender.canonicalSessionId!,
+      targetPartnerId: recipient.id,
+      content: "Please check whether the retry boundary is safe."
+    });
+    expect(delivered.message).toMatchObject({
+      senderPartnerId: sender.id,
+      recipientPartnerId: recipient.id,
+      deliveryStatus: "delivered"
+    });
+    expect(delivered.reservation.remainingMessages).toBe(11);
+
+    await vi.waitFor(() => {
+      expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(1);
+    });
+    const activity = fixture.manager.activity(recipient.id);
+    expect(activity.latestReplyCursor).toBeDefined();
+    expect(activity.artifactCount).toBe(0);
+    expect(fixture.manager.markRead(recipient.id, activity.latestReplyCursor!)).toMatchObject({
+      throughCursor: activity.latestReplyCursor
+    });
+    expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(0);
+
+    const thread = fixture.manager.getPrivateThread(delivered.reservation.thread.id, recipient.id);
+    expect(thread.messages).toEqual([
+      expect.objectContaining({ content: "Please check whether the retry boundary is safe." })
+    ]);
+    expect(fixture.manager.markPrivateThreadRead(
+      thread.thread.id,
+      recipient.id,
+      thread.messages.at(-1)!.sequence
+    ).throughSequence).toBe(1);
+    expect(() => fixture.manager.getPrivateThread(thread.thread.id, "unrelated-partner"))
+      .toThrowError(PartnerStoreError);
+  });
+
+  it("replays a persisted private delivery with the same operation after recovery", async () => {
+    const fixture = await createFixture();
+    const sender = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Aster"));
+    const recipient = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Beryl"));
+    const reserved = fixture.partnerStore.reservePrivateMessage({
+      senderPartnerId: sender.id,
+      recipientPartnerId: recipient.id,
+      senderSessionId: sender.canonicalSessionId!,
+      recipientSessionId: recipient.canonicalSessionId!,
+      content: "Resume this exact delivery after reconnect."
+    });
+    expect(fixture.partnerStore.listPendingPrivateMessages()).toEqual([
+      expect.objectContaining({ id: reserved.message.id, operationId: reserved.message.operationId })
+    ]);
+
+    await fixture.manager.retryPendingPrivateMessages();
+    await fixture.manager.retryPendingPrivateMessages();
+
+    expect(fixture.partnerStore.listPendingPrivateMessages()).toEqual([]);
+    expect(fixture.manager.getPrivateThread(reserved.thread.id, recipient.id).messages).toEqual([
+      expect.objectContaining({
+        id: reserved.message.id,
+        operationId: reserved.message.operationId,
+        deliveryStatus: "delivered"
+      })
+    ]);
+    expect(fixture.operationalStore.getOperation(reserved.message.operationId).status).toBe("completed");
+  });
+
+  it("recovers a persisted delegation into a distinct target-owned task", async () => {
+    const fixture = await createFixture();
+    const requester = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Aster"));
+    const target = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Beryl"));
+    const persisted = fixture.partnerStore.createDelegation({
+      id: "delegation-recovery",
+      requesterPartnerId: requester.id,
+      targetPartnerId: target.id,
+      parentSessionId: requester.canonicalSessionId!,
+      title: "Inspect retry safety",
+      objective: "Inspect the retry path and report the concrete result."
+    });
+
+    await fixture.manager.recoverPending();
+    await vi.waitFor(async () => {
+      const view = await fixture.manager.getDelegation(persisted.id, requester.id);
+      expect(view.delegation.status).toBe("completed");
+    });
+    const view = await fixture.manager.getDelegation(persisted.id, requester.id);
+    expect(view).toMatchObject({
+      delegation: {
+        requesterPartnerId: requester.id,
+        targetPartnerId: target.id,
+        targetProfileVersion: target.profileVersion,
+        status: "completed"
+      },
+      artifactCount: 0
+    });
+    expect(view.delegation.childSessionId).toBeDefined();
+    expect(view.delegation.resultSummary).toContain("Reply from");
+    fixture.operationalStore.putArtifact({
+      id: "delegation-artifact",
+      sha256: "a".repeat(64),
+      byteLength: 12,
+      mimeType: "text/plain",
+      fileName: "delegation-result.txt",
+      storageKey: "sha256/delegation-artifact",
+      sessionId: view.delegation.childSessionId!,
+      metadata: {}
+    });
+    expect((await fixture.manager.getDelegation(persisted.id, requester.id)).artifactCount).toBe(1);
+    expect(fixture.manager.activity(target.id).artifactCount).toBe(1);
+    expect(fixture.partnerStore.getSessionLink(view.delegation.childSessionId!)).toMatchObject({
+      partnerId: target.id,
+      role: "delegation",
+      delegationId: persisted.id,
+      parentSessionId: requester.canonicalSessionId
+    });
+    expect(fixture.operationalStore.getSession(view.delegation.childSessionId!).descriptor).toMatchObject({
+      targetId: target.homeTargetId,
+      appendSystemPrompt: target.identitySource
+    });
+    expect(fixture.manager.activity(requester.id).activeDelegationCount).toBe(0);
+  });
 });
 
 async function createFixture(
@@ -314,10 +455,15 @@ async function createFixture(
   );
   await sessionHost.initialize();
   const homesRoot = join(directory, "partner-homes");
+  const registerWorkspace = vi.fn(async (
+    input: Parameters<PartnerManagerOptions["workspaceService"]["register"]>[0]
+  ) => input);
+  const workspaceService: PartnerManagerOptions["workspaceService"] = { register: registerWorkspace };
   const manager = new PartnerManager({
     store: partnerStore,
     operationalStore,
     sessionHost,
+    workspaceService,
     homesRoot,
     ...(prepareAvatar === undefined ? {} : { prepareAvatar })
   });
@@ -327,7 +473,7 @@ async function createFixture(
     operationalStore.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { manager, operationalStore, partnerStore, sessionHost, homesRoot };
+  return { manager, operationalStore, partnerStore, sessionHost, homesRoot, workspaceService, registerWorkspace };
 }
 
 function createInput(store: PartnerStore, displayName: string) {

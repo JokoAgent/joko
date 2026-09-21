@@ -73,6 +73,11 @@ import { MessageNavRail } from "./MessageNavRail.js";
 import { PrevMessageJumpChip } from "./PrevMessageJumpChip.js";
 import { MessageUsageMeta } from "./MessageUsageMeta.js";
 import { SubagentInlineCard } from "./SubagentInlineCard.js";
+import {
+  PartnerDelegationInlineCard,
+  type PartnerDelegationCardActions
+} from "./PartnerDelegationInlineCard.js";
+import { readPartnerDelegationCardData } from "./partner-delegation-card-data.js";
 import { deriveMessageNavEntries } from "./message-nav-rail.js";
 import { usePreviousUserMessageJump } from "./use-prev-message-jump.js";
 import { consumeMessageNavBackfillRound, resetMessageNavBackfillBudget, scheduleMessageNavBackfill, shouldBackfillMessageNav, type MessageNavBackfillBudget } from "./message-nav-backfill.js";
@@ -146,6 +151,8 @@ interface TimelineSubagentContextValue {
 
 const TimelineSubagentContext = createContext<TimelineSubagentContextValue>({ runs: new Map(), details: new Map() });
 
+const TimelinePartnerDelegationContext = createContext<PartnerDelegationCardActions>({});
+
 interface TimelinePersonalizationContextValue {
   readonly ownerKey: string;
   readonly streamFadeEnabled: boolean;
@@ -175,7 +182,7 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
+export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange }: {
   readonly ownerKey: string;
   readonly sessionId: string;
   readonly sessionName: string;
@@ -196,6 +203,9 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   readonly subagentRunDetails?: ReadonlyMap<string, SubagentRunDetailView>;
   readonly onOpenSubagent?: (runId: string) => void;
   readonly onStopSubagent?: (runId: string) => Promise<void>;
+  readonly onGetPartnerDelegation?: OperationApi["getPartnerDelegation"];
+  readonly onCancelPartnerDelegation?: OperationApi["cancelPartnerDelegation"];
+  readonly onOpenPartnerSession?: (sessionId: string) => void;
   readonly hasEarlier: boolean;
   readonly historyLoading: boolean;
   readonly historyError?: string;
@@ -307,6 +317,11 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     ...(onOpenSubagent === undefined ? {} : { onOpen: onOpenSubagent }),
     ...(onStopSubagent === undefined ? {} : { onStop: onStopSubagent })
   }), [onOpenSubagent, onStopSubagent, subagentRunDetails, subagentRuns]);
+  const partnerDelegationContext = useMemo<PartnerDelegationCardActions>(() => ({
+    ...(onGetPartnerDelegation === undefined ? {} : { get: onGetPartnerDelegation }),
+    ...(onCancelPartnerDelegation === undefined ? {} : { cancel: onCancelPartnerDelegation }),
+    ...(onOpenPartnerSession === undefined ? {} : { openSession: onOpenPartnerSession })
+  }), [onCancelPartnerDelegation, onGetPartnerDelegation, onOpenPartnerSession]);
   const virtualizer = useVirtualizer({
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
@@ -729,6 +744,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
   }
 
   return (
+    <TimelinePartnerDelegationContext.Provider value={partnerDelegationContext}>
     <TimelineSubagentContext.Provider value={subagentContext}>
     <AudioArtworkContext.Provider value={artworkGateway}>
     <TimelineImageGalleryContext.Provider value={galleryContext}>
@@ -815,6 +831,7 @@ export function Timeline({ ownerKey, sessionId, sessionName, workspaceId, onRead
     </TimelineImageGalleryContext.Provider>
     </AudioArtworkContext.Provider>
     </TimelineSubagentContext.Provider>
+    </TimelinePartnerDelegationContext.Provider>
   );
 }
 
@@ -1511,9 +1528,18 @@ function usePrefersReducedMotion(): boolean {
 
 export function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
+  const partnerDelegationActions = useContext(TimelinePartnerDelegationContext);
   const [payloadPreview, setPayloadPreview] = useState<{ readonly sectionId: ToolPayloadSection["id"]; readonly trigger: HTMLButtonElement }>();
   const tool = item.tool;
   if (tool === undefined) return <NoticeBlock item={item} icon={<Wrench />} title={item.title ?? t("timeline.tool")} locale={locale} />;
+  const partnerDelegation = readPartnerDelegationCardData(tool);
+  if (partnerDelegation !== undefined) return <PartnerDelegationInlineCard
+    initial={partnerDelegation.delegation}
+    targetName={partnerDelegation.targetName}
+    ownerKey={`${ownerKey}:${item.id}`}
+    actions={partnerDelegationActions}
+    t={t}
+  />;
   const open = tool.state === "running" || tool.state === "waiting" || tool.state === "failed";
   const fileChanges = parseToolFileChangeSet(tool.name, tool.input)?.changes;
   const presentation = fileChanges === undefined ? describeToolPresentation(tool.name, tool.input) : undefined;

@@ -1694,6 +1694,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         subagentRunDetails={subagentRunDetails}
         onOpenSubagent={canListSubagents && inspectorAvailable ? onOpenSubagent : undefined}
         onStopSubagent={stopTimelineSubagent}
+        onGetPartnerDelegation={controller.state.connectionState === "connected" ? controller.getPartnerDelegation : undefined}
+        onCancelPartnerDelegation={controller.state.connectionState === "connected" && !reviewReadOnly ? controller.cancelPartnerDelegation : undefined}
+        onOpenPartnerSession={(sessionId) => controller.navigate({ kind: "session", sessionId })}
         hasEarlier={timelineHasEarlier}
         historyLoading={timelineHistoryLoading}
         historyError={timelineHistoryError}

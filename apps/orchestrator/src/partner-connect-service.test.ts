@@ -129,21 +129,114 @@ describe("PartnerService", () => {
       })
     }), context())).rejects.toMatchObject({ code: Code.InvalidArgument });
   });
+
+  it("maps activity, history, private threads, and revision-fenced delegation control", async () => {
+    const fixture = await createFixture(2_000);
+    const service = createPartnerConnectService(fixture.manager, () => ({ connectionId: "connection-1" }));
+    const first = await fixture.manager.createPartner(partnerInput(fixture.partnerStore, "Aster"));
+    const second = await fixture.manager.createPartner(partnerInput(fixture.partnerStore, "Beryl"));
+    const delivery = await fixture.manager.sendPrivateMessage({
+      callerSessionId: first.canonicalSessionId!,
+      targetPartnerId: second.id,
+      content: "Please inspect the recovery boundary."
+    });
+
+    const sessions = await service.listPartnerSessions(create(contract.ListPartnerSessionsRequestSchema, {
+      partnerId: second.id
+    }), context());
+    expect(sessions.sessions).toEqual([
+      expect.objectContaining({
+        sessionId: second.canonicalSessionId,
+        role: contract.PartnerSessionRole.CANONICAL,
+        available: true,
+        readOnly: false
+      })
+    ]);
+    const threads = await service.listPartnerPrivateThreads(create(
+      contract.ListPartnerPrivateThreadsRequestSchema,
+      { partnerId: second.id }
+    ), context());
+    expect(threads.threads).toEqual([
+      expect.objectContaining({ threadId: delivery.reservation.thread.id, messageCount: 1 })
+    ]);
+    const thread = await service.getPartnerPrivateThread(create(contract.GetPartnerPrivateThreadRequestSchema, {
+      partnerId: second.id,
+      threadId: delivery.reservation.thread.id
+    }), context());
+    expect(thread.messages).toEqual([
+      expect.objectContaining({ content: "Please inspect the recovery boundary.", sequence: 1n })
+    ]);
+    const read = await service.markPartnerPrivateThreadRead(create(
+      contract.MarkPartnerPrivateThreadReadRequestSchema,
+      { partnerId: second.id, threadId: delivery.reservation.thread.id, throughSequence: 1n }
+    ), context());
+    expect(read.readState?.throughSequence).toBe(1n);
+
+    await vi.waitFor(
+      () => expect(fixture.manager.activity(second.id).latestReplyCursor).toBeDefined(),
+      { timeout: 5_000 }
+    );
+    const beforeRead = await service.getPartner(create(contract.GetPartnerRequestSchema, {
+      partnerId: second.id
+    }), context());
+    expect(beforeRead.partner?.activity?.unreadReplyCount).toBe(1n);
+    const marked = await service.markPartnerRead(create(contract.MarkPartnerReadRequestSchema, {
+      partnerId: second.id,
+      throughCursor: beforeRead.partner!.activity!.latestReplyCursor
+    }), context());
+    expect(marked.activity?.unreadReplyCount).toBe(0n);
+
+    const delegation = await fixture.manager.startDelegation({
+      callerSessionId: first.canonicalSessionId!,
+      targetPartnerId: second.id,
+      title: "Recovery audit",
+      objective: "Audit the recovery boundary."
+    });
+    const listed = await service.listPartnerDelegations(create(contract.ListPartnerDelegationsRequestSchema, {
+      partnerId: first.id
+    }), context());
+    expect(listed.delegations).toEqual([
+      expect.objectContaining({
+        delegationId: delegation.delegation.id,
+        targetPartnerId: second.id,
+        childSessionId: expect.any(String)
+      })
+    ]);
+    await expect(service.cancelPartnerDelegation(create(contract.CancelPartnerDelegationRequestSchema, {
+      partnerId: first.id,
+      delegationId: delegation.delegation.id,
+      expectedRevision: revision(999n)
+    }), context())).rejects.toMatchObject({ code: Code.Aborted });
+    const current = await service.getPartnerDelegation(create(contract.GetPartnerDelegationRequestSchema, {
+      partnerId: first.id,
+      delegationId: delegation.delegation.id
+    }), context());
+    const cancelled = await service.cancelPartnerDelegation(create(contract.CancelPartnerDelegationRequestSchema, {
+      partnerId: first.id,
+      delegationId: delegation.delegation.id,
+      expectedRevision: current.delegation!.revision
+    }), context());
+    expect(cancelled.delegation?.status).toBe(contract.PartnerDelegationStatus.CANCELLED);
+  });
 });
 
-async function createFixture() {
+async function createFixture(streamDelayMs = 0) {
   const directory = mkdtempSync(join(tmpdir(), "joko-partner-service-"));
   const operationalStore = new OperationalStore(join(directory, "operational.db"));
   const partnerStore = new PartnerStore(join(directory, "partners.db"));
   const repository = new OperationalArtifactRepository(operationalStore);
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
   await artifacts.initialize();
-  const sessionHost = new SessionHost(operationalStore, artifacts, [new FakeBackendAdapter(PROFILE)]);
+  const sessionHost = new SessionHost(operationalStore, artifacts, [new FakeBackendAdapter({
+    ...PROFILE,
+    streamDelayMs
+  })]);
   await sessionHost.initialize();
   const manager = new PartnerManager({
     store: partnerStore,
     operationalStore,
     sessionHost,
+    workspaceService: { register: async (input) => input },
     homesRoot: join(directory, "partner-homes")
   });
   cleanups.push(async () => {
@@ -152,7 +245,29 @@ async function createFixture() {
     operationalStore.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { manager };
+  return { manager, partnerStore };
+}
+
+function partnerInput(store: PartnerStore, displayName: string) {
+  return {
+    expectedDirectoryRevision: store.directoryState().revision,
+    displayName,
+    avatar: "orbit",
+    identitySource: `You are ${displayName}, a long-lived work partner.`,
+    templateId: "general",
+    capabilities: {
+      modelChain: [{
+        backendId: PROFILE.id,
+        providerId: "test",
+        modelId: "text",
+        effort: "medium",
+        fastMode: false
+      }],
+      permissionMode: "ask",
+      planMode: false
+    },
+    usesDirectoryDefaults: false
+  } as const;
 }
 
 function protoCapabilities(): contract.PartnerCapabilities {

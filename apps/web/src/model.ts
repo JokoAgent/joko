@@ -360,6 +360,19 @@ export type PartnerInitializationErrorCodeView =
   | "stateChanged";
 export type PartnerInvitationStageView = "home" | "avatar" | "session" | "ready" | "failed";
 export type PartnerPermissionModeView = Extract<PermissionMode, "ask" | "auto">;
+export type PartnerSessionRoleView = "canonical" | "history" | "delegation";
+export type PartnerPrivateThreadStatusView = "active" | "closed";
+export type PartnerPrivateThreadCloseReasonView = "messageLimit" | "idleTimeout";
+export type PartnerPrivateMessageDeliveryStatusView = "pending" | "delivered" | "failed";
+export type PartnerDelegationStatusView =
+  | "preparing"
+  | "queued"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unknown";
 
 export interface PartnerModelRouteView {
   readonly backendId: string;
@@ -411,6 +424,95 @@ export interface PartnerProfileView {
   readonly usesDirectoryDefaults: boolean;
   readonly createdAt: number;
   readonly updatedAt: number;
+  readonly activity: PartnerActivityView;
+}
+
+export interface PartnerActivityView {
+  readonly partnerId: string;
+  readonly unreadReplyCount: number;
+  readonly latestReplyCursor?: bigint;
+  readonly latestReplyAt?: number;
+  readonly artifactCount: number;
+  readonly activeDelegationCount: number;
+  readonly readThroughCursor: bigint;
+  readonly readUpdatedAt: number;
+}
+
+export interface PartnerSessionView {
+  readonly sessionId: string;
+  readonly partnerId: string;
+  readonly role: PartnerSessionRoleView;
+  readonly profileVersion: bigint;
+  readonly parentSessionId?: string;
+  readonly delegationId?: string;
+  readonly displayName: string;
+  readonly available: boolean;
+  readonly readOnly: boolean;
+  readonly archived: boolean;
+  readonly deleted: boolean;
+  readonly createdAt: number;
+  readonly lastActivityAt?: number;
+}
+
+export interface PartnerPrivateThreadView {
+  readonly id: string;
+  readonly firstPartnerId: string;
+  readonly secondPartnerId: string;
+  readonly status: PartnerPrivateThreadStatusView;
+  readonly closeReason?: PartnerPrivateThreadCloseReasonView;
+  readonly messageCount: number;
+  readonly maxMessages: number;
+  readonly expiresAt: number;
+  readonly blockedUntil?: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly closedAt?: number;
+}
+
+export interface PartnerPrivateMessageView {
+  readonly id: string;
+  readonly threadId: string;
+  readonly sequence: number;
+  readonly senderPartnerId: string;
+  readonly recipientPartnerId: string;
+  readonly content: string;
+  readonly deliveryStatus: PartnerPrivateMessageDeliveryStatusView;
+  readonly createdAt: number;
+  readonly deliveredAt?: number;
+}
+
+export interface PartnerPrivateThreadReadStateView {
+  readonly threadId: string;
+  readonly partnerId: string;
+  readonly throughSequence: number;
+  readonly updatedAt: number;
+}
+
+export interface PartnerPrivateThreadDetailView {
+  readonly thread: PartnerPrivateThreadView;
+  readonly messages: readonly PartnerPrivateMessageView[];
+  readonly readState?: PartnerPrivateThreadReadStateView;
+}
+
+export interface PartnerDelegationView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly requesterPartnerId: string;
+  readonly targetPartnerId: string;
+  readonly parentSessionId: string;
+  readonly targetProfileVersion: bigint;
+  readonly title: string;
+  readonly objective: string;
+  readonly status: PartnerDelegationStatusView;
+  readonly childSessionId?: string;
+  readonly runId?: string;
+  readonly resultSummary?: string;
+  readonly error?: string;
+  readonly artifactCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly startedAt?: number;
+  readonly completedAt?: number;
 }
 
 export interface PartnerDraftView {
@@ -5195,6 +5297,14 @@ export interface OperationApi {
   setPartnerLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerMutationView>;
   retryPartnerInitialization(partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerMutationView>;
   updatePartnerDefaults(expectedDirectoryRevision: bigint, capabilities: PartnerCapabilitiesView, signal?: AbortSignal): Promise<PartnerDefaultsMutationView>;
+  listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]>;
+  markPartnerRead(partnerId: string, throughCursor: bigint, signal?: AbortSignal): Promise<PartnerActivityView>;
+  listPartnerPrivateThreads(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerPrivateThreadView[]>;
+  getPartnerPrivateThread(partnerId: string, threadId: string, signal?: AbortSignal): Promise<PartnerPrivateThreadDetailView>;
+  markPartnerPrivateThreadRead(partnerId: string, threadId: string, throughSequence: number, signal?: AbortSignal): Promise<PartnerPrivateThreadReadStateView>;
+  listPartnerDelegations(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerDelegationView[]>;
+  getPartnerDelegation(partnerId: string, delegationId: string, signal?: AbortSignal): Promise<PartnerDelegationView>;
+  cancelPartnerDelegation(partnerId: string, delegationId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerDelegationView>;
   getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView>;
   setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView>;
   listContacts(options?: ContactListOptionsView, signal?: AbortSignal): Promise<ContactListPageView>;
