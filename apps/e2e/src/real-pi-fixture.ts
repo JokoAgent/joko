@@ -10,6 +10,7 @@ import {
   createInternalServer,
   createPublicServer,
   type OrchestratorApplication,
+  type OrchestratorApplicationDependencies,
   type OrchestratorConfig
 } from "@joko/orchestrator";
 
@@ -55,6 +56,7 @@ export interface RealPiSystemFixtureOptions {
   readonly piSettings?: PiManagedSettings;
   readonly overflowRequestNumbers?: readonly number[];
   readonly providerResponder?: RealPiProviderResponder;
+  readonly providerSupportsImages?: boolean;
   readonly providerUsage?: {
     readonly promptTokens: number;
     readonly completionTokens: number;
@@ -66,6 +68,7 @@ export interface RealPiSystemFixtureOptions {
   /** Loopback-only endpoints used by the DingTalk Messaging product-chain fixture. */
   readonly dingTalkApiBaseUrl?: string;
   readonly dingTalkOapiBaseUrl?: string;
+  readonly createFeishuTransport?: OrchestratorApplicationDependencies["messagingCreateFeishuTransport"];
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -168,7 +171,8 @@ export class RealPiSystemFixture {
           id: REAL_PI_MODEL_ID,
           name: "Joko real Pi E2E model",
           contextWindow: 16_384,
-          maxTokens: 1_024
+          maxTokens: 1_024,
+          ...(options.providerSupportsImages === true ? { input: ["text", "image"] as const } : {})
         }]
       };
       const config: OrchestratorConfig = {
@@ -207,6 +211,9 @@ export class RealPiSystemFixture {
         ...(options.dingTalkOapiBaseUrl === undefined
           ? {}
           : { messagingDingTalkOapiBaseUrl: options.dingTalkOapiBaseUrl }),
+        ...(options.createFeishuTransport === undefined
+          ? {}
+          : { messagingCreateFeishuTransport: options.createFeishuTransport }),
         ...(options.messagingPollTimeoutSeconds === undefined
           ? {}
           : { messagingPollTimeoutSeconds: options.messagingPollTimeoutSeconds }),

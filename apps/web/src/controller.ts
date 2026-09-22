@@ -2400,6 +2400,8 @@ export function useAppController(): AppController {
       gateway().createDiscordMessagingConnection(ownerProviderUserId, configuration, signal),
     createDingTalkMessagingConnection: (configuration, signal) =>
       gateway().createDingTalkMessagingConnection(configuration, signal),
+    createFeishuMessagingConnection: (channel, configuration, signal) =>
+      gateway().createFeishuMessagingConnection(channel, configuration, signal),
     saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
       gateway().saveMessagingCredential(
         connectionId,
@@ -2456,6 +2458,19 @@ export function useAppController(): AppController {
       configuration,
       signal
     ) => gateway().updateDingTalkMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ),
+    updateFeishuMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ) => gateway().updateFeishuMessagingConfiguration(
       connectionId,
       expectedRevision,
       expectedGeneration,

@@ -5,6 +5,9 @@ import {
   DiscordEmojiReactions,
   DiscordGroupActivation,
   DiscordReplyQuoteMode,
+  FeishuEmojiReactions,
+  FeishuGroupActivation,
+  FeishuReplyQuoteMode,
   MessagingChannel,
   MessagingConnectionRuntimeStatus,
   MessagingConnectionTestFailure,
@@ -86,6 +89,29 @@ describe("Messaging gateway", () => {
             }
           },
           lastConnectedAt: 6_125
+        }),
+        expect.objectContaining({
+          id: "feishu-one",
+          channel: "feishu",
+          generation: 6n,
+          revision: 10n,
+          runtimeStatus: "connected",
+          credentialConfigured: true,
+          feishuConfiguration: {
+            appId: "cli_feishu",
+            lifecycleAnnouncements: true,
+            emojiReactions: "minimal",
+            replyQuoteDm: "off",
+            replyQuoteGroup: "first",
+            groupActivation: { oc_primary: "mention", oc_muted: "disabled" },
+            groupPermissionMode: "bypassPermissions"
+          },
+          lastConnectedAt: 7_250
+        }),
+        expect.objectContaining({
+          id: "lark-one",
+          channel: "lark",
+          feishuConfiguration: expect.objectContaining({ appId: "cli_lark" })
         })
       ],
       routes: [expect.objectContaining({
@@ -99,8 +125,8 @@ describe("Messaging gateway", () => {
         { channel: "telegram", available: true },
         { channel: "discord", available: true },
         { channel: "dingtalk", available: true },
-        { channel: "feishu", available: false, reason: "not implemented" },
-        { channel: "lark", available: false, reason: "not implemented" },
+        { channel: "feishu", available: true },
+        { channel: "lark", available: true },
         { channel: "wecom", available: false, reason: "not implemented" },
         { channel: "wechat", available: false, reason: "not implemented" },
         { channel: "slack", available: false, reason: "not implemented" }
@@ -127,6 +153,16 @@ describe("Messaging gateway", () => {
       groupActivation: { "cid-disabled": "disabled" as const }
     };
     await fixture.gateway.createDingTalkMessagingConnection(dingtalkConfiguration, signal);
+    const feishuConfiguration = {
+      appId: "cli_new",
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive" as const,
+      replyQuoteDm: "first" as const,
+      replyQuoteGroup: "all" as const,
+      groupActivation: { oc_new: "always" as const },
+      groupPermissionMode: "ask" as const
+    };
+    await fixture.gateway.createFeishuMessagingConnection("lark", feishuConfiguration, signal);
     await fixture.gateway.saveMessagingCredential("telegram-one", 7n, 3n, "telegram-test-token", true, signal);
     await fixture.gateway.clearMessagingCredential("telegram-one", 7n, 3n, signal);
     await fixture.gateway.setMessagingConnectionEnabled("telegram-one", 7n, 3n, false, signal);
@@ -144,6 +180,13 @@ describe("Messaging gateway", () => {
       9n,
       5n,
       dingtalkConfiguration,
+      signal
+    );
+    await fixture.gateway.updateFeishuMessagingConfiguration(
+      "feishu-one",
+      10n,
+      6n,
+      feishuConfiguration,
       signal
     );
     await expect(fixture.gateway.testMessagingConnection("telegram-one", signal)).resolves.toEqual({
@@ -223,6 +266,21 @@ describe("Messaging gateway", () => {
       }
     });
     expect(dingtalkCreate.ownerProviderUserId).toBeUndefined();
+    const larkCreate = fixture.requests.find((entry) => entry.method === "createMessagingConnection"
+      && entry.input.channel === MessagingChannel.LARK)?.input;
+    expect(larkCreate).toMatchObject({
+      channel: MessagingChannel.LARK,
+      feishuConfiguration: {
+        appId: "cli_new",
+        lifecycleAnnouncements: false,
+        emojiReactions: FeishuEmojiReactions.EXPRESSIVE,
+        replyQuoteDm: FeishuReplyQuoteMode.FIRST,
+        replyQuoteGroup: FeishuReplyQuoteMode.ALL,
+        groupActivationRules: [{ chatId: "oc_new", activation: FeishuGroupActivation.ALWAYS }],
+        groupPermissionMode: PermissionMode.ASK
+      }
+    });
+    expect(larkCreate.ownerProviderUserId).toBeUndefined();
     expect(byMethod("beginMessagingCredentialUpload")).toEqual({
       connectionId: "telegram-one",
       expectedRevision: { value: 7n },
@@ -278,6 +336,20 @@ describe("Messaging gateway", () => {
         }]
       }
     });
+    expect(byMethod("updateFeishuMessagingConfiguration")).toMatchObject({
+      connectionId: "feishu-one",
+      expectedRevision: { value: 10n },
+      expectedGeneration: 6n,
+      configuration: {
+        appId: "cli_new",
+        lifecycleAnnouncements: false,
+        emojiReactions: FeishuEmojiReactions.EXPRESSIVE,
+        replyQuoteDm: FeishuReplyQuoteMode.FIRST,
+        replyQuoteGroup: FeishuReplyQuoteMode.ALL,
+        groupActivationRules: [{ chatId: "oc_new", activation: FeishuGroupActivation.ALWAYS }],
+        groupPermissionMode: PermissionMode.ASK
+      }
+    });
     expect(byMethod("putMessagingRoute")).toEqual({
       connectionId: "telegram-one",
       expectedRevision: { value: 5n },
@@ -323,7 +395,13 @@ async function mount() {
         case "getMessagingSettings": {
           const channels = channelCapabilities();
           value = {
-            connections: [connection(), discordConnection(), dingTalkConnection()],
+            connections: [
+              connection(),
+              discordConnection(),
+              dingTalkConnection(),
+              feishuConnection(),
+              feishuConnection(MessagingChannel.LARK)
+            ],
             routes: [route()],
             channels: fixture.duplicateCapabilities ? [...channels, channels[0]] : channels
           };
@@ -348,7 +426,10 @@ async function mount() {
         case "putMessagingRoute": value = { route: route({ connectionId: "telegram-one", scopeKey: "connection:telegram-one" }) }; break;
         case "createMessagingConnection": value = {
           connection: input.channel === MessagingChannel.DISCORD ? discordConnection()
-            : input.channel === MessagingChannel.DINGTALK ? dingTalkConnection() : connection()
+            : input.channel === MessagingChannel.DINGTALK ? dingTalkConnection()
+              : input.channel === MessagingChannel.FEISHU ? feishuConnection()
+                : input.channel === MessagingChannel.LARK ? feishuConnection(MessagingChannel.LARK)
+                  : connection()
         }; break;
         case "commitMessagingCredential":
         case "clearMessagingCredential":
@@ -356,6 +437,7 @@ async function mount() {
         case "updateTelegramMessagingConfiguration": value = { connection: connection() }; break;
         case "updateDiscordMessagingConfiguration": value = { connection: discordConnection() }; break;
         case "updateDingTalkMessagingConfiguration": value = { connection: dingTalkConnection() }; break;
+        case "updateFeishuMessagingConfiguration": value = { connection: feishuConnection() }; break;
         default: throw new Error(`Unexpected RPC ${method.localName}`);
       }
       return response(method, create(method.output, value));
@@ -458,6 +540,37 @@ function dingTalkConnection() {
   };
 }
 
+function feishuConnection(channel = MessagingChannel.FEISHU) {
+  const lark = channel === MessagingChannel.LARK;
+  return {
+    connectionId: lark ? "lark-one" : "feishu-one",
+    channel,
+    generation: 6n,
+    enabled: true,
+    runtimeStatus: MessagingConnectionRuntimeStatus.CONNECTED,
+    credentialConfigured: true,
+    ownerProviderUserId: lark ? "ou_lark_owner" : "ou_feishu_owner",
+    providerAccountId: lark ? "cli_lark" : "cli_feishu",
+    providerUsername: lark ? "Lark bot" : "Feishu bot",
+    feishuConfiguration: {
+      appId: lark ? "cli_lark" : "cli_feishu",
+      lifecycleAnnouncements: true,
+      emojiReactions: FeishuEmojiReactions.MINIMAL,
+      replyQuoteDm: FeishuReplyQuoteMode.OFF,
+      replyQuoteGroup: FeishuReplyQuoteMode.FIRST,
+      groupActivationRules: [
+        { chatId: "oc_primary", activation: FeishuGroupActivation.MENTION },
+        { chatId: "oc_muted", activation: FeishuGroupActivation.DISABLED }
+      ],
+      groupPermissionMode: PermissionMode.BYPASS_PERMISSIONS
+    },
+    lastConnectedAt: timestamp(7n, 250_000_000),
+    createdAt: timestamp(4n),
+    updatedAt: timestamp(8n),
+    revision: { value: 10n }
+  };
+}
+
 function route(overrides: Record<string, unknown> = {}) {
   return {
     scopeKey: "global",
@@ -481,8 +594,8 @@ function channelCapabilities() {
     { channel: MessagingChannel.TELEGRAM, available: true },
     { channel: MessagingChannel.DISCORD, available: true },
     { channel: MessagingChannel.DINGTALK, available: true },
-    { channel: MessagingChannel.FEISHU, available: false, reason: "not implemented" },
-    { channel: MessagingChannel.LARK, available: false, reason: "not implemented" },
+    { channel: MessagingChannel.FEISHU, available: true },
+    { channel: MessagingChannel.LARK, available: true },
     { channel: MessagingChannel.WECOM, available: false, reason: "not implemented" },
     { channel: MessagingChannel.WECHAT, available: false, reason: "not implemented" },
     { channel: MessagingChannel.SLACK, available: false, reason: "not implemented" }

@@ -868,6 +868,7 @@ export interface BindMessagingConversationInput {
   readonly sessionId: SessionId;
   readonly expectedSessionGeneration: number;
   readonly routeScopeKey: string;
+  readonly expectedPermissionMode?: "ask" | "auto" | "bypassPermissions";
   readonly updatedAt?: UnixMillis;
 }
 

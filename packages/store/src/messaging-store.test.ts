@@ -149,6 +149,77 @@ describe("OperationalStore messaging", () => {
     expect(cleared.credentialReferenceId).toBeUndefined();
   });
 
+  it("binds a Session with an explicitly validated channel-specific permission mode", () => {
+    const fixture = createFixture();
+    const initial = fixture.store.createMessagingConnection({
+      id: "feishu-1",
+      channel: "feishu",
+      configuration: {},
+      createdAt: 10
+    });
+    const route = fixture.store.putMessagingRoute({
+      targetId: "target-1",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false,
+      updatedAt: 11
+    });
+    const configured = fixture.store.replaceMessagingCredential({
+      connectionId: initial.id,
+      expectedRevision: initial.revision,
+      expectedGeneration: initial.generation,
+      credentialReferenceId: "managed-feishu-secret",
+      credentialGeneration: "1".repeat(64),
+      enable: true,
+      updatedAt: 12
+    });
+    const observed = fixture.store.ensureMessagingConversation({
+      id: "feishu-group",
+      connectionId: configured.id,
+      expectedChannelGeneration: configured.generation,
+      providerConversationId: "oc_group",
+      conversationKind: "group",
+      observedAt: 13
+    });
+    fixture.store.createSession({
+      id: "feishu-group-session",
+      backendId: "backend-1",
+      targetId: "target-1",
+      title: "Feishu group",
+      binding: { opaqueRef: "service/messaging/feishu-group", generation: 0 },
+      pinned: false,
+      archived: false,
+      permissionMode: "bypassPermissions",
+      planMode: false,
+      fastMode: false,
+      createdAt: 14,
+      updatedAt: 14
+    });
+    const binding = {
+      conversationId: observed.id,
+      expectedRevision: observed.revision,
+      expectedChannelGeneration: configured.generation,
+      sessionId: "feishu-group-session" as const,
+      expectedSessionGeneration: 0,
+      routeScopeKey: route.scopeKey,
+      updatedAt: 15
+    };
+
+    expect(() => fixture.store.bindMessagingConversation(binding)).toThrow(
+      "Messaging Session does not match the selected creation-time route snapshot."
+    );
+    const bound = fixture.store.bindMessagingConversation({
+      ...binding,
+      expectedPermissionMode: "bypassPermissions"
+    });
+
+    expect(bound).toMatchObject({
+      status: "active",
+      sessionId: "feishu-group-session",
+      permissionMode: "bypassPermissions"
+    });
+  });
+
   it("claims an initially unknown owner without changing generation and can explicitly clear it", () => {
     const fixture = createFixture();
     const initial = fixture.store.createMessagingConnection({

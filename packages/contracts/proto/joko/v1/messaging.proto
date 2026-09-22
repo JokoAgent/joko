@@ -79,6 +79,27 @@ enum DingTalkGroupActivation {
   DING_TALK_GROUP_ACTIVATION_DISABLED = 3;
 }
 
+enum FeishuEmojiReactions {
+  FEISHU_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  FEISHU_EMOJI_REACTIONS_OFF = 1;
+  FEISHU_EMOJI_REACTIONS_MINIMAL = 2;
+  FEISHU_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum FeishuReplyQuoteMode {
+  FEISHU_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+  FEISHU_REPLY_QUOTE_MODE_OFF = 1;
+  FEISHU_REPLY_QUOTE_MODE_FIRST = 2;
+  FEISHU_REPLY_QUOTE_MODE_ALL = 3;
+}
+
+enum FeishuGroupActivation {
+  FEISHU_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  FEISHU_GROUP_ACTIVATION_MENTION = 1;
+  FEISHU_GROUP_ACTIVATION_ALWAYS = 2;
+  FEISHU_GROUP_ACTIVATION_DISABLED = 3;
+}
+
 enum MessagingConnectionTestFailure {
   MESSAGING_CONNECTION_TEST_FAILURE_UNSPECIFIED = 0;
   MESSAGING_CONNECTION_TEST_FAILURE_INVALID = 1;
@@ -124,6 +145,21 @@ message DingTalkGroupActivationRule {
   DingTalkGroupActivation activation = 2;
 }
 
+message FeishuMessagingConfiguration {
+  string app_id = 1;
+  bool lifecycle_announcements = 2;
+  FeishuEmojiReactions emoji_reactions = 3;
+  FeishuReplyQuoteMode reply_quote_dm = 4;
+  FeishuReplyQuoteMode reply_quote_group = 5;
+  repeated FeishuGroupActivationRule group_activation_rules = 6;
+  PermissionMode group_permission_mode = 7;
+}
+
+message FeishuGroupActivationRule {
+  string chat_id = 1;
+  FeishuGroupActivation activation = 2;
+}
+
 message MessagingChannelCapability {
   MessagingChannel channel = 1;
   bool available = 2;
@@ -149,6 +185,7 @@ message MessagingConnection {
   Revision revision = 16;
   optional DiscordMessagingConfiguration discord_configuration = 17;
   optional DingTalkMessagingConfiguration dingtalk_configuration = 18;
+  optional FeishuMessagingConfiguration feishu_configuration = 19;
 }
 
 message MessagingRoute {
@@ -181,6 +218,7 @@ message CreateMessagingConnectionRequest {
   optional TelegramMessagingConfiguration telegram_configuration = 3;
   optional DiscordMessagingConfiguration discord_configuration = 4;
   optional DingTalkMessagingConfiguration dingtalk_configuration = 5;
+  optional FeishuMessagingConfiguration feishu_configuration = 6;
 }
 
 message CreateMessagingConnectionResponse {
@@ -259,6 +297,17 @@ message UpdateDingTalkMessagingConfigurationRequest {
 }
 
 message UpdateDingTalkMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateFeishuMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  FeishuMessagingConfiguration configuration = 4;
+}
+
+message UpdateFeishuMessagingConfigurationResponse {
   MessagingConnection connection = 1;
 }
 

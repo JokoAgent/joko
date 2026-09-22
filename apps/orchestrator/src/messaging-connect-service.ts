@@ -13,9 +13,11 @@ import {
   MessagingManagerError,
   decodeDingTalkMessagingConfiguration,
   decodeDiscordMessagingConfiguration,
+  decodeFeishuMessagingConfiguration,
   decodeTelegramMessagingConfiguration,
   type DingTalkMessagingConfiguration,
   type DiscordMessagingConfiguration,
+  type FeishuMessagingConfiguration,
   type MessagingManager,
   type TelegramMessagingConfiguration
 } from "./messaging-manager.js";
@@ -60,7 +62,11 @@ export function createMessagingConnectService(
       const owner = requireManager(manager);
       const connection = request.channel === contract.MessagingChannel.TELEGRAM
         ? (() => {
-            if (request.discordConfiguration !== undefined || request.dingtalkConfiguration !== undefined) {
+            if (
+              request.discordConfiguration !== undefined
+              || request.dingtalkConfiguration !== undefined
+              || request.feishuConfiguration !== undefined
+            ) {
               throw new ConnectError("Another channel configuration does not belong to a Telegram connection.", Code.InvalidArgument);
             }
             return owner.createTelegramConnection({
@@ -72,7 +78,11 @@ export function createMessagingConnectService(
           })()
         : request.channel === contract.MessagingChannel.DISCORD
           ? (() => {
-              if (request.telegramConfiguration !== undefined || request.dingtalkConfiguration !== undefined) {
+              if (
+                request.telegramConfiguration !== undefined
+                || request.dingtalkConfiguration !== undefined
+                || request.feishuConfiguration !== undefined
+              ) {
                 throw new ConnectError("Another channel configuration does not belong to a Discord connection.", Code.InvalidArgument);
               }
               return owner.createDiscordConnection({
@@ -84,7 +94,11 @@ export function createMessagingConnectService(
             })()
           : request.channel === contract.MessagingChannel.DINGTALK
             ? (() => {
-                if (request.telegramConfiguration !== undefined || request.discordConfiguration !== undefined) {
+                if (
+                  request.telegramConfiguration !== undefined
+                  || request.discordConfiguration !== undefined
+                  || request.feishuConfiguration !== undefined
+                ) {
                   throw new ConnectError("Another channel configuration does not belong to a DingTalk connection.", Code.InvalidArgument);
                 }
                 if (request.ownerProviderUserId !== "") {
@@ -97,7 +111,34 @@ export function createMessagingConnectService(
                   configuration: fromProtoDingTalkConfiguration(request.dingtalkConfiguration)
                 });
               })()
-            : undefined;
+            : request.channel === contract.MessagingChannel.FEISHU
+                || request.channel === contract.MessagingChannel.LARK
+              ? (() => {
+                  if (
+                    request.telegramConfiguration !== undefined
+                    || request.discordConfiguration !== undefined
+                    || request.dingtalkConfiguration !== undefined
+                  ) {
+                    throw new ConnectError(
+                      "Another channel configuration does not belong to a Feishu/Lark connection.",
+                      Code.InvalidArgument
+                    );
+                  }
+                  if (request.ownerProviderUserId !== "") {
+                    throw new ConnectError(
+                      "Feishu/Lark ownership is claimed by the first direct message.",
+                      Code.InvalidArgument
+                    );
+                  }
+                  if (request.feishuConfiguration === undefined) {
+                    throw new ConnectError("Feishu/Lark configuration is required.", Code.InvalidArgument);
+                  }
+                  return owner.createFeishuConnection({
+                    channel: request.channel === contract.MessagingChannel.FEISHU ? "feishu" : "lark",
+                    configuration: fromProtoFeishuConfiguration(request.feishuConfiguration)
+                  });
+                })()
+              : undefined;
       if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
       }
@@ -207,6 +248,22 @@ export function createMessagingConnectService(
         configuration: fromProtoDingTalkConfiguration(request.configuration)
       });
       return create(contract.UpdateDingTalkMessagingConfigurationResponseSchema, {
+        connection: toProtoConnection(connection)
+      });
+    }),
+
+    updateFeishuMessagingConfiguration: async (request, context) => messagingRpc(async () => {
+      authenticate(context);
+      if (request.configuration === undefined) {
+        throw new ConnectError("configuration is required.", Code.InvalidArgument);
+      }
+      const connection = await requireManager(manager).replaceFeishuConfiguration({
+        connectionId: request.connectionId,
+        expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration),
+        configuration: fromProtoFeishuConfiguration(request.configuration)
+      });
+      return create(contract.UpdateFeishuMessagingConfigurationResponseSchema, {
         connection: toProtoConnection(connection)
       });
     }),
@@ -448,6 +505,84 @@ function toProtoDingTalkConfiguration(
   });
 }
 
+function fromProtoFeishuConfiguration(
+  value: contract.FeishuMessagingConfiguration
+): FeishuMessagingConfiguration {
+  const emojiReactions = value.emojiReactions === contract.FeishuEmojiReactions.OFF ? "off"
+    : value.emojiReactions === contract.FeishuEmojiReactions.MINIMAL ? "minimal"
+      : value.emojiReactions === contract.FeishuEmojiReactions.EXPRESSIVE ? "expressive"
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === contract.FeishuReplyQuoteMode.OFF ? "off"
+    : value.replyQuoteDm === contract.FeishuReplyQuoteMode.FIRST ? "first"
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === contract.FeishuReplyQuoteMode.OFF ? "off"
+    : value.replyQuoteGroup === contract.FeishuReplyQuoteMode.FIRST ? "first"
+      : value.replyQuoteGroup === contract.FeishuReplyQuoteMode.ALL ? "all"
+        : undefined;
+  const groupPermissionMode = value.groupPermissionMode === contract.PermissionMode.ASK ? "ask"
+    : value.groupPermissionMode === contract.PermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions"
+      : undefined;
+  if (
+    emojiReactions === undefined
+    || replyQuoteDm === undefined
+    || replyQuoteGroup === undefined
+    || groupPermissionMode === undefined
+  ) {
+    throw new ConnectError("Feishu/Lark configuration is invalid.", Code.InvalidArgument);
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const mapped = rule.activation === contract.FeishuGroupActivation.MENTION ? "mention"
+      : rule.activation === contract.FeishuGroupActivation.ALWAYS ? "always"
+        : rule.activation === contract.FeishuGroupActivation.DISABLED ? "disabled"
+          : undefined;
+    if (mapped === undefined || Object.hasOwn(groupActivation, rule.chatId)) {
+      throw new ConnectError("Feishu/Lark group activation is invalid.", Code.InvalidArgument);
+    }
+    groupActivation[rule.chatId] = mapped;
+  }
+  return decodeFeishuMessagingConfiguration({
+    format: 1,
+    appId: value.appId,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation,
+    groupPermissionMode
+  });
+}
+
+function toProtoFeishuConfiguration(
+  value: FeishuMessagingConfiguration
+): contract.FeishuMessagingConfiguration {
+  return create(contract.FeishuMessagingConfigurationSchema, {
+    appId: value.appId,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? contract.FeishuEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? contract.FeishuEmojiReactions.MINIMAL
+        : contract.FeishuEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? contract.FeishuReplyQuoteMode.OFF
+      : contract.FeishuReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? contract.FeishuReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? contract.FeishuReplyQuoteMode.FIRST
+        : contract.FeishuReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([chatId, activation]) => create(
+      contract.FeishuGroupActivationRuleSchema,
+      {
+        chatId,
+        activation: activation === "mention" ? contract.FeishuGroupActivation.MENTION
+          : activation === "always" ? contract.FeishuGroupActivation.ALWAYS
+            : contract.FeishuGroupActivation.DISABLED
+      }
+    )),
+    groupPermissionMode: value.groupPermissionMode === "ask"
+      ? contract.PermissionMode.ASK
+      : contract.PermissionMode.BYPASS_PERMISSIONS
+  });
+}
+
 function toProtoConnection(value: MessagingConnectionRecord): contract.MessagingConnection {
   return create(contract.MessagingConnectionSchema, {
     connectionId: value.id,
@@ -472,6 +607,11 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
     ...(value.channel !== "dingtalk" ? {} : {
       dingtalkConfiguration: toProtoDingTalkConfiguration(
         decodeDingTalkMessagingConfiguration(value.configuration)
+      )
+    }),
+    ...(value.channel !== "feishu" && value.channel !== "lark" ? {} : {
+      feishuConfiguration: toProtoFeishuConfiguration(
+        decodeFeishuMessagingConfiguration(value.configuration)
       )
     }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
@@ -515,7 +655,8 @@ function toProtoChannel(value: NativeMessagingChannel): contract.MessagingChanne
 }
 
 function isAvailableChannel(value: NativeMessagingChannel): boolean {
-  return value === "telegram" || value === "discord" || value === "dingtalk";
+  return value === "telegram" || value === "discord" || value === "dingtalk"
+    || value === "feishu" || value === "lark";
 }
 
 function toProtoRuntimeStatus(

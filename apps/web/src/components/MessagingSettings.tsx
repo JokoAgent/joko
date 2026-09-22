@@ -18,6 +18,7 @@ import type {
   AppSnapshot,
   DingTalkMessagingConfigurationView,
   DiscordMessagingConfigurationView,
+  FeishuMessagingConfigurationView,
   MessagingChannelView,
   MessagingConnectionTestResultView,
   MessagingConnectionView,
@@ -55,8 +56,17 @@ const DEFAULT_DISCORD_CONFIGURATION: DiscordMessagingConfigurationView = Object.
   groupActivation: Object.freeze({})
 });
 
+const DEFAULT_FEISHU_CONFIGURATION = Object.freeze({
+  lifecycleAnnouncements: true,
+  emojiReactions: "minimal",
+  replyQuoteDm: "off",
+  replyQuoteGroup: "all",
+  groupActivation: Object.freeze({}),
+  groupPermissionMode: "ask"
+} as const satisfies Omit<FeishuMessagingConfigurationView, "appId">);
+
 type MessagingDialog =
-  | { readonly kind: "create"; readonly channel: "telegram" | "discord" | "dingtalk" }
+  | { readonly kind: "create"; readonly channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark" }
   | { readonly kind: "credential"; readonly connectionId: string }
   | { readonly kind: "configuration"; readonly connectionId: string }
   | { readonly kind: "clear"; readonly connectionId: string }
@@ -175,16 +185,25 @@ export function MessagingSettings({ controller, snapshot, t }: {
     capability.channel === "discord" && capability.available) === true;
   const dingtalkAvailable = settings?.channels.some((capability) =>
     capability.channel === "dingtalk" && capability.available) === true;
+  const feishuAvailable = settings?.channels.some((capability) =>
+    capability.channel === "feishu" && capability.available) === true;
+  const larkAvailable = settings?.channels.some((capability) =>
+    capability.channel === "lark" && capability.available) === true;
 
   const createConnection = async (
-    channel: "telegram" | "discord" | "dingtalk",
+    channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark",
     identity: string
   ): Promise<void> => {
     const connection = await run(`create:${channel}`, () => channel === "telegram"
       ? controller.createTelegramMessagingConnection(identity, DEFAULT_TELEGRAM_CONFIGURATION)
       : channel === "discord"
         ? controller.createDiscordMessagingConnection(identity, DEFAULT_DISCORD_CONFIGURATION)
-        : controller.createDingTalkMessagingConnection({ appKey: identity, groupActivation: {} }));
+        : channel === "dingtalk"
+          ? controller.createDingTalkMessagingConnection({ appKey: identity, groupActivation: {} })
+          : controller.createFeishuMessagingConnection(channel, {
+              appId: identity,
+              ...DEFAULT_FEISHU_CONFIGURATION
+            }));
     if (connection === undefined) return;
     replaceConnection(connection);
     setDialog({ kind: "credential", connectionId: connection.id });
@@ -360,6 +379,38 @@ export function MessagingSettings({ controller, snapshot, t }: {
     setDialog(undefined);
   };
 
+  const updateFeishuConfiguration = async (
+    connection: MessagingConnectionView,
+    configuration: FeishuMessagingConfigurationView
+  ): Promise<void> => {
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.updateFeishuMessagingConfiguration(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        configuration
+      );
+      let candidate = await refreshConnection(connection);
+      if (feishuConfigurationEqual(candidate.feishuConfiguration, configuration)) return candidate;
+      if (candidate.generation !== connection.generation
+        || !feishuConfigurationEqual(candidate.feishuConfiguration, connection.feishuConfiguration)) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (feishuConfigurationEqual(candidate.feishuConfiguration, configuration)) return candidate;
+        if (candidate.generation !== connection.generation
+          || !feishuConfigurationEqual(candidate.feishuConfiguration, connection.feishuConfiguration)) throw reason;
+        return save(candidate);
+      }
+    });
+    if (updated === undefined) return;
+    replaceConnection(updated);
+    setDialog(undefined);
+  };
+
   const clearCredential = async (connection: MessagingConnectionView): Promise<void> => {
     const updated = await run(`clear:${connection.id}`, async () => {
       const clear = (candidate: MessagingConnectionView) => controller.clearMessagingCredential(
@@ -422,6 +473,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
         {dingtalkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "dingtalk" })}>
           <Plus aria-hidden="true" />{t("messaging.addDingTalk")}
         </Button>}
+        {feishuAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "feishu" })}>
+          <Plus aria-hidden="true" />{t("messaging.addFeishu")}
+        </Button>}
+        {larkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "lark" })}>
+          <Plus aria-hidden="true" />{t("messaging.addLark")}
+        </Button>}
       </div>
     </header>
 
@@ -465,6 +522,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
           {dingtalkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "dingtalk" })}>
             <Plus aria-hidden="true" />{t("messaging.addDingTalk")}
           </Button>}
+          {feishuAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "feishu" })}>
+            <Plus aria-hidden="true" />{t("messaging.addFeishu")}
+          </Button>}
+          {larkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "lark" })}>
+            <Plus aria-hidden="true" />{t("messaging.addLark")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -479,9 +542,10 @@ export function MessagingSettings({ controller, snapshot, t }: {
                       <h4>{channelLabel(connection.channel)}</h4>
                       <ConnectionStatus status={connection.runtimeStatus} channel={connection.channel} t={t} />
                     </div>
-                    <p>{connection.channel === "dingtalk"
+                    <p>{connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark"
                       ? connection.ownerProviderUserId === undefined
-                        ? t("messaging.dingtalkAwaitingOwner")
+                        ? t(connection.channel === "dingtalk"
+                          ? "messaging.dingtalkAwaitingOwner" : "messaging.feishuAwaitingOwner")
                         : t("messaging.ownerIdentity", { id: connection.ownerProviderUserId })
                       : connection.providerUsername === undefined
                         ? t("messaging.ownerIdentity", { id: connection.ownerProviderUserId ?? "—" })
@@ -507,8 +571,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
                   ? t("common.none")
                   : formatRelativeTime(connection.lastConnectedAt, controller.state.preferences.locale)}</span>
                 <span><strong>{t(connection.channel === "discord" ? "messaging.discordOwnerId"
-                  : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId
-                    ?? (connection.channel === "dingtalk" ? t("messaging.dingtalkAwaitingOwner") : "—")}</span>
+                  : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId"
+                    : connection.channel === "feishu" || connection.channel === "lark"
+                      ? "messaging.feishuOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId
+                    ?? (connection.channel === "dingtalk" ? t("messaging.dingtalkAwaitingOwner")
+                      : connection.channel === "feishu" || connection.channel === "lark"
+                        ? t("messaging.feishuAwaitingOwner") : "—")}</span>
               </div>
 
               {(connection.runtimeStatus === "conflict" || connection.runtimeStatus === "authLoss" || connection.runtimeStatus === "error") &&
@@ -537,7 +605,11 @@ export function MessagingSettings({ controller, snapshot, t }: {
                   <KeyRound aria-hidden="true" />{messagingCredentialActionLabel(connection, t)}
                 </Button>
                 {connection.credentialConfigured && <Button tone="ghost" disabled={pending} onClick={() => setDialog({ kind: "clear", connectionId: connection.id })}>
-                  <Trash2 aria-hidden="true" />{connection.channel === "dingtalk" ? t("messaging.dingtalkClearCredential") : t("messaging.clearCredential")}
+                  <Trash2 aria-hidden="true" />{t(connection.channel === "dingtalk"
+                    ? "messaging.dingtalkClearCredential"
+                    : connection.channel === "feishu" || connection.channel === "lark"
+                      ? "messaging.appSecretClearCredential"
+                      : "messaging.clearCredential")}
                 </Button>}
               </footer>
             </article>;
@@ -584,6 +656,14 @@ export function MessagingSettings({ controller, snapshot, t }: {
       onClose={() => setDialog(undefined)}
       onSubmit={(configuration) => { void updateDingTalkConfiguration(connectionForDialog, configuration); }}
     />}
+    {connectionForDialog !== undefined && connectionForDialog.feishuConfiguration !== undefined && <FeishuConfigurationDialog
+      open={dialog?.kind === "configuration"}
+      connection={connectionForDialog}
+      busy={busy === `configuration:${connectionForDialog.id}`}
+      t={t}
+      onClose={() => setDialog(undefined)}
+      onSubmit={(configuration) => { void updateFeishuConfiguration(connectionForDialog, configuration); }}
+    />}
     {connectionForDialog !== undefined && <ClearCredentialDialog
       open={dialog?.kind === "clear"}
       connection={connectionForDialog}
@@ -620,6 +700,8 @@ function ConnectionStatus({ status, channel, t }: {
   return <span className={cx("messaging-status", `messaging-status--${status}`)}>
     <span aria-hidden="true" />{t(status === "idle" && channel === "dingtalk"
       ? "messaging.status.dingtalkIdle"
+      : status === "idle" && (channel === "feishu" || channel === "lark")
+        ? "messaging.status.appSecretIdle"
       : `messaging.status.${status}`)}
   </span>;
 }
@@ -648,11 +730,11 @@ function RouteSummary({ route, fallback, snapshot, t, compact = false }: {
 
 function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
   readonly open: boolean;
-  readonly channel: "telegram" | "discord" | "dingtalk";
+  readonly channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark";
   readonly busy: boolean;
   readonly t: Translator;
   readonly onClose: () => void;
-  readonly onSubmit: (channel: "telegram" | "discord" | "dingtalk", identity: string) => void;
+  readonly onSubmit: (channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark", identity: string) => void;
 }): JSX.Element {
   const [identity, setIdentity] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -661,13 +743,18 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
     ? /^[1-9][0-9]{16,19}$/u.test(identity.trim())
     : channel === "dingtalk"
       ? validDingTalkProviderId(identity, 256)
-      : /^[1-9][0-9]{0,15}$/u.test(identity.trim());
+      : channel === "feishu" || channel === "lark"
+        ? validFeishuProviderId(identity, 256)
+        : /^[1-9][0-9]{0,15}$/u.test(identity.trim());
   return <Modal
     open={open}
     title={channel === "discord" ? t("messaging.discordCreateTitle")
-      : channel === "dingtalk" ? t("messaging.dingtalkCreateTitle") : t("messaging.createTitle")}
+      : channel === "dingtalk" ? t("messaging.dingtalkCreateTitle")
+        : channel === "feishu" ? t("messaging.feishuCreateTitle")
+          : channel === "lark" ? t("messaging.larkCreateTitle") : t("messaging.createTitle")}
     description={channel === "discord" ? t("messaging.discordCreateBody")
-      : channel === "dingtalk" ? t("messaging.dingtalkCreateBody") : t("messaging.createBody")}
+      : channel === "dingtalk" ? t("messaging.dingtalkCreateBody")
+        : channel === "feishu" || channel === "lark" ? t("messaging.feishuCreateBody") : t("messaging.createBody")}
     closeLabel={t("common.close")}
     onClose={onClose}
     initialFocus={() => inputRef.current}
@@ -675,9 +762,13 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
   >
     <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSubmit(channel, identity.trim()); }}>
       <label><span>{channel === "discord" ? t("messaging.discordOwnerId")
-        : channel === "dingtalk" ? t("messaging.dingtalkAppKey") : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "dingtalk" ? "text" : "numeric"} autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : "123456789"} /></label>
+        : channel === "dingtalk" ? t("messaging.dingtalkAppKey")
+          : channel === "feishu" || channel === "lark" ? t("messaging.feishuAppId")
+            : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "telegram" || channel === "discord" ? "numeric" : "text"} autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : channel === "feishu" || channel === "lark" ? "cli_xxxxxxxx" : "123456789"} /></label>
       <p className="messaging-form__hint">{channel === "discord" ? t("messaging.discordOwnerIdBody")
-        : channel === "dingtalk" ? t("messaging.dingtalkAppKeyBody") : t("messaging.ownerIdBody")}</p>
+        : channel === "dingtalk" ? t("messaging.dingtalkAppKeyBody")
+          : channel === "feishu" || channel === "lark" ? t("messaging.feishuAppIdBody")
+            : t("messaging.ownerIdBody")}</p>
       {channel === "discord" && <p className="messaging-form__hint"><a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">{t("messaging.discordDeveloperPortal")}</a></p>}
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.continue")}</Button></div>
     </form>
@@ -695,12 +786,19 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
   const [secret, setSecret] = useState("");
   const [enable, setEnable] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
+  const appSecret = connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark";
+  const credentialLabel = connection.channel === "dingtalk"
+    ? "messaging.dingtalkAppSecret"
+    : appSecret ? "messaging.appSecret" : "messaging.botToken";
+  const secretSafety = connection.channel === "dingtalk"
+    ? "messaging.dingtalkSecretSafety"
+    : appSecret ? "messaging.appSecretSafety" : "messaging.secretSafety";
   useEffect(() => { if (open) { setSecret(""); setEnable(true); } }, [open, connection.id]);
-  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
+  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
     <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (secret.trim() !== "") onSubmit(secret, enable); }}>
-      <label><span>{t(connection.channel === "dingtalk" ? "messaging.dingtalkAppSecret" : "messaging.botToken")}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
+      <label><span>{t(credentialLabel)}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
       <label className="messaging-choice-row"><CheckboxControl checked={enable} onChange={(event) => setEnable(event.target.checked)} aria-label={t("messaging.enableAfterSave")} /><span>{t("messaging.enableAfterSave")}</span></label>
-      <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t(connection.channel === "dingtalk" ? "messaging.dingtalkSecretSafety" : "messaging.secretSafety")}</p>
+      <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t(secretSafety)}</p>
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={secret.trim() === "" || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
     </form>
   </Modal>;
@@ -839,6 +937,66 @@ function DingTalkConfigurationDialog({ open, connection, busy, t, onClose, onSub
   </Modal>;
 }
 
+function FeishuConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
+  readonly open: boolean;
+  readonly connection: MessagingConnectionView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onSubmit: (configuration: FeishuMessagingConfigurationView) => void;
+}): JSX.Element {
+  const initial = connection.feishuConfiguration!;
+  const [appId, setAppId] = useState(initial.appId);
+  const [lifecycleAnnouncements, setLifecycleAnnouncements] = useState(initial.lifecycleAnnouncements);
+  const [emoji, setEmoji] = useState(initial.emojiReactions);
+  const [dmQuote, setDmQuote] = useState(initial.replyQuoteDm);
+  const [groupQuote, setGroupQuote] = useState(initial.replyQuoteGroup);
+  const [groupPermissionMode, setGroupPermissionMode] = useState(initial.groupPermissionMode);
+  const [groups, setGroups] = useState(groupActivationText(initial.groupActivation));
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const current = connection.feishuConfiguration!;
+    setAppId(current.appId);
+    setLifecycleAnnouncements(current.lifecycleAnnouncements);
+    setEmoji(current.emojiReactions);
+    setDmQuote(current.replyQuoteDm);
+    setGroupQuote(current.replyQuoteGroup);
+    setGroupPermissionMode(current.groupPermissionMode);
+    setGroups(groupActivationText(current.groupActivation));
+  }, [connection, open]);
+  const parsedGroups = parseFeishuGroupActivation(groups);
+  const valid = validFeishuProviderId(appId, 256) && parsedGroups !== undefined;
+  const providerName = channelLabel(connection.channel);
+  return <Modal open={open} title={t("messaging.feishuConfigureTitle", { name: providerName })} description={t("messaging.feishuConfigureBody", { name: providerName })} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose size="large">
+    <form className="messaging-form messaging-form--grid" onSubmit={(event) => {
+      event.preventDefault();
+      if (valid && parsedGroups !== undefined) onSubmit({
+        appId: appId.trim(),
+        lifecycleAnnouncements,
+        emojiReactions: emoji,
+        replyQuoteDm: dmQuote,
+        replyQuoteGroup: groupQuote,
+        groupActivation: parsedGroups,
+        groupPermissionMode
+      });
+    }}>
+      <label className="messaging-form__wide"><span>{t("messaging.feishuAppId")}</span><input ref={inputRef} value={appId} onChange={(event) => setAppId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+      <p className="messaging-form__hint messaging-form__wide">{t("messaging.feishuAppIdChangeBody")}</p>
+      <label><span>{t("messaging.emojiReactions")}</span><SelectControl value={emoji} onChange={(event) => setEmoji(event.target.value as typeof emoji)}><option value="off">{t("common.off")}</option><option value="minimal">{t("messaging.reactionsMinimal")}</option><option value="expressive">{t("messaging.reactionsExpressive")}</option></SelectControl></label>
+      <label><span>{t("messaging.dmQuote")}</span><SelectControl value={dmQuote} onChange={(event) => setDmQuote(event.target.value as typeof dmQuote)}><option value="off">{t("common.off")}</option><option value="first">{t("messaging.quoteFirst")}</option></SelectControl></label>
+      <label><span>{t("messaging.groupQuote")}</span><SelectControl value={groupQuote} onChange={(event) => setGroupQuote(event.target.value as typeof groupQuote)}><option value="off">{t("common.off")}</option><option value="first">{t("messaging.quoteFirst")}</option><option value="all">{t("messaging.quoteAll")}</option></SelectControl></label>
+      <label><span>{t("messaging.feishuGroupPermission")}</span><SelectControl value={groupPermissionMode} onChange={(event) => setGroupPermissionMode(event.target.value as typeof groupPermissionMode)}><option value="ask">{t("messaging.permissionAsk")}</option><option value="bypassPermissions">{t("messaging.permissionBypass")}</option></SelectControl></label>
+      <label className="messaging-choice-row"><CheckboxControl checked={lifecycleAnnouncements} onChange={(event) => setLifecycleAnnouncements(event.target.checked)} aria-label={t("messaging.lifecycleAnnouncements")} /><span>{t("messaging.lifecycleAnnouncements")}</span></label>
+      <p className="messaging-form__hint">{t("messaging.lifecycleAnnouncementsBody")}</p>
+      <label className="messaging-form__wide"><span>{t("messaging.feishuGroupActivation")}</span><textarea value={groups} onChange={(event) => setGroups(event.target.value)} rows={5} placeholder={"oc_xxxxxxxx=mention\noc_yyyyyyyy=always"} aria-invalid={parsedGroups === undefined} /></label>
+      <p className="messaging-form__hint messaging-form__wide">{parsedGroups === undefined ? t("messaging.feishuGroupActivationInvalid") : t("messaging.feishuGroupActivationBody")}</p>
+      <p className="messaging-form__warning messaging-form__wide">{t("messaging.feishuGroupSafety")}</p>
+      <div className="modal__actions messaging-form__wide"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
+    </form>
+  </Modal>;
+}
+
 function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }: {
   readonly open: boolean;
   readonly connection: MessagingConnectionView;
@@ -848,8 +1006,13 @@ function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }
   readonly onConfirm: () => void;
 }): JSX.Element {
   const dingtalk = connection.channel === "dingtalk";
-  return <Modal open={open} title={t(dingtalk ? "messaging.dingtalkClearTitle" : "messaging.clearTitle")} description={t("messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
-    <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(dingtalk ? "messaging.dingtalkClearCredential" : "messaging.clearCredential")}</Button></div>
+  const appSecret = connection.channel === "feishu" || connection.channel === "lark";
+  const title = dingtalk ? "messaging.dingtalkClearTitle"
+    : appSecret ? "messaging.appSecretClearTitle" : "messaging.clearTitle";
+  const action = dingtalk ? "messaging.dingtalkClearCredential"
+    : appSecret ? "messaging.appSecretClearCredential" : "messaging.clearCredential";
+  return <Modal open={open} title={t(title)} description={t("messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
+    <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(action)}</Button></div>
   </Modal>;
 }
 
@@ -994,7 +1157,26 @@ function parseDingTalkGroupActivation(value: string): Record<string, "mention" |
   return result;
 }
 
+function parseFeishuGroupActivation(value: string): Record<string, "mention" | "always" | "disabled"> | undefined {
+  const result: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rawLine of value.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    const match = /^(.+?)\s*=\s*(mention|always|disabled)$/u.exec(line);
+    const chatId = match?.[1]?.trim();
+    if (match === null || chatId === undefined || !validFeishuProviderId(chatId, 512)
+      || Object.hasOwn(result, chatId)) return undefined;
+    result[chatId] = match[2]! as "mention" | "always" | "disabled";
+  }
+  return result;
+}
+
 function validDingTalkProviderId(value: string, maximum: number): boolean {
+  const normalized = value.trim();
+  return normalized.length >= 1 && normalized.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(normalized);
+}
+
+function validFeishuProviderId(value: string, maximum: number): boolean {
   const normalized = value.trim();
   return normalized.length >= 1 && normalized.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(normalized);
 }
@@ -1030,9 +1212,26 @@ function dingtalkConfigurationEqual(
   return left.appKey === right.appKey && activationRulesEqual(left.groupActivation, right.groupActivation);
 }
 
+function feishuConfigurationEqual(
+  left: FeishuMessagingConfigurationView | undefined,
+  right: FeishuMessagingConfigurationView | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.appId === right.appId
+    && left.lifecycleAnnouncements === right.lifecycleAnnouncements
+    && left.emojiReactions === right.emojiReactions
+    && left.replyQuoteDm === right.replyQuoteDm
+    && left.replyQuoteGroup === right.replyQuoteGroup
+    && left.groupPermissionMode === right.groupPermissionMode
+    && activationRulesEqual(left.groupActivation, right.groupActivation);
+}
+
 function messagingCredentialActionLabel(connection: MessagingConnectionView, t: Translator): string {
   if (connection.channel === "dingtalk") {
     return t(connection.credentialConfigured ? "messaging.dingtalkReplaceCredential" : "messaging.dingtalkAddCredential");
+  }
+  if (connection.channel === "feishu" || connection.channel === "lark") {
+    return t(connection.credentialConfigured ? "messaging.feishuReplaceCredential" : "messaging.feishuAddCredential");
   }
   return t(connection.credentialConfigured ? "messaging.replaceCredential" : "messaging.addCredential");
 }

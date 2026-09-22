@@ -4266,6 +4266,17 @@ export interface DingTalkMessagingConfigurationView {
   readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
 }
 
+export interface FeishuMessagingConfigurationView {
+  readonly appId: string;
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  /** Keys are exact Feishu/Lark chat IDs. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+  readonly groupPermissionMode: "ask" | "bypassPermissions";
+}
+
 export interface MessagingConnectionView {
   readonly id: string;
   readonly channel: MessagingChannelView;
@@ -4280,6 +4291,7 @@ export interface MessagingConnectionView {
   readonly telegramConfiguration?: TelegramMessagingConfigurationView;
   readonly discordConfiguration?: DiscordMessagingConfigurationView;
   readonly dingtalkConfiguration?: DingTalkMessagingConfigurationView;
+  readonly feishuConfiguration?: FeishuMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -5524,6 +5536,11 @@ export interface OperationApi {
     configuration: DingTalkMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  createFeishuMessagingConnection(
+    channel: "feishu" | "lark",
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
   saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -5566,6 +5583,13 @@ export interface OperationApi {
     expectedRevision: bigint,
     expectedGeneration: bigint,
     configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateFeishuMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: FeishuMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
   testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;

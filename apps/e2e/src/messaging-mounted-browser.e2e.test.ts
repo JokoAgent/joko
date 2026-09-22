@@ -4,7 +4,11 @@ import {
   DiscordEmojiReactions,
   DiscordGroupActivation,
   DiscordReplyQuoteMode,
+  FeishuEmojiReactions,
+  FeishuGroupActivation,
+  FeishuReplyQuoteMode,
   MessagingChannel,
+  PermissionMode,
   TelegramEmojiReactions,
   TelegramGroupActivation,
   TelegramReplyQuoteMode
@@ -27,6 +31,14 @@ import {
 } from "./discord-system-fixture.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
 import {
+  FEISHU_SYSTEM_APP_ID,
+  FEISHU_SYSTEM_APP_SECRET,
+  FEISHU_SYSTEM_GROUP_ID,
+  LARK_SYSTEM_APP_ID,
+  LARK_SYSTEM_APP_SECRET,
+  FeishuSystemFixture
+} from "./feishu-system-fixture.js";
+import {
   TELEGRAM_SYSTEM_OWNER_ID,
   TELEGRAM_SYSTEM_TOKEN,
   TelegramSystemFixture
@@ -41,6 +53,7 @@ describe("mounted Messaging Settings product chain", () => {
   let telegram: TelegramSystemFixture | undefined;
   let discord: DiscordSystemFixture | undefined;
   let dingtalk: DingTalkSystemFixture | undefined;
+  let feishu: FeishuSystemFixture | undefined;
   let browser: Browser | undefined;
 
   afterEach(async () => {
@@ -54,20 +67,23 @@ describe("mounted Messaging Settings product chain", () => {
     discord = undefined;
     await dingtalk?.close();
     dingtalk = undefined;
+    feishu = undefined;
   });
 
-  mountedIt("configures the complete Telegram, Discord, and DingTalk matrix through wide and narrow production Web", { timeout: 120_000 }, async () => {
+  mountedIt("configures the complete Telegram, Discord, DingTalk, Feishu, and Lark matrix through wide and narrow production Web", { timeout: 180_000 }, async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
     telegram = await TelegramSystemFixture.start();
     discord = await DiscordSystemFixture.start();
     dingtalk = await DingTalkSystemFixture.start();
+    feishu = new FeishuSystemFixture();
     fixture = await RealPiSystemFixture.start({
       webDirectory,
       telegramApiBaseUrl: telegram.baseUrl,
       discordApiBaseUrl: discord.apiBaseUrl,
       dingTalkApiBaseUrl: dingtalk.baseUrl,
       dingTalkOapiBaseUrl: dingtalk.baseUrl,
+      createFeishuTransport: feishu.createTransport,
       messagingPollTimeoutSeconds: 1,
       messagingRetryDelayMs: 250
     });
@@ -95,10 +111,12 @@ describe("mounted Messaging Settings product chain", () => {
     });
     browserErrors.splice(0);
     expect(await settings.locator(".messaging-channel").count()).toBe(8);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(3);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(5);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Discord", { exact: true }).waitFor({ state: "visible" });
     await settings.getByText("DingTalk", { exact: true }).first().waitFor({ state: "visible" });
+    await settings.getByText("Feishu", { exact: true }).first().waitFor({ state: "visible" });
+    await settings.getByText("Lark", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Slack", { exact: true }).waitFor({ state: "visible" });
 
     await settings.getByRole("button", { name: "Set route", exact: true }).click();
@@ -278,6 +296,106 @@ describe("mounted Messaging Settings product chain", () => {
     await page.keyboard.press("Escape");
     await dingtalkConfigurationDialog.waitFor({ state: "hidden" });
 
+    await settings.getByRole("button", { name: "Add Feishu", exact: true }).first().click();
+    const feishuCreateDialog = page.getByRole("dialog", { name: "Add Feishu" });
+    await feishuCreateDialog.getByLabel("App ID").fill(FEISHU_SYSTEM_APP_ID);
+    await feishuCreateDialog.getByRole("button", { name: "Continue", exact: true }).click();
+    const feishuCredentialDialog = page.getByRole("dialog", { name: "Add App Secret" });
+    await feishuCredentialDialog.getByLabel("App Secret").fill(FEISHU_SYSTEM_APP_SECRET);
+    await feishuCredentialDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await feishuCredentialDialog.waitFor({ state: "hidden" });
+    expect(await page.locator("body").innerText()).not.toContain(FEISHU_SYSTEM_APP_SECRET);
+
+    const feishuCard = settings.locator(".messaging-connection-card").filter({
+      has: page.getByRole("heading", { name: "Feishu", exact: true })
+    });
+    await feishuCard.getByText("Connected", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    await feishuCard.getByText("Waiting for first direct message", { exact: true }).first().waitFor({ state: "visible" });
+    await feishuCard.getByRole("button", { name: "Test", exact: true }).click();
+    await feishuCard.getByText("Connected as Joko Feishu bot.", { exact: true }).waitFor({
+      state: "visible",
+      timeout: 15_000
+    });
+
+    await feishuCard.getByRole("button", { name: "Configure", exact: true }).click();
+    let feishuConfigurationDialog = page.getByRole("dialog", { name: "Feishu behavior" });
+    expect(await feishuConfigurationDialog.getByLabel("App ID").inputValue()).toBe(FEISHU_SYSTEM_APP_ID);
+    await feishuConfigurationDialog.getByLabel("Lifecycle announcements").uncheck();
+    await choose(page, feishuConfigurationDialog, "Acknowledgement reactions", "Expressive");
+    await choose(page, feishuConfigurationDialog, "Direct-message replies", "Quote first part");
+    await choose(page, feishuConfigurationDialog, "Group replies", "Quote first part");
+    await choose(page, feishuConfigurationDialog, "Group execution permission", "Bypass permissions");
+    await feishuConfigurationDialog.getByLabel("Group chat activation rules").fill(
+      `${FEISHU_SYSTEM_GROUP_ID}=always\noc-feishu-muted=disabled`
+    );
+    await feishuConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await feishuConfigurationDialog.waitFor({ state: "hidden" });
+
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.channel === MessagingChannel.FEISHU
+        && connection.feishuConfiguration?.appId === FEISHU_SYSTEM_APP_ID
+        && !connection.feishuConfiguration.lifecycleAnnouncements
+        && connection.feishuConfiguration.emojiReactions === FeishuEmojiReactions.EXPRESSIVE
+        && connection.feishuConfiguration.replyQuoteDm === FeishuReplyQuoteMode.FIRST
+        && connection.feishuConfiguration.replyQuoteGroup === FeishuReplyQuoteMode.FIRST
+        && connection.feishuConfiguration.groupPermissionMode === PermissionMode.BYPASS_PERMISSIONS
+        && connection.feishuConfiguration.groupActivationRules.some((rule) =>
+          rule.chatId === FEISHU_SYSTEM_GROUP_ID && rule.activation === FeishuGroupActivation.ALWAYS)
+        && connection.feishuConfiguration.groupActivationRules.some((rule) =>
+          rule.chatId === "oc-feishu-muted" && rule.activation === FeishuGroupActivation.DISABLED)),
+      "the mounted Feishu behavior matrix",
+      15_000
+    );
+
+    await feishuCard.getByRole("button", { name: "Configure", exact: true }).click();
+    feishuConfigurationDialog = page.getByRole("dialog", { name: "Feishu behavior" });
+    expect(await feishuConfigurationDialog.getByLabel("Lifecycle announcements").isChecked()).toBe(false);
+    expect((await feishuConfigurationDialog.getByLabel("Group execution permission").textContent())?.trim())
+      .toBe("Bypass permissions");
+    expect(await feishuConfigurationDialog.getByLabel("Group chat activation rules").inputValue())
+      .toBe(`${FEISHU_SYSTEM_GROUP_ID}=always\noc-feishu-muted=disabled`);
+    await page.keyboard.press("Escape");
+    await feishuConfigurationDialog.waitFor({ state: "hidden" });
+
+    await settings.getByRole("button", { name: "Add Lark", exact: true }).first().click();
+    const larkCreateDialog = page.getByRole("dialog", { name: "Add Lark" });
+    await larkCreateDialog.getByLabel("App ID").fill(LARK_SYSTEM_APP_ID);
+    await larkCreateDialog.getByRole("button", { name: "Continue", exact: true }).click();
+    const larkCredentialDialog = page.getByRole("dialog", { name: "Add App Secret" });
+    await larkCredentialDialog.getByLabel("App Secret").fill(LARK_SYSTEM_APP_SECRET);
+    await larkCredentialDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await larkCredentialDialog.waitFor({ state: "hidden" });
+    expect(await page.locator("body").innerText()).not.toContain(LARK_SYSTEM_APP_SECRET);
+
+    const larkCard = settings.locator(".messaging-connection-card").filter({
+      has: page.getByRole("heading", { name: "Lark", exact: true })
+    });
+    await larkCard.getByText("Connected", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    await larkCard.getByRole("button", { name: "Test", exact: true }).click();
+    await larkCard.getByText("Connected as Joko Lark bot.", { exact: true }).waitFor({
+      state: "visible",
+      timeout: 15_000
+    });
+    await larkCard.getByRole("button", { name: "Configure", exact: true }).click();
+    const larkConfigurationDialog = page.getByRole("dialog", { name: "Lark behavior" });
+    expect(await larkConfigurationDialog.getByLabel("App ID").inputValue()).toBe(LARK_SYSTEM_APP_ID);
+    await larkConfigurationDialog.getByLabel("Group chat activation rules").fill("oc-lark-approved=mention");
+    await larkConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await larkConfigurationDialog.waitFor({ state: "hidden" });
+
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.channel === MessagingChannel.LARK
+        && connection.feishuConfiguration?.appId === LARK_SYSTEM_APP_ID
+        && connection.feishuConfiguration.groupActivationRules.some((rule) =>
+          rule.chatId === "oc-lark-approved" && rule.activation === FeishuGroupActivation.MENTION)),
+      "the mounted Lark behavior matrix",
+      15_000
+    );
+
     await card.getByRole("button", { name: "Clear token", exact: true }).click();
     const clearDialog = page.getByRole("alertdialog", { name: "Clear bot token?" });
     await clearDialog.getByText("The connection goes offline immediately", { exact: false }).waitFor({ state: "visible" });
@@ -317,15 +435,46 @@ describe("mounted Messaging Settings product chain", () => {
       15_000
     );
 
+    await feishuCard.getByRole("button", { name: "Clear App Secret", exact: true }).click();
+    const feishuClearDialog = page.getByRole("alertdialog", { name: "Clear App Secret?" });
+    await feishuClearDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await feishuClearDialog.waitFor({ state: "hidden" });
+    await feishuCard.getByRole("button", { name: "Clear App Secret", exact: true }).click();
+    const confirmedFeishuClearDialog = page.getByRole("alertdialog", { name: "Clear App Secret?" });
+    await confirmedFeishuClearDialog.getByRole("button", { name: "Clear App Secret", exact: true }).click();
+    await confirmedFeishuClearDialog.waitFor({ state: "hidden" });
+    await feishuCard.getByText("Needs App Secret", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+
+    await larkCard.getByRole("button", { name: "Clear App Secret", exact: true }).click();
+    const larkClearDialog = page.getByRole("alertdialog", { name: "Clear App Secret?" });
+    await larkClearDialog.getByRole("button", { name: "Clear App Secret", exact: true }).click();
+    await larkClearDialog.waitFor({ state: "hidden" });
+    await larkCard.getByText("Needs App Secret", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => {
+        const connections = value.connections.filter((connection) =>
+          connection.channel === MessagingChannel.FEISHU || connection.channel === MessagingChannel.LARK);
+        return connections.length === 2
+          && connections.every((connection) => !connection.credentialConfigured && !connection.enabled);
+      },
+      "the mounted Feishu and Lark credential clear",
+      15_000
+    );
+
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     await page.setViewportSize({ width: 390, height: 844 });
     await card.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     await discordCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     await dingtalkCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
+    await feishuCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
+    await larkCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(await card.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await discordCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await dingtalkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    expect(await feishuCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    expect(await larkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
 
     const durableProjection = JSON.stringify({
@@ -336,6 +485,8 @@ describe("mounted Messaging Settings product chain", () => {
     expect(durableProjection).not.toContain(TELEGRAM_SYSTEM_TOKEN);
     expect(durableProjection).not.toContain(DISCORD_SYSTEM_TOKEN);
     expect(durableProjection).not.toContain(DINGTALK_SYSTEM_APP_SECRET);
+    expect(durableProjection).not.toContain(FEISHU_SYSTEM_APP_SECRET);
+    expect(durableProjection).not.toContain(LARK_SYSTEM_APP_SECRET);
   });
 });
 

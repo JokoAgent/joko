@@ -318,6 +318,10 @@ import {
   DiscordReplyQuoteMode as ProtoDiscordReplyQuoteMode,
   DingTalkGroupActivation as ProtoDingTalkGroupActivation,
   DingTalkGroupActivationRuleSchema as ProtoDingTalkGroupActivationRuleSchema,
+  FeishuEmojiReactions as ProtoFeishuEmojiReactions,
+  FeishuGroupActivation as ProtoFeishuGroupActivation,
+  FeishuGroupActivationRuleSchema as ProtoFeishuGroupActivationRuleSchema,
+  FeishuReplyQuoteMode as ProtoFeishuReplyQuoteMode,
   TelegramEmojiReactions as ProtoTelegramEmojiReactions,
   TelegramGroupActivation as ProtoTelegramGroupActivation,
   TelegramGroupActivationRuleSchema as ProtoTelegramGroupActivationRuleSchema,
@@ -402,6 +406,7 @@ import {
   type MessagingRoute as ProtoMessagingRoute,
   type DingTalkMessagingConfiguration as ProtoDingTalkMessagingConfiguration,
   type DiscordMessagingConfiguration as ProtoDiscordMessagingConfiguration,
+  type FeishuMessagingConfiguration as ProtoFeishuMessagingConfiguration,
   type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
@@ -614,6 +619,7 @@ import type {
   MessagingSettingsView,
   DingTalkMessagingConfigurationView,
   DiscordMessagingConfigurationView,
+  FeishuMessagingConfigurationView,
   OperationApi,
   PartnerCapabilitiesView,
   PartnerActivityView,
@@ -5923,6 +5929,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapMessagingConnection(response.connection);
   }
 
+  async createFeishuMessagingConnection(
+    channel: "feishu" | "lark",
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: channel === "feishu" ? ProtoMessagingChannel.FEISHU : ProtoMessagingChannel.LARK,
+      feishuConfiguration: protoFeishuMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
   async saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -6039,6 +6059,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         expectedRevision: { value: expectedRevision },
         expectedGeneration,
         configuration: protoDingTalkMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateFeishuMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateFeishuMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        configuration: protoFeishuMessagingConfiguration(configuration)
       }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
@@ -18336,6 +18375,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const dingtalkConfiguration = channel === "dingtalk"
     ? mapDingTalkMessagingConfiguration(value.dingtalkConfiguration)
     : undefined;
+  const feishuConfiguration = channel === "feishu" || channel === "lark"
+    ? mapFeishuMessagingConfiguration(value.feishuConfiguration)
+    : undefined;
   if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
   }
@@ -18344,6 +18386,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   }
   if (channel !== "dingtalk" && value.dingtalkConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned DingTalk configuration for another Messaging channel.");
+  }
+  if (channel !== "feishu" && channel !== "lark" && value.feishuConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Feishu/Lark configuration for another Messaging channel.");
   }
   return {
     id: value.connectionId,
@@ -18359,6 +18404,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(telegramConfiguration === undefined ? {} : { telegramConfiguration }),
     ...(discordConfiguration === undefined ? {} : { discordConfiguration }),
     ...(dingtalkConfiguration === undefined ? {} : { dingtalkConfiguration }),
+    ...(feishuConfiguration === undefined ? {} : { feishuConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -18587,6 +18633,91 @@ function protoDingTalkMessagingConfiguration(
             : ProtoDingTalkGroupActivation.DISABLED
       });
     })
+  };
+}
+
+function mapFeishuMessagingConfiguration(
+  value: ProtoFeishuMessagingConfiguration | undefined
+): FeishuMessagingConfigurationView {
+  if (value === undefined || value.appId.trim() === "") {
+    throw new GatewayError("Orchestrator returned an invalid Feishu/Lark configuration.");
+  }
+  const emojiReactions = value.emojiReactions === ProtoFeishuEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoFeishuEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoFeishuEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === ProtoFeishuReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteDm === ProtoFeishuReplyQuoteMode.FIRST ? "first" as const
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === ProtoFeishuReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteGroup === ProtoFeishuReplyQuoteMode.FIRST ? "first" as const
+      : value.replyQuoteGroup === ProtoFeishuReplyQuoteMode.ALL ? "all" as const
+        : undefined;
+  const groupPermissionMode = value.groupPermissionMode === ProtoPermissionMode.ASK ? "ask" as const
+    : value.groupPermissionMode === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const
+      : undefined;
+  if (
+    emojiReactions === undefined
+    || replyQuoteDm === undefined
+    || replyQuoteGroup === undefined
+    || groupPermissionMode === undefined
+  ) {
+    throw new GatewayError("Orchestrator returned an invalid Feishu/Lark configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const chatId = rule.chatId.trim();
+    const mapped = rule.activation === ProtoFeishuGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoFeishuGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoFeishuGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || chatId === "" || Object.hasOwn(groupActivation, chatId)) {
+      throw new GatewayError("Orchestrator returned an invalid Feishu/Lark group activation.");
+    }
+    groupActivation[chatId] = mapped;
+  }
+  return {
+    appId: value.appId,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation,
+    groupPermissionMode
+  };
+}
+
+function protoFeishuMessagingConfiguration(
+  value: FeishuMessagingConfigurationView
+): ProtoFeishuMessagingConfiguration {
+  const appId = value.appId.trim();
+  if (appId === "") throw new GatewayError("Feishu/Lark App ID is required.");
+  return {
+    $typeName: "joko.v1.FeishuMessagingConfiguration",
+    appId,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? ProtoFeishuEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoFeishuEmojiReactions.MINIMAL
+        : ProtoFeishuEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? ProtoFeishuReplyQuoteMode.OFF
+      : ProtoFeishuReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? ProtoFeishuReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? ProtoFeishuReplyQuoteMode.FIRST
+        : ProtoFeishuReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([chatId, activation]) => {
+      const normalized = chatId.trim();
+      if (normalized === "") throw new GatewayError("Feishu/Lark chat ID is invalid.");
+      return create(ProtoFeishuGroupActivationRuleSchema, {
+        chatId: normalized,
+        activation: activation === "mention" ? ProtoFeishuGroupActivation.MENTION
+          : activation === "always" ? ProtoFeishuGroupActivation.ALWAYS
+            : ProtoFeishuGroupActivation.DISABLED
+      });
+    }),
+    groupPermissionMode: value.groupPermissionMode === "ask"
+      ? ProtoPermissionMode.ASK
+      : ProtoPermissionMode.BYPASS_PERMISSIONS
   };
 }
 

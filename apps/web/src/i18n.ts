@@ -4786,6 +4786,8 @@ const en = {
   ,"messaging.addTelegram": "Add Telegram"
   ,"messaging.addDiscord": "Add Discord"
   ,"messaging.addDingTalk": "Add DingTalk"
+  ,"messaging.addFeishu": "Add Feishu"
+  ,"messaging.addLark": "Add Lark"
   ,"messaging.loadFailed": "Could not load Messaging settings."
   ,"messaging.actionFailed": "Could not complete the Messaging action."
   ,"messaging.connectionChanged": "The Messaging connection changed. Review the refreshed settings and try again."
@@ -4800,7 +4802,7 @@ const en = {
   ,"messaging.connections": "Connections"
   ,"messaging.connectionsBody": "Each external account has an independent credential, transport generation, and conversation-to-task mapping."
   ,"messaging.emptyTitle": "No messaging connections"
-  ,"messaging.emptyBody": "Add Telegram, Discord, or DingTalk to receive direct messages and group conversations in Joko tasks."
+  ,"messaging.emptyBody": "Add Telegram, Discord, DingTalk, Feishu, or Lark to receive direct messages and group conversations in Joko tasks."
   ,"messaging.ownerIdentity": "Owner ID {id}"
   ,"messaging.toggleConnection": "Enable or disable this Messaging connection"
   ,"messaging.credential": "Credential"
@@ -4828,7 +4830,15 @@ const en = {
   ,"messaging.dingtalkAppKeyBody": "Use the AppKey (client ID) from the DingTalk developer console. The AppSecret is added separately through the protected credential form."
   ,"messaging.dingtalkOwnerId": "DingTalk owner user ID"
   ,"messaging.dingtalkAwaitingOwner": "Waiting for first direct message"
+  ,"messaging.feishuCreateTitle": "Add Feishu"
+  ,"messaging.larkCreateTitle": "Add Lark"
+  ,"messaging.feishuCreateBody": "Enter the application identity now. The first direct-message sender claims the owner identity; only explicitly approved group chats are admitted."
+  ,"messaging.feishuAppId": "App ID"
+  ,"messaging.feishuAppIdBody": "Use the App ID from the Feishu or Lark developer console. The App Secret is added separately through the protected credential form."
+  ,"messaging.feishuOwnerId": "Feishu/Lark owner user ID"
+  ,"messaging.feishuAwaitingOwner": "Waiting for first direct message"
   ,"messaging.botToken": "Bot token"
+  ,"messaging.appSecret": "App Secret"
   ,"messaging.credentialBody": "Replacing the token retires the previous transport generation and its pending work."
   ,"messaging.enableAfterSave": "Connect after saving"
   ,"messaging.secretSafety": "The token uses a one-shot managed credential channel and is never stored in settings or task history."
@@ -4836,8 +4846,13 @@ const en = {
   ,"messaging.dingtalkAddCredential": "Add AppSecret"
   ,"messaging.dingtalkReplaceCredential": "Replace AppSecret"
   ,"messaging.dingtalkClearCredential": "Clear AppSecret"
+  ,"messaging.appSecretClearCredential": "Clear App Secret"
   ,"messaging.dingtalkCredentialBody": "Replacing the AppSecret retires the previous Stream transport generation and its pending work."
   ,"messaging.dingtalkSecretSafety": "The AppSecret uses a one-shot managed credential channel and is never stored in settings or task history."
+  ,"messaging.appSecretSafety": "The App Secret uses a one-shot managed credential channel and is never stored in settings or task history."
+  ,"messaging.feishuAddCredential": "Add App Secret"
+  ,"messaging.feishuReplaceCredential": "Replace App Secret"
+  ,"messaging.feishuCredentialBody": "Replacing the App Secret retires the previous WebSocket transport generation and its pending work."
   ,"messaging.configureTitle": "Telegram behavior"
   ,"messaging.configureBody": "Configure replies, reactions, and the activation policy for each group."
   ,"messaging.discordConfigureTitle": "Discord behavior"
@@ -4848,6 +4863,14 @@ const en = {
   ,"messaging.dingtalkGroupActivation": "Group conversation activation rules"
   ,"messaging.dingtalkGroupActivationBody": "Enter one approved conversation ID per line as conversationId=mention, conversationId=always, or conversationId=disabled. Unlisted group conversations are rejected."
   ,"messaging.dingtalkGroupActivationInvalid": "Use one unique, non-empty conversation ID per line with mention, always, or disabled."
+  ,"messaging.feishuConfigureTitle": "{name} behavior"
+  ,"messaging.feishuConfigureBody": "Configure the application identity, lifecycle notices, replies, reactions, group execution permission, and activation policy."
+  ,"messaging.feishuAppIdChangeBody": "Changing the App ID retires the active transport and clears the claimed owner. The next direct-message sender claims ownership again."
+  ,"messaging.feishuGroupActivation": "Group chat activation rules"
+  ,"messaging.feishuGroupActivationBody": "Enter one approved chat ID per line as chatId=mention, chatId=always, or chatId=disabled. Unlisted group chats are rejected."
+  ,"messaging.feishuGroupActivationInvalid": "Use one unique, non-empty chat ID per line with mention, always, or disabled."
+  ,"messaging.feishuGroupPermission": "Group execution permission"
+  ,"messaging.feishuGroupSafety": "Group history is untrusted. Keep Ask unless you explicitly accept bypassing execution permission for approved group chats."
   ,"messaging.lifecycleAnnouncements": "Lifecycle announcements"
   ,"messaging.lifecycleAnnouncementsBody": "Post online, offline, and recovery notices to the owner conversation when a route is available."
   ,"messaging.emojiReactions": "Acknowledgement reactions"
@@ -4865,6 +4888,7 @@ const en = {
   ,"messaging.discordGroupActivationInvalid": "Use one unique pair of 17–20 digit server and channel IDs per line with mention, always, or disabled."
   ,"messaging.clearTitle": "Clear bot token?"
   ,"messaging.dingtalkClearTitle": "Clear DingTalk AppSecret?"
+  ,"messaging.appSecretClearTitle": "Clear App Secret?"
   ,"messaging.clearBody": "The connection goes offline immediately. Existing tasks remain visible, but this transport and its pending work are retired."
   ,"messaging.target": "Workspace"
   ,"messaging.model": "Model"
@@ -4885,6 +4909,7 @@ const en = {
   ,"messaging.testFailure.connectionFailed": "The provider could not be reached or rejected the token."
   ,"messaging.status.idle": "Needs token"
   ,"messaging.status.dingtalkIdle": "Needs AppSecret"
+  ,"messaging.status.appSecretIdle": "Needs App Secret"
   ,"messaging.status.connecting": "Connecting"
   ,"messaging.status.connected": "Connected"
   ,"messaging.status.offline": "Offline"
@@ -7758,6 +7783,8 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.addTelegram": "添加 Telegram",
     "messaging.addDiscord": "添加 Discord",
     "messaging.addDingTalk": "添加钉钉",
+    "messaging.addFeishu": "添加飞书",
+    "messaging.addLark": "添加 Lark",
     "messaging.loadFailed": "无法加载消息渠道设置。",
     "messaging.actionFailed": "无法完成消息渠道操作。",
     "messaging.connectionChanged": "消息连接已发生变化。请检查刷新的设置后重试。",
@@ -7772,7 +7799,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.connections": "连接",
     "messaging.connectionsBody": "每个外部账号都有独立凭证、传输代际和会话到任务的映射。",
     "messaging.emptyTitle": "没有消息连接",
-    "messaging.emptyBody": "添加 Telegram、Discord 或钉钉，将私聊与群组会话接入 Joko 任务。",
+    "messaging.emptyBody": "添加 Telegram、Discord、钉钉、飞书或 Lark，将私聊与群组会话接入 Joko 任务。",
     "messaging.ownerIdentity": "所有者 ID {id}",
     "messaging.toggleConnection": "启用或停用此消息连接",
     "messaging.credential": "凭证",
@@ -7800,7 +7827,15 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.dingtalkAppKeyBody": "请使用钉钉开发者后台中的 AppKey（客户端 ID）。AppSecret 会通过受保护的凭证表单单独添加。",
     "messaging.dingtalkOwnerId": "钉钉所有者用户 ID",
     "messaging.dingtalkAwaitingOwner": "等待首位私聊用户认领",
+    "messaging.feishuCreateTitle": "添加飞书",
+    "messaging.larkCreateTitle": "添加 Lark",
+    "messaging.feishuCreateBody": "先填写应用身份。第一位发送私聊的用户会认领所有者身份；只有明确批准的群聊才能接入。",
+    "messaging.feishuAppId": "App ID",
+    "messaging.feishuAppIdBody": "请使用飞书或 Lark 开发者后台中的 App ID。App Secret 会通过受保护的凭证表单单独添加。",
+    "messaging.feishuOwnerId": "飞书/Lark 所有者用户 ID",
+    "messaging.feishuAwaitingOwner": "等待首位私聊用户认领",
     "messaging.botToken": "机器人令牌",
+    "messaging.appSecret": "App Secret",
     "messaging.credentialBody": "替换令牌会退休旧传输代际及其待处理工作。",
     "messaging.enableAfterSave": "保存后连接",
     "messaging.secretSafety": "令牌仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
@@ -7808,8 +7843,13 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.dingtalkAddCredential": "添加 AppSecret",
     "messaging.dingtalkReplaceCredential": "替换 AppSecret",
     "messaging.dingtalkClearCredential": "清除 AppSecret",
+    "messaging.appSecretClearCredential": "清除 App Secret",
     "messaging.dingtalkCredentialBody": "替换 AppSecret 会退休旧的 Stream 传输代际及其待处理工作。",
     "messaging.dingtalkSecretSafety": "AppSecret 仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
+    "messaging.appSecretSafety": "App Secret 仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
+    "messaging.feishuAddCredential": "添加 App Secret",
+    "messaging.feishuReplaceCredential": "替换 App Secret",
+    "messaging.feishuCredentialBody": "替换 App Secret 会退休旧的 WebSocket 传输代际及其待处理工作。",
     "messaging.configureTitle": "Telegram 行为",
     "messaging.configureBody": "配置回复、反应及每个群组的激活策略。",
     "messaging.discordConfigureTitle": "Discord 行为",
@@ -7820,6 +7860,14 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.dingtalkGroupActivation": "群会话激活规则",
     "messaging.dingtalkGroupActivationBody": "每行输入一个已批准的会话 ID，格式为 conversationId=mention、conversationId=always 或 conversationId=disabled。未列出的群会话会被拒绝。",
     "messaging.dingtalkGroupActivationInvalid": "每行使用一个唯一且非空的会话 ID，并选择 mention、always 或 disabled。",
+    "messaging.feishuConfigureTitle": "{name} 行为",
+    "messaging.feishuConfigureBody": "配置应用身份、生命周期通知、回复、反应、群聊执行权限和激活策略。",
+    "messaging.feishuAppIdChangeBody": "修改 App ID 会退休当前传输并清除已认领的所有者；下一位发送私聊的用户会重新认领。",
+    "messaging.feishuGroupActivation": "群聊激活规则",
+    "messaging.feishuGroupActivationBody": "每行输入一个已批准的聊天 ID，格式为 chatId=mention、chatId=always 或 chatId=disabled。未列出的群聊会被拒绝。",
+    "messaging.feishuGroupActivationInvalid": "每行使用一个唯一且非空的聊天 ID，并选择 mention、always 或 disabled。",
+    "messaging.feishuGroupPermission": "群聊执行权限",
+    "messaging.feishuGroupSafety": "群聊历史是不可信输入。除非你明确接受为已批准群聊绕过执行权限，否则请保持“询问”。",
     "messaging.lifecycleAnnouncements": "生命周期通知",
     "messaging.lifecycleAnnouncementsBody": "存在可用路由时，在所有者会话中发布上线、离线和恢复通知。",
     "messaging.emojiReactions": "确认反应",
@@ -7837,6 +7885,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.discordGroupActivationInvalid": "每行使用一组唯一的 17–20 位服务器与频道 ID，并选择 mention、always 或 disabled。",
     "messaging.clearTitle": "清除机器人令牌？",
     "messaging.dingtalkClearTitle": "清除钉钉 AppSecret？",
+    "messaging.appSecretClearTitle": "清除 App Secret？",
     "messaging.clearBody": "连接会立即离线。现有任务仍可见，但当前传输及其待处理工作会被退休。",
     "messaging.target": "工作区",
     "messaging.model": "模型",
@@ -7857,6 +7906,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.testFailure.connectionFailed": "无法访问提供方，或令牌被拒绝。",
     "messaging.status.idle": "需要令牌",
     "messaging.status.dingtalkIdle": "需要 AppSecret",
+    "messaging.status.appSecretIdle": "需要 App Secret",
     "messaging.status.connecting": "正在连接",
     "messaging.status.connected": "已连接",
     "messaging.status.offline": "离线",

@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./dingtalk": "./src/dingtalk/index.ts",
     "./discord": "./src/discord/index.ts",
+    "./feishu": "./src/feishu/index.ts",
     "./telegram": "./src/telegram/index.ts"
   },
   "scripts": {
@@ -15,6 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.71.1",
     "ws": "8.21.3"
   },
   "devDependencies": {

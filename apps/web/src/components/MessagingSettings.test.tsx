@@ -45,7 +45,7 @@ describe("Messaging settings", () => {
     const container = await renderSettings(controller, snapshot());
 
     expect(container.querySelectorAll(".messaging-channel")).toHaveLength(8);
-    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(3);
+    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(5);
     expect(container.textContent).toContain("Conflict");
     expect(container.textContent).toContain("Another poller owns this bot token.");
 
@@ -183,6 +183,59 @@ describe("Messaging settings", () => {
     expect(container.textContent).toContain("Replace AppSecret");
   });
 
+  it("creates Feishu with App ID and a one-shot App Secret while leaving ownership unclaimed", async () => {
+    const created = feishuConnection({
+      enabled: false,
+      runtimeStatus: "idle",
+      credentialConfigured: false,
+      ownerProviderUserId: undefined
+    });
+    const saved = feishuConnection({
+      enabled: true,
+      runtimeStatus: "connecting",
+      credentialConfigured: true,
+      ownerProviderUserId: undefined,
+      revision: 11n
+    });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createFeishuMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add Feishu")[0]!.click());
+    const appId = required(document.querySelector<HTMLInputElement>('input[placeholder="cli_xxxxxxxx"]'));
+    expect(document.activeElement).toBe(appId);
+    await change(appId, "cli_new_feishu");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith("feishu", {
+      appId: "cli_new_feishu",
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "all",
+      groupActivation: {},
+      groupPermissionMode: "ask"
+    });
+
+    const credentialDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(credentialDialog.textContent).toContain("App Secret");
+    expect(credentialDialog.textContent).toContain("WebSocket transport generation");
+    expect(credentialDialog.textContent).not.toContain("Bot token");
+    const secret = required(credentialDialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(secret, "feishu-secret");
+    await act(async () => button(credentialDialog, "Save").click());
+    expect(save).toHaveBeenCalledWith("feishu-one", 10n, 6n, "feishu-secret", true);
+    expect(document.body.textContent).not.toContain("feishu-secret");
+    expect(container.textContent).toContain("Waiting for first direct message");
+    expect(container.textContent).toContain("Replace App Secret");
+  });
+
   it("saves Discord lifecycle, reply, reaction, and approved server-channel policy together", async () => {
     const original = discordConnection();
     const refreshed = discordConnection({ revision: 9n });
@@ -265,6 +318,64 @@ describe("Messaging settings", () => {
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(container.textContent).toContain("Waiting for first direct message");
   });
+
+  it("saves Lark lifecycle, reply, reaction, group permission, and approved chat policy together", async () => {
+    const original = feishuConnection({
+      id: "lark-one",
+      channel: "lark",
+      ownerProviderUserId: "ou_lark_owner",
+      feishuConfiguration: {
+        appId: "cli_lark",
+        lifecycleAnnouncements: true,
+        emojiReactions: "minimal",
+        replyQuoteDm: "off",
+        replyQuoteGroup: "all",
+        groupActivation: { oc_primary: "mention" },
+        groupPermissionMode: "ask"
+      }
+    });
+    const update = vi.fn(async (_connectionId, _revision, _generation, configuration) => feishuConnection({
+      id: "lark-one",
+      channel: "lark",
+      generation: 7n,
+      revision: 11n,
+      ownerProviderUserId: undefined,
+      feishuConfiguration: configuration
+    }));
+    const controller = controllerFixture(messagingSettings([original]), {
+      updateFeishuMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("Lark behavior");
+    expect(dialog.textContent).toContain("Group history is untrusted");
+    const appId = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    await change(appId, "cli_lark_replacement");
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    await act(async () => lifecycle.click());
+    const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
+    await change(required(selects[0]), "expressive");
+    await change(required(selects[1]), "first");
+    await change(required(selects[2]), "first");
+    await change(required(selects[3]), "bypassPermissions");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "oc_primary=always\noc_muted=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenCalledWith("lark-one", 10n, 6n, {
+      appId: "cli_lark_replacement",
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive",
+      replyQuoteDm: "first",
+      replyQuoteGroup: "first",
+      groupActivation: { oc_primary: "always", oc_muted: "disabled" },
+      groupPermissionMode: "bypassPermissions"
+    });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.textContent).toContain("Waiting for first direct message");
+  });
 });
 
 async function renderSettings(controller: AppController, currentSnapshot: AppSnapshot): Promise<HTMLElement> {
@@ -291,12 +402,14 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     createTelegramMessagingConnection: vi.fn(async () => telegramConnection()),
     createDiscordMessagingConnection: vi.fn(async () => discordConnection()),
     createDingTalkMessagingConnection: vi.fn(async () => dingTalkConnection()),
+    createFeishuMessagingConnection: vi.fn(async () => feishuConnection()),
     saveMessagingCredential: vi.fn(unchanged),
     clearMessagingCredential: vi.fn(unchanged),
     setMessagingConnectionEnabled: vi.fn(unchanged),
     updateTelegramMessagingConfiguration: vi.fn(unchanged),
     updateDiscordMessagingConfiguration: vi.fn(async () => discordConnection()),
     updateDingTalkMessagingConfiguration: vi.fn(async () => dingTalkConnection()),
+    updateFeishuMessagingConfiguration: vi.fn(async () => feishuConnection()),
     testMessagingConnection: vi.fn(async () => ({ ok: true as const, providerAccountId: "9001", displayName: "Joko Bot" })),
     putMessagingRoute: vi.fn(async () => messagingRoute()),
     ...overrides
@@ -311,8 +424,8 @@ function messagingSettings(connections: readonly MessagingConnectionView[]): Mes
       { channel: "telegram", available: true },
       { channel: "discord", available: true },
       { channel: "dingtalk", available: true },
-      { channel: "feishu", available: false, reason: "not implemented" },
-      { channel: "lark", available: false, reason: "not implemented" },
+      { channel: "feishu", available: true },
+      { channel: "lark", available: true },
       { channel: "wecom", available: false, reason: "not implemented" },
       { channel: "wechat", available: false, reason: "not implemented" },
       { channel: "slack", available: false, reason: "not implemented" }
@@ -384,6 +497,34 @@ function dingTalkConnection(overrides: Partial<MessagingConnectionView> = {}): M
     dingtalkConfiguration: {
       appKey: "ding-app-key",
       groupActivation: { "cid-primary": "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function feishuConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "feishu-one",
+    channel: "feishu",
+    generation: 6n,
+    revision: 10n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "ou_feishu_owner",
+    providerAccountId: "cli_feishu",
+    providerUsername: "Feishu bot",
+    feishuConfiguration: {
+      appId: "cli_feishu",
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "all",
+      groupActivation: { oc_primary: "mention" },
+      groupPermissionMode: "ask"
     },
     lastConnectedAt: Date.now() - 1_000,
     createdAt: 1_000,

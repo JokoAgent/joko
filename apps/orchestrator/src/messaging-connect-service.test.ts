@@ -46,7 +46,11 @@ describe("MessagingService", () => {
       .toMatchObject({ available: true, reason: "" });
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.DINGTALK))
       .toMatchObject({ available: true, reason: "" });
-    expect(channels.filter((channel) => channel.available)).toHaveLength(3);
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.FEISHU))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.LARK))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.filter((channel) => channel.available)).toHaveLength(5);
 
     const created = await service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
@@ -373,6 +377,159 @@ describe("MessagingService", () => {
     expect(changedApp.connection?.ownerProviderUserId).toBeUndefined();
   });
 
+  it("projects Feishu and Lark settings and clears a claimed owner only when App ID changes", async () => {
+    const fixture = await createFixture();
+    const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
+    const context = {} as HandlerContext;
+
+    for (const [channel, appId] of [
+      [contract.MessagingChannel.FEISHU, "cli_feishu"],
+      [contract.MessagingChannel.LARK, "cli_lark"]
+    ] as const) {
+      const created = await service.createMessagingConnection(create(
+        contract.CreateMessagingConnectionRequestSchema,
+        {
+          channel,
+          feishuConfiguration: create(contract.FeishuMessagingConfigurationSchema, {
+            appId,
+            lifecycleAnnouncements: true,
+            emojiReactions: contract.FeishuEmojiReactions.EXPRESSIVE,
+            replyQuoteDm: contract.FeishuReplyQuoteMode.FIRST,
+            replyQuoteGroup: contract.FeishuReplyQuoteMode.ALL,
+            groupActivationRules: [create(contract.FeishuGroupActivationRuleSchema, {
+              chatId: "oc_group",
+              activation: contract.FeishuGroupActivation.MENTION
+            })],
+            groupPermissionMode: contract.PermissionMode.BYPASS_PERMISSIONS
+          })
+        }
+      ), context);
+      expect(created.connection).toMatchObject({
+        channel,
+        generation: 1n,
+        credentialConfigured: false,
+        runtimeStatus: contract.MessagingConnectionRuntimeStatus.IDLE,
+        feishuConfiguration: {
+          appId,
+          lifecycleAnnouncements: true,
+          emojiReactions: contract.FeishuEmojiReactions.EXPRESSIVE,
+          replyQuoteDm: contract.FeishuReplyQuoteMode.FIRST,
+          replyQuoteGroup: contract.FeishuReplyQuoteMode.ALL,
+          groupActivationRules: [{
+            chatId: "oc_group",
+            activation: contract.FeishuGroupActivation.MENTION
+          }],
+          groupPermissionMode: contract.PermissionMode.BYPASS_PERMISSIONS
+        }
+      });
+      expect(created.connection?.ownerProviderUserId).toBeUndefined();
+      expect(created.connection).not.toHaveProperty("dingtalkConfiguration");
+      if (created.connection === undefined) throw new Error("Missing Feishu/Lark connection.");
+    }
+
+    await expect(service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      {
+        channel: contract.MessagingChannel.FEISHU,
+        ownerProviderUserId: "ou_owner",
+        feishuConfiguration: create(contract.FeishuMessagingConfigurationSchema, {
+          appId: "cli_invalid",
+          emojiReactions: contract.FeishuEmojiReactions.MINIMAL,
+          replyQuoteDm: contract.FeishuReplyQuoteMode.FIRST,
+          replyQuoteGroup: contract.FeishuReplyQuoteMode.FIRST,
+          groupPermissionMode: contract.PermissionMode.ASK
+        })
+      }
+    ), context)).rejects.toSatisfy(
+      (error: unknown) => error instanceof ConnectError && error.code === Code.InvalidArgument
+    );
+
+    const createdSettings = await service.getMessagingSettings(
+      create(contract.GetMessagingSettingsRequestSchema),
+      context
+    );
+    const original = createdSettings.connections?.find(
+      (connection) => connection.channel === contract.MessagingChannel.FEISHU
+    );
+    if (original === undefined) throw new Error("Missing created Feishu connection.");
+    const originalConnectionId = original.connectionId;
+    if (originalConnectionId === undefined) throw new Error("Missing created Feishu connection identity.");
+    const stored = fixture.store.getMessagingConnection(originalConnectionId);
+    fixture.store.claimMessagingConnectionOwner({
+      connectionId: stored.id,
+      expectedRevision: stored.revision,
+      expectedGeneration: stored.generation,
+      ownerProviderUserId: "ou_owner"
+    });
+    const claimedSettings = await service.getMessagingSettings(
+      create(contract.GetMessagingSettingsRequestSchema),
+      context
+    );
+    const claimed = claimedSettings.connections?.find(
+      (connection) => connection.connectionId === originalConnectionId
+    );
+    if (claimed === undefined) throw new Error("Missing claimed Feishu connection.");
+    expect(claimed.ownerProviderUserId).toBe("ou_owner");
+
+    const sameApp = await service.updateFeishuMessagingConfiguration(create(
+      contract.UpdateFeishuMessagingConfigurationRequestSchema,
+      {
+        connectionId: claimed.connectionId,
+        expectedRevision: claimed.revision,
+        expectedGeneration: claimed.generation,
+        configuration: create(contract.FeishuMessagingConfigurationSchema, {
+          appId: "cli_feishu",
+          lifecycleAnnouncements: false,
+          emojiReactions: contract.FeishuEmojiReactions.OFF,
+          replyQuoteDm: contract.FeishuReplyQuoteMode.OFF,
+          replyQuoteGroup: contract.FeishuReplyQuoteMode.FIRST,
+          groupActivationRules: [create(contract.FeishuGroupActivationRuleSchema, {
+            chatId: "oc_second",
+            activation: contract.FeishuGroupActivation.ALWAYS
+          })],
+          groupPermissionMode: contract.PermissionMode.ASK
+        })
+      }
+    ), context);
+    expect(sameApp.connection).toMatchObject({
+      generation: 2n,
+      ownerProviderUserId: "ou_owner",
+      feishuConfiguration: {
+        appId: "cli_feishu",
+        lifecycleAnnouncements: false,
+        emojiReactions: contract.FeishuEmojiReactions.OFF,
+        replyQuoteDm: contract.FeishuReplyQuoteMode.OFF,
+        replyQuoteGroup: contract.FeishuReplyQuoteMode.FIRST,
+        groupActivationRules: [{
+          chatId: "oc_second",
+          activation: contract.FeishuGroupActivation.ALWAYS
+        }],
+        groupPermissionMode: contract.PermissionMode.ASK
+      }
+    });
+
+    const changedApp = await service.updateFeishuMessagingConfiguration(create(
+      contract.UpdateFeishuMessagingConfigurationRequestSchema,
+      {
+        connectionId: sameApp.connection!.connectionId,
+        expectedRevision: sameApp.connection!.revision,
+        expectedGeneration: sameApp.connection!.generation,
+        configuration: create(contract.FeishuMessagingConfigurationSchema, {
+          appId: "cli_replacement",
+          emojiReactions: contract.FeishuEmojiReactions.MINIMAL,
+          replyQuoteDm: contract.FeishuReplyQuoteMode.FIRST,
+          replyQuoteGroup: contract.FeishuReplyQuoteMode.FIRST,
+          groupPermissionMode: contract.PermissionMode.ASK
+        })
+      }
+    ), context);
+    expect(changedApp.connection).toMatchObject({
+      generation: 3n,
+      feishuConfiguration: { appId: "cli_replacement" }
+    });
+    expect(changedApp.connection?.ownerProviderUserId).toBeUndefined();
+  });
+
   it("reports unavailable channels and nodes explicitly", async () => {
     const context = {} as HandlerContext;
     const unavailable = createMessagingConnectService(undefined, () => ({ connectionId: "desktop" }));
@@ -387,7 +544,7 @@ describe("MessagingService", () => {
     const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
     await expect(service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
-      { channel: contract.MessagingChannel.FEISHU, ownerProviderUserId: "42" }
+      { channel: contract.MessagingChannel.WECOM }
     ), context)).rejects.toSatisfy(
       (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
     );

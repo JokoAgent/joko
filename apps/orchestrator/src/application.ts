@@ -135,7 +135,7 @@ import {
   resolveAuthenticatedLspTarget
 } from "./lsp-tool-bridge.js";
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
-import { MessagingManager } from "./messaging-manager.js";
+import { MessagingManager, type MessagingManagerOptions } from "./messaging-manager.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
@@ -432,6 +432,7 @@ export interface OrchestratorApplicationDependencies {
   readonly messagingDiscordApiBaseUrl?: string;
   readonly messagingDingTalkApiBaseUrl?: string;
   readonly messagingDingTalkOapiBaseUrl?: string;
+  readonly messagingCreateFeishuTransport?: MessagingManagerOptions["createFeishuTransport"];
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -1315,6 +1316,9 @@ export async function createOrchestratorApplication(
     ...(dependencies.messagingDingTalkOapiBaseUrl === undefined
       ? {}
       : { dingTalkOapiBaseUrl: dependencies.messagingDingTalkOapiBaseUrl }),
+    ...(dependencies.messagingCreateFeishuTransport === undefined
+      ? {}
+      : { createFeishuTransport: dependencies.messagingCreateFeishuTransport }),
     ...(dependencies.messagingPollTimeoutSeconds === undefined
       ? {}
       : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),

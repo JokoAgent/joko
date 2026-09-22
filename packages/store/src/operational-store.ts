@@ -5053,7 +5053,15 @@ export class OperationalStore {
       if (session.descriptor.binding.generation !== input.expectedSessionGeneration) {
         throw new StaleGenerationError(input.expectedSessionGeneration, session.descriptor.binding.generation);
       }
-      assertMessagingSessionMatchesRoute(session, route);
+      const expectedPermissionMode = input.expectedPermissionMode ?? route.permissionMode;
+      if (
+        expectedPermissionMode !== "ask" &&
+        expectedPermissionMode !== "auto" &&
+        expectedPermissionMode !== "bypassPermissions"
+      ) {
+        throw new StoreError("Messaging Session expected permission mode is invalid.");
+      }
+      assertMessagingSessionMatchesRoute(session, route, expectedPermissionMode);
       const at = Math.max(current.createdAt, messagingTimestamp(
         input.updatedAt ?? this.now(),
         "conversation bind time"
@@ -19158,13 +19166,17 @@ function messagingRevisionConflict(
   );
 }
 
-function assertMessagingSessionMatchesRoute(session: StoredSession, route: MessagingRouteRecord): void {
+function assertMessagingSessionMatchesRoute(
+  session: StoredSession,
+  route: MessagingRouteRecord,
+  expectedPermissionMode: MessagingRouteRecord["permissionMode"]
+): void {
   const descriptor = session.descriptor;
   if (
     descriptor.targetId !== route.targetId || descriptor.backendId !== route.backendId ||
     descriptor.providerId !== route.providerId || descriptor.modelId !== route.modelId ||
     descriptor.effort !== route.effort || descriptor.fastMode !== route.fastMode ||
-    descriptor.permissionMode !== route.permissionMode || descriptor.planMode !== route.planMode
+    descriptor.permissionMode !== expectedPermissionMode || descriptor.planMode !== route.planMode
   ) {
     throw new StoreError("Messaging Session does not match the selected creation-time route snapshot.");
   }
