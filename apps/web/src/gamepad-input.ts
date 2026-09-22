@@ -2,7 +2,7 @@ export const GAMEPAD_ACTIONS = [
   "none", "activate", "back", "new-task", "toggle-sidebar", "focus-composer",
   "previous-task", "next-task", "previous-panel", "next-panel", "scroll-up", "scroll-down",
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
-  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "add-attachments", "open-commands",
+  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands",
   "open-settings", "toggle-inspector", "scroll-bottom", "voice"
 ] as const;
 export type GamepadAction = (typeof GAMEPAD_ACTIONS)[number];

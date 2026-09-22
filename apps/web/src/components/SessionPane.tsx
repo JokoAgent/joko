@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Bot,
   CircleStop,
+  Copy,
   Gauge,
   GitBranch,
   Menu,
@@ -55,6 +56,8 @@ import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
 import { NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { useGamepadActions } from "../gamepad-actions.js";
+import { collectConversationMarkdown, ConversationMarkdownError } from "../conversation-markdown.js";
+import { writeClipboardText } from "../clipboard-action.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { randomUuid } from "../web-crypto.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
@@ -101,6 +104,13 @@ interface ActiveMessageRewind extends MessageRewindPreviewState {
   readonly navigate: AppController["navigateSessionBranch"];
   readonly executeWorkspaceRewind: AppController["executeWorkspaceRewind"];
   readonly isCurrent: () => boolean;
+}
+
+interface ConversationCopyFeedback {
+  readonly sessionId: string;
+  readonly ownerEpoch: number;
+  readonly documentEpoch: number;
+  readonly phase: "busy" | "copied" | "empty" | "read-failed" | "pagination" | "too-large" | "clipboard-failed";
 }
 
 interface ActiveMessageDelete {
@@ -218,6 +228,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     readonly percent: number;
   }>();
   const [compactFeedback, setCompactFeedback] = useState<CompactRequestFeedback>();
+  const [conversationCopyFeedback, setConversationCopyFeedback] = useState<ConversationCopyFeedback>();
   const [statisticsUsage, setStatisticsUsage] = useState<{
     readonly sessionId: string;
     readonly usage?: UsageTokensView;
@@ -243,6 +254,14 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const timelineSubagentEpochRef = useRef(0);
   const stoppingRunIdsRef = useRef(new Set<string>());
   const gamepadSettingFlightsRef = useRef(new Set<string>());
+  const conversationCopyFlightRef = useRef<{ readonly ownerEpoch: number; readonly sourceSessionId: string; readonly abort: AbortController } | undefined>(undefined);
+  const conversationCopyOwnerEpochRef = useRef(0);
+  useLayoutEffect(() => {
+    conversationCopyOwnerEpochRef.current += 1;
+    conversationCopyFlightRef.current?.abort.abort();
+    setConversationCopyFeedback(undefined);
+  }, [timelineResourceOwnerKey, session.generation, controller.state.connectionState, controller.state.snapshot.generation,
+    controller.state.navigationRevision, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId]);
   const recoveryFlightsRef = useRef(new RecoveryActionSingleFlight());
   const recoveryWaitAbortsRef = useRef(new Map<string, AbortController>());
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
@@ -260,6 +279,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     if (document === rewindDocumentRef.current?.document) return;
     rewindDocumentRef.current?.remove();
     rewindEpochRef.current += 1;
+    conversationCopyFlightRef.current?.abort.abort();
+    conversationCopyFlightRef.current = undefined;
+    setConversationCopyFeedback(undefined);
     setComposerDraftReplacement(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
@@ -272,6 +294,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
     const retire = () => {
       rewindEpochRef.current += 1;
+      conversationCopyFlightRef.current?.abort.abort();
+      conversationCopyFlightRef.current = undefined;
+      setConversationCopyFeedback(undefined);
       artifactCatalogDocumentEpochRef.current += 1;
       setComposerDraftReplacement(undefined);
       setMessageRewind(undefined);
@@ -295,7 +320,12 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     setMessageRewind(undefined);
     setRewindPreview(undefined);
   }, [session.id, session.generation, controller.navigateSessionBranch, controller.state.navigationRevision]);
-  useLayoutEffect(() => () => { rewindEpochRef.current += 1; rewindDocumentRef.current?.remove(); }, []);
+  useLayoutEffect(() => () => {
+    rewindEpochRef.current += 1;
+    conversationCopyFlightRef.current?.abort.abort();
+    conversationCopyFlightRef.current = undefined;
+    rewindDocumentRef.current?.remove();
+  }, []);
   const bottomOverlayRef = useRef<HTMLDivElement>(null);
   const composerMessageMentionInsertionIdRef = useRef(0);
   const composerSelectionQuoteInsertionIdRef = useRef(0);
@@ -434,6 +464,15 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     && compactGuardRef.current.isCurrent(session.id, compactFeedback.epoch)
     ? compactFeedback
     : undefined;
+  const currentConversationCopyFeedback = conversationCopyFeedback !== undefined
+    && conversationCopyFeedback.sessionId === session.id
+    && conversationCopyFeedback.ownerEpoch === conversationCopyOwnerEpochRef.current
+    && conversationCopyFeedback.documentEpoch === rewindEpochRef.current
+    && controller.state.ready && controller.state.connectionState === "connected"
+    ? conversationCopyFeedback
+    : undefined;
+  const conversationCopyFailed = currentConversationCopyFeedback !== undefined
+    && ["read-failed", "pagination", "too-large", "clipboard-failed"].includes(currentConversationCopyFeedback.phase);
   const recoveryContext: RecoveryActionContext = {
     ...(reviewReadOnly || session.retryRunId === undefined ? {} : { retryRunId: session.retryRunId }),
     ...(reviewReadOnly || session.activeRunId === undefined ? {} : { activeRunId: session.activeRunId }),
@@ -1514,6 +1553,62 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     if (effort === undefined || effort === session.effort) return;
     gamepadSettingAction("model", () => controller.setModel(session.id, model.providerId, model.modelId, effort, session.fastMode));
   };
+  const copyConversationMarkdown = (): void => {
+    const sourceDocument = paneRef.current?.ownerDocument;
+    const sourceController = controllerRef.current;
+    const sourceState = sourceController.state;
+    if (sourceDocument === undefined || !sourceState.ready || sourceState.connectionState !== "connected") return;
+    const sourceSessionId = session.id;
+    const sourceGeneration = session.generation;
+    const sourceSnapshotGeneration = sourceState.snapshot.generation;
+    const sourceNavigationRevision = sourceState.navigationRevision;
+    const sourceProfileId = sourceState.activeProfile?.id;
+    const sourceServerId = sourceState.activeProfile?.serverId;
+    const ownerEpoch = conversationCopyOwnerEpochRef.current;
+    const documentEpoch = rewindEpochRef.current;
+    const operation = { ownerEpoch, sourceSessionId, abort: new AbortController() };
+    if (conversationCopyFlightRef.current?.ownerEpoch === ownerEpoch
+      && conversationCopyFlightRef.current.sourceSessionId === sourceSessionId) return;
+    conversationCopyFlightRef.current = operation;
+    const isCurrent = (): boolean => {
+      const state = controllerRef.current.state;
+      return conversationCopyFlightRef.current === operation && !operation.abort.signal.aborted
+        && conversationCopyOwnerEpochRef.current === ownerEpoch
+        && rewindEpochRef.current === documentEpoch
+        && timelineResourceOwnerRef.current === timelineResourceOwnerKey
+        && activeSessionIdRef.current === sourceSessionId
+        && paneRef.current?.isConnected === true && paneRef.current.ownerDocument === sourceDocument
+        && sourceDocument.defaultView?.document === sourceDocument
+        && state.ready && state.connectionState === "connected"
+        && state.snapshot.generation === sourceSnapshotGeneration
+        && state.navigationRevision === sourceNavigationRevision
+        && state.activeProfile?.id === sourceProfileId && state.activeProfile?.serverId === sourceServerId
+        && state.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceGeneration
+        && controllerRef.current.loadSessionTimelinePage === sourceController.loadSessionTimelinePage;
+    };
+    const feedback = (phase: ConversationCopyFeedback["phase"]): void => {
+      if (isCurrent()) setConversationCopyFeedback({ sessionId: sourceSessionId, ownerEpoch, documentEpoch, phase });
+    };
+    feedback("busy");
+    void (async () => {
+      try {
+        const markdown = await collectConversationMarkdown(sourceSessionId, sourceController.loadSessionTimelinePage, isCurrent, {
+          user: t("timeline.you"), assistant: t("timeline.agent")
+        });
+        if (!isCurrent()) return;
+        if (markdown === undefined) { feedback("empty"); return; }
+        try {
+          await writeClipboardText(markdown, { ownerDocument: sourceDocument, signal: operation.abort.signal });
+        } catch { feedback("clipboard-failed"); return; }
+        feedback("copied");
+      } catch (error) {
+        if (!isCurrent()) return;
+        feedback(error instanceof ConversationMarkdownError && error.reason !== "stale" ? error.reason : "read-failed");
+      } finally {
+        if (conversationCopyFlightRef.current === operation) conversationCopyFlightRef.current = undefined;
+      }
+    })();
+  };
   const gamepadConnected = controller.state.ready && controller.state.connectionState === "connected";
   useGamepadActions(paneRef, `${timelineResourceOwnerKey}:${session.generation}`, "session", {
     "scroll-bottom": () => setFollowLatestSignal((current) => current + 1),
@@ -1532,7 +1627,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           if (source !== undefined) forkFromMessage(source);
         }
       }),
-      ...(onCopyTaskLink === undefined ? {} : { "copy-task-link": onCopyTaskLink })
+      ...(onCopyTaskLink === undefined ? {} : { "copy-task-link": onCopyTaskLink }),
+      "copy-conversation-markdown": copyConversationMarkdown
     } : {})
   });
 
@@ -1659,6 +1755,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
             onDelete={onDelete}
             onMoveSessionProject={onMoveSessionProject}
             onCopyTaskLink={onCopyTaskLink}
+            onCopyConversationMarkdown={gamepadConnected ? copyConversationMarkdown : undefined}
             onExportPortableSession={canExportPortable ? onExportPortableSession : undefined}
             exportHtmlPending={exportDownload.pending}
             onExportHtml={canExport ? (ownerDocument) => exportDownload.run(ownerDocument, (context) => controller.exportSession(session.id, context)) : undefined}
@@ -1845,6 +1942,19 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           ? undefined
           : current)}
       />}
+      {currentConversationCopyFeedback !== undefined && <div className="compact-feedback-region">
+        <div className={cx("compact-action-feedback", currentConversationCopyFeedback.phase === "busy"
+          ? "compact-action-feedback--busy" : conversationCopyFailed ? "compact-action-feedback--failure" : "compact-action-feedback--compacted")}
+          role={conversationCopyFailed ? "alert" : "status"}
+          aria-live={conversationCopyFailed ? "assertive" : "polite"}
+          aria-atomic="true">
+          {currentConversationCopyFeedback.phase === "busy" ? <LoaderCircle aria-hidden="true" />
+            : conversationCopyFailed
+              ? <AlertTriangle aria-hidden="true" /> : <Copy aria-hidden="true" />}
+          <span>{t(`session.conversationCopy.${currentConversationCopyFeedback.phase}`)}</span>
+          {currentConversationCopyFeedback.phase !== "busy" && <Button tone="ghost" onClick={() => setConversationCopyFeedback(undefined)}>{t("common.dismiss")}</Button>}
+        </div>
+      </div>}
       {activeCompaction !== undefined && <CompactionStatusIndicator compaction={activeCompaction} t={t} />}
       {activeRetry !== undefined && <RetryStatusIndicator retry={activeRetry} t={t} />}
       <InteractionPromptHost

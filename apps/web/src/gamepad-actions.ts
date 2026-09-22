@@ -3,7 +3,7 @@ import type { GamepadAction } from "./gamepad-input.js";
 
 export const GAMEPAD_OWNED_ACTIONS = [
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
-  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "add-attachments", "open-commands", "scroll-bottom"
+  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands", "scroll-bottom"
 ] as const satisfies readonly GamepadAction[];
 export type GamepadOwnedAction = (typeof GAMEPAD_OWNED_ACTIONS)[number];
 type ActionOwner = "composer" | "session" | "interaction";

@@ -38,6 +38,7 @@ export interface SessionHeaderActionsMenuProps {
   readonly onDelete: () => void;
   readonly onMoveSessionProject?: (placement: SessionProjectNavigationPlacement) => void;
   readonly onCopyTaskLink?: () => void;
+  readonly onCopyConversationMarkdown?: () => void;
   readonly onExportPortableSession?: () => void;
   readonly onExportHtml?: (ownerDocument: Document) => void;
   readonly exportHtmlPending?: boolean;
@@ -59,6 +60,7 @@ export function SessionHeaderActionsMenu({
   onDelete,
   onMoveSessionProject,
   onCopyTaskLink,
+  onCopyConversationMarkdown,
   onExportPortableSession,
   onExportHtml,
   exportHtmlPending,
@@ -239,6 +241,10 @@ export function SessionHeaderActionsMenu({
         {onCopyTaskLink !== undefined && <button type="button" role="menuitem" onClick={() => run(onCopyTaskLink)}>
           <Copy aria-hidden="true" />
           {t("session.copyTaskLink")}
+        </button>}
+        {onCopyConversationMarkdown !== undefined && <button type="button" role="menuitem" onClick={() => run(onCopyConversationMarkdown)}>
+          <Copy aria-hidden="true" />
+          {t("session.copyConversationMarkdown")}
         </button>}
         {onExportPortableSession !== undefined && <button type="button" role="menuitem" onClick={() => run(onExportPortableSession)}>
           <FileOutput aria-hidden="true" />

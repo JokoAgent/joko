@@ -76,6 +76,7 @@ describe("SessionHeaderActionsMenu", () => {
       "session.rename",
       "session.moveToProject",
       "session.copyTaskLink",
+      "session.copyConversationMarkdown",
       "session.exportPortable",
       "session.export",
       "session.clone",
@@ -87,6 +88,7 @@ describe("SessionHeaderActionsMenu", () => {
     ]));
 
     await click(button(container, "session.copyTaskLink"));
+    await click(button(container, "session.copyConversationMarkdown"));
     await click(button(container, "session.exportPortable"));
     await click(button(container, "session.export"));
     await click(button(container, "session.clone"));
@@ -95,6 +97,7 @@ describe("SessionHeaderActionsMenu", () => {
     await click(button(container, "session.openNewWindow"));
 
     expect(callbacks.onCopyTaskLink).toHaveBeenCalledOnce();
+    expect(callbacks.onCopyConversationMarkdown).toHaveBeenCalledOnce();
     expect(callbacks.onExportPortableSession).toHaveBeenCalledOnce();
     expect(callbacks.onExportHtml).toHaveBeenCalledOnce();
     expect(callbacks.onClone).toHaveBeenCalledOnce();
@@ -140,6 +143,7 @@ function callbackProps() {
     onDelete: vi.fn<() => void>(),
     onMoveSessionProject: vi.fn<(placement: SessionProjectNavigationPlacement) => void>(),
     onCopyTaskLink: vi.fn<() => void>(),
+    onCopyConversationMarkdown: vi.fn<() => void>(),
     onExportPortableSession: vi.fn<() => void>(),
     onExportHtml: vi.fn<() => void>(),
     onClone: vi.fn<() => void>(),
