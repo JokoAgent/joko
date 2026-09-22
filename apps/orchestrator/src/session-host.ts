@@ -182,6 +182,8 @@ const SESSION_RUNTIME_USAGE_SOURCE_ID = "session-runtime";
 interface ActiveSession {
   readonly adapter: BackendAdapter;
   readonly sessionId: string;
+  /** Private prompt identity applied when this runtime handle was activated. */
+  readonly appendSystemPromptDigest: string;
   /** Exact Backend process instance that owns this native runtime handle. */
   readonly backendInstanceGeneration: number;
   /** Resource authority observed before this native runtime began activation. */
@@ -485,7 +487,7 @@ export interface CreateScheduledSessionInput {
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
   readonly operationId: string;
-  readonly serviceKind: "session_handoff";
+  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging";
   readonly targetId: string;
   readonly title: string;
   readonly providerId?: string;
@@ -494,7 +496,8 @@ export interface CreateServiceSessionInput {
   readonly fastMode: boolean;
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
-  readonly appendSystemPrompt?: undefined;
+  /** Private, bounded identity snapshot for service-owned partner creation. */
+  readonly appendSystemPrompt?: string;
   readonly nativeStart?: undefined;
   readonly catalogImport?: undefined;
   readonly worktree?: { readonly sourceRef?: string; readonly refreshRemote: boolean };
@@ -620,6 +623,10 @@ export interface EnqueueServiceInput {
   /** Durable non-secret ownership fence for cross-Session helper messages. */
   readonly originSessionId?: string;
   readonly overrides?: TurnExecutionOverrides;
+  /** Runs inside the same Store transaction after Queue admission and before
+   * dispatch can start. Trusted service owners use this to bind their durable
+   * projection to the exact Queue identity. */
+  readonly onAdmitted?: (store: OperationalStore, result: EnqueueResult) => void;
 }
 
 export type SessionRuntimeControlErrorCode = "CONFLICT" | "INVALID_ARGS" | "ROUTE_UNAVAILABLE";
@@ -779,6 +786,12 @@ export class SessionHost {
     providerId: string
   ) => "actual-cost" | "subscription-value" | "reference-value";
   readonly #sessionRuntimeFallbackEnabled: () => boolean;
+  readonly #serviceSessionRuntimeFallback: (input: {
+    readonly sessionId: string;
+    readonly current: SessionRuntimeProfile;
+    readonly visitedRoutes: readonly string[];
+    readonly currentHop: number;
+  }) => { readonly owned: boolean; readonly candidate?: SessionRuntimeProfile };
   readonly #backendEnabled: (backendId: string) => boolean;
   readonly #providerRoutingEnabled: (backendId: string, providerId: string) => boolean;
   readonly #modelRoutingEnabled: (backendId: string, providerId: string, modelId: string) => boolean;
@@ -790,6 +803,19 @@ export class SessionHost {
   readonly #sessionRuntimeRecoveryDelayMs: (attempt: number) => number;
   readonly #backendDispatchBlocked: (backendId: string) => boolean;
   readonly #onBackendMayBeIdle: ((backendId: string) => void) | undefined;
+  readonly #onServiceRunSettled: ((input: {
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly outcome: "completed" | "aborted" | "failed";
+  }) => Promise<void> | void) | undefined;
+  readonly #onServiceInteractionOpened: ((input: {
+    readonly sessionId: string;
+    readonly interactionId: string;
+  }) => Promise<void> | void) | undefined;
+  readonly #onServiceInteractionSettled: ((input: {
+    readonly sessionId: string;
+    readonly interactionId: string;
+  }) => Promise<void> | void) | undefined;
   readonly #monotonicNow: () => number;
   readonly #runSilenceTimeoutMs: number;
   readonly #backendRetirementTimeoutMs: number;
@@ -823,6 +849,13 @@ export class SessionHost {
       ) => "actual-cost" | "subscription-value" | "reference-value";
       /** Owner setting read at decision time; the default is deliberately off. */
       readonly sessionRuntimeFallbackEnabled?: () => boolean;
+      /** Service-owned fallback order, independent of the ordinary task preference. */
+      readonly serviceSessionRuntimeFallback?: (input: {
+        readonly sessionId: string;
+        readonly current: SessionRuntimeProfile;
+        readonly visitedRoutes: readonly string[];
+        readonly currentHop: number;
+      }) => { readonly owned: boolean; readonly candidate?: SessionRuntimeProfile };
       /** Owner enablement read at every new-task admission boundary. */
       readonly backendEnabled?: (backendId: string) => boolean;
       /** Owner Provider access read at every new-route admission boundary. */
@@ -841,6 +874,22 @@ export class SessionHost {
       readonly backendDispatchBlocked?: (backendId: string) => boolean;
       /** Content-free settle signal for an external deferred replacement owner. */
       readonly onBackendMayBeIdle?: (backendId: string) => void;
+      /** Post-commit notification for service-owned projections such as Messaging outboxes. */
+      readonly onServiceRunSettled?: (input: {
+        readonly sessionId: string;
+        readonly runId: string;
+        readonly outcome: "completed" | "aborted" | "failed";
+      }) => Promise<void> | void;
+      /** Post-commit notification for service-owned interaction projections. */
+      readonly onServiceInteractionOpened?: (input: {
+        readonly sessionId: string;
+        readonly interactionId: string;
+      }) => Promise<void> | void;
+      /** Post-commit notification used to retire service-owned interaction projections. */
+      readonly onServiceInteractionSettled?: (input: {
+        readonly sessionId: string;
+        readonly interactionId: string;
+      }) => Promise<void> | void;
       /** Registry-probed descriptors, including unavailable instance shadows. */
       readonly backendDescriptors?: readonly BackendDescriptor[];
     } = {}
@@ -856,6 +905,7 @@ export class SessionHost {
     this.#usageOwnerId = options.usageOwnerId ?? "orchestrator";
     this.#usageMoneyKind = options.usageMoneyKind ?? (() => "actual-cost");
     this.#sessionRuntimeFallbackEnabled = options.sessionRuntimeFallbackEnabled ?? (() => false);
+    this.#serviceSessionRuntimeFallback = options.serviceSessionRuntimeFallback ?? (() => ({ owned: false }));
     this.#backendEnabled = options.backendEnabled ?? (() => true);
     this.#providerRoutingEnabled = options.providerRoutingEnabled ?? (() => true);
     this.#modelRoutingEnabled = options.modelRoutingEnabled ?? (() => true);
@@ -866,6 +916,9 @@ export class SessionHost {
       ?? sessionRuntimeRecoveryDelayMs;
     this.#backendDispatchBlocked = options.backendDispatchBlocked ?? (() => false);
     this.#onBackendMayBeIdle = options.onBackendMayBeIdle;
+    this.#onServiceRunSettled = options.onServiceRunSettled;
+    this.#onServiceInteractionOpened = options.onServiceInteractionOpened;
+    this.#onServiceInteractionSettled = options.onServiceInteractionSettled;
     this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
     const runSilenceTimeoutMs = options.runSilenceTimeoutMs ?? DEFAULT_RUN_SILENCE_TIMEOUT_MS;
     if (!Number.isSafeInteger(runSilenceTimeoutMs) || runSilenceTimeoutMs < 0) {
@@ -1439,6 +1492,10 @@ export class SessionHost {
    * idempotent across retries. */
   async createServiceSession(input: CreateServiceSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
+    validateAppendSystemPrompt(input.appendSystemPrompt);
+    if (input.serviceKind === "session_handoff" && input.appendSystemPrompt !== undefined) {
+      throw new StoreError("A handed-off task cannot supply a private system prompt.");
+    }
     const target = this.#store.getTarget(input.targetId);
     this.validateFastSelection(
       target.descriptor.backendId,
@@ -2156,7 +2213,9 @@ export class SessionHost {
           ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
           createdAt: now
         });
-        return { sessionId: input.sessionId, runId, attemptId, queueItemId };
+        const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
+        input.onAdmitted?.(store, result);
+        return result;
       }
     );
     if (!execution.replayed) void this.drain(input.sessionId);
@@ -4168,25 +4227,34 @@ export class SessionHost {
   }
 
   async #applyAutomaticSessionRuntimeFallback(sessionId: string): Promise<boolean> {
-    if (!this.#sessionRuntimeFallbackEnabled()) return false;
     const stored = this.#store.getSession(sessionId);
     const baseline = sessionRuntimeBaseline(stored.descriptor);
     if (baseline === undefined) return false;
     const snapshot = this.#sessionRuntimeControl.snapshot(sessionId, baseline);
     if (snapshot.pending !== undefined || snapshot.effective === undefined) return false;
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
-    const context = this.#sessionRuntimeFallbackContext(stored.descriptor.backendId);
-    const candidate = pickSessionRuntimeFallback({
+    const service = this.#serviceSessionRuntimeFallback({
+      sessionId,
       current: snapshot.effective,
-      models: backend.models.filter((model) =>
-        this.#modelRoutingEnabled(backend.id, model.providerId, model.modelId)),
-      availableProviderIds: context.availableProviderIds,
-      ...(context.explicitDefault === undefined ? {} : { explicitDefault: context.explicitDefault }),
       visitedRoutes: snapshot.visitedRoutes,
-      currentHop: snapshot.fallbackHop,
-      maxHops: 2,
-      fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true
+      currentHop: snapshot.fallbackHop
     });
+    let candidate = service.candidate;
+    if (!service.owned) {
+      if (!this.#sessionRuntimeFallbackEnabled()) return false;
+      const context = this.#sessionRuntimeFallbackContext(stored.descriptor.backendId);
+      candidate = pickSessionRuntimeFallback({
+        current: snapshot.effective,
+        models: backend.models.filter((model) =>
+          this.#modelRoutingEnabled(backend.id, model.providerId, model.modelId)),
+        availableProviderIds: context.availableProviderIds,
+        ...(context.explicitDefault === undefined ? {} : { explicitDefault: context.explicitDefault }),
+        visitedRoutes: snapshot.visitedRoutes,
+        currentHop: snapshot.fallbackHop,
+        maxHops: 2,
+        fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true
+      });
+    }
     if (candidate === undefined) return false;
     try {
       const result = await this.setSessionRuntimeControl({
@@ -4555,6 +4623,31 @@ export class SessionHost {
       );
     }
     this.extraDirectories.resolveSelection(stored.descriptor.targetId, overrides.extraDirectoryIds);
+  }
+
+  /**
+   * Advance a service-owned Session's private runtime identity. The durable
+   * value changes immediately; a live handle is rebuilt only at an idle or
+   * pre-send boundary, so an in-flight turn keeps its frozen identity.
+   */
+  async updateServiceSessionPrompt(sessionId: string, appendSystemPrompt: string): Promise<void> {
+    validateAppendSystemPrompt(appendSystemPrompt);
+    if (appendSystemPrompt.trim() === "") {
+      throw new StoreError("A service Session runtime prompt cannot be empty.");
+    }
+    if (this.isReviewReadOnlySession(sessionId)) {
+      throw new StoreError("Reviewer runtime prompts are immutable.");
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = this.#store.getSession(sessionId);
+      if (current.descriptor.appendSystemPrompt === appendSystemPrompt) return;
+      try {
+        this.#store.updateSessionPrivatePrompt(sessionId, appendSystemPrompt, current.revision);
+        return;
+      } catch (error) {
+        if (!(error instanceof RevisionConflictError) || attempt === 2) throw error;
+      }
+    }
   }
 
   /**
@@ -7076,6 +7169,7 @@ export class SessionHost {
         traceId,
         operationId
       );
+      this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       this.#pendingInteractions.delete(id);
       clearPendingInteractionExpiry(pending);
       pending.resolve({ kind: "cancelled" });
@@ -7096,6 +7190,7 @@ export class SessionHost {
       }
       continuation = this.commitPostTurnPlanReviewContinuation(store, interaction, decision);
     });
+    this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
     if (pending?.generation === generation) {
       this.#pendingInteractions.delete(id);
       clearPendingInteractionExpiry(pending);
@@ -7212,6 +7307,7 @@ export class SessionHost {
       throw new InvalidStateTransitionError("interaction", interaction.status, "dismissed");
     }
     this.#store.dismissInteraction(id, generation, reason, traceId, operationId);
+    this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
     const pending = this.#pendingInteractions.get(id);
     if (pending?.generation === generation) {
       this.#pendingInteractions.delete(id);
@@ -7241,6 +7337,7 @@ export class SessionHost {
           reason,
           `interaction-policy:${interaction.id}`
         );
+        this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       } catch (error) {
         // A newer native binding already fences this interaction in the
         // durable store. Still release any in-memory waiter so a stale bridge
@@ -8221,7 +8318,13 @@ export class SessionHost {
     const operationKind = authorized
       ? "create_session"
       : "serviceKind" in input
-        ? "create_session_handoff"
+        ? input.serviceKind === "partner"
+          ? "create_partner_session"
+          : input.serviceKind === "collaboration"
+            ? "create_collaboration_worker_session"
+            : input.serviceKind === "messaging"
+              ? "create_messaging_session"
+              : "create_session_handoff"
         : "create_scheduled_session";
     const claim = authorized
       ? this.#store.claimAuthorizedDeferredEffectOperation<{ readonly sessionId: string }>(
@@ -8927,21 +9030,62 @@ export class SessionHost {
       await reaping.catch(() => undefined);
       this.#assertOpen();
     }
-    const active = this.#active.get(sessionId);
-    if (active !== undefined) {
-      active.lastActivityAt = this.#monotonicNow();
-      return active;
-    }
     const inflight = this.#activating.get(sessionId);
     if (inflight !== undefined) return inflight;
-    const task = this.activateOnce(sessionId, {
+    const allowance: BackendSideEffectAdmissionAllowance = {
       backendReplacement: allowBackendReplacement,
       runtimeRestart: allowRuntimeRestart,
       sessionReset: allowSessionReset,
       ...(lifecycleOperationId === undefined ? {} : { lifecycleOperationId })
-    }).finally(() => this.#activating.delete(sessionId));
+    };
+    const active = this.#active.get(sessionId);
+    if (active !== undefined) {
+      if (active.appendSystemPromptDigest === privatePromptDigest(session.descriptor.appendSystemPrompt)
+        || !this.canRefreshPrivatePromptAtBoundary(sessionId)) {
+        active.lastActivityAt = this.#monotonicNow();
+        return active;
+      }
+      const task = this.refreshPrivatePromptRuntime(sessionId, active)
+        .then(() => this.activateOnce(sessionId, allowance))
+        .finally(() => this.#activating.delete(sessionId));
+      this.#activating.set(sessionId, task);
+      return task;
+    }
+    const task = this.activateOnce(sessionId, allowance).finally(() => this.#activating.delete(sessionId));
     this.#activating.set(sessionId, task);
     return task;
+  }
+
+  private canRefreshPrivatePromptAtBoundary(sessionId: string): boolean {
+    if (
+      (this.#activeEffects.get(sessionId) ?? 0) > 0
+      || this.#nativeCompactions.has(sessionId)
+      || this.#explicitCompactionFlights.has(sessionId)
+      || this.#compactionEffects.has(sessionId)
+      || this.#userShellRequests.has(sessionId)
+      || this.#userShells.has(sessionId)
+      || (this.#backgroundTasks.get(sessionId)?.size ?? 0) > 0
+      || [...this.#pendingInteractions.values()].some((interaction) => interaction.sessionId === sessionId)
+      || [...this.#turnOverrideLeases.values()].some((lease) => lease.sessionId === sessionId)
+    ) return false;
+    const liveRuns = listAllRuns(this.#store, { sessionId, activeOnly: true })
+      .filter((run) => run.descriptor.state !== "queued");
+    const preparation = this.#dispatchPreparations.get(sessionId);
+    if (preparation?.phase === "pre-send") return liveRuns.length <= 1;
+    return liveRuns.length === 0 && !this.#draining.has(sessionId);
+  }
+
+  private async refreshPrivatePromptRuntime(sessionId: string, active: ActiveSession): Promise<void> {
+    this.clearRunSilenceWatchdog(sessionId);
+    const stored = this.#store.getSession(sessionId);
+    await active.adapter.closeSession(stored.descriptor.binding, this.contextFor(stored));
+    if (this.#active.get(sessionId) !== active) {
+      throw new StoreError("The native runtime changed while its private prompt was being refreshed.");
+    }
+    this.deleteActiveSession(sessionId, active);
+    this.#nativeCompactions.delete(sessionId);
+    this.clearTurnOverrideLeases(sessionId);
+    this.#releaseSessionTools(sessionId);
   }
 
   private async closeIfActiveOnce(sessionId: string): Promise<void> {
@@ -10115,6 +10259,7 @@ export class SessionHost {
           });
           if (!uncertain) {
             removeNativeDispatchRecoveryEntry(this.#store, sessionId, run.descriptor.id);
+            await this.notifyServiceRunSettled(sessionId, run.descriptor.id, "failed");
           }
           if (recoveryTrigger?.reason === "context_overflow") this.ensureContextOverflowReplay(sessionId);
           if (this.isReviewReadOnlySession(sessionId)) {
@@ -10686,7 +10831,33 @@ export class SessionHost {
         if (pending.abortSignal.aborted) pending.abortListener();
       }
       this.refreshRunSilenceWatchdog(sessionId);
+      if (this.#onServiceInteractionOpened !== undefined) {
+        queueMicrotask(() => void Promise.resolve()
+          .then(() => this.#onServiceInteractionOpened?.({
+            sessionId,
+            interactionId: interaction.id
+          }))
+          .catch((error: unknown) => this.recordFailure("service-interaction-opened", error)));
+      }
     });
+  }
+
+  private notifyServiceInteractionSettled(sessionId: string, interactionId: string): void {
+    if (this.#onServiceInteractionSettled === undefined) return;
+    queueMicrotask(() => void Promise.resolve()
+      .then(() => this.#onServiceInteractionSettled?.({ sessionId, interactionId }))
+      .catch((error: unknown) => this.recordFailure("service-interaction-settled", error)));
+  }
+
+  private async notifyServiceRunSettled(
+    sessionId: string,
+    runId: string,
+    outcome: "completed" | "aborted" | "failed"
+  ): Promise<void> {
+    if (this.#onServiceRunSettled === undefined) return;
+    await Promise.resolve()
+      .then(() => this.#onServiceRunSettled?.({ sessionId, runId, outcome }))
+      .catch((error: unknown) => this.recordFailure("service-run-settled", error));
   }
 
   private cancelPendingInteractionFromAdapter(id: string, generation: number): void {
@@ -10701,6 +10872,7 @@ export class SessionHost {
           "The Backend cancelled its native interaction request.",
           `interaction-backend-cancelled:${id}`
         );
+        this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       }
     } catch (error) {
       if (!(error instanceof StaleGenerationError)) this.recordFailure("interaction_backend_cancel", error);
@@ -10724,6 +10896,7 @@ export class SessionHost {
           TIMED_EXTENSION_INTERACTION_EXPIRED_REASON,
           `interaction-expired:${id}`
         );
+        this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       }
     } catch (error) {
       if (!(error instanceof StaleGenerationError)) this.recordFailure("interaction_expiry", error);
@@ -10808,6 +10981,7 @@ export class SessionHost {
       else if (this.#sessionRuntimeRecoveries.get(sessionId)?.currentRunId === run.descriptor.id) {
         this.#clearSessionRuntimeRecovery(sessionId, "succeeded");
       }
+      await this.notifyServiceRunSettled(sessionId, run.descriptor.id, outcome);
     }
     if (outcome === "failed") this.ensureContextOverflowReplay(sessionId);
     await this.#applyPendingSessionRuntimeControl(sessionId);
@@ -11399,6 +11573,7 @@ export class SessionHost {
             target: this.targetForSession(recoveredSession)
           }).catch((error: unknown) => this.recordFailure("workspace-change-set", error));
         }
+        await this.notifyServiceRunSettled(sessionId, recoveredRunId, recovered.outcome);
         if (recovered.outcome === "failed") this.ensureContextOverflowReplay(sessionId);
         this.refreshRunSilenceWatchdog(sessionId);
         void this.reconcileScheduledWorktrees();
@@ -11677,6 +11852,7 @@ export class SessionHost {
     return {
       adapter,
       sessionId,
+      appendSystemPromptDigest: privatePromptDigest(session.descriptor.appendSystemPrompt),
       backendInstanceGeneration,
       resourceCatalogEpoch,
       lastActivityAt: this.#monotonicNow()
@@ -13406,6 +13582,10 @@ function validateAppendSystemPrompt(value: string | undefined): void {
     stateMayHaveChanged: false,
     recovery: "Remove the invalid character, then create a new task."
   });
+}
+
+function privatePromptDigest(value: string | undefined): string {
+  return createHash("sha256").update(value === undefined ? "undefined" : `value:${value}`).digest("hex");
 }
 
 async function nativeDerivationCleanupDeadline(task: Promise<void>, controller: AbortController): Promise<void> {

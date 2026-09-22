@@ -54,6 +54,7 @@ interface ScriptedPiProcessOptions {
   readonly clearQueueResponseData?: unknown;
   readonly echoQueuedUserMessages?: boolean;
   readonly queuedUserMessageTransform?: (command: Record<string, unknown>) => string;
+  readonly skipInitialSessionWrite?: boolean;
 }
 
 function chunkedRuntimeToolCatalog(
@@ -115,7 +116,7 @@ class ScriptedPiProcess extends EventEmitter {
     this.sessionFile = resume ?? join(sessionDirectory, `${this.sessionId}.jsonl`);
     this.#contextTokens = options.contextUsage?.tokens ?? options.contextTokens;
     mkdirSync(sessionDirectory, { recursive: true });
-    if (!resume) this.#writeSession();
+    if (!resume && !options.skipInitialSessionWrite) this.#writeSession();
     this.stdin = new Writable({
       write: (chunk: Buffer, _encoding, callback) => {
         this.#pending = Buffer.concat([this.#pending, chunk]);
@@ -540,7 +541,9 @@ class ScriptedPiProcess extends EventEmitter {
       }
       case "switch_session":
         this.sessionFile = String(command.sessionPath);
-        this.sessionId = "switched";
+        this.sessionId = String(
+          (JSON.parse(readFileSync(this.sessionFile, "utf8").split(/\r?\n/u)[0]!) as { id?: unknown }).id
+        );
         this.#success(command, { cancelled: false });
         return;
       default:
@@ -1044,6 +1047,69 @@ describe("PiBackendAdapter", () => {
       expect(restoredPrompt).toContain(memoryPrompt);
       expect(restoredPrompt).toContain("Use the dedicated grep tool for content search");
       expect(restoredPrompt).toContain("After locating a target, read only the relevant range when practical");
+    } finally {
+      await restarted.dispose();
+    }
+  });
+
+  it("materializes an empty fresh native Session before returning so restart can resume it", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-empty-resume-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-empty-resume-workspace-"));
+    const options = {
+      agentHome,
+      sessionRoot: agentHome,
+      versionProbe: async () => "pi 99.1.0",
+      providers: [{
+        id: "local",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        api: "openai-completions" as const,
+        keyless: true,
+        models: [{ id: "test-model", contextWindow: 32768, maxTokens: 4096 }]
+      }],
+      processFactory: (spec: PiProcessSpec) => new ScriptedPiProcess(spec, {
+        skipInitialSessionWrite: true
+      }) as unknown as PiProcessHandle
+    };
+    const target: TargetDescriptor = {
+      id: "target-empty-resume",
+      backendId: "pi",
+      displayName: "Empty resumable task",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: true
+    };
+    const context = makeContext(target, []);
+    const first = createPiAdapter(options);
+    const binding = await first.createSession({
+      target,
+      name: "Durable empty task",
+      providerId: "local",
+      modelId: "test-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, context);
+    const records = (await readFile(binding.opaqueRef, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records[0]).toMatchObject({
+      type: "session",
+      id: binding.nativeSessionId,
+      cwd: workspace
+    });
+    expect(records[1]).toMatchObject({ type: "session_info", name: "Durable empty task" });
+    await first.closeSession(binding, { ...context, binding });
+    await first.dispose();
+
+    const restarted = createPiAdapter(options);
+    try {
+      await expect(restarted.resumeSession(binding, {
+        ...context,
+        generation: binding.generation + 1,
+        binding
+      })).resolves.toMatchObject({
+        binding: { opaqueRef: binding.opaqueRef, generation: binding.generation + 1 }
+      });
     } finally {
       await restarted.dispose();
     }

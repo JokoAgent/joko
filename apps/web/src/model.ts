@@ -350,6 +350,577 @@ export interface RemoteHostCapabilitiesView {
   readonly backendRuntimeSetup: boolean;
 }
 
+export type PartnerLifecycleView = "active" | "archived" | "deleted";
+export type PartnerInitializationStateView = "pending" | "ready" | "error";
+export type PartnerInitializationErrorCodeView =
+  | "homeUnavailable"
+  | "avatarUnavailable"
+  | "modelUnavailable"
+  | "sessionUnavailable"
+  | "stateChanged";
+export type PartnerInvitationStageView = "home" | "avatar" | "session" | "ready" | "failed";
+export type PartnerPermissionModeView = Extract<PermissionMode, "ask" | "auto">;
+export type PartnerSessionRoleView = "canonical" | "history" | "delegation";
+export type PartnerPrivateThreadStatusView = "active" | "closed";
+export type PartnerPrivateThreadCloseReasonView = "messageLimit" | "idleTimeout";
+export type PartnerPrivateMessageDeliveryStatusView = "pending" | "delivered" | "failed";
+export type PartnerDelegationStatusView =
+  | "preparing"
+  | "queued"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unknown";
+
+export interface PartnerModelRouteView {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+}
+
+export interface PartnerCapabilitiesView {
+  readonly modelChain: readonly PartnerModelRouteView[];
+  readonly permissionMode: PartnerPermissionModeView;
+  readonly planMode: boolean;
+}
+
+export interface PartnerTemplateView {
+  readonly id: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly identitySource: string;
+}
+
+export interface PartnerDirectoryView {
+  readonly revision: bigint;
+  readonly activeCount: number;
+  readonly archivedCount: number;
+  readonly errorCount: number;
+  readonly updatedAt: number;
+  readonly templates: readonly PartnerTemplateView[];
+  readonly avatarPresets: readonly string[];
+  readonly defaultCapabilities?: PartnerCapabilitiesView;
+}
+
+export interface PartnerProfileView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly profileVersion: bigint;
+  readonly displayName: string;
+  readonly avatar: string;
+  readonly identitySource: string;
+  readonly templateId: string;
+  readonly lifecycle: PartnerLifecycleView;
+  readonly initializationState: PartnerInitializationStateView;
+  readonly invitationStage: PartnerInvitationStageView;
+  readonly initializationErrorCode?: PartnerInitializationErrorCodeView;
+  readonly homeTargetId: string;
+  readonly canonicalSessionId?: string;
+  readonly capabilities: PartnerCapabilitiesView;
+  readonly usesDirectoryDefaults: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly activity: PartnerActivityView;
+}
+
+export interface PartnerActivityView {
+  readonly partnerId: string;
+  readonly unreadReplyCount: number;
+  readonly latestReplyCursor?: bigint;
+  readonly latestReplyAt?: number;
+  readonly artifactCount: number;
+  readonly activeDelegationCount: number;
+  readonly readThroughCursor: bigint;
+  readonly readUpdatedAt: number;
+}
+
+export interface PartnerSessionView {
+  readonly sessionId: string;
+  readonly partnerId: string;
+  readonly role: PartnerSessionRoleView;
+  readonly profileVersion: bigint;
+  readonly parentSessionId?: string;
+  readonly delegationId?: string;
+  readonly displayName: string;
+  readonly available: boolean;
+  readonly readOnly: boolean;
+  readonly archived: boolean;
+  readonly deleted: boolean;
+  readonly createdAt: number;
+  readonly lastActivityAt?: number;
+}
+
+export interface PartnerPrivateThreadView {
+  readonly id: string;
+  readonly firstPartnerId: string;
+  readonly secondPartnerId: string;
+  readonly status: PartnerPrivateThreadStatusView;
+  readonly closeReason?: PartnerPrivateThreadCloseReasonView;
+  readonly messageCount: number;
+  readonly maxMessages: number;
+  readonly expiresAt: number;
+  readonly blockedUntil?: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly closedAt?: number;
+}
+
+export interface PartnerPrivateMessageView {
+  readonly id: string;
+  readonly threadId: string;
+  readonly sequence: number;
+  readonly senderPartnerId: string;
+  readonly recipientPartnerId: string;
+  readonly content: string;
+  readonly deliveryStatus: PartnerPrivateMessageDeliveryStatusView;
+  readonly createdAt: number;
+  readonly deliveredAt?: number;
+}
+
+export interface PartnerPrivateThreadReadStateView {
+  readonly threadId: string;
+  readonly partnerId: string;
+  readonly throughSequence: number;
+  readonly updatedAt: number;
+}
+
+export interface PartnerPrivateThreadDetailView {
+  readonly thread: PartnerPrivateThreadView;
+  readonly messages: readonly PartnerPrivateMessageView[];
+  readonly readState?: PartnerPrivateThreadReadStateView;
+}
+
+export interface PartnerDelegationView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly requesterPartnerId: string;
+  readonly targetPartnerId: string;
+  readonly parentSessionId: string;
+  readonly targetProfileVersion: bigint;
+  readonly title: string;
+  readonly objective: string;
+  readonly status: PartnerDelegationStatusView;
+  readonly childSessionId?: string;
+  readonly runId?: string;
+  readonly resultSummary?: string;
+  readonly error?: string;
+  readonly artifactCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly startedAt?: number;
+  readonly completedAt?: number;
+}
+
+export interface PartnerDraftView {
+  readonly displayName: string;
+  readonly avatar: string;
+  readonly identitySource: string;
+  readonly templateId: string;
+  readonly capabilities?: PartnerCapabilitiesView;
+  readonly usesDirectoryDefaults: boolean;
+}
+
+export interface PartnerPatchView {
+  readonly displayName?: string;
+  readonly avatar?: string;
+  readonly identitySource?: string;
+  readonly modelChain?: readonly PartnerModelRouteView[];
+  readonly permissionMode?: PartnerPermissionModeView;
+  readonly planMode?: boolean;
+  readonly usesDirectoryDefaults?: boolean;
+}
+
+export interface PartnerListView {
+  readonly partners: readonly PartnerProfileView[];
+  readonly directory: PartnerDirectoryView;
+}
+
+export interface PartnerMutationView {
+  readonly partner: PartnerProfileView;
+  readonly directory: PartnerDirectoryView;
+}
+
+export interface PartnerDefaultsMutationView {
+  readonly directory: PartnerDirectoryView;
+  readonly affectedPartners: readonly PartnerProfileView[];
+}
+
+export type CollaborationGoalStatusView = "active" | "completed" | "stopped" | "failed" | "archived";
+export type CollaborationWorkerStatusView =
+  | "provisioning"
+  | "idle"
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopping"
+  | "stopped"
+  | "dispatchUnknown"
+  | "archived";
+export type CollaborationDispatchStatusView = "preparing" | "queued" | "merged" | "cancelled" | "dispatchUnknown";
+export type CollaborationInterruptStopOutcomeView = "stopped" | "notRunning" | "unconfirmed" | "alreadyQueued";
+
+export interface CollaborationGoalView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly leadId: string;
+  readonly leadSessionId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly sessionGeneration: bigint;
+  readonly backendInstanceGeneration: bigint;
+  readonly title: string;
+  readonly objective: string;
+  readonly maximumWorkers?: number;
+  readonly status: CollaborationGoalStatusView;
+  readonly error?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+}
+
+export interface CollaborationWorkerRouteView {
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+}
+
+export interface CollaborationWorkerView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly goalId: string;
+  readonly parentWorkerId?: string;
+  readonly sessionId?: string;
+  readonly route: CollaborationWorkerRouteView;
+  readonly sessionGeneration?: bigint;
+  readonly backendInstanceGeneration?: bigint;
+  readonly label: string;
+  readonly role: string;
+  readonly assignment: string;
+  readonly status: CollaborationWorkerStatusView;
+  readonly focused: boolean;
+  readonly runtimeReleased: boolean;
+  readonly softLimitWarning: boolean;
+  readonly idleSince?: number;
+  readonly error?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface CollaborationDispatchView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly goalId: string;
+  readonly workerId: string;
+  readonly callerLeadSessionId: string;
+  readonly operationId: string;
+  readonly queueItemId?: string;
+  readonly message: string;
+  readonly status: CollaborationDispatchStatusView;
+  readonly mergedIntoDispatchId?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface CollaborationQueueEntryView {
+  readonly dispatch: CollaborationDispatchView;
+  readonly queueItem?: QueueItemView;
+}
+
+export interface CollaborationGoalTreeView {
+  readonly goal: CollaborationGoalView;
+  readonly workers: readonly CollaborationWorkerView[];
+  readonly queue: readonly CollaborationQueueEntryView[];
+  readonly focusedWorkerId?: string;
+}
+
+export interface CollaborationWorkerDraftView {
+  readonly parentWorkerId?: string;
+  readonly label: string;
+  readonly role: string;
+  readonly assignment: string;
+  readonly targetId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+}
+
+export type ContactKindView = "person" | "organization";
+export type ContactStatusView = "confirmed" | "pending";
+export type ContactSourceView = "manual" | "agent" | "import";
+
+export interface ContactIdentityInputView {
+  readonly platform: string;
+  readonly value: string;
+  readonly label: string;
+  readonly note: string;
+}
+
+export interface ContactEventInputView {
+  readonly date: string;
+  readonly text: string;
+  readonly source: string;
+}
+
+export interface ContactIdentityView extends ContactIdentityInputView {
+  readonly id: string;
+  readonly contactId: string;
+  readonly revision: bigint;
+  readonly normalizedValue: string;
+  readonly createdAt: number;
+}
+
+export interface ContactEventView extends ContactEventInputView {
+  readonly id: string;
+  readonly contactId: string;
+  readonly revision: bigint;
+  readonly createdAt: number;
+}
+
+export interface ContactGroupView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly name: string;
+  readonly description: string;
+  readonly memberCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ContactRelationView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly fromContactId: string;
+  readonly toContactId: string;
+  readonly relation: string;
+  readonly note: string;
+  readonly createdAt: number;
+  readonly direction: "outgoing" | "incoming";
+  readonly relatedContactId: string;
+  readonly relatedDisplayName: string;
+  readonly relatedKind: ContactKindView;
+}
+
+export interface ContactSummaryView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly kind: ContactKindView;
+  readonly displayName: string;
+  readonly aliases: readonly string[];
+  readonly summary: string;
+  readonly status: ContactStatusView;
+  readonly source: ContactSourceView;
+  readonly identityCount: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ContactProfileView extends ContactSummaryView {
+  readonly narrative: string;
+  readonly agentNotes: string;
+  readonly identities: readonly ContactIdentityView[];
+  readonly events: readonly ContactEventView[];
+  readonly groups: readonly ContactGroupView[];
+  readonly relations: readonly ContactRelationView[];
+}
+
+export interface ContactDirectoryView {
+  readonly format: number;
+  readonly revision: bigint;
+  readonly enabled: boolean;
+  readonly people: number;
+  readonly organizations: number;
+  readonly pending: number;
+  readonly groups: number;
+}
+
+export type ContactSyncPhaseView = "off" | "waiting" | "syncing" | "upToDate" | "error";
+export type ContactSyncErrorCodeView = "identityUnavailable" | "peerIdentityChanged" | "syncFailed";
+
+export interface ContactSyncPeerView {
+  readonly peerId: string;
+  readonly revision: bigint;
+  readonly displayName: string;
+  readonly fingerprint: string;
+  readonly online: boolean;
+  readonly state: "pending" | "active";
+  readonly grantedAt: number;
+  readonly lastSyncAt?: number;
+  readonly lastRoute?: "lan";
+}
+
+export interface ContactSyncCandidateView {
+  readonly nodeId: string;
+  readonly displayName: string;
+  readonly fingerprint: string;
+  readonly seenAt: number;
+  readonly granted: boolean;
+  readonly keyChanged: boolean;
+}
+
+export interface ContactSyncStatusView {
+  readonly available: boolean;
+  readonly configurationRevision: bigint;
+  readonly nodeId: string;
+  readonly fingerprint: string;
+  readonly enabled: boolean;
+  readonly phase: ContactSyncPhaseView;
+  readonly onlinePeerCount: number;
+  readonly errorCode?: ContactSyncErrorCodeView;
+  readonly lastSyncAt?: number;
+  readonly lastSyncPeerId?: string;
+  readonly lastSyncPeerName?: string;
+  readonly lastRoute?: "lan";
+  readonly peers: readonly ContactSyncPeerView[];
+  readonly candidates: readonly ContactSyncCandidateView[];
+}
+
+export interface ContactDraftView {
+  readonly kind: ContactKindView;
+  readonly displayName: string;
+  readonly aliases: readonly string[];
+  readonly summary: string;
+  readonly narrative: string;
+  readonly agentNotes: string;
+  readonly status: ContactStatusView;
+  readonly source: ContactSourceView;
+  readonly identities: readonly ContactIdentityInputView[];
+}
+
+export interface ContactPatchView {
+  readonly kind?: ContactKindView;
+  readonly displayName?: string;
+  readonly aliases?: readonly string[];
+  readonly summary?: string;
+  readonly narrative?: string;
+  readonly agentNotes?: string;
+  readonly status?: ContactStatusView;
+}
+
+export interface ContactDuplicateCandidateView {
+  readonly matchType: "identity" | "name";
+  readonly contactId: string;
+  readonly displayName: string;
+  readonly kind: ContactKindView;
+  readonly status: ContactStatusView;
+  readonly summary: string;
+  readonly matchedPlatform?: string;
+  readonly matchedValue?: string;
+}
+
+export interface ContactDuplicatePairView {
+  readonly first: ContactSummaryView;
+  readonly second: ContactSummaryView;
+}
+
+export interface ContactListOptionsView {
+  readonly query?: string;
+  readonly kind?: ContactKindView;
+  readonly status?: ContactStatusView;
+  readonly groupId?: string;
+  readonly pageSize?: number;
+  readonly pageOffset?: number;
+}
+
+export interface ContactListPageView {
+  readonly contacts: readonly ContactSummaryView[];
+  readonly total: number;
+  readonly nextPageOffset?: number;
+}
+
+export interface ContactMutationView {
+  readonly contact: ContactProfileView;
+  readonly directory: ContactDirectoryView;
+}
+
+export interface ContactCreateResultView {
+  readonly contact?: ContactProfileView;
+  readonly candidates: readonly ContactDuplicateCandidateView[];
+  readonly directory: ContactDirectoryView;
+}
+
+export interface ContactMergeResultView {
+  readonly target: ContactProfileView;
+  readonly mergedContactId: string;
+  readonly movedIdentities: number;
+  readonly movedEvents: number;
+  readonly movedRelations: number;
+  readonly directory: ContactDirectoryView;
+}
+
+export type ContactVCardImportDispositionView = "create" | "autoEnrich" | "needsReview";
+export type ContactVCardImportDecisionKindView = "create" | "merge" | "skip";
+
+export interface ContactVCardImportPreviewEntryView {
+  readonly entryId: string;
+  readonly contact: ContactDraftView;
+  readonly disposition: ContactVCardImportDispositionView;
+  readonly existingContactId?: string;
+  readonly candidates: readonly ContactDuplicateCandidateView[];
+  readonly existingEntryId?: string;
+  readonly similarEntryIds: readonly string[];
+  readonly organizationName?: string;
+  readonly title?: string;
+  readonly groups: readonly string[];
+  readonly organizationContactId?: string;
+  readonly organizationCandidates: readonly ContactDuplicateCandidateView[];
+}
+
+export interface ContactVCardImportPreviewView {
+  readonly previewId: string;
+  readonly directoryRevision: bigint;
+  readonly entries: readonly ContactVCardImportPreviewEntryView[];
+  readonly expiresAt: number;
+}
+
+export interface ContactVCardImportDecisionView {
+  readonly entryId: string;
+  readonly decision: ContactVCardImportDecisionKindView;
+  readonly targetContactId?: string;
+  readonly expectedTargetRevision?: bigint;
+  readonly confirmedNameCandidateIds?: readonly string[];
+  readonly targetEntryId?: string;
+  readonly organizationDecision?: ContactVCardImportDecisionKindView;
+  readonly organizationTargetContactId?: string;
+  readonly expectedOrganizationTargetRevision?: bigint;
+  readonly organizationTargetEntryId?: string;
+  readonly confirmedOrganizationCandidateIds?: readonly string[];
+}
+
+export interface ContactVCardImportResultView {
+  readonly created: number;
+  readonly enriched: number;
+  readonly skipped: number;
+  readonly contactIds: readonly string[];
+  readonly entries: readonly ContactVCardImportEntryResultView[];
+  readonly directory: ContactDirectoryView;
+}
+
+export interface ContactVCardImportEntryResultView {
+  readonly entryId: string;
+  readonly displayName: string;
+  readonly outcome: "created" | "enriched" | "skipped";
+  readonly contactId?: string;
+}
+
+export interface ContactVCardExportView {
+  readonly text: string;
+  readonly contactCount: number;
+  readonly suggestedFileName: string;
+}
+
 export type RemoteBackendRuntimeStateView = "probing" | "notInstalled" | "installing" | "ready" | "failed" | "outcomeUnknown";
 export type RemoteBackendRuntimeInstallPhaseView = "probing" | "downloading" | "installing" | "validating" | "complete" | "failed" | "outcomeUnknown";
 export type RemoteBackendRuntimeFailureCodeView = "aborted" | "authorityChanged" | "hostNotReady" | "notSupported" | "probeFailed" | "installFailed" | "uninstallFailed" | "busy";
@@ -3654,6 +4225,173 @@ export interface VoiceInputServiceSettingsDraft {
   readonly expectedRevision: bigint;
 }
 
+export type MessagingChannelView =
+  | "telegram"
+  | "discord"
+  | "dingtalk"
+  | "feishu"
+  | "lark"
+  | "wecom"
+  | "wechat"
+  | "slack";
+
+export type MessagingConnectionRuntimeStatusView =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "offline"
+  | "conflict"
+  | "authLoss"
+  | "error";
+
+export interface TelegramMessagingConfigurationView {
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export interface DiscordMessagingConfigurationView {
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  /** Keys are exact guild/root-channel pairs formatted as guild/channel. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export interface DingTalkMessagingConfigurationView {
+  readonly appKey: string;
+  /** Keys are exact DingTalk conversation IDs. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export interface FeishuMessagingConfigurationView {
+  readonly appId: string;
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  /** Keys are exact Feishu/Lark chat IDs. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+  readonly groupPermissionMode: "ask" | "bypassPermissions";
+}
+
+export interface WeComMessagingConfigurationView {
+  readonly botId: string;
+}
+
+export interface WeChatMessagingConfigurationView {
+  readonly format: 1;
+}
+
+export interface SlackMessagingConfigurationView {
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  /** Keys are exact approved Slack channel IDs. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export type WeChatAuthorizationStatusView =
+  | "waiting"
+  | "scanned"
+  | "verificationRequired"
+  | "qrRefreshed"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "expired";
+
+export interface WeChatAuthorizationAttemptView {
+  readonly attemptId: string;
+  readonly connectionId: string;
+  readonly generation: bigint;
+  readonly revision: bigint;
+  readonly status: WeChatAuthorizationStatusView;
+  readonly qrCodeUrl?: string;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly verificationRetry: boolean;
+  readonly errorCode?: string;
+  readonly errorSummary?: string;
+  readonly connection?: MessagingConnectionView;
+}
+
+export interface MessagingConnectionView {
+  readonly id: string;
+  readonly channel: MessagingChannelView;
+  readonly generation: bigint;
+  readonly revision: bigint;
+  readonly enabled: boolean;
+  readonly runtimeStatus: MessagingConnectionRuntimeStatusView;
+  readonly credentialConfigured: boolean;
+  readonly ownerProviderUserId?: string;
+  readonly providerAccountId?: string;
+  readonly providerUsername?: string;
+  readonly telegramConfiguration?: TelegramMessagingConfigurationView;
+  readonly discordConfiguration?: DiscordMessagingConfigurationView;
+  readonly dingtalkConfiguration?: DingTalkMessagingConfigurationView;
+  readonly feishuConfiguration?: FeishuMessagingConfigurationView;
+  readonly wecomConfiguration?: WeComMessagingConfigurationView;
+  readonly wechatConfiguration?: WeChatMessagingConfigurationView;
+  readonly slackConfiguration?: SlackMessagingConfigurationView;
+  readonly errorCode?: string;
+  readonly errorSummary?: string;
+  readonly lastConnectedAt?: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface MessagingRouteView {
+  readonly scopeKey: string;
+  readonly connectionId?: string;
+  readonly targetId: string;
+  readonly backendId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly revision: bigint;
+}
+
+export interface MessagingRouteDraftView {
+  readonly connectionId?: string;
+  readonly expectedRevision?: bigint;
+  readonly targetId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+}
+
+export interface MessagingSettingsView {
+  readonly connections: readonly MessagingConnectionView[];
+  readonly routes: readonly MessagingRouteView[];
+  readonly channels: readonly {
+    readonly channel: MessagingChannelView;
+    readonly available: boolean;
+    readonly reason?: string;
+  }[];
+}
+
+export type MessagingConnectionTestResultView =
+  | {
+      readonly ok: true;
+      readonly providerAccountId: string;
+      readonly displayName: string;
+      readonly username?: string;
+    }
+  | {
+      readonly ok: false;
+      readonly failure: "invalid" | "conflict" | "credentialUnavailable" | "channelUnavailable" | "connectionFailed";
+    };
+
 export interface VoiceInputRefinementContextView {
   readonly instructions?: string;
   readonly dictionaryTerms: readonly string[];
@@ -4826,6 +5564,186 @@ export interface OperationApi {
   clearProviderCredentialSurface(backendId: string, providerId: string, surfaceId: string): Promise<void>;
   saveCredential(draft: CredentialDraft, signal?: AbortSignal): Promise<void>;
   deleteCredential(credentialId: string): Promise<void>;
+  getMessagingSettings(signal?: AbortSignal): Promise<MessagingSettingsView>;
+  createTelegramMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  createDiscordMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  createDingTalkMessagingConnection(
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  createFeishuMessagingConnection(
+    channel: "feishu" | "lark",
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  createWeComMessagingConnection(
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  createWeChatMessagingConnection(signal?: AbortSignal): Promise<MessagingConnectionView>;
+  createSlackMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  beginWeChatAuthorization(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  getWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  submitWeChatVerificationCode(
+    attempt: WeChatAuthorizationAttemptView,
+    code: string,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  cancelWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  saveMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    secret: string,
+    enable: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  clearMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  setMessagingConnectionEnabled(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    enabled: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateTelegramMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateDiscordMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateDingTalkMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateFeishuMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateWeComMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateSlackMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;
+  putMessagingRoute(draft: MessagingRouteDraftView, signal?: AbortSignal): Promise<MessagingRouteView>;
+  getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;
+  listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
+  getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;
+  createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatchView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  setPartnerLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  retryPartnerInitialization(partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerMutationView>;
+  updatePartnerDefaults(expectedDirectoryRevision: bigint, capabilities: PartnerCapabilitiesView, signal?: AbortSignal): Promise<PartnerDefaultsMutationView>;
+  listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]>;
+  markPartnerRead(partnerId: string, throughCursor: bigint, signal?: AbortSignal): Promise<PartnerActivityView>;
+  listPartnerPrivateThreads(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerPrivateThreadView[]>;
+  getPartnerPrivateThread(partnerId: string, threadId: string, signal?: AbortSignal): Promise<PartnerPrivateThreadDetailView>;
+  markPartnerPrivateThreadRead(partnerId: string, threadId: string, throughSequence: number, signal?: AbortSignal): Promise<PartnerPrivateThreadReadStateView>;
+  listPartnerDelegations(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerDelegationView[]>;
+  getPartnerDelegation(partnerId: string, delegationId: string, signal?: AbortSignal): Promise<PartnerDelegationView>;
+  cancelPartnerDelegation(partnerId: string, delegationId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerDelegationView>;
+  listCollaborationGoals(sessionId: string, includeArchived?: boolean, signal?: AbortSignal): Promise<readonly CollaborationGoalView[]>;
+  getCollaborationGoal(goalId: string, viewerSessionId: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  createCollaborationGoal(leadSessionId: string, expectedSessionGeneration: bigint, title: string, objective: string, maximumWorkers?: number, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  setCollaborationGoalStatus(goal: CollaborationGoalView, status: Exclude<CollaborationGoalStatusView, "active">, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  createCollaborationWorker(goal: CollaborationGoalView, draft: CollaborationWorkerDraftView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  updateCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, patch: { readonly label?: string; readonly role?: string; readonly assignment?: string }, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  focusCollaborationWorker(goal: CollaborationGoalView, worker?: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  wakeCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  stopCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  releaseCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  archiveCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  sendCollaborationWorkerMessage(goal: CollaborationGoalView, worker: CollaborationWorkerView, message: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  interruptCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, message: string, signal?: AbortSignal): Promise<{ readonly tree: CollaborationGoalTreeView; readonly stopOutcome: CollaborationInterruptStopOutcomeView }>;
+  editCollaborationDispatch(dispatch: CollaborationDispatchView, queueItem: QueueItemView, message: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  cancelCollaborationDispatch(dispatch: CollaborationDispatchView, queueItem: QueueItemView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  mergeCollaborationDispatches(goal: CollaborationGoalView, worker: CollaborationWorkerView, entries: readonly CollaborationQueueEntryView[], signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView>;
+  setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView>;
+  listContacts(options?: ContactListOptionsView, signal?: AbortSignal): Promise<ContactListPageView>;
+  getContact(contactId: string, signal?: AbortSignal): Promise<ContactProfileView>;
+  findSimilarContacts(contact: ContactDraftView, signal?: AbortSignal): Promise<readonly ContactDuplicateCandidateView[]>;
+  createContact(expectedDirectoryRevision: bigint, contact: ContactDraftView, confirmedNameCandidateIds?: readonly string[], signal?: AbortSignal): Promise<ContactCreateResultView>;
+  updateContact(contactId: string, expectedRevision: bigint, patch: ContactPatchView, signal?: AbortSignal): Promise<ContactMutationView>;
+  confirmContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactMutationView>;
+  deleteContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView>;
+  addContactIdentity(contactId: string, expectedContactRevision: bigint, identity: ContactIdentityInputView, signal?: AbortSignal): Promise<ContactMutationView>;
+  removeContactIdentity(contactId: string, expectedContactRevision: bigint, contactIdentityId: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  appendContactEvent(contactId: string, expectedContactRevision: bigint, event: ContactEventInputView, signal?: AbortSignal): Promise<ContactMutationView>;
+  removeContactEvent(contactId: string, expectedContactRevision: bigint, contactEventId: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  listContactGroups(signal?: AbortSignal): Promise<readonly ContactGroupView[]>;
+  createContactGroup(expectedDirectoryRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }>;
+  updateContactGroup(contactGroupId: string, expectedRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }>;
+  deleteContactGroup(contactGroupId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView>;
+  setContactGroupMembership(contactId: string, expectedContactRevision: bigint, contactGroupId: string, member: boolean, signal?: AbortSignal): Promise<ContactMutationView>;
+  addContactRelation(fromContactId: string, expectedFromRevision: bigint, toContactId: string, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  updateContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, expectedRelationRevision: bigint, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  removeContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, signal?: AbortSignal): Promise<ContactMutationView>;
+  scanContactDuplicates(limit?: number, signal?: AbortSignal): Promise<{ readonly pairs: readonly ContactDuplicatePairView[]; readonly directory: ContactDirectoryView }>;
+  mergeContacts(targetContactId: string, expectedTargetRevision: bigint, mergedContactId: string, expectedMergedRevision: bigint, signal?: AbortSignal): Promise<ContactMergeResultView>;
+  previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
+  commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
+  exportContactsVCard(contactIds?: readonly string[], signal?: AbortSignal): Promise<ContactVCardExportView>;
+  getContactSyncStatus(signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  setContactSyncEnabled(expectedConfigurationRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  grantContactSyncPeer(nodeId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  revokeContactSyncPeer(peerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactSyncStatusView>;
+  syncContactsNow(peerId?: string, signal?: AbortSignal): Promise<ContactSyncStatusView>;
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
   watchRemoteHosts(targetId: string, signal?: AbortSignal): AsyncIterable<readonly RemoteHostView[]>;

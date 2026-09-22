@@ -89,12 +89,24 @@ import {
 import type {
   AcquireToolLeaseInput,
   AppendEventInput,
+  AppendMessagingGroupObservationInput,
   ArtifactRecord,
   ArtifactSourceRecord,
+  BindCollaborationDispatchQueueInput,
+  BindCollaborationWorkerSessionInput,
+  BindMessagingConversationInput,
+  BindMessagingInboundAdmissionInput,
+  CancelCollaborationDispatchInput,
   ClearRemoteHostTrustInput,
   ConnectionRecord,
   ContextRebuildClaim,
   ConsumePairingInput,
+  CreateCollaborationDispatchInput,
+  CreateCollaborationGoalInput,
+  CreateCollaborationWorkerInput,
+  CreateMessagingConnectionInput,
+  ClaimMessagingConnectionOwnerInput,
+  CreateMessagingInboundRequestInput,
   CreateRemoteHostInput,
   CreateDeviceInput,
   CreatePairingInput,
@@ -107,8 +119,11 @@ import type {
   DurableRuntimeActivitySnapshot,
   EffectOperationClaim,
   EnqueueInput,
+  EnqueueMessagingDeliveryInput,
   EventQuery,
   EventSubscriber,
+  EditCollaborationDispatchInput,
+  FocusCollaborationWorkerInput,
   InteractionRecord,
   ListSubagentRunsInput,
   ListSubagentTranscriptInput,
@@ -129,9 +144,30 @@ import type {
   MakerMemoryEntry,
   MakerMemoryKind,
   MakerMemorySearchHit,
+  MessagingConnectionRecord,
+  MessagingConnectionRuntimeStatus,
+  MessagingConversationKind,
+  MessagingConversationContextAadInput,
+  MessagingConversationContextRecord,
+  MessagingConversationRecord,
+  MessagingDeliveryRecord,
+  MessagingDeliveryStatus,
+  MessagingGroupObservationRecord,
+  MessagingInboundRequestCreation,
+  MessagingInboundRequestRecord,
+  MessagingInboundRequestStatus,
+  MessagingInteractionRecord,
+  MessagingRouteRecord,
   MessageEmbeddingJob,
   MessageEmbeddingStatus,
+  MergeCollaborationDispatchesInput,
   ClaimedMobilePushDelivery,
+  CollaborationDispatchRecord,
+  CollaborationDispatchStatus,
+  CollaborationGoalRecord,
+  CollaborationGoalStatus,
+  CollaborationWorkerRecord,
+  CollaborationWorkerStatus,
   MobilePushDeliveryRecord,
   MobilePushRegistrationRecord,
   ModelPriceOverrideRecord,
@@ -155,6 +191,8 @@ import type {
   PutArtifactInput,
   PutObjectiveInput,
   PutMakerMemoryEntryInput,
+  PutMessagingRouteInput,
+  PutMessagingConversationContextInput,
   PutMobilePushRegistrationInput,
   PutLocalModelPullCheckpointInput,
   PutLocalRuntimeProviderBindingInput,
@@ -186,6 +224,7 @@ import type {
   ScheduleRunRecord,
   SchedulerRuntimeOwnerRecord,
   SearchSessionMessagesInput,
+  SetMessagingConnectionEnabledInput,
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
   SessionSnapshot,
@@ -212,11 +251,17 @@ import type {
   UsageLedgerSummary,
   UsageObservationResult,
   UpsertModelPriceOverrideInput,
+  UpdateCollaborationGoalStatusInput,
+  UpdateCollaborationWorkerAssignmentInput,
+  UpdateCollaborationWorkerStateInput,
+  UpdateMessagingConnectionRuntimeInput,
   UpdateRemoteHostInput,
   UpdateRemoteHostStatusInput,
   UpdateQueueStateInput,
   UpdateObjectiveInput,
   UpdateRunStateInput,
+  ReplaceMessagingCredentialInput,
+  EnsureMessagingConversationInput,
   UpsertScheduleInput,
   ValidatedSessionMessageSearch,
   ValidateSessionMessageSearchInput
@@ -298,6 +343,31 @@ const QUEUE_TRANSITIONS: Readonly<Record<QueueState, ReadonlySet<QueueState>>> =
   failed: new Set()
 };
 
+const COLLABORATION_GOAL_TRANSITIONS: Readonly<
+  Record<CollaborationGoalStatus, ReadonlySet<CollaborationGoalStatus>>
+> = {
+  active: new Set(["completed", "stopped", "failed"]),
+  completed: new Set(["archived"]),
+  stopped: new Set(["archived"]),
+  failed: new Set(["archived"]),
+  archived: new Set()
+};
+
+const COLLABORATION_WORKER_TRANSITIONS: Readonly<
+  Record<CollaborationWorkerStatus, ReadonlySet<CollaborationWorkerStatus>>
+> = {
+  provisioning: new Set(["idle", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  idle: new Set(["queued", "running", "completed", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  queued: new Set(["idle", "running", "completed", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  running: new Set(["idle", "queued", "completed", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  completed: new Set(["idle", "queued", "failed", "stopping", "stopped", "dispatch_unknown", "archived"]),
+  failed: new Set(["idle", "stopping", "stopped", "dispatch_unknown", "archived"]),
+  stopping: new Set(["stopped", "failed", "dispatch_unknown"]),
+  stopped: new Set(["archived"]),
+  dispatch_unknown: new Set(["idle", "queued", "running", "completed", "failed", "stopping", "stopped"]),
+  archived: new Set()
+};
+
 const REMOTE_HOST_STATUS_TRANSITIONS: Readonly<Record<RemoteHostStatus, ReadonlySet<RemoteHostStatus>>> = {
   disconnected: new Set(["connecting"]),
   connecting: new Set(["authenticating", "failed", "disconnected"]),
@@ -323,6 +393,19 @@ const MESSAGE_SEARCH_VECTOR_DIMENSIONS = 1024;
 const MESSAGE_SEARCH_VECTOR_POOL = 150;
 const MESSAGE_SEARCH_VECTOR_POOL_MAX = 1_000;
 const MAX_MESSAGE_SEARCH_FILTER_VALUES = 1_000;
+
+/** Exact AES-GCM associated reference shared with the Orchestrator vault. */
+export function messagingConversationContextAad(
+  input: MessagingConversationContextAadInput
+): string {
+  return JSON.stringify([
+    "joko.messaging.conversation-context",
+    1,
+    input.connectionId,
+    input.materialGeneration,
+    input.conversationId
+  ]);
+}
 const MESSAGE_SEARCH_RRF_K = 60;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
@@ -3300,6 +3383,3008 @@ export class OperationalStore {
     });
   }
 
+  createCollaborationGoal(input: CreateCollaborationGoalInput): CollaborationGoalRecord {
+    return this.write(() => {
+      const leadSession = this.getSession(input.leadSessionId);
+      assertActiveCollaborationSession(leadSession, "lead");
+      if (this.findCollaborationWorkerBySession(input.leadSessionId) !== undefined) {
+        throw new StoreError("A collaboration worker Session cannot lead a nested Goal.");
+      }
+      const sessionGeneration = leadSession.descriptor.binding.generation;
+      if (
+        input.expectedSessionGeneration !== undefined &&
+        input.expectedSessionGeneration !== sessionGeneration
+      ) {
+        throw new StaleGenerationError(input.expectedSessionGeneration, sessionGeneration);
+      }
+      const existing = this.findActiveCollaborationGoalByLeadSession(input.leadSessionId);
+      if (existing !== undefined) {
+        throw new StoreError(`Session ${input.leadSessionId} already leads an active collaboration Goal.`);
+      }
+      const backend = this.getBackend(leadSession.descriptor.backendId);
+      const id = collaborationIdentity(input.id ?? this.idFactory(), "Goal ID");
+      const leadId = collaborationIdentity(input.leadId ?? `lead:${id}`, "lead ID");
+      const maximumWorkers = input.maximumWorkers === undefined
+        ? undefined
+        : collaborationLimit(input.maximumWorkers, "Goal maximum workers", 128);
+      const at = collaborationTimestamp(input.createdAt ?? this.now(), "Goal creation time");
+      this.database.prepare(`
+        INSERT INTO collaboration_goals(
+          id, lead_id, lead_session_id, backend_id, target_id,
+          session_generation, backend_instance_generation, title, objective,
+          maximum_workers, status, last_error_json, created_at, updated_at,
+          completed_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL, ?)
+      `).run(
+        id,
+        leadId,
+        leadSession.descriptor.id,
+        leadSession.descriptor.backendId,
+        leadSession.descriptor.targetId,
+        sessionGeneration,
+        backend.descriptor.instanceGeneration,
+        collaborationShortText(input.title, "Goal title", 256),
+        collaborationText(input.objective, "Goal objective"),
+        maximumWorkers ?? null,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getCollaborationGoal(id);
+    });
+  }
+
+  findCollaborationGoal(id: string): CollaborationGoalRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_goals WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : collaborationGoalFromRow(row);
+  }
+
+  getCollaborationGoal(id: string): CollaborationGoalRecord {
+    const goal = this.findCollaborationGoal(id);
+    if (goal === undefined) throw new NotFoundError("Collaboration Goal", id);
+    return goal;
+  }
+
+  findActiveCollaborationGoalByLeadSession(
+    leadSessionId: string
+  ): CollaborationGoalRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM collaboration_goals
+      WHERE lead_session_id = ? AND status = 'active'
+      LIMIT 1
+    `).get(leadSessionId) as Row | undefined;
+    return row === undefined ? undefined : collaborationGoalFromRow(row);
+  }
+
+  listCollaborationGoals(options: {
+    readonly leadSessionId?: string;
+    readonly statuses?: readonly CollaborationGoalStatus[];
+  } = {}): CollaborationGoalRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.leadSessionId !== undefined) {
+      clauses.push("lead_session_id = ?");
+      params.push(options.leadSessionId);
+    }
+    if (options.statuses !== undefined && options.statuses.length > 0) {
+      const statuses = [...new Set(options.statuses.map(collaborationGoalStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    return (this.database.prepare(`
+      SELECT * FROM collaboration_goals ${where}
+      ORDER BY updated_at DESC, id
+    `).all(...params) as Row[]).map(collaborationGoalFromRow);
+  }
+
+  updateCollaborationGoalStatus(
+    input: UpdateCollaborationGoalStatusInput
+  ): CollaborationGoalRecord {
+    return this.write(() => {
+      const current = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(current, input.callerLeadSessionId);
+      assertCollaborationRevision("Collaboration Goal", current.id, current.revision, input.expectedRevision);
+      const status = collaborationGoalStatus(input.status);
+      if (status === "active") throw new StoreError("A terminal Goal update cannot reactivate a Goal.");
+      if (current.status === status) return current;
+      if (!COLLABORATION_GOAL_TRANSITIONS[current.status].has(status)) {
+        throw new InvalidStateTransitionError("collaboration Goal", current.status, status);
+      }
+      const activeWorkers = this.database.prepare(`
+        SELECT COUNT(*) AS count FROM collaboration_workers
+        WHERE goal_id = ? AND status IN (
+          'provisioning', 'idle', 'queued', 'running', 'stopping', 'dispatch_unknown'
+        )
+      `).get(current.id) as Row;
+      if (numberValue(activeWorkers["count"]) > 0) {
+        throw new StoreError("A collaboration Goal cannot finish or archive while it has active workers.");
+      }
+      if (input.error !== undefined && status !== "failed") {
+        throw new StoreError("Only a failed collaboration Goal can retain an error.");
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "Goal update time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_goals
+        SET status = ?, last_error_json = ?, completed_at = COALESCE(completed_at, ?),
+            updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        status,
+        input.error === undefined ? null : serializeJson(input.error),
+        status === "archived" ? current.completedAt ?? at : at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration Goal",
+          current.id,
+          current.revision,
+          this.getCollaborationGoal(current.id).revision
+        );
+      }
+      return this.getCollaborationGoal(current.id);
+    });
+  }
+
+  reserveCollaborationWorker(
+    input: CreateCollaborationWorkerInput
+  ): CollaborationWorkerRecord {
+    return this.transaction(() => {
+      const replay = this.findCollaborationWorkerByCreateOperation(input.createOperationId);
+      if (replay !== undefined) {
+        assertSameCollaborationWorkerReservation(replay, input);
+        return replay;
+      }
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      assertCollaborationRevision("Collaboration Goal", goal.id, goal.revision, input.expectedGoalRevision);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal worker admission", goal.status, "active");
+      }
+      this.getOperation(input.createOperationId);
+      const backend = this.getBackend(input.backendId);
+      const target = this.getTarget(input.targetId);
+      if (target.descriptor.backendId !== backend.descriptor.id) {
+        throw new StoreError("A collaboration worker Target must belong to its selected Backend.");
+      }
+      if (input.parentWorkerId !== undefined) {
+        const parent = this.getCollaborationWorker(input.parentWorkerId);
+        if (parent.goalId !== goal.id || parent.status === "archived") {
+          throw new StoreError("A collaboration worker parent must be visible in the same Goal.");
+        }
+      }
+      if ((input.providerId === undefined) !== (input.modelId === undefined)) {
+        throw new StoreError("A collaboration worker route requires both provider and model IDs.");
+      }
+      const providerId = input.providerId === undefined
+        ? undefined
+        : collaborationRouteIdentity(input.providerId, "provider ID");
+      const modelId = input.modelId === undefined
+        ? undefined
+        : collaborationRouteIdentity(input.modelId, "model ID");
+      const effort = input.effort === undefined
+        ? undefined
+        : collaborationRouteIdentity(input.effort, "effort");
+      const permissionMode = collaborationPermissionMode(input.permissionMode);
+      const softLimit = collaborationLimit(input.softLimit, "worker soft limit", 128);
+      const hardLimit = collaborationLimit(input.hardLimit, "worker hard limit", 128);
+      if (softLimit > hardLimit) {
+        throw new StoreError("The collaboration worker soft limit cannot exceed the hard limit.");
+      }
+      const globalCapacity = this.database.prepare(`
+        SELECT COUNT(*) AS count FROM collaboration_workers
+        WHERE runtime_released = 0
+          AND status NOT IN ('archived', 'stopped')
+      `).get() as Row;
+      const activeRuntimeCount = numberValue(globalCapacity["count"]);
+      if (activeRuntimeCount >= hardLimit) {
+        throw new StoreError(`The collaboration worker hard limit of ${hardLimit} is reached.`);
+      }
+      if (goal.maximumWorkers !== undefined) {
+        const goalCount = this.database.prepare(`
+          SELECT COUNT(*) AS count FROM collaboration_workers
+          WHERE goal_id = ? AND status <> 'archived'
+        `).get(goal.id) as Row;
+        if (numberValue(goalCount["count"]) >= goal.maximumWorkers) {
+          throw new StoreError(`Collaboration Goal ${goal.id} reached its worker limit.`);
+        }
+      }
+      const id = collaborationIdentity(input.id ?? this.idFactory(), "worker ID");
+      const at = collaborationTimestamp(input.createdAt ?? this.now(), "worker creation time");
+      this.database.prepare(`
+        INSERT INTO collaboration_workers(
+          id, goal_id, parent_worker_id, session_id, backend_id, target_id,
+          provider_id, model_id, effort, fast_mode, permission_mode, plan_mode,
+          session_generation, backend_instance_generation, create_operation_id,
+          label, role, assignment, status, focused, runtime_released,
+          soft_limit_warning, idle_since, last_error_json, created_at,
+          updated_at, revision
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, 'provisioning',
+          0, 0, ?, NULL, NULL, ?, ?, ?)
+      `).run(
+        id,
+        goal.id,
+        input.parentWorkerId ?? null,
+        backend.descriptor.id,
+        target.descriptor.id,
+        providerId ?? null,
+        modelId ?? null,
+        effort ?? null,
+        boolInt(input.fastMode),
+        permissionMode,
+        boolInt(input.planMode),
+        input.createOperationId,
+        collaborationShortText(input.label, "worker label", 64),
+        collaborationShortText(input.role, "worker role", 128),
+        collaborationText(input.assignment, "worker assignment"),
+        boolInt(activeRuntimeCount + 1 >= softLimit),
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      this.database.prepare(`
+        UPDATE collaboration_goals
+        SET updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        goal.id,
+        asSqlInteger(goal.revision)
+      );
+      return this.getCollaborationWorker(id);
+    });
+  }
+
+  findCollaborationWorker(id: string): CollaborationWorkerRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_workers WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : collaborationWorkerFromRow(row);
+  }
+
+  getCollaborationWorker(id: string): CollaborationWorkerRecord {
+    const worker = this.findCollaborationWorker(id);
+    if (worker === undefined) throw new NotFoundError("Collaboration worker", id);
+    return worker;
+  }
+
+  findCollaborationWorkerBySession(sessionId: string): CollaborationWorkerRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_workers WHERE session_id = ?"
+    ).get(sessionId) as Row | undefined;
+    return row === undefined ? undefined : collaborationWorkerFromRow(row);
+  }
+
+  findCollaborationWorkerByCreateOperation(
+    operationId: string
+  ): CollaborationWorkerRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_workers WHERE create_operation_id = ?"
+    ).get(operationId) as Row | undefined;
+    return row === undefined ? undefined : collaborationWorkerFromRow(row);
+  }
+
+  listCollaborationWorkers(options: {
+    readonly goalId?: string;
+    readonly statuses?: readonly CollaborationWorkerStatus[];
+    readonly includeArchived?: boolean;
+  } = {}): CollaborationWorkerRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.goalId !== undefined) {
+      clauses.push("goal_id = ?");
+      params.push(options.goalId);
+    }
+    if (options.statuses !== undefined && options.statuses.length > 0) {
+      const statuses = [...new Set(options.statuses.map(collaborationWorkerStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    } else if (options.includeArchived !== true) {
+      clauses.push("status <> 'archived'");
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    return (this.database.prepare(`
+      SELECT * FROM collaboration_workers ${where}
+      ORDER BY created_at, id
+    `).all(...params) as Row[]).map(collaborationWorkerFromRow);
+  }
+
+  bindCollaborationWorkerSession(
+    input: BindCollaborationWorkerSessionInput
+  ): CollaborationWorkerRecord {
+    return this.write(() => {
+      const current = this.getCollaborationWorker(input.workerId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      assertCollaborationRevision("Collaboration worker", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "provisioning" && current.status !== "dispatch_unknown") {
+        throw new InvalidStateTransitionError("collaboration worker", current.status, "idle");
+      }
+      if (current.sessionId !== undefined && current.sessionId !== input.sessionId) {
+        throw new StoreError("A collaboration worker cannot be rebound to another Session.");
+      }
+      const session = this.getSession(input.sessionId);
+      assertActiveCollaborationSession(session, "worker");
+      if (this.listCollaborationGoals({ leadSessionId: session.descriptor.id }).length > 0) {
+        throw new StoreError("A collaboration lead Session cannot become a worker.");
+      }
+      const existingWorker = this.findCollaborationWorkerBySession(session.descriptor.id);
+      if (existingWorker !== undefined && existingWorker.id !== current.id) {
+        throw new StoreError("A collaboration Session can belong to only one worker.");
+      }
+      if (
+        session.descriptor.backendId !== current.backendId ||
+        session.descriptor.targetId !== current.targetId
+      ) {
+        throw new StoreError("The collaboration worker Session route does not match its reservation.");
+      }
+      if (
+        (current.providerId !== undefined && current.providerId !== session.descriptor.providerId) ||
+        (current.modelId !== undefined && current.modelId !== session.descriptor.modelId) ||
+        (current.effort !== undefined && current.effort !== session.descriptor.effort) ||
+        current.fastMode !== session.descriptor.fastMode ||
+        current.permissionMode !== session.descriptor.permissionMode ||
+        current.planMode !== session.descriptor.planMode
+      ) {
+        throw new StoreError("The collaboration worker Session settings do not match its reservation.");
+      }
+      if (session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(
+          input.expectedSessionGeneration,
+          session.descriptor.binding.generation
+        );
+      }
+      const backendGeneration = this.getBackend(current.backendId).descriptor.instanceGeneration;
+      if (backendGeneration !== input.expectedBackendInstanceGeneration) {
+        throw new StaleGenerationError(input.expectedBackendInstanceGeneration, backendGeneration);
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "worker bind time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET session_id = ?, provider_id = ?, model_id = ?, effort = ?,
+            session_generation = ?, backend_instance_generation = ?,
+            status = 'idle', runtime_released = 0, idle_since = ?,
+            last_error_json = NULL, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        session.descriptor.id,
+        session.descriptor.providerId ?? null,
+        session.descriptor.modelId ?? null,
+        session.descriptor.effort ?? null,
+        session.descriptor.binding.generation,
+        backendGeneration,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          current.id,
+          current.revision,
+          this.getCollaborationWorker(current.id).revision
+        );
+      }
+      return this.getCollaborationWorker(current.id);
+    });
+  }
+
+  updateCollaborationWorkerAssignment(
+    input: UpdateCollaborationWorkerAssignmentInput
+  ): CollaborationWorkerRecord {
+    return this.write(() => {
+      const current = this.getCollaborationWorker(input.workerId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal worker assignment", goal.status, "active");
+      }
+      assertCollaborationRevision("Collaboration worker", current.id, current.revision, input.expectedRevision);
+      if (!["provisioning", "idle", "queued"].includes(current.status)) {
+        throw new InvalidStateTransitionError("collaboration worker assignment", current.status, "editable");
+      }
+      if (input.label === undefined && input.role === undefined && input.assignment === undefined) {
+        return current;
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "worker assignment update time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET label = ?, role = ?, assignment = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        input.label === undefined ? current.label : collaborationShortText(input.label, "worker label", 64),
+        input.role === undefined ? current.role : collaborationShortText(input.role, "worker role", 128),
+        input.assignment === undefined
+          ? current.assignment
+          : collaborationText(input.assignment, "worker assignment"),
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          current.id,
+          current.revision,
+          this.getCollaborationWorker(current.id).revision
+        );
+      }
+      return this.getCollaborationWorker(current.id);
+    });
+  }
+
+  updateCollaborationWorkerState(
+    input: UpdateCollaborationWorkerStateInput
+  ): CollaborationWorkerRecord {
+    return this.write(() => {
+      const current = this.getCollaborationWorker(input.workerId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      if (input.callerLeadSessionId !== undefined) {
+        assertCollaborationLead(goal, input.callerLeadSessionId);
+      }
+      assertCollaborationRevision("Collaboration worker", current.id, current.revision, input.expectedRevision);
+      if (input.expectedSessionGeneration !== undefined) {
+        if (current.sessionGeneration === undefined) {
+          throw new StoreError("An unbound collaboration worker has no Session generation.");
+        }
+        if (current.sessionGeneration !== input.expectedSessionGeneration) {
+          throw new StaleGenerationError(input.expectedSessionGeneration, current.sessionGeneration);
+        }
+      }
+      if ((input.refreshedSessionGeneration === undefined) !==
+          (input.refreshedBackendInstanceGeneration === undefined)) {
+        throw new StoreError("A collaboration worker runtime refresh requires both Session and Backend generations.");
+      }
+      let sessionGeneration = current.sessionGeneration;
+      let backendInstanceGeneration = current.backendInstanceGeneration;
+      if (input.refreshedSessionGeneration !== undefined &&
+          input.refreshedBackendInstanceGeneration !== undefined) {
+        if (current.sessionId === undefined) {
+          throw new StoreError("An unbound collaboration worker cannot refresh its runtime generations.");
+        }
+        const session = this.getSession(current.sessionId);
+        const backend = this.getBackend(current.backendId);
+        if (session.descriptor.binding.generation !== input.refreshedSessionGeneration) {
+          throw new StaleGenerationError(
+            input.refreshedSessionGeneration,
+            session.descriptor.binding.generation
+          );
+        }
+        if (backend.descriptor.instanceGeneration !== input.refreshedBackendInstanceGeneration) {
+          throw new StaleGenerationError(
+            input.refreshedBackendInstanceGeneration,
+            backend.descriptor.instanceGeneration
+          );
+        }
+        sessionGeneration = input.refreshedSessionGeneration;
+        backendInstanceGeneration = input.refreshedBackendInstanceGeneration;
+      }
+      const status = input.status === undefined ? current.status : collaborationWorkerStatus(input.status);
+      if (status !== current.status && !COLLABORATION_WORKER_TRANSITIONS[current.status].has(status)) {
+        throw new InvalidStateTransitionError("collaboration worker", current.status, status);
+      }
+      const runtimeReleased = input.runtimeReleased ?? current.runtimeReleased;
+      if (runtimeReleased && !["idle", "completed", "failed", "stopped", "archived"].includes(status)) {
+        throw new StoreError("Only an idle or terminal collaboration worker can release its runtime.");
+      }
+      if (current.sessionId !== undefined && ["completed", "failed", "stopped", "archived"].includes(status)) {
+        const activeQueue = this.listQueueItems({
+          sessionId: current.sessionId,
+          states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"]
+        });
+        if (activeQueue.length > 0) {
+          throw new StoreError("A collaboration worker with active Queue items cannot become terminal.");
+        }
+      }
+      if (status === "archived") {
+        if (!runtimeReleased) throw new StoreError("A collaboration worker must release its runtime before archive.");
+      }
+      if (input.error !== undefined && input.error !== null && !["failed", "dispatch_unknown"].includes(status)) {
+        throw new StoreError("Only a failed or dispatch-unknown worker can retain an error.");
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "worker state update time"
+      ));
+      const idleSince = input.idleSince === undefined
+        ? (status === "idle" ? current.idleSince ?? at : null)
+        : (input.idleSince === null
+            ? null
+            : collaborationTimestamp(input.idleSince, "worker idle time"));
+      if (idleSince !== null && !["idle", "completed", "failed"].includes(status)) {
+        throw new StoreError("Only an idle or settled collaboration worker can retain an idle timestamp.");
+      }
+      const errorJson = input.error === undefined
+        ? (["failed", "dispatch_unknown"].includes(status) && current.lastError !== undefined
+            ? serializeJson(current.lastError)
+            : null)
+        : (input.error === null ? null : serializeJson(input.error));
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET status = ?, runtime_released = ?, session_generation = ?, backend_instance_generation = ?,
+            focused = CASE WHEN ? = 1 OR ? IN ('failed', 'stopped', 'archived') THEN 0 ELSE focused END,
+            idle_since = ?, last_error_json = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        status,
+        boolInt(runtimeReleased),
+        sessionGeneration ?? null,
+        backendInstanceGeneration ?? null,
+        boolInt(runtimeReleased),
+        status,
+        idleSince,
+        errorJson,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          current.id,
+          current.revision,
+          this.getCollaborationWorker(current.id).revision
+        );
+      }
+      return this.getCollaborationWorker(current.id);
+    });
+  }
+
+  focusCollaborationWorker(input: FocusCollaborationWorkerInput): CollaborationWorkerRecord | undefined {
+    return this.transaction(() => {
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal focus", goal.status, "active");
+      }
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "worker focus time");
+      let selected: CollaborationWorkerRecord | undefined;
+      if (input.workerId !== undefined) {
+        selected = this.getCollaborationWorker(input.workerId);
+        if (selected.goalId !== goal.id || selected.status === "archived") {
+          throw new StoreError("The focused collaboration worker must be visible in the selected Goal.");
+        }
+        if (input.expectedWorkerRevision === undefined) {
+          throw new StoreError("Focusing a collaboration worker requires its expected revision.");
+        }
+        assertCollaborationRevision(
+          "Collaboration worker",
+          selected.id,
+          selected.revision,
+          input.expectedWorkerRevision
+        );
+        if (selected.focused) return selected;
+      }
+      this.database.prepare(`
+        UPDATE collaboration_workers
+        SET focused = 0, updated_at = ?, revision = ?
+        WHERE goal_id = ? AND focused = 1 AND status <> 'archived'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), goal.id);
+      if (selected === undefined) return undefined;
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET focused = 1, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status <> 'archived'
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        selected.id,
+        asSqlInteger(selected.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          selected.id,
+          selected.revision,
+          this.getCollaborationWorker(selected.id).revision
+        );
+      }
+      return this.getCollaborationWorker(selected.id);
+    });
+  }
+
+  createCollaborationDispatch(
+    input: CreateCollaborationDispatchInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const replay = this.findCollaborationDispatchByOperation(input.operationId);
+      if (replay !== undefined) {
+        assertSameCollaborationDispatch(replay, input);
+        return replay;
+      }
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal dispatch", goal.status, "active");
+      }
+      const worker = this.getCollaborationWorker(input.workerId);
+      if (worker.goalId !== goal.id) {
+        throw new StoreError("A collaboration dispatch worker must belong to its Goal.");
+      }
+      assertCollaborationRevision(
+        "Collaboration worker",
+        worker.id,
+        worker.revision,
+        input.expectedWorkerRevision
+      );
+      if (worker.sessionId === undefined || worker.sessionGeneration === undefined ||
+          worker.backendInstanceGeneration === undefined) {
+        throw new StoreError("A collaboration dispatch requires a bound worker Session.");
+      }
+      if (worker.runtimeReleased) {
+        throw new StoreError("A released collaboration worker must be woken before dispatch.");
+      }
+      if (!["idle", "queued", "running", "completed"].includes(worker.status)) {
+        throw new InvalidStateTransitionError("collaboration worker dispatch", worker.status, "queued");
+      }
+      if (worker.sessionGeneration !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(input.expectedSessionGeneration, worker.sessionGeneration);
+      }
+      const session = this.getSession(worker.sessionId);
+      assertActiveCollaborationSession(session, "worker");
+      if (session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(
+          input.expectedSessionGeneration,
+          session.descriptor.binding.generation
+        );
+      }
+      const backendGeneration = this.getBackend(worker.backendId).descriptor.instanceGeneration;
+      if (backendGeneration !== worker.backendInstanceGeneration) {
+        throw new StaleGenerationError(worker.backendInstanceGeneration, backendGeneration);
+      }
+      this.getOperation(input.operationId);
+      const id = collaborationIdentity(input.id ?? this.idFactory(), "dispatch ID");
+      const at = collaborationTimestamp(input.createdAt ?? this.now(), "dispatch creation time");
+      this.database.prepare(`
+        INSERT INTO collaboration_dispatches(
+          id, goal_id, worker_id, caller_lead_session_id, operation_id,
+          queue_item_id, message, status, merged_into_dispatch_id,
+          created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'preparing', NULL, ?, ?, ?)
+      `).run(
+        id,
+        goal.id,
+        worker.id,
+        goal.leadSessionId,
+        input.operationId,
+        collaborationText(input.message, "dispatch message"),
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getCollaborationDispatch(id);
+    });
+  }
+
+  findCollaborationDispatch(id: string): CollaborationDispatchRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_dispatches WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : collaborationDispatchFromRow(row);
+  }
+
+  getCollaborationDispatch(id: string): CollaborationDispatchRecord {
+    const dispatch = this.findCollaborationDispatch(id);
+    if (dispatch === undefined) throw new NotFoundError("Collaboration dispatch", id);
+    return dispatch;
+  }
+
+  findCollaborationDispatchByOperation(
+    operationId: string
+  ): CollaborationDispatchRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_dispatches WHERE operation_id = ?"
+    ).get(operationId) as Row | undefined;
+    return row === undefined ? undefined : collaborationDispatchFromRow(row);
+  }
+
+  findCollaborationDispatchByQueueItem(
+    queueItemId: string
+  ): CollaborationDispatchRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_dispatches WHERE queue_item_id = ?"
+    ).get(queueItemId) as Row | undefined;
+    return row === undefined ? undefined : collaborationDispatchFromRow(row);
+  }
+
+  listCollaborationDispatches(options: {
+    readonly goalId?: string;
+    readonly workerId?: string;
+    readonly statuses?: readonly CollaborationDispatchStatus[];
+  } = {}): CollaborationDispatchRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.goalId !== undefined) {
+      clauses.push("goal_id = ?");
+      params.push(options.goalId);
+    }
+    if (options.workerId !== undefined) {
+      clauses.push("worker_id = ?");
+      params.push(options.workerId);
+    }
+    if (options.statuses !== undefined && options.statuses.length > 0) {
+      const statuses = [...new Set(options.statuses.map(collaborationDispatchStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    return (this.database.prepare(`
+      SELECT * FROM collaboration_dispatches ${where}
+      ORDER BY created_at, id
+    `).all(...params) as Row[]).map(collaborationDispatchFromRow);
+  }
+
+  bindCollaborationDispatchQueue(
+    input: BindCollaborationDispatchQueueInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedRevision
+      );
+      if (current.status !== "preparing" && current.status !== "dispatch_unknown") {
+        throw new InvalidStateTransitionError("collaboration dispatch", current.status, "queued");
+      }
+      const worker = this.getCollaborationWorker(current.workerId);
+      if (worker.sessionId === undefined) {
+        throw new StoreError("A collaboration dispatch worker is not bound to a Session.");
+      }
+      const queueItem = this.getQueueItem(input.queueItemId);
+      if (
+        queueItem.sessionId !== worker.sessionId ||
+        queueItem.operationId !== current.operationId ||
+        queueItem.state !== "accepted"
+      ) {
+        throw new StoreError("A collaboration dispatch must bind its own accepted worker Queue item.");
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "dispatch bind time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET queue_item_id = ?, status = 'queued', updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        queueItem.id,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration dispatch",
+          current.id,
+          current.revision,
+          this.getCollaborationDispatch(current.id).revision
+        );
+      }
+      if (worker.status === "idle" || worker.status === "completed") {
+        this.database.prepare(`
+          UPDATE collaboration_workers
+          SET status = 'queued', idle_since = NULL, updated_at = ?, revision = ?
+          WHERE id = ? AND revision = ?
+        `).run(
+          at,
+          asSqlInteger(this.requireActiveRevision()),
+          worker.id,
+          asSqlInteger(worker.revision)
+        );
+      }
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  markCollaborationDispatchUnknown(input: {
+    readonly dispatchId: string;
+    readonly expectedRevision: bigint;
+    readonly updatedAt?: number;
+  }): CollaborationDispatchRecord {
+    return this.write(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedRevision
+      );
+      if (current.status === "dispatch_unknown") return current;
+      if (current.status !== "preparing") {
+        throw new InvalidStateTransitionError(
+          "collaboration dispatch",
+          current.status,
+          "dispatch_unknown"
+        );
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "dispatch recovery time"
+      ));
+      this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET status = 'dispatch_unknown', updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  editCollaborationDispatch(
+    input: EditCollaborationDispatchInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationDispatchLead(this, current, input.callerLeadSessionId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal Queue edit", goal.status, "active");
+      }
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedDispatchRevision
+      );
+      if (current.status !== "queued" || current.queueItemId === undefined) {
+        throw new InvalidStateTransitionError("collaboration dispatch edit", current.status, "queued");
+      }
+      const message = collaborationText(input.message, "dispatch message");
+      const queueItem = this.getQueueItem(current.queueItemId);
+      assertCollaborationRevision(
+        "Queue item",
+        queueItem.id,
+        queueItem.revision,
+        input.expectedQueueRevision
+      );
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "dispatch edit time");
+      this.editQueueItem({
+        queueItemId: queueItem.id,
+        expectedRevision: queueItem.revision,
+        body: { ...queueItem.body, text: message },
+        traceId: input.traceId,
+        at
+      });
+      const result = this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET message = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        message,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration dispatch",
+          current.id,
+          current.revision,
+          this.getCollaborationDispatch(current.id).revision
+        );
+      }
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  cancelCollaborationDispatch(
+    input: CancelCollaborationDispatchInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationDispatchLead(this, current, input.callerLeadSessionId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal Queue cancel", goal.status, "active");
+      }
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedDispatchRevision
+      );
+      if (current.status === "cancelled") return current;
+      if (current.status !== "queued" || current.queueItemId === undefined) {
+        throw new InvalidStateTransitionError("collaboration dispatch cancel", current.status, "cancelled");
+      }
+      const queueItem = this.getQueueItem(current.queueItemId);
+      assertCollaborationRevision(
+        "Queue item",
+        queueItem.id,
+        queueItem.revision,
+        input.expectedQueueRevision
+      );
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "dispatch cancel time");
+      this.cancelQueueItem({
+        queueItemId: queueItem.id,
+        expectedRevision: queueItem.revision,
+        traceId: input.traceId,
+        at
+      });
+      this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET status = 'cancelled', updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      this.refreshCollaborationWorkerQueueState(current.workerId, at);
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  mergeCollaborationDispatches(
+    input: MergeCollaborationDispatchesInput
+  ): readonly CollaborationDispatchRecord[] {
+    return this.transaction(() => {
+      if (input.dispatches.length < 2) {
+        throw new StoreError("A collaboration Queue merge requires at least two dispatches.");
+      }
+      const ids = input.dispatches.map((item) => item.dispatchId);
+      if (new Set(ids).size !== ids.length) {
+        throw new StoreError("A collaboration Queue merge cannot contain duplicate dispatches.");
+      }
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal Queue merge", goal.status, "active");
+      }
+      const worker = this.getCollaborationWorker(input.workerId);
+      if (worker.goalId !== goal.id || worker.sessionId === undefined) {
+        throw new StoreError("A collaboration Queue merge worker must be bound to the selected Goal.");
+      }
+      const dispatches = input.dispatches.map((candidate) => {
+        const dispatch = this.getCollaborationDispatch(candidate.dispatchId);
+        if (
+          dispatch.goalId !== goal.id || dispatch.workerId !== worker.id ||
+          dispatch.callerLeadSessionId !== goal.leadSessionId ||
+          dispatch.status !== "queued" || dispatch.queueItemId === undefined
+        ) {
+          throw new StoreError("Only queued dispatches from one worker and lead can be merged.");
+        }
+        assertCollaborationRevision(
+          "Collaboration dispatch",
+          dispatch.id,
+          dispatch.revision,
+          candidate.expectedDispatchRevision
+        );
+        const queueItem = this.getQueueItem(dispatch.queueItemId);
+        assertCollaborationRevision(
+          "Queue item",
+          queueItem.id,
+          queueItem.revision,
+          candidate.expectedQueueRevision
+        );
+        if (queueItem.sessionId !== worker.sessionId || queueItem.state !== "accepted") {
+          throw new StoreError("Only accepted Queue items from the same worker can be merged.");
+        }
+        return { dispatch, queueItem };
+      });
+      const accepted = collectStorePages((offset, limit) => this.listQueueItems({
+        sessionId: worker.sessionId!,
+        states: ["accepted"],
+        offset,
+        limit
+      }));
+      const selectedIndexes = dispatches.map(({ queueItem }) =>
+        accepted.findIndex((candidate) => candidate.id === queueItem.id)
+      );
+      if (selectedIndexes.some((index) => index < 0)) {
+        throw new StoreError("A collaboration Queue merge selection is no longer pending.");
+      }
+      const firstIndex = selectedIndexes[0]!;
+      if (selectedIndexes.some((index, position) => index !== firstIndex + position)) {
+        throw new StoreError("A collaboration Queue merge must be one contiguous pending segment in Queue order.");
+      }
+      const mergedMessage = collaborationText(
+        dispatches.map(({ dispatch }) => dispatch.message).join("\n\n"),
+        "merged dispatch message"
+      );
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "dispatch merge time");
+      const survivor = dispatches[0]!;
+      this.editQueueItem({
+        queueItemId: survivor.queueItem.id,
+        expectedRevision: survivor.queueItem.revision,
+        body: { ...survivor.queueItem.body, text: mergedMessage },
+        traceId: `${input.traceId}:survivor`,
+        at
+      });
+      this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET message = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        mergedMessage,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        survivor.dispatch.id,
+        asSqlInteger(survivor.dispatch.revision)
+      );
+      for (const merged of dispatches.slice(1)) {
+        this.cancelQueueItem({
+          queueItemId: merged.queueItem.id,
+          expectedRevision: merged.queueItem.revision,
+          traceId: `${input.traceId}:merged:${merged.dispatch.id}`,
+          at
+        });
+        this.database.prepare(`
+          UPDATE collaboration_dispatches
+          SET status = 'merged', merged_into_dispatch_id = ?, updated_at = ?, revision = ?
+          WHERE id = ? AND revision = ?
+        `).run(
+          survivor.dispatch.id,
+          at,
+          asSqlInteger(this.requireActiveRevision()),
+          merged.dispatch.id,
+          asSqlInteger(merged.dispatch.revision)
+        );
+      }
+      return ids.map((id) => this.getCollaborationDispatch(id));
+    });
+  }
+
+  private refreshCollaborationWorkerQueueState(workerId: string, at: number): void {
+    const worker = this.getCollaborationWorker(workerId);
+    if (worker.sessionId === undefined || worker.status !== "queued") return;
+    const active = this.listQueueItems({
+      sessionId: worker.sessionId,
+      states: ["accepted", "dispatching"]
+    });
+    if (active.length > 0) return;
+    this.database.prepare(`
+      UPDATE collaboration_workers
+      SET status = 'idle', idle_since = ?, updated_at = ?, revision = ?
+      WHERE id = ? AND revision = ? AND status = 'queued'
+    `).run(
+      at,
+      at,
+      asSqlInteger(this.requireActiveRevision()),
+      worker.id,
+      asSqlInteger(worker.revision)
+    );
+  }
+
+  createMessagingConnection(input: CreateMessagingConnectionInput): MessagingConnectionRecord {
+    return this.write(() => {
+      const id = messagingIdentity(input.id ?? this.idFactory(), "connection ID");
+      const channel = messagingChannel(input.channel);
+      const configurationJson = messagingConfigurationJson(input.configuration);
+      const ownerId = input.ownerProviderUserId === undefined
+        ? null
+        : messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
+      const at = messagingTimestamp(input.createdAt ?? this.now(), "connection creation time");
+      this.database.prepare(`
+        INSERT INTO messaging_channels(
+          id, channel, generation, enabled, runtime_status,
+          credential_reference_id, credential_generation, owner_provider_user_id,
+          provider_account_id, provider_username, configuration_json, cursor,
+          error_code, error_summary, last_connected_at, created_at, updated_at, revision
+        ) VALUES (?, ?, 1, 0, 'idle', NULL, NULL, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?, ?)
+      `).run(
+        id,
+        channel,
+        ownerId,
+        configurationJson,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getMessagingConnection(id);
+    });
+  }
+
+  findMessagingConnection(id: string): MessagingConnectionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_channels WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingConnectionFromRow(row);
+  }
+
+  getMessagingConnection(id: string): MessagingConnectionRecord {
+    const connection = this.findMessagingConnection(id);
+    if (connection === undefined) throw new NotFoundError("Messaging connection", id);
+    return connection;
+  }
+
+  listMessagingConnections(): MessagingConnectionRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM messaging_channels ORDER BY created_at, id
+    `).all() as Row[]).map(messagingConnectionFromRow);
+  }
+
+  replaceMessagingCredential(input: ReplaceMessagingCredentialInput): MessagingConnectionRecord {
+    return this.transaction(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      const referenceId = messagingIdentity(input.credentialReferenceId, "credential reference", 512);
+      const credentialGeneration = messagingCredentialGeneration(
+        input.credentialGeneration,
+      );
+      const ownerId = input.ownerProviderUserId === undefined
+        ? current.ownerProviderUserId ?? null
+        : messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "credential replacement time"
+      ));
+      const nextGeneration = current.generation + 1;
+      if (!Number.isSafeInteger(nextGeneration)) throw new StoreError("Messaging generation is exhausted.");
+      this.retireMessagingGeneration(current.id, current.generation, at);
+      this.retireMessagingConversationContextsForConnection(current.id);
+      this.retireMessagingConversationsForConnection(current.id, at);
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET generation = ?, enabled = ?, runtime_status = ?,
+            credential_reference_id = ?, credential_generation = ?, owner_provider_user_id = ?,
+            provider_account_id = NULL, provider_username = NULL, cursor = NULL,
+            error_code = NULL, error_summary = NULL, last_connected_at = NULL,
+            updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ?
+      `).run(
+        nextGeneration,
+        input.enable ? 1 : 0,
+        input.enable ? "connecting" : "offline",
+        referenceId,
+        credentialGeneration,
+        ownerId,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  clearMessagingCredential(input: {
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly clearOwner?: boolean;
+    readonly updatedAt?: number;
+  }): MessagingConnectionRecord {
+    return this.transaction(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "credential clear time"
+      ));
+      const nextGeneration = current.generation + 1;
+      this.retireMessagingGeneration(current.id, current.generation, at);
+      this.retireMessagingConversationContextsForConnection(current.id);
+      this.retireMessagingConversationsForConnection(current.id, at);
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET generation = ?, enabled = 0, runtime_status = 'idle',
+            credential_reference_id = NULL, credential_generation = NULL,
+            owner_provider_user_id = ?,
+            provider_account_id = NULL, provider_username = NULL,
+            cursor = NULL, error_code = NULL, error_summary = NULL, last_connected_at = NULL,
+            updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ?
+      `).run(
+        nextGeneration,
+        input.clearOwner === true ? null : current.ownerProviderUserId ?? null,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  setMessagingConnectionEnabled(input: SetMessagingConnectionEnabledInput): MessagingConnectionRecord {
+    return this.transaction(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      if (current.credentialReferenceId === undefined || current.credentialGeneration === undefined) {
+        throw new StoreError("A Messaging connection requires a managed credential before it can change availability.");
+      }
+      if (current.enabled === input.enabled && (
+        (input.enabled && (current.runtimeStatus === "connecting" || current.runtimeStatus === "connected")) ||
+        (!input.enabled && current.runtimeStatus === "offline")
+      )) return current;
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "connection availability time"
+      ));
+      const nextGeneration = current.generation + 1;
+      this.retireMessagingGeneration(current.id, current.generation, at);
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET generation = ?, enabled = ?, runtime_status = ?, error_code = NULL, error_summary = NULL,
+            updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ?
+      `).run(
+        nextGeneration,
+        input.enabled ? 1 : 0,
+        input.enabled ? "connecting" : "offline",
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
+      this.database.prepare(`
+        UPDATE messaging_conversations
+        SET channel_generation = ?, updated_at = ?, revision = ?
+        WHERE connection_id = ? AND channel_generation = ? AND status <> 'retired'
+      `).run(
+        nextGeneration,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        current.generation
+      );
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  replaceMessagingConfiguration(input: {
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly configuration: unknown;
+    readonly ownerProviderUserId?: string | null;
+    readonly updatedAt?: number;
+  }): MessagingConnectionRecord {
+    return this.transaction(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      const configurationJson = messagingConfigurationJson(input.configuration);
+      const owner = input.ownerProviderUserId === undefined
+        ? current.ownerProviderUserId ?? null
+        : input.ownerProviderUserId === null
+          ? null
+          : messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "connection configuration time"
+      ));
+      const nextGeneration = current.generation + 1;
+      this.retireMessagingGeneration(current.id, current.generation, at);
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET generation = ?, configuration_json = ?, owner_provider_user_id = ?,
+            runtime_status = CASE WHEN enabled = 1 THEN 'connecting' ELSE runtime_status END,
+            error_code = NULL, error_summary = NULL, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ?
+      `).run(
+        nextGeneration,
+        configurationJson,
+        owner,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
+      this.database.prepare(`
+        UPDATE messaging_conversations
+        SET channel_generation = ?, updated_at = ?, revision = ?
+        WHERE connection_id = ? AND channel_generation = ? AND status <> 'retired'
+      `).run(
+        nextGeneration,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        current.generation
+      );
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  claimMessagingConnectionOwner(input: ClaimMessagingConnectionOwnerInput): MessagingConnectionRecord {
+    return this.write(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      const owner = messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
+      if (current.ownerProviderUserId === owner) return current;
+      if (current.ownerProviderUserId !== undefined) {
+        throw new StoreError("Messaging connection ownership has already been claimed.");
+      }
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "connection ownership claim time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET owner_provider_user_id = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ? AND owner_provider_user_id IS NULL
+      `).run(
+        owner,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  updateMessagingConnectionRuntime(
+    input: UpdateMessagingConnectionRuntimeInput
+  ): MessagingConnectionRecord {
+    return this.write(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      if (!current.enabled || current.credentialReferenceId === undefined) {
+        throw new InvalidStateTransitionError(
+          "Messaging connection runtime",
+          current.runtimeStatus,
+          input.runtimeStatus
+        );
+      }
+      const status = messagingRuntimeStatus(input.runtimeStatus);
+      const needsError = status === "offline" || status === "conflict" || status === "auth_loss" || status === "error";
+      if (needsError !== (input.error !== null && input.error !== undefined)) {
+        throw new StoreError("Messaging failure states require one bounded error and healthy states forbid it.");
+      }
+      const cursor = input.cursor === undefined
+        ? current.cursor ?? null
+        : input.cursor === null ? null : messagingCursor(input.cursor);
+      const accountId = input.providerAccountId === undefined
+        ? current.providerAccountId ?? null
+        : input.providerAccountId === null ? null : messagingIdentity(input.providerAccountId, "provider account ID", 512);
+      const username = input.providerUsername === undefined
+        ? current.providerUsername ?? null
+        : input.providerUsername === null ? null : messagingIdentity(input.providerUsername, "provider username", 512);
+      if (status === "connected" && accountId === null) {
+        throw new StoreError("A connected Messaging runtime requires its provider account identity.");
+      }
+      const errorCode = input.error === null || input.error === undefined
+        ? null
+        : messagingErrorCode(input.error.code);
+      const errorSummary = input.error === null || input.error === undefined
+        ? null
+        : messagingSafeText(input.error.summary, "runtime error summary", 512, false);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "runtime update time"
+      ));
+      const connectedAt = status === "connected"
+        ? messagingTimestamp(input.connectedAt ?? current.lastConnectedAt ?? at, "connected time")
+        : current.lastConnectedAt ?? null;
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET runtime_status = ?, cursor = ?, provider_account_id = ?, provider_username = ?,
+            error_code = ?, error_summary = ?, last_connected_at = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ?
+      `).run(
+        status,
+        cursor,
+        accountId,
+        username,
+        errorCode,
+        errorSummary,
+        connectedAt,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  putMessagingRoute(input: PutMessagingRouteInput): MessagingRouteRecord {
+    return this.write(() => {
+      const connectionId = input.connectionId === undefined
+        ? undefined
+        : messagingIdentity(input.connectionId, "connection ID");
+      if (connectionId !== undefined) this.getMessagingConnection(connectionId);
+      const scopeKey = connectionId === undefined ? "global" : `connection:${connectionId}`;
+      const existing = this.findMessagingRoute(scopeKey);
+      if (existing === undefined && input.expectedRevision !== undefined) {
+        throw new RevisionConflictError("Messaging route", scopeKey, input.expectedRevision, 0n);
+      }
+      if (existing !== undefined) {
+        if (input.expectedRevision === undefined) {
+          throw new StoreError("Updating a Messaging route requires its expected revision.");
+        }
+        assertMessagingRevision("Messaging route", scopeKey, existing.revision, input.expectedRevision);
+      }
+      const target = this.getTarget(input.targetId);
+      const route = normalizeMessagingRoute(input);
+      const at = Math.max(existing?.createdAt ?? 0, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "route update time"
+      ));
+      if (existing === undefined) {
+        this.database.prepare(`
+          INSERT INTO messaging_routes(
+            scope_key, connection_id, target_id, backend_id, provider_id, model_id, effort,
+            fast_mode, permission_mode, plan_mode, created_at, updated_at, revision
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          scopeKey,
+          connectionId ?? null,
+          target.descriptor.id,
+          target.descriptor.backendId,
+          route.providerId ?? null,
+          route.modelId ?? null,
+          route.effort ?? null,
+          route.fastMode ? 1 : 0,
+          route.permissionMode,
+          route.planMode ? 1 : 0,
+          at,
+          at,
+          asSqlInteger(this.requireActiveRevision())
+        );
+      } else {
+        const result = this.database.prepare(`
+          UPDATE messaging_routes
+          SET target_id = ?, backend_id = ?, provider_id = ?, model_id = ?, effort = ?,
+              fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
+          WHERE scope_key = ? AND revision = ?
+        `).run(
+          target.descriptor.id,
+          target.descriptor.backendId,
+          route.providerId ?? null,
+          route.modelId ?? null,
+          route.effort ?? null,
+          route.fastMode ? 1 : 0,
+          route.permissionMode,
+          route.planMode ? 1 : 0,
+          at,
+          asSqlInteger(this.requireActiveRevision()),
+          scopeKey,
+          asSqlInteger(existing.revision)
+        );
+        if (result.changes !== 1) {
+          throw new RevisionConflictError(
+            "Messaging route",
+            scopeKey,
+            existing.revision,
+            this.getMessagingRoute(scopeKey).revision
+          );
+        }
+      }
+      return this.getMessagingRoute(scopeKey);
+    });
+  }
+
+  findMessagingRoute(scopeKey: string): MessagingRouteRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_routes WHERE scope_key = ?"
+    ).get(scopeKey) as Row | undefined;
+    return row === undefined ? undefined : messagingRouteFromRow(row);
+  }
+
+  getMessagingRoute(scopeKey: string): MessagingRouteRecord {
+    const route = this.findMessagingRoute(scopeKey);
+    if (route === undefined) throw new NotFoundError("Messaging route", scopeKey);
+    return route;
+  }
+
+  resolveMessagingRoute(connectionId: string): MessagingRouteRecord {
+    this.getMessagingConnection(connectionId);
+    const scoped = this.findMessagingRoute(`connection:${connectionId}`);
+    if (scoped !== undefined) return scoped;
+    const global = this.findMessagingRoute("global");
+    if (global === undefined) throw new StoreError("A Messaging route has not been configured.");
+    return global;
+  }
+
+  ensureMessagingConversation(
+    input: EnsureMessagingConversationInput
+  ): MessagingConversationRecord {
+    return this.write(() => {
+      const connection = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      const providerConversationId = messagingIdentity(
+        input.providerConversationId,
+        "provider conversation ID",
+        512
+      );
+      const providerThreadId = input.providerThreadId === undefined || input.providerThreadId === ""
+        ? ""
+        : messagingIdentity(input.providerThreadId, "provider thread ID", 512);
+      const existing = this.findMessagingConversationByAddress({
+        connectionId: connection.id,
+        channelGeneration: connection.generation,
+        providerConversationId,
+        providerThreadId
+      });
+      const kind = messagingConversationKind(input.conversationKind);
+      if (existing !== undefined) {
+        if (existing.conversationKind !== kind || existing.status === "retired") {
+          throw new StoreError("Messaging conversation address is already bound with incompatible state.");
+        }
+        return existing;
+      }
+      const id = messagingIdentity(input.id ?? this.idFactory(), "conversation ID");
+      const at = messagingTimestamp(input.observedAt ?? this.now(), "conversation observation time");
+      this.database.prepare(`
+        INSERT INTO messaging_conversations(
+          id, connection_id, channel_generation, provider_conversation_id, provider_thread_id,
+          conversation_kind, status, session_id, session_generation, route_scope_key,
+          target_id, backend_id, provider_id, model_id, effort, fast_mode, permission_mode, plan_mode,
+          created_at, updated_at, retired_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, 'observed', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                  NULL, NULL, NULL, ?, ?, NULL, ?)
+      `).run(
+        id,
+        connection.id,
+        connection.generation,
+        providerConversationId,
+        providerThreadId,
+        kind,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getMessagingConversation(id);
+    });
+  }
+
+  findMessagingConversation(id: string): MessagingConversationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_conversations WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingConversationFromRow(row);
+  }
+
+  getMessagingConversation(id: string): MessagingConversationRecord {
+    const conversation = this.findMessagingConversation(id);
+    if (conversation === undefined) throw new NotFoundError("Messaging conversation", id);
+    return conversation;
+  }
+
+  findMessagingConversationByAddress(input: {
+    readonly connectionId: string;
+    readonly channelGeneration: number;
+    readonly providerConversationId: string;
+    readonly providerThreadId?: string;
+  }): MessagingConversationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM messaging_conversations
+      WHERE connection_id = ? AND channel_generation = ?
+        AND provider_conversation_id = ? AND provider_thread_id = ?
+    `).get(
+      input.connectionId,
+      input.channelGeneration,
+      input.providerConversationId,
+      input.providerThreadId ?? ""
+    ) as Row | undefined;
+    return row === undefined ? undefined : messagingConversationFromRow(row);
+  }
+
+  findMessagingConversationBySessionId(sessionId: string): MessagingConversationRecord | undefined {
+    this.assertOpen();
+    const id = boundedPrivateIdentity(sessionId, "Messaging Session ID");
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_conversations WHERE session_id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingConversationFromRow(row);
+  }
+
+  listMessagingConversations(input: {
+    readonly connectionId?: string;
+    readonly statuses?: readonly MessagingConversationRecord["status"][];
+  } = {}): MessagingConversationRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.connectionId !== undefined) {
+      clauses.push("connection_id = ?");
+      params.push(input.connectionId);
+    }
+    if (input.statuses !== undefined && input.statuses.length > 0) {
+      const statuses = [...new Set(input.statuses.map(messagingConversationStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    return (this.database.prepare(`
+      SELECT * FROM messaging_conversations
+      ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
+      ORDER BY updated_at DESC, id
+    `).all(...params) as Row[]).map(messagingConversationFromRow);
+  }
+
+  bindMessagingConversation(input: BindMessagingConversationInput): MessagingConversationRecord {
+    return this.write(() => {
+      const current = this.getMessagingConversation(input.conversationId);
+      assertMessagingRevision("Messaging conversation", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "observed") {
+        throw new InvalidStateTransitionError("Messaging conversation", current.status, "active");
+      }
+      const connection = this.getMessagingConnection(current.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (current.channelGeneration !== connection.generation) {
+        throw new StaleGenerationError(current.channelGeneration, connection.generation);
+      }
+      const route = this.getMessagingRoute(input.routeScopeKey);
+      if (route.connectionId !== undefined && route.connectionId !== current.connectionId) {
+        throw new StoreError("Messaging route belongs to another connection.");
+      }
+      const session = this.getSession(input.sessionId);
+      if (session.descriptor.archived || session.descriptor.deletedAt !== undefined) {
+        throw new StoreError("Messaging cannot bind an inactive Session.");
+      }
+      if (session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(input.expectedSessionGeneration, session.descriptor.binding.generation);
+      }
+      const expectedPermissionMode = input.expectedPermissionMode ?? route.permissionMode;
+      if (
+        expectedPermissionMode !== "ask" &&
+        expectedPermissionMode !== "auto" &&
+        expectedPermissionMode !== "bypassPermissions"
+      ) {
+        throw new StoreError("Messaging Session expected permission mode is invalid.");
+      }
+      assertMessagingSessionMatchesRoute(session, route, expectedPermissionMode);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "conversation bind time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_conversations
+        SET status = 'active', session_id = ?, session_generation = ?, route_scope_key = ?,
+            target_id = ?, backend_id = ?, provider_id = ?, model_id = ?, effort = ?,
+            fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'observed'
+      `).run(
+        session.descriptor.id,
+        session.descriptor.binding.generation,
+        route.scopeKey,
+        session.descriptor.targetId,
+        session.descriptor.backendId,
+        session.descriptor.providerId ?? null,
+        session.descriptor.modelId ?? null,
+        session.descriptor.effort ?? null,
+        session.descriptor.fastMode ? 1 : 0,
+        session.descriptor.permissionMode,
+        session.descriptor.planMode ? 1 : 0,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Messaging conversation",
+          current.id,
+          current.revision,
+          this.getMessagingConversation(current.id).revision
+        );
+      }
+      return this.getMessagingConversation(current.id);
+    });
+  }
+
+  /** Starts a fresh visible task for one direct peer without erasing the prior task history. */
+  rebindMessagingConversationSession(input: {
+    readonly conversationId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedChannelGeneration: number;
+    readonly expectedSessionId: string;
+    readonly sessionId: string;
+    readonly expectedSessionGeneration: number;
+    readonly routeScopeKey: string;
+    readonly expectedPermissionMode?: "ask" | "auto" | "bypassPermissions";
+    readonly updatedAt?: number;
+  }): MessagingConversationRecord {
+    return this.write(() => {
+      const current = this.getMessagingConversation(input.conversationId);
+      assertMessagingRevision("Messaging conversation", current.id, current.revision, input.expectedRevision);
+      const connection = this.getMessagingConnection(current.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (current.status !== "active" || current.conversationKind !== "direct"
+        || current.channelGeneration !== connection.generation
+        || current.sessionId !== input.expectedSessionId || current.sessionId === input.sessionId) {
+        throw new StoreError("Messaging direct conversation cannot switch a stale task binding.");
+      }
+      if (this.listRuns({ sessionId: current.sessionId, activeOnly: true, limit: 1 }).length > 0
+        || this.listQueueItems({
+          sessionId: current.sessionId,
+          states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"],
+          limit: 1
+        }).length > 0
+        || this.listInteractions({ sessionId: current.sessionId, status: "open", limit: 1 }).length > 0) {
+        throw new StoreError("Messaging cannot start a new conversation while the prior task is active.");
+      }
+      const route = this.getMessagingRoute(input.routeScopeKey);
+      if (route.connectionId !== undefined && route.connectionId !== current.connectionId) {
+        throw new StoreError("Messaging route belongs to another connection.");
+      }
+      const session = this.getSession(input.sessionId);
+      if (session.descriptor.archived || session.descriptor.deletedAt !== undefined
+        || session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StoreError("Messaging replacement task is stale or inactive.");
+      }
+      const permissionMode = input.expectedPermissionMode ?? route.permissionMode;
+      assertMessagingSessionMatchesRoute(session, route, permissionMode);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(), "conversation new task time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_conversations
+        SET session_id = ?, session_generation = ?, route_scope_key = ?,
+            target_id = ?, backend_id = ?, provider_id = ?, model_id = ?, effort = ?,
+            fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'active' AND session_id = ?
+      `).run(
+        session.descriptor.id,
+        session.descriptor.binding.generation,
+        route.scopeKey,
+        session.descriptor.targetId,
+        session.descriptor.backendId,
+        session.descriptor.providerId ?? null,
+        session.descriptor.modelId ?? null,
+        session.descriptor.effort ?? null,
+        session.descriptor.fastMode ? 1 : 0,
+        permissionMode,
+        session.descriptor.planMode ? 1 : 0,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        input.expectedSessionId
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Messaging conversation",
+          current.id,
+          current.revision,
+          this.getMessagingConversation(current.id).revision
+        );
+      }
+      return this.getMessagingConversation(current.id);
+    });
+  }
+
+  retireMessagingConversation(input: {
+    readonly conversationId: string;
+    readonly expectedRevision: bigint;
+    readonly retiredAt?: number;
+  }): MessagingConversationRecord {
+    return this.write(() => {
+      const current = this.getMessagingConversation(input.conversationId);
+      assertMessagingRevision("Messaging conversation", current.id, current.revision, input.expectedRevision);
+      if (current.status === "retired") return current;
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.retiredAt ?? this.now(),
+        "conversation retirement time"
+      ));
+      this.database.prepare(
+        "DELETE FROM messaging_conversation_context_sources WHERE conversation_id = ?"
+      ).run(current.id);
+      this.database.prepare(
+        "DELETE FROM messaging_conversation_contexts WHERE conversation_id = ?"
+      ).run(current.id);
+      this.database.prepare(`
+        UPDATE messaging_conversations
+        SET status = 'retired', retired_at = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return this.getMessagingConversation(current.id);
+    });
+  }
+
+  findMessagingConversationContext(
+    conversationId: string
+  ): MessagingConversationContextRecord | undefined {
+    this.assertOpen();
+    const id = messagingIdentity(conversationId, "conversation ID");
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_conversation_contexts WHERE conversation_id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingConversationContextFromRow(row);
+  }
+
+  getMessagingConversationContext(conversationId: string): MessagingConversationContextRecord {
+    const context = this.findMessagingConversationContext(conversationId);
+    if (context === undefined) {
+      throw new NotFoundError("Messaging conversation context", conversationId);
+    }
+    return context;
+  }
+
+  /** Persists only a vault-sealed latest provider context. Callers may compose
+   * this write with inbound request/Interaction creation and the final cursor
+   * CAS through `transaction`; otherwise they must commit this context before
+   * advancing the cursor or scheduling any outbound delivery drain. */
+  putMessagingConversationContext(
+    input: PutMessagingConversationContextInput
+  ): MessagingConversationContextRecord {
+    return this.write(() => {
+      const connection = this.getMessagingConnection(
+        messagingIdentity(input.connectionId, "connection ID")
+      );
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (!connection.enabled || connection.credentialGeneration === undefined) {
+        throw new StoreError("A Messaging conversation context requires an enabled managed credential.");
+      }
+      const materialGeneration = messagingCredentialGeneration(input.expectedMaterialGeneration);
+      if (connection.credentialGeneration !== materialGeneration) {
+        throw new StoreError("Messaging conversation context credential material is stale.");
+      }
+      const conversation = this.getMessagingConversation(
+        messagingIdentity(input.conversationId, "conversation ID")
+      );
+      if (
+        conversation.connectionId !== connection.id ||
+        conversation.channelGeneration !== connection.generation ||
+        conversation.status === "retired"
+      ) {
+        throw new StoreError("Messaging conversation context authority is stale.");
+      }
+
+      const hasRequest = input.sourceRequestId !== undefined;
+      const hasInteraction = input.sourceInteractionId !== undefined;
+      if (hasRequest === hasInteraction) {
+        throw new StoreError("Messaging conversation context requires exactly one durable source.");
+      }
+      const sourceKind = hasRequest ? "request" : "interaction";
+      const sourceId = messagingIdentity(
+        hasRequest ? input.sourceRequestId! : input.sourceInteractionId!,
+        `context source ${sourceKind} ID`
+      );
+      if (sourceKind === "request") {
+        const request = this.getMessagingInboundRequest(sourceId);
+        if (
+          request.connectionId !== connection.id ||
+          request.channelGeneration !== connection.generation ||
+          request.conversationId !== conversation.id
+        ) {
+          throw new StoreError("Messaging conversation context request authority is stale.");
+        }
+      } else {
+        const interaction = this.getMessagingInteraction(sourceId);
+        if (
+          interaction.connectionId !== connection.id ||
+          interaction.channelGeneration !== connection.generation ||
+          interaction.conversationId !== conversation.id
+        ) {
+          throw new StoreError("Messaging conversation context Interaction authority is stale.");
+        }
+      }
+
+      const sealed = messagingSealedConversationContext(input.sealed);
+      const priorSource = this.database.prepare(`
+        SELECT * FROM messaging_conversation_context_sources
+        WHERE source_kind = ? AND source_id = ?
+      `).get(sourceKind, sourceId) as Row | undefined;
+      if (priorSource !== undefined) {
+        if (
+          stringValue(priorSource["connection_id"]) !== connection.id ||
+          stringValue(priorSource["material_generation"]) !== materialGeneration ||
+          stringValue(priorSource["conversation_id"]) !== conversation.id
+        ) {
+          throw new StoreError("Messaging conversation context source identity conflicts with durable history.");
+        }
+        const current = this.findMessagingConversationContext(conversation.id);
+        if (current === undefined) {
+          throw new StoreError("Messaging conversation context source has no current sealed authority.");
+        }
+        return current;
+      }
+
+      const current = this.findMessagingConversationContext(conversation.id);
+      const at = Math.max(current?.createdAt ?? 0, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "conversation context update time"
+      ));
+      const revision = asSqlInteger(this.requireActiveRevision());
+      if (current === undefined) {
+        if (input.expectedRevision !== null) {
+          throw new StoreError("Messaging conversation context expected an existing revision.");
+        }
+        this.database.prepare(`
+          INSERT INTO messaging_conversation_contexts(
+            conversation_id, connection_id, material_generation, source_kind, source_id,
+            algorithm, nonce, ciphertext, tag, created_at, updated_at, revision
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          conversation.id,
+          connection.id,
+          materialGeneration,
+          sourceKind,
+          sourceId,
+          sealed.algorithm,
+          sealed.nonce,
+          sealed.ciphertext,
+          sealed.tag,
+          at,
+          at,
+          revision
+        );
+      } else {
+        if (input.expectedRevision === null) {
+          throw new StoreError("Messaging conversation context already exists.");
+        }
+        assertMessagingRevision(
+          "Messaging conversation context",
+          conversation.id,
+          current.revision,
+          input.expectedRevision
+        );
+        const result = this.database.prepare(`
+          UPDATE messaging_conversation_contexts
+          SET material_generation = ?, source_kind = ?, source_id = ?,
+              algorithm = ?, nonce = ?, ciphertext = ?, tag = ?, updated_at = ?, revision = ?
+          WHERE conversation_id = ? AND revision = ?
+        `).run(
+          materialGeneration,
+          sourceKind,
+          sourceId,
+          sealed.algorithm,
+          sealed.nonce,
+          sealed.ciphertext,
+          sealed.tag,
+          at,
+          revision,
+          conversation.id,
+          asSqlInteger(current.revision)
+        );
+        if (result.changes !== 1) {
+          throw new RevisionConflictError(
+            "Messaging conversation context",
+            conversation.id,
+            current.revision,
+            this.getMessagingConversationContext(conversation.id).revision
+          );
+        }
+      }
+      this.database.prepare(`
+        INSERT INTO messaging_conversation_context_sources(
+          source_kind, source_id, connection_id, material_generation,
+          conversation_id, created_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        sourceKind,
+        sourceId,
+        connection.id,
+        materialGeneration,
+        conversation.id,
+        at,
+        revision
+      );
+      return this.getMessagingConversationContext(conversation.id);
+    });
+  }
+
+  private retireMessagingConversationsForConnection(connectionId: string, at: number): void {
+    this.database.prepare(`
+      UPDATE messaging_conversations
+      SET status = 'retired', retired_at = ?, updated_at = ?, revision = ?
+      WHERE connection_id = ? AND status <> 'retired'
+    `).run(at, at, asSqlInteger(this.requireActiveRevision()), connectionId);
+  }
+
+  private retireMessagingConversationContextsForConnection(connectionId: string): void {
+    this.database.prepare(
+      "DELETE FROM messaging_conversation_context_sources WHERE connection_id = ?"
+    ).run(connectionId);
+    this.database.prepare(
+      "DELETE FROM messaging_conversation_contexts WHERE connection_id = ?"
+    ).run(connectionId);
+  }
+
+  /** A user-owned generation change retires late callbacks and queued external
+   * effects from the exact old transport. Dispatching effects remain unknown. */
+  private retireMessagingGeneration(connectionId: string, generation: number, at: number): void {
+    const revision = asSqlInteger(this.requireActiveRevision());
+    this.database.prepare(`
+      UPDATE messaging_inbound_requests
+      SET status = 'cancelled', error_code = NULL, updated_at = ?, revision = ?
+      WHERE connection_id = ? AND channel_generation = ? AND status IN ('preparing', 'queued')
+    `).run(at, revision, connectionId, generation);
+    this.database.prepare(`
+      UPDATE messaging_deliveries
+      SET status = 'cancelled', claim_token = NULL, claimed_at = NULL,
+          error_code = NULL, updated_at = ?, revision = ?
+      WHERE connection_id = ? AND channel_generation = ? AND status IN ('pending', 'failed')
+    `).run(at, revision, connectionId, generation);
+    this.database.prepare(`
+      UPDATE messaging_deliveries
+      SET status = 'unknown', claim_token = NULL, claimed_at = NULL,
+          error_code = 'generation_changed', updated_at = ?, revision = ?
+      WHERE connection_id = ? AND channel_generation = ? AND status = 'dispatching'
+    `).run(at, revision, connectionId, generation);
+    this.database.prepare(`
+      UPDATE messaging_interactions
+      SET status = 'expired', claim_token = NULL, claimed_at = NULL,
+          outcome_code = 'generation_changed', updated_at = ?, revision = ?
+      WHERE connection_id = ? AND channel_generation = ? AND status = 'pending'
+    `).run(at, revision, connectionId, generation);
+    this.database.prepare(`
+      UPDATE messaging_interactions
+      SET status = 'unknown', claim_token = NULL, claimed_at = NULL,
+          outcome_code = 'generation_changed', updated_at = ?, revision = ?
+      WHERE connection_id = ? AND channel_generation = ? AND status = 'claimed'
+    `).run(at, revision, connectionId, generation);
+  }
+
+  createMessagingInboundRequest(
+    input: CreateMessagingInboundRequestInput
+  ): MessagingInboundRequestCreation {
+    return this.transaction(() => {
+      const connection = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (!connection.enabled || connection.credentialReferenceId === undefined) {
+        throw new StoreError("A disabled Messaging connection cannot admit inbound work.");
+      }
+      const requestIds = normalizeMessagingRequestIds(input.providerRequestIds);
+      const bodyHash = messagingHash(input.bodyHash, "inbound body hash");
+      const placeholders = requestIds.map(() => "?").join(", ");
+      const existingKeys = this.database.prepare(`
+        SELECT request_id, provider_request_id, body_hash
+        FROM messaging_inbound_request_keys
+        WHERE connection_id = ? AND channel_generation = ?
+          AND provider_request_id IN (${placeholders})
+      `).all(connection.id, connection.generation, ...requestIds) as Row[];
+      if (existingKeys.length > 0) {
+        const existingRequestIds = new Set(existingKeys.map((row) => stringValue(row["request_id"])));
+        const existingProviderIds = new Set(existingKeys.map((row) => stringValue(row["provider_request_id"])));
+        const hashesMatch = existingKeys.every((row) => stringValue(row["body_hash"]) === bodyHash);
+        if (
+          existingRequestIds.size !== 1 || !hashesMatch ||
+          requestIds.some((requestId) => !existingProviderIds.has(requestId))
+        ) {
+          throw new StoreError("Messaging request deduplication identity conflicts with durable history.");
+        }
+        const existingId = existingRequestIds.values().next().value;
+        if (existingId === undefined) throw new StoreError("Messaging request identity is invalid.");
+        const existing = this.getMessagingInboundRequest(existingId);
+        if (existing.bodyHash !== bodyHash) {
+          throw new StoreError("Messaging request body hash conflicts with durable history.");
+        }
+        return { created: false, request: existing };
+      }
+      const conversation = input.conversationId === undefined
+        ? undefined
+        : this.getMessagingConversation(input.conversationId);
+      if (conversation !== undefined && (
+        conversation.connectionId !== connection.id ||
+        conversation.channelGeneration !== connection.generation ||
+        conversation.status === "retired"
+      )) {
+        throw new StoreError("Messaging request conversation authority is stale.");
+      }
+      const id = messagingIdentity(input.id ?? this.idFactory(), "request ID");
+      const providerMessageId = input.providerMessageId === undefined
+        ? null
+        : messagingIdentity(input.providerMessageId, "provider message ID", 512);
+      const receivedAt = messagingTimestamp(input.receivedAt ?? this.now(), "request receipt time");
+      const occurredAt = messagingTimestamp(input.occurredAt, "request occurrence time");
+      this.database.prepare(`
+        INSERT INTO messaging_inbound_requests(
+          id, connection_id, channel_generation, conversation_id, provider_message_id,
+          body_hash, protected_content, status, operation_id, run_id, attempt_id, queue_item_id,
+          error_code, occurred_at, received_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'preparing', NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
+      `).run(
+        id,
+        connection.id,
+        connection.generation,
+        conversation?.id ?? null,
+        providerMessageId,
+        bodyHash,
+        input.protectedContent ? 1 : 0,
+        occurredAt,
+        receivedAt,
+        receivedAt,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      const insertKey = this.database.prepare(`
+        INSERT INTO messaging_inbound_request_keys(
+          connection_id, channel_generation, provider_request_id, request_id,
+          body_hash, created_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const providerRequestId of requestIds) {
+        insertKey.run(
+          connection.id,
+          connection.generation,
+          providerRequestId,
+          id,
+          bodyHash,
+          receivedAt,
+          asSqlInteger(this.requireActiveRevision())
+        );
+      }
+      return { created: true, request: this.getMessagingInboundRequest(id) };
+    });
+  }
+
+  findMessagingInboundRequest(id: string): MessagingInboundRequestRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_inbound_requests WHERE id = ?"
+    ).get(id) as Row | undefined;
+    if (row === undefined) return undefined;
+    const requestIds = (this.database.prepare(`
+      SELECT provider_request_id FROM messaging_inbound_request_keys
+      WHERE request_id = ? ORDER BY provider_request_id
+    `).all(id) as Row[]).map((entry) => stringValue(entry["provider_request_id"]));
+    const artifactIds = (this.database.prepare(`
+      SELECT artifact_id FROM messaging_request_artifacts
+      WHERE request_id = ? ORDER BY ordinal
+    `).all(id) as Row[]).map((entry) => stringValue(entry["artifact_id"]));
+    return messagingInboundRequestFromRow(row, requestIds, artifactIds);
+  }
+
+  getMessagingInboundRequest(id: string): MessagingInboundRequestRecord {
+    const request = this.findMessagingInboundRequest(id);
+    if (request === undefined) throw new NotFoundError("Messaging inbound request", id);
+    return request;
+  }
+
+  findMessagingInboundRequestByProviderId(input: {
+    readonly connectionId: string;
+    readonly channelGeneration: number;
+    readonly providerRequestId: string;
+  }): MessagingInboundRequestRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT request_id FROM messaging_inbound_request_keys
+      WHERE connection_id = ? AND channel_generation = ? AND provider_request_id = ?
+    `).get(
+      input.connectionId,
+      input.channelGeneration,
+      input.providerRequestId
+    ) as Row | undefined;
+    return row === undefined ? undefined : this.getMessagingInboundRequest(stringValue(row["request_id"]));
+  }
+
+  findMessagingInboundRequestByRunId(runId: string): MessagingInboundRequestRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT id FROM messaging_inbound_requests WHERE run_id = ? LIMIT 1
+    `).get(nonBlank(runId, "Messaging Run ID")) as Row | undefined;
+    return row === undefined ? undefined : this.getMessagingInboundRequest(stringValue(row["id"]));
+  }
+
+  listMessagingInboundRequests(input: {
+    readonly connectionId?: string;
+    readonly statuses?: readonly MessagingInboundRequestStatus[];
+    readonly limit?: number;
+  } = {}): MessagingInboundRequestRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.connectionId !== undefined) {
+      clauses.push("connection_id = ?");
+      params.push(input.connectionId);
+    }
+    if (input.statuses !== undefined && input.statuses.length > 0) {
+      const statuses = [...new Set(input.statuses.map(messagingInboundRequestStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const limit = boundedLimit(input.limit ?? 100, 1, 500, "Messaging request list limit");
+    const rows = this.database.prepare(`
+      SELECT id FROM messaging_inbound_requests
+      ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
+      ORDER BY received_at DESC, id DESC LIMIT ?
+    `).all(...params, limit) as Row[];
+    return rows.map((row) => this.getMessagingInboundRequest(stringValue(row["id"])));
+  }
+
+  bindMessagingInboundAdmission(
+    input: BindMessagingInboundAdmissionInput
+  ): MessagingInboundRequestRecord {
+    return this.write(() => {
+      const current = this.getMessagingInboundRequest(input.requestId);
+      assertMessagingRevision("Messaging inbound request", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "preparing") {
+        throw new InvalidStateTransitionError("Messaging inbound request", current.status, "queued");
+      }
+      const conversation = this.getMessagingConversation(input.conversationId);
+      if (
+        conversation.status !== "active" || conversation.sessionId === undefined ||
+        conversation.connectionId !== current.connectionId ||
+        conversation.channelGeneration !== current.channelGeneration
+      ) {
+        throw new StoreError("Messaging request cannot bind a stale or inactive conversation.");
+      }
+      const queueItem = this.getQueueItem(input.queueItemId);
+      if (
+        queueItem.sessionId !== conversation.sessionId ||
+        queueItem.operationId !== input.operationId || queueItem.runId !== input.runId ||
+        queueItem.attemptId !== input.attemptId || queueItem.state !== "accepted"
+      ) {
+        throw new StoreError("Messaging request must bind its own accepted Queue lineage.");
+      }
+      const at = Math.max(current.receivedAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "request admission time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_inbound_requests
+        SET conversation_id = ?, operation_id = ?, run_id = ?, attempt_id = ?, queue_item_id = ?,
+            status = 'queued', error_code = NULL, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'preparing'
+      `).run(
+        conversation.id,
+        input.operationId,
+        input.runId,
+        input.attemptId,
+        input.queueItemId,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Messaging inbound request",
+          current.id,
+          current.revision,
+          this.getMessagingInboundRequest(current.id).revision
+        );
+      }
+      return this.getMessagingInboundRequest(current.id);
+    });
+  }
+
+  attachMessagingRequestArtifact(input: {
+    readonly requestId: string;
+    readonly expectedRevision: bigint;
+    readonly ordinal: number;
+    readonly artifactId: string;
+  }): MessagingInboundRequestRecord {
+    return this.write(() => {
+      const current = this.getMessagingInboundRequest(input.requestId);
+      assertMessagingRevision("Messaging inbound request", current.id, current.revision, input.expectedRevision);
+      if (current.protectedContent) {
+        throw new StoreError("Protected Messaging content cannot be adopted into the durable Artifact catalog.");
+      }
+      if (current.status !== "preparing") {
+        throw new InvalidStateTransitionError("Messaging attachment adoption", current.status, "preparing");
+      }
+      const ordinal = messagingBoundedInteger(input.ordinal, 0, 63, "attachment ordinal");
+      this.getArtifact(input.artifactId);
+      this.database.prepare(`
+        INSERT INTO messaging_request_artifacts(request_id, ordinal, artifact_id, revision)
+        VALUES (?, ?, ?, ?)
+      `).run(current.id, ordinal, input.artifactId, asSqlInteger(this.requireActiveRevision()));
+      this.database.prepare(`
+        UPDATE messaging_inbound_requests SET revision = ? WHERE id = ? AND revision = ?
+      `).run(
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return this.getMessagingInboundRequest(current.id);
+    });
+  }
+
+  updateMessagingInboundRequestStatus(input: {
+    readonly requestId: string;
+    readonly expectedRevision: bigint;
+    readonly status: Exclude<MessagingInboundRequestStatus, "preparing" | "queued">;
+    readonly errorCode?: string;
+    readonly updatedAt?: number;
+  }): MessagingInboundRequestRecord {
+    return this.write(() => {
+      const current = this.getMessagingInboundRequest(input.requestId);
+      assertMessagingRevision("Messaging inbound request", current.id, current.revision, input.expectedRevision);
+      const status = messagingInboundRequestStatus(input.status);
+      const permitted = current.status === "queued"
+        ? ["completed", "failed", "cancelled", "dispatch_unknown"].includes(status)
+        : current.status === "preparing" && status === "dispatch_unknown";
+      if (!permitted) {
+        throw new InvalidStateTransitionError("Messaging inbound request", current.status, status);
+      }
+      const needsError = status === "failed" || status === "dispatch_unknown";
+      if (needsError !== (input.errorCode !== undefined)) {
+        throw new StoreError("Messaging failed or unknown requests require an error code only in those states.");
+      }
+      const at = Math.max(current.receivedAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "request status time"
+      ));
+      this.database.prepare(`
+        UPDATE messaging_inbound_requests
+        SET status = ?, error_code = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        status,
+        input.errorCode === undefined ? null : messagingErrorCode(input.errorCode),
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return this.getMessagingInboundRequest(current.id);
+    });
+  }
+
+  recoverPreparingMessagingInboundRequests(at = this.now()): number {
+    return this.write(() => Number(this.database.prepare(`
+      UPDATE messaging_inbound_requests
+      SET status = 'dispatch_unknown', error_code = 'recovery_unknown', updated_at = ?, revision = ?
+      WHERE status = 'preparing'
+    `).run(
+      messagingTimestamp(at, "request recovery time"),
+      asSqlInteger(this.requireActiveRevision())
+    ).changes));
+  }
+
+  appendMessagingGroupObservation(
+    input: AppendMessagingGroupObservationInput
+  ): MessagingGroupObservationRecord {
+    return this.transaction(() => {
+      if (input.protectedContent) {
+        throw new StoreError("Protected Messaging content cannot enter durable group history.");
+      }
+      const conversation = this.getMessagingConversation(input.conversationId);
+      if (conversation.status === "retired" || conversation.conversationKind === "direct") {
+        throw new StoreError("Messaging group history requires a live group or channel conversation.");
+      }
+      const providerMessageId = messagingIdentity(input.providerMessageId, "provider message ID", 512);
+      const existing = this.findMessagingGroupObservation(conversation.id, providerMessageId);
+      if (existing !== undefined) return existing;
+      const providerUserId = messagingIdentity(input.providerUserId, "provider user ID", 512);
+      const displayName = messagingRedactedText(input.displayName, "speaker display name", 512, false);
+      const username = input.username === undefined
+        ? null
+        : messagingRedactedText(input.username, "speaker username", 512, false);
+      const text = messagingRedactedText(input.text, "group message", 65_536, true, true);
+      const attachmentNames = input.attachmentNames.map((name) =>
+        messagingRedactedText(name, "attachment name", 512, false)
+      );
+      if (attachmentNames.length > 64) throw new StoreError("Messaging group history has too many attachment names.");
+      const attachmentJson = serializeJson(attachmentNames);
+      if (Buffer.byteLength(attachmentJson, "utf8") > 8_192) {
+        throw new StoreError("Messaging group attachment names exceed their durable bound.");
+      }
+      const occurredAt = messagingTimestamp(input.occurredAt, "group message occurrence time");
+      const createdAt = messagingTimestamp(input.createdAt ?? this.now(), "group message storage time");
+      this.database.prepare(`
+        INSERT INTO messaging_group_observations(
+          conversation_id, provider_message_id, provider_user_id, display_name, username,
+          is_bot, text, attachment_names_json, occurred_at, created_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        conversation.id,
+        providerMessageId,
+        providerUserId,
+        displayName,
+        username,
+        input.isBot ? 1 : 0,
+        text,
+        attachmentJson,
+        occurredAt,
+        createdAt,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      const maximumEntries = messagingBoundedInteger(
+        input.maximumEntries ?? 100,
+        1,
+        1_000,
+        "group history capacity"
+      );
+      this.database.prepare(`
+        DELETE FROM messaging_group_observations
+        WHERE conversation_id = ? AND provider_message_id IN (
+          SELECT provider_message_id FROM messaging_group_observations
+          WHERE conversation_id = ?
+          ORDER BY occurred_at DESC, provider_message_id DESC
+          LIMIT -1 OFFSET ?
+        )
+      `).run(conversation.id, conversation.id, maximumEntries);
+      return this.getMessagingGroupObservation(conversation.id, providerMessageId);
+    });
+  }
+
+  findMessagingGroupObservation(
+    conversationId: string,
+    providerMessageId: string
+  ): MessagingGroupObservationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM messaging_group_observations
+      WHERE conversation_id = ? AND provider_message_id = ?
+    `).get(conversationId, providerMessageId) as Row | undefined;
+    return row === undefined ? undefined : messagingGroupObservationFromRow(row);
+  }
+
+  getMessagingGroupObservation(
+    conversationId: string,
+    providerMessageId: string
+  ): MessagingGroupObservationRecord {
+    const observation = this.findMessagingGroupObservation(conversationId, providerMessageId);
+    if (observation === undefined) {
+      throw new NotFoundError("Messaging group observation", `${conversationId}:${providerMessageId}`);
+    }
+    return observation;
+  }
+
+  listMessagingGroupObservations(input: {
+    readonly conversationId: string;
+    readonly limit?: number;
+  }): MessagingGroupObservationRecord[] {
+    this.assertOpen();
+    const limit = boundedLimit(input.limit ?? 100, 1, 1_000, "Messaging group history limit");
+    return (this.database.prepare(`
+      SELECT * FROM messaging_group_observations
+      WHERE conversation_id = ?
+      ORDER BY occurred_at DESC, provider_message_id DESC LIMIT ?
+    `).all(input.conversationId, limit) as Row[]).map(messagingGroupObservationFromRow);
+  }
+
+  enqueueMessagingDelivery(input: EnqueueMessagingDeliveryInput): MessagingDeliveryRecord {
+    return this.transaction(() => {
+      const connection = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (connection.credentialReferenceId === undefined) {
+        throw new StoreError("Messaging delivery requires a managed connection credential.");
+      }
+      const conversation = this.getMessagingConversation(input.conversationId);
+      if (
+        conversation.connectionId !== connection.id ||
+        conversation.channelGeneration !== connection.generation ||
+        conversation.status !== "active"
+      ) {
+        throw new StoreError("Messaging delivery conversation authority is stale.");
+      }
+      const dedupeKey = messagingIdentity(input.dedupeKey, "delivery dedupe key", 512);
+      const partIndex = messagingBoundedInteger(input.partIndex, 0, 10_000, "delivery part index");
+      const partCount = messagingBoundedInteger(input.partCount, 1, 10_001, "delivery part count");
+      if (partIndex >= partCount) throw new StoreError("Messaging delivery part index is outside its sequence.");
+      const payloadHash = messagingHash(input.payloadHash, "delivery payload hash");
+      if (operationBodyHash(input.payload) !== payloadHash) {
+        throw new StoreError("Messaging delivery payload hash does not match its canonical payload.");
+      }
+      const payloadJson = messagingPayloadJson(input.payload, 131_072, "delivery payload");
+      const existingRow = this.database.prepare(`
+        SELECT * FROM messaging_deliveries
+        WHERE connection_id = ? AND channel_generation = ? AND dedupe_key = ? AND part_index = ?
+      `).get(connection.id, connection.generation, dedupeKey, partIndex) as Row | undefined;
+      if (existingRow !== undefined) {
+        const existing = messagingDeliveryFromRow(existingRow);
+        if (
+          existing.payloadHash !== payloadHash || existing.partCount !== partCount ||
+          existing.kind !== input.kind || serializeJson(existing.payload) !== payloadJson ||
+          existing.conversationId !== conversation.id
+        ) {
+          throw new StoreError("Messaging delivery dedupe key conflicts with durable history.");
+        }
+        return existing;
+      }
+      const maximumPending = messagingBoundedInteger(
+        input.maximumPending ?? 256,
+        1,
+        10_000,
+        "delivery outbox capacity"
+      );
+      const pending = numberValue(this.database.prepare(`
+        SELECT COUNT(*) AS count FROM messaging_deliveries
+        WHERE connection_id = ? AND channel_generation = ?
+          AND status IN ('pending', 'dispatching', 'failed')
+      `).get(connection.id, connection.generation)?.["count"]);
+      if (pending >= maximumPending) {
+        throw new StoreError("Messaging delivery outbox is at capacity.");
+      }
+      const id = messagingIdentity(input.id ?? this.idFactory(), "delivery ID");
+      const createdAt = messagingTimestamp(input.createdAt ?? this.now(), "delivery creation time");
+      const availableAt = Math.max(createdAt, messagingTimestamp(
+        input.availableAt ?? createdAt,
+        "delivery availability time"
+      ));
+      this.database.prepare(`
+        INSERT INTO messaging_deliveries(
+          id, connection_id, channel_generation, conversation_id, dedupe_key, kind,
+          part_index, part_count, payload_hash, payload_json, status, available_at,
+          attempts, claim_token, claimed_at, provider_message_id, error_code,
+          created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, NULL, NULL, NULL, ?, ?, ?)
+      `).run(
+        id,
+        connection.id,
+        connection.generation,
+        conversation.id,
+        dedupeKey,
+        messagingDeliveryKind(input.kind),
+        partIndex,
+        partCount,
+        payloadHash,
+        payloadJson,
+        availableAt,
+        createdAt,
+        createdAt,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getMessagingDelivery(id);
+    });
+  }
+
+  findMessagingDelivery(id: string): MessagingDeliveryRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_deliveries WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingDeliveryFromRow(row);
+  }
+
+  findMessagingDeliveryByDedupe(input: {
+    readonly connectionId: string;
+    readonly channelGeneration: number;
+    readonly dedupeKey: string;
+    readonly partIndex?: number;
+  }): MessagingDeliveryRecord | undefined {
+    this.assertOpen();
+    const connectionId = messagingIdentity(input.connectionId, "connection ID");
+    const channelGeneration = messagingPositiveInteger(input.channelGeneration, "channel generation");
+    const dedupeKey = messagingIdentity(input.dedupeKey, "delivery dedupe key", 512);
+    const partIndex = messagingBoundedInteger(input.partIndex ?? 0, 0, 10_000, "delivery part index");
+    const row = this.database.prepare(`
+      SELECT * FROM messaging_deliveries
+      WHERE connection_id = ? AND channel_generation = ? AND dedupe_key = ? AND part_index = ?
+      LIMIT 1
+    `).get(connectionId, channelGeneration, dedupeKey, partIndex) as Row | undefined;
+    return row === undefined ? undefined : messagingDeliveryFromRow(row);
+  }
+
+  getMessagingDelivery(id: string): MessagingDeliveryRecord {
+    const delivery = this.findMessagingDelivery(id);
+    if (delivery === undefined) throw new NotFoundError("Messaging delivery", id);
+    return delivery;
+  }
+
+  listMessagingDeliveries(input: {
+    readonly connectionId?: string;
+    readonly statuses?: readonly MessagingDeliveryStatus[];
+    readonly limit?: number;
+  } = {}): MessagingDeliveryRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.connectionId !== undefined) {
+      clauses.push("connection_id = ?");
+      params.push(input.connectionId);
+    }
+    if (input.statuses !== undefined && input.statuses.length > 0) {
+      const statuses = [...new Set(input.statuses.map(messagingDeliveryStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const limit = boundedLimit(input.limit ?? 100, 1, 1_000, "Messaging delivery list limit");
+    return (this.database.prepare(`
+      SELECT * FROM messaging_deliveries
+      ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
+      ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(...params, limit) as Row[]).map(messagingDeliveryFromRow);
+  }
+
+  findSentMessagingInteractionDelivery(input: {
+    readonly connectionId: string;
+    readonly channelGeneration: number;
+    readonly conversationId: string;
+    readonly providerMessageId: string;
+  }): MessagingDeliveryRecord | undefined {
+    this.assertOpen();
+    const connectionId = messagingIdentity(input.connectionId, "connection ID");
+    const channelGeneration = messagingPositiveInteger(input.channelGeneration, "channel generation");
+    const conversationId = messagingIdentity(input.conversationId, "conversation ID");
+    const providerMessageId = messagingIdentity(input.providerMessageId, "provider message ID", 512);
+    const row = this.database.prepare(`
+      SELECT * FROM messaging_deliveries
+      WHERE connection_id = ? AND channel_generation = ? AND conversation_id = ?
+        AND kind = 'interaction' AND status = 'sent' AND provider_message_id = ?
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(connectionId, channelGeneration, conversationId, providerMessageId) as Row | undefined;
+    return row === undefined ? undefined : messagingDeliveryFromRow(row);
+  }
+
+  claimNextMessagingDelivery(input: {
+    readonly connectionId: string;
+    readonly expectedChannelGeneration: number;
+    readonly claimToken: string;
+    readonly claimedAt?: number;
+  }): MessagingDeliveryRecord | undefined {
+    return this.transaction(() => {
+      const connection = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (!connection.enabled || connection.runtimeStatus !== "connected") return undefined;
+      const claimToken = messagingClaimToken(input.claimToken);
+      const at = messagingTimestamp(input.claimedAt ?? this.now(), "delivery claim time");
+      const row = this.database.prepare(`
+        SELECT * FROM messaging_deliveries
+        WHERE connection_id = ? AND channel_generation = ? AND status = 'pending' AND available_at <= ?
+        ORDER BY available_at, created_at, id LIMIT 1
+      `).get(connection.id, connection.generation, at) as Row | undefined;
+      if (row === undefined) return undefined;
+      const current = messagingDeliveryFromRow(row);
+      const result = this.database.prepare(`
+        UPDATE messaging_deliveries
+        SET status = 'dispatching', attempts = attempts + 1, claim_token = ?, claimed_at = ?,
+            error_code = NULL, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'pending'
+      `).run(
+        claimToken,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) return undefined;
+      return this.getMessagingDelivery(current.id);
+    });
+  }
+
+  settleMessagingDelivery(input: {
+    readonly deliveryId: string;
+    readonly expectedRevision: bigint;
+    readonly claimToken: string;
+    readonly status: "sent" | "failed" | "cancelled" | "unknown";
+    readonly providerMessageId?: string;
+    readonly errorCode?: string;
+    readonly settledAt?: number;
+  }): MessagingDeliveryRecord {
+    return this.write(() => {
+      const current = this.getMessagingDelivery(input.deliveryId);
+      assertMessagingRevision("Messaging delivery", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "dispatching" || current.claimToken !== messagingClaimToken(input.claimToken)) {
+        throw new InvalidStateTransitionError("Messaging delivery", current.status, input.status);
+      }
+      const status = messagingDeliveryStatus(input.status);
+      const providerMessageId = input.providerMessageId === undefined
+        ? null
+        : messagingIdentity(input.providerMessageId, "provider message ID", 512);
+      const errorCode = input.errorCode === undefined ? null : messagingErrorCode(input.errorCode);
+      if ((status === "sent") !== (providerMessageId !== null)) {
+        throw new StoreError("Only a sent Messaging delivery accepts a provider message identity.");
+      }
+      if ((status === "failed" || status === "unknown") !== (errorCode !== null)) {
+        throw new StoreError("Failed and unknown Messaging deliveries require an error code only in those states.");
+      }
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.settledAt ?? this.now(),
+        "delivery settlement time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_deliveries
+        SET status = ?, claim_token = NULL, claimed_at = NULL, provider_message_id = ?,
+            error_code = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'dispatching' AND claim_token = ?
+      `).run(
+        status,
+        providerMessageId,
+        errorCode,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.claimToken
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Messaging delivery",
+          current.id,
+          current.revision,
+          this.getMessagingDelivery(current.id).revision
+        );
+      }
+      return this.getMessagingDelivery(current.id);
+    });
+  }
+
+  retryMessagingDelivery(input: {
+    readonly deliveryId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedChannelGeneration: number;
+    readonly availableAt: number;
+  }): MessagingDeliveryRecord {
+    return this.write(() => {
+      const current = this.getMessagingDelivery(input.deliveryId);
+      assertMessagingRevision("Messaging delivery", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "failed") {
+        throw new InvalidStateTransitionError("Messaging delivery", current.status, "pending");
+      }
+      const connection = this.getMessagingConnection(current.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (current.channelGeneration !== connection.generation) {
+        throw new StaleGenerationError(current.channelGeneration, connection.generation);
+      }
+      const at = messagingTimestamp(input.availableAt, "delivery retry time");
+      this.database.prepare(`
+        UPDATE messaging_deliveries
+        SET status = 'pending', available_at = ?, error_code = NULL, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'failed'
+      `).run(
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return this.getMessagingDelivery(current.id);
+    });
+  }
+
+  recoverClaimedMessagingDeliveries(at = this.now()): number {
+    return this.write(() => Number(this.database.prepare(`
+      UPDATE messaging_deliveries
+      SET status = 'unknown', claim_token = NULL, claimed_at = NULL,
+          error_code = 'recovery_unknown', updated_at = ?, revision = ?
+      WHERE status = 'dispatching'
+    `).run(
+      messagingTimestamp(at, "delivery recovery time"),
+      asSqlInteger(this.requireActiveRevision())
+    ).changes));
+  }
+
+  createMessagingInteraction(input: {
+    readonly id?: string;
+    readonly connectionId: string;
+    readonly expectedChannelGeneration: number;
+    readonly conversationId: string;
+    readonly providerRequestId: string;
+    readonly providerInteractionId: string;
+    readonly providerMessageId: string;
+    readonly actionHash: string;
+    readonly payload: unknown;
+    readonly expiresAt: number;
+    readonly createdAt?: number;
+  }): MessagingInteractionRecord {
+    return this.write(() => {
+      const connection = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      const conversation = this.getMessagingConversation(input.conversationId);
+      if (
+        conversation.connectionId !== connection.id ||
+        conversation.channelGeneration !== connection.generation ||
+        conversation.status !== "active"
+      ) throw new StoreError("Messaging interaction conversation authority is stale.");
+      const providerRequestId = messagingIdentity(input.providerRequestId, "provider request ID", 512);
+      const providerInteractionId = messagingIdentity(input.providerInteractionId, "provider interaction ID", 512);
+      const providerMessageId = messagingIdentity(input.providerMessageId, "provider message ID", 512);
+      const actionHash = messagingHash(input.actionHash, "interaction action hash");
+      if (operationBodyHash(input.payload) !== actionHash) {
+        throw new StoreError("Messaging interaction action hash does not match its canonical payload.");
+      }
+      const payloadJson = messagingPayloadJson(input.payload, 65_536, "interaction payload");
+      const existingRow = this.database.prepare(`
+        SELECT * FROM messaging_interactions
+        WHERE connection_id = ? AND channel_generation = ? AND provider_request_id = ?
+      `).get(connection.id, connection.generation, providerRequestId) as Row | undefined;
+      if (existingRow !== undefined) {
+        const existing = messagingInteractionFromRow(existingRow);
+        if (
+          existing.actionHash !== actionHash || serializeJson(existing.payload) !== payloadJson ||
+          existing.providerInteractionId !== providerInteractionId
+        ) throw new StoreError("Messaging interaction dedupe identity conflicts with durable history.");
+        return existing;
+      }
+      const id = messagingIdentity(input.id ?? this.idFactory(), "interaction ID");
+      const createdAt = messagingTimestamp(input.createdAt ?? this.now(), "interaction creation time");
+      const expiresAt = messagingTimestamp(input.expiresAt, "interaction expiry time");
+      if (expiresAt <= createdAt) throw new StoreError("Messaging interaction must expire after it is created.");
+      this.database.prepare(`
+        INSERT INTO messaging_interactions(
+          id, connection_id, channel_generation, conversation_id,
+          provider_request_id, provider_interaction_id, provider_message_id,
+          action_hash, payload_json, status, claim_token, claimed_at,
+          expires_at, outcome_code, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL, ?, ?, ?)
+      `).run(
+        id,
+        connection.id,
+        connection.generation,
+        conversation.id,
+        providerRequestId,
+        providerInteractionId,
+        providerMessageId,
+        actionHash,
+        payloadJson,
+        expiresAt,
+        createdAt,
+        createdAt,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getMessagingInteraction(id);
+    });
+  }
+
+  findMessagingInteraction(id: string): MessagingInteractionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_interactions WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingInteractionFromRow(row);
+  }
+
+  getMessagingInteraction(id: string): MessagingInteractionRecord {
+    const interaction = this.findMessagingInteraction(id);
+    if (interaction === undefined) throw new NotFoundError("Messaging interaction", id);
+    return interaction;
+  }
+
+  listMessagingInteractions(input: {
+    readonly connectionId?: string;
+    readonly statuses?: readonly MessagingInteractionRecord["status"][];
+    readonly limit?: number;
+  } = {}): MessagingInteractionRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.connectionId !== undefined) {
+      clauses.push("connection_id = ?");
+      params.push(messagingIdentity(input.connectionId, "connection ID"));
+    }
+    if (input.statuses !== undefined && input.statuses.length > 0) {
+      const statuses = [...new Set(input.statuses.map(messagingInteractionStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const limit = boundedLimit(input.limit ?? 100, 1, 1_000, "Messaging interaction list limit");
+    return (this.database.prepare(`
+      SELECT * FROM messaging_interactions
+      ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
+      ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(...params, limit) as Row[]).map(messagingInteractionFromRow);
+  }
+
+  claimMessagingInteraction(input: {
+    readonly interactionId: string;
+    readonly expectedRevision: bigint;
+    readonly claimToken: string;
+    readonly claimedAt?: number;
+  }): MessagingInteractionRecord | undefined {
+    return this.transaction(() => {
+      const current = this.getMessagingInteraction(input.interactionId);
+      assertMessagingRevision("Messaging interaction", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "pending") return undefined;
+      const at = messagingTimestamp(input.claimedAt ?? this.now(), "interaction claim time");
+      if (at >= current.expiresAt) {
+        this.database.prepare(`
+          UPDATE messaging_interactions
+          SET status = 'expired', outcome_code = 'expired', updated_at = ?, revision = ?
+          WHERE id = ? AND revision = ? AND status = 'pending'
+        `).run(
+          at,
+          asSqlInteger(this.requireActiveRevision()),
+          current.id,
+          asSqlInteger(current.revision)
+        );
+        return undefined;
+      }
+      const token = messagingClaimToken(input.claimToken);
+      const result = this.database.prepare(`
+        UPDATE messaging_interactions
+        SET status = 'claimed', claim_token = ?, claimed_at = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'pending'
+      `).run(
+        token,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return result.changes === 1 ? this.getMessagingInteraction(current.id) : undefined;
+    });
+  }
+
+  settleMessagingInteraction(input: {
+    readonly interactionId: string;
+    readonly expectedRevision: bigint;
+    readonly claimToken: string;
+    readonly status: "completed" | "failed" | "unknown";
+    readonly outcomeCode?: string;
+    readonly settledAt?: number;
+  }): MessagingInteractionRecord {
+    return this.write(() => {
+      const current = this.getMessagingInteraction(input.interactionId);
+      assertMessagingRevision("Messaging interaction", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "claimed" || current.claimToken !== messagingClaimToken(input.claimToken)) {
+        throw new InvalidStateTransitionError("Messaging interaction", current.status, input.status);
+      }
+      if ((input.status !== "completed") !== (input.outcomeCode !== undefined)) {
+        throw new StoreError("Failed and unknown Messaging interactions require an outcome code only in those states.");
+      }
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.settledAt ?? this.now(),
+        "interaction settlement time"
+      ));
+      this.database.prepare(`
+        UPDATE messaging_interactions
+        SET status = ?, claim_token = NULL, claimed_at = NULL, outcome_code = ?,
+            updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'claimed' AND claim_token = ?
+      `).run(
+        input.status,
+        input.outcomeCode === undefined ? null : messagingErrorCode(input.outcomeCode),
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.claimToken
+      );
+      return this.getMessagingInteraction(current.id);
+    });
+  }
+
+  recoverClaimedMessagingInteractions(at = this.now()): number {
+    return this.write(() => Number(this.database.prepare(`
+      UPDATE messaging_interactions
+      SET status = 'unknown', claim_token = NULL, claimed_at = NULL,
+          outcome_code = 'recovery_unknown', updated_at = ?, revision = ?
+      WHERE status = 'claimed'
+    `).run(
+      messagingTimestamp(at, "interaction recovery time"),
+      asSqlInteger(this.requireActiveRevision())
+    ).changes));
+  }
+
   listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean } = {}): StoredSession[] {
     this.assertOpen();
     const clauses: string[] = [];
@@ -3831,6 +6916,46 @@ export class OperationalStore {
         patch.deletedAt !== undefined
       ) this.appendSessionProjectionEvent(updated, `session-update:${id}:${updated.revision.toString(10)}`);
       return updated;
+    });
+  }
+
+  /**
+   * Advance the private prompt of a service-owned Session. Public task mutation
+   * surfaces never call this; SessionHost owns the runtime refresh boundary.
+   */
+  updateSessionPrivatePrompt(
+    id: string,
+    appendSystemPrompt: string | undefined,
+    expectedRevision: bigint,
+    now = this.now()
+  ): StoredSession {
+    if ((appendSystemPrompt?.length ?? 0) > 8_000) {
+      throw new StoreError("Session append system prompt cannot exceed 8,000 characters.");
+    }
+    if (appendSystemPrompt?.includes("\0") === true) {
+      throw new StoreError("Session append system prompt cannot contain NUL characters.");
+    }
+    return this.write(() => {
+      const current = this.getSession(id);
+      if (current.revision !== expectedRevision) {
+        throw new RevisionConflictError("Session", id, expectedRevision, current.revision);
+      }
+      if (current.descriptor.appendSystemPrompt === appendSystemPrompt) return current;
+      const result = this.database.prepare(`
+        UPDATE product_sessions SET append_system_prompt = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        appendSystemPrompt ?? null,
+        now,
+        asSqlInteger(this.requireActiveRevision()),
+        id,
+        asSqlInteger(current.revision)
+      );
+      if (Number(result.changes) !== 1) {
+        const changed = this.getSession(id);
+        throw new RevisionConflictError("Session", id, expectedRevision, changed.revision);
+      }
+      return this.getSession(id);
     });
   }
 
@@ -9208,11 +12333,16 @@ export class OperationalStore {
     });
   }
 
-  getInteraction(id: string): InteractionRecord {
+  findInteraction(id: string): InteractionRecord | undefined {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM interactions WHERE id = ?").get(id) as Row | undefined;
-    if (row === undefined) throw new NotFoundError("Interaction", id);
-    return interactionFromRow(row);
+    return row === undefined ? undefined : interactionFromRow(row);
+  }
+
+  getInteraction(id: string): InteractionRecord {
+    const interaction = this.findInteraction(id);
+    if (interaction === undefined) throw new NotFoundError("Interaction", id);
+    return interaction;
   }
 
   listInteractions(options: InteractionListOptions = {}): InteractionRecord[] {
@@ -13966,6 +17096,265 @@ function objectiveFromRow(row: Row): ObjectiveRecord {
   };
 }
 
+function collaborationGoalFromRow(row: Row): CollaborationGoalRecord {
+  return {
+    id: stringValue(row["id"]),
+    leadId: stringValue(row["lead_id"]),
+    leadSessionId: stringValue(row["lead_session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    targetId: stringValue(row["target_id"]),
+    sessionGeneration: numberValue(row["session_generation"]),
+    backendInstanceGeneration: numberValue(row["backend_instance_generation"]),
+    title: stringValue(row["title"]),
+    objective: stringValue(row["objective"]),
+    ...optionalNumber("maximumWorkers", row["maximum_workers"]),
+    status: collaborationGoalStatus(stringValue(row["status"])),
+    ...optionalJson<PublicError, "lastError">("lastError", row["last_error_json"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    ...optionalNumber("completedAt", row["completed_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function collaborationWorkerFromRow(row: Row): CollaborationWorkerRecord {
+  return {
+    id: stringValue(row["id"]),
+    goalId: stringValue(row["goal_id"]),
+    ...optionalString("parentWorkerId", row["parent_worker_id"]),
+    ...optionalString("sessionId", row["session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    targetId: stringValue(row["target_id"]),
+    ...optionalString("providerId", row["provider_id"]),
+    ...optionalString("modelId", row["model_id"]),
+    ...optionalString("effort", row["effort"]),
+    fastMode: booleanValue(row["fast_mode"]),
+    permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const),
+    planMode: booleanValue(row["plan_mode"]),
+    ...optionalNumber("sessionGeneration", row["session_generation"]),
+    ...optionalNumber("backendInstanceGeneration", row["backend_instance_generation"]),
+    createOperationId: stringValue(row["create_operation_id"]),
+    label: stringValue(row["label"]),
+    role: stringValue(row["role"]),
+    assignment: stringValue(row["assignment"]),
+    status: collaborationWorkerStatus(stringValue(row["status"])),
+    focused: booleanValue(row["focused"]),
+    runtimeReleased: booleanValue(row["runtime_released"]),
+    softLimitWarning: booleanValue(row["soft_limit_warning"]),
+    ...optionalNumber("idleSince", row["idle_since"]),
+    ...optionalJson<PublicError, "lastError">("lastError", row["last_error_json"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function collaborationDispatchFromRow(row: Row): CollaborationDispatchRecord {
+  return {
+    id: stringValue(row["id"]),
+    goalId: stringValue(row["goal_id"]),
+    workerId: stringValue(row["worker_id"]),
+    callerLeadSessionId: stringValue(row["caller_lead_session_id"]),
+    operationId: stringValue(row["operation_id"]),
+    ...optionalString("queueItemId", row["queue_item_id"]),
+    message: stringValue(row["message"]),
+    status: collaborationDispatchStatus(stringValue(row["status"])),
+    ...optionalString("mergedIntoDispatchId", row["merged_into_dispatch_id"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingConnectionFromRow(row: Row): MessagingConnectionRecord {
+  return {
+    id: stringValue(row["id"]),
+    channel: messagingChannel(stringValue(row["channel"])),
+    generation: numberValue(row["generation"]),
+    enabled: booleanValue(row["enabled"]),
+    runtimeStatus: messagingRuntimeStatus(stringValue(row["runtime_status"])),
+    ...optionalString("credentialReferenceId", row["credential_reference_id"]),
+    ...optionalString("credentialGeneration", row["credential_generation"]),
+    ...optionalString("ownerProviderUserId", row["owner_provider_user_id"]),
+    ...optionalString("providerAccountId", row["provider_account_id"]),
+    ...optionalString("providerUsername", row["provider_username"]),
+    configuration: parseJson(stringValue(row["configuration_json"])),
+    ...optionalString("cursor", row["cursor"]),
+    ...optionalString("errorCode", row["error_code"]),
+    ...optionalString("errorSummary", row["error_summary"]),
+    ...optionalNumber("lastConnectedAt", row["last_connected_at"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingRouteFromRow(row: Row): MessagingRouteRecord {
+  return {
+    scopeKey: stringValue(row["scope_key"]),
+    ...optionalString("connectionId", row["connection_id"]),
+    targetId: stringValue(row["target_id"]),
+    backendId: stringValue(row["backend_id"]),
+    ...optionalString("providerId", row["provider_id"]),
+    ...optionalString("modelId", row["model_id"]),
+    ...optionalString("effort", row["effort"]),
+    fastMode: booleanValue(row["fast_mode"]),
+    permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const),
+    planMode: booleanValue(row["plan_mode"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingConversationFromRow(row: Row): MessagingConversationRecord {
+  return {
+    id: stringValue(row["id"]),
+    connectionId: stringValue(row["connection_id"]),
+    channelGeneration: numberValue(row["channel_generation"]),
+    providerConversationId: stringValue(row["provider_conversation_id"]),
+    providerThreadId: stringValue(row["provider_thread_id"]),
+    conversationKind: messagingConversationKind(stringValue(row["conversation_kind"])),
+    status: messagingConversationStatus(stringValue(row["status"])),
+    ...optionalString("sessionId", row["session_id"]),
+    ...optionalNumber("sessionGeneration", row["session_generation"]),
+    ...optionalString("routeScopeKey", row["route_scope_key"]),
+    ...optionalString("targetId", row["target_id"]),
+    ...optionalString("backendId", row["backend_id"]),
+    ...optionalString("providerId", row["provider_id"]),
+    ...optionalString("modelId", row["model_id"]),
+    ...optionalString("effort", row["effort"]),
+    ...(row["fast_mode"] === null || row["fast_mode"] === undefined
+      ? {}
+      : { fastMode: booleanValue(row["fast_mode"]) }),
+    ...(row["permission_mode"] === null || row["permission_mode"] === undefined
+      ? {}
+      : { permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const) }),
+    ...(row["plan_mode"] === null || row["plan_mode"] === undefined
+      ? {}
+      : { planMode: booleanValue(row["plan_mode"]) }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    ...optionalNumber("retiredAt", row["retired_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingConversationContextFromRow(row: Row): MessagingConversationContextRecord {
+  const sourceKind = enumValue(row["source_kind"], ["request", "interaction"] as const);
+  const sourceId = stringValue(row["source_id"]);
+  return {
+    connectionId: stringValue(row["connection_id"]),
+    materialGeneration: stringValue(row["material_generation"]),
+    conversationId: stringValue(row["conversation_id"]),
+    ...(sourceKind === "request"
+      ? { sourceRequestId: sourceId }
+      : { sourceInteractionId: sourceId }),
+    sealed: {
+      algorithm: "aes-256-gcm",
+      nonce: stringValue(row["nonce"]),
+      ciphertext: stringValue(row["ciphertext"]),
+      tag: stringValue(row["tag"])
+    },
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingInboundRequestFromRow(
+  row: Row,
+  providerRequestIds: readonly string[],
+  artifactIds: readonly string[]
+): MessagingInboundRequestRecord {
+  return {
+    id: stringValue(row["id"]),
+    connectionId: stringValue(row["connection_id"]),
+    channelGeneration: numberValue(row["channel_generation"]),
+    ...optionalString("conversationId", row["conversation_id"]),
+    ...optionalString("providerMessageId", row["provider_message_id"]),
+    providerRequestIds,
+    bodyHash: stringValue(row["body_hash"]),
+    protectedContent: booleanValue(row["protected_content"]),
+    status: messagingInboundRequestStatus(stringValue(row["status"])),
+    ...optionalString("operationId", row["operation_id"]),
+    ...optionalString("runId", row["run_id"]),
+    ...optionalString("attemptId", row["attempt_id"]),
+    ...optionalString("queueItemId", row["queue_item_id"]),
+    artifactIds,
+    ...optionalString("errorCode", row["error_code"]),
+    occurredAt: numberValue(row["occurred_at"]),
+    receivedAt: numberValue(row["received_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingGroupObservationFromRow(row: Row): MessagingGroupObservationRecord {
+  return {
+    conversationId: stringValue(row["conversation_id"]),
+    providerMessageId: stringValue(row["provider_message_id"]),
+    providerUserId: stringValue(row["provider_user_id"]),
+    displayName: stringValue(row["display_name"]),
+    ...optionalString("username", row["username"]),
+    isBot: booleanValue(row["is_bot"]),
+    text: stringValue(row["text"]),
+    attachmentNames: parseJson<readonly string[]>(stringValue(row["attachment_names_json"])),
+    occurredAt: numberValue(row["occurred_at"]),
+    createdAt: numberValue(row["created_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingDeliveryFromRow(row: Row): MessagingDeliveryRecord {
+  return {
+    id: stringValue(row["id"]),
+    connectionId: stringValue(row["connection_id"]),
+    channelGeneration: numberValue(row["channel_generation"]),
+    conversationId: stringValue(row["conversation_id"]),
+    dedupeKey: stringValue(row["dedupe_key"]),
+    kind: messagingDeliveryKind(stringValue(row["kind"])),
+    partIndex: numberValue(row["part_index"]),
+    partCount: numberValue(row["part_count"]),
+    payloadHash: stringValue(row["payload_hash"]),
+    payload: parseJson(stringValue(row["payload_json"])),
+    status: messagingDeliveryStatus(stringValue(row["status"])),
+    availableAt: numberValue(row["available_at"]),
+    attempts: numberValue(row["attempts"]),
+    ...optionalString("claimToken", row["claim_token"]),
+    ...optionalNumber("claimedAt", row["claimed_at"]),
+    ...optionalString("providerMessageId", row["provider_message_id"]),
+    ...optionalString("errorCode", row["error_code"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function messagingInteractionFromRow(row: Row): MessagingInteractionRecord {
+  return {
+    id: stringValue(row["id"]),
+    connectionId: stringValue(row["connection_id"]),
+    channelGeneration: numberValue(row["channel_generation"]),
+    conversationId: stringValue(row["conversation_id"]),
+    providerRequestId: stringValue(row["provider_request_id"]),
+    providerInteractionId: stringValue(row["provider_interaction_id"]),
+    providerMessageId: stringValue(row["provider_message_id"]),
+    actionHash: stringValue(row["action_hash"]),
+    payload: parseJson(stringValue(row["payload_json"])),
+    status: enumValue(row["status"], [
+      "pending", "claimed", "completed", "failed", "expired", "duplicate", "unknown"
+    ] as const),
+    ...optionalString("claimToken", row["claim_token"]),
+    ...optionalNumber("claimedAt", row["claimed_at"]),
+    expiresAt: numberValue(row["expires_at"]),
+    ...optionalString("outcomeCode", row["outcome_code"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
 function makerMemoryEntryFromRow(row: Row): MakerMemoryEntry {
   return {
     id: stringValue(row["id"]),
@@ -15793,6 +19182,538 @@ function objectiveStatus(value: string): ObjectiveStatus {
   ];
   if (!statuses.includes(value as ObjectiveStatus)) throw new StoreError("Objective status is invalid.");
   return value as ObjectiveStatus;
+}
+
+function collaborationGoalStatus(value: string): CollaborationGoalStatus {
+  const statuses: readonly CollaborationGoalStatus[] = [
+    "active",
+    "completed",
+    "stopped",
+    "failed",
+    "archived"
+  ];
+  if (!statuses.includes(value as CollaborationGoalStatus)) {
+    throw new StoreError("Collaboration Goal status is invalid.");
+  }
+  return value as CollaborationGoalStatus;
+}
+
+function collaborationWorkerStatus(value: string): CollaborationWorkerStatus {
+  const statuses: readonly CollaborationWorkerStatus[] = [
+    "provisioning",
+    "idle",
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "stopping",
+    "stopped",
+    "dispatch_unknown",
+    "archived"
+  ];
+  if (!statuses.includes(value as CollaborationWorkerStatus)) {
+    throw new StoreError("Collaboration worker status is invalid.");
+  }
+  return value as CollaborationWorkerStatus;
+}
+
+function collaborationDispatchStatus(value: string): CollaborationDispatchStatus {
+  const statuses: readonly CollaborationDispatchStatus[] = [
+    "preparing",
+    "queued",
+    "merged",
+    "cancelled",
+    "dispatch_unknown"
+  ];
+  if (!statuses.includes(value as CollaborationDispatchStatus)) {
+    throw new StoreError("Collaboration dispatch status is invalid.");
+  }
+  return value as CollaborationDispatchStatus;
+}
+
+function messagingChannel(value: unknown): MessagingConnectionRecord["channel"] {
+  const channels: readonly MessagingConnectionRecord["channel"][] = [
+    "telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat", "slack"
+  ];
+  if (!channels.includes(value as MessagingConnectionRecord["channel"])) {
+    throw new StoreError("Messaging channel is invalid.");
+  }
+  return value as MessagingConnectionRecord["channel"];
+}
+
+function messagingRuntimeStatus(value: unknown): MessagingConnectionRuntimeStatus {
+  const statuses: readonly MessagingConnectionRuntimeStatus[] = [
+    "idle", "connecting", "connected", "offline", "conflict", "auth_loss", "error"
+  ];
+  if (!statuses.includes(value as MessagingConnectionRuntimeStatus)) {
+    throw new StoreError("Messaging runtime status is invalid.");
+  }
+  return value as MessagingConnectionRuntimeStatus;
+}
+
+function messagingConversationKind(value: unknown): MessagingConversationKind {
+  if (value !== "direct" && value !== "group" && value !== "channel") {
+    throw new StoreError("Messaging conversation kind is invalid.");
+  }
+  return value;
+}
+
+function messagingConversationStatus(value: unknown): MessagingConversationRecord["status"] {
+  if (value !== "observed" && value !== "active" && value !== "retired") {
+    throw new StoreError("Messaging conversation status is invalid.");
+  }
+  return value;
+}
+
+function messagingInboundRequestStatus(value: unknown): MessagingInboundRequestStatus {
+  const statuses: readonly MessagingInboundRequestStatus[] = [
+    "preparing", "queued", "completed", "failed", "cancelled", "dispatch_unknown"
+  ];
+  if (!statuses.includes(value as MessagingInboundRequestStatus)) {
+    throw new StoreError("Messaging inbound request status is invalid.");
+  }
+  return value as MessagingInboundRequestStatus;
+}
+
+function messagingDeliveryKind(value: unknown): MessagingDeliveryRecord["kind"] {
+  const kinds: readonly MessagingDeliveryRecord["kind"][] = [
+    "text", "file", "reaction", "interaction", "notice"
+  ];
+  if (!kinds.includes(value as MessagingDeliveryRecord["kind"])) {
+    throw new StoreError("Messaging delivery kind is invalid.");
+  }
+  return value as MessagingDeliveryRecord["kind"];
+}
+
+function messagingDeliveryStatus(value: unknown): MessagingDeliveryStatus {
+  const statuses: readonly MessagingDeliveryStatus[] = [
+    "pending", "dispatching", "sent", "failed", "cancelled", "unknown"
+  ];
+  if (!statuses.includes(value as MessagingDeliveryStatus)) {
+    throw new StoreError("Messaging delivery status is invalid.");
+  }
+  return value as MessagingDeliveryStatus;
+}
+
+function messagingInteractionStatus(value: unknown): MessagingInteractionRecord["status"] {
+  const statuses: readonly MessagingInteractionRecord["status"][] = [
+    "pending", "claimed", "completed", "failed", "expired", "duplicate", "unknown"
+  ];
+  if (!statuses.includes(value as MessagingInteractionRecord["status"])) {
+    throw new StoreError("Messaging interaction status is invalid.");
+  }
+  return value as MessagingInteractionRecord["status"];
+}
+
+function messagingIdentity(value: string, label: string, maximum = 256): string {
+  if (typeof value !== "string") throw new StoreError(`Messaging ${label} is invalid.`);
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 || normalized.length > maximum ||
+    /[\u0000-\u001f\u007f]/u.test(normalized) || redactSecrets(normalized) !== normalized
+  ) {
+    throw new StoreError(`Messaging ${label} is invalid or credential-like.`);
+  }
+  return normalized;
+}
+
+function messagingConfigurationJson(value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new StoreError("Messaging configuration must be an object.");
+  }
+  return messagingPayloadJson(value, 65_536, "configuration");
+}
+
+function messagingPayloadJson(value: unknown, maximumBytes: number, label: string): string {
+  const serialized = serializeJson(value);
+  if (
+    serialized.includes("[REDACTED]") || serialized.length < 2 ||
+    Buffer.byteLength(serialized, "utf8") > maximumBytes
+  ) {
+    throw new StoreError(`Messaging ${label} contains credential-like material or exceeds its durable bound.`);
+  }
+  return serialized;
+}
+
+function messagingRedactedText(
+  value: string,
+  label: string,
+  maximum: number,
+  multiline: boolean,
+  allowEmpty = false
+): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new StoreError(`Messaging ${label} is invalid.`);
+  }
+  const normalized = multiline
+    ? value.normalize("NFC").replace(/\r\n?/gu, "\n")
+    : value.normalize("NFC").replace(/\s+/gu, " ").trim();
+  if ((!allowEmpty && normalized.length === 0) || normalized.length > maximum) {
+    throw new StoreError(`Messaging ${label} exceeds its durable bound.`);
+  }
+  return redactSecrets(normalized);
+}
+
+function messagingSafeText(
+  value: string,
+  label: string,
+  maximum: number,
+  multiline: boolean
+): string {
+  return messagingRedactedText(value, label, maximum, multiline);
+}
+
+function messagingCursor(value: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096 || value.includes("\0")) {
+    throw new StoreError("Messaging cursor is invalid.");
+  }
+  return value;
+}
+
+function messagingErrorCode(value: string): string {
+  const normalized = value.trim().toLocaleLowerCase("en-US");
+  if (!/^[a-z0-9_]{1,64}$/u.test(normalized)) throw new StoreError("Messaging error code is invalid.");
+  return normalized;
+}
+
+function messagingHash(value: string, label: string): string {
+  if (!/^sha256:[0-9a-f]{64}$/u.test(value)) throw new StoreError(`Messaging ${label} is invalid.`);
+  return value;
+}
+
+function messagingCredentialGeneration(value: string): string {
+  if (!/^[0-9a-f]{64}$/u.test(value)) {
+    throw new StoreError("Messaging credential generation is invalid.");
+  }
+  return value;
+}
+
+function messagingSealedConversationContext(
+  value: PutMessagingConversationContextInput["sealed"]
+): PutMessagingConversationContextInput["sealed"] {
+  if (value === null || typeof value !== "object" || value.algorithm !== "aes-256-gcm") {
+    throw new StoreError("Messaging conversation context envelope is invalid.");
+  }
+  return {
+    algorithm: "aes-256-gcm",
+    nonce: canonicalMessagingContextBase64(value.nonce, "nonce", 12, 12),
+    ciphertext: canonicalMessagingContextBase64(value.ciphertext, "ciphertext", 1, 16_384),
+    tag: canonicalMessagingContextBase64(value.tag, "authentication tag", 16, 16)
+  };
+}
+
+function canonicalMessagingContextBase64(
+  value: unknown,
+  label: string,
+  minimumBytes: number,
+  maximumBytes: number
+): string {
+  if (typeof value !== "string" || value.length < 4 || value.length > 21_848) {
+    throw new StoreError(`Messaging conversation context ${label} is invalid.`);
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (
+    decoded.byteLength < minimumBytes ||
+    decoded.byteLength > maximumBytes ||
+    decoded.toString("base64") !== value
+  ) {
+    throw new StoreError(`Messaging conversation context ${label} is invalid.`);
+  }
+  return value;
+}
+
+function messagingTimestamp(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new StoreError(`Messaging ${label} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function messagingPositiveInteger(value: number, label: string): number {
+  return messagingBoundedInteger(value, 1, Number.MAX_SAFE_INTEGER, label);
+}
+
+function messagingBoundedInteger(value: number, minimum: number, maximum: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new StoreError(`Messaging ${label} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  return value;
+}
+
+function boundedLimit(value: number, minimum: number, maximum: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new StoreError(`${label} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  return value;
+}
+
+function messagingClaimToken(value: string): string {
+  const normalized = messagingIdentity(value, "claim token", 256);
+  if (normalized.length < 16) throw new StoreError("Messaging claim token is too short.");
+  return normalized;
+}
+
+function normalizeMessagingRequestIds(values: readonly string[]): readonly string[] {
+  if (!Array.isArray(values) || values.length === 0 || values.length > 64) {
+    throw new StoreError("Messaging request must contain between 1 and 64 provider request identities.");
+  }
+  const normalized = values.map((value) => messagingIdentity(value, "provider request ID", 512));
+  if (new Set(normalized).size !== normalized.length) {
+    throw new StoreError("Messaging request contains duplicate provider request identities.");
+  }
+  return [...normalized].sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function normalizeMessagingRoute(input: PutMessagingRouteInput): Pick<
+  MessagingRouteRecord,
+  "providerId" | "modelId" | "effort" | "fastMode" | "permissionMode" | "planMode"
+> {
+  if ((input.providerId === undefined) !== (input.modelId === undefined)) {
+    throw new StoreError("Messaging route provider and model must be selected together.");
+  }
+  const providerId = input.providerId === undefined
+    ? undefined
+    : messagingIdentity(input.providerId, "provider ID", 512);
+  const modelId = input.modelId === undefined
+    ? undefined
+    : messagingIdentity(input.modelId, "model ID", 512);
+  const effort = input.effort === undefined
+    ? undefined
+    : messagingIdentity(input.effort, "effort", 128);
+  if (input.permissionMode !== "ask" && input.permissionMode !== "auto" && input.permissionMode !== "bypassPermissions") {
+    throw new StoreError("Messaging route permission mode is invalid.");
+  }
+  return {
+    ...(providerId === undefined ? {} : { providerId }),
+    ...(modelId === undefined ? {} : { modelId }),
+    ...(effort === undefined ? {} : { effort }),
+    fastMode: input.fastMode,
+    permissionMode: input.permissionMode,
+    planMode: input.planMode
+  };
+}
+
+function assertMessagingGeneration(connection: MessagingConnectionRecord, expected: number): void {
+  messagingPositiveInteger(expected, "expected connection generation");
+  if (connection.generation !== expected) throw new StaleGenerationError(expected, connection.generation);
+}
+
+function assertMessagingRevision(
+  resource: string,
+  id: string,
+  actual: bigint,
+  expected: bigint
+): void {
+  if (actual !== expected) throw new RevisionConflictError(resource, id, expected, actual);
+}
+
+function messagingRevisionConflict(
+  store: OperationalStore,
+  current: MessagingConnectionRecord
+): RevisionConflictError {
+  return new RevisionConflictError(
+    "Messaging connection",
+    current.id,
+    current.revision,
+    store.getMessagingConnection(current.id).revision
+  );
+}
+
+function assertMessagingSessionMatchesRoute(
+  session: StoredSession,
+  route: MessagingRouteRecord,
+  expectedPermissionMode: MessagingRouteRecord["permissionMode"]
+): void {
+  const descriptor = session.descriptor;
+  if (
+    descriptor.targetId !== route.targetId || descriptor.backendId !== route.backendId ||
+    descriptor.providerId !== route.providerId || descriptor.modelId !== route.modelId ||
+    descriptor.effort !== route.effort || descriptor.fastMode !== route.fastMode ||
+    descriptor.permissionMode !== expectedPermissionMode || descriptor.planMode !== route.planMode
+  ) {
+    throw new StoreError("Messaging Session does not match the selected creation-time route snapshot.");
+  }
+}
+
+function collaborationIdentity(value: string, label: string): string {
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    [...normalized].length > 256 ||
+    /[\p{Cc}\u2028\u2029]/u.test(normalized)
+  ) {
+    throw new StoreError(`Collaboration ${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function collaborationShortText(value: string, label: string, maximum: number): string {
+  if (typeof value !== "string") throw new StoreError(`Collaboration ${label} must be text.`);
+  const normalized = value.normalize("NFC").replace(/\s+/gu, " ").trim();
+  if (
+    normalized.length === 0 ||
+    [...normalized].length > maximum ||
+    /[\p{Cc}\u2028\u2029]/u.test(normalized)
+  ) {
+    throw new StoreError(`Collaboration ${label} must contain between 1 and ${maximum} safe characters.`);
+  }
+  return normalized;
+}
+
+function collaborationRouteIdentity(value: string, label: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 512 || /[\u0000\r\n]/u.test(normalized)) {
+    throw new StoreError(`Collaboration worker ${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function collaborationPermissionMode(
+  value: CreateCollaborationWorkerInput["permissionMode"]
+): CreateCollaborationWorkerInput["permissionMode"] {
+  if (value !== "ask" && value !== "auto" && value !== "bypassPermissions") {
+    throw new StoreError("Collaboration worker permission mode is invalid.");
+  }
+  return value;
+}
+
+function collaborationText(value: string, label: string): string {
+  if (typeof value !== "string") throw new StoreError(`Collaboration ${label} must be text.`);
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  if (normalized.length === 0 || [...normalized].length > 32_000 || normalized.includes("\0")) {
+    throw new StoreError(`Collaboration ${label} must contain between 1 and 32000 safe characters.`);
+  }
+  return normalized;
+}
+
+function collaborationLimit(value: number, label: string, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new StoreError(`Collaboration ${label} must be an integer between 1 and ${maximum}.`);
+  }
+  return value;
+}
+
+function collaborationTimestamp(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new StoreError(`Collaboration ${label} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function assertActiveCollaborationSession(session: StoredSession, role: "lead" | "worker"): void {
+  if (session.descriptor.archived || session.descriptor.deletedAt !== undefined) {
+    throw new StoreError(`A collaboration ${role} requires an active, non-archived Session.`);
+  }
+}
+
+function assertCollaborationLead(goal: CollaborationGoalRecord, callerSessionId: string): void {
+  if (goal.leadSessionId !== callerSessionId) {
+    throw new AuthorizationError("Only the collaboration Goal lead Session can perform this action.");
+  }
+}
+
+function assertCollaborationRevision(
+  resource: string,
+  id: string,
+  actual: bigint,
+  expected: bigint
+): void {
+  if (actual !== expected) throw new RevisionConflictError(resource, id, expected, actual);
+}
+
+function assertSameCollaborationWorkerReservation(
+  worker: CollaborationWorkerRecord,
+  input: CreateCollaborationWorkerInput
+): void {
+  if (
+    worker.goalId !== input.goalId ||
+    worker.parentWorkerId !== input.parentWorkerId ||
+    worker.backendId !== input.backendId ||
+    worker.targetId !== input.targetId ||
+    worker.providerId !== input.providerId ||
+    worker.modelId !== input.modelId ||
+    worker.effort !== input.effort ||
+    worker.fastMode !== input.fastMode ||
+    worker.permissionMode !== input.permissionMode ||
+    worker.planMode !== input.planMode ||
+    worker.label !== collaborationShortText(input.label, "worker label", 64) ||
+    worker.role !== collaborationShortText(input.role, "worker role", 128) ||
+    worker.assignment !== collaborationText(input.assignment, "worker assignment")
+  ) {
+    throw new OperationConflictError(
+      input.createOperationId,
+      operationBodyHash({
+        goalId: worker.goalId,
+        parentWorkerId: worker.parentWorkerId,
+        backendId: worker.backendId,
+        targetId: worker.targetId,
+        providerId: worker.providerId,
+        modelId: worker.modelId,
+        effort: worker.effort,
+        fastMode: worker.fastMode,
+        permissionMode: worker.permissionMode,
+        planMode: worker.planMode,
+        label: worker.label,
+        role: worker.role,
+        assignment: worker.assignment
+      }),
+      operationBodyHash({
+        goalId: input.goalId,
+        parentWorkerId: input.parentWorkerId,
+        backendId: input.backendId,
+        targetId: input.targetId,
+        providerId: input.providerId,
+        modelId: input.modelId,
+        effort: input.effort,
+        fastMode: input.fastMode,
+        permissionMode: input.permissionMode,
+        planMode: input.planMode,
+        label: input.label,
+        role: input.role,
+        assignment: input.assignment
+      })
+    );
+  }
+}
+
+function assertSameCollaborationDispatch(
+  dispatch: CollaborationDispatchRecord,
+  input: CreateCollaborationDispatchInput
+): void {
+  if (
+    dispatch.goalId !== input.goalId ||
+    dispatch.workerId !== input.workerId ||
+    dispatch.callerLeadSessionId !== input.callerLeadSessionId ||
+    dispatch.message !== collaborationText(input.message, "dispatch message")
+  ) {
+    throw new OperationConflictError(
+      input.operationId,
+      operationBodyHash({
+        goalId: dispatch.goalId,
+        workerId: dispatch.workerId,
+        callerLeadSessionId: dispatch.callerLeadSessionId,
+        message: dispatch.message
+      }),
+      operationBodyHash({
+        goalId: input.goalId,
+        workerId: input.workerId,
+        callerLeadSessionId: input.callerLeadSessionId,
+        message: input.message
+      })
+    );
+  }
+}
+
+function assertCollaborationDispatchLead(
+  store: OperationalStore,
+  dispatch: CollaborationDispatchRecord,
+  callerSessionId: string
+): void {
+  const goal = store.getCollaborationGoal(dispatch.goalId);
+  assertCollaborationLead(goal, callerSessionId);
+  if (dispatch.callerLeadSessionId !== callerSessionId) {
+    throw new AuthorizationError("The collaboration dispatch belongs to another lead Session.");
+  }
 }
 
 function objectiveText(value: string): string {

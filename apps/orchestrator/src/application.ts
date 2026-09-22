@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
-import { userInfo } from "node:os";
+import { hostname, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -53,7 +53,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -135,6 +135,8 @@ import {
   resolveAuthenticatedLspTarget
 } from "./lsp-tool-bridge.js";
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { MessagingManager, type MessagingManagerOptions } from "./messaging-manager.js";
+import type { WeChatAuthorizationPort } from "./wechat-authorization-manager.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
@@ -162,6 +164,13 @@ import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
+import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
+import { CollaborationToolBridgeProvider } from "./collaboration-tool-provider.js";
+import { ContactManager } from "./contact-manager.js";
+import { ContactSyncManager } from "./contact-sync-manager.js";
+import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
+import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
+import { PartnerToolBridgeProvider } from "./partner-tool-provider.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import {
   RemoteBackendRuntimeSetupManager,
@@ -343,7 +352,19 @@ export interface OrchestratorApplication {
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
+  /** Direct third-party Messaging transport, durable admission and delivery owner. */
+  readonly messaging?: MessagingManager;
+  /** Test-only, process-local third-party authorization fixture seam. */
+  readonly messagingCreateWeChatAuthorization?: () => WeChatAuthorizationPort;
   readonly collaboration?: CollaborationManager;
+  /** Durable Goal/lead/worker scheduling authority. */
+  readonly collaborationGoals?: CollaborationGoalManager;
+  /** Node-local structured authority for people and organizations. */
+  readonly contacts?: ContactManager;
+  /** Explicitly granted, encrypted node-to-node Contacts convergence owner. */
+  readonly contactSync?: ContactSyncManager;
+  /** Node-local authority for long-lived partner profiles and their canonical Sessions. */
+  readonly partners?: PartnerManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -409,6 +430,18 @@ export interface OrchestratorApplicationDependencies {
   readonly providerAccountUsageFetch?: typeof fetch;
   /** Test-only transport seam; production uses the configured generic APNs provider. */
   readonly mobilePushProvider?: MobilePushProviderPort;
+  /** Test-only direct-Messaging loopback seams; not sourced from product configuration. */
+  readonly messagingTelegramApiBaseUrl?: string;
+  readonly messagingDiscordApiBaseUrl?: string;
+  readonly messagingDingTalkApiBaseUrl?: string;
+  readonly messagingDingTalkOapiBaseUrl?: string;
+  readonly messagingCreateFeishuTransport?: MessagingManagerOptions["createFeishuTransport"];
+  readonly messagingCreateWeComTransport?: MessagingManagerOptions["createWeComTransport"];
+  readonly messagingCreateWeChatTransport?: MessagingManagerOptions["createWeChatTransport"];
+  readonly messagingCreateSlackTransport?: MessagingManagerOptions["createSlackTransport"];
+  readonly messagingCreateWeChatAuthorization?: () => WeChatAuthorizationPort;
+  readonly messagingPollTimeoutSeconds?: number;
+  readonly messagingRetryDelayMs?: number;
 }
 
 export type OutboundProxyResolver = (
@@ -437,6 +470,23 @@ export async function createOrchestratorApplication(
   ]);
 
   const store = new OperationalStore(config.databasePath);
+  let contactStore: ContactStore;
+  try {
+    contactStore = new ContactStore(join(config.dataDirectory, "contacts.db"));
+  } catch (error) {
+    store.close();
+    throw error;
+  }
+  const contacts = new ContactManager(contactStore);
+  let partnerStore: PartnerStore;
+  try {
+    partnerStore = new PartnerStore(join(config.dataDirectory, "partners.db"));
+  } catch (error) {
+    contacts.close();
+    contactStore.close();
+    store.close();
+    throw error;
+  }
   let backendInstances!: BackendInstanceRegistry;
   let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
   const subagentModels = new SubagentModelSettings({
@@ -520,6 +570,29 @@ export async function createOrchestratorApplication(
   const baseSettings = await loadJsonFile<PiManagedSettings>(config.piSettingsFile, {});
   const settings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", "settings.pi.pi")?.value);
   const credentialVault = await CredentialVault.open(join(config.dataDirectory, "credentials", "master.key"));
+  let lastContactSyncDiagnosticAt = 0;
+  const contactSync = new ContactSyncManager({
+    store: contactStore,
+    vault: credentialVault,
+    nodeId: serverId,
+    displayName: contactSyncDisplayName(),
+    logger: {
+      debug: () => undefined,
+      warn: () => {
+        const at = Date.now();
+        if (at - lastContactSyncDiagnosticAt < 5 * 60_000) return;
+        lastContactSyncDiagnosticAt = at;
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "contacts-sync",
+          code: "CONTACTS_SYNC_UNAVAILABLE",
+          message: "Contacts device sync encountered a secure transport failure.",
+          details: {}
+        });
+      }
+    }
+  });
+  await contactSync.initialize().catch(() => undefined);
   const mobilePushProvider = dependencies.mobilePushProvider ?? (config.mobilePush === undefined
     ? undefined
     : new ApnsMobilePushProvider({
@@ -714,6 +787,9 @@ export async function createOrchestratorApplication(
       host: () => sessionHostForHelperTools,
       messageSearch: () => messageSearchForHelperTools
     })
+  );
+  const unregisterContactTools = mcpRouter.registerBridgeToolProvider(
+    new ContactToolBridgeProvider({ store, contacts })
   );
   const unregisterRemoteHostTools = mcpRouter.registerBridgeToolProvider(
     new RemoteHostToolBridgeProvider({ store, registry: remoteHosts, outputRedactor: credentials })
@@ -1166,6 +1242,7 @@ export async function createOrchestratorApplication(
   const workspaceCapture = new DurableWorkspaceRunCapture(store, workspaceChanges, workspaces, gitSafety);
   let androidRuntimeForSessionCleanup: AndroidRuntimeSupervisor | undefined;
   let computerBridgeForSessionCleanup: ComputerToolBridgeProvider | undefined;
+  let messaging: MessagingManager | undefined;
   const configuredProviderRouteEnabled = (backendId: string, providerId: string): boolean => {
     const backend = store.getBackend(backendId).descriptor;
     if (backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true) return true;
@@ -1198,6 +1275,7 @@ export async function createOrchestratorApplication(
         && providers.list(backendId).some((provider) => !provider.enabled)
       ),
     sessionRuntimeFallbackEnabled: () => configuredSessionRuntimeFallback(store),
+    serviceSessionRuntimeFallback: (input) => partnerSessionRuntimeFallback(partnerStore, input),
     backendDispatchBlocked: (backendId) => deferredBackendRestarts?.blocksDispatch(backendId) === true,
     onBackendMayBeIdle: (backendId) => deferredBackendRestarts?.onBackendMayBeIdle(backendId),
     sessionRuntimeFallbackContext: (backendId) => {
@@ -1223,8 +1301,66 @@ export async function createOrchestratorApplication(
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
     },
+    onServiceRunSettled: (input) => messaging?.onRunSettled(input),
+    onServiceInteractionOpened: (input) => messaging?.onInteractionOpened(input),
+    onServiceInteractionSettled: (input) => messaging?.onInteractionSettled(input),
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
+  messaging = new MessagingManager({
+    store,
+    credentials,
+    contextVault: credentialVault,
+    sessionHost,
+    artifacts,
+    ...(dependencies.messagingTelegramApiBaseUrl === undefined
+      ? {}
+      : { telegramApiBaseUrl: dependencies.messagingTelegramApiBaseUrl }),
+    ...(dependencies.messagingDiscordApiBaseUrl === undefined
+      ? {}
+      : { discordApiBaseUrl: dependencies.messagingDiscordApiBaseUrl }),
+    ...(dependencies.messagingDingTalkApiBaseUrl === undefined
+      ? {}
+      : { dingTalkApiBaseUrl: dependencies.messagingDingTalkApiBaseUrl }),
+    ...(dependencies.messagingDingTalkOapiBaseUrl === undefined
+      ? {}
+      : { dingTalkOapiBaseUrl: dependencies.messagingDingTalkOapiBaseUrl }),
+    ...(dependencies.messagingCreateFeishuTransport === undefined
+      ? {}
+      : { createFeishuTransport: dependencies.messagingCreateFeishuTransport }),
+    ...(dependencies.messagingCreateWeComTransport === undefined
+      ? {}
+      : { createWeComTransport: dependencies.messagingCreateWeComTransport }),
+    ...(dependencies.messagingCreateWeChatTransport === undefined
+      ? {}
+      : { createWeChatTransport: dependencies.messagingCreateWeChatTransport }),
+    ...(dependencies.messagingCreateSlackTransport === undefined
+      ? {}
+      : { createSlackTransport: dependencies.messagingCreateSlackTransport }),
+    ...(dependencies.messagingPollTimeoutSeconds === undefined
+      ? {}
+      : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),
+    ...(dependencies.messagingRetryDelayMs === undefined
+      ? {}
+      : { retryDelayMs: dependencies.messagingRetryDelayMs })
+  });
+  const partners = new PartnerManager({
+    store: partnerStore,
+    operationalStore: store,
+    sessionHost,
+    workspaceService: workspaces,
+    homesRoot: join(config.dataDirectory, "partner-homes")
+  });
+  const collaborationGoals = new CollaborationGoalManager({
+    store,
+    sessionHost,
+    readSettings: () => runtimeGovernance.collaboration()
+  });
+  const unregisterCollaborationGoalTools = mcpRouter.registerBridgeToolProvider(
+    new CollaborationToolBridgeProvider({ store, manager: collaborationGoals })
+  );
+  const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
+    new PartnerToolBridgeProvider({ store, partners })
+  );
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
     const result = backendLifecycleTail.catch(() => undefined).then(action);
@@ -1332,6 +1468,10 @@ export async function createOrchestratorApplication(
           // race the next replacement.
           piReplacementRefreshRoute = undefined;
         }
+        // A persisted Partner delivery may have been waiting for this Backend.
+        // Reconcile only after the replacement is published and admissions are
+        // open again; stable operations make this replay idempotent.
+        await partners.recoverPending();
       } catch (error) {
         if (replacementRoute !== undefined && piReplacementRefreshRoute !== undefined) {
           return await refreshRetainedPi(error);
@@ -1783,6 +1923,9 @@ export async function createOrchestratorApplication(
         await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
       }
     }
+    await messaging.initialize();
+    await collaborationGoals.initialize();
+    await partners.recoverPending();
 
     const computerRuntimeAdapter = computerAutomationRuntime(computerRuntime);
     computerAutomation = new ComputerAutomationSettingsController({
@@ -1989,6 +2132,8 @@ export async function createOrchestratorApplication(
     providerAuth.beginShutdown();
     providerAccountUsage.invalidate();
     await managedModelRuntimeSystem.close().catch(() => undefined);
+    await collaborationGoals.close().catch(() => undefined);
+    await messaging.close().catch(() => undefined);
     await sessionHost.dispose().catch(() => undefined);
     sessionWorktrees.dispose();
     await generationGcTail.catch(() => undefined);
@@ -2004,6 +2149,9 @@ export async function createOrchestratorApplication(
     unregisterAndroidBridge?.();
     unregisterImageGenerationBridge();
     unregisterSessionHelperTools();
+    unregisterContactTools();
+    unregisterCollaborationGoalTools();
+    unregisterPartnerTools();
     unregisterLspBridge();
     unregisterRemoteHostTools();
     lspBridge.dispose();
@@ -2022,6 +2170,10 @@ export async function createOrchestratorApplication(
     await remoteBackendRuntimeSetup.close().catch(() => undefined);
     await remoteHosts.close().catch(() => undefined);
     runtimeActivity.close();
+    contactSync.close();
+    contacts.close();
+    contactStore.close();
+    partnerStore.close();
     store.close();
     throw error;
   }
@@ -2070,7 +2222,15 @@ export async function createOrchestratorApplication(
     skillMarket,
     skillMarketSync,
     skillPublication,
+    messaging,
+    ...(dependencies.messagingCreateWeChatAuthorization === undefined
+      ? {}
+      : { messagingCreateWeChatAuthorization: dependencies.messagingCreateWeChatAuthorization }),
     collaboration,
+    collaborationGoals,
+    contacts,
+    contactSync,
+    partners,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -2140,6 +2300,8 @@ export async function createOrchestratorApplication(
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
         await attempt(() => managedModelRuntimeSystem.close());
+        await attempt(() => collaborationGoals.close());
+        await attempt(() => messaging.close());
         await refreshTail.catch(() => undefined);
         await backendLifecycleTail.catch(() => undefined);
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.
@@ -2160,6 +2322,9 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterAndroidBridge?.());
         await attempt(() => unregisterImageGenerationBridge());
         await attempt(() => unregisterSessionHelperTools());
+        await attempt(() => unregisterContactTools());
+        await attempt(() => unregisterCollaborationGoalTools());
+        await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => lspBridge.dispose());
@@ -2175,6 +2340,10 @@ export async function createOrchestratorApplication(
         await attempt(() => remoteHosts.close());
         await attempt(() => workspaces.close());
         await attempt(() => runtimeActivity.close());
+        await attempt(() => contactSync.close());
+        await attempt(() => contacts.close());
+        await attempt(() => contactStore.close());
+        await attempt(() => partnerStore.close());
         await attempt(() => store.close());
         if (failures.length === 1) throw failures[0];
         if (failures.length > 1) throw new AggregateError(failures, "Some Orchestrator owners could not finish shutdown.");
@@ -2182,6 +2351,13 @@ export async function createOrchestratorApplication(
       return closePromise;
     }
   };
+}
+
+function contactSyncDisplayName(): string {
+  const value = hostname().trim();
+  return value.length >= 1 && value.length <= 90 && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? `${value} · Joko`
+    : "Joko";
 }
 
 function createClaudeCodeCredentialPort(

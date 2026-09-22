@@ -151,6 +151,9 @@ async function copyWorkspaceInputs() {
     const destination = join(workspaceRoot, filename);
     await writeFile(destination, await readFile(source), { flag: "wx", mode: 0o644 });
   }
+  // The frozen workspace manifest names local dependency patches even when
+  // the filtered production closure does not install the patched package.
+  await copyRegularTree(join(repositoryRoot, "dependency-patches"), join(workspaceRoot, "dependency-patches"));
   for (const descriptor of ORCHESTRATOR_RUNTIME_PACKAGES) {
     const sourcePackageRoot = join(repositoryRoot, descriptor.workspacePath);
     const workspacePackageRoot = join(workspaceRoot, descriptor.workspacePath);

@@ -468,7 +468,7 @@ async function captureProcessIdentity(pid: number, platform: NodeJS.Platform): P
       ]);
       return linuxIdentity(stat, executable, bootId);
     }
-    return capturePortableIdentity(pid, platform);
+    return await capturePortableIdentity(pid, platform);
   } catch (error) {
     return identityFailure(error);
   }
@@ -534,8 +534,11 @@ function portableWindowsIdentityArgs(pid: number): readonly string[] {
 
 function identityFailure(error: unknown): undefined {
   if (isMissingProcessError(error)) return undefined;
-  const exitCode = (error as { code?: unknown }).code;
-  if (exitCode === 1 || exitCode === 3) return undefined;
+  const failure = error as { code?: unknown; status?: unknown };
+  const exitCodes = [failure.code, failure.status];
+  if (exitCodes.some((value) => value === 1 || value === 3 || value === "1" || value === "3")) {
+    return undefined;
+  }
   throw error;
 }
 

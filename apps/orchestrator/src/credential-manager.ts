@@ -55,6 +55,8 @@ interface UploadTicket {
   readonly providerId?: string;
   readonly connectionId?: string;
   readonly credentialReferenceId?: string;
+  /** Memory-only service surface fence. Tickets with this field can never be committed as user credentials. */
+  readonly servicePurpose?: string;
   providerLoginInput?: {
     readonly flowId: string;
     readonly promptId: string;
@@ -152,6 +154,7 @@ export class CredentialManager {
     readonly providerId?: string;
     readonly connectionId?: string;
     readonly credentialReferenceId?: string;
+    readonly servicePurpose?: string;
   } = {}): {
     readonly credentialUploadTicketId: string;
     readonly expiresAt: number;
@@ -175,6 +178,7 @@ export class CredentialManager {
       ...(options.providerId === undefined ? {} : { providerId: nonBlank(options.providerId, "Provider ID") }),
       ...(options.connectionId === undefined ? {} : { connectionId: nonBlank(options.connectionId, "Connection ID") }),
       ...(options.credentialReferenceId === undefined ? {} : { credentialReferenceId: normalizeReference(options.credentialReferenceId) }),
+      ...(options.servicePurpose === undefined ? {} : { servicePurpose: nonBlank(options.servicePurpose, "Service purpose") }),
       consumed: false
     });
     return { credentialUploadTicketId: id, expiresAt, maximumBytes };
@@ -300,7 +304,7 @@ export class CredentialManager {
   }): Promise<CredentialDescriptor> {
     this.#assertInitialized();
     const ticket = this.#requireTicket(input.credentialUploadTicketId);
-    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined) {
+    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined || ticket.servicePurpose !== undefined) {
       throw new Error("Ephemeral input tickets cannot be committed as credentials.");
     }
     if (ticket.sealed === undefined) throw new Error("Credential upload ticket has no uploaded value.");
@@ -389,6 +393,7 @@ export class CredentialManager {
     readonly displayName: string;
     readonly kind: CredentialKind;
     readonly connectionId: string;
+    readonly servicePurpose?: string;
     /** The service journals this non-secret reservation before any credential I/O. */
     readonly onReserved: (credentialReferenceId: string) => void;
   }): Promise<CredentialDescriptor> {
@@ -396,10 +401,14 @@ export class CredentialManager {
     const ticket = this.#requireTicket(input.credentialUploadTicketId);
     const displayName = nonBlank(input.displayName, "Credential display name");
     const connectionId = nonBlank(input.connectionId, "Connection ID");
+    const servicePurpose = input.servicePurpose === undefined
+      ? undefined
+      : nonBlank(input.servicePurpose, "Service purpose");
     validateCredentialKind(input.kind);
     if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined
       || ticket.credentialReferenceId !== undefined || ticket.providerId !== undefined
-      || ticket.kind !== input.kind || ticket.connectionId !== connectionId || ticket.sealed === undefined) {
+      || ticket.kind !== input.kind || ticket.connectionId !== connectionId
+      || ticket.servicePurpose !== servicePurpose || ticket.sealed === undefined) {
       throw new Error("Credential ticket does not authorize a new service credential.");
     }
     const reference = `cred_managed_${randomUUID()}`;
@@ -446,6 +455,7 @@ export class CredentialManager {
     readonly kind: CredentialKind;
     readonly providerId?: string;
     readonly connectionId?: string;
+    readonly servicePurpose?: string;
   }): Promise<CredentialDescriptor> {
     this.#assertInitialized();
     const ticket = this.#requireTicket(input.credentialUploadTicketId);
@@ -456,6 +466,7 @@ export class CredentialManager {
     if (ticket.kind !== undefined && ticket.kind !== input.kind) throw new Error("Credential upload ticket is bound to a different credential kind.");
     if (ticket.providerId !== undefined && ticket.providerId !== input.providerId) throw new Error("Credential upload ticket is bound to a different provider.");
     if (ticket.connectionId !== undefined && ticket.connectionId !== input.connectionId) throw new Error("Credential upload ticket is bound to a different connection.");
+    if (ticket.servicePurpose !== input.servicePurpose) throw new Error("Credential upload ticket is bound to a different service purpose.");
     const reference = normalizeReference(input.credentialReferenceId);
     const providerId = input.providerId === undefined ? undefined : nonBlank(input.providerId, "Provider ID");
     if (ticket.credentialReferenceId !== reference) {

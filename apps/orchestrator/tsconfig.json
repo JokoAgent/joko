@@ -11,6 +11,7 @@
     { "path": "../../packages/core" },
     { "path": "../../packages/git-safety" },
     { "path": "../../packages/local-model-runtime" },
+    { "path": "../../packages/messaging" },
     { "path": "../../packages/outbound-network" },
     { "path": "../../packages/remote-ssh" },
     { "path": "../../packages/runtime-governance" },

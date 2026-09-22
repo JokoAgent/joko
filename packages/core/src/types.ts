@@ -477,7 +477,8 @@ export type DynamicInputFieldType =
   | "boolean"
   | "object"
   | "array"
-  | "blob";
+  | "blob"
+  | "unknown";
 
 export interface DynamicInputFieldConstraints {
   readonly minimumLength?: number;
@@ -733,7 +734,11 @@ export interface SessionDescriptor {
   readonly worktree?: SessionWorktreeBinding;
   /** Immutable creation-time copy of the Target's Remote workspace binding. */
   readonly remoteWorkspace?: RemoteWorkspaceBinding;
-  /** Private creation-time system prompt snapshot; never map into public Session projections. */
+  /**
+   * Private runtime system-prompt snapshot; never map into public Session projections.
+   * Ordinary Sessions freeze it at creation. A service-owned Session may advance it
+   * only through the Host's explicit safe-boundary refresh path.
+   */
   readonly appendSystemPrompt?: string;
   /** Durable, content-free attention/read receipt projected by Orchestrator. */
   readonly attention?: SessionAttention;

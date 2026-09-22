@@ -81,6 +81,59 @@ describe("Pi built-in tool catalog", () => {
     });
   });
 
+  it("preserves heterogeneous scalar unions without inventing one branch as the field type", () => {
+    expect(projectPiInputSchema({
+      type: "object",
+      properties: {
+        expectedRevision: {
+          anyOf: [
+            { type: "string", pattern: "^[0-9]+$", maxLength: 32 },
+            { type: "integer", minimum: 0 }
+          ],
+          description: "Optional optimistic-concurrency revision."
+        }
+      }
+    }, "schedule_update")).toMatchObject({
+      fields: [{
+        fieldPath: "expectedRevision",
+        type: "unknown",
+        required: false,
+        description: "Optional optimistic-concurrency revision."
+      }]
+    });
+  });
+
+  it("projects nullable fields through their concrete branch while retaining nested fields", () => {
+    expect(projectPiInputSchema({
+      type: "object",
+      properties: {
+        expireAt: {
+          anyOf: [
+            { type: "integer", minimum: 0, description: "Unix-millisecond expiration." },
+            { type: "null" }
+          ]
+        },
+        preRunHook: {
+          anyOf: [
+            {
+              type: "object",
+              properties: { command: { type: "string", minLength: 1 } },
+              required: ["command"],
+              additionalProperties: false
+            },
+            { type: "null" }
+          ]
+        }
+      }
+    }, "schedule_update")).toMatchObject({
+      fields: expect.arrayContaining([
+        expect.objectContaining({ fieldPath: "expireAt", type: "integer", required: false }),
+        expect.objectContaining({ fieldPath: "preRunHook", type: "object", required: false }),
+        expect.objectContaining({ fieldPath: "preRunHook.command", type: "string", required: true })
+      ])
+    });
+  });
+
   it("projects more than 256 fields and schemas deeper than eight levels without recursion limits", () => {
     const properties = Object.fromEntries(
       Array.from({ length: 257 }, (_, index) => [`field_${index.toString().padStart(3, "0")}`, {

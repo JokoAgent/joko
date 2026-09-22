@@ -178,6 +178,260 @@ test("voice input remains an ephemeral capability surface", () => {
   assert.equal(fieldNames(contract.SnapshotSchema).has("voice_input"), false);
 });
 
+test("WeCom messaging exposes one strict non-secret bot configuration and revision-fenced update", () => {
+  assert.equal(field(contract.WeComMessagingConfigurationSchema, "bot_id").number, 1);
+  assert.equal(field(contract.MessagingConnectionSchema, "wecom_configuration").number, 20);
+  assert.equal(field(contract.CreateMessagingConnectionRequestSchema, "wecom_configuration").number, 7);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "connection_id").number, 1);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "expected_revision").number, 2);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "expected_generation").number, 3);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "configuration").number, 4);
+  assert.equal(methodNames(contract.MessagingService).has("updateWeComMessagingConfiguration"), true);
+  assertNoFields([
+    contract.WeComMessagingConfigurationSchema,
+    contract.MessagingConnectionSchema,
+    contract.CreateMessagingConnectionRequestSchema,
+    contract.UpdateWeComMessagingConfigurationRequestSchema
+  ], ["secret", "token", "credential", "credential_reference_id", "authorization"]);
+
+  const value = roundTrip(contract.WeComMessagingConfigurationSchema, { botId: "wecom-bot" });
+  assert.equal(value.botId, "wecom-bot");
+});
+
+test("WeChat messaging exposes only an empty configuration and a fenced QR authorization flow", () => {
+  assert.deepEqual([...fieldNames(contract.WeChatMessagingConfigurationSchema)], []);
+  assert.equal(field(contract.MessagingConnectionSchema, "wechat_configuration").number, 21);
+  assert.equal(field(contract.CreateMessagingConnectionRequestSchema, "wechat_configuration").number, 8);
+  for (const name of [
+    "beginWeChatAuthorization", "getWeChatAuthorization", "beginWeChatVerificationInput",
+    "submitWeChatVerificationCode", "cancelWeChatAuthorization"
+  ]) assert.equal(methodNames(contract.MessagingService).has(name), true, name);
+  for (const schema of [
+    contract.BeginWeChatAuthorizationRequestSchema,
+    contract.GetWeChatAuthorizationRequestSchema,
+    contract.BeginWeChatVerificationInputRequestSchema,
+    contract.SubmitWeChatVerificationCodeRequestSchema,
+    contract.CancelWeChatAuthorizationRequestSchema
+  ]) {
+    assert.equal(fieldNames(schema).has("expected_generation"), true, schema.typeName);
+  }
+  assert.equal(fieldNames(contract.WeChatAuthorizationAttemptSchema).has("qr_code_url"), true);
+  assert.equal(fieldNames(contract.WeChatAuthorizationAttemptSchema).has("verification_retry"), true);
+  assertNoFields([
+    contract.WeChatMessagingConfigurationSchema,
+    contract.WeChatAuthorizationAttemptSchema,
+    contract.BeginWeChatAuthorizationRequestSchema,
+    contract.GetWeChatAuthorizationResponseSchema,
+    contract.SubmitWeChatVerificationCodeRequestSchema
+  ], [
+    "token", "bot_token", "context_token", "qrcode", "poll_token", "verification_code",
+    "base_url", "aes_key", "credential_value"
+  ]);
+  const input = roundTrip(contract.WeChatAuthorizationAttemptSchema, {
+    attemptId: "attempt-id",
+    connectionId: "connection-id",
+    generation: 1n,
+    revision: 2n,
+    status: contract.WeChatAuthorizationStatus.VERIFICATION_REQUIRED,
+    qrCodeUrl: "https://ilinkai.weixin.qq.com/qr/example",
+    verificationRetry: true
+  });
+  assert.equal(input.status, contract.WeChatAuthorizationStatus.VERIFICATION_REQUIRED);
+  assert.equal(input.qrCodeUrl, "https://ilinkai.weixin.qq.com/qr/example");
+});
+
+test("Slack messaging exposes one non-secret channel configuration and fenced update", () => {
+  assert.deepEqual([...fieldNames(contract.SlackMessagingConfigurationSchema)], [
+    "lifecycle_announcements", "emoji_reactions", "group_activation_rules"
+  ]);
+  assert.equal(field(contract.SlackMessagingConfigurationSchema, "group_activation_rules").number, 3);
+  assert.equal(field(contract.SlackGroupActivationRuleSchema, "channel_id").number, 1);
+  assert.equal(field(contract.SlackGroupActivationRuleSchema, "activation").number, 2);
+  assert.equal(field(contract.MessagingConnectionSchema, "slack_configuration").number, 22);
+  assert.equal(field(contract.CreateMessagingConnectionRequestSchema, "slack_configuration").number, 9);
+  for (const [name, number] of [
+    ["connection_id", 1], ["expected_revision", 2], ["expected_generation", 3],
+    ["owner_provider_user_id", 4], ["configuration", 5]
+  ]) {
+    assert.equal(field(contract.UpdateSlackMessagingConfigurationRequestSchema, name).number, number);
+  }
+  assert.equal(methodNames(contract.MessagingService).has("updateSlackMessagingConfiguration"), true);
+  assertNoFields([
+    contract.SlackMessagingConfigurationSchema,
+    contract.SlackGroupActivationRuleSchema,
+    contract.UpdateSlackMessagingConfigurationRequestSchema
+  ], ["secret", "token", "credential", "authorization"]);
+  const value = roundTrip(contract.SlackMessagingConfigurationSchema, {
+    lifecycleAnnouncements: true,
+    emojiReactions: contract.SlackEmojiReactions.MINIMAL,
+    groupActivationRules: [{
+      channelId: "C0123456789",
+      activation: contract.SlackGroupActivation.MENTION
+    }]
+  });
+  assert.equal(value.groupActivationRules[0].channelId, "C0123456789");
+});
+
+test("Contacts exposes revision-fenced local and explicit device-sync authority without secret transport fields", () => {
+  assert.deepEqual([...methodNames(contract.ContactService)], [
+    "getContactDirectory",
+    "setContactDirectoryEnabled",
+    "listContacts",
+    "getContact",
+    "findSimilarContacts",
+    "createContact",
+    "updateContact",
+    "confirmContact",
+    "deleteContact",
+    "addContactIdentity",
+    "removeContactIdentity",
+    "appendContactEvent",
+    "removeContactEvent",
+    "listContactGroups",
+    "createContactGroup",
+    "updateContactGroup",
+    "deleteContactGroup",
+    "setContactGroupMembership",
+    "addContactRelation",
+    "updateContactRelation",
+    "removeContactRelation",
+    "scanContactDuplicates",
+    "mergeContacts",
+    "previewContactVCardImport",
+    "commitContactVCardImport",
+    "exportContactsVCard",
+    "getContactSyncStatus",
+    "setContactSyncEnabled",
+    "grantContactSyncPeer",
+    "revokeContactSyncPeer",
+    "syncContactsNow"
+  ]);
+  assertNoFields([
+    contract.ContactDirectorySchema,
+    contract.ContactSummarySchema,
+    contract.ContactProfileSchema,
+    contract.ContactIdentitySchema,
+    contract.ContactVCardImportPreviewEntrySchema,
+    contract.ExportContactsVCardResponseSchema,
+    contract.ContactSyncStatusSchema,
+    contract.ContactSyncPeerSchema,
+    contract.ContactSyncCandidateSchema,
+    contract.GrantContactSyncPeerRequestSchema,
+    contract.RevokeContactSyncPeerRequestSchema,
+    contract.SyncContactsNowRequestSchema
+  ], [
+    "absolute_path", "database_path", "credential", "credential_reference_id",
+    "device_contact_id", "system_contact_id", "permission_token", "public_key", "private_key",
+    "sealed_private_key", "proof", "challenge", "ciphertext", "state_json", "projection_json",
+    "address", "port"
+  ]);
+  assert.equal(field(contract.ContactPatchSchema, "display_name").proto.proto3Optional, true);
+  assert.equal(field(contract.ContactVCardImportDecisionSchema, "target_contact_id").proto.proto3Optional, true);
+});
+
+test("Partners exposes revision-fenced durable profiles without private home or runtime authority", () => {
+  assert.deepEqual([...methodNames(contract.PartnerService)], [
+    "getPartnerDirectory",
+    "listPartners",
+    "getPartner",
+    "createPartner",
+    "updatePartner",
+    "setPartnerLifecycle",
+    "retryPartnerInitialization",
+    "updatePartnerDefaults",
+    "listPartnerSessions",
+    "markPartnerRead",
+    "listPartnerPrivateThreads",
+    "getPartnerPrivateThread",
+    "markPartnerPrivateThreadRead",
+    "listPartnerDelegations",
+    "getPartnerDelegation",
+    "cancelPartnerDelegation"
+  ]);
+  assertNoFields([
+    contract.PartnerDirectorySchema,
+    contract.PartnerProfileSchema,
+    contract.PartnerTemplateSchema,
+    contract.PartnerDraftSchema,
+    contract.PartnerPatchSchema,
+    contract.PartnerActivitySchema,
+    contract.PartnerSessionSchema,
+    contract.PartnerPrivateThreadSchema,
+    contract.PartnerPrivateMessageSchema,
+    contract.PartnerPrivateThreadReadStateSchema,
+    contract.PartnerDelegationSchema
+  ], [
+    "absolute_path", "workspace_root", "database_path", "credential", "credential_reference_id",
+    "auth_key", "operation_id", "create_operation_id", "enqueue_operation_id", "raw_error", "error_message",
+    "sender_session_id", "recipient_session_id"
+  ]);
+  assert.equal(field(contract.PartnerProfileSchema, "canonical_session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPatchSchema, "display_name").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPatchSchema, "permission_mode").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPatchSchema, "uses_directory_defaults").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerSessionSchema, "delegation_id").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPrivateThreadSchema, "close_reason").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerPrivateMessageSchema, "delivered_at").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerDelegationSchema, "child_session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerDelegationSchema, "result_summary").proto.proto3Optional, true);
+  assert.equal(field(contract.PartnerDelegationSchema, "error").proto.proto3Optional, true);
+});
+
+test("Collaboration exposes exact Goal, worker, lifecycle, and Queue CAS authority without private runtime data", () => {
+  assert.deepEqual([...methodNames(contract.CollaborationService)], [
+    "listCollaborationGoals",
+    "getCollaborationGoal",
+    "createCollaborationGoal",
+    "setCollaborationGoalStatus",
+    "createCollaborationWorker",
+    "updateCollaborationWorker",
+    "focusCollaborationWorker",
+    "wakeCollaborationWorker",
+    "stopCollaborationWorker",
+    "releaseCollaborationWorker",
+    "archiveCollaborationWorker",
+    "sendCollaborationWorkerMessage",
+    "interruptCollaborationWorker",
+    "editCollaborationDispatch",
+    "cancelCollaborationDispatch",
+    "mergeCollaborationDispatches"
+  ]);
+  assertNoFields([
+    contract.CollaborationGoalSchema,
+    contract.CollaborationWorkerRouteSchema,
+    contract.CollaborationWorkerSchema,
+    contract.CollaborationDispatchSchema,
+    contract.CollaborationGoalTreeSchema,
+    contract.CollaborationGoalAccessSchema,
+    contract.ListCollaborationGoalsRequestSchema,
+    contract.GetCollaborationGoalRequestSchema,
+    contract.CreateCollaborationWorkerRequestSchema,
+    contract.WakeCollaborationWorkerRequestSchema,
+    contract.ReleaseCollaborationWorkerRequestSchema
+  ], [
+    "absolute_path", "workspace_root", "credential", "credential_reference_id",
+    "auth_key", "private_runtime_handle", "native_reference", "raw_error", "error_message"
+  ]);
+  assert.equal(field(contract.CollaborationGoalSchema, "maximum_workers").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "parent_worker_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "session_generation").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "backend_instance_generation").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerRouteSchema, "provider_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerRouteSchema, "model_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerRouteSchema, "effort").proto.proto3Optional, true);
+  assert.equal(field(contract.FocusCollaborationWorkerRequestSchema, "worker_id").proto.proto3Optional, true);
+  assert.equal(field(contract.FocusCollaborationWorkerRequestSchema, "expected_worker_revision").proto.proto3Optional, true);
+  assert.equal(field(contract.StopCollaborationWorkerRequestSchema, "expected_session_generation").proto.proto3Optional, true);
+  assert.deepEqual(fields(contract.ListCollaborationGoalsRequestSchema).map((candidate) => candidate.name), [
+    "session_id", "include_archived"
+  ]);
+  assert.deepEqual(fields(contract.GetCollaborationGoalRequestSchema).map((candidate) => candidate.name), [
+    "goal_id", "viewer_session_id"
+  ]);
+  assert.equal(field(contract.CollaborationGoalAccessSchema, "worker_id").proto.proto3Optional, true);
+});
+
 test("discovery metadata is a closed public allowlist", () => {
   assert.deepEqual(fields(contract.DiscoveredNodeSchema).map((candidate) => candidate.name), [
     "server_id", "display_name", "origin", "version", "api_version", "pairing_enabled", "last_seen"

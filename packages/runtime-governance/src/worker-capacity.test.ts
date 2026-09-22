@@ -48,4 +48,32 @@ describe("worker capacity controller", () => {
     expect(controller.snapshot()).toMatchObject({ active: 0, idle: 1 });
     await controller.close();
   });
+
+  it("restores durable workers beyond a lowered limit and blocks only new admission", async () => {
+    const ids = ["restored-1", "restored-2", "new"];
+    const controller = createWorkerCapacityController({
+      readSettings: () => ({ workerSoftLimit: 1, workerHardLimit: 1, workerIdleReleaseMinutes: 10 }),
+      releaseIdleWorker: () => undefined,
+      now: () => 10_000,
+      idFactory: () => ids.shift()!
+    });
+    const first = controller.restore({
+      ownerId: "goal-1",
+      workerId: "worker-1",
+      state: "active",
+      acquiredAt: 1
+    });
+    const second = controller.restore({
+      ownerId: "goal-2",
+      workerId: "worker-2",
+      state: "idle",
+      acquiredAt: 2,
+      idleSince: 3
+    });
+    expect(first.softLimitReached).toBe(true);
+    expect(second.softLimitReached).toBe(true);
+    expect(controller.snapshot()).toMatchObject({ active: 1, idle: 1, hardLimit: 1 });
+    await expect(controller.acquire("goal-3", "worker-3")).rejects.toBeInstanceOf(WorkerHardLimitError);
+    await controller.close();
+  });
 });

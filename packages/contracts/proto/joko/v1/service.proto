@@ -5,13 +5,17 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/collaboration.proto";
+import "joko/v1/contact.proto";
 import "joko/v1/event.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/managed_model_runtime.proto";
+import "joko/v1/messaging.proto";
 import "joko/v1/mobile_push.proto";
 import "joko/v1/model.proto";
 import "joko/v1/operation.proto";
+import "joko/v1/partner.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/portable_session.proto";
 import "joko/v1/runtime.proto";
@@ -188,6 +192,110 @@ service CredentialService {
 
 service SettingsService {
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+}
+
+// Authenticated node-owned third-party Messaging authority. Credentials enter
+// only through connection-bound one-shot upload tickets and are never projected.
+service MessagingService {
+  rpc GetMessagingSettings(GetMessagingSettingsRequest) returns (GetMessagingSettingsResponse);
+  rpc CreateMessagingConnection(CreateMessagingConnectionRequest) returns (CreateMessagingConnectionResponse);
+  rpc BeginMessagingCredentialUpload(BeginMessagingCredentialUploadRequest) returns (BeginMessagingCredentialUploadResponse);
+  rpc CommitMessagingCredential(CommitMessagingCredentialRequest) returns (CommitMessagingCredentialResponse);
+  rpc ClearMessagingCredential(ClearMessagingCredentialRequest) returns (ClearMessagingCredentialResponse);
+  rpc SetMessagingConnectionEnabled(SetMessagingConnectionEnabledRequest) returns (SetMessagingConnectionEnabledResponse);
+  rpc UpdateTelegramMessagingConfiguration(UpdateTelegramMessagingConfigurationRequest) returns (UpdateTelegramMessagingConfigurationResponse);
+  rpc UpdateDiscordMessagingConfiguration(UpdateDiscordMessagingConfigurationRequest) returns (UpdateDiscordMessagingConfigurationResponse);
+  rpc UpdateDingTalkMessagingConfiguration(UpdateDingTalkMessagingConfigurationRequest) returns (UpdateDingTalkMessagingConfigurationResponse);
+  rpc UpdateFeishuMessagingConfiguration(UpdateFeishuMessagingConfigurationRequest) returns (UpdateFeishuMessagingConfigurationResponse);
+  rpc UpdateWeComMessagingConfiguration(UpdateWeComMessagingConfigurationRequest) returns (UpdateWeComMessagingConfigurationResponse);
+  rpc UpdateSlackMessagingConfiguration(UpdateSlackMessagingConfigurationRequest) returns (UpdateSlackMessagingConfigurationResponse);
+  rpc BeginWeChatAuthorization(BeginWeChatAuthorizationRequest) returns (BeginWeChatAuthorizationResponse);
+  rpc GetWeChatAuthorization(GetWeChatAuthorizationRequest) returns (GetWeChatAuthorizationResponse);
+  rpc BeginWeChatVerificationInput(BeginWeChatVerificationInputRequest) returns (BeginWeChatVerificationInputResponse);
+  rpc SubmitWeChatVerificationCode(SubmitWeChatVerificationCodeRequest) returns (SubmitWeChatVerificationCodeResponse);
+  rpc CancelWeChatAuthorization(CancelWeChatAuthorizationRequest) returns (CancelWeChatAuthorizationResponse);
+  rpc TestMessagingConnection(TestMessagingConnectionRequest) returns (TestMessagingConnectionResponse);
+  rpc PutMessagingRoute(PutMessagingRouteRequest) returns (PutMessagingRouteResponse);
+}
+
+// Authenticated, node-local contact authority. Device address-book access is
+// exposed separately because operating-system permission is not implied here.
+service ContactService {
+  rpc GetContactDirectory(GetContactDirectoryRequest) returns (GetContactDirectoryResponse);
+  rpc SetContactDirectoryEnabled(SetContactDirectoryEnabledRequest) returns (SetContactDirectoryEnabledResponse);
+  rpc ListContacts(ListContactsRequest) returns (ListContactsResponse);
+  rpc GetContact(GetContactRequest) returns (GetContactResponse);
+  rpc FindSimilarContacts(FindSimilarContactsRequest) returns (FindSimilarContactsResponse);
+  rpc CreateContact(CreateContactRequest) returns (CreateContactResponse);
+  rpc UpdateContact(UpdateContactRequest) returns (UpdateContactResponse);
+  rpc ConfirmContact(ConfirmContactRequest) returns (ConfirmContactResponse);
+  rpc DeleteContact(DeleteContactRequest) returns (DeleteContactResponse);
+  rpc AddContactIdentity(AddContactIdentityRequest) returns (AddContactIdentityResponse);
+  rpc RemoveContactIdentity(RemoveContactIdentityRequest) returns (RemoveContactIdentityResponse);
+  rpc AppendContactEvent(AppendContactEventRequest) returns (AppendContactEventResponse);
+  rpc RemoveContactEvent(RemoveContactEventRequest) returns (RemoveContactEventResponse);
+  rpc ListContactGroups(ListContactGroupsRequest) returns (ListContactGroupsResponse);
+  rpc CreateContactGroup(CreateContactGroupRequest) returns (CreateContactGroupResponse);
+  rpc UpdateContactGroup(UpdateContactGroupRequest) returns (UpdateContactGroupResponse);
+  rpc DeleteContactGroup(DeleteContactGroupRequest) returns (DeleteContactGroupResponse);
+  rpc SetContactGroupMembership(SetContactGroupMembershipRequest) returns (SetContactGroupMembershipResponse);
+  rpc AddContactRelation(AddContactRelationRequest) returns (AddContactRelationResponse);
+  rpc UpdateContactRelation(UpdateContactRelationRequest) returns (UpdateContactRelationResponse);
+  rpc RemoveContactRelation(RemoveContactRelationRequest) returns (RemoveContactRelationResponse);
+  rpc ScanContactDuplicates(ScanContactDuplicatesRequest) returns (ScanContactDuplicatesResponse);
+  rpc MergeContacts(MergeContactsRequest) returns (MergeContactsResponse);
+  rpc PreviewContactVCardImport(PreviewContactVCardImportRequest) returns (PreviewContactVCardImportResponse);
+  rpc CommitContactVCardImport(CommitContactVCardImportRequest) returns (CommitContactVCardImportResponse);
+  rpc ExportContactsVCard(ExportContactsVCardRequest) returns (ExportContactsVCardResponse);
+  rpc GetContactSyncStatus(GetContactSyncStatusRequest) returns (GetContactSyncStatusResponse);
+  rpc SetContactSyncEnabled(SetContactSyncEnabledRequest) returns (SetContactSyncEnabledResponse);
+  rpc GrantContactSyncPeer(GrantContactSyncPeerRequest) returns (GrantContactSyncPeerResponse);
+  rpc RevokeContactSyncPeer(RevokeContactSyncPeerRequest) returns (RevokeContactSyncPeerResponse);
+  rpc SyncContactsNow(SyncContactsNowRequest) returns (SyncContactsNowResponse);
+}
+
+// Authenticated, node-local authority for durable long-lived partners. Home
+// filesystem paths remain private; clients receive only stable Target and
+// canonical Session identities.
+service PartnerService {
+  rpc GetPartnerDirectory(GetPartnerDirectoryRequest) returns (GetPartnerDirectoryResponse);
+  rpc ListPartners(ListPartnersRequest) returns (ListPartnersResponse);
+  rpc GetPartner(GetPartnerRequest) returns (GetPartnerResponse);
+  rpc CreatePartner(CreatePartnerRequest) returns (CreatePartnerResponse);
+  rpc UpdatePartner(UpdatePartnerRequest) returns (UpdatePartnerResponse);
+  rpc SetPartnerLifecycle(SetPartnerLifecycleRequest) returns (SetPartnerLifecycleResponse);
+  rpc RetryPartnerInitialization(RetryPartnerInitializationRequest) returns (RetryPartnerInitializationResponse);
+  rpc UpdatePartnerDefaults(UpdatePartnerDefaultsRequest) returns (UpdatePartnerDefaultsResponse);
+  rpc ListPartnerSessions(ListPartnerSessionsRequest) returns (ListPartnerSessionsResponse);
+  rpc MarkPartnerRead(MarkPartnerReadRequest) returns (MarkPartnerReadResponse);
+  rpc ListPartnerPrivateThreads(ListPartnerPrivateThreadsRequest) returns (ListPartnerPrivateThreadsResponse);
+  rpc GetPartnerPrivateThread(GetPartnerPrivateThreadRequest) returns (GetPartnerPrivateThreadResponse);
+  rpc MarkPartnerPrivateThreadRead(MarkPartnerPrivateThreadReadRequest) returns (MarkPartnerPrivateThreadReadResponse);
+  rpc ListPartnerDelegations(ListPartnerDelegationsRequest) returns (ListPartnerDelegationsResponse);
+  rpc GetPartnerDelegation(GetPartnerDelegationRequest) returns (GetPartnerDelegationResponse);
+  rpc CancelPartnerDelegation(CancelPartnerDelegationRequest) returns (CancelPartnerDelegationResponse);
+}
+
+// Authenticated, Backend-neutral authority for one lead Session and its
+// durable worker tree. Mutations are revision/generation fenced; dispatches
+// enter the worker Queue before any Backend can observe them.
+service CollaborationService {
+  rpc ListCollaborationGoals(ListCollaborationGoalsRequest) returns (ListCollaborationGoalsResponse);
+  rpc GetCollaborationGoal(GetCollaborationGoalRequest) returns (GetCollaborationGoalResponse);
+  rpc CreateCollaborationGoal(CreateCollaborationGoalRequest) returns (CreateCollaborationGoalResponse);
+  rpc SetCollaborationGoalStatus(SetCollaborationGoalStatusRequest) returns (SetCollaborationGoalStatusResponse);
+  rpc CreateCollaborationWorker(CreateCollaborationWorkerRequest) returns (CreateCollaborationWorkerResponse);
+  rpc UpdateCollaborationWorker(UpdateCollaborationWorkerRequest) returns (UpdateCollaborationWorkerResponse);
+  rpc FocusCollaborationWorker(FocusCollaborationWorkerRequest) returns (FocusCollaborationWorkerResponse);
+  rpc WakeCollaborationWorker(WakeCollaborationWorkerRequest) returns (WakeCollaborationWorkerResponse);
+  rpc StopCollaborationWorker(StopCollaborationWorkerRequest) returns (StopCollaborationWorkerResponse);
+  rpc ReleaseCollaborationWorker(ReleaseCollaborationWorkerRequest) returns (ReleaseCollaborationWorkerResponse);
+  rpc ArchiveCollaborationWorker(ArchiveCollaborationWorkerRequest) returns (ArchiveCollaborationWorkerResponse);
+  rpc SendCollaborationWorkerMessage(SendCollaborationWorkerMessageRequest) returns (SendCollaborationWorkerMessageResponse);
+  rpc InterruptCollaborationWorker(InterruptCollaborationWorkerRequest) returns (InterruptCollaborationWorkerResponse);
+  rpc EditCollaborationDispatch(EditCollaborationDispatchRequest) returns (EditCollaborationDispatchResponse);
+  rpc CancelCollaborationDispatch(CancelCollaborationDispatchRequest) returns (CancelCollaborationDispatchResponse);
+  rpc MergeCollaborationDispatches(MergeCollaborationDispatchesRequest) returns (MergeCollaborationDispatchesResponse);
 }
 
 // Orchestrator-node-owned local inference runtimes. Shared clients discover every

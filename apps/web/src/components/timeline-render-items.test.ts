@@ -94,6 +94,24 @@ describe("projectTimelineRenderItems", () => {
     expect(findTimelineRenderItemIndex(projected, "plan-first")).toBe(1);
   });
 
+  it("keeps a valid Partner delegation card out of the collapsed work group", () => {
+    const delegation = timelineItem("delegation", "toolResult", 2, {
+      tool: partnerDelegationTool()
+    });
+    const projected = projectTimelineRenderItems([
+      timelineItem("thinking", "thinking", 1),
+      delegation,
+      timelineItem("tool-after", "tool", 3)
+    ]);
+
+    expect(isTimelineWorkActivity(delegation)).toBe(false);
+    expect(projected.map((item) => [item.type, item.key])).toEqual([
+      ["work", "thinking"],
+      ["item", "delegation"],
+      ["work", "tool-after"]
+    ]);
+  });
+
   it("marks only an active tail group running and exposes its latest five children", () => {
     const activities = Array.from({ length: 8 }, (_, index) =>
       timelineItem(`activity-${index + 1}`, index % 2 === 0 ? "thinking" : "tool", index + 2)
@@ -184,6 +202,39 @@ function timelineItem(
     kind,
     createdAt,
     ...overrides
+  };
+}
+
+function partnerDelegationTool(): NonNullable<TimelineItemView["tool"]> {
+  return {
+    id: "tool-delegation",
+    name: "mcp__joko_partners__start_delegation",
+    state: "succeeded",
+    input: "",
+    output: JSON.stringify({
+      id: "delegation-one",
+      revision: "1",
+      requester_partner_id: "partner-one",
+      target_partner_id: "partner-two",
+      parent_session_id: "session-one",
+      target_profile_version: "1",
+      target_partner: {
+        id: "partner-two",
+        display_name: "Nova",
+        avatar: "orbit",
+        status: "active",
+        ready: true
+      },
+      title: "Research",
+      objective: "Find the durable answer",
+      status: "queued",
+      child_session_id: "session-two",
+      run_id: "run-one",
+      artifact_count: 0,
+      created_at: 2_000,
+      updated_at: 2_000
+    }),
+    isError: false
   };
 }
 

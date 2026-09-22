@@ -57,10 +57,39 @@ import {
   CompactSessionOutcome,
   CollaborationRole as ProtoCollaborationRole,
   CollaborationScopeKind as ProtoCollaborationScopeKind,
+  CollaborationDispatchStatus as ProtoCollaborationDispatchStatus,
+  CollaborationGoalStatus as ProtoCollaborationGoalStatus,
+  CollaborationInterruptStopOutcome as ProtoCollaborationInterruptStopOutcome,
+  CollaborationSessionRole as ProtoCollaborationSessionRole,
+  CollaborationService,
+  CollaborationWorkerStatus as ProtoCollaborationWorkerStatus,
   CompactionState,
   ContextRebuildReason,
   CompositeArgumentKind,
   ConnectionService,
+  ContactDuplicateMatchType,
+  ContactKind as ProtoContactKind,
+  ContactRelationDirection,
+  ContactService,
+  ContactSource as ProtoContactSource,
+  ContactStatus as ProtoContactStatus,
+  ContactSyncErrorCode,
+  ContactSyncPeerState,
+  ContactSyncPhase,
+  ContactSyncRoute,
+  ContactVCardImportDecisionKind,
+  ContactVCardImportDisposition,
+  ContactVCardImportOutcome,
+  PartnerInitializationErrorCode,
+  PartnerInitializationState,
+  PartnerInvitationStage,
+  PartnerDelegationStatus,
+  PartnerLifecycle,
+  PartnerPrivateMessageDeliveryStatus,
+  PartnerPrivateThreadCloseReason,
+  PartnerPrivateThreadStatus,
+  PartnerSessionRole,
+  PartnerService,
   CredentialKind,
   CredentialService,
   DeviceKind,
@@ -123,6 +152,11 @@ import {
   ManagedModelRuntimeTransferKind,
   ManagedModelRuntimeTransferPhase,
   ManagedProcessPriority,
+  MessagingChannel as ProtoMessagingChannel,
+  MessagingConnectionRuntimeStatus as ProtoMessagingConnectionRuntimeStatus,
+  MessagingConnectionTestFailure as ProtoMessagingConnectionTestFailure,
+  MessagingService,
+  WeChatAuthorizationStatus as ProtoWeChatAuthorizationStatus,
   ModelInputModality,
   ModelOutputModality,
   ModelPriceCurrency,
@@ -279,6 +313,23 @@ import {
   VoiceInputTerminalOutcome,
   VoiceInputTextSource,
   VoiceInputTranscriptionProtocol,
+  DiscordEmojiReactions as ProtoDiscordEmojiReactions,
+  DiscordGroupActivation as ProtoDiscordGroupActivation,
+  DiscordGroupActivationRuleSchema as ProtoDiscordGroupActivationRuleSchema,
+  DiscordReplyQuoteMode as ProtoDiscordReplyQuoteMode,
+  DingTalkGroupActivation as ProtoDingTalkGroupActivation,
+  DingTalkGroupActivationRuleSchema as ProtoDingTalkGroupActivationRuleSchema,
+  FeishuEmojiReactions as ProtoFeishuEmojiReactions,
+  FeishuGroupActivation as ProtoFeishuGroupActivation,
+  FeishuGroupActivationRuleSchema as ProtoFeishuGroupActivationRuleSchema,
+  FeishuReplyQuoteMode as ProtoFeishuReplyQuoteMode,
+  SlackEmojiReactions as ProtoSlackEmojiReactions,
+  SlackGroupActivation as ProtoSlackGroupActivation,
+  SlackGroupActivationRuleSchema as ProtoSlackGroupActivationRuleSchema,
+  TelegramEmojiReactions as ProtoTelegramEmojiReactions,
+  TelegramGroupActivation as ProtoTelegramGroupActivation,
+  TelegramGroupActivationRuleSchema as ProtoTelegramGroupActivationRuleSchema,
+  TelegramReplyQuoteMode as ProtoTelegramReplyQuoteMode,
   WorktreeEligibility,
   WorktreeService,
   WorktreeSourceStrategy,
@@ -295,7 +346,32 @@ import {
   type BrowserProvider,
   type BrowserTransfer,
   type Connection,
+  type ContactDirectory as ProtoContactDirectory,
+  type ContactDraft as ProtoContactDraft,
+  type ContactDuplicateCandidate as ProtoContactDuplicateCandidate,
+  type ContactGroup as ProtoContactGroup,
+  type ContactIdentity as ProtoContactIdentity,
+  type ContactEvent as ProtoContactEvent,
+  type ContactProfile as ProtoContactProfile,
+  type ContactRelation as ProtoContactRelation,
+  type ContactSummary as ProtoContactSummary,
+  type ContactSyncStatus as ProtoContactSyncStatus,
+  type ContactVCardImportPreviewEntry as ProtoContactVCardImportPreviewEntry,
+  type PartnerCapabilities as ProtoPartnerCapabilities,
+  type PartnerActivity as ProtoPartnerActivity,
+  type PartnerDelegation as ProtoPartnerDelegation,
+  type PartnerDirectory as ProtoPartnerDirectory,
+  type PartnerPrivateMessage as ProtoPartnerPrivateMessage,
+  type PartnerPrivateThread as ProtoPartnerPrivateThread,
+  type PartnerPrivateThreadReadState as ProtoPartnerPrivateThreadReadState,
+  type PartnerProfile as ProtoPartnerProfile,
+  type PartnerSession as ProtoPartnerSession,
   type CollaborationDirectory as ProtoCollaborationDirectory,
+  type CollaborationDispatch as ProtoCollaborationDispatch,
+  type CollaborationGoal as ProtoCollaborationGoal,
+  type CollaborationGoalTree as ProtoCollaborationGoalTree,
+  type CollaborationQueueEntry as ProtoCollaborationQueueEntry,
+  type CollaborationWorker as ProtoCollaborationWorker,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
   type Device,
@@ -330,6 +406,16 @@ import {
   type ManagedResource,
   type ManagedModelRuntime,
   type McpServerDescriptor,
+  type MessagingConnection as ProtoMessagingConnection,
+  type MessagingRoute as ProtoMessagingRoute,
+  type DingTalkMessagingConfiguration as ProtoDingTalkMessagingConfiguration,
+  type DiscordMessagingConfiguration as ProtoDiscordMessagingConfiguration,
+  type FeishuMessagingConfiguration as ProtoFeishuMessagingConfiguration,
+  type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
+  type WeComMessagingConfiguration as ProtoWeComMessagingConfiguration,
+  type WeChatAuthorizationAttempt as ProtoWeChatAuthorizationAttempt,
+  type WeChatMessagingConfiguration as ProtoWeChatMessagingConfiguration,
+  type SlackMessagingConfiguration as ProtoSlackMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
   type ModelDescriptor,
@@ -466,6 +552,35 @@ import type {
   BrowserView,
   ComposerDraft,
   ConnectionProfile,
+  ContactCreateResultView,
+  ContactDirectoryView,
+  ContactDraftView,
+  ContactDuplicateCandidateView,
+  ContactDuplicatePairView,
+  ContactEventInputView,
+  ContactEventView,
+  ContactGroupView,
+  ContactIdentityInputView,
+  ContactIdentityView,
+  ContactKindView,
+  ContactListOptionsView,
+  ContactListPageView,
+  ContactMergeResultView,
+  ContactMutationView,
+  ContactPatchView,
+  ContactProfileView,
+  ContactRelationView,
+  ContactSourceView,
+  ContactStatusView,
+  ContactSyncStatusView,
+  ContactSummaryView,
+  ContactVCardExportView,
+  ContactVCardImportDecisionKindView,
+  ContactVCardImportDecisionView,
+  ContactVCardImportDispositionView,
+  ContactVCardImportPreviewEntryView,
+  ContactVCardImportPreviewView,
+  ContactVCardImportResultView,
   CredentialDraft,
   DeviceControlRelationView,
   DeviceView,
@@ -505,7 +620,44 @@ import type {
   ModelPriceQuoteView,
   ModelView,
   ManagedModelRuntimeView,
+  MessagingConnectionTestResultView,
+  MessagingConnectionView,
+  MessagingRouteDraftView,
+  MessagingRouteView,
+  MessagingSettingsView,
+  DingTalkMessagingConfigurationView,
+  DiscordMessagingConfigurationView,
+  FeishuMessagingConfigurationView,
+  WeComMessagingConfigurationView,
+  WeChatAuthorizationAttemptView,
+  WeChatMessagingConfigurationView,
+  SlackMessagingConfigurationView,
   OperationApi,
+  PartnerCapabilitiesView,
+  PartnerActivityView,
+  PartnerDelegationStatusView,
+  PartnerDelegationView,
+  PartnerDefaultsMutationView,
+  PartnerDirectoryView,
+  PartnerDraftView,
+  PartnerInitializationErrorCodeView,
+  PartnerInitializationStateView,
+  PartnerInvitationStageView,
+  PartnerLifecycleView,
+  PartnerListView,
+  PartnerModelRouteView,
+  PartnerMutationView,
+  PartnerPatchView,
+  PartnerPrivateMessageDeliveryStatusView,
+  PartnerPrivateMessageView,
+  PartnerPrivateThreadCloseReasonView,
+  PartnerPrivateThreadDetailView,
+  PartnerPrivateThreadReadStateView,
+  PartnerPrivateThreadStatusView,
+  PartnerPrivateThreadView,
+  PartnerProfileView,
+  PartnerSessionRoleView,
+  PartnerSessionView,
   PermissionArgumentView,
   PermissionMode,
   PermissionSubjectView,
@@ -562,8 +714,18 @@ import type {
   TargetView,
   SkillCatalogView,
   CollaborationDirectoryView,
+  CollaborationDispatchStatusView,
+  CollaborationDispatchView,
+  CollaborationGoalStatusView,
+  CollaborationGoalTreeView,
+  CollaborationGoalView,
+  CollaborationInterruptStopOutcomeView,
+  CollaborationQueueEntryView,
   CollaborationScopeKindView,
   CollaborationScopeView,
+  CollaborationWorkerDraftView,
+  CollaborationWorkerStatusView,
+  CollaborationWorkerView,
   SkillDescriptorView,
   SkillDiffChangeView,
   SkillDiffView,
@@ -670,6 +832,7 @@ import type {
   VoiceInputDictionaryLearningActionView,
   VoiceInputRefinementContextView,
   VoiceInputServiceSettingsDraft,
+  TelegramMessagingConfigurationView,
   VoiceInputTranscriptionProtocolView,
   TargetDraft,
   TargetWorktreeProbeView,
@@ -5709,6 +5872,1402 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async deleteCredential(credentialId: string): Promise<void> {
     await this.submit({ case: "deleteCredential", value: { credentialReferenceId: credentialId } }, true);
+  }
+
+  async getMessagingSettings(signal?: AbortSignal): Promise<MessagingSettingsView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .getMessagingSettings({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const channels = response.channels.map((value) => ({
+      channel: mapMessagingChannel(value.channel),
+      available: value.available,
+      ...(value.reason === "" ? {} : { reason: value.reason })
+    }));
+    if (new Set(channels.map((value) => value.channel)).size !== channels.length) {
+      throw new GatewayError("Orchestrator returned duplicate Messaging channel capabilities.");
+    }
+    return {
+      connections: response.connections.map(mapMessagingConnection),
+      routes: response.routes.map(mapMessagingRoute),
+      channels
+    };
+  }
+
+  async createTelegramMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.TELEGRAM,
+      ownerProviderUserId,
+      ...(configuration === undefined ? {} : {
+        telegramConfiguration: protoTelegramMessagingConfiguration(configuration)
+      })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createDiscordMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.DISCORD,
+      ownerProviderUserId,
+      ...(configuration === undefined ? {} : {
+        discordConfiguration: protoDiscordMessagingConfiguration(configuration)
+      })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createDingTalkMessagingConnection(
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.DINGTALK,
+      dingtalkConfiguration: protoDingTalkMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createFeishuMessagingConnection(
+    channel: "feishu" | "lark",
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: channel === "feishu" ? ProtoMessagingChannel.FEISHU : ProtoMessagingChannel.LARK,
+      feishuConfiguration: protoFeishuMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createWeComMessagingConnection(
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.WECOM,
+      wecomConfiguration: protoWeComMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createWeChatMessagingConnection(signal?: AbortSignal): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.WECHAT,
+      wechatConfiguration: protoWeChatMessagingConfiguration({ format: 1 })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createSlackMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    if (!validSlackOwnerId(ownerProviderUserId)) throw new GatewayError("Slack owner user ID is invalid.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.SLACK,
+      ownerProviderUserId,
+      ...(configuration === undefined ? {} : { slackConfiguration: protoSlackMessagingConfiguration(configuration) })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async beginWeChatAuthorization(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).beginWeChatAuthorization({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, connectionId, expectedGeneration);
+  }
+
+  async getWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).getWeChatAuthorization({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, attempt.connectionId, attempt.generation, attempt.attemptId);
+  }
+
+  async submitWeChatVerificationCode(
+    attempt: WeChatAuthorizationAttemptView,
+    code: string,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    if (!/^\d{1,12}$/u.test(code)) throw new GatewayError("A WeChat verification code must contain 1–12 digits.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(MessagingService, scope.transport);
+    const begun = await client.beginWeChatVerificationInput({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation
+    }, { signal: scope.signal });
+    const ticketId = await this.uploadCredentialTicket(code, begun.ticket, scope);
+    scope.signal.throwIfAborted();
+    const response = await client.submitWeChatVerificationCode({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation,
+      credentialInputTicketId: ticketId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, attempt.connectionId, attempt.generation, attempt.attemptId);
+  }
+
+  async cancelWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).cancelWeChatAuthorization({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, attempt.connectionId, attempt.generation, attempt.attemptId);
+  }
+
+  async saveMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    secret: string,
+    enable: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    if (secret.length === 0) throw new GatewayError("Messaging credential value is required.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(MessagingService, scope.transport);
+    const begun = await client.beginMessagingCredentialUpload({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration
+    }, { signal: scope.signal });
+    const ticketId = await this.uploadCredentialTicket(secret, begun.ticket, scope);
+    scope.signal.throwIfAborted();
+    const response = await client.commitMessagingCredential({
+      credentialUploadTicketId: ticketId,
+      enable
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async clearMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).clearMessagingCredential({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async setMessagingConnectionEnabled(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    enabled: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).setMessagingConnectionEnabled({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration,
+      enabled
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateTelegramMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateTelegramMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        ownerProviderUserId,
+        configuration: protoTelegramMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateDiscordMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateDiscordMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        ownerProviderUserId,
+        configuration: protoDiscordMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateDingTalkMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateDingTalkMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        configuration: protoDingTalkMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateFeishuMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateFeishuMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        configuration: protoFeishuMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateWeComMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateWeComMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        configuration: protoWeComMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateSlackMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    if (!validSlackOwnerId(ownerProviderUserId)) throw new GatewayError("Slack owner user ID is invalid.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateSlackMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        ownerProviderUserId,
+        configuration: protoSlackMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async testMessagingConnection(
+    connectionId: string,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionTestResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .testMessagingConnection({ connectionId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.ok) return { ok: false, failure: mapMessagingTestFailure(response.failure) };
+    if (response.providerAccountId === undefined || response.providerAccountId === ""
+      || response.displayName === undefined || response.displayName === "") {
+      throw new GatewayError("Orchestrator returned an incomplete Messaging connection test result.");
+    }
+    return {
+      ok: true,
+      providerAccountId: response.providerAccountId,
+      displayName: response.displayName,
+      ...(response.username === undefined ? {} : { username: response.username })
+    };
+  }
+
+  async putMessagingRoute(
+    draft: MessagingRouteDraftView,
+    signal?: AbortSignal
+  ): Promise<MessagingRouteView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).putMessagingRoute({
+      ...(draft.connectionId === undefined ? {} : { connectionId: draft.connectionId }),
+      ...(draft.expectedRevision === undefined ? {} : { expectedRevision: { value: draft.expectedRevision } }),
+      targetId: draft.targetId,
+      ...(draft.providerId === undefined ? {} : { providerId: draft.providerId }),
+      ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
+      ...(draft.effort === undefined ? {} : { effort: draft.effort }),
+      fastMode: draft.fastMode,
+      permissionMode: protoPermission(draft.permissionMode),
+      planMode: draft.planMode
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingRoute(response.route);
+  }
+
+  async getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerDirectory({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerDirectory(response.directory);
+  }
+
+  async listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartners({
+      ...(lifecycle === undefined ? {} : { lifecycle: protoPartnerLifecycle(lifecycle) })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      partners: response.partners.map(mapPartnerProfile),
+      directory: mapPartnerDirectory(response.directory)
+    };
+  }
+
+  async getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartner({ partnerId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerProfile(response.partner);
+  }
+
+  async createPartner(
+    expectedDirectoryRevision: bigint,
+    draft: PartnerDraftView,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).createPartner({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      draft: {
+        displayName: draft.displayName,
+        avatar: draft.avatar,
+        identitySource: draft.identitySource,
+        templateId: draft.templateId,
+        ...(draft.capabilities === undefined ? {} : { capabilities: protoPartnerCapabilities(draft.capabilities) }),
+        usesDirectoryDefaults: draft.usesDirectoryDefaults
+      }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async updatePartner(
+    partnerId: string,
+    expectedRevision: bigint,
+    patch: PartnerPatchView,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).updatePartner({
+      partnerId,
+      expectedRevision: { value: expectedRevision },
+      patch: protoPartnerPatch(patch)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async setPartnerLifecycle(
+    partnerId: string,
+    expectedRevision: bigint,
+    lifecycle: PartnerLifecycleView,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).setPartnerLifecycle({
+      partnerId,
+      expectedRevision: { value: expectedRevision },
+      lifecycle: protoPartnerLifecycle(lifecycle)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async retryPartnerInitialization(
+    partnerId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retryPartnerInitialization({
+      partnerId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async updatePartnerDefaults(
+    expectedDirectoryRevision: bigint,
+    capabilities: PartnerCapabilitiesView,
+    signal?: AbortSignal
+  ): Promise<PartnerDefaultsMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).updatePartnerDefaults({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      capabilities: protoPartnerCapabilities(capabilities)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      directory: mapPartnerDirectory(response.directory),
+      affectedPartners: response.affectedPartners.map(mapPartnerProfile)
+    };
+  }
+
+  async listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerSessions(
+      { partnerId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const sessions = response.sessions.map(mapPartnerSession);
+    if (sessions.some((session) => session.partnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a Partner task owned by another profile.");
+    }
+    return sessions;
+  }
+
+  async markPartnerRead(
+    partnerId: string,
+    throughCursor: bigint,
+    signal?: AbortSignal
+  ): Promise<PartnerActivityView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).markPartnerRead({
+      partnerId,
+      throughCursor: { value: throughCursor }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const activity = mapPartnerActivity(response.activity);
+    if (activity.partnerId !== partnerId || activity.readThroughCursor < throughCursor) {
+      throw new GatewayError("Orchestrator returned activity owned by another Partner.");
+    }
+    return activity;
+  }
+
+  async listPartnerPrivateThreads(
+    partnerId: string,
+    signal?: AbortSignal
+  ): Promise<readonly PartnerPrivateThreadView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerPrivateThreads(
+      { partnerId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const threads = response.threads.map(mapPartnerPrivateThread);
+    if (threads.some((thread) => thread.firstPartnerId !== partnerId && thread.secondPartnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a private thread owned by other Partners.");
+    }
+    return threads;
+  }
+
+  async getPartnerPrivateThread(
+    partnerId: string,
+    threadId: string,
+    signal?: AbortSignal
+  ): Promise<PartnerPrivateThreadDetailView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerPrivateThread(
+      { partnerId, threadId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const thread = mapPartnerPrivateThread(response.thread);
+    const messages = response.messages.map(mapPartnerPrivateMessage);
+    const readState = response.readState === undefined ? undefined : mapPartnerPrivateReadState(response.readState);
+    let previousSequence = 0;
+    if (thread.id !== threadId
+      || (thread.firstPartnerId !== partnerId && thread.secondPartnerId !== partnerId)
+      || thread.messageCount !== messages.length
+      || messages.some((message) => {
+        const participantsMatch = message.senderPartnerId === thread.firstPartnerId
+          && message.recipientPartnerId === thread.secondPartnerId
+          || message.senderPartnerId === thread.secondPartnerId
+          && message.recipientPartnerId === thread.firstPartnerId;
+        const valid = message.threadId === thread.id && participantsMatch && message.sequence > previousSequence;
+        previousSequence = message.sequence;
+        return !valid;
+      })
+      || (readState !== undefined && (
+        readState.threadId !== thread.id || readState.partnerId !== partnerId
+        || readState.throughSequence > (messages.at(-1)?.sequence ?? 0)
+      ))) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner private thread.");
+    }
+    return { thread, messages, ...(readState === undefined ? {} : { readState }) };
+  }
+
+  async markPartnerPrivateThreadRead(
+    partnerId: string,
+    threadId: string,
+    throughSequence: number,
+    signal?: AbortSignal
+  ): Promise<PartnerPrivateThreadReadStateView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).markPartnerPrivateThreadRead({
+      partnerId,
+      threadId,
+      throughSequence: BigInt(throughSequence)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const readState = mapPartnerPrivateReadState(response.readState);
+    if (readState.partnerId !== partnerId || readState.threadId !== threadId
+      || readState.throughSequence < throughSequence) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner private read state.");
+    }
+    return readState;
+  }
+
+  async listPartnerDelegations(
+    partnerId: string,
+    signal?: AbortSignal
+  ): Promise<readonly PartnerDelegationView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerDelegations(
+      { partnerId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const delegations = response.delegations.map(mapPartnerDelegation);
+    if (delegations.some((delegation) => delegation.requesterPartnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a delegation owned by another Partner.");
+    }
+    return delegations;
+  }
+
+  async getPartnerDelegation(
+    partnerId: string,
+    delegationId: string,
+    signal?: AbortSignal
+  ): Promise<PartnerDelegationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerDelegation(
+      { partnerId, delegationId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const delegation = mapPartnerDelegation(response.delegation);
+    if (delegation.id !== delegationId
+      || (delegation.requesterPartnerId !== partnerId && delegation.targetPartnerId !== partnerId)) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner delegation.");
+    }
+    return delegation;
+  }
+
+  async cancelPartnerDelegation(
+    partnerId: string,
+    delegationId: string,
+    expectedRevision: bigint,
+    signal?: AbortSignal
+  ): Promise<PartnerDelegationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).cancelPartnerDelegation({
+      partnerId,
+      delegationId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const delegation = mapPartnerDelegation(response.delegation);
+    if (delegation.id !== delegationId || delegation.requesterPartnerId !== partnerId) {
+      throw new GatewayError("Orchestrator returned a mismatched Partner delegation cancellation.");
+    }
+    return delegation;
+  }
+
+  async listCollaborationGoals(
+    sessionId: string,
+    includeArchived = false,
+    signal?: AbortSignal
+  ): Promise<readonly CollaborationGoalView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).listCollaborationGoals({
+      sessionId,
+      includeArchived
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const goals = response.access.map((entry) => {
+      const goal = mapCollaborationGoal(entry.goal);
+      const lead = entry.role === ProtoCollaborationSessionRole.LEAD;
+      const worker = entry.role === ProtoCollaborationSessionRole.WORKER;
+      if ((lead && (goal.leadSessionId !== sessionId || entry.workerId !== undefined))
+        || (worker && (goal.leadSessionId === sessionId || !validCollaborationOwnedIdentity(entry.workerId ?? "")))
+        || (!lead && !worker)) {
+        throw new GatewayError("Orchestrator returned an invalid collaboration Session role.");
+      }
+      return goal;
+    });
+    if (new Set(goals.map((goal) => goal.id)).size !== goals.length) {
+      throw new GatewayError("Orchestrator returned duplicate collaboration Goal access.");
+    }
+    return goals;
+  }
+
+  async getCollaborationGoal(
+    goalId: string,
+    viewerSessionId: string,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).getCollaborationGoal(
+      { goalId, viewerSessionId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationGoalTree(response.tree);
+    if (tree.goal.id !== goalId) throw new GatewayError("Orchestrator returned a different collaboration Goal.");
+    if (tree.goal.leadSessionId !== viewerSessionId
+      && !tree.workers.some((worker) => worker.sessionId === viewerSessionId)) {
+      throw new GatewayError("Orchestrator returned a collaboration Goal outside the viewing task.");
+    }
+    return tree;
+  }
+
+  async createCollaborationGoal(
+    leadSessionId: string,
+    expectedSessionGeneration: bigint,
+    title: string,
+    objective: string,
+    maximumWorkers?: number,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).createCollaborationGoal({
+      operationId: randomUuid(),
+      leadSessionId,
+      expectedSessionGeneration,
+      title,
+      objective,
+      ...(maximumWorkers === undefined ? {} : { maximumWorkers })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationGoalTree(response.tree);
+    if (tree.goal.leadSessionId !== leadSessionId || tree.goal.sessionGeneration !== expectedSessionGeneration
+      || tree.goal.title !== title || tree.goal.objective !== objective
+      || tree.goal.maximumWorkers !== maximumWorkers || tree.goal.status !== "active") {
+      throw new GatewayError("Orchestrator returned a collaboration Goal owned by another lead task.");
+    }
+    return tree;
+  }
+
+  async setCollaborationGoalStatus(
+    goal: CollaborationGoalView,
+    status: Exclude<CollaborationGoalStatusView, "active">,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).setCollaborationGoalStatus({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: goal.revision },
+      status: protoCollaborationGoalStatus(status)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    if (tree.goal.status !== status) throw new GatewayError("Orchestrator returned a mismatched collaboration Goal status.");
+    return tree;
+  }
+
+  async createCollaborationWorker(
+    goal: CollaborationGoalView,
+    draft: CollaborationWorkerDraftView,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).createCollaborationWorker({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedGoalRevision: { value: goal.revision },
+      ...(draft.parentWorkerId === undefined ? {} : { parentWorkerId: draft.parentWorkerId }),
+      label: draft.label,
+      role: draft.role,
+      assignment: draft.assignment,
+      targetId: draft.targetId,
+      ...(draft.providerId === undefined ? {} : { providerId: draft.providerId }),
+      ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
+      ...(draft.effort === undefined ? {} : { effort: draft.effort }),
+      fastMode: draft.fastMode,
+      permissionMode: protoPermission(draft.permissionMode),
+      planMode: draft.planMode
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const worker = mapCollaborationWorker(response.worker);
+    if (worker.goalId !== goal.id || worker.parentWorkerId !== draft.parentWorkerId
+      || worker.label !== draft.label || worker.role !== draft.role || worker.assignment !== draft.assignment
+      || worker.route.targetId !== draft.targetId || worker.route.providerId !== draft.providerId
+      || worker.route.modelId !== draft.modelId || worker.route.effort !== draft.effort
+      || worker.route.fastMode !== draft.fastMode || worker.route.permissionMode !== draft.permissionMode
+      || worker.route.planMode !== draft.planMode
+      || !tree.workers.some((candidate) => candidate.id === worker.id && candidate.revision === worker.revision)) {
+      throw new GatewayError("Orchestrator returned a collaboration worker outside the requested Goal.");
+    }
+    return tree;
+  }
+
+  async updateCollaborationWorker(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    patch: { readonly label?: string; readonly role?: string; readonly assignment?: string },
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).updateCollaborationWorker({
+      operationId: randomUuid(),
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      ...patch
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    const updated = mapCollaborationWorker(response.worker);
+    if ((patch.label !== undefined && updated.label !== patch.label)
+      || (patch.role !== undefined && updated.role !== patch.role)
+      || (patch.assignment !== undefined && updated.assignment !== patch.assignment)) {
+      throw new GatewayError("Orchestrator returned a collaboration worker without the requested update.");
+    }
+    return tree;
+  }
+
+  async focusCollaborationWorker(
+    goal: CollaborationGoalView,
+    worker?: CollaborationWorkerView,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).focusCollaborationWorker({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      callerLeadSessionId: goal.leadSessionId,
+      ...(worker === undefined ? {} : {
+        workerId: worker.id,
+        expectedWorkerRevision: { value: worker.revision }
+      })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    if (tree.focusedWorkerId !== worker?.id) {
+      throw new GatewayError("Orchestrator returned a mismatched collaboration worker focus.");
+    }
+    return tree;
+  }
+
+  async wakeCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).wakeCollaborationWorker({
+      operationId: randomUuid(), workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      expectedSessionGeneration: requiredCollaborationWorkerGeneration(worker)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    if (mapCollaborationWorker(response.worker).runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker that remained released after wake.");
+    }
+    return tree;
+  }
+
+  async stopCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).stopCollaborationWorker({
+      operationId: randomUuid(), workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      ...(worker.sessionGeneration === undefined ? {} : { expectedSessionGeneration: worker.sessionGeneration })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    const stopped = mapCollaborationWorker(response.worker);
+    if (stopped.status !== "stopped" || !stopped.runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker that did not stop.");
+    }
+    return tree;
+  }
+
+  async releaseCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).releaseCollaborationWorker({
+      operationId: randomUuid(), workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      expectedSessionGeneration: requiredCollaborationWorkerGeneration(worker)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    if (!mapCollaborationWorker(response.worker).runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker with an unreleased runtime.");
+    }
+    return tree;
+  }
+
+  async archiveCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).archiveCollaborationWorker({
+      operationId: randomUuid(),
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    const archived = mapCollaborationWorker(response.worker);
+    if (archived.status !== "archived" || !archived.runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker that was not archived.");
+    }
+    return tree;
+  }
+
+  async sendCollaborationWorkerMessage(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    message: string,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const generation = requiredCollaborationWorkerGeneration(worker);
+    const response = await createClient(CollaborationService, scope.transport).sendCollaborationWorkerMessage({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedWorkerRevision: { value: worker.revision },
+      expectedSessionGeneration: generation,
+      message
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const dispatch = mapCollaborationDispatch(response.dispatch);
+    if (dispatch.workerId !== worker.id || dispatch.message !== message
+      || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id && entry.dispatch.revision === dispatch.revision)) {
+      throw new GatewayError("Orchestrator returned a mismatched collaboration dispatch.");
+    }
+    return tree;
+  }
+
+  async interruptCollaborationWorker(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    message: string,
+    signal?: AbortSignal
+  ): Promise<{ readonly tree: CollaborationGoalTreeView; readonly stopOutcome: CollaborationInterruptStopOutcomeView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).interruptCollaborationWorker({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedWorkerRevision: { value: worker.revision },
+      expectedSessionGeneration: requiredCollaborationWorkerGeneration(worker),
+      message
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const dispatch = mapCollaborationDispatch(response.dispatch);
+    if (dispatch.workerId !== worker.id || dispatch.message !== message
+      || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id && entry.dispatch.revision === dispatch.revision)) {
+      throw new GatewayError("Orchestrator returned a mismatched collaboration interrupt dispatch.");
+    }
+    return { tree, stopOutcome: collaborationInterruptStopOutcome(response.stopOutcome) };
+  }
+
+  async editCollaborationDispatch(
+    dispatch: CollaborationDispatchView,
+    queueItem: QueueItemView,
+    message: string,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).editCollaborationDispatch({
+      operationId: randomUuid(),
+      dispatchId: dispatch.id,
+      callerLeadSessionId: dispatch.callerLeadSessionId,
+      expectedDispatchRevision: { value: dispatch.revision },
+      expectedQueueRevision: { value: queueItem.revision },
+      message
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationQueueMutation(response.tree, response.dispatch, dispatch);
+    if (mapCollaborationDispatch(response.dispatch).message !== message) {
+      throw new GatewayError("Orchestrator returned a collaboration dispatch without the requested edit.");
+    }
+    return tree;
+  }
+
+  async cancelCollaborationDispatch(
+    dispatch: CollaborationDispatchView,
+    queueItem: QueueItemView,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).cancelCollaborationDispatch({
+      operationId: randomUuid(),
+      dispatchId: dispatch.id,
+      callerLeadSessionId: dispatch.callerLeadSessionId,
+      expectedDispatchRevision: { value: dispatch.revision },
+      expectedQueueRevision: { value: queueItem.revision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationQueueMutation(response.tree, response.dispatch, dispatch);
+    if (mapCollaborationDispatch(response.dispatch).status !== "cancelled") {
+      throw new GatewayError("Orchestrator returned a collaboration dispatch that was not cancelled.");
+    }
+    return tree;
+  }
+
+  async mergeCollaborationDispatches(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    entries: readonly CollaborationQueueEntryView[],
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    if (entries.length < 2 || entries.some((entry) => entry.dispatch.workerId !== worker.id || entry.queueItem === undefined)) {
+      throw new GatewayError("Select at least two pending messages from one collaboration worker.");
+    }
+    const response = await createClient(CollaborationService, scope.transport).mergeCollaborationDispatches({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      dispatches: entries.map((entry) => ({
+        dispatchId: entry.dispatch.id,
+        expectedDispatchRevision: { value: entry.dispatch.revision },
+        expectedQueueRevision: { value: entry.queueItem!.revision }
+      }))
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const dispatches = response.dispatches.map(mapCollaborationDispatch);
+    const expectedIds = new Set(entries.map((entry) => entry.dispatch.id));
+    if (dispatches.length !== entries.length || new Set(dispatches.map((dispatch) => dispatch.id)).size !== dispatches.length
+      || dispatches.some((dispatch) => !expectedIds.has(dispatch.id) || dispatch.goalId !== goal.id
+        || dispatch.workerId !== worker.id || dispatch.callerLeadSessionId !== goal.leadSessionId
+        || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id
+          && entry.dispatch.revision === dispatch.revision))) {
+      throw new GatewayError("Orchestrator returned an incomplete collaboration Queue merge.");
+    }
+    return tree;
+  }
+
+  async getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).getContactDirectory({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).setContactDirectoryEnabled({
+      expectedDirectoryRevision: { value: expectedRevision }, enabled
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async listContacts(options: ContactListOptionsView = {}, signal?: AbortSignal): Promise<ContactListPageView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).listContacts({
+      ...(options.query === undefined ? {} : { query: options.query }),
+      ...(options.kind === undefined ? {} : { kind: protoContactKind(options.kind) }),
+      ...(options.status === undefined ? {} : { status: protoContactStatus(options.status) }),
+      ...(options.groupId === undefined ? {} : { contactGroupId: options.groupId }),
+      pageSize: options.pageSize ?? 100,
+      pageOffset: options.pageOffset ?? 0
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      contacts: response.contacts.map(mapContactSummary),
+      total: response.total,
+      ...(response.nextPageOffset === undefined ? {} : { nextPageOffset: response.nextPageOffset })
+    };
+  }
+
+  async getContact(contactId: string, signal?: AbortSignal): Promise<ContactProfileView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).getContact({ contactId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactProfile(response.contact);
+  }
+
+  async findSimilarContacts(contact: ContactDraftView, signal?: AbortSignal): Promise<readonly ContactDuplicateCandidateView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).findSimilarContacts({ contact: protoContactDraft(contact) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.candidates.map(mapContactDuplicateCandidate);
+  }
+
+  async createContact(
+    expectedDirectoryRevision: bigint,
+    contact: ContactDraftView,
+    confirmedNameCandidateIds: readonly string[] = [],
+    signal?: AbortSignal
+  ): Promise<ContactCreateResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).createContact({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      contact: protoContactDraft(contact),
+      confirmedNameCandidateIds: [...confirmedNameCandidateIds]
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      ...(response.contact === undefined ? {} : { contact: mapContactProfile(response.contact) }),
+      candidates: response.candidates.map(mapContactDuplicateCandidate),
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async updateContact(contactId: string, expectedRevision: bigint, patch: ContactPatchView, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).updateContact({
+      contactId, expectedRevision: { value: expectedRevision }, patch: protoContactPatch(patch)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async confirmContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).confirmContact({
+      contactId, expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async deleteContact(contactId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).deleteContact({
+      contactId, expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async addContactIdentity(contactId: string, expectedContactRevision: bigint, identity: ContactIdentityInputView, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).addContactIdentity({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, identity: protoContactIdentityInput(identity)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async removeContactIdentity(contactId: string, expectedContactRevision: bigint, contactIdentityId: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).removeContactIdentity({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, contactIdentityId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async appendContactEvent(contactId: string, expectedContactRevision: bigint, event: ContactEventInputView, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).appendContactEvent({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, event: protoContactEventInput(event)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async removeContactEvent(contactId: string, expectedContactRevision: bigint, contactEventId: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).removeContactEvent({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, contactEventId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async listContactGroups(signal?: AbortSignal): Promise<readonly ContactGroupView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).listContactGroups({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.groups.map(mapContactGroup);
+  }
+
+  async createContactGroup(expectedDirectoryRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).createContactGroup({
+      expectedDirectoryRevision: { value: expectedDirectoryRevision }, name, description
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { group: mapContactGroup(response.group), directory: mapContactDirectory(response.directory) };
+  }
+
+  async updateContactGroup(contactGroupId: string, expectedRevision: bigint, name: string, description: string, signal?: AbortSignal): Promise<{ readonly group: ContactGroupView; readonly directory: ContactDirectoryView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).updateContactGroup({
+      contactGroupId, expectedRevision: { value: expectedRevision }, name, description
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { group: mapContactGroup(response.group), directory: mapContactDirectory(response.directory) };
+  }
+
+  async deleteContactGroup(contactGroupId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactDirectoryView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).deleteContactGroup({
+      contactGroupId, expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactDirectory(response.directory);
+  }
+
+  async setContactGroupMembership(contactId: string, expectedContactRevision: bigint, contactGroupId: string, member: boolean, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).setContactGroupMembership({
+      contactId, expectedContactRevision: { value: expectedContactRevision }, contactGroupId, member
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async addContactRelation(fromContactId: string, expectedFromRevision: bigint, toContactId: string, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).addContactRelation({
+      fromContactId, expectedFromRevision: { value: expectedFromRevision }, toContactId, relation, note
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async updateContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, expectedRelationRevision: bigint, relation: string, note: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).updateContactRelation({
+      ownerContactId,
+      expectedOwnerRevision: { value: expectedOwnerRevision },
+      contactRelationId,
+      expectedRelationRevision: { value: expectedRelationRevision },
+      relation,
+      note
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async removeContactRelation(ownerContactId: string, expectedOwnerRevision: bigint, contactRelationId: string, signal?: AbortSignal): Promise<ContactMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).removeContactRelation({
+      ownerContactId, expectedOwnerRevision: { value: expectedOwnerRevision }, contactRelationId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactMutation(response.contact, response.directory);
+  }
+
+  async scanContactDuplicates(limit = 100, signal?: AbortSignal): Promise<{ readonly pairs: readonly ContactDuplicatePairView[]; readonly directory: ContactDirectoryView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).scanContactDuplicates({ limit }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      pairs: response.pairs.map((pair) => ({ first: mapContactSummary(pair.first), second: mapContactSummary(pair.second) })),
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async mergeContacts(targetContactId: string, expectedTargetRevision: bigint, mergedContactId: string, expectedMergedRevision: bigint, signal?: AbortSignal): Promise<ContactMergeResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).mergeContacts({
+      targetContactId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      mergedContactId,
+      expectedMergedRevision: { value: expectedMergedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      target: mapContactProfile(response.target),
+      mergedContactId: response.mergedContactId,
+      movedIdentities: response.movedIdentities,
+      movedEvents: response.movedEvents,
+      movedRelations: response.movedRelations,
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).previewContactVCardImport({ vcardText }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return {
+      previewId: response.previewId,
+      directoryRevision: requiredContactRevision(response.directoryRevision, "vCard preview directory"),
+      entries: response.entries.map(mapContactVCardImportPreviewEntry),
+      expiresAt: requiredContactTimestamp(response.expiresAt, "vCard preview expiry")
+    };
+  }
+
+  async commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).commitContactVCardImport({
+      previewId,
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      decisions: decisions.map(protoContactVCardImportDecision)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const entries = response.entries.map((entry) => {
+      const outcome = entry.outcome === ContactVCardImportOutcome.CREATED ? "created" as const
+        : entry.outcome === ContactVCardImportOutcome.ENRICHED ? "enriched" as const
+          : entry.outcome === ContactVCardImportOutcome.SKIPPED ? "skipped" as const
+            : undefined;
+      if (entry.entryId.trim() === "" || entry.displayName.trim() === "" || outcome === undefined
+        || (outcome === "skipped") !== (entry.contactId === undefined)) {
+        throw new GatewayError("Orchestrator returned an invalid Contact vCard entry result.");
+      }
+      return {
+        entryId: entry.entryId,
+        displayName: entry.displayName,
+        outcome,
+        ...(entry.contactId === undefined ? {} : { contactId: entry.contactId })
+      };
+    });
+    if (response.created !== entries.filter((entry) => entry.outcome === "created").length
+      || response.enriched !== entries.filter((entry) => entry.outcome === "enriched").length
+      || response.skipped !== entries.filter((entry) => entry.outcome === "skipped").length) {
+      throw new GatewayError("Orchestrator returned inconsistent Contact vCard import totals.");
+    }
+    return {
+      created: response.created,
+      enriched: response.enriched,
+      skipped: response.skipped,
+      contactIds: response.contactIds,
+      entries,
+      directory: mapContactDirectory(response.directory)
+    };
+  }
+
+  async exportContactsVCard(contactIds: readonly string[] = [], signal?: AbortSignal): Promise<ContactVCardExportView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).exportContactsVCard({ contactIds: [...contactIds] }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { text: response.vcardText, contactCount: response.contactCount, suggestedFileName: response.suggestedFileName };
+  }
+
+  async getContactSyncStatus(signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).getContactSyncStatus({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async setContactSyncEnabled(expectedConfigurationRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).setContactSyncEnabled({
+      expectedConfigurationRevision: { value: expectedConfigurationRevision },
+      enabled
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async grantContactSyncPeer(nodeId: string, expectedFingerprint: string, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).grantContactSyncPeer({
+      nodeId,
+      expectedFingerprint
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async revokeContactSyncPeer(peerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).revokeContactSyncPeer({
+      peerId,
+      expectedRevision: { value: expectedRevision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
+  }
+
+  async syncContactsNow(peerId?: string, signal?: AbortSignal): Promise<ContactSyncStatusView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).syncContactsNow({
+      ...(peerId === undefined ? {} : { peerId })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapContactSyncStatus(response.status);
   }
 
   async getRemoteHostCapabilities(
@@ -15798,6 +17357,1757 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
     }
   }
   return attachments;
+}
+
+function requiredCollaborationRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 1n) {
+    throw new GatewayError(`Orchestrator returned an invalid ${label} revision.`);
+  }
+  return value.value;
+}
+
+function requiredCollaborationTimestamp(
+  value: Parameters<typeof timestampMs>[0] | undefined,
+  label: string
+): number {
+  if (value === undefined || value.seconds < 0n || value.nanos < 0 || value.nanos >= 1_000_000_000
+    || value.nanos % 1_000_000 !== 0) {
+    throw new GatewayError(`Orchestrator returned an invalid collaboration ${label} timestamp.`);
+  }
+  const milliseconds = value.seconds * 1_000n + BigInt(value.nanos / 1_000_000);
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new GatewayError(`Orchestrator returned an invalid collaboration ${label} timestamp.`);
+  }
+  return Number(milliseconds);
+}
+
+function validCollaborationGeneration(value: bigint): boolean {
+  return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function validCollaborationOwnedIdentity(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length > 0 && [...normalized].length <= 256 && !/[\p{Cc}\u2028\u2029]/u.test(normalized);
+}
+
+function validCollaborationShortText(value: string, maximum: number): boolean {
+  const normalized = value.normalize("NFC").replace(/\s+/gu, " ").trim();
+  return normalized.length > 0 && [...normalized].length <= maximum
+    && !/[\p{Cc}\u2028\u2029]/u.test(normalized);
+}
+
+function validCollaborationText(value: string): boolean {
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  return normalized.length > 0 && [...normalized].length <= 32_000 && !normalized.includes("\0");
+}
+
+function validCollaborationRouteIdentity(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length > 0 && normalized.length <= 512 && !/[\u0000\r\n]/u.test(normalized);
+}
+
+function collaborationGoalStatus(value: ProtoCollaborationGoalStatus): CollaborationGoalStatusView {
+  switch (value) {
+    case ProtoCollaborationGoalStatus.ACTIVE: return "active";
+    case ProtoCollaborationGoalStatus.COMPLETED: return "completed";
+    case ProtoCollaborationGoalStatus.STOPPED: return "stopped";
+    case ProtoCollaborationGoalStatus.FAILED: return "failed";
+    case ProtoCollaborationGoalStatus.ARCHIVED: return "archived";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration Goal status.");
+  }
+}
+
+function protoCollaborationGoalStatus(
+  value: Exclude<CollaborationGoalStatusView, "active">
+): ProtoCollaborationGoalStatus {
+  switch (value) {
+    case "completed": return ProtoCollaborationGoalStatus.COMPLETED;
+    case "stopped": return ProtoCollaborationGoalStatus.STOPPED;
+    case "failed": return ProtoCollaborationGoalStatus.FAILED;
+    case "archived": return ProtoCollaborationGoalStatus.ARCHIVED;
+  }
+}
+
+function collaborationWorkerStatus(value: ProtoCollaborationWorkerStatus): CollaborationWorkerStatusView {
+  switch (value) {
+    case ProtoCollaborationWorkerStatus.PROVISIONING: return "provisioning";
+    case ProtoCollaborationWorkerStatus.IDLE: return "idle";
+    case ProtoCollaborationWorkerStatus.QUEUED: return "queued";
+    case ProtoCollaborationWorkerStatus.RUNNING: return "running";
+    case ProtoCollaborationWorkerStatus.COMPLETED: return "completed";
+    case ProtoCollaborationWorkerStatus.FAILED: return "failed";
+    case ProtoCollaborationWorkerStatus.STOPPING: return "stopping";
+    case ProtoCollaborationWorkerStatus.STOPPED: return "stopped";
+    case ProtoCollaborationWorkerStatus.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    case ProtoCollaborationWorkerStatus.ARCHIVED: return "archived";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration worker status.");
+  }
+}
+
+function collaborationDispatchStatus(value: ProtoCollaborationDispatchStatus): CollaborationDispatchStatusView {
+  switch (value) {
+    case ProtoCollaborationDispatchStatus.PREPARING: return "preparing";
+    case ProtoCollaborationDispatchStatus.QUEUED: return "queued";
+    case ProtoCollaborationDispatchStatus.MERGED: return "merged";
+    case ProtoCollaborationDispatchStatus.CANCELLED: return "cancelled";
+    case ProtoCollaborationDispatchStatus.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration dispatch status.");
+  }
+}
+
+function collaborationInterruptStopOutcome(
+  value: ProtoCollaborationInterruptStopOutcome
+): CollaborationInterruptStopOutcomeView {
+  switch (value) {
+    case ProtoCollaborationInterruptStopOutcome.STOPPED: return "stopped";
+    case ProtoCollaborationInterruptStopOutcome.NOT_RUNNING: return "notRunning";
+    case ProtoCollaborationInterruptStopOutcome.UNCONFIRMED: return "unconfirmed";
+    case ProtoCollaborationInterruptStopOutcome.ALREADY_QUEUED: return "alreadyQueued";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration interrupt outcome.");
+  }
+}
+
+function collaborationPermission(value: ProtoPermissionMode): PermissionMode {
+  if (value === ProtoPermissionMode.ASK) return "ask";
+  if (value === ProtoPermissionMode.AUTO) return "auto";
+  if (value === ProtoPermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
+  throw new GatewayError("Orchestrator returned an unknown collaboration worker permission mode.");
+}
+
+function mapCollaborationGoal(value: ProtoCollaborationGoal | undefined): CollaborationGoalView {
+  const revision = requiredCollaborationRevision(value?.revision, "Goal");
+  if (value === undefined || !validCollaborationOwnedIdentity(value.goalId)
+    || !validCollaborationOwnedIdentity(value.leadId)
+    || value.leadSessionId.trim() === "" || value.backendId.trim() === "" || value.targetId.trim() === ""
+    || !validCollaborationGeneration(value.sessionGeneration)
+    || !validCollaborationGeneration(value.backendInstanceGeneration)
+    || !validCollaborationShortText(value.title, 256) || !validCollaborationText(value.objective)
+    || (value.maximumWorkers !== undefined
+      && (!Number.isSafeInteger(value.maximumWorkers) || value.maximumWorkers < 1 || value.maximumWorkers > 128))) {
+    throw new GatewayError("Orchestrator returned an incomplete collaboration Goal.");
+  }
+  const status = collaborationGoalStatus(value.status);
+  const createdAt = requiredCollaborationTimestamp(value.createdAt, "Goal");
+  const updatedAt = requiredCollaborationTimestamp(value.updatedAt, "Goal update");
+  const completedAt = value.completedAt === undefined
+    ? undefined
+    : requiredCollaborationTimestamp(value.completedAt, "Goal completion");
+  if (updatedAt < createdAt || (completedAt !== undefined && completedAt < createdAt)
+    || (status === "active") !== (completedAt === undefined)
+    || (value.error?.message && status !== "failed")) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration Goal.");
+  }
+  return {
+    id: value.goalId,
+    revision,
+    leadId: value.leadId,
+    leadSessionId: value.leadSessionId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    sessionGeneration: value.sessionGeneration,
+    backendInstanceGeneration: value.backendInstanceGeneration,
+    title: value.title,
+    objective: value.objective,
+    ...(value.maximumWorkers === undefined ? {} : { maximumWorkers: value.maximumWorkers }),
+    status,
+    ...(value.error?.message ? { error: presentJokoServiceTerminology(value.error.message) } : {}),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt })
+  };
+}
+
+function mapCollaborationWorker(value: ProtoCollaborationWorker | undefined): CollaborationWorkerView {
+  const revision = requiredCollaborationRevision(value?.revision, "worker");
+  const route = value?.route;
+  if (value === undefined || route === undefined || !validCollaborationOwnedIdentity(value.workerId)
+    || !validCollaborationOwnedIdentity(value.goalId)
+    || !validCollaborationShortText(value.label, 64) || !validCollaborationShortText(value.role, 128)
+    || !validCollaborationText(value.assignment)
+    || !validCollaborationRouteIdentity(route.backendId) || !validCollaborationRouteIdentity(route.targetId)
+    || (value.parentWorkerId !== undefined && !validCollaborationOwnedIdentity(value.parentWorkerId))
+    || (value.sessionId !== undefined && value.sessionId.trim() === "")
+    || (route.providerId !== undefined && !validCollaborationRouteIdentity(route.providerId))
+    || (route.modelId !== undefined && !validCollaborationRouteIdentity(route.modelId))
+    || (route.effort !== undefined && !validCollaborationRouteIdentity(route.effort))
+    || ((route.providerId === undefined) !== (route.modelId === undefined))
+    || ((value.sessionId === undefined) !== (value.sessionGeneration === undefined))
+    || ((value.sessionId === undefined) !== (value.backendInstanceGeneration === undefined))
+    || (value.sessionGeneration !== undefined && !validCollaborationGeneration(value.sessionGeneration))
+    || (value.backendInstanceGeneration !== undefined && !validCollaborationGeneration(value.backendInstanceGeneration))) {
+    throw new GatewayError("Orchestrator returned an incomplete collaboration worker.");
+  }
+  const status = collaborationWorkerStatus(value.status);
+  const createdAt = requiredCollaborationTimestamp(value.createdAt, "worker");
+  const updatedAt = requiredCollaborationTimestamp(value.updatedAt, "worker update");
+  const idleSince = value.idleSince === undefined
+    ? undefined
+    : requiredCollaborationTimestamp(value.idleSince, "worker idle");
+  if (updatedAt < createdAt || (idleSince !== undefined && idleSince < createdAt)
+    || (value.runtimeReleased && !["idle", "completed", "failed", "stopped", "archived"].includes(status))
+    || (["stopped", "archived"].includes(status) && !value.runtimeReleased)
+    || (idleSince !== undefined && !["idle", "completed", "failed"].includes(status))
+    || (value.focused && (value.runtimeReleased || ["failed", "stopped", "archived"].includes(status)))
+    || (value.error?.message && !["failed", "dispatchUnknown"].includes(status))) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration worker.");
+  }
+  return {
+    id: value.workerId,
+    revision,
+    goalId: value.goalId,
+    ...(value.parentWorkerId === undefined ? {} : { parentWorkerId: value.parentWorkerId }),
+    ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId }),
+    route: {
+      backendId: route.backendId,
+      targetId: route.targetId,
+      ...(route.providerId === undefined ? {} : { providerId: route.providerId }),
+      ...(route.modelId === undefined ? {} : { modelId: route.modelId }),
+      ...(route.effort === undefined ? {} : { effort: route.effort }),
+      fastMode: route.fastMode,
+      permissionMode: collaborationPermission(route.permissionMode),
+      planMode: route.planMode
+    },
+    ...(value.sessionGeneration === undefined ? {} : { sessionGeneration: value.sessionGeneration }),
+    ...(value.backendInstanceGeneration === undefined ? {} : { backendInstanceGeneration: value.backendInstanceGeneration }),
+    label: value.label,
+    role: value.role,
+    assignment: value.assignment,
+    status,
+    focused: value.focused,
+    runtimeReleased: value.runtimeReleased,
+    softLimitWarning: value.softLimitWarning,
+    ...(idleSince === undefined ? {} : { idleSince }),
+    ...(value.error?.message ? { error: presentJokoServiceTerminology(value.error.message) } : {}),
+    createdAt,
+    updatedAt
+  };
+}
+
+function mapCollaborationDispatch(value: ProtoCollaborationDispatch | undefined): CollaborationDispatchView {
+  const revision = requiredCollaborationRevision(value?.revision, "dispatch");
+  if (value === undefined || !validCollaborationOwnedIdentity(value.dispatchId)
+    || !validCollaborationOwnedIdentity(value.goalId) || !validCollaborationOwnedIdentity(value.workerId)
+    || value.callerLeadSessionId.trim() === "" || !validCollaborationOwnedIdentity(value.operationId)
+    || !validCollaborationText(value.message)
+    || (value.queueItemId !== undefined && value.queueItemId.trim() === "")
+    || (value.mergedIntoDispatchId !== undefined && !validCollaborationOwnedIdentity(value.mergedIntoDispatchId))) {
+    throw new GatewayError("Orchestrator returned an incomplete collaboration dispatch.");
+  }
+  const status = collaborationDispatchStatus(value.status);
+  const createdAt = requiredCollaborationTimestamp(value.createdAt, "dispatch");
+  const updatedAt = requiredCollaborationTimestamp(value.updatedAt, "dispatch update");
+  if (updatedAt < createdAt
+    || (["preparing", "dispatchUnknown"].includes(status) !== (value.queueItemId === undefined))
+    || ((status === "merged") !== (value.mergedIntoDispatchId !== undefined))
+    || value.mergedIntoDispatchId === value.dispatchId) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration dispatch.");
+  }
+  return {
+    id: value.dispatchId,
+    revision,
+    goalId: value.goalId,
+    workerId: value.workerId,
+    callerLeadSessionId: value.callerLeadSessionId,
+    operationId: value.operationId,
+    ...(value.queueItemId === undefined ? {} : { queueItemId: value.queueItemId }),
+    message: value.message,
+    status,
+    ...(value.mergedIntoDispatchId === undefined ? {} : { mergedIntoDispatchId: value.mergedIntoDispatchId }),
+    createdAt,
+    updatedAt
+  };
+}
+
+function mapCollaborationQueueEntry(value: ProtoCollaborationQueueEntry): CollaborationQueueEntryView {
+  const dispatch = mapCollaborationDispatch(value.dispatch);
+  const queueItem = value.queueItem === undefined ? undefined : mapQueueItem(value.queueItem);
+  if ((dispatch.queueItemId === undefined) !== (queueItem === undefined)
+    || (queueItem !== undefined && (queueItem.id !== dispatch.queueItemId || queueItem.text !== dispatch.message))) {
+    throw new GatewayError("Orchestrator returned a mismatched collaboration Queue entry.");
+  }
+  return { dispatch, ...(queueItem === undefined ? {} : { queueItem }) };
+}
+
+function mapCollaborationGoalTree(value: ProtoCollaborationGoalTree | undefined): CollaborationGoalTreeView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no collaboration Goal tree.");
+  const goal = mapCollaborationGoal(value.goal);
+  const workers = value.workers.map(mapCollaborationWorker);
+  const queue = value.queue.map(mapCollaborationQueueEntry);
+  const workerIds = new Set(workers.map((worker) => worker.id));
+  const dispatchIds = new Set(queue.map((entry) => entry.dispatch.id));
+  const dispatches = new Map(queue.map((entry) => [entry.dispatch.id, entry.dispatch]));
+  const workersById = new Map(workers.map((worker) => [worker.id, worker]));
+  const queueItemIds = queue.flatMap((entry) => entry.queueItem === undefined ? [] : [entry.queueItem.id]);
+  if (workerIds.size !== workers.length || workers.some((worker) => worker.goalId !== goal.id
+      || worker.parentWorkerId === worker.id
+      || (worker.parentWorkerId !== undefined && !workerIds.has(worker.parentWorkerId)))
+    || hasCollaborationParentCycle(workers)
+    || dispatchIds.size !== queue.length
+    || new Set(queueItemIds).size !== queueItemIds.length
+    || queue.some((entry) => entry.dispatch.goalId !== goal.id || !workerIds.has(entry.dispatch.workerId)
+      || entry.dispatch.callerLeadSessionId !== goal.leadSessionId
+      || (entry.queueItem !== undefined && (entry.queueItem.sessionId !== workersById.get(entry.dispatch.workerId)?.sessionId
+        || entry.queueItem.generation !== workersById.get(entry.dispatch.workerId)?.sessionGeneration))
+      || (entry.dispatch.status === "merged" && (
+        dispatches.get(entry.dispatch.mergedIntoDispatchId ?? "")?.goalId !== goal.id
+        || dispatches.get(entry.dispatch.mergedIntoDispatchId ?? "")?.workerId !== entry.dispatch.workerId)))
+    || (value.focusedWorkerId !== undefined && !workerIds.has(value.focusedWorkerId))
+    || workers.filter((worker) => worker.focused).length > 1
+    || workers.some((worker) => worker.focused !== (value.focusedWorkerId === worker.id))
+    || workers.some((worker) => worker.focused && worker.status === "archived")) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration Goal tree.");
+  }
+  return {
+    goal,
+    workers,
+    queue,
+    ...(value.focusedWorkerId === undefined ? {} : { focusedWorkerId: value.focusedWorkerId })
+  };
+}
+
+function hasCollaborationParentCycle(workers: readonly CollaborationWorkerView[]): boolean {
+  const parents = new Map(workers.map((worker) => [worker.id, worker.parentWorkerId]));
+  for (const worker of workers) {
+    const visited = new Set<string>();
+    let current: string | undefined = worker.id;
+    while (current !== undefined) {
+      if (visited.has(current)) return true;
+      visited.add(current);
+      current = parents.get(current);
+    }
+  }
+  return false;
+}
+
+function mapOwnedCollaborationTree(
+  value: ProtoCollaborationGoalTree | undefined,
+  goalId: string,
+  leadSessionId: string
+): CollaborationGoalTreeView {
+  const tree = mapCollaborationGoalTree(value);
+  if (tree.goal.id !== goalId || tree.goal.leadSessionId !== leadSessionId) {
+    throw new GatewayError("Orchestrator returned a collaboration tree owned by another lead task.");
+  }
+  return tree;
+}
+
+function assertCollaborationWorkerMutation(
+  tree: CollaborationGoalTreeView,
+  value: ProtoCollaborationWorker | undefined,
+  expected: CollaborationWorkerView
+): void {
+  const worker = mapCollaborationWorker(value);
+  if (worker.id !== expected.id || worker.goalId !== expected.goalId
+    || !tree.workers.some((candidate) => candidate.id === worker.id && candidate.revision === worker.revision)) {
+    throw new GatewayError("Orchestrator returned a mismatched collaboration worker mutation.");
+  }
+}
+
+function mapCollaborationQueueMutation(
+  value: ProtoCollaborationGoalTree | undefined,
+  dispatchValue: ProtoCollaborationDispatch | undefined,
+  expected: CollaborationDispatchView
+): CollaborationGoalTreeView {
+  const tree = mapOwnedCollaborationTree(value, expected.goalId, expected.callerLeadSessionId);
+  const dispatch = mapCollaborationDispatch(dispatchValue);
+  if (dispatch.id !== expected.id || dispatch.workerId !== expected.workerId
+    || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id && entry.dispatch.revision === dispatch.revision)) {
+    throw new GatewayError("Orchestrator returned a mismatched collaboration Queue mutation.");
+  }
+  return tree;
+}
+
+function requiredCollaborationWorkerGeneration(worker: CollaborationWorkerView): bigint {
+  if (worker.sessionGeneration === undefined) {
+    throw new GatewayError("The collaboration worker has no active task generation.");
+  }
+  return worker.sessionGeneration;
+}
+
+function requiredPartnerRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 1n) throw new GatewayError(`Orchestrator returned an invalid ${label} revision.`);
+  return value.value;
+}
+
+function protoPartnerLifecycle(value: PartnerLifecycleView): PartnerLifecycle {
+  if (value === "active") return PartnerLifecycle.ACTIVE;
+  if (value === "archived") return PartnerLifecycle.ARCHIVED;
+  return PartnerLifecycle.DELETED;
+}
+
+function partnerLifecycle(value: PartnerLifecycle): PartnerLifecycleView {
+  if (value === PartnerLifecycle.ACTIVE) return "active";
+  if (value === PartnerLifecycle.ARCHIVED) return "archived";
+  if (value === PartnerLifecycle.DELETED) return "deleted";
+  throw new GatewayError("Orchestrator returned an unknown Partner lifecycle.");
+}
+
+function partnerInitializationState(value: PartnerInitializationState): PartnerInitializationStateView {
+  if (value === PartnerInitializationState.PENDING) return "pending";
+  if (value === PartnerInitializationState.READY) return "ready";
+  if (value === PartnerInitializationState.ERROR) return "error";
+  throw new GatewayError("Orchestrator returned an unknown Partner initialization state.");
+}
+
+function partnerInvitationStage(value: PartnerInvitationStage): PartnerInvitationStageView {
+  if (value === PartnerInvitationStage.HOME) return "home";
+  if (value === PartnerInvitationStage.AVATAR) return "avatar";
+  if (value === PartnerInvitationStage.SESSION) return "session";
+  if (value === PartnerInvitationStage.READY) return "ready";
+  if (value === PartnerInvitationStage.FAILED) return "failed";
+  throw new GatewayError("Orchestrator returned an unknown Partner invitation stage.");
+}
+
+function partnerInitializationError(value: PartnerInitializationErrorCode): PartnerInitializationErrorCodeView {
+  if (value === PartnerInitializationErrorCode.HOME_UNAVAILABLE) return "homeUnavailable";
+  if (value === PartnerInitializationErrorCode.AVATAR_UNAVAILABLE) return "avatarUnavailable";
+  if (value === PartnerInitializationErrorCode.MODEL_UNAVAILABLE) return "modelUnavailable";
+  if (value === PartnerInitializationErrorCode.SESSION_UNAVAILABLE) return "sessionUnavailable";
+  if (value === PartnerInitializationErrorCode.STATE_CHANGED) return "stateChanged";
+  throw new GatewayError("Orchestrator returned an unknown Partner initialization error.");
+}
+
+function protoPartnerRoute(value: PartnerModelRouteView) {
+  return {
+    backendId: value.backendId,
+    providerId: value.providerId,
+    modelId: value.modelId,
+    ...(value.effort === undefined ? {} : { effort: value.effort }),
+    fastMode: value.fastMode
+  };
+}
+
+function protoPartnerCapabilities(value: PartnerCapabilitiesView) {
+  return {
+    modelChain: value.modelChain.map(protoPartnerRoute),
+    permissionMode: protoPermission(value.permissionMode),
+    planMode: value.planMode
+  };
+}
+
+function protoPartnerPatch(value: PartnerPatchView) {
+  return {
+    ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
+    ...(value.avatar === undefined ? {} : { avatar: value.avatar }),
+    ...(value.identitySource === undefined ? {} : { identitySource: value.identitySource }),
+    ...(value.modelChain === undefined ? {} : { modelChain: { routes: value.modelChain.map(protoPartnerRoute) } }),
+    ...(value.permissionMode === undefined ? {} : { permissionMode: protoPermission(value.permissionMode) }),
+    ...(value.planMode === undefined ? {} : { planMode: value.planMode }),
+    ...(value.usesDirectoryDefaults === undefined ? {} : { usesDirectoryDefaults: value.usesDirectoryDefaults })
+  };
+}
+
+function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): PartnerCapabilitiesView {
+  if (value === undefined || value.modelChain.length < 1 || value.modelChain.length > 3) {
+    throw new GatewayError("Orchestrator returned an invalid Partner model chain.");
+  }
+  const routes = value.modelChain.map((route): PartnerModelRouteView => {
+    if (route.backendId.trim() === "" || route.providerId.trim() === "" || route.modelId.trim() === ""
+      || (route.effort !== undefined && route.effort.trim() === "")) {
+      throw new GatewayError("Orchestrator returned an incomplete Partner model route.");
+    }
+    return {
+      backendId: route.backendId,
+      providerId: route.providerId,
+      modelId: route.modelId,
+      ...(route.effort === undefined ? {} : { effort: route.effort }),
+      fastMode: route.fastMode
+    };
+  });
+  const backendId = routes[0]!.backendId;
+  const identities = new Set(routes.map((route) => `${route.providerId}\u0000${route.modelId}`));
+  if (routes.some((route) => route.backendId !== backendId) || identities.size !== routes.length) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner model chain.");
+  }
+  const permissionMode = value.permissionMode === ProtoPermissionMode.ASK ? "ask" as const
+    : value.permissionMode === ProtoPermissionMode.AUTO ? "auto" as const : undefined;
+  if (permissionMode === undefined) throw new GatewayError("Orchestrator returned an unsupported Partner permission mode.");
+  return { modelChain: routes, permissionMode, planMode: value.planMode };
+}
+
+function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfileView {
+  if (value === undefined || value.partnerId.trim() === "" || value.displayName.trim() === ""
+    || value.avatar.trim() === "" || value.identitySource.trim() === "" || value.templateId.trim() === ""
+    || value.homeTargetId.trim() === "" || value.profileVersion < 1n
+    || (value.canonicalSessionId !== undefined && value.canonicalSessionId.trim() === "")) {
+    throw new GatewayError("Orchestrator returned an incomplete Partner profile.");
+  }
+  const lifecycle = partnerLifecycle(value.lifecycle);
+  const initializationState = partnerInitializationState(value.initializationState);
+  const invitationStage = partnerInvitationStage(value.invitationStage);
+  const initializationErrorCode = value.initializationErrorCode === undefined
+    ? undefined : partnerInitializationError(value.initializationErrorCode);
+  if ((initializationState === "error") !== (initializationErrorCode !== undefined)
+    || (initializationState === "error") !== (invitationStage === "failed")
+    || (initializationState === "ready") !== (invitationStage === "ready")
+    || (initializationState === "ready" && value.canonicalSessionId === undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner initialization state.");
+  }
+  const activity = mapPartnerActivity(value.activity);
+  if (activity.partnerId !== value.partnerId) {
+    throw new GatewayError("Orchestrator returned Partner activity owned by another profile.");
+  }
+  return {
+    id: value.partnerId,
+    revision: requiredPartnerRevision(value.revision, "Partner"),
+    profileVersion: value.profileVersion,
+    displayName: value.displayName,
+    avatar: value.avatar,
+    identitySource: value.identitySource,
+    templateId: value.templateId,
+    lifecycle,
+    initializationState,
+    invitationStage,
+    ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
+    homeTargetId: value.homeTargetId,
+    ...(value.canonicalSessionId === undefined ? {} : { canonicalSessionId: value.canonicalSessionId }),
+    capabilities: mapPartnerCapabilities(value.capabilities),
+    usesDirectoryDefaults: value.usesDirectoryDefaults,
+    createdAt: requiredContactTimestamp(value.createdAt, "Partner creation"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner update"),
+    activity
+  };
+}
+
+function mapPartnerActivity(value: ProtoPartnerActivity | undefined): PartnerActivityView {
+  if (value === undefined || value.partnerId.trim() === "") {
+    throw new GatewayError("Orchestrator returned an incomplete Partner activity summary.");
+  }
+  if ((value.latestReplyCursor === undefined) !== (value.latestReplyAt === undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner latest reply.");
+  }
+  return {
+    partnerId: value.partnerId,
+    unreadReplyCount: safePartnerCount(value.unreadReplyCount, "Partner unread reply count"),
+    ...(value.latestReplyCursor === undefined
+      ? {}
+      : { latestReplyCursor: partnerCursor(value.latestReplyCursor, "Partner latest reply cursor") }),
+    ...(value.latestReplyAt === undefined
+      ? {}
+      : { latestReplyAt: requiredContactTimestamp(value.latestReplyAt, "Partner latest reply") }),
+    artifactCount: safePartnerCount(value.artifactCount, "Partner Artifact count"),
+    activeDelegationCount: safePartnerCount(value.activeDelegationCount, "Partner active delegation count"),
+    readThroughCursor: partnerCursor(value.readThroughCursor, "Partner read cursor"),
+    readUpdatedAt: requiredContactTimestamp(value.readUpdatedAt, "Partner read update")
+  };
+}
+
+function mapPartnerSession(value: ProtoPartnerSession): PartnerSessionView {
+  if (value.sessionId.trim() === "" || value.partnerId.trim() === "" || value.displayName.trim() === ""
+    || value.profileVersion < 1n || value.parentSessionId?.trim() === "" || value.delegationId?.trim() === "") {
+    throw new GatewayError("Orchestrator returned an incomplete Partner task link.");
+  }
+  const role: PartnerSessionRoleView = value.role === PartnerSessionRole.CANONICAL ? "canonical"
+    : value.role === PartnerSessionRole.HISTORY ? "history"
+      : value.role === PartnerSessionRole.DELEGATION ? "delegation"
+        : (() => { throw new GatewayError("Orchestrator returned an unknown Partner task role."); })();
+  if ((role === "delegation") !== (value.parentSessionId !== undefined)
+    || (role === "delegation") !== (value.delegationId !== undefined)
+    || (role !== "canonical" && !value.readOnly)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner task link.");
+  }
+  return {
+    sessionId: value.sessionId,
+    partnerId: value.partnerId,
+    role,
+    profileVersion: value.profileVersion,
+    ...(value.parentSessionId === undefined ? {} : { parentSessionId: value.parentSessionId }),
+    ...(value.delegationId === undefined ? {} : { delegationId: value.delegationId }),
+    displayName: value.displayName,
+    available: value.available,
+    readOnly: value.readOnly,
+    archived: value.archived,
+    deleted: value.deleted,
+    createdAt: requiredContactTimestamp(value.createdAt, "Partner task creation"),
+    ...(value.lastActivityAt === undefined
+      ? {}
+      : { lastActivityAt: requiredContactTimestamp(value.lastActivityAt, "Partner task activity") })
+  };
+}
+
+function mapPartnerPrivateThread(value: ProtoPartnerPrivateThread | undefined): PartnerPrivateThreadView {
+  if (value === undefined || value.threadId.trim() === "" || value.firstPartnerId.trim() === ""
+    || value.secondPartnerId.trim() === "" || value.firstPartnerId === value.secondPartnerId
+    || value.messageCount > value.maxMessages || value.maxMessages < 1) {
+    throw new GatewayError("Orchestrator returned an invalid Partner private thread.");
+  }
+  const status: PartnerPrivateThreadStatusView = value.status === PartnerPrivateThreadStatus.ACTIVE ? "active"
+    : value.status === PartnerPrivateThreadStatus.CLOSED ? "closed"
+      : (() => { throw new GatewayError("Orchestrator returned an unknown Partner private thread status."); })();
+  const closeReason: PartnerPrivateThreadCloseReasonView | undefined = value.closeReason === undefined
+    ? undefined
+    : value.closeReason === PartnerPrivateThreadCloseReason.MESSAGE_LIMIT ? "messageLimit"
+      : value.closeReason === PartnerPrivateThreadCloseReason.IDLE_TIMEOUT ? "idleTimeout"
+        : (() => { throw new GatewayError("Orchestrator returned an unknown Partner private thread close reason."); })();
+  const expiresAt = requiredContactTimestamp(value.expiresAt, "Partner private thread expiry");
+  const blockedUntil = value.blockedUntil === undefined
+    ? undefined
+    : requiredContactTimestamp(value.blockedUntil, "Partner private thread cooldown");
+  const createdAt = requiredContactTimestamp(value.createdAt, "Partner private thread creation");
+  const updatedAt = requiredContactTimestamp(value.updatedAt, "Partner private thread update");
+  const closedAt = value.closedAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.closedAt, "Partner private thread closure");
+  if ((status === "active") !== (closeReason === undefined)
+    || (status === "active") !== (closedAt === undefined)
+    || (closeReason === "messageLimit") !== (blockedUntil !== undefined)
+    || updatedAt < createdAt || expiresAt < createdAt
+    || (closedAt !== undefined && closedAt < createdAt)
+    || (blockedUntil !== undefined && blockedUntil < createdAt)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner private thread.");
+  }
+  return {
+    id: value.threadId,
+    firstPartnerId: value.firstPartnerId,
+    secondPartnerId: value.secondPartnerId,
+    status,
+    ...(closeReason === undefined ? {} : { closeReason }),
+    messageCount: value.messageCount,
+    maxMessages: value.maxMessages,
+    expiresAt,
+    ...(blockedUntil === undefined ? {} : { blockedUntil }),
+    createdAt,
+    updatedAt,
+    ...(closedAt === undefined ? {} : { closedAt })
+  };
+}
+
+function mapPartnerPrivateMessage(value: ProtoPartnerPrivateMessage): PartnerPrivateMessageView {
+  if (value.messageId.trim() === "" || value.threadId.trim() === "" || value.senderPartnerId.trim() === ""
+    || value.recipientPartnerId.trim() === "" || value.senderPartnerId === value.recipientPartnerId
+    || value.content.trim() === "" || value.sequence < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Partner private message.");
+  }
+  const deliveryStatus: PartnerPrivateMessageDeliveryStatusView =
+    value.deliveryStatus === PartnerPrivateMessageDeliveryStatus.PENDING ? "pending"
+      : value.deliveryStatus === PartnerPrivateMessageDeliveryStatus.DELIVERED ? "delivered"
+        : value.deliveryStatus === PartnerPrivateMessageDeliveryStatus.FAILED ? "failed"
+          : (() => { throw new GatewayError("Orchestrator returned an unknown Partner message state."); })();
+  const createdAt = requiredContactTimestamp(value.createdAt, "Partner private message creation");
+  const deliveredAt = value.deliveredAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.deliveredAt, "Partner private message delivery");
+  if ((deliveryStatus === "delivered") !== (deliveredAt !== undefined)
+    || (deliveredAt !== undefined && deliveredAt < createdAt)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner private message.");
+  }
+  return {
+    id: value.messageId,
+    threadId: value.threadId,
+    sequence: safePartnerCount(value.sequence, "Partner private message sequence"),
+    senderPartnerId: value.senderPartnerId,
+    recipientPartnerId: value.recipientPartnerId,
+    content: value.content,
+    deliveryStatus,
+    createdAt,
+    ...(deliveredAt === undefined ? {} : { deliveredAt })
+  };
+}
+
+function mapPartnerPrivateReadState(
+  value: ProtoPartnerPrivateThreadReadState | undefined
+): PartnerPrivateThreadReadStateView {
+  if (value === undefined || value.threadId.trim() === "" || value.partnerId.trim() === "") {
+    throw new GatewayError("Orchestrator returned an invalid Partner private read state.");
+  }
+  return {
+    threadId: value.threadId,
+    partnerId: value.partnerId,
+    throughSequence: safePartnerCount(value.throughSequence, "Partner private read sequence"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner private read update")
+  };
+}
+
+function mapPartnerDelegation(value: ProtoPartnerDelegation | undefined): PartnerDelegationView {
+  if (value === undefined || value.delegationId.trim() === "" || value.requesterPartnerId.trim() === ""
+    || value.targetPartnerId.trim() === "" || value.parentSessionId.trim() === ""
+    || value.requesterPartnerId === value.targetPartnerId
+    || value.targetProfileVersion < 1n || value.title.trim() === "" || value.objective.trim() === ""
+    || value.childSessionId?.trim() === "" || value.runId?.trim() === ""
+    || value.resultSummary?.trim() === "" || value.error?.trim() === "") {
+    throw new GatewayError("Orchestrator returned an incomplete Partner delegation.");
+  }
+  const status = partnerDelegationStatus(value.status);
+  const createdAt = requiredContactTimestamp(value.createdAt, "Partner delegation creation");
+  const updatedAt = requiredContactTimestamp(value.updatedAt, "Partner delegation update");
+  const startedAt = value.startedAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.startedAt, "Partner delegation start");
+  const completedAt = value.completedAt === undefined
+    ? undefined
+    : requiredContactTimestamp(value.completedAt, "Partner delegation completion");
+  const dispatched = status === "queued" || status === "running" || status === "waiting" || status === "completed";
+  const terminal = status === "completed" || status === "failed" || status === "cancelled";
+  if (updatedAt < createdAt
+    || (startedAt !== undefined && startedAt < createdAt)
+    || (completedAt !== undefined && completedAt < createdAt)
+    || (dispatched && (value.childSessionId === undefined || value.runId === undefined))
+    || (terminal !== (completedAt !== undefined))
+    || ((status === "running" || status === "waiting" || status === "completed") && startedAt === undefined)
+    || ((status === "completed") !== (value.resultSummary !== undefined))
+    || (status === "failed" && value.error === undefined)
+    || (status !== "failed" && status !== "unknown" && value.error !== undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner delegation.");
+  }
+  return {
+    id: value.delegationId,
+    revision: requiredPartnerRevision(value.revision, "Partner delegation"),
+    requesterPartnerId: value.requesterPartnerId,
+    targetPartnerId: value.targetPartnerId,
+    parentSessionId: value.parentSessionId,
+    targetProfileVersion: value.targetProfileVersion,
+    title: value.title,
+    objective: value.objective,
+    status,
+    ...(value.childSessionId === undefined ? {} : { childSessionId: value.childSessionId }),
+    ...(value.runId === undefined ? {} : { runId: value.runId }),
+    ...(value.resultSummary === undefined ? {} : { resultSummary: value.resultSummary }),
+    ...(value.error === undefined ? {} : { error: value.error }),
+    artifactCount: safePartnerCount(value.artifactCount, "Partner delegation Artifact count"),
+    createdAt,
+    updatedAt,
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(completedAt === undefined ? {} : { completedAt })
+  };
+}
+
+function partnerDelegationStatus(value: PartnerDelegationStatus): PartnerDelegationStatusView {
+  if (value === PartnerDelegationStatus.PREPARING) return "preparing";
+  if (value === PartnerDelegationStatus.QUEUED) return "queued";
+  if (value === PartnerDelegationStatus.RUNNING) return "running";
+  if (value === PartnerDelegationStatus.WAITING) return "waiting";
+  if (value === PartnerDelegationStatus.COMPLETED) return "completed";
+  if (value === PartnerDelegationStatus.FAILED) return "failed";
+  if (value === PartnerDelegationStatus.CANCELLED) return "cancelled";
+  if (value === PartnerDelegationStatus.UNKNOWN) return "unknown";
+  throw new GatewayError("Orchestrator returned an unknown Partner delegation status.");
+}
+
+function partnerCursor(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 0n) throw new GatewayError(`Orchestrator returned an invalid ${label}.`);
+  return value.value;
+}
+
+function safePartnerCount(value: bigint, label: string): number {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new GatewayError(`Orchestrator returned an invalid ${label}.`);
+  }
+  return Number(value);
+}
+
+function mapPartnerDirectory(value: ProtoPartnerDirectory | undefined): PartnerDirectoryView {
+  if (value === undefined || ![value.activeCount, value.archivedCount, value.errorCount]
+    .every((count) => Number.isSafeInteger(count) && count >= 0)) {
+    throw new GatewayError("Orchestrator returned an invalid Partner directory.");
+  }
+  const templates = value.templates.map((template) => {
+    if (template.templateId.trim() === "" || template.displayName.trim() === ""
+      || template.description.trim() === "" || template.identitySource.trim() === "") {
+      throw new GatewayError("Orchestrator returned an incomplete Partner template.");
+    }
+    return {
+      id: template.templateId,
+      displayName: template.displayName,
+      description: template.description,
+      identitySource: template.identitySource
+    };
+  });
+  const templateIds = new Set(templates.map((template) => template.id));
+  const avatars = value.avatarPresets.map((avatar) => avatar.trim());
+  if (templateIds.size !== templates.length || avatars.some((avatar) => avatar === "")
+    || new Set(avatars).size !== avatars.length) {
+    throw new GatewayError("Orchestrator returned a duplicate Partner directory option.");
+  }
+  return {
+    revision: requiredPartnerRevision(value.revision, "Partner directory"),
+    activeCount: value.activeCount,
+    archivedCount: value.archivedCount,
+    errorCount: value.errorCount,
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Partner directory update"),
+    templates,
+    avatarPresets: avatars,
+    ...(value.defaultCapabilities === undefined
+      ? {} : { defaultCapabilities: mapPartnerCapabilities(value.defaultCapabilities) })
+  };
+}
+
+function mapPartnerMutation(
+  partner: ProtoPartnerProfile | undefined,
+  directory: ProtoPartnerDirectory | undefined
+): PartnerMutationView {
+  return { partner: mapPartnerProfile(partner), directory: mapPartnerDirectory(directory) };
+}
+
+function requiredContactRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 1n) throw new GatewayError(`Orchestrator returned an invalid ${label} revision.`);
+  return value.value;
+}
+
+function requiredContactTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  if (value === undefined) throw new GatewayError(`Orchestrator returned no ${label} timestamp.`);
+  const mapped = timestampMs(value);
+  if (!Number.isSafeInteger(mapped) || mapped < 0) throw new GatewayError(`Orchestrator returned an invalid ${label} timestamp.`);
+  return mapped;
+}
+
+function protoContactKind(value: ContactKindView): ProtoContactKind {
+  return value === "person" ? ProtoContactKind.PERSON : ProtoContactKind.ORGANIZATION;
+}
+
+function contactKind(value: ProtoContactKind): ContactKindView {
+  if (value === ProtoContactKind.PERSON) return "person";
+  if (value === ProtoContactKind.ORGANIZATION) return "organization";
+  throw new GatewayError("Orchestrator returned an unknown Contact kind.");
+}
+
+function protoContactStatus(value: ContactStatusView): ProtoContactStatus {
+  return value === "confirmed" ? ProtoContactStatus.CONFIRMED : ProtoContactStatus.PENDING;
+}
+
+function contactStatus(value: ProtoContactStatus): ContactStatusView {
+  if (value === ProtoContactStatus.CONFIRMED) return "confirmed";
+  if (value === ProtoContactStatus.PENDING) return "pending";
+  throw new GatewayError("Orchestrator returned an unknown Contact status.");
+}
+
+function protoContactSource(value: ContactSourceView): ProtoContactSource {
+  if (value === "manual") return ProtoContactSource.MANUAL;
+  if (value === "agent") return ProtoContactSource.AGENT;
+  return ProtoContactSource.IMPORT;
+}
+
+function contactSource(value: ProtoContactSource): ContactSourceView {
+  if (value === ProtoContactSource.MANUAL) return "manual";
+  if (value === ProtoContactSource.AGENT) return "agent";
+  if (value === ProtoContactSource.IMPORT) return "import";
+  throw new GatewayError("Orchestrator returned an unknown Contact source.");
+}
+
+function protoContactIdentityInput(value: ContactIdentityInputView) {
+  return { platform: value.platform, value: value.value, label: value.label, note: value.note };
+}
+
+function protoContactEventInput(value: ContactEventInputView) {
+  return { date: value.date, text: value.text, source: value.source };
+}
+
+function protoContactDraft(value: ContactDraftView) {
+  return {
+    kind: protoContactKind(value.kind),
+    displayName: value.displayName,
+    aliases: [...value.aliases],
+    summary: value.summary,
+    narrative: value.narrative,
+    agentNotes: value.agentNotes,
+    status: protoContactStatus(value.status),
+    source: protoContactSource(value.source),
+    identities: value.identities.map(protoContactIdentityInput)
+  };
+}
+
+function protoContactPatch(value: ContactPatchView) {
+  return {
+    ...(value.kind === undefined ? {} : { kind: protoContactKind(value.kind) }),
+    ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
+    ...(value.aliases === undefined ? {} : { aliases: { values: [...value.aliases] } }),
+    ...(value.summary === undefined ? {} : { summary: value.summary }),
+    ...(value.narrative === undefined ? {} : { narrative: value.narrative }),
+    ...(value.agentNotes === undefined ? {} : { agentNotes: value.agentNotes }),
+    ...(value.status === undefined ? {} : { status: protoContactStatus(value.status) })
+  };
+}
+
+function mapContactIdentity(value: ProtoContactIdentity): ContactIdentityView {
+  return {
+    id: value.contactIdentityId,
+    contactId: value.contactId,
+    revision: requiredContactRevision(value.revision, "Contact identity"),
+    platform: value.platform,
+    value: value.value,
+    normalizedValue: value.normalizedValue,
+    label: value.label,
+    note: value.note,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact identity creation")
+  };
+}
+
+function mapContactEvent(value: ProtoContactEvent): ContactEventView {
+  return {
+    id: value.contactEventId,
+    contactId: value.contactId,
+    revision: requiredContactRevision(value.revision, "Contact event"),
+    date: value.date,
+    text: value.text,
+    source: value.source,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact event creation")
+  };
+}
+
+function mapContactGroup(value: ProtoContactGroup | undefined): ContactGroupView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact group.");
+  return {
+    id: value.contactGroupId,
+    revision: requiredContactRevision(value.revision, "Contact group"),
+    name: value.name,
+    description: value.description,
+    memberCount: value.memberCount,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact group creation"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Contact group update")
+  };
+}
+
+function mapContactRelation(value: ProtoContactRelation): ContactRelationView {
+  const direction = value.direction === ContactRelationDirection.OUTGOING
+    ? "outgoing"
+    : value.direction === ContactRelationDirection.INCOMING
+      ? "incoming"
+      : undefined;
+  if (direction === undefined) throw new GatewayError("Orchestrator returned an unknown Contact relation direction.");
+  return {
+    id: value.contactRelationId,
+    revision: requiredContactRevision(value.revision, "Contact relation"),
+    fromContactId: value.fromContactId,
+    toContactId: value.toContactId,
+    relation: value.relation,
+    note: value.note,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact relation creation"),
+    direction,
+    relatedContactId: value.relatedContactId,
+    relatedDisplayName: value.relatedDisplayName,
+    relatedKind: contactKind(value.relatedKind)
+  };
+}
+
+function mapContactSummary(value: ProtoContactSummary | undefined): ContactSummaryView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact summary.");
+  return {
+    id: value.contactId,
+    revision: requiredContactRevision(value.revision, "Contact"),
+    kind: contactKind(value.kind),
+    displayName: value.displayName,
+    aliases: value.aliases,
+    summary: value.summary,
+    status: contactStatus(value.status),
+    source: contactSource(value.source),
+    identityCount: value.identityCount,
+    createdAt: requiredContactTimestamp(value.createdAt, "Contact creation"),
+    updatedAt: requiredContactTimestamp(value.updatedAt, "Contact update")
+  };
+}
+
+function mapContactProfile(value: ProtoContactProfile | undefined): ContactProfileView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact profile.");
+  return {
+    ...mapContactSummary(value.summary),
+    narrative: value.narrative,
+    agentNotes: value.agentNotes,
+    identities: value.identities.map(mapContactIdentity),
+    events: value.events.map(mapContactEvent),
+    groups: value.groups.map(mapContactGroup),
+    relations: value.relations.map(mapContactRelation)
+  };
+}
+
+function mapContactDirectory(value: ProtoContactDirectory | undefined): ContactDirectoryView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact directory state.");
+  return {
+    format: value.format,
+    revision: requiredContactRevision(value.revision, "Contact directory"),
+    enabled: value.enabled,
+    people: value.people,
+    organizations: value.organizations,
+    pending: value.pending,
+    groups: value.groups
+  };
+}
+
+function mapContactSyncStatus(value: ProtoContactSyncStatus | undefined): ContactSyncStatusView {
+  if (value === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value.nodeId) ||
+    !/^[a-f0-9]{64}$/u.test(value.fingerprint)) {
+    throw new GatewayError("Orchestrator returned an invalid Contacts sync status.");
+  }
+  const phase = value.phase === ContactSyncPhase.OFF ? "off" as const
+    : value.phase === ContactSyncPhase.WAITING ? "waiting" as const
+      : value.phase === ContactSyncPhase.SYNCING ? "syncing" as const
+        : value.phase === ContactSyncPhase.UP_TO_DATE ? "upToDate" as const
+          : value.phase === ContactSyncPhase.ERROR ? "error" as const
+            : undefined;
+  if (phase === undefined) throw new GatewayError("Orchestrator returned an unknown Contacts sync phase.");
+  const errorCode = value.errorCode === undefined ? undefined
+    : value.errorCode === ContactSyncErrorCode.IDENTITY_UNAVAILABLE ? "identityUnavailable" as const
+      : value.errorCode === ContactSyncErrorCode.PEER_IDENTITY_CHANGED ? "peerIdentityChanged" as const
+        : value.errorCode === ContactSyncErrorCode.SYNC_FAILED ? "syncFailed" as const
+          : undefined;
+  if (value.errorCode !== undefined && errorCode === undefined) {
+    throw new GatewayError("Orchestrator returned an unknown Contacts sync error.");
+  }
+  const lastRoute = value.lastRoute === undefined ? undefined
+    : value.lastRoute === ContactSyncRoute.LAN ? "lan" as const : undefined;
+  if (value.lastRoute !== undefined && lastRoute === undefined) throw new GatewayError("Orchestrator returned an unknown Contacts sync route.");
+  const peers = value.peers.map((peer) => {
+    const state = peer.state === ContactSyncPeerState.PENDING ? "pending" as const
+      : peer.state === ContactSyncPeerState.ACTIVE ? "active" as const : undefined;
+    const route = peer.lastRoute === undefined ? undefined
+      : peer.lastRoute === ContactSyncRoute.LAN ? "lan" as const : undefined;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(peer.peerId) || !validContactSyncDisplayName(peer.displayName) ||
+      !/^[a-f0-9]{64}$/u.test(peer.fingerprint) || state === undefined ||
+      (peer.lastRoute !== undefined && route === undefined)) {
+      throw new GatewayError("Orchestrator returned an invalid Contacts sync peer.");
+    }
+    const lastSyncAt = peer.lastSyncAt === undefined ? undefined
+      : requiredContactTimestamp(peer.lastSyncAt, "Contacts sync peer completion");
+    if ((lastSyncAt === undefined) !== (route === undefined) || (state === "active") !== (lastSyncAt !== undefined)) {
+      throw new GatewayError("Orchestrator returned an incomplete Contacts sync peer.");
+    }
+    return {
+      peerId: peer.peerId,
+      revision: requiredContactRevision(peer.revision, "Contacts sync peer"),
+      displayName: peer.displayName,
+      fingerprint: peer.fingerprint,
+      online: peer.online,
+      state,
+      grantedAt: requiredContactTimestamp(peer.grantedAt, "Contacts sync peer grant"),
+      ...(lastSyncAt === undefined ? {} : { lastSyncAt }),
+      ...(route === undefined ? {} : { lastRoute: route })
+    };
+  });
+  const candidates = value.candidates.map((candidate) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(candidate.nodeId) || !validContactSyncDisplayName(candidate.displayName) ||
+      !/^[a-f0-9]{64}$/u.test(candidate.fingerprint) || candidate.granted && candidate.keyChanged) {
+      throw new GatewayError("Orchestrator returned an invalid Contacts sync candidate.");
+    }
+    return {
+      nodeId: candidate.nodeId,
+      displayName: candidate.displayName,
+      fingerprint: candidate.fingerprint,
+      seenAt: requiredContactTimestamp(candidate.seenAt, "Contacts sync candidate observation"),
+      granted: candidate.granted,
+      keyChanged: candidate.keyChanged
+    };
+  });
+  if (new Set(peers.map((peer) => peer.peerId)).size !== peers.length ||
+    new Set(candidates.map((candidate) => candidate.nodeId)).size !== candidates.length ||
+    value.onlinePeerCount !== peers.filter((peer) => peer.online).length) {
+    throw new GatewayError("Orchestrator returned inconsistent Contacts sync peers.");
+  }
+  const lastSyncAt = value.lastSyncAt === undefined ? undefined
+    : requiredContactTimestamp(value.lastSyncAt, "Contacts sync completion");
+  const hasLastSyncIdentity = value.lastSyncPeerId !== undefined && value.lastSyncPeerName !== undefined;
+  if ((lastSyncAt === undefined) !== !hasLastSyncIdentity || (lastSyncAt === undefined) !== (lastRoute === undefined) ||
+    hasLastSyncIdentity && (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value.lastSyncPeerId!) ||
+      !validContactSyncDisplayName(value.lastSyncPeerName!))) {
+    throw new GatewayError("Orchestrator returned an incomplete Contacts sync completion.");
+  }
+  return {
+    available: value.available,
+    configurationRevision: requiredContactRevision(value.configurationRevision, "Contacts sync configuration"),
+    nodeId: value.nodeId,
+    fingerprint: value.fingerprint,
+    enabled: value.enabled,
+    phase,
+    onlinePeerCount: value.onlinePeerCount,
+    ...(errorCode === undefined ? {} : { errorCode }),
+    ...(lastSyncAt === undefined ? {} : {
+      lastSyncAt,
+      lastSyncPeerId: value.lastSyncPeerId!,
+      lastSyncPeerName: value.lastSyncPeerName!,
+      lastRoute: lastRoute!
+    }),
+    peers,
+    candidates
+  };
+}
+
+function validContactSyncDisplayName(value: string): boolean {
+  return value === value.trim() && value.length >= 1 && value.length <= 100 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function mapContactMutation(contact: ProtoContactProfile | undefined, directory: ProtoContactDirectory | undefined): ContactMutationView {
+  return { contact: mapContactProfile(contact), directory: mapContactDirectory(directory) };
+}
+
+function mapContactDuplicateCandidate(value: ProtoContactDuplicateCandidate): ContactDuplicateCandidateView {
+  const matchType = value.matchType === ContactDuplicateMatchType.IDENTITY
+    ? "identity"
+    : value.matchType === ContactDuplicateMatchType.NAME
+      ? "name"
+      : undefined;
+  if (matchType === undefined) throw new GatewayError("Orchestrator returned an unknown Contact duplicate match type.");
+  return {
+    matchType,
+    contactId: value.contactId,
+    displayName: value.displayName,
+    kind: contactKind(value.kind),
+    status: contactStatus(value.status),
+    summary: value.summary,
+    ...(value.matchedPlatform === undefined ? {} : { matchedPlatform: value.matchedPlatform }),
+    ...(value.matchedValue === undefined ? {} : { matchedValue: value.matchedValue })
+  };
+}
+
+function contactVCardImportDisposition(value: ContactVCardImportDisposition): ContactVCardImportDispositionView {
+  if (value === ContactVCardImportDisposition.CREATE) return "create";
+  if (value === ContactVCardImportDisposition.AUTO_ENRICH) return "autoEnrich";
+  if (value === ContactVCardImportDisposition.NEEDS_REVIEW) return "needsReview";
+  throw new GatewayError("Orchestrator returned an unknown Contact vCard import disposition.");
+}
+
+function protoContactVCardImportDecisionKind(value: ContactVCardImportDecisionKindView): ContactVCardImportDecisionKind {
+  if (value === "create") return ContactVCardImportDecisionKind.CREATE;
+  if (value === "merge") return ContactVCardImportDecisionKind.MERGE;
+  return ContactVCardImportDecisionKind.SKIP;
+}
+
+function mapProtoContactDraft(value: ProtoContactDraft | undefined): ContactDraftView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no Contact vCard draft.");
+  return {
+    kind: contactKind(value.kind),
+    displayName: value.displayName,
+    aliases: value.aliases,
+    summary: value.summary,
+    narrative: value.narrative,
+    agentNotes: value.agentNotes,
+    status: contactStatus(value.status),
+    source: contactSource(value.source),
+    identities: value.identities.map((identity) => ({
+      platform: identity.platform,
+      value: identity.value,
+      label: identity.label,
+      note: identity.note
+    }))
+  };
+}
+
+function mapContactVCardImportPreviewEntry(value: ProtoContactVCardImportPreviewEntry): ContactVCardImportPreviewEntryView {
+  return {
+    entryId: value.entryId,
+    contact: mapProtoContactDraft(value.contact),
+    disposition: contactVCardImportDisposition(value.disposition),
+    ...(value.existingContactId === undefined ? {} : { existingContactId: value.existingContactId }),
+    candidates: value.candidates.map(mapContactDuplicateCandidate),
+    ...(value.existingEntryId === undefined ? {} : { existingEntryId: value.existingEntryId }),
+    similarEntryIds: value.similarEntryIds,
+    ...(value.organizationName === undefined ? {} : { organizationName: value.organizationName }),
+    ...(value.title === undefined ? {} : { title: value.title }),
+    groups: value.groups,
+    ...(value.organizationContactId === undefined ? {} : { organizationContactId: value.organizationContactId }),
+    organizationCandidates: value.organizationCandidates.map(mapContactDuplicateCandidate)
+  };
+}
+
+function protoContactVCardImportDecision(value: ContactVCardImportDecisionView) {
+  return {
+    entryId: value.entryId,
+    decision: protoContactVCardImportDecisionKind(value.decision),
+    ...(value.targetContactId === undefined ? {} : { targetContactId: value.targetContactId }),
+    ...(value.expectedTargetRevision === undefined ? {} : { expectedTargetRevision: { value: value.expectedTargetRevision } }),
+    confirmedNameCandidateIds: [...(value.confirmedNameCandidateIds ?? [])],
+    ...(value.targetEntryId === undefined ? {} : { targetEntryId: value.targetEntryId }),
+    ...(value.organizationDecision === undefined ? {} : { organizationDecision: protoContactVCardImportDecisionKind(value.organizationDecision) }),
+    ...(value.organizationTargetContactId === undefined ? {} : { organizationTargetContactId: value.organizationTargetContactId }),
+    ...(value.expectedOrganizationTargetRevision === undefined
+      ? {}
+      : { expectedOrganizationTargetRevision: { value: value.expectedOrganizationTargetRevision } }),
+    ...(value.organizationTargetEntryId === undefined ? {} : { organizationTargetEntryId: value.organizationTargetEntryId }),
+    confirmedOrganizationCandidateIds: [...(value.confirmedOrganizationCandidateIds ?? [])]
+  };
+}
+
+function mapMessagingConnection(value: ProtoMessagingConnection | undefined): MessagingConnectionView {
+  if (value === undefined || value.connectionId.trim() === "") {
+    throw new GatewayError("Orchestrator returned no Messaging connection.");
+  }
+  if (value.generation < 1n || value.revision === undefined || value.revision.value < 1n) {
+    throw new GatewayError("Orchestrator returned an unfenced Messaging connection.");
+  }
+  const createdAt = requiredMessagingTimestamp(value.createdAt, "created_at");
+  const updatedAt = requiredMessagingTimestamp(value.updatedAt, "updated_at");
+  if (updatedAt < createdAt) throw new GatewayError("Orchestrator returned an invalid Messaging connection timeline.");
+  const channel = mapMessagingChannel(value.channel);
+  const telegramConfiguration = channel === "telegram"
+    ? mapTelegramMessagingConfiguration(value.telegramConfiguration)
+    : undefined;
+  const discordConfiguration = channel === "discord"
+    ? mapDiscordMessagingConfiguration(value.discordConfiguration)
+    : undefined;
+  const dingtalkConfiguration = channel === "dingtalk"
+    ? mapDingTalkMessagingConfiguration(value.dingtalkConfiguration)
+    : undefined;
+  const feishuConfiguration = channel === "feishu" || channel === "lark"
+    ? mapFeishuMessagingConfiguration(value.feishuConfiguration)
+    : undefined;
+  const wecomConfiguration = channel === "wecom"
+    ? mapWeComMessagingConfiguration(value.wecomConfiguration)
+    : undefined;
+  const wechatConfiguration = channel === "wechat"
+    ? mapWeChatMessagingConfiguration(value.wechatConfiguration)
+    : undefined;
+  const slackConfiguration = channel === "slack"
+    ? mapSlackMessagingConfiguration(value.slackConfiguration)
+    : undefined;
+  if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
+  }
+  if (channel !== "discord" && value.discordConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Discord configuration for another Messaging channel.");
+  }
+  if (channel !== "dingtalk" && value.dingtalkConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned DingTalk configuration for another Messaging channel.");
+  }
+  if (channel !== "feishu" && channel !== "lark" && value.feishuConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Feishu/Lark configuration for another Messaging channel.");
+  }
+  if (channel !== "wecom" && value.wecomConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned WeCom configuration for another Messaging channel.");
+  }
+  if (channel !== "wechat" && value.wechatConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned WeChat configuration for another Messaging channel.");
+  }
+  if (channel !== "slack" && value.slackConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Slack configuration for another Messaging channel.");
+  }
+  if (channel === "slack" && !validSlackOwnerId(value.ownerProviderUserId ?? "")) {
+    throw new GatewayError("Orchestrator returned an invalid Slack owner user ID.");
+  }
+  return {
+    id: value.connectionId,
+    channel,
+    generation: value.generation,
+    revision: value.revision.value,
+    enabled: value.enabled,
+    runtimeStatus: mapMessagingRuntimeStatus(value.runtimeStatus),
+    credentialConfigured: value.credentialConfigured,
+    ...(value.ownerProviderUserId === undefined ? {} : { ownerProviderUserId: value.ownerProviderUserId }),
+    ...(value.providerAccountId === undefined ? {} : { providerAccountId: value.providerAccountId }),
+    ...(value.providerUsername === undefined ? {} : { providerUsername: value.providerUsername }),
+    ...(telegramConfiguration === undefined ? {} : { telegramConfiguration }),
+    ...(discordConfiguration === undefined ? {} : { discordConfiguration }),
+    ...(dingtalkConfiguration === undefined ? {} : { dingtalkConfiguration }),
+    ...(feishuConfiguration === undefined ? {} : { feishuConfiguration }),
+    ...(wecomConfiguration === undefined ? {} : { wecomConfiguration }),
+    ...(wechatConfiguration === undefined ? {} : { wechatConfiguration }),
+    ...(slackConfiguration === undefined ? {} : { slackConfiguration }),
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
+    ...(value.lastConnectedAt === undefined
+      ? {}
+      : { lastConnectedAt: requiredMessagingTimestamp(value.lastConnectedAt, "last_connected_at") }),
+    createdAt,
+    updatedAt
+  };
+}
+
+function mapMessagingRoute(value: ProtoMessagingRoute | undefined): MessagingRouteView {
+  if (value === undefined || value.scopeKey.trim() === "" || value.targetId.trim() === ""
+    || value.backendId.trim() === "" || value.revision === undefined || value.revision.value < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Messaging route.");
+  }
+  return {
+    scopeKey: value.scopeKey,
+    ...(value.connectionId === undefined ? {} : { connectionId: value.connectionId }),
+    targetId: value.targetId,
+    backendId: value.backendId,
+    ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
+    ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
+    ...(value.effort === undefined ? {} : { effort: value.effort }),
+    fastMode: value.fastMode,
+    permissionMode: uiPermission(value.permissionMode),
+    planMode: value.planMode,
+    createdAt: requiredMessagingTimestamp(value.createdAt, "route.created_at"),
+    updatedAt: requiredMessagingTimestamp(value.updatedAt, "route.updated_at"),
+    revision: value.revision.value
+  };
+}
+
+function mapMessagingChannel(value: ProtoMessagingChannel): import("./model.js").MessagingChannelView {
+  switch (value) {
+    case ProtoMessagingChannel.TELEGRAM: return "telegram";
+    case ProtoMessagingChannel.DISCORD: return "discord";
+    case ProtoMessagingChannel.DINGTALK: return "dingtalk";
+    case ProtoMessagingChannel.FEISHU: return "feishu";
+    case ProtoMessagingChannel.LARK: return "lark";
+    case ProtoMessagingChannel.WECOM: return "wecom";
+    case ProtoMessagingChannel.WECHAT: return "wechat";
+    case ProtoMessagingChannel.SLACK: return "slack";
+    default: throw new GatewayError("Orchestrator returned an unknown Messaging channel.");
+  }
+}
+
+function mapMessagingRuntimeStatus(
+  value: ProtoMessagingConnectionRuntimeStatus
+): import("./model.js").MessagingConnectionRuntimeStatusView {
+  switch (value) {
+    case ProtoMessagingConnectionRuntimeStatus.IDLE: return "idle";
+    case ProtoMessagingConnectionRuntimeStatus.CONNECTING: return "connecting";
+    case ProtoMessagingConnectionRuntimeStatus.CONNECTED: return "connected";
+    case ProtoMessagingConnectionRuntimeStatus.OFFLINE: return "offline";
+    case ProtoMessagingConnectionRuntimeStatus.CONFLICT: return "conflict";
+    case ProtoMessagingConnectionRuntimeStatus.AUTH_LOSS: return "authLoss";
+    case ProtoMessagingConnectionRuntimeStatus.ERROR: return "error";
+    default: throw new GatewayError("Orchestrator returned an unknown Messaging runtime status.");
+  }
+}
+
+function mapTelegramMessagingConfiguration(
+  value: ProtoTelegramMessagingConfiguration | undefined
+): TelegramMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator omitted Telegram configuration.");
+  const emojiReactions = value.emojiReactions === ProtoTelegramEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoTelegramEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoTelegramEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === ProtoTelegramReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteDm === ProtoTelegramReplyQuoteMode.FIRST ? "first" as const
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === ProtoTelegramReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteGroup === ProtoTelegramReplyQuoteMode.FIRST ? "first" as const
+      : value.replyQuoteGroup === ProtoTelegramReplyQuoteMode.ALL ? "all" as const
+        : undefined;
+  if (emojiReactions === undefined || replyQuoteDm === undefined || replyQuoteGroup === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Telegram configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const chatId = rule.chatId;
+    const mapped = rule.activation === ProtoTelegramGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoTelegramGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoTelegramGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || Object.hasOwn(groupActivation, chatId)) {
+      throw new GatewayError("Orchestrator returned an invalid Telegram group activation.");
+    }
+    groupActivation[chatId] = mapped;
+  }
+  return { emojiReactions, replyQuoteDm, replyQuoteGroup, groupActivation };
+}
+
+function protoTelegramMessagingConfiguration(
+  value: TelegramMessagingConfigurationView
+): ProtoTelegramMessagingConfiguration {
+  return {
+    $typeName: "joko.v1.TelegramMessagingConfiguration",
+    emojiReactions: value.emojiReactions === "off" ? ProtoTelegramEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoTelegramEmojiReactions.MINIMAL
+        : ProtoTelegramEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? ProtoTelegramReplyQuoteMode.OFF
+      : ProtoTelegramReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? ProtoTelegramReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? ProtoTelegramReplyQuoteMode.FIRST
+        : ProtoTelegramReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([chatId, activation]) => create(
+      ProtoTelegramGroupActivationRuleSchema,
+      {
+        chatId,
+        activation: activation === "mention" ? ProtoTelegramGroupActivation.MENTION
+          : activation === "always" ? ProtoTelegramGroupActivation.ALWAYS
+            : ProtoTelegramGroupActivation.DISABLED
+      }
+    ))
+  };
+}
+
+function mapDiscordMessagingConfiguration(
+  value: ProtoDiscordMessagingConfiguration | undefined
+): DiscordMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator omitted Discord configuration.");
+  const emojiReactions = value.emojiReactions === ProtoDiscordEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoDiscordEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoDiscordEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === ProtoDiscordReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteDm === ProtoDiscordReplyQuoteMode.FIRST ? "first" as const
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === ProtoDiscordReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteGroup === ProtoDiscordReplyQuoteMode.FIRST ? "first" as const
+      : value.replyQuoteGroup === ProtoDiscordReplyQuoteMode.ALL ? "all" as const
+        : undefined;
+  if (emojiReactions === undefined || replyQuoteDm === undefined || replyQuoteGroup === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Discord configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const key = `${rule.guildId}/${rule.channelId}`;
+    const mapped = rule.activation === ProtoDiscordGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoDiscordGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoDiscordGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || !/^[1-9][0-9]{16,19}\/[1-9][0-9]{16,19}$/u.test(key)
+      || Object.hasOwn(groupActivation, key)) {
+      throw new GatewayError("Orchestrator returned an invalid Discord group activation.");
+    }
+    groupActivation[key] = mapped;
+  }
+  return {
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation
+  };
+}
+
+function protoDiscordMessagingConfiguration(
+  value: DiscordMessagingConfigurationView
+): ProtoDiscordMessagingConfiguration {
+  return {
+    $typeName: "joko.v1.DiscordMessagingConfiguration",
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? ProtoDiscordEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoDiscordEmojiReactions.MINIMAL
+        : ProtoDiscordEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? ProtoDiscordReplyQuoteMode.OFF
+      : ProtoDiscordReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? ProtoDiscordReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? ProtoDiscordReplyQuoteMode.FIRST
+        : ProtoDiscordReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([key, activation]) => {
+      const match = /^([1-9][0-9]{16,19})\/([1-9][0-9]{16,19})$/u.exec(key);
+      if (match === null) throw new GatewayError("Discord group activation key is invalid.");
+      return create(ProtoDiscordGroupActivationRuleSchema, {
+        guildId: match[1]!,
+        channelId: match[2]!,
+        activation: activation === "mention" ? ProtoDiscordGroupActivation.MENTION
+          : activation === "always" ? ProtoDiscordGroupActivation.ALWAYS
+            : ProtoDiscordGroupActivation.DISABLED
+      });
+    })
+  };
+}
+
+function mapSlackMessagingConfiguration(
+  value: ProtoSlackMessagingConfiguration | undefined
+): SlackMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator omitted Slack configuration.");
+  const emojiReactions = value.emojiReactions === ProtoSlackEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoSlackEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoSlackEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  if (emojiReactions === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Slack configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const mapped = rule.activation === ProtoSlackGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoSlackGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoSlackGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || !validSlackChannelId(rule.channelId)
+      || Object.hasOwn(groupActivation, rule.channelId)) {
+      throw new GatewayError("Orchestrator returned an invalid Slack channel activation.");
+    }
+    groupActivation[rule.channelId] = mapped;
+  }
+  return {
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    groupActivation
+  };
+}
+
+function protoSlackMessagingConfiguration(
+  value: SlackMessagingConfigurationView
+): ProtoSlackMessagingConfiguration {
+  if (!["off", "minimal", "expressive"].includes(value.emojiReactions)) {
+    throw new GatewayError("Slack reaction configuration is invalid.");
+  }
+  return {
+    $typeName: "joko.v1.SlackMessagingConfiguration",
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? ProtoSlackEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoSlackEmojiReactions.MINIMAL
+        : ProtoSlackEmojiReactions.EXPRESSIVE,
+    groupActivationRules: Object.entries(value.groupActivation).map(([channelId, activation]) => {
+      if (!validSlackChannelId(channelId) || !["mention", "always", "disabled"].includes(activation)) {
+        throw new GatewayError("Slack channel activation is invalid.");
+      }
+      return create(ProtoSlackGroupActivationRuleSchema, {
+        channelId,
+        activation: activation === "mention" ? ProtoSlackGroupActivation.MENTION
+          : activation === "always" ? ProtoSlackGroupActivation.ALWAYS : ProtoSlackGroupActivation.DISABLED
+      });
+    })
+  };
+}
+
+function validSlackOwnerId(value: string): boolean {
+  return /^[UW][A-Z0-9]{8,63}$/u.test(value);
+}
+
+function validSlackChannelId(value: string): boolean {
+  return /^[CG][A-Z0-9]{8,63}$/u.test(value);
+}
+
+function mapDingTalkMessagingConfiguration(
+  value: ProtoDingTalkMessagingConfiguration | undefined
+): DingTalkMessagingConfigurationView {
+  if (value === undefined || value.appKey.trim() === "") {
+    throw new GatewayError("Orchestrator returned an invalid DingTalk configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const conversationId = rule.conversationId.trim();
+    const mapped = rule.activation === ProtoDingTalkGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoDingTalkGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoDingTalkGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || conversationId === "" || Object.hasOwn(groupActivation, conversationId)) {
+      throw new GatewayError("Orchestrator returned an invalid DingTalk group activation.");
+    }
+    groupActivation[conversationId] = mapped;
+  }
+  return { appKey: value.appKey, groupActivation };
+}
+
+function protoDingTalkMessagingConfiguration(
+  value: DingTalkMessagingConfigurationView
+): ProtoDingTalkMessagingConfiguration {
+  const appKey = value.appKey.trim();
+  if (appKey === "") throw new GatewayError("DingTalk AppKey is required.");
+  return {
+    $typeName: "joko.v1.DingTalkMessagingConfiguration",
+    appKey,
+    groupActivationRules: Object.entries(value.groupActivation).map(([conversationId, activation]) => {
+      const normalized = conversationId.trim();
+      if (normalized === "") throw new GatewayError("DingTalk conversation ID is invalid.");
+      return create(ProtoDingTalkGroupActivationRuleSchema, {
+        conversationId: normalized,
+        activation: activation === "mention" ? ProtoDingTalkGroupActivation.MENTION
+          : activation === "always" ? ProtoDingTalkGroupActivation.ALWAYS
+            : ProtoDingTalkGroupActivation.DISABLED
+      });
+    })
+  };
+}
+
+function mapFeishuMessagingConfiguration(
+  value: ProtoFeishuMessagingConfiguration | undefined
+): FeishuMessagingConfigurationView {
+  if (value === undefined || value.appId.trim() === "") {
+    throw new GatewayError("Orchestrator returned an invalid Feishu/Lark configuration.");
+  }
+  const emojiReactions = value.emojiReactions === ProtoFeishuEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoFeishuEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoFeishuEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === ProtoFeishuReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteDm === ProtoFeishuReplyQuoteMode.FIRST ? "first" as const
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === ProtoFeishuReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteGroup === ProtoFeishuReplyQuoteMode.FIRST ? "first" as const
+      : value.replyQuoteGroup === ProtoFeishuReplyQuoteMode.ALL ? "all" as const
+        : undefined;
+  const groupPermissionMode = value.groupPermissionMode === ProtoPermissionMode.ASK ? "ask" as const
+    : value.groupPermissionMode === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const
+      : undefined;
+  if (
+    emojiReactions === undefined
+    || replyQuoteDm === undefined
+    || replyQuoteGroup === undefined
+    || groupPermissionMode === undefined
+  ) {
+    throw new GatewayError("Orchestrator returned an invalid Feishu/Lark configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const chatId = rule.chatId.trim();
+    const mapped = rule.activation === ProtoFeishuGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoFeishuGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoFeishuGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || chatId === "" || Object.hasOwn(groupActivation, chatId)) {
+      throw new GatewayError("Orchestrator returned an invalid Feishu/Lark group activation.");
+    }
+    groupActivation[chatId] = mapped;
+  }
+  return {
+    appId: value.appId,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation,
+    groupPermissionMode
+  };
+}
+
+function protoFeishuMessagingConfiguration(
+  value: FeishuMessagingConfigurationView
+): ProtoFeishuMessagingConfiguration {
+  const appId = value.appId.trim();
+  if (appId === "") throw new GatewayError("Feishu/Lark App ID is required.");
+  return {
+    $typeName: "joko.v1.FeishuMessagingConfiguration",
+    appId,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? ProtoFeishuEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoFeishuEmojiReactions.MINIMAL
+        : ProtoFeishuEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? ProtoFeishuReplyQuoteMode.OFF
+      : ProtoFeishuReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? ProtoFeishuReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? ProtoFeishuReplyQuoteMode.FIRST
+        : ProtoFeishuReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([chatId, activation]) => {
+      const normalized = chatId.trim();
+      if (normalized === "") throw new GatewayError("Feishu/Lark chat ID is invalid.");
+      return create(ProtoFeishuGroupActivationRuleSchema, {
+        chatId: normalized,
+        activation: activation === "mention" ? ProtoFeishuGroupActivation.MENTION
+          : activation === "always" ? ProtoFeishuGroupActivation.ALWAYS
+            : ProtoFeishuGroupActivation.DISABLED
+      });
+    }),
+    groupPermissionMode: value.groupPermissionMode === "ask"
+      ? ProtoPermissionMode.ASK
+      : ProtoPermissionMode.BYPASS_PERMISSIONS
+  };
+}
+
+function mapWeComMessagingConfiguration(
+  value: ProtoWeComMessagingConfiguration | undefined
+): WeComMessagingConfigurationView {
+  if (value === undefined || !validWeComBotId(value.botId)) {
+    throw new GatewayError("Orchestrator returned an invalid WeCom configuration.");
+  }
+  return { botId: value.botId };
+}
+
+function mapWeChatMessagingConfiguration(
+  value: ProtoWeChatMessagingConfiguration | undefined
+): WeChatMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no WeChat configuration.");
+  return { format: 1 };
+}
+
+function protoWeChatMessagingConfiguration(
+  value: WeChatMessagingConfigurationView
+): ProtoWeChatMessagingConfiguration {
+  if (value.format !== 1) throw new GatewayError("WeChat configuration format must be 1.");
+  return { $typeName: "joko.v1.WeChatMessagingConfiguration" };
+}
+
+function mapWeChatAuthorizationAttempt(
+  value: ProtoWeChatAuthorizationAttempt | undefined,
+  connectionId: string,
+  generation: bigint,
+  attemptId?: string
+): WeChatAuthorizationAttemptView {
+  if (value === undefined || value.attemptId.trim() === "" || value.connectionId !== connectionId
+    || value.generation !== generation || value.generation < 1n || value.revision < 1n
+    || (attemptId !== undefined && value.attemptId !== attemptId)) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization attempt.");
+  }
+  const createdAt = requiredMessagingTimestamp(value.createdAt, "wechat_authorization.created_at");
+  const expiresAt = requiredMessagingTimestamp(value.expiresAt, "wechat_authorization.expires_at");
+  if (expiresAt <= createdAt || expiresAt > createdAt + 5 * 60_000 + 1_000) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization expiration.");
+  }
+  const status = mapWeChatAuthorizationStatus(value.status);
+  const qrCodeUrl = value.qrCodeUrl === undefined ? undefined : trustedWeChatQrUrl(value.qrCodeUrl);
+  if ((status === "waiting" || status === "scanned" || status === "verificationRequired" || status === "qrRefreshed")
+    && qrCodeUrl === undefined) {
+    throw new GatewayError("Orchestrator returned an active WeChat authorization without a QR code.");
+  }
+  const connection = value.connection === undefined ? undefined : mapMessagingConnection(value.connection);
+  if (connection !== undefined && (status !== "succeeded" || connection.id !== connectionId
+    || connection.channel !== "wechat" || connection.generation <= generation || !connection.credentialConfigured)) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization connection.");
+  }
+  if (status === "succeeded" && connection === undefined) {
+    throw new GatewayError("Orchestrator returned WeChat authorization success without a connection.");
+  }
+  if (value.errorCode !== undefined && (value.errorCode.length > 128 || /[\u0000-\u001f\u007f]/u.test(value.errorCode))) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization error code.");
+  }
+  if (value.errorSummary !== undefined && (value.errorSummary.length > 1024 || /[\u0000-\u0008\u000b-\u001f\u007f]/u.test(value.errorSummary))) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization error summary.");
+  }
+  return {
+    attemptId: value.attemptId,
+    connectionId,
+    generation,
+    revision: value.revision,
+    status,
+    ...(qrCodeUrl === undefined ? {} : { qrCodeUrl }),
+    createdAt,
+    expiresAt,
+    verificationRetry: value.verificationRetry,
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
+    ...(connection === undefined ? {} : { connection })
+  };
+}
+
+function mapWeChatAuthorizationStatus(value: ProtoWeChatAuthorizationStatus): WeChatAuthorizationAttemptView["status"] {
+  switch (value) {
+    case ProtoWeChatAuthorizationStatus.WAITING: return "waiting";
+    case ProtoWeChatAuthorizationStatus.SCANNED: return "scanned";
+    case ProtoWeChatAuthorizationStatus.VERIFICATION_REQUIRED: return "verificationRequired";
+    case ProtoWeChatAuthorizationStatus.QR_REFRESHED: return "qrRefreshed";
+    case ProtoWeChatAuthorizationStatus.SUCCEEDED: return "succeeded";
+    case ProtoWeChatAuthorizationStatus.FAILED: return "failed";
+    case ProtoWeChatAuthorizationStatus.CANCELLED: return "cancelled";
+    case ProtoWeChatAuthorizationStatus.EXPIRED: return "expired";
+    default: throw new GatewayError("Orchestrator returned an unknown WeChat authorization status.");
+  }
+}
+
+function trustedWeChatQrUrl(value: string): string {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new GatewayError("Orchestrator returned an invalid WeChat QR URL."); }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.port !== ""
+    || !(url.hostname === "weixin.qq.com" || url.hostname.endsWith(".weixin.qq.com"))) {
+    throw new GatewayError("Orchestrator returned an untrusted WeChat QR URL.");
+  }
+  return url.toString();
+}
+
+function protoWeComMessagingConfiguration(
+  value: WeComMessagingConfigurationView
+): ProtoWeComMessagingConfiguration {
+  const botId = value.botId.trim();
+  if (!validWeComBotId(botId)) throw new GatewayError("WeCom Bot ID is required.");
+  return {
+    $typeName: "joko.v1.WeComMessagingConfiguration",
+    botId
+  };
+}
+
+function validWeComBotId(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length >= 1
+    && normalized.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(normalized);
+}
+
+function mapMessagingTestFailure(
+  value: ProtoMessagingConnectionTestFailure
+): Extract<MessagingConnectionTestResultView, { readonly ok: false }>["failure"] {
+  switch (value) {
+    case ProtoMessagingConnectionTestFailure.INVALID: return "invalid";
+    case ProtoMessagingConnectionTestFailure.CONFLICT: return "conflict";
+    case ProtoMessagingConnectionTestFailure.CREDENTIAL_UNAVAILABLE: return "credentialUnavailable";
+    case ProtoMessagingConnectionTestFailure.CHANNEL_UNAVAILABLE: return "channelUnavailable";
+    case ProtoMessagingConnectionTestFailure.CONNECTION_FAILED: return "connectionFailed";
+    default: throw new GatewayError("Orchestrator returned an unknown Messaging test failure.");
+  }
+}
+
+function requiredMessagingTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  const mapped = timestampMs(value);
+  if (value === undefined || !Number.isSafeInteger(mapped) || mapped < 0) {
+    throw new GatewayError(`Orchestrator returned an invalid Messaging ${label} timestamp.`);
+  }
+  return mapped;
 }
 
 function asRecord(value: unknown): Record<string, any> {
