@@ -12,7 +12,8 @@ import {
   PanelRight,
   RotateCcw,
   Shield,
-  Sparkles
+  Sparkles,
+  UsersRound
 } from "lucide-react";
 import type { AppController, AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
@@ -74,6 +75,7 @@ import {
   planModeSupported
 } from "./backend-control-capabilities.js";
 import { sessionDerivationOriginRoute } from "./session-derivation-origin.js";
+import { CollaborationGoalPanel } from "./CollaborationGoalPanel.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -201,6 +203,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const [forkingMessageId, setForkingMessageId] = useState<string>();
   const [backgroundStopping, setBackgroundStopping] = useState(false);
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
+  const [collaborationOpen, setCollaborationOpen] = useState(false);
+  const collaborationButtonRef = useRef<HTMLButtonElement>(null);
   const [timelineSubagentRuns, setTimelineSubagentRuns] = useState<{
     readonly sessionId: string;
     readonly runs: ReadonlyMap<string, SubagentRunView>;
@@ -228,6 +232,14 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   controllerRef.current = controller;
   const activeSessionIdRef = useRef(session.id);
   activeSessionIdRef.current = session.id;
+  const collaborationOwnerKey = JSON.stringify([
+    controller.state.activeProfile?.serverId,
+    controller.state.activeProfile?.id,
+    controller.state.connectionState,
+    session.id,
+    session.generation.toString(10)
+  ]);
+  useEffect(() => setCollaborationOpen(false), [collaborationOwnerKey]);
   const timelineSubagentEpochRef = useRef(0);
   const stoppingRunIdsRef = useRef(new Set<string>());
   const gamepadSettingFlightsRef = useRef(new Set<string>());
@@ -1629,6 +1641,12 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         <div className="session-header__actions">
           {canStop && running && session.activeRunId !== undefined && <Button tone="danger" disabled={stopInFlight} onClick={stopRun}><CircleStop aria-hidden="true" />{t("controls.abort")}</Button>}
           {!reviewReadOnly && session.state === "error" && session.retryRunId !== undefined && <Button onClick={() => runAction("retry", () => controller.retry(session.retryRunId as string))}><RotateCcw aria-hidden="true" />{t("common.retry")}</Button>}
+          {controller.state.connectionState === "connected" && <IconButton
+            buttonRef={collaborationButtonRef}
+            label={t("collaboration.open")}
+            aria-expanded={collaborationOpen}
+            onClick={() => setCollaborationOpen((current) => !current)}
+          ><UsersRound aria-hidden="true" /></IconButton>}
           <SessionHeaderActionsMenu
             session={session}
             projectTargets={sessionProjectTargets}
@@ -1667,6 +1685,21 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       </header>}
 
       {session.worktree?.state === "preserved" && <div className="session-worktree-warning" role="alert"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.preservedTitle")}</strong><small>{t("worktree.preservedDescription", { branch: session.worktree.branch })}</small></span></div>}
+
+      <CollaborationGoalPanel
+        controller={controller}
+        session={session}
+        models={models}
+        locale={controller.state.preferences.locale}
+        ownerKey={collaborationOwnerKey}
+        open={collaborationOpen && presentation !== "filesRail" && controller.state.connectionState === "connected"}
+        readOnly={reviewReadOnly}
+        onClose={() => {
+          setCollaborationOpen(false);
+          collaborationButtonRef.current?.focus({ preventScroll: true });
+        }}
+        t={t}
+      />
 
       <ExtensionStatuses statuses={extensionStatuses} />
 

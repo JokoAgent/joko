@@ -549,6 +549,114 @@ export interface PartnerDefaultsMutationView {
   readonly affectedPartners: readonly PartnerProfileView[];
 }
 
+export type CollaborationGoalStatusView = "active" | "completed" | "stopped" | "failed" | "archived";
+export type CollaborationWorkerStatusView =
+  | "provisioning"
+  | "idle"
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopping"
+  | "stopped"
+  | "dispatchUnknown"
+  | "archived";
+export type CollaborationDispatchStatusView = "preparing" | "queued" | "merged" | "cancelled" | "dispatchUnknown";
+export type CollaborationInterruptStopOutcomeView = "stopped" | "notRunning" | "unconfirmed" | "alreadyQueued";
+
+export interface CollaborationGoalView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly leadId: string;
+  readonly leadSessionId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly sessionGeneration: bigint;
+  readonly backendInstanceGeneration: bigint;
+  readonly title: string;
+  readonly objective: string;
+  readonly maximumWorkers?: number;
+  readonly status: CollaborationGoalStatusView;
+  readonly error?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt?: number;
+}
+
+export interface CollaborationWorkerRouteView {
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+}
+
+export interface CollaborationWorkerView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly goalId: string;
+  readonly parentWorkerId?: string;
+  readonly sessionId?: string;
+  readonly route: CollaborationWorkerRouteView;
+  readonly sessionGeneration?: bigint;
+  readonly backendInstanceGeneration?: bigint;
+  readonly label: string;
+  readonly role: string;
+  readonly assignment: string;
+  readonly status: CollaborationWorkerStatusView;
+  readonly focused: boolean;
+  readonly runtimeReleased: boolean;
+  readonly softLimitWarning: boolean;
+  readonly idleSince?: number;
+  readonly error?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface CollaborationDispatchView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly goalId: string;
+  readonly workerId: string;
+  readonly callerLeadSessionId: string;
+  readonly operationId: string;
+  readonly queueItemId?: string;
+  readonly message: string;
+  readonly status: CollaborationDispatchStatusView;
+  readonly mergedIntoDispatchId?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface CollaborationQueueEntryView {
+  readonly dispatch: CollaborationDispatchView;
+  readonly queueItem?: QueueItemView;
+}
+
+export interface CollaborationGoalTreeView {
+  readonly goal: CollaborationGoalView;
+  readonly workers: readonly CollaborationWorkerView[];
+  readonly queue: readonly CollaborationQueueEntryView[];
+  readonly focusedWorkerId?: string;
+}
+
+export interface CollaborationWorkerDraftView {
+  readonly parentWorkerId?: string;
+  readonly label: string;
+  readonly role: string;
+  readonly assignment: string;
+  readonly targetId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+}
+
 export type ContactKindView = "person" | "organization";
 export type ContactStatusView = "confirmed" | "pending";
 export type ContactSourceView = "manual" | "agent" | "import";
@@ -5305,6 +5413,22 @@ export interface OperationApi {
   listPartnerDelegations(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerDelegationView[]>;
   getPartnerDelegation(partnerId: string, delegationId: string, signal?: AbortSignal): Promise<PartnerDelegationView>;
   cancelPartnerDelegation(partnerId: string, delegationId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerDelegationView>;
+  listCollaborationGoals(sessionId: string, includeArchived?: boolean, signal?: AbortSignal): Promise<readonly CollaborationGoalView[]>;
+  getCollaborationGoal(goalId: string, viewerSessionId: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  createCollaborationGoal(leadSessionId: string, expectedSessionGeneration: bigint, title: string, objective: string, maximumWorkers?: number, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  setCollaborationGoalStatus(goal: CollaborationGoalView, status: Exclude<CollaborationGoalStatusView, "active">, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  createCollaborationWorker(goal: CollaborationGoalView, draft: CollaborationWorkerDraftView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  updateCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, patch: { readonly label?: string; readonly role?: string; readonly assignment?: string }, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  focusCollaborationWorker(goal: CollaborationGoalView, worker?: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  wakeCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  stopCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  releaseCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  archiveCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  sendCollaborationWorkerMessage(goal: CollaborationGoalView, worker: CollaborationWorkerView, message: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  interruptCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, message: string, signal?: AbortSignal): Promise<{ readonly tree: CollaborationGoalTreeView; readonly stopOutcome: CollaborationInterruptStopOutcomeView }>;
+  editCollaborationDispatch(dispatch: CollaborationDispatchView, queueItem: QueueItemView, message: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  cancelCollaborationDispatch(dispatch: CollaborationDispatchView, queueItem: QueueItemView, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
+  mergeCollaborationDispatches(goal: CollaborationGoalView, worker: CollaborationWorkerView, entries: readonly CollaborationQueueEntryView[], signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
   getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView>;
   setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView>;
   listContacts(options?: ContactListOptionsView, signal?: AbortSignal): Promise<ContactListPageView>;

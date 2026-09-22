@@ -2318,6 +2318,31 @@ export function useAppController(): AppController {
       gateway().getPartnerDelegation(partnerId, delegationId, signal),
     cancelPartnerDelegation: (partnerId, delegationId, expectedRevision, signal) =>
       gateway().cancelPartnerDelegation(partnerId, delegationId, expectedRevision, signal),
+    listCollaborationGoals: (sessionId, includeArchived, signal) =>
+      gateway().listCollaborationGoals(sessionId, includeArchived, signal),
+    getCollaborationGoal: (goalId, viewerSessionId, signal) =>
+      gateway().getCollaborationGoal(goalId, viewerSessionId, signal),
+    createCollaborationGoal: (leadSessionId, expectedSessionGeneration, title, objective, maximumWorkers, signal) =>
+      gateway().createCollaborationGoal(leadSessionId, expectedSessionGeneration, title, objective, maximumWorkers, signal),
+    setCollaborationGoalStatus: (goal, status, signal) => gateway().setCollaborationGoalStatus(goal, status, signal),
+    createCollaborationWorker: (goal, draft, signal) => gateway().createCollaborationWorker(goal, draft, signal),
+    updateCollaborationWorker: (goal, worker, patch, signal) =>
+      gateway().updateCollaborationWorker(goal, worker, patch, signal),
+    focusCollaborationWorker: (goal, worker, signal) => gateway().focusCollaborationWorker(goal, worker, signal),
+    wakeCollaborationWorker: (goal, worker, signal) => gateway().wakeCollaborationWorker(goal, worker, signal),
+    stopCollaborationWorker: (goal, worker, signal) => gateway().stopCollaborationWorker(goal, worker, signal),
+    releaseCollaborationWorker: (goal, worker, signal) => gateway().releaseCollaborationWorker(goal, worker, signal),
+    archiveCollaborationWorker: (goal, worker, signal) => gateway().archiveCollaborationWorker(goal, worker, signal),
+    sendCollaborationWorkerMessage: (goal, worker, message, signal) =>
+      gateway().sendCollaborationWorkerMessage(goal, worker, message, signal),
+    interruptCollaborationWorker: (goal, worker, message, signal) =>
+      gateway().interruptCollaborationWorker(goal, worker, message, signal),
+    editCollaborationDispatch: (dispatch, queueItem, message, signal) =>
+      gateway().editCollaborationDispatch(dispatch, queueItem, message, signal),
+    cancelCollaborationDispatch: (dispatch, queueItem, signal) =>
+      gateway().cancelCollaborationDispatch(dispatch, queueItem, signal),
+    mergeCollaborationDispatches: (goal, worker, entries, signal) =>
+      gateway().mergeCollaborationDispatches(goal, worker, entries, signal),
     getContactDirectory: (signal) => gateway().getContactDirectory(signal),
     setContactDirectoryEnabled: (expectedRevision, enabled, signal) =>
       gateway().setContactDirectoryEnabled(expectedRevision, enabled, signal),

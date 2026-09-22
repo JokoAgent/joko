@@ -472,6 +472,237 @@ export interface UpdateObjectiveInput {
   readonly updatedAt?: UnixMillis;
 }
 
+export type CollaborationGoalStatus =
+  | "active"
+  | "completed"
+  | "stopped"
+  | "failed"
+  | "archived";
+
+export type CollaborationWorkerStatus =
+  | "provisioning"
+  | "idle"
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopping"
+  | "stopped"
+  | "dispatch_unknown"
+  | "archived";
+
+export type CollaborationDispatchStatus =
+  | "preparing"
+  | "queued"
+  | "merged"
+  | "cancelled"
+  | "dispatch_unknown";
+
+/** One durable, Backend-neutral collaboration goal led by a visible Session. */
+export interface CollaborationGoalRecord {
+  readonly id: string;
+  readonly leadId: string;
+  readonly leadSessionId: SessionId;
+  readonly backendId: BackendId;
+  readonly targetId: TargetId;
+  readonly sessionGeneration: number;
+  readonly backendInstanceGeneration: number;
+  readonly title: string;
+  readonly objective: string;
+  readonly maximumWorkers?: number;
+  readonly status: CollaborationGoalStatus;
+  readonly lastError?: PublicError;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly completedAt?: UnixMillis;
+  readonly revision: bigint;
+}
+
+/** Stable worker identity. Runtime release never removes this durable record. */
+export interface CollaborationWorkerRecord {
+  readonly id: string;
+  readonly goalId: string;
+  readonly parentWorkerId?: string;
+  readonly sessionId?: SessionId;
+  readonly backendId: BackendId;
+  readonly targetId: TargetId;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly planMode: boolean;
+  readonly sessionGeneration?: number;
+  readonly backendInstanceGeneration?: number;
+  readonly createOperationId: OperationId;
+  readonly label: string;
+  readonly role: string;
+  readonly assignment: string;
+  readonly status: CollaborationWorkerStatus;
+  readonly focused: boolean;
+  readonly runtimeReleased: boolean;
+  readonly softLimitWarning: boolean;
+  readonly idleSince?: UnixMillis;
+  readonly lastError?: PublicError;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+/** Durable ownership link between a lead-issued message and the worker Queue. */
+export interface CollaborationDispatchRecord {
+  readonly id: string;
+  readonly goalId: string;
+  readonly workerId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly operationId: OperationId;
+  readonly queueItemId?: QueueItemId;
+  readonly message: string;
+  readonly status: CollaborationDispatchStatus;
+  readonly mergedIntoDispatchId?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface CreateCollaborationGoalInput {
+  readonly id?: string;
+  readonly leadId?: string;
+  readonly leadSessionId: SessionId;
+  readonly title: string;
+  readonly objective: string;
+  readonly maximumWorkers?: number;
+  readonly expectedSessionGeneration?: number;
+  readonly createdAt?: UnixMillis;
+}
+
+export interface CreateCollaborationWorkerInput {
+  readonly id?: string;
+  readonly goalId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedGoalRevision: bigint;
+  readonly createOperationId: OperationId;
+  readonly backendId: BackendId;
+  readonly targetId: TargetId;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly planMode: boolean;
+  readonly parentWorkerId?: string;
+  readonly label: string;
+  readonly role: string;
+  readonly assignment: string;
+  readonly softLimit: number;
+  readonly hardLimit: number;
+  readonly createdAt?: UnixMillis;
+}
+
+export interface CreateCollaborationDispatchInput {
+  readonly id?: string;
+  readonly goalId: string;
+  readonly workerId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedWorkerRevision: bigint;
+  readonly expectedSessionGeneration: number;
+  readonly operationId: OperationId;
+  readonly message: string;
+  readonly createdAt?: UnixMillis;
+}
+
+export interface UpdateCollaborationGoalStatusInput {
+  readonly goalId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly status: Exclude<CollaborationGoalStatus, "active">;
+  readonly error?: PublicError;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface BindCollaborationWorkerSessionInput {
+  readonly workerId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly sessionId: SessionId;
+  readonly expectedSessionGeneration: number;
+  readonly expectedBackendInstanceGeneration: number;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface UpdateCollaborationWorkerAssignmentInput {
+  readonly workerId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly label?: string;
+  readonly role?: string;
+  readonly assignment?: string;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface UpdateCollaborationWorkerStateInput {
+  readonly workerId: string;
+  readonly callerLeadSessionId?: SessionId;
+  readonly expectedRevision: bigint;
+  readonly expectedSessionGeneration?: number;
+  /** New exact runtime generations observed after a confirmed Session resume. */
+  readonly refreshedSessionGeneration?: number;
+  readonly refreshedBackendInstanceGeneration?: number;
+  readonly status?: CollaborationWorkerStatus;
+  readonly runtimeReleased?: boolean;
+  readonly idleSince?: UnixMillis | null;
+  readonly error?: PublicError | null;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface FocusCollaborationWorkerInput {
+  readonly goalId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly workerId?: string;
+  readonly expectedWorkerRevision?: bigint;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface BindCollaborationDispatchQueueInput {
+  readonly dispatchId: string;
+  readonly expectedRevision: bigint;
+  readonly queueItemId: QueueItemId;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface EditCollaborationDispatchInput {
+  readonly dispatchId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedDispatchRevision: bigint;
+  readonly expectedQueueRevision: bigint;
+  readonly message: string;
+  readonly traceId: string;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface CancelCollaborationDispatchInput {
+  readonly dispatchId: string;
+  readonly callerLeadSessionId: SessionId;
+  readonly expectedDispatchRevision: bigint;
+  readonly expectedQueueRevision: bigint;
+  readonly traceId: string;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface MergeCollaborationDispatchesInput {
+  readonly goalId: string;
+  readonly workerId: string;
+  readonly callerLeadSessionId: SessionId;
+  /** Queue order. The first dispatch survives and retains its Queue identity. */
+  readonly dispatches: readonly {
+    readonly dispatchId: string;
+    readonly expectedDispatchRevision: bigint;
+    readonly expectedQueueRevision: bigint;
+  }[];
+  readonly traceId: string;
+  readonly updatedAt?: UnixMillis;
+}
+
 export type MakerMemoryKind = "user" | "feedback" | "project" | "reference" | "digest";
 
 /** Owner-private memory content. Callers must never copy these fields into Events or diagnostics. */

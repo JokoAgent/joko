@@ -20,6 +20,15 @@ export interface WorkerCapacitySnapshot {
 
 export interface WorkerCapacityController {
   acquire(ownerId: string, workerId: string): Promise<WorkerCapacityLease>;
+  /** Rehydrate already-admitted durable work after process restart. A newly
+   * lowered hard limit fences only future acquisitions. */
+  restore(input: {
+    readonly ownerId: string;
+    readonly workerId: string;
+    readonly state: "active" | "idle";
+    readonly acquiredAt?: number;
+    readonly idleSince?: number;
+  }): WorkerCapacityLease;
   markActive(leaseId: string): boolean;
   markIdle(leaseId: string): boolean;
   release(leaseId: string): boolean;
@@ -131,6 +140,34 @@ export function createWorkerCapacityController(options: WorkerCapacityController
       workerKeys.set(key, lease.leaseId);
       return publicLease(lease);
     },
+    restore(input) {
+      if (closed) throw new Error("Worker capacity controller is closed.");
+      const normalizedOwner = boundedIdentifier(input.ownerId, "Worker owner");
+      const normalizedWorker = boundedIdentifier(input.workerId, "Worker ID");
+      const key = keyOf(normalizedOwner, normalizedWorker);
+      const duplicate = workerKeys.get(key);
+      if (duplicate !== undefined) return publicLease(leases.get(duplicate)!);
+      const acquiredAt = optionalTimestamp(input.acquiredAt, "Worker acquisition time") ?? now();
+      const idleSince = optionalTimestamp(input.idleSince, "Worker idle time");
+      if (input.state === "active" && idleSince !== undefined) {
+        throw new Error("An active restored worker cannot have an idle time.");
+      }
+      const configured = settings();
+      const lease: InternalLease = {
+        leaseId: boundedIdentifier(idFactory(), "Worker lease ID"),
+        ownerId: normalizedOwner,
+        workerId: normalizedWorker,
+        acquiredAt,
+        softLimitReached: leases.size + 1 >= configured.workerSoftLimit,
+        state: input.state,
+        ...(input.state === "idle" ? { idleSince: idleSince ?? acquiredAt } : {}),
+        releasing: false
+      };
+      if (leases.has(lease.leaseId)) throw new Error("Worker lease ID collision.");
+      leases.set(lease.leaseId, lease);
+      workerKeys.set(key, lease.leaseId);
+      return publicLease(lease);
+    },
     markActive(leaseId) {
       const lease = leases.get(leaseId);
       if (lease === undefined || lease.releasing) return false;
@@ -192,4 +229,10 @@ function boundedIdentifier(value: string, label: string): string {
     throw new Error(`${label} is invalid.`);
   }
   return normalized;
+}
+
+function optionalTimestamp(value: number | undefined, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} is invalid.`);
+  return value;
 }

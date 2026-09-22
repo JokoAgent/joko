@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/collaboration.proto";
 import "joko/v1/contact.proto";
 import "joko/v1/event.proto";
 import "joko/v1/extension.proto";
@@ -248,6 +249,28 @@ service PartnerService {
   rpc ListPartnerDelegations(ListPartnerDelegationsRequest) returns (ListPartnerDelegationsResponse);
   rpc GetPartnerDelegation(GetPartnerDelegationRequest) returns (GetPartnerDelegationResponse);
   rpc CancelPartnerDelegation(CancelPartnerDelegationRequest) returns (CancelPartnerDelegationResponse);
+}
+
+// Authenticated, Backend-neutral authority for one lead Session and its
+// durable worker tree. Mutations are revision/generation fenced; dispatches
+// enter the worker Queue before any Backend can observe them.
+service CollaborationService {
+  rpc ListCollaborationGoals(ListCollaborationGoalsRequest) returns (ListCollaborationGoalsResponse);
+  rpc GetCollaborationGoal(GetCollaborationGoalRequest) returns (GetCollaborationGoalResponse);
+  rpc CreateCollaborationGoal(CreateCollaborationGoalRequest) returns (CreateCollaborationGoalResponse);
+  rpc SetCollaborationGoalStatus(SetCollaborationGoalStatusRequest) returns (SetCollaborationGoalStatusResponse);
+  rpc CreateCollaborationWorker(CreateCollaborationWorkerRequest) returns (CreateCollaborationWorkerResponse);
+  rpc UpdateCollaborationWorker(UpdateCollaborationWorkerRequest) returns (UpdateCollaborationWorkerResponse);
+  rpc FocusCollaborationWorker(FocusCollaborationWorkerRequest) returns (FocusCollaborationWorkerResponse);
+  rpc WakeCollaborationWorker(WakeCollaborationWorkerRequest) returns (WakeCollaborationWorkerResponse);
+  rpc StopCollaborationWorker(StopCollaborationWorkerRequest) returns (StopCollaborationWorkerResponse);
+  rpc ReleaseCollaborationWorker(ReleaseCollaborationWorkerRequest) returns (ReleaseCollaborationWorkerResponse);
+  rpc ArchiveCollaborationWorker(ArchiveCollaborationWorkerRequest) returns (ArchiveCollaborationWorkerResponse);
+  rpc SendCollaborationWorkerMessage(SendCollaborationWorkerMessageRequest) returns (SendCollaborationWorkerMessageResponse);
+  rpc InterruptCollaborationWorker(InterruptCollaborationWorkerRequest) returns (InterruptCollaborationWorkerResponse);
+  rpc EditCollaborationDispatch(EditCollaborationDispatchRequest) returns (EditCollaborationDispatchResponse);
+  rpc CancelCollaborationDispatch(CancelCollaborationDispatchRequest) returns (CancelCollaborationDispatchResponse);
+  rpc MergeCollaborationDispatches(MergeCollaborationDispatchesRequest) returns (MergeCollaborationDispatchesResponse);
 }
 
 // Orchestrator-node-owned local inference runtimes. Shared clients discover every

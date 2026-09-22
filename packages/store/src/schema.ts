@@ -1304,6 +1304,119 @@ CREATE TABLE session_objectives (
         )
       ) STRICT;
 
+CREATE TABLE collaboration_goals (
+        id TEXT PRIMARY KEY CHECK (
+          length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        lead_id TEXT NOT NULL UNIQUE CHECK (
+          length(lead_id) BETWEEN 1 AND 256 AND instr(lead_id, char(0)) = 0
+        ),
+        lead_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        session_generation INTEGER NOT NULL CHECK (session_generation BETWEEN 0 AND 9007199254740991),
+        backend_instance_generation INTEGER NOT NULL CHECK (
+          backend_instance_generation BETWEEN 0 AND 9007199254740991
+        ),
+        title TEXT NOT NULL CHECK (
+          length(trim(title)) BETWEEN 1 AND 256 AND instr(title, char(0)) = 0
+        ),
+        objective TEXT NOT NULL CHECK (
+          length(trim(objective)) BETWEEN 1 AND 32000 AND instr(objective, char(0)) = 0
+        ),
+        maximum_workers INTEGER CHECK (maximum_workers IS NULL OR maximum_workers BETWEEN 1 AND 128),
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'stopped', 'failed', 'archived')),
+        last_error_json TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        completed_at INTEGER CHECK (completed_at IS NULL OR completed_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
+      ) STRICT;
+
+CREATE TABLE collaboration_workers (
+        id TEXT PRIMARY KEY CHECK (
+          length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        goal_id TEXT NOT NULL REFERENCES collaboration_goals(id) ON DELETE CASCADE,
+        parent_worker_id TEXT,
+        session_id TEXT UNIQUE REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        provider_id TEXT,
+        model_id TEXT,
+        effort TEXT,
+        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
+        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+        plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
+        session_generation INTEGER CHECK (
+          session_generation IS NULL OR session_generation BETWEEN 0 AND 9007199254740991
+        ),
+        backend_instance_generation INTEGER CHECK (
+          backend_instance_generation IS NULL OR backend_instance_generation BETWEEN 0 AND 9007199254740991
+        ),
+        create_operation_id TEXT NOT NULL UNIQUE CHECK (
+          length(create_operation_id) BETWEEN 1 AND 256 AND instr(create_operation_id, char(0)) = 0
+        ),
+        label TEXT NOT NULL CHECK (
+          length(trim(label)) BETWEEN 1 AND 64 AND instr(label, char(0)) = 0
+        ),
+        role TEXT NOT NULL CHECK (
+          length(trim(role)) BETWEEN 1 AND 128 AND instr(role, char(0)) = 0
+        ),
+        assignment TEXT NOT NULL CHECK (
+          length(trim(assignment)) BETWEEN 1 AND 32000 AND instr(assignment, char(0)) = 0
+        ),
+        status TEXT NOT NULL CHECK (status IN (
+          'provisioning', 'idle', 'queued', 'running', 'completed', 'failed',
+          'stopping', 'stopped', 'dispatch_unknown', 'archived'
+        )),
+        focused INTEGER NOT NULL CHECK (focused IN (0, 1)),
+        runtime_released INTEGER NOT NULL CHECK (runtime_released IN (0, 1)),
+        soft_limit_warning INTEGER NOT NULL CHECK (soft_limit_warning IN (0, 1)),
+        idle_since INTEGER CHECK (idle_since IS NULL OR idle_since >= 0),
+        last_error_json TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(id, goal_id),
+        UNIQUE(goal_id, label COLLATE NOCASE),
+        FOREIGN KEY(parent_worker_id, goal_id)
+          REFERENCES collaboration_workers(id, goal_id) ON DELETE RESTRICT,
+        CHECK (parent_worker_id IS NULL OR parent_worker_id <> id),
+        CHECK ((provider_id IS NULL) = (model_id IS NULL)),
+        CHECK ((session_id IS NULL) = (session_generation IS NULL)),
+        CHECK ((session_id IS NULL) = (backend_instance_generation IS NULL))
+      ) STRICT;
+
+CREATE TABLE collaboration_dispatches (
+        id TEXT PRIMARY KEY CHECK (
+          length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        goal_id TEXT NOT NULL REFERENCES collaboration_goals(id) ON DELETE CASCADE,
+        worker_id TEXT NOT NULL,
+        caller_lead_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        operation_id TEXT NOT NULL UNIQUE CHECK (
+          length(operation_id) BETWEEN 1 AND 256 AND instr(operation_id, char(0)) = 0
+        ),
+        queue_item_id TEXT UNIQUE REFERENCES queue_items(id) ON DELETE RESTRICT,
+        message TEXT NOT NULL CHECK (
+          length(trim(message)) BETWEEN 1 AND 32000 AND instr(message, char(0)) = 0
+        ),
+        status TEXT NOT NULL CHECK (status IN (
+          'preparing', 'queued', 'merged', 'cancelled', 'dispatch_unknown'
+        )),
+        merged_into_dispatch_id TEXT REFERENCES collaboration_dispatches(id) ON DELETE RESTRICT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        FOREIGN KEY(worker_id, goal_id)
+          REFERENCES collaboration_workers(id, goal_id) ON DELETE CASCADE,
+        CHECK (
+          (status = 'merged' AND merged_into_dispatch_id IS NOT NULL)
+          OR (status <> 'merged' AND merged_into_dispatch_id IS NULL)
+        )
+      ) STRICT;
+
 CREATE TABLE session_reset_boundaries (
         session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
         reset_operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE RESTRICT,
@@ -1765,6 +1878,29 @@ CREATE UNIQUE INDEX session_objectives_pending_run_idx
 CREATE INDEX session_objectives_status_idx
         ON session_objectives(status, updated_at, session_id);
 
+CREATE UNIQUE INDEX collaboration_goals_active_lead_idx
+        ON collaboration_goals(lead_session_id) WHERE status = 'active';
+
+CREATE INDEX collaboration_goals_status_idx
+        ON collaboration_goals(status, updated_at DESC, id);
+
+CREATE UNIQUE INDEX collaboration_workers_focused_goal_idx
+        ON collaboration_workers(goal_id) WHERE focused = 1 AND status <> 'archived';
+
+CREATE INDEX collaboration_workers_goal_status_idx
+        ON collaboration_workers(goal_id, status, updated_at DESC, id);
+
+CREATE INDEX collaboration_workers_capacity_idx
+        ON collaboration_workers(runtime_released, status, updated_at, id)
+        WHERE status NOT IN ('archived', 'stopped');
+
+CREATE INDEX collaboration_dispatches_worker_idx
+        ON collaboration_dispatches(worker_id, created_at, id);
+
+CREATE INDEX collaboration_dispatches_recovery_idx
+        ON collaboration_dispatches(status, updated_at, id)
+        WHERE status IN ('preparing', 'queued', 'dispatch_unknown');
+
 CREATE INDEX session_worktrees_state_idx
         ON session_worktrees(state, updated_at DESC, session_id);
 
@@ -1976,6 +2112,91 @@ CREATE TRIGGER session_objectives_generation_update
       )
       BEGIN
         SELECT RAISE(ABORT, 'objective session generation is stale');
+      END;
+
+CREATE TRIGGER collaboration_goals_owner_insert
+      BEFORE INSERT ON collaboration_goals
+      WHEN NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.lead_session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration goal lead authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_goals_owner_update
+      BEFORE UPDATE OF lead_session_id, backend_id, target_id, session_generation ON collaboration_goals
+      WHEN NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.lead_session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration goal lead authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_workers_session_insert
+      BEFORE INSERT ON collaboration_workers
+      WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration worker Session authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_workers_session_update
+      BEFORE UPDATE OF session_id, backend_id, target_id, session_generation ON collaboration_workers
+      WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration worker Session authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_follow_session_generation
+      AFTER UPDATE OF generation ON product_sessions
+      WHEN OLD.generation <> NEW.generation
+      BEGIN
+        UPDATE collaboration_goals
+        SET session_generation = NEW.generation,
+            updated_at = MAX(updated_at, NEW.updated_at),
+            revision = NEW.revision
+        WHERE lead_session_id = NEW.id AND status = 'active';
+        UPDATE collaboration_workers
+        SET session_generation = NEW.generation,
+            updated_at = MAX(updated_at, NEW.updated_at),
+            revision = NEW.revision
+        WHERE session_id = NEW.id AND status <> 'archived';
+      END;
+
+CREATE TRIGGER collaboration_dispatch_queue_update
+      BEFORE UPDATE OF queue_item_id ON collaboration_dispatches
+      WHEN NEW.queue_item_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM queue_items item
+        JOIN collaboration_workers worker ON worker.id = NEW.worker_id
+        WHERE item.id = NEW.queue_item_id
+          AND item.session_id = worker.session_id
+          AND item.operation_id = NEW.operation_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration dispatch Queue authority is stale');
       END;
 
 CREATE TRIGGER sessions_remote_binding_insert

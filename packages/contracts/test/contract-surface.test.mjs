@@ -283,6 +283,61 @@ test("Partners exposes revision-fenced durable profiles without private home or 
   assert.equal(field(contract.PartnerDelegationSchema, "error").proto.proto3Optional, true);
 });
 
+test("Collaboration exposes exact Goal, worker, lifecycle, and Queue CAS authority without private runtime data", () => {
+  assert.deepEqual([...methodNames(contract.CollaborationService)], [
+    "listCollaborationGoals",
+    "getCollaborationGoal",
+    "createCollaborationGoal",
+    "setCollaborationGoalStatus",
+    "createCollaborationWorker",
+    "updateCollaborationWorker",
+    "focusCollaborationWorker",
+    "wakeCollaborationWorker",
+    "stopCollaborationWorker",
+    "releaseCollaborationWorker",
+    "archiveCollaborationWorker",
+    "sendCollaborationWorkerMessage",
+    "interruptCollaborationWorker",
+    "editCollaborationDispatch",
+    "cancelCollaborationDispatch",
+    "mergeCollaborationDispatches"
+  ]);
+  assertNoFields([
+    contract.CollaborationGoalSchema,
+    contract.CollaborationWorkerRouteSchema,
+    contract.CollaborationWorkerSchema,
+    contract.CollaborationDispatchSchema,
+    contract.CollaborationGoalTreeSchema,
+    contract.CollaborationGoalAccessSchema,
+    contract.ListCollaborationGoalsRequestSchema,
+    contract.GetCollaborationGoalRequestSchema,
+    contract.CreateCollaborationWorkerRequestSchema,
+    contract.WakeCollaborationWorkerRequestSchema,
+    contract.ReleaseCollaborationWorkerRequestSchema
+  ], [
+    "absolute_path", "workspace_root", "credential", "credential_reference_id",
+    "auth_key", "private_runtime_handle", "native_reference", "raw_error", "error_message"
+  ]);
+  assert.equal(field(contract.CollaborationGoalSchema, "maximum_workers").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "parent_worker_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "session_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "session_generation").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerSchema, "backend_instance_generation").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerRouteSchema, "provider_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerRouteSchema, "model_id").proto.proto3Optional, true);
+  assert.equal(field(contract.CollaborationWorkerRouteSchema, "effort").proto.proto3Optional, true);
+  assert.equal(field(contract.FocusCollaborationWorkerRequestSchema, "worker_id").proto.proto3Optional, true);
+  assert.equal(field(contract.FocusCollaborationWorkerRequestSchema, "expected_worker_revision").proto.proto3Optional, true);
+  assert.equal(field(contract.StopCollaborationWorkerRequestSchema, "expected_session_generation").proto.proto3Optional, true);
+  assert.deepEqual(fields(contract.ListCollaborationGoalsRequestSchema).map((candidate) => candidate.name), [
+    "session_id", "include_archived"
+  ]);
+  assert.deepEqual(fields(contract.GetCollaborationGoalRequestSchema).map((candidate) => candidate.name), [
+    "goal_id", "viewer_session_id"
+  ]);
+  assert.equal(field(contract.CollaborationGoalAccessSchema, "worker_id").proto.proto3Optional, true);
+});
+
 test("discovery metadata is a closed public allowlist", () => {
   assert.deepEqual(fields(contract.DiscoveredNodeSchema).map((candidate) => candidate.name), [
     "server_id", "display_name", "origin", "version", "api_version", "pairing_enabled", "last_seen"

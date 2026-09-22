@@ -91,10 +91,16 @@ import type {
   AppendEventInput,
   ArtifactRecord,
   ArtifactSourceRecord,
+  BindCollaborationDispatchQueueInput,
+  BindCollaborationWorkerSessionInput,
+  CancelCollaborationDispatchInput,
   ClearRemoteHostTrustInput,
   ConnectionRecord,
   ContextRebuildClaim,
   ConsumePairingInput,
+  CreateCollaborationDispatchInput,
+  CreateCollaborationGoalInput,
+  CreateCollaborationWorkerInput,
   CreateRemoteHostInput,
   CreateDeviceInput,
   CreatePairingInput,
@@ -109,6 +115,8 @@ import type {
   EnqueueInput,
   EventQuery,
   EventSubscriber,
+  EditCollaborationDispatchInput,
+  FocusCollaborationWorkerInput,
   InteractionRecord,
   ListSubagentRunsInput,
   ListSubagentTranscriptInput,
@@ -131,7 +139,14 @@ import type {
   MakerMemorySearchHit,
   MessageEmbeddingJob,
   MessageEmbeddingStatus,
+  MergeCollaborationDispatchesInput,
   ClaimedMobilePushDelivery,
+  CollaborationDispatchRecord,
+  CollaborationDispatchStatus,
+  CollaborationGoalRecord,
+  CollaborationGoalStatus,
+  CollaborationWorkerRecord,
+  CollaborationWorkerStatus,
   MobilePushDeliveryRecord,
   MobilePushRegistrationRecord,
   ModelPriceOverrideRecord,
@@ -212,6 +227,9 @@ import type {
   UsageLedgerSummary,
   UsageObservationResult,
   UpsertModelPriceOverrideInput,
+  UpdateCollaborationGoalStatusInput,
+  UpdateCollaborationWorkerAssignmentInput,
+  UpdateCollaborationWorkerStateInput,
   UpdateRemoteHostInput,
   UpdateRemoteHostStatusInput,
   UpdateQueueStateInput,
@@ -296,6 +314,31 @@ const QUEUE_TRANSITIONS: Readonly<Record<QueueState, ReadonlySet<QueueState>>> =
   completed: new Set(),
   cancelled: new Set(),
   failed: new Set()
+};
+
+const COLLABORATION_GOAL_TRANSITIONS: Readonly<
+  Record<CollaborationGoalStatus, ReadonlySet<CollaborationGoalStatus>>
+> = {
+  active: new Set(["completed", "stopped", "failed"]),
+  completed: new Set(["archived"]),
+  stopped: new Set(["archived"]),
+  failed: new Set(["archived"]),
+  archived: new Set()
+};
+
+const COLLABORATION_WORKER_TRANSITIONS: Readonly<
+  Record<CollaborationWorkerStatus, ReadonlySet<CollaborationWorkerStatus>>
+> = {
+  provisioning: new Set(["idle", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  idle: new Set(["queued", "running", "completed", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  queued: new Set(["idle", "running", "completed", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  running: new Set(["idle", "queued", "completed", "failed", "stopping", "stopped", "dispatch_unknown"]),
+  completed: new Set(["idle", "queued", "failed", "stopping", "stopped", "dispatch_unknown", "archived"]),
+  failed: new Set(["idle", "stopping", "stopped", "dispatch_unknown", "archived"]),
+  stopping: new Set(["stopped", "failed", "dispatch_unknown"]),
+  stopped: new Set(["archived"]),
+  dispatch_unknown: new Set(["idle", "queued", "running", "completed", "failed", "stopping", "stopped"]),
+  archived: new Set()
 };
 
 const REMOTE_HOST_STATUS_TRANSITIONS: Readonly<Record<RemoteHostStatus, ReadonlySet<RemoteHostStatus>>> = {
@@ -3298,6 +3341,1110 @@ export class OperationalStore {
       );
       return current;
     });
+  }
+
+  createCollaborationGoal(input: CreateCollaborationGoalInput): CollaborationGoalRecord {
+    return this.write(() => {
+      const leadSession = this.getSession(input.leadSessionId);
+      assertActiveCollaborationSession(leadSession, "lead");
+      if (this.findCollaborationWorkerBySession(input.leadSessionId) !== undefined) {
+        throw new StoreError("A collaboration worker Session cannot lead a nested Goal.");
+      }
+      const sessionGeneration = leadSession.descriptor.binding.generation;
+      if (
+        input.expectedSessionGeneration !== undefined &&
+        input.expectedSessionGeneration !== sessionGeneration
+      ) {
+        throw new StaleGenerationError(input.expectedSessionGeneration, sessionGeneration);
+      }
+      const existing = this.findActiveCollaborationGoalByLeadSession(input.leadSessionId);
+      if (existing !== undefined) {
+        throw new StoreError(`Session ${input.leadSessionId} already leads an active collaboration Goal.`);
+      }
+      const backend = this.getBackend(leadSession.descriptor.backendId);
+      const id = collaborationIdentity(input.id ?? this.idFactory(), "Goal ID");
+      const leadId = collaborationIdentity(input.leadId ?? `lead:${id}`, "lead ID");
+      const maximumWorkers = input.maximumWorkers === undefined
+        ? undefined
+        : collaborationLimit(input.maximumWorkers, "Goal maximum workers", 128);
+      const at = collaborationTimestamp(input.createdAt ?? this.now(), "Goal creation time");
+      this.database.prepare(`
+        INSERT INTO collaboration_goals(
+          id, lead_id, lead_session_id, backend_id, target_id,
+          session_generation, backend_instance_generation, title, objective,
+          maximum_workers, status, last_error_json, created_at, updated_at,
+          completed_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL, ?)
+      `).run(
+        id,
+        leadId,
+        leadSession.descriptor.id,
+        leadSession.descriptor.backendId,
+        leadSession.descriptor.targetId,
+        sessionGeneration,
+        backend.descriptor.instanceGeneration,
+        collaborationShortText(input.title, "Goal title", 256),
+        collaborationText(input.objective, "Goal objective"),
+        maximumWorkers ?? null,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getCollaborationGoal(id);
+    });
+  }
+
+  findCollaborationGoal(id: string): CollaborationGoalRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_goals WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : collaborationGoalFromRow(row);
+  }
+
+  getCollaborationGoal(id: string): CollaborationGoalRecord {
+    const goal = this.findCollaborationGoal(id);
+    if (goal === undefined) throw new NotFoundError("Collaboration Goal", id);
+    return goal;
+  }
+
+  findActiveCollaborationGoalByLeadSession(
+    leadSessionId: string
+  ): CollaborationGoalRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM collaboration_goals
+      WHERE lead_session_id = ? AND status = 'active'
+      LIMIT 1
+    `).get(leadSessionId) as Row | undefined;
+    return row === undefined ? undefined : collaborationGoalFromRow(row);
+  }
+
+  listCollaborationGoals(options: {
+    readonly leadSessionId?: string;
+    readonly statuses?: readonly CollaborationGoalStatus[];
+  } = {}): CollaborationGoalRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.leadSessionId !== undefined) {
+      clauses.push("lead_session_id = ?");
+      params.push(options.leadSessionId);
+    }
+    if (options.statuses !== undefined && options.statuses.length > 0) {
+      const statuses = [...new Set(options.statuses.map(collaborationGoalStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    return (this.database.prepare(`
+      SELECT * FROM collaboration_goals ${where}
+      ORDER BY updated_at DESC, id
+    `).all(...params) as Row[]).map(collaborationGoalFromRow);
+  }
+
+  updateCollaborationGoalStatus(
+    input: UpdateCollaborationGoalStatusInput
+  ): CollaborationGoalRecord {
+    return this.write(() => {
+      const current = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(current, input.callerLeadSessionId);
+      assertCollaborationRevision("Collaboration Goal", current.id, current.revision, input.expectedRevision);
+      const status = collaborationGoalStatus(input.status);
+      if (status === "active") throw new StoreError("A terminal Goal update cannot reactivate a Goal.");
+      if (current.status === status) return current;
+      if (!COLLABORATION_GOAL_TRANSITIONS[current.status].has(status)) {
+        throw new InvalidStateTransitionError("collaboration Goal", current.status, status);
+      }
+      const activeWorkers = this.database.prepare(`
+        SELECT COUNT(*) AS count FROM collaboration_workers
+        WHERE goal_id = ? AND status IN (
+          'provisioning', 'idle', 'queued', 'running', 'stopping', 'dispatch_unknown'
+        )
+      `).get(current.id) as Row;
+      if (numberValue(activeWorkers["count"]) > 0) {
+        throw new StoreError("A collaboration Goal cannot finish or archive while it has active workers.");
+      }
+      if (input.error !== undefined && status !== "failed") {
+        throw new StoreError("Only a failed collaboration Goal can retain an error.");
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "Goal update time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_goals
+        SET status = ?, last_error_json = ?, completed_at = COALESCE(completed_at, ?),
+            updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        status,
+        input.error === undefined ? null : serializeJson(input.error),
+        status === "archived" ? current.completedAt ?? at : at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration Goal",
+          current.id,
+          current.revision,
+          this.getCollaborationGoal(current.id).revision
+        );
+      }
+      return this.getCollaborationGoal(current.id);
+    });
+  }
+
+  reserveCollaborationWorker(
+    input: CreateCollaborationWorkerInput
+  ): CollaborationWorkerRecord {
+    return this.transaction(() => {
+      const replay = this.findCollaborationWorkerByCreateOperation(input.createOperationId);
+      if (replay !== undefined) {
+        assertSameCollaborationWorkerReservation(replay, input);
+        return replay;
+      }
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      assertCollaborationRevision("Collaboration Goal", goal.id, goal.revision, input.expectedGoalRevision);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal worker admission", goal.status, "active");
+      }
+      this.getOperation(input.createOperationId);
+      const backend = this.getBackend(input.backendId);
+      const target = this.getTarget(input.targetId);
+      if (target.descriptor.backendId !== backend.descriptor.id) {
+        throw new StoreError("A collaboration worker Target must belong to its selected Backend.");
+      }
+      if (input.parentWorkerId !== undefined) {
+        const parent = this.getCollaborationWorker(input.parentWorkerId);
+        if (parent.goalId !== goal.id || parent.status === "archived") {
+          throw new StoreError("A collaboration worker parent must be visible in the same Goal.");
+        }
+      }
+      if ((input.providerId === undefined) !== (input.modelId === undefined)) {
+        throw new StoreError("A collaboration worker route requires both provider and model IDs.");
+      }
+      const providerId = input.providerId === undefined
+        ? undefined
+        : collaborationRouteIdentity(input.providerId, "provider ID");
+      const modelId = input.modelId === undefined
+        ? undefined
+        : collaborationRouteIdentity(input.modelId, "model ID");
+      const effort = input.effort === undefined
+        ? undefined
+        : collaborationRouteIdentity(input.effort, "effort");
+      const permissionMode = collaborationPermissionMode(input.permissionMode);
+      const softLimit = collaborationLimit(input.softLimit, "worker soft limit", 128);
+      const hardLimit = collaborationLimit(input.hardLimit, "worker hard limit", 128);
+      if (softLimit > hardLimit) {
+        throw new StoreError("The collaboration worker soft limit cannot exceed the hard limit.");
+      }
+      const globalCapacity = this.database.prepare(`
+        SELECT COUNT(*) AS count FROM collaboration_workers
+        WHERE runtime_released = 0
+          AND status NOT IN ('archived', 'stopped')
+      `).get() as Row;
+      const activeRuntimeCount = numberValue(globalCapacity["count"]);
+      if (activeRuntimeCount >= hardLimit) {
+        throw new StoreError(`The collaboration worker hard limit of ${hardLimit} is reached.`);
+      }
+      if (goal.maximumWorkers !== undefined) {
+        const goalCount = this.database.prepare(`
+          SELECT COUNT(*) AS count FROM collaboration_workers
+          WHERE goal_id = ? AND status <> 'archived'
+        `).get(goal.id) as Row;
+        if (numberValue(goalCount["count"]) >= goal.maximumWorkers) {
+          throw new StoreError(`Collaboration Goal ${goal.id} reached its worker limit.`);
+        }
+      }
+      const id = collaborationIdentity(input.id ?? this.idFactory(), "worker ID");
+      const at = collaborationTimestamp(input.createdAt ?? this.now(), "worker creation time");
+      this.database.prepare(`
+        INSERT INTO collaboration_workers(
+          id, goal_id, parent_worker_id, session_id, backend_id, target_id,
+          provider_id, model_id, effort, fast_mode, permission_mode, plan_mode,
+          session_generation, backend_instance_generation, create_operation_id,
+          label, role, assignment, status, focused, runtime_released,
+          soft_limit_warning, idle_since, last_error_json, created_at,
+          updated_at, revision
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, 'provisioning',
+          0, 0, ?, NULL, NULL, ?, ?, ?)
+      `).run(
+        id,
+        goal.id,
+        input.parentWorkerId ?? null,
+        backend.descriptor.id,
+        target.descriptor.id,
+        providerId ?? null,
+        modelId ?? null,
+        effort ?? null,
+        boolInt(input.fastMode),
+        permissionMode,
+        boolInt(input.planMode),
+        input.createOperationId,
+        collaborationShortText(input.label, "worker label", 64),
+        collaborationShortText(input.role, "worker role", 128),
+        collaborationText(input.assignment, "worker assignment"),
+        boolInt(activeRuntimeCount + 1 >= softLimit),
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      this.database.prepare(`
+        UPDATE collaboration_goals
+        SET updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        goal.id,
+        asSqlInteger(goal.revision)
+      );
+      return this.getCollaborationWorker(id);
+    });
+  }
+
+  findCollaborationWorker(id: string): CollaborationWorkerRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_workers WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : collaborationWorkerFromRow(row);
+  }
+
+  getCollaborationWorker(id: string): CollaborationWorkerRecord {
+    const worker = this.findCollaborationWorker(id);
+    if (worker === undefined) throw new NotFoundError("Collaboration worker", id);
+    return worker;
+  }
+
+  findCollaborationWorkerBySession(sessionId: string): CollaborationWorkerRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_workers WHERE session_id = ?"
+    ).get(sessionId) as Row | undefined;
+    return row === undefined ? undefined : collaborationWorkerFromRow(row);
+  }
+
+  findCollaborationWorkerByCreateOperation(
+    operationId: string
+  ): CollaborationWorkerRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_workers WHERE create_operation_id = ?"
+    ).get(operationId) as Row | undefined;
+    return row === undefined ? undefined : collaborationWorkerFromRow(row);
+  }
+
+  listCollaborationWorkers(options: {
+    readonly goalId?: string;
+    readonly statuses?: readonly CollaborationWorkerStatus[];
+    readonly includeArchived?: boolean;
+  } = {}): CollaborationWorkerRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.goalId !== undefined) {
+      clauses.push("goal_id = ?");
+      params.push(options.goalId);
+    }
+    if (options.statuses !== undefined && options.statuses.length > 0) {
+      const statuses = [...new Set(options.statuses.map(collaborationWorkerStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    } else if (options.includeArchived !== true) {
+      clauses.push("status <> 'archived'");
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    return (this.database.prepare(`
+      SELECT * FROM collaboration_workers ${where}
+      ORDER BY created_at, id
+    `).all(...params) as Row[]).map(collaborationWorkerFromRow);
+  }
+
+  bindCollaborationWorkerSession(
+    input: BindCollaborationWorkerSessionInput
+  ): CollaborationWorkerRecord {
+    return this.write(() => {
+      const current = this.getCollaborationWorker(input.workerId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      assertCollaborationRevision("Collaboration worker", current.id, current.revision, input.expectedRevision);
+      if (current.status !== "provisioning" && current.status !== "dispatch_unknown") {
+        throw new InvalidStateTransitionError("collaboration worker", current.status, "idle");
+      }
+      if (current.sessionId !== undefined && current.sessionId !== input.sessionId) {
+        throw new StoreError("A collaboration worker cannot be rebound to another Session.");
+      }
+      const session = this.getSession(input.sessionId);
+      assertActiveCollaborationSession(session, "worker");
+      if (this.listCollaborationGoals({ leadSessionId: session.descriptor.id }).length > 0) {
+        throw new StoreError("A collaboration lead Session cannot become a worker.");
+      }
+      const existingWorker = this.findCollaborationWorkerBySession(session.descriptor.id);
+      if (existingWorker !== undefined && existingWorker.id !== current.id) {
+        throw new StoreError("A collaboration Session can belong to only one worker.");
+      }
+      if (
+        session.descriptor.backendId !== current.backendId ||
+        session.descriptor.targetId !== current.targetId
+      ) {
+        throw new StoreError("The collaboration worker Session route does not match its reservation.");
+      }
+      if (
+        (current.providerId !== undefined && current.providerId !== session.descriptor.providerId) ||
+        (current.modelId !== undefined && current.modelId !== session.descriptor.modelId) ||
+        (current.effort !== undefined && current.effort !== session.descriptor.effort) ||
+        current.fastMode !== session.descriptor.fastMode ||
+        current.permissionMode !== session.descriptor.permissionMode ||
+        current.planMode !== session.descriptor.planMode
+      ) {
+        throw new StoreError("The collaboration worker Session settings do not match its reservation.");
+      }
+      if (session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(
+          input.expectedSessionGeneration,
+          session.descriptor.binding.generation
+        );
+      }
+      const backendGeneration = this.getBackend(current.backendId).descriptor.instanceGeneration;
+      if (backendGeneration !== input.expectedBackendInstanceGeneration) {
+        throw new StaleGenerationError(input.expectedBackendInstanceGeneration, backendGeneration);
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "worker bind time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET session_id = ?, provider_id = ?, model_id = ?, effort = ?,
+            session_generation = ?, backend_instance_generation = ?,
+            status = 'idle', runtime_released = 0, idle_since = ?,
+            last_error_json = NULL, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        session.descriptor.id,
+        session.descriptor.providerId ?? null,
+        session.descriptor.modelId ?? null,
+        session.descriptor.effort ?? null,
+        session.descriptor.binding.generation,
+        backendGeneration,
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          current.id,
+          current.revision,
+          this.getCollaborationWorker(current.id).revision
+        );
+      }
+      return this.getCollaborationWorker(current.id);
+    });
+  }
+
+  updateCollaborationWorkerAssignment(
+    input: UpdateCollaborationWorkerAssignmentInput
+  ): CollaborationWorkerRecord {
+    return this.write(() => {
+      const current = this.getCollaborationWorker(input.workerId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal worker assignment", goal.status, "active");
+      }
+      assertCollaborationRevision("Collaboration worker", current.id, current.revision, input.expectedRevision);
+      if (!["provisioning", "idle", "queued"].includes(current.status)) {
+        throw new InvalidStateTransitionError("collaboration worker assignment", current.status, "editable");
+      }
+      if (input.label === undefined && input.role === undefined && input.assignment === undefined) {
+        return current;
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "worker assignment update time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET label = ?, role = ?, assignment = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        input.label === undefined ? current.label : collaborationShortText(input.label, "worker label", 64),
+        input.role === undefined ? current.role : collaborationShortText(input.role, "worker role", 128),
+        input.assignment === undefined
+          ? current.assignment
+          : collaborationText(input.assignment, "worker assignment"),
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          current.id,
+          current.revision,
+          this.getCollaborationWorker(current.id).revision
+        );
+      }
+      return this.getCollaborationWorker(current.id);
+    });
+  }
+
+  updateCollaborationWorkerState(
+    input: UpdateCollaborationWorkerStateInput
+  ): CollaborationWorkerRecord {
+    return this.write(() => {
+      const current = this.getCollaborationWorker(input.workerId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      if (input.callerLeadSessionId !== undefined) {
+        assertCollaborationLead(goal, input.callerLeadSessionId);
+      }
+      assertCollaborationRevision("Collaboration worker", current.id, current.revision, input.expectedRevision);
+      if (input.expectedSessionGeneration !== undefined) {
+        if (current.sessionGeneration === undefined) {
+          throw new StoreError("An unbound collaboration worker has no Session generation.");
+        }
+        if (current.sessionGeneration !== input.expectedSessionGeneration) {
+          throw new StaleGenerationError(input.expectedSessionGeneration, current.sessionGeneration);
+        }
+      }
+      if ((input.refreshedSessionGeneration === undefined) !==
+          (input.refreshedBackendInstanceGeneration === undefined)) {
+        throw new StoreError("A collaboration worker runtime refresh requires both Session and Backend generations.");
+      }
+      let sessionGeneration = current.sessionGeneration;
+      let backendInstanceGeneration = current.backendInstanceGeneration;
+      if (input.refreshedSessionGeneration !== undefined &&
+          input.refreshedBackendInstanceGeneration !== undefined) {
+        if (current.sessionId === undefined) {
+          throw new StoreError("An unbound collaboration worker cannot refresh its runtime generations.");
+        }
+        const session = this.getSession(current.sessionId);
+        const backend = this.getBackend(current.backendId);
+        if (session.descriptor.binding.generation !== input.refreshedSessionGeneration) {
+          throw new StaleGenerationError(
+            input.refreshedSessionGeneration,
+            session.descriptor.binding.generation
+          );
+        }
+        if (backend.descriptor.instanceGeneration !== input.refreshedBackendInstanceGeneration) {
+          throw new StaleGenerationError(
+            input.refreshedBackendInstanceGeneration,
+            backend.descriptor.instanceGeneration
+          );
+        }
+        sessionGeneration = input.refreshedSessionGeneration;
+        backendInstanceGeneration = input.refreshedBackendInstanceGeneration;
+      }
+      const status = input.status === undefined ? current.status : collaborationWorkerStatus(input.status);
+      if (status !== current.status && !COLLABORATION_WORKER_TRANSITIONS[current.status].has(status)) {
+        throw new InvalidStateTransitionError("collaboration worker", current.status, status);
+      }
+      const runtimeReleased = input.runtimeReleased ?? current.runtimeReleased;
+      if (runtimeReleased && !["idle", "completed", "failed", "stopped", "archived"].includes(status)) {
+        throw new StoreError("Only an idle or terminal collaboration worker can release its runtime.");
+      }
+      if (current.sessionId !== undefined && ["completed", "failed", "stopped", "archived"].includes(status)) {
+        const activeQueue = this.listQueueItems({
+          sessionId: current.sessionId,
+          states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"]
+        });
+        if (activeQueue.length > 0) {
+          throw new StoreError("A collaboration worker with active Queue items cannot become terminal.");
+        }
+      }
+      if (status === "archived") {
+        if (!runtimeReleased) throw new StoreError("A collaboration worker must release its runtime before archive.");
+      }
+      if (input.error !== undefined && input.error !== null && !["failed", "dispatch_unknown"].includes(status)) {
+        throw new StoreError("Only a failed or dispatch-unknown worker can retain an error.");
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "worker state update time"
+      ));
+      const idleSince = input.idleSince === undefined
+        ? (status === "idle" ? current.idleSince ?? at : null)
+        : (input.idleSince === null
+            ? null
+            : collaborationTimestamp(input.idleSince, "worker idle time"));
+      if (idleSince !== null && !["idle", "completed", "failed"].includes(status)) {
+        throw new StoreError("Only an idle or settled collaboration worker can retain an idle timestamp.");
+      }
+      const errorJson = input.error === undefined
+        ? (["failed", "dispatch_unknown"].includes(status) && current.lastError !== undefined
+            ? serializeJson(current.lastError)
+            : null)
+        : (input.error === null ? null : serializeJson(input.error));
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET status = ?, runtime_released = ?, session_generation = ?, backend_instance_generation = ?,
+            focused = CASE WHEN ? = 1 OR ? IN ('failed', 'stopped', 'archived') THEN 0 ELSE focused END,
+            idle_since = ?, last_error_json = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        status,
+        boolInt(runtimeReleased),
+        sessionGeneration ?? null,
+        backendInstanceGeneration ?? null,
+        boolInt(runtimeReleased),
+        status,
+        idleSince,
+        errorJson,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          current.id,
+          current.revision,
+          this.getCollaborationWorker(current.id).revision
+        );
+      }
+      return this.getCollaborationWorker(current.id);
+    });
+  }
+
+  focusCollaborationWorker(input: FocusCollaborationWorkerInput): CollaborationWorkerRecord | undefined {
+    return this.transaction(() => {
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal focus", goal.status, "active");
+      }
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "worker focus time");
+      let selected: CollaborationWorkerRecord | undefined;
+      if (input.workerId !== undefined) {
+        selected = this.getCollaborationWorker(input.workerId);
+        if (selected.goalId !== goal.id || selected.status === "archived") {
+          throw new StoreError("The focused collaboration worker must be visible in the selected Goal.");
+        }
+        if (input.expectedWorkerRevision === undefined) {
+          throw new StoreError("Focusing a collaboration worker requires its expected revision.");
+        }
+        assertCollaborationRevision(
+          "Collaboration worker",
+          selected.id,
+          selected.revision,
+          input.expectedWorkerRevision
+        );
+        if (selected.focused) return selected;
+      }
+      this.database.prepare(`
+        UPDATE collaboration_workers
+        SET focused = 0, updated_at = ?, revision = ?
+        WHERE goal_id = ? AND focused = 1 AND status <> 'archived'
+      `).run(at, asSqlInteger(this.requireActiveRevision()), goal.id);
+      if (selected === undefined) return undefined;
+      const result = this.database.prepare(`
+        UPDATE collaboration_workers
+        SET focused = 1, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status <> 'archived'
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        selected.id,
+        asSqlInteger(selected.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration worker",
+          selected.id,
+          selected.revision,
+          this.getCollaborationWorker(selected.id).revision
+        );
+      }
+      return this.getCollaborationWorker(selected.id);
+    });
+  }
+
+  createCollaborationDispatch(
+    input: CreateCollaborationDispatchInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const replay = this.findCollaborationDispatchByOperation(input.operationId);
+      if (replay !== undefined) {
+        assertSameCollaborationDispatch(replay, input);
+        return replay;
+      }
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal dispatch", goal.status, "active");
+      }
+      const worker = this.getCollaborationWorker(input.workerId);
+      if (worker.goalId !== goal.id) {
+        throw new StoreError("A collaboration dispatch worker must belong to its Goal.");
+      }
+      assertCollaborationRevision(
+        "Collaboration worker",
+        worker.id,
+        worker.revision,
+        input.expectedWorkerRevision
+      );
+      if (worker.sessionId === undefined || worker.sessionGeneration === undefined ||
+          worker.backendInstanceGeneration === undefined) {
+        throw new StoreError("A collaboration dispatch requires a bound worker Session.");
+      }
+      if (worker.runtimeReleased) {
+        throw new StoreError("A released collaboration worker must be woken before dispatch.");
+      }
+      if (!["idle", "queued", "running", "completed"].includes(worker.status)) {
+        throw new InvalidStateTransitionError("collaboration worker dispatch", worker.status, "queued");
+      }
+      if (worker.sessionGeneration !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(input.expectedSessionGeneration, worker.sessionGeneration);
+      }
+      const session = this.getSession(worker.sessionId);
+      assertActiveCollaborationSession(session, "worker");
+      if (session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StaleGenerationError(
+          input.expectedSessionGeneration,
+          session.descriptor.binding.generation
+        );
+      }
+      const backendGeneration = this.getBackend(worker.backendId).descriptor.instanceGeneration;
+      if (backendGeneration !== worker.backendInstanceGeneration) {
+        throw new StaleGenerationError(worker.backendInstanceGeneration, backendGeneration);
+      }
+      this.getOperation(input.operationId);
+      const id = collaborationIdentity(input.id ?? this.idFactory(), "dispatch ID");
+      const at = collaborationTimestamp(input.createdAt ?? this.now(), "dispatch creation time");
+      this.database.prepare(`
+        INSERT INTO collaboration_dispatches(
+          id, goal_id, worker_id, caller_lead_session_id, operation_id,
+          queue_item_id, message, status, merged_into_dispatch_id,
+          created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'preparing', NULL, ?, ?, ?)
+      `).run(
+        id,
+        goal.id,
+        worker.id,
+        goal.leadSessionId,
+        input.operationId,
+        collaborationText(input.message, "dispatch message"),
+        at,
+        at,
+        asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getCollaborationDispatch(id);
+    });
+  }
+
+  findCollaborationDispatch(id: string): CollaborationDispatchRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_dispatches WHERE id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : collaborationDispatchFromRow(row);
+  }
+
+  getCollaborationDispatch(id: string): CollaborationDispatchRecord {
+    const dispatch = this.findCollaborationDispatch(id);
+    if (dispatch === undefined) throw new NotFoundError("Collaboration dispatch", id);
+    return dispatch;
+  }
+
+  findCollaborationDispatchByOperation(
+    operationId: string
+  ): CollaborationDispatchRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_dispatches WHERE operation_id = ?"
+    ).get(operationId) as Row | undefined;
+    return row === undefined ? undefined : collaborationDispatchFromRow(row);
+  }
+
+  findCollaborationDispatchByQueueItem(
+    queueItemId: string
+  ): CollaborationDispatchRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM collaboration_dispatches WHERE queue_item_id = ?"
+    ).get(queueItemId) as Row | undefined;
+    return row === undefined ? undefined : collaborationDispatchFromRow(row);
+  }
+
+  listCollaborationDispatches(options: {
+    readonly goalId?: string;
+    readonly workerId?: string;
+    readonly statuses?: readonly CollaborationDispatchStatus[];
+  } = {}): CollaborationDispatchRecord[] {
+    this.assertOpen();
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.goalId !== undefined) {
+      clauses.push("goal_id = ?");
+      params.push(options.goalId);
+    }
+    if (options.workerId !== undefined) {
+      clauses.push("worker_id = ?");
+      params.push(options.workerId);
+    }
+    if (options.statuses !== undefined && options.statuses.length > 0) {
+      const statuses = [...new Set(options.statuses.map(collaborationDispatchStatus))];
+      clauses.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    return (this.database.prepare(`
+      SELECT * FROM collaboration_dispatches ${where}
+      ORDER BY created_at, id
+    `).all(...params) as Row[]).map(collaborationDispatchFromRow);
+  }
+
+  bindCollaborationDispatchQueue(
+    input: BindCollaborationDispatchQueueInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedRevision
+      );
+      if (current.status !== "preparing" && current.status !== "dispatch_unknown") {
+        throw new InvalidStateTransitionError("collaboration dispatch", current.status, "queued");
+      }
+      const worker = this.getCollaborationWorker(current.workerId);
+      if (worker.sessionId === undefined) {
+        throw new StoreError("A collaboration dispatch worker is not bound to a Session.");
+      }
+      const queueItem = this.getQueueItem(input.queueItemId);
+      if (
+        queueItem.sessionId !== worker.sessionId ||
+        queueItem.operationId !== current.operationId ||
+        queueItem.state !== "accepted"
+      ) {
+        throw new StoreError("A collaboration dispatch must bind its own accepted worker Queue item.");
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "dispatch bind time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET queue_item_id = ?, status = 'queued', updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        queueItem.id,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration dispatch",
+          current.id,
+          current.revision,
+          this.getCollaborationDispatch(current.id).revision
+        );
+      }
+      if (worker.status === "idle" || worker.status === "completed") {
+        this.database.prepare(`
+          UPDATE collaboration_workers
+          SET status = 'queued', idle_since = NULL, updated_at = ?, revision = ?
+          WHERE id = ? AND revision = ?
+        `).run(
+          at,
+          asSqlInteger(this.requireActiveRevision()),
+          worker.id,
+          asSqlInteger(worker.revision)
+        );
+      }
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  markCollaborationDispatchUnknown(input: {
+    readonly dispatchId: string;
+    readonly expectedRevision: bigint;
+    readonly updatedAt?: number;
+  }): CollaborationDispatchRecord {
+    return this.write(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedRevision
+      );
+      if (current.status === "dispatch_unknown") return current;
+      if (current.status !== "preparing") {
+        throw new InvalidStateTransitionError(
+          "collaboration dispatch",
+          current.status,
+          "dispatch_unknown"
+        );
+      }
+      const at = Math.max(current.createdAt, collaborationTimestamp(
+        input.updatedAt ?? this.now(),
+        "dispatch recovery time"
+      ));
+      this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET status = 'dispatch_unknown', updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  editCollaborationDispatch(
+    input: EditCollaborationDispatchInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationDispatchLead(this, current, input.callerLeadSessionId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal Queue edit", goal.status, "active");
+      }
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedDispatchRevision
+      );
+      if (current.status !== "queued" || current.queueItemId === undefined) {
+        throw new InvalidStateTransitionError("collaboration dispatch edit", current.status, "queued");
+      }
+      const message = collaborationText(input.message, "dispatch message");
+      const queueItem = this.getQueueItem(current.queueItemId);
+      assertCollaborationRevision(
+        "Queue item",
+        queueItem.id,
+        queueItem.revision,
+        input.expectedQueueRevision
+      );
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "dispatch edit time");
+      this.editQueueItem({
+        queueItemId: queueItem.id,
+        expectedRevision: queueItem.revision,
+        body: { ...queueItem.body, text: message },
+        traceId: input.traceId,
+        at
+      });
+      const result = this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET message = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        message,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Collaboration dispatch",
+          current.id,
+          current.revision,
+          this.getCollaborationDispatch(current.id).revision
+        );
+      }
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  cancelCollaborationDispatch(
+    input: CancelCollaborationDispatchInput
+  ): CollaborationDispatchRecord {
+    return this.transaction(() => {
+      const current = this.getCollaborationDispatch(input.dispatchId);
+      assertCollaborationDispatchLead(this, current, input.callerLeadSessionId);
+      const goal = this.getCollaborationGoal(current.goalId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal Queue cancel", goal.status, "active");
+      }
+      assertCollaborationRevision(
+        "Collaboration dispatch",
+        current.id,
+        current.revision,
+        input.expectedDispatchRevision
+      );
+      if (current.status === "cancelled") return current;
+      if (current.status !== "queued" || current.queueItemId === undefined) {
+        throw new InvalidStateTransitionError("collaboration dispatch cancel", current.status, "cancelled");
+      }
+      const queueItem = this.getQueueItem(current.queueItemId);
+      assertCollaborationRevision(
+        "Queue item",
+        queueItem.id,
+        queueItem.revision,
+        input.expectedQueueRevision
+      );
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "dispatch cancel time");
+      this.cancelQueueItem({
+        queueItemId: queueItem.id,
+        expectedRevision: queueItem.revision,
+        traceId: input.traceId,
+        at
+      });
+      this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET status = 'cancelled', updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision)
+      );
+      this.refreshCollaborationWorkerQueueState(current.workerId, at);
+      return this.getCollaborationDispatch(current.id);
+    });
+  }
+
+  mergeCollaborationDispatches(
+    input: MergeCollaborationDispatchesInput
+  ): readonly CollaborationDispatchRecord[] {
+    return this.transaction(() => {
+      if (input.dispatches.length < 2) {
+        throw new StoreError("A collaboration Queue merge requires at least two dispatches.");
+      }
+      const ids = input.dispatches.map((item) => item.dispatchId);
+      if (new Set(ids).size !== ids.length) {
+        throw new StoreError("A collaboration Queue merge cannot contain duplicate dispatches.");
+      }
+      const goal = this.getCollaborationGoal(input.goalId);
+      assertCollaborationLead(goal, input.callerLeadSessionId);
+      if (goal.status !== "active") {
+        throw new InvalidStateTransitionError("collaboration Goal Queue merge", goal.status, "active");
+      }
+      const worker = this.getCollaborationWorker(input.workerId);
+      if (worker.goalId !== goal.id || worker.sessionId === undefined) {
+        throw new StoreError("A collaboration Queue merge worker must be bound to the selected Goal.");
+      }
+      const dispatches = input.dispatches.map((candidate) => {
+        const dispatch = this.getCollaborationDispatch(candidate.dispatchId);
+        if (
+          dispatch.goalId !== goal.id || dispatch.workerId !== worker.id ||
+          dispatch.callerLeadSessionId !== goal.leadSessionId ||
+          dispatch.status !== "queued" || dispatch.queueItemId === undefined
+        ) {
+          throw new StoreError("Only queued dispatches from one worker and lead can be merged.");
+        }
+        assertCollaborationRevision(
+          "Collaboration dispatch",
+          dispatch.id,
+          dispatch.revision,
+          candidate.expectedDispatchRevision
+        );
+        const queueItem = this.getQueueItem(dispatch.queueItemId);
+        assertCollaborationRevision(
+          "Queue item",
+          queueItem.id,
+          queueItem.revision,
+          candidate.expectedQueueRevision
+        );
+        if (queueItem.sessionId !== worker.sessionId || queueItem.state !== "accepted") {
+          throw new StoreError("Only accepted Queue items from the same worker can be merged.");
+        }
+        return { dispatch, queueItem };
+      });
+      const accepted = collectStorePages((offset, limit) => this.listQueueItems({
+        sessionId: worker.sessionId!,
+        states: ["accepted"],
+        offset,
+        limit
+      }));
+      const selectedIndexes = dispatches.map(({ queueItem }) =>
+        accepted.findIndex((candidate) => candidate.id === queueItem.id)
+      );
+      if (selectedIndexes.some((index) => index < 0)) {
+        throw new StoreError("A collaboration Queue merge selection is no longer pending.");
+      }
+      const firstIndex = selectedIndexes[0]!;
+      if (selectedIndexes.some((index, position) => index !== firstIndex + position)) {
+        throw new StoreError("A collaboration Queue merge must be one contiguous pending segment in Queue order.");
+      }
+      const mergedMessage = collaborationText(
+        dispatches.map(({ dispatch }) => dispatch.message).join("\n\n"),
+        "merged dispatch message"
+      );
+      const at = collaborationTimestamp(input.updatedAt ?? this.now(), "dispatch merge time");
+      const survivor = dispatches[0]!;
+      this.editQueueItem({
+        queueItemId: survivor.queueItem.id,
+        expectedRevision: survivor.queueItem.revision,
+        body: { ...survivor.queueItem.body, text: mergedMessage },
+        traceId: `${input.traceId}:survivor`,
+        at
+      });
+      this.database.prepare(`
+        UPDATE collaboration_dispatches
+        SET message = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        mergedMessage,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        survivor.dispatch.id,
+        asSqlInteger(survivor.dispatch.revision)
+      );
+      for (const merged of dispatches.slice(1)) {
+        this.cancelQueueItem({
+          queueItemId: merged.queueItem.id,
+          expectedRevision: merged.queueItem.revision,
+          traceId: `${input.traceId}:merged:${merged.dispatch.id}`,
+          at
+        });
+        this.database.prepare(`
+          UPDATE collaboration_dispatches
+          SET status = 'merged', merged_into_dispatch_id = ?, updated_at = ?, revision = ?
+          WHERE id = ? AND revision = ?
+        `).run(
+          survivor.dispatch.id,
+          at,
+          asSqlInteger(this.requireActiveRevision()),
+          merged.dispatch.id,
+          asSqlInteger(merged.dispatch.revision)
+        );
+      }
+      return ids.map((id) => this.getCollaborationDispatch(id));
+    });
+  }
+
+  private refreshCollaborationWorkerQueueState(workerId: string, at: number): void {
+    const worker = this.getCollaborationWorker(workerId);
+    if (worker.sessionId === undefined || worker.status !== "queued") return;
+    const active = this.listQueueItems({
+      sessionId: worker.sessionId,
+      states: ["accepted", "dispatching"]
+    });
+    if (active.length > 0) return;
+    this.database.prepare(`
+      UPDATE collaboration_workers
+      SET status = 'idle', idle_since = ?, updated_at = ?, revision = ?
+      WHERE id = ? AND revision = ? AND status = 'queued'
+    `).run(
+      at,
+      at,
+      asSqlInteger(this.requireActiveRevision()),
+      worker.id,
+      asSqlInteger(worker.revision)
+    );
   }
 
   listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean } = {}): StoredSession[] {
@@ -14006,6 +15153,76 @@ function objectiveFromRow(row: Row): ObjectiveRecord {
   };
 }
 
+function collaborationGoalFromRow(row: Row): CollaborationGoalRecord {
+  return {
+    id: stringValue(row["id"]),
+    leadId: stringValue(row["lead_id"]),
+    leadSessionId: stringValue(row["lead_session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    targetId: stringValue(row["target_id"]),
+    sessionGeneration: numberValue(row["session_generation"]),
+    backendInstanceGeneration: numberValue(row["backend_instance_generation"]),
+    title: stringValue(row["title"]),
+    objective: stringValue(row["objective"]),
+    ...optionalNumber("maximumWorkers", row["maximum_workers"]),
+    status: collaborationGoalStatus(stringValue(row["status"])),
+    ...optionalJson<PublicError, "lastError">("lastError", row["last_error_json"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    ...optionalNumber("completedAt", row["completed_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function collaborationWorkerFromRow(row: Row): CollaborationWorkerRecord {
+  return {
+    id: stringValue(row["id"]),
+    goalId: stringValue(row["goal_id"]),
+    ...optionalString("parentWorkerId", row["parent_worker_id"]),
+    ...optionalString("sessionId", row["session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    targetId: stringValue(row["target_id"]),
+    ...optionalString("providerId", row["provider_id"]),
+    ...optionalString("modelId", row["model_id"]),
+    ...optionalString("effort", row["effort"]),
+    fastMode: booleanValue(row["fast_mode"]),
+    permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const),
+    planMode: booleanValue(row["plan_mode"]),
+    ...optionalNumber("sessionGeneration", row["session_generation"]),
+    ...optionalNumber("backendInstanceGeneration", row["backend_instance_generation"]),
+    createOperationId: stringValue(row["create_operation_id"]),
+    label: stringValue(row["label"]),
+    role: stringValue(row["role"]),
+    assignment: stringValue(row["assignment"]),
+    status: collaborationWorkerStatus(stringValue(row["status"])),
+    focused: booleanValue(row["focused"]),
+    runtimeReleased: booleanValue(row["runtime_released"]),
+    softLimitWarning: booleanValue(row["soft_limit_warning"]),
+    ...optionalNumber("idleSince", row["idle_since"]),
+    ...optionalJson<PublicError, "lastError">("lastError", row["last_error_json"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function collaborationDispatchFromRow(row: Row): CollaborationDispatchRecord {
+  return {
+    id: stringValue(row["id"]),
+    goalId: stringValue(row["goal_id"]),
+    workerId: stringValue(row["worker_id"]),
+    callerLeadSessionId: stringValue(row["caller_lead_session_id"]),
+    operationId: stringValue(row["operation_id"]),
+    ...optionalString("queueItemId", row["queue_item_id"]),
+    message: stringValue(row["message"]),
+    status: collaborationDispatchStatus(stringValue(row["status"])),
+    ...optionalString("mergedIntoDispatchId", row["merged_into_dispatch_id"]),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
 function makerMemoryEntryFromRow(row: Row): MakerMemoryEntry {
   return {
     id: stringValue(row["id"]),
@@ -15833,6 +17050,234 @@ function objectiveStatus(value: string): ObjectiveStatus {
   ];
   if (!statuses.includes(value as ObjectiveStatus)) throw new StoreError("Objective status is invalid.");
   return value as ObjectiveStatus;
+}
+
+function collaborationGoalStatus(value: string): CollaborationGoalStatus {
+  const statuses: readonly CollaborationGoalStatus[] = [
+    "active",
+    "completed",
+    "stopped",
+    "failed",
+    "archived"
+  ];
+  if (!statuses.includes(value as CollaborationGoalStatus)) {
+    throw new StoreError("Collaboration Goal status is invalid.");
+  }
+  return value as CollaborationGoalStatus;
+}
+
+function collaborationWorkerStatus(value: string): CollaborationWorkerStatus {
+  const statuses: readonly CollaborationWorkerStatus[] = [
+    "provisioning",
+    "idle",
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "stopping",
+    "stopped",
+    "dispatch_unknown",
+    "archived"
+  ];
+  if (!statuses.includes(value as CollaborationWorkerStatus)) {
+    throw new StoreError("Collaboration worker status is invalid.");
+  }
+  return value as CollaborationWorkerStatus;
+}
+
+function collaborationDispatchStatus(value: string): CollaborationDispatchStatus {
+  const statuses: readonly CollaborationDispatchStatus[] = [
+    "preparing",
+    "queued",
+    "merged",
+    "cancelled",
+    "dispatch_unknown"
+  ];
+  if (!statuses.includes(value as CollaborationDispatchStatus)) {
+    throw new StoreError("Collaboration dispatch status is invalid.");
+  }
+  return value as CollaborationDispatchStatus;
+}
+
+function collaborationIdentity(value: string, label: string): string {
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    [...normalized].length > 256 ||
+    /[\p{Cc}\u2028\u2029]/u.test(normalized)
+  ) {
+    throw new StoreError(`Collaboration ${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function collaborationShortText(value: string, label: string, maximum: number): string {
+  if (typeof value !== "string") throw new StoreError(`Collaboration ${label} must be text.`);
+  const normalized = value.normalize("NFC").replace(/\s+/gu, " ").trim();
+  if (
+    normalized.length === 0 ||
+    [...normalized].length > maximum ||
+    /[\p{Cc}\u2028\u2029]/u.test(normalized)
+  ) {
+    throw new StoreError(`Collaboration ${label} must contain between 1 and ${maximum} safe characters.`);
+  }
+  return normalized;
+}
+
+function collaborationRouteIdentity(value: string, label: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 512 || /[\u0000\r\n]/u.test(normalized)) {
+    throw new StoreError(`Collaboration worker ${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function collaborationPermissionMode(
+  value: CreateCollaborationWorkerInput["permissionMode"]
+): CreateCollaborationWorkerInput["permissionMode"] {
+  if (value !== "ask" && value !== "auto" && value !== "bypassPermissions") {
+    throw new StoreError("Collaboration worker permission mode is invalid.");
+  }
+  return value;
+}
+
+function collaborationText(value: string, label: string): string {
+  if (typeof value !== "string") throw new StoreError(`Collaboration ${label} must be text.`);
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  if (normalized.length === 0 || [...normalized].length > 32_000 || normalized.includes("\0")) {
+    throw new StoreError(`Collaboration ${label} must contain between 1 and 32000 safe characters.`);
+  }
+  return normalized;
+}
+
+function collaborationLimit(value: number, label: string, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new StoreError(`Collaboration ${label} must be an integer between 1 and ${maximum}.`);
+  }
+  return value;
+}
+
+function collaborationTimestamp(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new StoreError(`Collaboration ${label} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function assertActiveCollaborationSession(session: StoredSession, role: "lead" | "worker"): void {
+  if (session.descriptor.archived || session.descriptor.deletedAt !== undefined) {
+    throw new StoreError(`A collaboration ${role} requires an active, non-archived Session.`);
+  }
+}
+
+function assertCollaborationLead(goal: CollaborationGoalRecord, callerSessionId: string): void {
+  if (goal.leadSessionId !== callerSessionId) {
+    throw new AuthorizationError("Only the collaboration Goal lead Session can perform this action.");
+  }
+}
+
+function assertCollaborationRevision(
+  resource: string,
+  id: string,
+  actual: bigint,
+  expected: bigint
+): void {
+  if (actual !== expected) throw new RevisionConflictError(resource, id, expected, actual);
+}
+
+function assertSameCollaborationWorkerReservation(
+  worker: CollaborationWorkerRecord,
+  input: CreateCollaborationWorkerInput
+): void {
+  if (
+    worker.goalId !== input.goalId ||
+    worker.parentWorkerId !== input.parentWorkerId ||
+    worker.backendId !== input.backendId ||
+    worker.targetId !== input.targetId ||
+    worker.providerId !== input.providerId ||
+    worker.modelId !== input.modelId ||
+    worker.effort !== input.effort ||
+    worker.fastMode !== input.fastMode ||
+    worker.permissionMode !== input.permissionMode ||
+    worker.planMode !== input.planMode ||
+    worker.label !== collaborationShortText(input.label, "worker label", 64) ||
+    worker.role !== collaborationShortText(input.role, "worker role", 128) ||
+    worker.assignment !== collaborationText(input.assignment, "worker assignment")
+  ) {
+    throw new OperationConflictError(
+      input.createOperationId,
+      operationBodyHash({
+        goalId: worker.goalId,
+        parentWorkerId: worker.parentWorkerId,
+        backendId: worker.backendId,
+        targetId: worker.targetId,
+        providerId: worker.providerId,
+        modelId: worker.modelId,
+        effort: worker.effort,
+        fastMode: worker.fastMode,
+        permissionMode: worker.permissionMode,
+        planMode: worker.planMode,
+        label: worker.label,
+        role: worker.role,
+        assignment: worker.assignment
+      }),
+      operationBodyHash({
+        goalId: input.goalId,
+        parentWorkerId: input.parentWorkerId,
+        backendId: input.backendId,
+        targetId: input.targetId,
+        providerId: input.providerId,
+        modelId: input.modelId,
+        effort: input.effort,
+        fastMode: input.fastMode,
+        permissionMode: input.permissionMode,
+        planMode: input.planMode,
+        label: input.label,
+        role: input.role,
+        assignment: input.assignment
+      })
+    );
+  }
+}
+
+function assertSameCollaborationDispatch(
+  dispatch: CollaborationDispatchRecord,
+  input: CreateCollaborationDispatchInput
+): void {
+  if (
+    dispatch.goalId !== input.goalId ||
+    dispatch.workerId !== input.workerId ||
+    dispatch.callerLeadSessionId !== input.callerLeadSessionId ||
+    dispatch.message !== collaborationText(input.message, "dispatch message")
+  ) {
+    throw new OperationConflictError(
+      input.operationId,
+      operationBodyHash({
+        goalId: dispatch.goalId,
+        workerId: dispatch.workerId,
+        callerLeadSessionId: dispatch.callerLeadSessionId,
+        message: dispatch.message
+      }),
+      operationBodyHash({
+        goalId: input.goalId,
+        workerId: input.workerId,
+        callerLeadSessionId: input.callerLeadSessionId,
+        message: input.message
+      })
+    );
+  }
+}
+
+function assertCollaborationDispatchLead(
+  store: OperationalStore,
+  dispatch: CollaborationDispatchRecord,
+  callerSessionId: string
+): void {
+  const goal = store.getCollaborationGoal(dispatch.goalId);
+  assertCollaborationLead(goal, callerSessionId);
+  if (dispatch.callerLeadSessionId !== callerSessionId) {
+    throw new AuthorizationError("The collaboration dispatch belongs to another lead Session.");
+  }
 }
 
 function objectiveText(value: string): string {

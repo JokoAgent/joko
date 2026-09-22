@@ -487,7 +487,7 @@ export interface CreateScheduledSessionInput {
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
   readonly operationId: string;
-  readonly serviceKind: "session_handoff" | "partner";
+  readonly serviceKind: "session_handoff" | "partner" | "collaboration";
   readonly targetId: string;
   readonly title: string;
   readonly providerId?: string;
@@ -623,6 +623,10 @@ export interface EnqueueServiceInput {
   /** Durable non-secret ownership fence for cross-Session helper messages. */
   readonly originSessionId?: string;
   readonly overrides?: TurnExecutionOverrides;
+  /** Runs inside the same Store transaction after Queue admission and before
+   * dispatch can start. Trusted service owners use this to bind their durable
+   * projection to the exact Queue identity. */
+  readonly onAdmitted?: (store: OperationalStore, result: EnqueueResult) => void;
 }
 
 export type SessionRuntimeControlErrorCode = "CONFLICT" | "INVALID_ARGS" | "ROUTE_UNAVAILABLE";
@@ -2177,7 +2181,9 @@ export class SessionHost {
           ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
           createdAt: now
         });
-        return { sessionId: input.sessionId, runId, attemptId, queueItemId };
+        const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
+        input.onAdmitted?.(store, result);
+        return result;
       }
     );
     if (!execution.replayed) void this.drain(input.sessionId);
@@ -8276,7 +8282,11 @@ export class SessionHost {
     const operationKind = authorized
       ? "create_session"
       : "serviceKind" in input
-        ? input.serviceKind === "partner" ? "create_partner_session" : "create_session_handoff"
+        ? input.serviceKind === "partner"
+          ? "create_partner_session"
+          : input.serviceKind === "collaboration"
+            ? "create_collaboration_worker_session"
+            : "create_session_handoff"
         : "create_scheduled_session";
     const claim = authorized
       ? this.#store.claimAuthorizedDeferredEffectOperation<{ readonly sessionId: string }>(

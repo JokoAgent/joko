@@ -162,6 +162,8 @@ import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
+import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
+import { CollaborationToolBridgeProvider } from "./collaboration-tool-provider.js";
 import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
@@ -349,6 +351,8 @@ export interface OrchestratorApplication {
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
   readonly collaboration?: CollaborationManager;
+  /** Durable Goal/lead/worker scheduling authority. */
+  readonly collaborationGoals?: CollaborationGoalManager;
   /** Node-local structured authority for people and organizations. */
   readonly contacts?: ContactManager;
   /** Explicitly granted, encrypted node-to-node Contacts convergence owner. */
@@ -1287,6 +1291,14 @@ export async function createOrchestratorApplication(
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes")
   });
+  const collaborationGoals = new CollaborationGoalManager({
+    store,
+    sessionHost,
+    readSettings: () => runtimeGovernance.collaboration()
+  });
+  const unregisterCollaborationGoalTools = mcpRouter.registerBridgeToolProvider(
+    new CollaborationToolBridgeProvider({ store, manager: collaborationGoals })
+  );
   const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
     new PartnerToolBridgeProvider({ store, partners })
   );
@@ -1852,6 +1864,7 @@ export async function createOrchestratorApplication(
         await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
       }
     }
+    await collaborationGoals.initialize();
     await partners.recoverPending();
 
     const computerRuntimeAdapter = computerAutomationRuntime(computerRuntime);
@@ -2059,6 +2072,7 @@ export async function createOrchestratorApplication(
     providerAuth.beginShutdown();
     providerAccountUsage.invalidate();
     await managedModelRuntimeSystem.close().catch(() => undefined);
+    await collaborationGoals.close().catch(() => undefined);
     await sessionHost.dispose().catch(() => undefined);
     sessionWorktrees.dispose();
     await generationGcTail.catch(() => undefined);
@@ -2075,6 +2089,7 @@ export async function createOrchestratorApplication(
     unregisterImageGenerationBridge();
     unregisterSessionHelperTools();
     unregisterContactTools();
+    unregisterCollaborationGoalTools();
     unregisterPartnerTools();
     unregisterLspBridge();
     unregisterRemoteHostTools();
@@ -2147,6 +2162,7 @@ export async function createOrchestratorApplication(
     skillMarketSync,
     skillPublication,
     collaboration,
+    collaborationGoals,
     contacts,
     contactSync,
     partners,
@@ -2219,6 +2235,7 @@ export async function createOrchestratorApplication(
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
         await attempt(() => managedModelRuntimeSystem.close());
+        await attempt(() => collaborationGoals.close());
         await refreshTail.catch(() => undefined);
         await backendLifecycleTail.catch(() => undefined);
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.
@@ -2240,6 +2257,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterImageGenerationBridge());
         await attempt(() => unregisterSessionHelperTools());
         await attempt(() => unregisterContactTools());
+        await attempt(() => unregisterCollaborationGoalTools());
         await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());

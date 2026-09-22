@@ -4,6 +4,7 @@ import {
   ArtifactService,
   BackendService,
   BrowserService,
+  CollaborationService,
   ConnectionService,
   ContactService,
   EventService,
@@ -29,6 +30,7 @@ import {
 
 export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
+  readonly collaboration: Client<typeof CollaborationService>;
   readonly contact: Client<typeof ContactService>;
   readonly event: Client<typeof EventService>;
   readonly extension: Client<typeof ExtensionService>;
@@ -77,6 +79,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
   });
   return {
     connection: createClient(ConnectionService, transport),
+    collaboration: createClient(CollaborationService, transport),
     contact: createClient(ContactService, transport),
     event: createClient(EventService, transport),
     extension: createClient(ExtensionService, transport),

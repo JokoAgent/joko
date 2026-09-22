@@ -57,6 +57,12 @@ import {
   CompactSessionOutcome,
   CollaborationRole as ProtoCollaborationRole,
   CollaborationScopeKind as ProtoCollaborationScopeKind,
+  CollaborationDispatchStatus as ProtoCollaborationDispatchStatus,
+  CollaborationGoalStatus as ProtoCollaborationGoalStatus,
+  CollaborationInterruptStopOutcome as ProtoCollaborationInterruptStopOutcome,
+  CollaborationSessionRole as ProtoCollaborationSessionRole,
+  CollaborationService,
+  CollaborationWorkerStatus as ProtoCollaborationWorkerStatus,
   CompactionState,
   ContextRebuildReason,
   CompositeArgumentKind,
@@ -339,6 +345,11 @@ import {
   type PartnerProfile as ProtoPartnerProfile,
   type PartnerSession as ProtoPartnerSession,
   type CollaborationDirectory as ProtoCollaborationDirectory,
+  type CollaborationDispatch as ProtoCollaborationDispatch,
+  type CollaborationGoal as ProtoCollaborationGoal,
+  type CollaborationGoalTree as ProtoCollaborationGoalTree,
+  type CollaborationQueueEntry as ProtoCollaborationQueueEntry,
+  type CollaborationWorker as ProtoCollaborationWorker,
   type ContextUsage as ProtoContextUsage,
   type CredentialDescriptor,
   type Device,
@@ -659,8 +670,18 @@ import type {
   TargetView,
   SkillCatalogView,
   CollaborationDirectoryView,
+  CollaborationDispatchStatusView,
+  CollaborationDispatchView,
+  CollaborationGoalStatusView,
+  CollaborationGoalTreeView,
+  CollaborationGoalView,
+  CollaborationInterruptStopOutcomeView,
+  CollaborationQueueEntryView,
   CollaborationScopeKindView,
   CollaborationScopeView,
+  CollaborationWorkerDraftView,
+  CollaborationWorkerStatusView,
+  CollaborationWorkerView,
   SkillDescriptorView,
   SkillDiffChangeView,
   SkillDiffView,
@@ -6073,6 +6094,385 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned a mismatched Partner delegation cancellation.");
     }
     return delegation;
+  }
+
+  async listCollaborationGoals(
+    sessionId: string,
+    includeArchived = false,
+    signal?: AbortSignal
+  ): Promise<readonly CollaborationGoalView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).listCollaborationGoals({
+      sessionId,
+      includeArchived
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const goals = response.access.map((entry) => {
+      const goal = mapCollaborationGoal(entry.goal);
+      const lead = entry.role === ProtoCollaborationSessionRole.LEAD;
+      const worker = entry.role === ProtoCollaborationSessionRole.WORKER;
+      if ((lead && (goal.leadSessionId !== sessionId || entry.workerId !== undefined))
+        || (worker && (goal.leadSessionId === sessionId || !validCollaborationOwnedIdentity(entry.workerId ?? "")))
+        || (!lead && !worker)) {
+        throw new GatewayError("Orchestrator returned an invalid collaboration Session role.");
+      }
+      return goal;
+    });
+    if (new Set(goals.map((goal) => goal.id)).size !== goals.length) {
+      throw new GatewayError("Orchestrator returned duplicate collaboration Goal access.");
+    }
+    return goals;
+  }
+
+  async getCollaborationGoal(
+    goalId: string,
+    viewerSessionId: string,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).getCollaborationGoal(
+      { goalId, viewerSessionId }, { signal: scope.signal }
+    );
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationGoalTree(response.tree);
+    if (tree.goal.id !== goalId) throw new GatewayError("Orchestrator returned a different collaboration Goal.");
+    if (tree.goal.leadSessionId !== viewerSessionId
+      && !tree.workers.some((worker) => worker.sessionId === viewerSessionId)) {
+      throw new GatewayError("Orchestrator returned a collaboration Goal outside the viewing task.");
+    }
+    return tree;
+  }
+
+  async createCollaborationGoal(
+    leadSessionId: string,
+    expectedSessionGeneration: bigint,
+    title: string,
+    objective: string,
+    maximumWorkers?: number,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).createCollaborationGoal({
+      operationId: randomUuid(),
+      leadSessionId,
+      expectedSessionGeneration,
+      title,
+      objective,
+      ...(maximumWorkers === undefined ? {} : { maximumWorkers })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationGoalTree(response.tree);
+    if (tree.goal.leadSessionId !== leadSessionId || tree.goal.sessionGeneration !== expectedSessionGeneration
+      || tree.goal.title !== title || tree.goal.objective !== objective
+      || tree.goal.maximumWorkers !== maximumWorkers || tree.goal.status !== "active") {
+      throw new GatewayError("Orchestrator returned a collaboration Goal owned by another lead task.");
+    }
+    return tree;
+  }
+
+  async setCollaborationGoalStatus(
+    goal: CollaborationGoalView,
+    status: Exclude<CollaborationGoalStatusView, "active">,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).setCollaborationGoalStatus({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: goal.revision },
+      status: protoCollaborationGoalStatus(status)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    if (tree.goal.status !== status) throw new GatewayError("Orchestrator returned a mismatched collaboration Goal status.");
+    return tree;
+  }
+
+  async createCollaborationWorker(
+    goal: CollaborationGoalView,
+    draft: CollaborationWorkerDraftView,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).createCollaborationWorker({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedGoalRevision: { value: goal.revision },
+      ...(draft.parentWorkerId === undefined ? {} : { parentWorkerId: draft.parentWorkerId }),
+      label: draft.label,
+      role: draft.role,
+      assignment: draft.assignment,
+      targetId: draft.targetId,
+      ...(draft.providerId === undefined ? {} : { providerId: draft.providerId }),
+      ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
+      ...(draft.effort === undefined ? {} : { effort: draft.effort }),
+      fastMode: draft.fastMode,
+      permissionMode: protoPermission(draft.permissionMode),
+      planMode: draft.planMode
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const worker = mapCollaborationWorker(response.worker);
+    if (worker.goalId !== goal.id || worker.parentWorkerId !== draft.parentWorkerId
+      || worker.label !== draft.label || worker.role !== draft.role || worker.assignment !== draft.assignment
+      || worker.route.targetId !== draft.targetId || worker.route.providerId !== draft.providerId
+      || worker.route.modelId !== draft.modelId || worker.route.effort !== draft.effort
+      || worker.route.fastMode !== draft.fastMode || worker.route.permissionMode !== draft.permissionMode
+      || worker.route.planMode !== draft.planMode
+      || !tree.workers.some((candidate) => candidate.id === worker.id && candidate.revision === worker.revision)) {
+      throw new GatewayError("Orchestrator returned a collaboration worker outside the requested Goal.");
+    }
+    return tree;
+  }
+
+  async updateCollaborationWorker(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    patch: { readonly label?: string; readonly role?: string; readonly assignment?: string },
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).updateCollaborationWorker({
+      operationId: randomUuid(),
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      ...patch
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    const updated = mapCollaborationWorker(response.worker);
+    if ((patch.label !== undefined && updated.label !== patch.label)
+      || (patch.role !== undefined && updated.role !== patch.role)
+      || (patch.assignment !== undefined && updated.assignment !== patch.assignment)) {
+      throw new GatewayError("Orchestrator returned a collaboration worker without the requested update.");
+    }
+    return tree;
+  }
+
+  async focusCollaborationWorker(
+    goal: CollaborationGoalView,
+    worker?: CollaborationWorkerView,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).focusCollaborationWorker({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      callerLeadSessionId: goal.leadSessionId,
+      ...(worker === undefined ? {} : {
+        workerId: worker.id,
+        expectedWorkerRevision: { value: worker.revision }
+      })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    if (tree.focusedWorkerId !== worker?.id) {
+      throw new GatewayError("Orchestrator returned a mismatched collaboration worker focus.");
+    }
+    return tree;
+  }
+
+  async wakeCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).wakeCollaborationWorker({
+      operationId: randomUuid(), workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      expectedSessionGeneration: requiredCollaborationWorkerGeneration(worker)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    if (mapCollaborationWorker(response.worker).runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker that remained released after wake.");
+    }
+    return tree;
+  }
+
+  async stopCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).stopCollaborationWorker({
+      operationId: randomUuid(), workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      ...(worker.sessionGeneration === undefined ? {} : { expectedSessionGeneration: worker.sessionGeneration })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    const stopped = mapCollaborationWorker(response.worker);
+    if (stopped.status !== "stopped" || !stopped.runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker that did not stop.");
+    }
+    return tree;
+  }
+
+  async releaseCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).releaseCollaborationWorker({
+      operationId: randomUuid(), workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision },
+      expectedSessionGeneration: requiredCollaborationWorkerGeneration(worker)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    if (!mapCollaborationWorker(response.worker).runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker with an unreleased runtime.");
+    }
+    return tree;
+  }
+
+  async archiveCollaborationWorker(goal: CollaborationGoalView, worker: CollaborationWorkerView, signal?: AbortSignal): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).archiveCollaborationWorker({
+      operationId: randomUuid(),
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedRevision: { value: worker.revision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    assertCollaborationWorkerMutation(tree, response.worker, worker);
+    const archived = mapCollaborationWorker(response.worker);
+    if (archived.status !== "archived" || !archived.runtimeReleased) {
+      throw new GatewayError("Orchestrator returned a collaboration worker that was not archived.");
+    }
+    return tree;
+  }
+
+  async sendCollaborationWorkerMessage(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    message: string,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const generation = requiredCollaborationWorkerGeneration(worker);
+    const response = await createClient(CollaborationService, scope.transport).sendCollaborationWorkerMessage({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedWorkerRevision: { value: worker.revision },
+      expectedSessionGeneration: generation,
+      message
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const dispatch = mapCollaborationDispatch(response.dispatch);
+    if (dispatch.workerId !== worker.id || dispatch.message !== message
+      || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id && entry.dispatch.revision === dispatch.revision)) {
+      throw new GatewayError("Orchestrator returned a mismatched collaboration dispatch.");
+    }
+    return tree;
+  }
+
+  async interruptCollaborationWorker(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    message: string,
+    signal?: AbortSignal
+  ): Promise<{ readonly tree: CollaborationGoalTreeView; readonly stopOutcome: CollaborationInterruptStopOutcomeView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).interruptCollaborationWorker({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      expectedWorkerRevision: { value: worker.revision },
+      expectedSessionGeneration: requiredCollaborationWorkerGeneration(worker),
+      message
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const dispatch = mapCollaborationDispatch(response.dispatch);
+    if (dispatch.workerId !== worker.id || dispatch.message !== message
+      || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id && entry.dispatch.revision === dispatch.revision)) {
+      throw new GatewayError("Orchestrator returned a mismatched collaboration interrupt dispatch.");
+    }
+    return { tree, stopOutcome: collaborationInterruptStopOutcome(response.stopOutcome) };
+  }
+
+  async editCollaborationDispatch(
+    dispatch: CollaborationDispatchView,
+    queueItem: QueueItemView,
+    message: string,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).editCollaborationDispatch({
+      operationId: randomUuid(),
+      dispatchId: dispatch.id,
+      callerLeadSessionId: dispatch.callerLeadSessionId,
+      expectedDispatchRevision: { value: dispatch.revision },
+      expectedQueueRevision: { value: queueItem.revision },
+      message
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationQueueMutation(response.tree, response.dispatch, dispatch);
+    if (mapCollaborationDispatch(response.dispatch).message !== message) {
+      throw new GatewayError("Orchestrator returned a collaboration dispatch without the requested edit.");
+    }
+    return tree;
+  }
+
+  async cancelCollaborationDispatch(
+    dispatch: CollaborationDispatchView,
+    queueItem: QueueItemView,
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(CollaborationService, scope.transport).cancelCollaborationDispatch({
+      operationId: randomUuid(),
+      dispatchId: dispatch.id,
+      callerLeadSessionId: dispatch.callerLeadSessionId,
+      expectedDispatchRevision: { value: dispatch.revision },
+      expectedQueueRevision: { value: queueItem.revision }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapCollaborationQueueMutation(response.tree, response.dispatch, dispatch);
+    if (mapCollaborationDispatch(response.dispatch).status !== "cancelled") {
+      throw new GatewayError("Orchestrator returned a collaboration dispatch that was not cancelled.");
+    }
+    return tree;
+  }
+
+  async mergeCollaborationDispatches(
+    goal: CollaborationGoalView,
+    worker: CollaborationWorkerView,
+    entries: readonly CollaborationQueueEntryView[],
+    signal?: AbortSignal
+  ): Promise<CollaborationGoalTreeView> {
+    const scope = this.captureActionScope(signal);
+    if (entries.length < 2 || entries.some((entry) => entry.dispatch.workerId !== worker.id || entry.queueItem === undefined)) {
+      throw new GatewayError("Select at least two pending messages from one collaboration worker.");
+    }
+    const response = await createClient(CollaborationService, scope.transport).mergeCollaborationDispatches({
+      operationId: randomUuid(),
+      goalId: goal.id,
+      workerId: worker.id,
+      callerLeadSessionId: goal.leadSessionId,
+      dispatches: entries.map((entry) => ({
+        dispatchId: entry.dispatch.id,
+        expectedDispatchRevision: { value: entry.dispatch.revision },
+        expectedQueueRevision: { value: entry.queueItem!.revision }
+      }))
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
+    const dispatches = response.dispatches.map(mapCollaborationDispatch);
+    const expectedIds = new Set(entries.map((entry) => entry.dispatch.id));
+    if (dispatches.length !== entries.length || new Set(dispatches.map((dispatch) => dispatch.id)).size !== dispatches.length
+      || dispatches.some((dispatch) => !expectedIds.has(dispatch.id) || dispatch.goalId !== goal.id
+        || dispatch.workerId !== worker.id || dispatch.callerLeadSessionId !== goal.leadSessionId
+        || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id
+          && entry.dispatch.revision === dispatch.revision))) {
+      throw new GatewayError("Orchestrator returned an incomplete collaboration Queue merge.");
+    }
+    return tree;
   }
 
   async getContactDirectory(signal?: AbortSignal): Promise<ContactDirectoryView> {
@@ -16501,6 +16901,371 @@ function toolResultAttachments(result: any): readonly ArtifactView[] {
     }
   }
   return attachments;
+}
+
+function requiredCollaborationRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
+  if (value === undefined || value.value < 1n) {
+    throw new GatewayError(`Orchestrator returned an invalid ${label} revision.`);
+  }
+  return value.value;
+}
+
+function requiredCollaborationTimestamp(
+  value: Parameters<typeof timestampMs>[0] | undefined,
+  label: string
+): number {
+  if (value === undefined || value.seconds < 0n || value.nanos < 0 || value.nanos >= 1_000_000_000
+    || value.nanos % 1_000_000 !== 0) {
+    throw new GatewayError(`Orchestrator returned an invalid collaboration ${label} timestamp.`);
+  }
+  const milliseconds = value.seconds * 1_000n + BigInt(value.nanos / 1_000_000);
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new GatewayError(`Orchestrator returned an invalid collaboration ${label} timestamp.`);
+  }
+  return Number(milliseconds);
+}
+
+function validCollaborationGeneration(value: bigint): boolean {
+  return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function validCollaborationOwnedIdentity(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length > 0 && [...normalized].length <= 256 && !/[\p{Cc}\u2028\u2029]/u.test(normalized);
+}
+
+function validCollaborationShortText(value: string, maximum: number): boolean {
+  const normalized = value.normalize("NFC").replace(/\s+/gu, " ").trim();
+  return normalized.length > 0 && [...normalized].length <= maximum
+    && !/[\p{Cc}\u2028\u2029]/u.test(normalized);
+}
+
+function validCollaborationText(value: string): boolean {
+  const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+  return normalized.length > 0 && [...normalized].length <= 32_000 && !normalized.includes("\0");
+}
+
+function validCollaborationRouteIdentity(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length > 0 && normalized.length <= 512 && !/[\u0000\r\n]/u.test(normalized);
+}
+
+function collaborationGoalStatus(value: ProtoCollaborationGoalStatus): CollaborationGoalStatusView {
+  switch (value) {
+    case ProtoCollaborationGoalStatus.ACTIVE: return "active";
+    case ProtoCollaborationGoalStatus.COMPLETED: return "completed";
+    case ProtoCollaborationGoalStatus.STOPPED: return "stopped";
+    case ProtoCollaborationGoalStatus.FAILED: return "failed";
+    case ProtoCollaborationGoalStatus.ARCHIVED: return "archived";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration Goal status.");
+  }
+}
+
+function protoCollaborationGoalStatus(
+  value: Exclude<CollaborationGoalStatusView, "active">
+): ProtoCollaborationGoalStatus {
+  switch (value) {
+    case "completed": return ProtoCollaborationGoalStatus.COMPLETED;
+    case "stopped": return ProtoCollaborationGoalStatus.STOPPED;
+    case "failed": return ProtoCollaborationGoalStatus.FAILED;
+    case "archived": return ProtoCollaborationGoalStatus.ARCHIVED;
+  }
+}
+
+function collaborationWorkerStatus(value: ProtoCollaborationWorkerStatus): CollaborationWorkerStatusView {
+  switch (value) {
+    case ProtoCollaborationWorkerStatus.PROVISIONING: return "provisioning";
+    case ProtoCollaborationWorkerStatus.IDLE: return "idle";
+    case ProtoCollaborationWorkerStatus.QUEUED: return "queued";
+    case ProtoCollaborationWorkerStatus.RUNNING: return "running";
+    case ProtoCollaborationWorkerStatus.COMPLETED: return "completed";
+    case ProtoCollaborationWorkerStatus.FAILED: return "failed";
+    case ProtoCollaborationWorkerStatus.STOPPING: return "stopping";
+    case ProtoCollaborationWorkerStatus.STOPPED: return "stopped";
+    case ProtoCollaborationWorkerStatus.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    case ProtoCollaborationWorkerStatus.ARCHIVED: return "archived";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration worker status.");
+  }
+}
+
+function collaborationDispatchStatus(value: ProtoCollaborationDispatchStatus): CollaborationDispatchStatusView {
+  switch (value) {
+    case ProtoCollaborationDispatchStatus.PREPARING: return "preparing";
+    case ProtoCollaborationDispatchStatus.QUEUED: return "queued";
+    case ProtoCollaborationDispatchStatus.MERGED: return "merged";
+    case ProtoCollaborationDispatchStatus.CANCELLED: return "cancelled";
+    case ProtoCollaborationDispatchStatus.DISPATCH_UNKNOWN: return "dispatchUnknown";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration dispatch status.");
+  }
+}
+
+function collaborationInterruptStopOutcome(
+  value: ProtoCollaborationInterruptStopOutcome
+): CollaborationInterruptStopOutcomeView {
+  switch (value) {
+    case ProtoCollaborationInterruptStopOutcome.STOPPED: return "stopped";
+    case ProtoCollaborationInterruptStopOutcome.NOT_RUNNING: return "notRunning";
+    case ProtoCollaborationInterruptStopOutcome.UNCONFIRMED: return "unconfirmed";
+    case ProtoCollaborationInterruptStopOutcome.ALREADY_QUEUED: return "alreadyQueued";
+    default: throw new GatewayError("Orchestrator returned an unknown collaboration interrupt outcome.");
+  }
+}
+
+function collaborationPermission(value: ProtoPermissionMode): PermissionMode {
+  if (value === ProtoPermissionMode.ASK) return "ask";
+  if (value === ProtoPermissionMode.AUTO) return "auto";
+  if (value === ProtoPermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
+  throw new GatewayError("Orchestrator returned an unknown collaboration worker permission mode.");
+}
+
+function mapCollaborationGoal(value: ProtoCollaborationGoal | undefined): CollaborationGoalView {
+  const revision = requiredCollaborationRevision(value?.revision, "Goal");
+  if (value === undefined || !validCollaborationOwnedIdentity(value.goalId)
+    || !validCollaborationOwnedIdentity(value.leadId)
+    || value.leadSessionId.trim() === "" || value.backendId.trim() === "" || value.targetId.trim() === ""
+    || !validCollaborationGeneration(value.sessionGeneration)
+    || !validCollaborationGeneration(value.backendInstanceGeneration)
+    || !validCollaborationShortText(value.title, 256) || !validCollaborationText(value.objective)
+    || (value.maximumWorkers !== undefined
+      && (!Number.isSafeInteger(value.maximumWorkers) || value.maximumWorkers < 1 || value.maximumWorkers > 128))) {
+    throw new GatewayError("Orchestrator returned an incomplete collaboration Goal.");
+  }
+  const status = collaborationGoalStatus(value.status);
+  const createdAt = requiredCollaborationTimestamp(value.createdAt, "Goal");
+  const updatedAt = requiredCollaborationTimestamp(value.updatedAt, "Goal update");
+  const completedAt = value.completedAt === undefined
+    ? undefined
+    : requiredCollaborationTimestamp(value.completedAt, "Goal completion");
+  if (updatedAt < createdAt || (completedAt !== undefined && completedAt < createdAt)
+    || (status === "active") !== (completedAt === undefined)
+    || (value.error?.message && status !== "failed")) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration Goal.");
+  }
+  return {
+    id: value.goalId,
+    revision,
+    leadId: value.leadId,
+    leadSessionId: value.leadSessionId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    sessionGeneration: value.sessionGeneration,
+    backendInstanceGeneration: value.backendInstanceGeneration,
+    title: value.title,
+    objective: value.objective,
+    ...(value.maximumWorkers === undefined ? {} : { maximumWorkers: value.maximumWorkers }),
+    status,
+    ...(value.error?.message ? { error: presentJokoServiceTerminology(value.error.message) } : {}),
+    createdAt,
+    updatedAt,
+    ...(completedAt === undefined ? {} : { completedAt })
+  };
+}
+
+function mapCollaborationWorker(value: ProtoCollaborationWorker | undefined): CollaborationWorkerView {
+  const revision = requiredCollaborationRevision(value?.revision, "worker");
+  const route = value?.route;
+  if (value === undefined || route === undefined || !validCollaborationOwnedIdentity(value.workerId)
+    || !validCollaborationOwnedIdentity(value.goalId)
+    || !validCollaborationShortText(value.label, 64) || !validCollaborationShortText(value.role, 128)
+    || !validCollaborationText(value.assignment)
+    || !validCollaborationRouteIdentity(route.backendId) || !validCollaborationRouteIdentity(route.targetId)
+    || (value.parentWorkerId !== undefined && !validCollaborationOwnedIdentity(value.parentWorkerId))
+    || (value.sessionId !== undefined && value.sessionId.trim() === "")
+    || (route.providerId !== undefined && !validCollaborationRouteIdentity(route.providerId))
+    || (route.modelId !== undefined && !validCollaborationRouteIdentity(route.modelId))
+    || (route.effort !== undefined && !validCollaborationRouteIdentity(route.effort))
+    || ((route.providerId === undefined) !== (route.modelId === undefined))
+    || ((value.sessionId === undefined) !== (value.sessionGeneration === undefined))
+    || ((value.sessionId === undefined) !== (value.backendInstanceGeneration === undefined))
+    || (value.sessionGeneration !== undefined && !validCollaborationGeneration(value.sessionGeneration))
+    || (value.backendInstanceGeneration !== undefined && !validCollaborationGeneration(value.backendInstanceGeneration))) {
+    throw new GatewayError("Orchestrator returned an incomplete collaboration worker.");
+  }
+  const status = collaborationWorkerStatus(value.status);
+  const createdAt = requiredCollaborationTimestamp(value.createdAt, "worker");
+  const updatedAt = requiredCollaborationTimestamp(value.updatedAt, "worker update");
+  const idleSince = value.idleSince === undefined
+    ? undefined
+    : requiredCollaborationTimestamp(value.idleSince, "worker idle");
+  if (updatedAt < createdAt || (idleSince !== undefined && idleSince < createdAt)
+    || (value.runtimeReleased && !["idle", "completed", "failed", "stopped", "archived"].includes(status))
+    || (["stopped", "archived"].includes(status) && !value.runtimeReleased)
+    || (idleSince !== undefined && !["idle", "completed", "failed"].includes(status))
+    || (value.focused && (value.runtimeReleased || ["failed", "stopped", "archived"].includes(status)))
+    || (value.error?.message && !["failed", "dispatchUnknown"].includes(status))) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration worker.");
+  }
+  return {
+    id: value.workerId,
+    revision,
+    goalId: value.goalId,
+    ...(value.parentWorkerId === undefined ? {} : { parentWorkerId: value.parentWorkerId }),
+    ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId }),
+    route: {
+      backendId: route.backendId,
+      targetId: route.targetId,
+      ...(route.providerId === undefined ? {} : { providerId: route.providerId }),
+      ...(route.modelId === undefined ? {} : { modelId: route.modelId }),
+      ...(route.effort === undefined ? {} : { effort: route.effort }),
+      fastMode: route.fastMode,
+      permissionMode: collaborationPermission(route.permissionMode),
+      planMode: route.planMode
+    },
+    ...(value.sessionGeneration === undefined ? {} : { sessionGeneration: value.sessionGeneration }),
+    ...(value.backendInstanceGeneration === undefined ? {} : { backendInstanceGeneration: value.backendInstanceGeneration }),
+    label: value.label,
+    role: value.role,
+    assignment: value.assignment,
+    status,
+    focused: value.focused,
+    runtimeReleased: value.runtimeReleased,
+    softLimitWarning: value.softLimitWarning,
+    ...(idleSince === undefined ? {} : { idleSince }),
+    ...(value.error?.message ? { error: presentJokoServiceTerminology(value.error.message) } : {}),
+    createdAt,
+    updatedAt
+  };
+}
+
+function mapCollaborationDispatch(value: ProtoCollaborationDispatch | undefined): CollaborationDispatchView {
+  const revision = requiredCollaborationRevision(value?.revision, "dispatch");
+  if (value === undefined || !validCollaborationOwnedIdentity(value.dispatchId)
+    || !validCollaborationOwnedIdentity(value.goalId) || !validCollaborationOwnedIdentity(value.workerId)
+    || value.callerLeadSessionId.trim() === "" || !validCollaborationOwnedIdentity(value.operationId)
+    || !validCollaborationText(value.message)
+    || (value.queueItemId !== undefined && value.queueItemId.trim() === "")
+    || (value.mergedIntoDispatchId !== undefined && !validCollaborationOwnedIdentity(value.mergedIntoDispatchId))) {
+    throw new GatewayError("Orchestrator returned an incomplete collaboration dispatch.");
+  }
+  const status = collaborationDispatchStatus(value.status);
+  const createdAt = requiredCollaborationTimestamp(value.createdAt, "dispatch");
+  const updatedAt = requiredCollaborationTimestamp(value.updatedAt, "dispatch update");
+  if (updatedAt < createdAt
+    || (["preparing", "dispatchUnknown"].includes(status) !== (value.queueItemId === undefined))
+    || ((status === "merged") !== (value.mergedIntoDispatchId !== undefined))
+    || value.mergedIntoDispatchId === value.dispatchId) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration dispatch.");
+  }
+  return {
+    id: value.dispatchId,
+    revision,
+    goalId: value.goalId,
+    workerId: value.workerId,
+    callerLeadSessionId: value.callerLeadSessionId,
+    operationId: value.operationId,
+    ...(value.queueItemId === undefined ? {} : { queueItemId: value.queueItemId }),
+    message: value.message,
+    status,
+    ...(value.mergedIntoDispatchId === undefined ? {} : { mergedIntoDispatchId: value.mergedIntoDispatchId }),
+    createdAt,
+    updatedAt
+  };
+}
+
+function mapCollaborationQueueEntry(value: ProtoCollaborationQueueEntry): CollaborationQueueEntryView {
+  const dispatch = mapCollaborationDispatch(value.dispatch);
+  const queueItem = value.queueItem === undefined ? undefined : mapQueueItem(value.queueItem);
+  if ((dispatch.queueItemId === undefined) !== (queueItem === undefined)
+    || (queueItem !== undefined && (queueItem.id !== dispatch.queueItemId || queueItem.text !== dispatch.message))) {
+    throw new GatewayError("Orchestrator returned a mismatched collaboration Queue entry.");
+  }
+  return { dispatch, ...(queueItem === undefined ? {} : { queueItem }) };
+}
+
+function mapCollaborationGoalTree(value: ProtoCollaborationGoalTree | undefined): CollaborationGoalTreeView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no collaboration Goal tree.");
+  const goal = mapCollaborationGoal(value.goal);
+  const workers = value.workers.map(mapCollaborationWorker);
+  const queue = value.queue.map(mapCollaborationQueueEntry);
+  const workerIds = new Set(workers.map((worker) => worker.id));
+  const dispatchIds = new Set(queue.map((entry) => entry.dispatch.id));
+  const dispatches = new Map(queue.map((entry) => [entry.dispatch.id, entry.dispatch]));
+  const workersById = new Map(workers.map((worker) => [worker.id, worker]));
+  const queueItemIds = queue.flatMap((entry) => entry.queueItem === undefined ? [] : [entry.queueItem.id]);
+  if (workerIds.size !== workers.length || workers.some((worker) => worker.goalId !== goal.id
+      || worker.parentWorkerId === worker.id
+      || (worker.parentWorkerId !== undefined && !workerIds.has(worker.parentWorkerId)))
+    || hasCollaborationParentCycle(workers)
+    || dispatchIds.size !== queue.length
+    || new Set(queueItemIds).size !== queueItemIds.length
+    || queue.some((entry) => entry.dispatch.goalId !== goal.id || !workerIds.has(entry.dispatch.workerId)
+      || entry.dispatch.callerLeadSessionId !== goal.leadSessionId
+      || (entry.queueItem !== undefined && (entry.queueItem.sessionId !== workersById.get(entry.dispatch.workerId)?.sessionId
+        || entry.queueItem.generation !== workersById.get(entry.dispatch.workerId)?.sessionGeneration))
+      || (entry.dispatch.status === "merged" && (
+        dispatches.get(entry.dispatch.mergedIntoDispatchId ?? "")?.goalId !== goal.id
+        || dispatches.get(entry.dispatch.mergedIntoDispatchId ?? "")?.workerId !== entry.dispatch.workerId)))
+    || (value.focusedWorkerId !== undefined && !workerIds.has(value.focusedWorkerId))
+    || workers.filter((worker) => worker.focused).length > 1
+    || workers.some((worker) => worker.focused !== (value.focusedWorkerId === worker.id))
+    || workers.some((worker) => worker.focused && worker.status === "archived")) {
+    throw new GatewayError("Orchestrator returned an inconsistent collaboration Goal tree.");
+  }
+  return {
+    goal,
+    workers,
+    queue,
+    ...(value.focusedWorkerId === undefined ? {} : { focusedWorkerId: value.focusedWorkerId })
+  };
+}
+
+function hasCollaborationParentCycle(workers: readonly CollaborationWorkerView[]): boolean {
+  const parents = new Map(workers.map((worker) => [worker.id, worker.parentWorkerId]));
+  for (const worker of workers) {
+    const visited = new Set<string>();
+    let current: string | undefined = worker.id;
+    while (current !== undefined) {
+      if (visited.has(current)) return true;
+      visited.add(current);
+      current = parents.get(current);
+    }
+  }
+  return false;
+}
+
+function mapOwnedCollaborationTree(
+  value: ProtoCollaborationGoalTree | undefined,
+  goalId: string,
+  leadSessionId: string
+): CollaborationGoalTreeView {
+  const tree = mapCollaborationGoalTree(value);
+  if (tree.goal.id !== goalId || tree.goal.leadSessionId !== leadSessionId) {
+    throw new GatewayError("Orchestrator returned a collaboration tree owned by another lead task.");
+  }
+  return tree;
+}
+
+function assertCollaborationWorkerMutation(
+  tree: CollaborationGoalTreeView,
+  value: ProtoCollaborationWorker | undefined,
+  expected: CollaborationWorkerView
+): void {
+  const worker = mapCollaborationWorker(value);
+  if (worker.id !== expected.id || worker.goalId !== expected.goalId
+    || !tree.workers.some((candidate) => candidate.id === worker.id && candidate.revision === worker.revision)) {
+    throw new GatewayError("Orchestrator returned a mismatched collaboration worker mutation.");
+  }
+}
+
+function mapCollaborationQueueMutation(
+  value: ProtoCollaborationGoalTree | undefined,
+  dispatchValue: ProtoCollaborationDispatch | undefined,
+  expected: CollaborationDispatchView
+): CollaborationGoalTreeView {
+  const tree = mapOwnedCollaborationTree(value, expected.goalId, expected.callerLeadSessionId);
+  const dispatch = mapCollaborationDispatch(dispatchValue);
+  if (dispatch.id !== expected.id || dispatch.workerId !== expected.workerId
+    || !tree.queue.some((entry) => entry.dispatch.id === dispatch.id && entry.dispatch.revision === dispatch.revision)) {
+    throw new GatewayError("Orchestrator returned a mismatched collaboration Queue mutation.");
+  }
+  return tree;
+}
+
+function requiredCollaborationWorkerGeneration(worker: CollaborationWorkerView): bigint {
+  if (worker.sessionGeneration === undefined) {
+    throw new GatewayError("The collaboration worker has no active task generation.");
+  }
+  return worker.sessionGeneration;
 }
 
 function requiredPartnerRevision(value: { readonly value: bigint } | undefined, label: string): bigint {
