@@ -8,6 +8,8 @@ describe("workspace document route lifecycle", () => {
     expect(workspaceRouteLeaveRequest(from, { kind: "files", sessionId: "s1", file: "src/b.ts" })?.reason).toBe("switch-file");
     expect(workspaceRouteLeaveRequest(from, { kind: "files", sessionId: "s2", file: "src/a.ts" })?.reason).toBe("switch-session");
     expect(workspaceRouteLeaveRequest(from, { kind: "session", sessionId: "s1" })?.reason).toBe("route-change");
+    const skillsRoute = { kind: "tools", tab: "skills" } as const;
+    expect(workspaceRouteLeaveRequest(from, skillsRoute)?.reason).toBe("route-change");
     expect(workspaceRouteLeaveRequest({ kind: "session", sessionId: "s1" }, from)).toBeUndefined();
   });
 

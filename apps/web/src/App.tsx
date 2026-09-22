@@ -1059,6 +1059,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (!state.ready || document.body.classList.contains("modal-open")) return;
     if (action === "new-task") { navigateFromShortcut({ kind: "newSession" }); return; }
     if (action === "open-settings") { navigateFromShortcut({ kind: "settings" }); return; }
+    if (action === "open-skills") { navigateFromShortcut({ kind: "tools", tab: "skills" }); return; }
     if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
     if (action === "toggle-inspector") {
       if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));
@@ -1841,10 +1842,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             snapshot={state.snapshot}
             runtimeSessionId={lastRuntimeSessionIdRef.current}
             selectedExtensionId={state.route.extensionId}
+            selectedTab={state.route.tab}
             locale={state.preferences.locale}
             t={t}
             runAction={runAction}
-            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? {} : { extensionId }) })}
+            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }) })}
+            onSelectTab={(tab) => controller.navigate({ kind: "tools", ...(tab === "browser" ? {} : { tab }) })}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
           />}
           {state.route.kind === "extensionMainView" && <ExtensionMainViewPage

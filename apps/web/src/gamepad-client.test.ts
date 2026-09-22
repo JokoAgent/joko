@@ -123,6 +123,22 @@ describe("gamepad UI target ownership", () => {
     input({ kind: "action", action: "back", phase: "press" }); expect(back.mock.calls[0]?.[0].key).toBe("Escape");
     root.setAttribute("inert", ""); input({ kind: "action", action: "activate", phase: "press" }); expect(clicked).toHaveBeenCalledOnce();
   });
+  it("admits skill-library navigation only from the active host surface", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const pressSkills = (): void => input({ kind: "action", action: "open-skills", phase: "press" });
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    document.body.classList.add("modal-open"); pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    document.body.classList.remove("modal-open");
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus();
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    const preview = document.body.appendChild(document.createElement("button")); preview.dataset.messageRewindPreview = "true"; preview.focus();
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    preview.removeAttribute("data-message-rewind-preview");
+    document.body.dataset.appShortcutRecording = "1"; pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    delete document.body.dataset.appShortcutRecording;
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(2);
+  });
   it("focuses the real new-task composer without selecting another task", () => {
     document.body.innerHTML = '<main class="new-task-page"><div data-composer-editor="true" tabindex="0"></div></main>';
     createGamepadDomInput(document, vi.fn())({ kind: "action", action: "focus-composer", phase: "press" });

@@ -89,6 +89,9 @@ const DARK_APP_ICON_URL = darkAppIconUrl;
 const FAVICON_SIZE = 256;
 let faviconRequest = 0;
 
+export type ToolsTab = "browser" | "extensions" | "skills" | "resources" | "mcp" | "activity";
+const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "resources", "mcp", "activity"];
+
 export type AppRoute =
   | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly messageId?: string; readonly messageEventId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
@@ -96,7 +99,7 @@ export type AppRoute =
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "partners"; readonly partnerId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
-  | { readonly kind: "tools"; readonly extensionId?: string }
+  | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
@@ -3205,9 +3208,11 @@ export function routeFromHash(hash: string): AppRoute {
   if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
+    if (extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId)) return { kind: "tools", extensionId };
+    const tab = query.get("tab");
     return {
       kind: "tools",
-      ...(extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId) ? { extensionId } : {})
+      ...(tab !== null && tab !== "browser" && (TOOLS_TABS as readonly string[]).includes(tab) ? { tab: tab as ToolsTab } : {})
     };
   }
   if (parts[0] === "extensions" && parts[1] !== undefined && /^extension_[a-f0-9]{32}$/u.test(parts[1])) {
@@ -3271,6 +3276,7 @@ export function appRouteHash(route: AppRoute): string {
   if (route.kind === "tools") {
     const query = new URLSearchParams();
     if (route.extensionId !== undefined) query.set("extension", route.extensionId);
+    else if (route.tab !== undefined && route.tab !== "browser") query.set("tab", route.tab);
     return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "extensionMainView") return `#/extensions/${encodeURIComponent(route.extensionId)}`;

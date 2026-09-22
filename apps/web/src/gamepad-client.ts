@@ -176,6 +176,9 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
       return;
     }
     if (doc.body.classList.contains("modal-open")) return;
+    if (effect.action === "open-skills" && (doc.body.dataset.appShortcutRecording === "1"
+      || focused !== null && (focused.matches("iframe, webview, object, embed")
+        || focused.closest("[data-gamepad-preview], [data-message-rewind-preview], [role='dialog'], [role='menu'], [role='listbox']") !== null))) return;
     if (effect.action === "focus-composer") {
       currentGamepadTaskRoot(doc)?.querySelector<HTMLElement>("[data-composer-editor='true']")?.focus(); return;
     }
