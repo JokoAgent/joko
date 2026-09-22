@@ -14,7 +14,7 @@ describe("settings section navigation", () => {
   it("deep-links only the compact first-level information architecture", () => {
     expect(SETTINGS_NAV_SECTION_IDS).toEqual([
       "general", "personalization", "providers", "voice", "shortcuts", "taskStatus", "import",
-      "connections", "tools", "automation", "about"
+      "contacts", "connections", "tools", "automation", "about"
     ]);
     for (const section of SETTINGS_NAV_SECTION_IDS) {
       expect(settingsSectionFromHash(`#/settings/${section}`)).toBe(section);

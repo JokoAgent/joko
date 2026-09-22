@@ -4,11 +4,15 @@ import {
   ArtifactService,
   BackendService,
   BrowserService,
+  CollaborationService,
   ConnectionService,
+  ContactService,
   EventService,
   ExtensionService,
   InteractionService,
+  MessagingService,
   OperationService,
+  PartnerService,
   PiService,
   PortableSessionService,
   QueueService,
@@ -27,9 +31,12 @@ import {
 
 export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
+  readonly collaboration: Client<typeof CollaborationService>;
+  readonly contact: Client<typeof ContactService>;
   readonly event: Client<typeof EventService>;
   readonly extension: Client<typeof ExtensionService>;
   readonly operation: Client<typeof OperationService>;
+  readonly partner: Client<typeof PartnerService>;
   readonly backend: Client<typeof BackendService>;
   readonly target: Client<typeof TargetService>;
   readonly session: Client<typeof SessionService>;
@@ -40,6 +47,7 @@ export interface E2eClients {
   readonly queue: Client<typeof QueueService>;
   readonly scheduler: Client<typeof SchedulerService>;
   readonly interaction: Client<typeof InteractionService>;
+  readonly messaging: Client<typeof MessagingService>;
   readonly workspace: Client<typeof WorkspaceContractService>;
   readonly artifact: Client<typeof ArtifactService>;
   readonly tool: Client<typeof ToolService>;
@@ -73,9 +81,12 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
   });
   return {
     connection: createClient(ConnectionService, transport),
+    collaboration: createClient(CollaborationService, transport),
+    contact: createClient(ContactService, transport),
     event: createClient(EventService, transport),
     extension: createClient(ExtensionService, transport),
     operation: createClient(OperationService, transport),
+    partner: createClient(PartnerService, transport),
     backend: createClient(BackendService, transport),
     target: createClient(TargetService, transport),
     session: createClient(SessionService, transport),
@@ -86,6 +97,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     queue: createClient(QueueService, transport),
     scheduler: createClient(SchedulerService, transport),
     interaction: createClient(InteractionService, transport),
+    messaging: createClient(MessagingService, transport),
     workspace: createClient(WorkspaceContractService, transport),
     artifact: createClient(ArtifactService, transport),
     tool: createClient(ToolService, transport),

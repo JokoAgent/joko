@@ -1,0 +1,360 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+import "joko/v1/runtime.proto";
+
+enum CollaborationGoalStatus {
+  COLLABORATION_GOAL_STATUS_UNSPECIFIED = 0;
+  COLLABORATION_GOAL_STATUS_ACTIVE = 1;
+  COLLABORATION_GOAL_STATUS_COMPLETED = 2;
+  COLLABORATION_GOAL_STATUS_STOPPED = 3;
+  COLLABORATION_GOAL_STATUS_FAILED = 4;
+  COLLABORATION_GOAL_STATUS_ARCHIVED = 5;
+}
+
+enum CollaborationWorkerStatus {
+  COLLABORATION_WORKER_STATUS_UNSPECIFIED = 0;
+  COLLABORATION_WORKER_STATUS_PROVISIONING = 1;
+  COLLABORATION_WORKER_STATUS_IDLE = 2;
+  COLLABORATION_WORKER_STATUS_QUEUED = 3;
+  COLLABORATION_WORKER_STATUS_RUNNING = 4;
+  COLLABORATION_WORKER_STATUS_COMPLETED = 5;
+  COLLABORATION_WORKER_STATUS_FAILED = 6;
+  COLLABORATION_WORKER_STATUS_STOPPING = 7;
+  COLLABORATION_WORKER_STATUS_STOPPED = 8;
+  COLLABORATION_WORKER_STATUS_DISPATCH_UNKNOWN = 9;
+  COLLABORATION_WORKER_STATUS_ARCHIVED = 10;
+}
+
+enum CollaborationDispatchStatus {
+  COLLABORATION_DISPATCH_STATUS_UNSPECIFIED = 0;
+  COLLABORATION_DISPATCH_STATUS_PREPARING = 1;
+  COLLABORATION_DISPATCH_STATUS_QUEUED = 2;
+  COLLABORATION_DISPATCH_STATUS_MERGED = 3;
+  COLLABORATION_DISPATCH_STATUS_CANCELLED = 4;
+  COLLABORATION_DISPATCH_STATUS_DISPATCH_UNKNOWN = 5;
+}
+
+enum CollaborationInterruptStopOutcome {
+  COLLABORATION_INTERRUPT_STOP_OUTCOME_UNSPECIFIED = 0;
+  COLLABORATION_INTERRUPT_STOP_OUTCOME_STOPPED = 1;
+  COLLABORATION_INTERRUPT_STOP_OUTCOME_NOT_RUNNING = 2;
+  COLLABORATION_INTERRUPT_STOP_OUTCOME_UNCONFIRMED = 3;
+  COLLABORATION_INTERRUPT_STOP_OUTCOME_ALREADY_QUEUED = 4;
+}
+
+enum CollaborationSessionRole {
+  COLLABORATION_SESSION_ROLE_UNSPECIFIED = 0;
+  COLLABORATION_SESSION_ROLE_LEAD = 1;
+  COLLABORATION_SESSION_ROLE_WORKER = 2;
+}
+
+message CollaborationGoal {
+  string goal_id = 1;
+  string lead_id = 2;
+  string lead_session_id = 3;
+  string backend_id = 4;
+  string target_id = 5;
+  uint64 session_generation = 6;
+  uint64 backend_instance_generation = 7;
+  string title = 8;
+  string objective = 9;
+  optional uint32 maximum_workers = 10;
+  CollaborationGoalStatus status = 11;
+  optional ErrorInfo error = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  optional google.protobuf.Timestamp completed_at = 15;
+  Revision revision = 16;
+}
+
+message CollaborationWorkerRoute {
+  string backend_id = 1;
+  string target_id = 2;
+  optional string provider_id = 3;
+  optional string model_id = 4;
+  optional string effort = 5;
+  bool fast_mode = 6;
+  PermissionMode permission_mode = 7;
+  bool plan_mode = 8;
+}
+
+message CollaborationWorker {
+  string worker_id = 1;
+  string goal_id = 2;
+  optional string parent_worker_id = 3;
+  optional string session_id = 4;
+  CollaborationWorkerRoute route = 5;
+  optional uint64 session_generation = 6;
+  optional uint64 backend_instance_generation = 7;
+  string label = 8;
+  string role = 9;
+  string assignment = 10;
+  CollaborationWorkerStatus status = 11;
+  bool focused = 12;
+  bool runtime_released = 13;
+  bool soft_limit_warning = 14;
+  optional google.protobuf.Timestamp idle_since = 15;
+  optional ErrorInfo error = 16;
+  google.protobuf.Timestamp created_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+  Revision revision = 19;
+}
+
+message CollaborationDispatch {
+  string dispatch_id = 1;
+  string goal_id = 2;
+  string worker_id = 3;
+  string caller_lead_session_id = 4;
+  string operation_id = 5;
+  optional string queue_item_id = 6;
+  string message = 7;
+  CollaborationDispatchStatus status = 8;
+  optional string merged_into_dispatch_id = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  Revision revision = 12;
+}
+
+message CollaborationQueueEntry {
+  CollaborationDispatch dispatch = 1;
+  optional QueueItem queue_item = 2;
+}
+
+message CollaborationGoalTree {
+  CollaborationGoal goal = 1;
+  repeated CollaborationWorker workers = 2;
+  repeated CollaborationQueueEntry queue = 3;
+  optional string focused_worker_id = 4;
+}
+
+message CollaborationGoalAccess {
+  CollaborationGoal goal = 1;
+  CollaborationSessionRole role = 2;
+  optional string worker_id = 3;
+}
+
+message ListCollaborationGoalsRequest {
+  string session_id = 1;
+  bool include_archived = 2;
+}
+
+message ListCollaborationGoalsResponse {
+  repeated CollaborationGoalAccess access = 1;
+}
+
+message GetCollaborationGoalRequest {
+  string goal_id = 1;
+  string viewer_session_id = 2;
+}
+
+message GetCollaborationGoalResponse {
+  CollaborationGoalTree tree = 1;
+}
+
+message CreateCollaborationGoalRequest {
+  string operation_id = 1;
+  string lead_session_id = 2;
+  uint64 expected_session_generation = 3;
+  string title = 4;
+  string objective = 5;
+  optional uint32 maximum_workers = 6;
+}
+
+message CreateCollaborationGoalResponse {
+  CollaborationGoalTree tree = 1;
+}
+
+message SetCollaborationGoalStatusRequest {
+  string operation_id = 1;
+  string goal_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_revision = 4;
+  CollaborationGoalStatus status = 5;
+}
+
+message SetCollaborationGoalStatusResponse {
+  CollaborationGoalTree tree = 1;
+}
+
+message CreateCollaborationWorkerRequest {
+  string operation_id = 1;
+  string goal_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_goal_revision = 4;
+  optional string parent_worker_id = 5;
+  string label = 6;
+  string role = 7;
+  string assignment = 8;
+  string target_id = 9;
+  optional string provider_id = 10;
+  optional string model_id = 11;
+  optional string effort = 12;
+  bool fast_mode = 13;
+  PermissionMode permission_mode = 14;
+  bool plan_mode = 15;
+}
+
+message CreateCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationWorker worker = 2;
+}
+
+message UpdateCollaborationWorkerRequest {
+  string operation_id = 1;
+  string worker_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_revision = 4;
+  optional string label = 5;
+  optional string role = 6;
+  optional string assignment = 7;
+}
+
+message UpdateCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationWorker worker = 2;
+}
+
+message FocusCollaborationWorkerRequest {
+  string operation_id = 1;
+  string goal_id = 2;
+  string caller_lead_session_id = 3;
+  optional string worker_id = 4;
+  optional Revision expected_worker_revision = 5;
+}
+
+message FocusCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+}
+
+message WakeCollaborationWorkerRequest {
+  string operation_id = 1;
+  string worker_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_revision = 4;
+  uint64 expected_session_generation = 5;
+}
+
+message WakeCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationWorker worker = 2;
+}
+
+message StopCollaborationWorkerRequest {
+  string operation_id = 1;
+  string worker_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_revision = 4;
+  optional uint64 expected_session_generation = 5;
+}
+
+message StopCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationWorker worker = 2;
+}
+
+message ReleaseCollaborationWorkerRequest {
+  string operation_id = 1;
+  string worker_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_revision = 4;
+  uint64 expected_session_generation = 5;
+}
+
+message ReleaseCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationWorker worker = 2;
+}
+
+message ArchiveCollaborationWorkerRequest {
+  string operation_id = 1;
+  string worker_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_revision = 4;
+}
+
+message ArchiveCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationWorker worker = 2;
+}
+
+message SendCollaborationWorkerMessageRequest {
+  string operation_id = 1;
+  string goal_id = 2;
+  string worker_id = 3;
+  string caller_lead_session_id = 4;
+  Revision expected_worker_revision = 5;
+  uint64 expected_session_generation = 6;
+  string message = 7;
+}
+
+message SendCollaborationWorkerMessageResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationDispatch dispatch = 2;
+}
+
+message InterruptCollaborationWorkerRequest {
+  string operation_id = 1;
+  string goal_id = 2;
+  string worker_id = 3;
+  string caller_lead_session_id = 4;
+  Revision expected_worker_revision = 5;
+  uint64 expected_session_generation = 6;
+  string message = 7;
+}
+
+message InterruptCollaborationWorkerResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationDispatch dispatch = 2;
+  CollaborationInterruptStopOutcome stop_outcome = 3;
+}
+
+message EditCollaborationDispatchRequest {
+  string operation_id = 1;
+  string dispatch_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_dispatch_revision = 4;
+  Revision expected_queue_revision = 5;
+  string message = 6;
+}
+
+message EditCollaborationDispatchResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationDispatch dispatch = 2;
+}
+
+message CancelCollaborationDispatchRequest {
+  string operation_id = 1;
+  string dispatch_id = 2;
+  string caller_lead_session_id = 3;
+  Revision expected_dispatch_revision = 4;
+  Revision expected_queue_revision = 5;
+}
+
+message CancelCollaborationDispatchResponse {
+  CollaborationGoalTree tree = 1;
+  CollaborationDispatch dispatch = 2;
+}
+
+message CollaborationMergeCandidate {
+  string dispatch_id = 1;
+  Revision expected_dispatch_revision = 2;
+  Revision expected_queue_revision = 3;
+}
+
+message MergeCollaborationDispatchesRequest {
+  string operation_id = 1;
+  string goal_id = 2;
+  string worker_id = 3;
+  string caller_lead_session_id = 4;
+  repeated CollaborationMergeCandidate dispatches = 5;
+}
+
+message MergeCollaborationDispatchesResponse {
+  CollaborationGoalTree tree = 1;
+  repeated CollaborationDispatch dispatches = 2;
+}

@@ -1304,6 +1304,464 @@ CREATE TABLE session_objectives (
         )
       ) STRICT;
 
+CREATE TABLE collaboration_goals (
+        id TEXT PRIMARY KEY CHECK (
+          length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        lead_id TEXT NOT NULL UNIQUE CHECK (
+          length(lead_id) BETWEEN 1 AND 256 AND instr(lead_id, char(0)) = 0
+        ),
+        lead_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        session_generation INTEGER NOT NULL CHECK (session_generation BETWEEN 0 AND 9007199254740991),
+        backend_instance_generation INTEGER NOT NULL CHECK (
+          backend_instance_generation BETWEEN 0 AND 9007199254740991
+        ),
+        title TEXT NOT NULL CHECK (
+          length(trim(title)) BETWEEN 1 AND 256 AND instr(title, char(0)) = 0
+        ),
+        objective TEXT NOT NULL CHECK (
+          length(trim(objective)) BETWEEN 1 AND 32000 AND instr(objective, char(0)) = 0
+        ),
+        maximum_workers INTEGER CHECK (maximum_workers IS NULL OR maximum_workers BETWEEN 1 AND 128),
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'stopped', 'failed', 'archived')),
+        last_error_json TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        completed_at INTEGER CHECK (completed_at IS NULL OR completed_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
+      ) STRICT;
+
+CREATE TABLE collaboration_workers (
+        id TEXT PRIMARY KEY CHECK (
+          length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        goal_id TEXT NOT NULL REFERENCES collaboration_goals(id) ON DELETE CASCADE,
+        parent_worker_id TEXT,
+        session_id TEXT UNIQUE REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        provider_id TEXT,
+        model_id TEXT,
+        effort TEXT,
+        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
+        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+        plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
+        session_generation INTEGER CHECK (
+          session_generation IS NULL OR session_generation BETWEEN 0 AND 9007199254740991
+        ),
+        backend_instance_generation INTEGER CHECK (
+          backend_instance_generation IS NULL OR backend_instance_generation BETWEEN 0 AND 9007199254740991
+        ),
+        create_operation_id TEXT NOT NULL UNIQUE CHECK (
+          length(create_operation_id) BETWEEN 1 AND 256 AND instr(create_operation_id, char(0)) = 0
+        ),
+        label TEXT NOT NULL CHECK (
+          length(trim(label)) BETWEEN 1 AND 64 AND instr(label, char(0)) = 0
+        ),
+        role TEXT NOT NULL CHECK (
+          length(trim(role)) BETWEEN 1 AND 128 AND instr(role, char(0)) = 0
+        ),
+        assignment TEXT NOT NULL CHECK (
+          length(trim(assignment)) BETWEEN 1 AND 32000 AND instr(assignment, char(0)) = 0
+        ),
+        status TEXT NOT NULL CHECK (status IN (
+          'provisioning', 'idle', 'queued', 'running', 'completed', 'failed',
+          'stopping', 'stopped', 'dispatch_unknown', 'archived'
+        )),
+        focused INTEGER NOT NULL CHECK (focused IN (0, 1)),
+        runtime_released INTEGER NOT NULL CHECK (runtime_released IN (0, 1)),
+        soft_limit_warning INTEGER NOT NULL CHECK (soft_limit_warning IN (0, 1)),
+        idle_since INTEGER CHECK (idle_since IS NULL OR idle_since >= 0),
+        last_error_json TEXT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(id, goal_id),
+        UNIQUE(goal_id, label COLLATE NOCASE),
+        FOREIGN KEY(parent_worker_id, goal_id)
+          REFERENCES collaboration_workers(id, goal_id) ON DELETE RESTRICT,
+        CHECK (parent_worker_id IS NULL OR parent_worker_id <> id),
+        CHECK ((provider_id IS NULL) = (model_id IS NULL)),
+        CHECK ((session_id IS NULL) = (session_generation IS NULL)),
+        CHECK ((session_id IS NULL) = (backend_instance_generation IS NULL))
+      ) STRICT;
+
+CREATE TABLE collaboration_dispatches (
+        id TEXT PRIMARY KEY CHECK (
+          length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        goal_id TEXT NOT NULL REFERENCES collaboration_goals(id) ON DELETE CASCADE,
+        worker_id TEXT NOT NULL,
+        caller_lead_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        operation_id TEXT NOT NULL UNIQUE CHECK (
+          length(operation_id) BETWEEN 1 AND 256 AND instr(operation_id, char(0)) = 0
+        ),
+        queue_item_id TEXT UNIQUE REFERENCES queue_items(id) ON DELETE RESTRICT,
+        message TEXT NOT NULL CHECK (
+          length(trim(message)) BETWEEN 1 AND 32000 AND instr(message, char(0)) = 0
+        ),
+        status TEXT NOT NULL CHECK (status IN (
+          'preparing', 'queued', 'merged', 'cancelled', 'dispatch_unknown'
+        )),
+        merged_into_dispatch_id TEXT REFERENCES collaboration_dispatches(id) ON DELETE RESTRICT,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        FOREIGN KEY(worker_id, goal_id)
+          REFERENCES collaboration_workers(id, goal_id) ON DELETE CASCADE,
+        CHECK (
+          (status = 'merged' AND merged_into_dispatch_id IS NOT NULL)
+          OR (status <> 'merged' AND merged_into_dispatch_id IS NULL)
+        )
+      ) STRICT;
+
+CREATE TABLE messaging_channels (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        channel TEXT NOT NULL CHECK (channel IN (
+          'telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack'
+        )),
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        runtime_status TEXT NOT NULL CHECK (runtime_status IN (
+          'idle', 'connecting', 'connected', 'offline', 'conflict', 'auth_loss', 'error'
+        )),
+        credential_reference_id TEXT CHECK (
+          credential_reference_id IS NULL OR (
+            length(trim(credential_reference_id)) BETWEEN 1 AND 512
+            AND instr(credential_reference_id, char(0)) = 0
+          )
+        ),
+        credential_generation TEXT CHECK (
+          credential_generation IS NULL OR (
+            length(credential_generation) = 64
+            AND credential_generation NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        owner_provider_user_id TEXT CHECK (
+          owner_provider_user_id IS NULL OR (
+            length(trim(owner_provider_user_id)) BETWEEN 1 AND 512
+            AND instr(owner_provider_user_id, char(0)) = 0
+          )
+        ),
+        provider_account_id TEXT CHECK (
+          provider_account_id IS NULL OR (
+            length(trim(provider_account_id)) BETWEEN 1 AND 512
+            AND instr(provider_account_id, char(0)) = 0
+          )
+        ),
+        provider_username TEXT CHECK (
+          provider_username IS NULL OR (
+            length(trim(provider_username)) BETWEEN 1 AND 512
+            AND instr(provider_username, char(0)) = 0
+          )
+        ),
+        configuration_json TEXT NOT NULL CHECK (length(configuration_json) BETWEEN 2 AND 65536),
+        cursor TEXT CHECK (
+          cursor IS NULL OR (length(cursor) BETWEEN 1 AND 4096 AND instr(cursor, char(0)) = 0)
+        ),
+        error_code TEXT CHECK (
+          error_code IS NULL OR (
+            length(error_code) BETWEEN 1 AND 64 AND error_code NOT GLOB '*[^a-z0-9_]*'
+          )
+        ),
+        error_summary TEXT CHECK (
+          error_summary IS NULL OR (
+            length(trim(error_summary)) BETWEEN 1 AND 512 AND instr(error_summary, char(0)) = 0
+          )
+        ),
+        last_connected_at INTEGER CHECK (last_connected_at IS NULL OR last_connected_at >= 0),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK ((credential_reference_id IS NULL) = (credential_generation IS NULL)),
+        CHECK (
+          credential_reference_id IS NOT NULL
+          OR (enabled = 0 AND runtime_status = 'idle' AND cursor IS NULL)
+        ),
+        CHECK (runtime_status <> 'idle' OR credential_reference_id IS NULL),
+        CHECK (runtime_status <> 'offline' OR credential_reference_id IS NOT NULL),
+        CHECK ((error_code IS NULL) = (error_summary IS NULL))
+      ) STRICT;
+
+CREATE TABLE messaging_routes (
+        scope_key TEXT PRIMARY KEY CHECK (
+          length(scope_key) BETWEEN 1 AND 768 AND instr(scope_key, char(0)) = 0
+        ),
+        connection_id TEXT UNIQUE REFERENCES messaging_channels(id) ON DELETE CASCADE,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        provider_id TEXT CHECK (
+          provider_id IS NULL OR (length(provider_id) BETWEEN 1 AND 512 AND instr(provider_id, char(0)) = 0)
+        ),
+        model_id TEXT CHECK (
+          model_id IS NULL OR (length(model_id) BETWEEN 1 AND 512 AND instr(model_id, char(0)) = 0)
+        ),
+        effort TEXT CHECK (
+          effort IS NULL OR (length(effort) BETWEEN 1 AND 128 AND instr(effort, char(0)) = 0)
+        ),
+        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
+        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+        plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK (
+          (scope_key = 'global' AND connection_id IS NULL)
+          OR (connection_id IS NOT NULL AND scope_key = 'connection:' || connection_id)
+        )
+      ) STRICT;
+
+CREATE TABLE messaging_conversations (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        channel_generation INTEGER NOT NULL CHECK (channel_generation >= 1),
+        provider_conversation_id TEXT NOT NULL CHECK (
+          length(provider_conversation_id) BETWEEN 1 AND 512 AND instr(provider_conversation_id, char(0)) = 0
+        ),
+        provider_thread_id TEXT NOT NULL CHECK (
+          length(provider_thread_id) <= 512 AND instr(provider_thread_id, char(0)) = 0
+        ),
+        conversation_kind TEXT NOT NULL CHECK (conversation_kind IN ('direct', 'group', 'channel')),
+        status TEXT NOT NULL CHECK (status IN ('observed', 'active', 'retired')),
+        session_id TEXT UNIQUE REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        session_generation INTEGER CHECK (session_generation IS NULL OR session_generation >= 0),
+        route_scope_key TEXT REFERENCES messaging_routes(scope_key) ON DELETE RESTRICT,
+        target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        backend_id TEXT REFERENCES backends(id) ON DELETE RESTRICT,
+        provider_id TEXT,
+        model_id TEXT,
+        effort TEXT,
+        fast_mode INTEGER CHECK (fast_mode IS NULL OR fast_mode IN (0, 1)),
+        permission_mode TEXT CHECK (
+          permission_mode IS NULL OR permission_mode IN ('ask', 'auto', 'bypassPermissions')
+        ),
+        plan_mode INTEGER CHECK (plan_mode IS NULL OR plan_mode IN (0, 1)),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        retired_at INTEGER CHECK (retired_at IS NULL OR retired_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(connection_id, channel_generation, provider_conversation_id, provider_thread_id),
+        CHECK (
+          status <> 'observed' OR (
+            session_id IS NULL AND session_generation IS NULL AND route_scope_key IS NULL
+            AND target_id IS NULL AND backend_id IS NULL AND provider_id IS NULL
+            AND model_id IS NULL AND effort IS NULL AND fast_mode IS NULL
+            AND permission_mode IS NULL AND plan_mode IS NULL
+          )
+        ),
+        CHECK (
+          status <> 'active' OR (
+            session_id IS NOT NULL AND session_generation IS NOT NULL AND route_scope_key IS NOT NULL
+            AND target_id IS NOT NULL AND backend_id IS NOT NULL AND fast_mode IS NOT NULL
+            AND permission_mode IS NOT NULL AND plan_mode IS NOT NULL AND retired_at IS NULL
+          )
+        ),
+        CHECK (status = 'retired' OR retired_at IS NULL)
+      ) STRICT;
+
+CREATE TABLE messaging_inbound_requests (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        channel_generation INTEGER NOT NULL CHECK (channel_generation >= 1),
+        conversation_id TEXT REFERENCES messaging_conversations(id) ON DELETE RESTRICT,
+        provider_message_id TEXT CHECK (
+          provider_message_id IS NULL OR (
+            length(provider_message_id) BETWEEN 1 AND 512 AND instr(provider_message_id, char(0)) = 0
+          )
+        ),
+        body_hash TEXT NOT NULL CHECK (body_hash GLOB 'sha256:*' AND length(body_hash) = 71),
+        protected_content INTEGER NOT NULL CHECK (protected_content IN (0, 1)),
+        status TEXT NOT NULL CHECK (status IN (
+          'preparing', 'queued', 'completed', 'failed', 'cancelled', 'dispatch_unknown'
+        )),
+        operation_id TEXT UNIQUE REFERENCES operations(id) ON DELETE RESTRICT,
+        run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+        attempt_id TEXT UNIQUE REFERENCES attempts(id) ON DELETE RESTRICT,
+        queue_item_id TEXT UNIQUE REFERENCES queue_items(id) ON DELETE RESTRICT,
+        error_code TEXT CHECK (
+          error_code IS NULL OR (
+            length(error_code) BETWEEN 1 AND 64 AND error_code NOT GLOB '*[^a-z0-9_]*'
+          )
+        ),
+        occurred_at INTEGER NOT NULL CHECK (occurred_at >= 0),
+        received_at INTEGER NOT NULL CHECK (received_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= received_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK (
+          (operation_id IS NULL AND run_id IS NULL AND attempt_id IS NULL AND queue_item_id IS NULL)
+          OR (operation_id IS NOT NULL AND run_id IS NOT NULL AND attempt_id IS NOT NULL AND queue_item_id IS NOT NULL)
+        ),
+        CHECK (status IN ('preparing', 'cancelled', 'dispatch_unknown') OR queue_item_id IS NOT NULL)
+      ) STRICT;
+
+CREATE TABLE messaging_inbound_request_keys (
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        channel_generation INTEGER NOT NULL CHECK (channel_generation >= 1),
+        provider_request_id TEXT NOT NULL CHECK (
+          length(provider_request_id) BETWEEN 1 AND 512 AND instr(provider_request_id, char(0)) = 0
+        ),
+        request_id TEXT NOT NULL REFERENCES messaging_inbound_requests(id) ON DELETE CASCADE,
+        body_hash TEXT NOT NULL CHECK (body_hash GLOB 'sha256:*' AND length(body_hash) = 71),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(connection_id, channel_generation, provider_request_id)
+      ) STRICT;
+
+CREATE TABLE messaging_request_artifacts (
+        request_id TEXT NOT NULL REFERENCES messaging_inbound_requests(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 63),
+        artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(request_id, ordinal),
+        UNIQUE(request_id, artifact_id)
+      ) STRICT;
+
+CREATE TABLE messaging_conversation_contexts (
+        conversation_id TEXT PRIMARY KEY
+          REFERENCES messaging_conversations(id) ON DELETE CASCADE,
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        material_generation TEXT NOT NULL CHECK (
+          length(material_generation) = 64
+          AND material_generation NOT GLOB '*[^0-9a-f]*'
+        ),
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('request', 'interaction')),
+        source_id TEXT NOT NULL CHECK (
+          length(trim(source_id)) BETWEEN 1 AND 256 AND instr(source_id, char(0)) = 0
+        ),
+        algorithm TEXT NOT NULL CHECK (algorithm = 'aes-256-gcm'),
+        nonce TEXT NOT NULL CHECK (length(nonce) = 16),
+        ciphertext TEXT NOT NULL CHECK (length(ciphertext) BETWEEN 4 AND 21848),
+        tag TEXT NOT NULL CHECK (length(tag) = 24),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
+      ) STRICT;
+
+CREATE TABLE messaging_conversation_context_sources (
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('request', 'interaction')),
+        source_id TEXT NOT NULL CHECK (
+          length(trim(source_id)) BETWEEN 1 AND 256 AND instr(source_id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        material_generation TEXT NOT NULL CHECK (
+          length(material_generation) = 64
+          AND material_generation NOT GLOB '*[^0-9a-f]*'
+        ),
+        conversation_id TEXT NOT NULL
+          REFERENCES messaging_conversations(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(source_kind, source_id)
+      ) STRICT;
+
+CREATE TABLE messaging_group_observations (
+        conversation_id TEXT NOT NULL REFERENCES messaging_conversations(id) ON DELETE CASCADE,
+        provider_message_id TEXT NOT NULL CHECK (
+          length(provider_message_id) BETWEEN 1 AND 512 AND instr(provider_message_id, char(0)) = 0
+        ),
+        provider_user_id TEXT NOT NULL CHECK (
+          length(provider_user_id) BETWEEN 1 AND 512 AND instr(provider_user_id, char(0)) = 0
+        ),
+        display_name TEXT NOT NULL CHECK (
+          length(display_name) BETWEEN 1 AND 512 AND instr(display_name, char(0)) = 0
+        ),
+        username TEXT CHECK (
+          username IS NULL OR (length(username) BETWEEN 1 AND 512 AND instr(username, char(0)) = 0)
+        ),
+        is_bot INTEGER NOT NULL CHECK (is_bot IN (0, 1)),
+        text TEXT NOT NULL CHECK (length(text) <= 65536 AND instr(text, char(0)) = 0),
+        attachment_names_json TEXT NOT NULL CHECK (length(attachment_names_json) BETWEEN 2 AND 8192),
+        occurred_at INTEGER NOT NULL CHECK (occurred_at >= 0),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(conversation_id, provider_message_id)
+      ) STRICT;
+
+CREATE TABLE messaging_deliveries (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        channel_generation INTEGER NOT NULL CHECK (channel_generation >= 1),
+        conversation_id TEXT NOT NULL REFERENCES messaging_conversations(id) ON DELETE RESTRICT,
+        dedupe_key TEXT NOT NULL CHECK (
+          length(dedupe_key) BETWEEN 1 AND 512 AND instr(dedupe_key, char(0)) = 0
+        ),
+        kind TEXT NOT NULL CHECK (kind IN ('text', 'file', 'reaction', 'interaction', 'notice')),
+        part_index INTEGER NOT NULL CHECK (part_index >= 0),
+        part_count INTEGER NOT NULL CHECK (part_count >= 1 AND part_index < part_count),
+        payload_hash TEXT NOT NULL CHECK (payload_hash GLOB 'sha256:*' AND length(payload_hash) = 71),
+        payload_json TEXT NOT NULL CHECK (length(payload_json) BETWEEN 2 AND 131072),
+        status TEXT NOT NULL CHECK (status IN (
+          'pending', 'dispatching', 'sent', 'failed', 'cancelled', 'unknown'
+        )),
+        available_at INTEGER NOT NULL CHECK (available_at >= 0),
+        attempts INTEGER NOT NULL CHECK (attempts >= 0),
+        claim_token TEXT,
+        claimed_at INTEGER,
+        provider_message_id TEXT CHECK (
+          provider_message_id IS NULL OR (
+            length(provider_message_id) BETWEEN 1 AND 512 AND instr(provider_message_id, char(0)) = 0
+          )
+        ),
+        error_code TEXT CHECK (
+          error_code IS NULL OR (
+            length(error_code) BETWEEN 1 AND 64 AND error_code NOT GLOB '*[^a-z0-9_]*'
+          )
+        ),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(connection_id, channel_generation, dedupe_key, part_index),
+        CHECK ((status = 'dispatching') = (claim_token IS NOT NULL AND claimed_at IS NOT NULL)),
+        CHECK (status = 'sent' OR provider_message_id IS NULL)
+      ) STRICT;
+
+CREATE TABLE messaging_interactions (
+        id TEXT PRIMARY KEY CHECK (
+          length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        channel_generation INTEGER NOT NULL CHECK (channel_generation >= 1),
+        conversation_id TEXT NOT NULL REFERENCES messaging_conversations(id) ON DELETE RESTRICT,
+        provider_request_id TEXT NOT NULL CHECK (
+          length(provider_request_id) BETWEEN 1 AND 512 AND instr(provider_request_id, char(0)) = 0
+        ),
+        provider_interaction_id TEXT NOT NULL CHECK (
+          length(provider_interaction_id) BETWEEN 1 AND 512 AND instr(provider_interaction_id, char(0)) = 0
+        ),
+        provider_message_id TEXT NOT NULL CHECK (
+          length(provider_message_id) BETWEEN 1 AND 512 AND instr(provider_message_id, char(0)) = 0
+        ),
+        action_hash TEXT NOT NULL CHECK (action_hash GLOB 'sha256:*' AND length(action_hash) = 71),
+        payload_json TEXT NOT NULL CHECK (length(payload_json) BETWEEN 2 AND 65536),
+        status TEXT NOT NULL CHECK (status IN (
+          'pending', 'claimed', 'completed', 'failed', 'expired', 'duplicate', 'unknown'
+        )),
+        claim_token TEXT,
+        claimed_at INTEGER,
+        expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+        outcome_code TEXT CHECK (
+          outcome_code IS NULL OR (
+            length(outcome_code) BETWEEN 1 AND 64 AND outcome_code NOT GLOB '*[^a-z0-9_]*'
+          )
+        ),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(connection_id, channel_generation, provider_request_id),
+        UNIQUE(connection_id, channel_generation, provider_interaction_id),
+        CHECK ((status = 'claimed') = (claim_token IS NOT NULL AND claimed_at IS NOT NULL))
+      ) STRICT;
+
 CREATE TABLE session_reset_boundaries (
         session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
         reset_operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE RESTRICT,
@@ -1765,6 +2223,55 @@ CREATE UNIQUE INDEX session_objectives_pending_run_idx
 CREATE INDEX session_objectives_status_idx
         ON session_objectives(status, updated_at, session_id);
 
+CREATE UNIQUE INDEX collaboration_goals_active_lead_idx
+        ON collaboration_goals(lead_session_id) WHERE status = 'active';
+
+CREATE INDEX collaboration_goals_status_idx
+        ON collaboration_goals(status, updated_at DESC, id);
+
+CREATE UNIQUE INDEX collaboration_workers_focused_goal_idx
+        ON collaboration_workers(goal_id) WHERE focused = 1 AND status <> 'archived';
+
+CREATE INDEX collaboration_workers_goal_status_idx
+        ON collaboration_workers(goal_id, status, updated_at DESC, id);
+
+CREATE INDEX collaboration_workers_capacity_idx
+        ON collaboration_workers(runtime_released, status, updated_at, id)
+        WHERE status NOT IN ('archived', 'stopped');
+
+CREATE INDEX collaboration_dispatches_worker_idx
+        ON collaboration_dispatches(worker_id, created_at, id);
+
+CREATE INDEX collaboration_dispatches_recovery_idx
+        ON collaboration_dispatches(status, updated_at, id)
+        WHERE status IN ('preparing', 'queued', 'dispatch_unknown');
+
+CREATE INDEX messaging_channels_runtime_idx
+        ON messaging_channels(enabled, runtime_status, updated_at, id);
+
+CREATE INDEX messaging_conversations_connection_idx
+        ON messaging_conversations(connection_id, channel_generation, status, updated_at, id);
+
+CREATE INDEX messaging_inbound_requests_recovery_idx
+        ON messaging_inbound_requests(status, updated_at, id)
+        WHERE status IN ('preparing', 'queued', 'dispatch_unknown');
+
+CREATE INDEX messaging_conversation_contexts_connection_idx
+        ON messaging_conversation_contexts(connection_id, material_generation, updated_at);
+
+CREATE INDEX messaging_conversation_context_sources_connection_idx
+        ON messaging_conversation_context_sources(connection_id, material_generation, conversation_id);
+
+CREATE INDEX messaging_group_observations_history_idx
+        ON messaging_group_observations(conversation_id, occurred_at DESC, provider_message_id DESC);
+
+CREATE INDEX messaging_deliveries_pending_idx
+        ON messaging_deliveries(connection_id, channel_generation, status, available_at, created_at, id);
+
+CREATE INDEX messaging_interactions_recovery_idx
+        ON messaging_interactions(status, expires_at, updated_at, id)
+        WHERE status IN ('pending', 'claimed', 'unknown');
+
 CREATE INDEX session_worktrees_state_idx
         ON session_worktrees(state, updated_at DESC, session_id);
 
@@ -1976,6 +2483,165 @@ CREATE TRIGGER session_objectives_generation_update
       )
       BEGIN
         SELECT RAISE(ABORT, 'objective session generation is stale');
+      END;
+
+CREATE TRIGGER collaboration_goals_owner_insert
+      BEFORE INSERT ON collaboration_goals
+      WHEN NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.lead_session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration goal lead authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_goals_owner_update
+      BEFORE UPDATE OF lead_session_id, backend_id, target_id, session_generation ON collaboration_goals
+      WHEN NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.lead_session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration goal lead authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_workers_session_insert
+      BEFORE INSERT ON collaboration_workers
+      WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration worker Session authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_workers_session_update
+      BEFORE UPDATE OF session_id, backend_id, target_id, session_generation ON collaboration_workers
+      WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration worker Session authority is stale');
+      END;
+
+CREATE TRIGGER collaboration_follow_session_generation
+      AFTER UPDATE OF generation ON product_sessions
+      WHEN OLD.generation <> NEW.generation
+      BEGIN
+        UPDATE collaboration_goals
+        SET session_generation = NEW.generation,
+            updated_at = MAX(updated_at, NEW.updated_at),
+            revision = NEW.revision
+        WHERE lead_session_id = NEW.id AND status = 'active';
+        UPDATE collaboration_workers
+        SET session_generation = NEW.generation,
+            updated_at = MAX(updated_at, NEW.updated_at),
+            revision = NEW.revision
+        WHERE session_id = NEW.id AND status <> 'archived';
+      END;
+
+CREATE TRIGGER collaboration_dispatch_queue_update
+      BEFORE UPDATE OF queue_item_id ON collaboration_dispatches
+      WHEN NEW.queue_item_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM queue_items item
+        JOIN collaboration_workers worker ON worker.id = NEW.worker_id
+        WHERE item.id = NEW.queue_item_id
+          AND item.session_id = worker.session_id
+          AND item.operation_id = NEW.operation_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'collaboration dispatch Queue authority is stale');
+      END;
+
+CREATE TRIGGER messaging_routes_target_insert
+      BEFORE INSERT ON messaging_routes
+      WHEN NOT EXISTS (
+        SELECT 1 FROM targets target
+        WHERE target.id = NEW.target_id AND target.backend_id = NEW.backend_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'messaging route Target authority is stale');
+      END;
+
+CREATE TRIGGER messaging_routes_target_update
+      BEFORE UPDATE OF target_id, backend_id ON messaging_routes
+      WHEN NOT EXISTS (
+        SELECT 1 FROM targets target
+        WHERE target.id = NEW.target_id AND target.backend_id = NEW.backend_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'messaging route Target authority is stale');
+      END;
+
+CREATE TRIGGER messaging_conversations_session_insert
+      BEFORE INSERT ON messaging_conversations
+      WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'messaging conversation Session authority is stale');
+      END;
+
+CREATE TRIGGER messaging_conversations_session_update
+      BEFORE UPDATE OF session_id, backend_id, target_id, session_generation ON messaging_conversations
+      WHEN NEW.session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM product_sessions session
+        WHERE session.id = NEW.session_id
+          AND session.backend_id = NEW.backend_id
+          AND session.target_id = NEW.target_id
+          AND session.generation = NEW.session_generation
+          AND session.archived = 0 AND session.deleted_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'messaging conversation Session authority is stale');
+      END;
+
+CREATE TRIGGER messaging_follow_session_generation
+      AFTER UPDATE OF generation ON product_sessions
+      WHEN OLD.generation <> NEW.generation
+      BEGIN
+        UPDATE messaging_conversations
+        SET session_generation = NEW.generation,
+            updated_at = MAX(updated_at, NEW.updated_at),
+            revision = NEW.revision
+        WHERE session_id = NEW.id AND status = 'active';
+      END;
+
+CREATE TRIGGER messaging_inbound_queue_update
+      BEFORE UPDATE OF operation_id, run_id, attempt_id, queue_item_id ON messaging_inbound_requests
+      WHEN NEW.queue_item_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM queue_items item
+        JOIN messaging_conversations conversation ON conversation.id = NEW.conversation_id
+        WHERE item.id = NEW.queue_item_id
+          AND item.session_id = conversation.session_id
+          AND item.operation_id = NEW.operation_id
+          AND item.run_id = NEW.run_id
+          AND item.attempt_id = NEW.attempt_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'messaging request Queue authority is stale');
       END;
 
 CREATE TRIGGER sessions_remote_binding_insert

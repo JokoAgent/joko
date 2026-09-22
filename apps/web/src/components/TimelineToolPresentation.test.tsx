@@ -47,6 +47,34 @@ describe("Timeline tool presentation", () => {
     expect(heading()).toEqual(["Delegate task", "Verify release · Failed"]);
   });
 
+  it("renders a successful Partner delegation as the durable collaboration card", async () => {
+    await renderTool("mcp__joko_partners__start_delegation", '{"title":"Research"}', "succeeded", JSON.stringify({
+      id: "delegation-one",
+      revision: "1",
+      requester_partner_id: "partner-one",
+      target_partner_id: "partner-two",
+      parent_session_id: "session-one",
+      target_profile_version: "2",
+      target_partner: { id: "partner-two", display_name: "Nova", avatar: "orbit", status: "active", ready: true },
+      title: "Research",
+      objective: "Find the durable answer",
+      status: "completed",
+      child_session_id: "session-two",
+      run_id: "run-two",
+      artifact_count: 1,
+      result_summary: "Verified",
+      created_at: 2_000,
+      updated_at: 4_000,
+      started_at: 3_000,
+      completed_at: 4_000
+    }));
+
+    expect(host.querySelector(".partner-delegation-inline")).not.toBeNull();
+    expect(host.textContent).toContain("Research");
+    expect(host.textContent).toContain("Verified");
+    expect(host.querySelector("details.tool-block")).toBeNull();
+  });
+
   it("preserves the original tool name and raw payload for an unknown shape", async () => {
     await renderTool("custom_runtime_tool", '$: {"path":"src/main.ts"}', "failed");
 
@@ -55,13 +83,13 @@ describe("Timeline tool presentation", () => {
   });
 });
 
-async function renderTool(name: string, input: string, state: ToolCallView["state"]): Promise<void> {
+async function renderTool(name: string, input: string, state: ToolCallView["state"], output?: string): Promise<void> {
   const item: TimelineItemView = {
     id: "tool-call",
     sequence: 1n,
     kind: state === "succeeded" || state === "failed" ? "toolResult" : "tool",
     createdAt: 1,
-    tool: { id: "tool-call", name, state, input, isError: state === "failed" }
+    tool: { id: "tool-call", name, state, input, ...(output === undefined ? {} : { output }), isError: state === "failed" }
   };
   await act(async () => root.render(<ToolBlock
     item={item}

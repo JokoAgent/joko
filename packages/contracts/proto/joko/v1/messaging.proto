@@ -1,0 +1,479 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+import "joko/v1/operation.proto";
+
+enum MessagingChannel {
+  MESSAGING_CHANNEL_UNSPECIFIED = 0;
+  MESSAGING_CHANNEL_TELEGRAM = 1;
+  MESSAGING_CHANNEL_DISCORD = 2;
+  MESSAGING_CHANNEL_DINGTALK = 3;
+  MESSAGING_CHANNEL_FEISHU = 4;
+  MESSAGING_CHANNEL_LARK = 5;
+  MESSAGING_CHANNEL_WECOM = 6;
+  MESSAGING_CHANNEL_WECHAT = 7;
+  MESSAGING_CHANNEL_SLACK = 8;
+}
+
+enum MessagingConnectionRuntimeStatus {
+  MESSAGING_CONNECTION_RUNTIME_STATUS_UNSPECIFIED = 0;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_IDLE = 1;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_CONNECTING = 2;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_CONNECTED = 3;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_OFFLINE = 4;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_CONFLICT = 5;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_AUTH_LOSS = 6;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_ERROR = 7;
+}
+
+enum TelegramEmojiReactions {
+  TELEGRAM_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  TELEGRAM_EMOJI_REACTIONS_OFF = 1;
+  TELEGRAM_EMOJI_REACTIONS_MINIMAL = 2;
+  TELEGRAM_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum TelegramReplyQuoteMode {
+  TELEGRAM_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+  TELEGRAM_REPLY_QUOTE_MODE_OFF = 1;
+  TELEGRAM_REPLY_QUOTE_MODE_FIRST = 2;
+  TELEGRAM_REPLY_QUOTE_MODE_ALL = 3;
+}
+
+enum TelegramGroupActivation {
+  TELEGRAM_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  TELEGRAM_GROUP_ACTIVATION_MENTION = 1;
+  TELEGRAM_GROUP_ACTIVATION_ALWAYS = 2;
+  TELEGRAM_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+enum DiscordEmojiReactions {
+  DISCORD_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  DISCORD_EMOJI_REACTIONS_OFF = 1;
+  DISCORD_EMOJI_REACTIONS_MINIMAL = 2;
+  DISCORD_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum DiscordReplyQuoteMode {
+  DISCORD_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+  DISCORD_REPLY_QUOTE_MODE_OFF = 1;
+  DISCORD_REPLY_QUOTE_MODE_FIRST = 2;
+  DISCORD_REPLY_QUOTE_MODE_ALL = 3;
+}
+
+enum DiscordGroupActivation {
+  DISCORD_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  DISCORD_GROUP_ACTIVATION_MENTION = 1;
+  DISCORD_GROUP_ACTIVATION_ALWAYS = 2;
+  DISCORD_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+enum DingTalkGroupActivation {
+  DING_TALK_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  DING_TALK_GROUP_ACTIVATION_MENTION = 1;
+  DING_TALK_GROUP_ACTIVATION_ALWAYS = 2;
+  DING_TALK_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+enum FeishuEmojiReactions {
+  FEISHU_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  FEISHU_EMOJI_REACTIONS_OFF = 1;
+  FEISHU_EMOJI_REACTIONS_MINIMAL = 2;
+  FEISHU_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum FeishuReplyQuoteMode {
+  FEISHU_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+  FEISHU_REPLY_QUOTE_MODE_OFF = 1;
+  FEISHU_REPLY_QUOTE_MODE_FIRST = 2;
+  FEISHU_REPLY_QUOTE_MODE_ALL = 3;
+}
+
+enum FeishuGroupActivation {
+  FEISHU_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  FEISHU_GROUP_ACTIVATION_MENTION = 1;
+  FEISHU_GROUP_ACTIVATION_ALWAYS = 2;
+  FEISHU_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+enum SlackEmojiReactions {
+  SLACK_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  SLACK_EMOJI_REACTIONS_OFF = 1;
+  SLACK_EMOJI_REACTIONS_MINIMAL = 2;
+  SLACK_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum SlackGroupActivation {
+  SLACK_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  SLACK_GROUP_ACTIVATION_MENTION = 1;
+  SLACK_GROUP_ACTIVATION_ALWAYS = 2;
+  SLACK_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+enum MessagingConnectionTestFailure {
+  MESSAGING_CONNECTION_TEST_FAILURE_UNSPECIFIED = 0;
+  MESSAGING_CONNECTION_TEST_FAILURE_INVALID = 1;
+  MESSAGING_CONNECTION_TEST_FAILURE_CONFLICT = 2;
+  MESSAGING_CONNECTION_TEST_FAILURE_CREDENTIAL_UNAVAILABLE = 3;
+  MESSAGING_CONNECTION_TEST_FAILURE_CHANNEL_UNAVAILABLE = 4;
+  MESSAGING_CONNECTION_TEST_FAILURE_CONNECTION_FAILED = 5;
+}
+
+enum WeChatAuthorizationStatus {
+  WE_CHAT_AUTHORIZATION_STATUS_UNSPECIFIED = 0;
+  WE_CHAT_AUTHORIZATION_STATUS_WAITING = 1;
+  WE_CHAT_AUTHORIZATION_STATUS_SCANNED = 2;
+  WE_CHAT_AUTHORIZATION_STATUS_VERIFICATION_REQUIRED = 3;
+  WE_CHAT_AUTHORIZATION_STATUS_QR_REFRESHED = 4;
+  WE_CHAT_AUTHORIZATION_STATUS_SUCCEEDED = 5;
+  WE_CHAT_AUTHORIZATION_STATUS_FAILED = 6;
+  WE_CHAT_AUTHORIZATION_STATUS_CANCELLED = 7;
+  WE_CHAT_AUTHORIZATION_STATUS_EXPIRED = 8;
+}
+
+message TelegramMessagingConfiguration {
+  TelegramEmojiReactions emoji_reactions = 1;
+  TelegramReplyQuoteMode reply_quote_dm = 2;
+  TelegramReplyQuoteMode reply_quote_group = 3;
+  repeated TelegramGroupActivationRule group_activation_rules = 4;
+}
+
+message TelegramGroupActivationRule {
+  string chat_id = 1;
+  TelegramGroupActivation activation = 2;
+}
+
+message DiscordMessagingConfiguration {
+  bool lifecycle_announcements = 1;
+  DiscordEmojiReactions emoji_reactions = 2;
+  DiscordReplyQuoteMode reply_quote_dm = 3;
+  DiscordReplyQuoteMode reply_quote_group = 4;
+  repeated DiscordGroupActivationRule group_activation_rules = 5;
+}
+
+message DiscordGroupActivationRule {
+  string guild_id = 1;
+  string channel_id = 2;
+  DiscordGroupActivation activation = 3;
+}
+
+message DingTalkMessagingConfiguration {
+  string app_key = 1;
+  repeated DingTalkGroupActivationRule group_activation_rules = 2;
+}
+
+message DingTalkGroupActivationRule {
+  string conversation_id = 1;
+  DingTalkGroupActivation activation = 2;
+}
+
+message FeishuMessagingConfiguration {
+  string app_id = 1;
+  bool lifecycle_announcements = 2;
+  FeishuEmojiReactions emoji_reactions = 3;
+  FeishuReplyQuoteMode reply_quote_dm = 4;
+  FeishuReplyQuoteMode reply_quote_group = 5;
+  repeated FeishuGroupActivationRule group_activation_rules = 6;
+  PermissionMode group_permission_mode = 7;
+}
+
+message FeishuGroupActivationRule {
+  string chat_id = 1;
+  FeishuGroupActivation activation = 2;
+}
+
+message WeComMessagingConfiguration {
+  string bot_id = 1;
+}
+
+// Presence selects the only supported strict current-v1 shape: { format: 1 }.
+message WeChatMessagingConfiguration {}
+
+message SlackMessagingConfiguration {
+  bool lifecycle_announcements = 1;
+  SlackEmojiReactions emoji_reactions = 2;
+  repeated SlackGroupActivationRule group_activation_rules = 3;
+}
+
+message SlackGroupActivationRule {
+  string channel_id = 1;
+  SlackGroupActivation activation = 2;
+}
+
+message MessagingChannelCapability {
+  MessagingChannel channel = 1;
+  bool available = 2;
+  string reason = 3;
+}
+
+message MessagingConnection {
+  string connection_id = 1;
+  MessagingChannel channel = 2;
+  uint64 generation = 3;
+  bool enabled = 4;
+  MessagingConnectionRuntimeStatus runtime_status = 5;
+  bool credential_configured = 6;
+  optional string owner_provider_user_id = 7;
+  optional string provider_account_id = 8;
+  optional string provider_username = 9;
+  optional TelegramMessagingConfiguration telegram_configuration = 10;
+  optional string error_code = 11;
+  optional string error_summary = 12;
+  optional google.protobuf.Timestamp last_connected_at = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp updated_at = 15;
+  Revision revision = 16;
+  optional DiscordMessagingConfiguration discord_configuration = 17;
+  optional DingTalkMessagingConfiguration dingtalk_configuration = 18;
+  optional FeishuMessagingConfiguration feishu_configuration = 19;
+  optional WeComMessagingConfiguration wecom_configuration = 20;
+  optional WeChatMessagingConfiguration wechat_configuration = 21;
+  optional SlackMessagingConfiguration slack_configuration = 22;
+}
+
+message MessagingRoute {
+  string scope_key = 1;
+  optional string connection_id = 2;
+  string target_id = 3;
+  string backend_id = 4;
+  optional string provider_id = 5;
+  optional string model_id = 6;
+  optional string effort = 7;
+  bool fast_mode = 8;
+  PermissionMode permission_mode = 9;
+  bool plan_mode = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  Revision revision = 13;
+}
+
+message GetMessagingSettingsRequest {}
+
+message GetMessagingSettingsResponse {
+  repeated MessagingConnection connections = 1;
+  repeated MessagingRoute routes = 2;
+  repeated MessagingChannelCapability channels = 3;
+}
+
+message CreateMessagingConnectionRequest {
+  MessagingChannel channel = 1;
+  string owner_provider_user_id = 2;
+  optional TelegramMessagingConfiguration telegram_configuration = 3;
+  optional DiscordMessagingConfiguration discord_configuration = 4;
+  optional DingTalkMessagingConfiguration dingtalk_configuration = 5;
+  optional FeishuMessagingConfiguration feishu_configuration = 6;
+  optional WeComMessagingConfiguration wecom_configuration = 7;
+  optional WeChatMessagingConfiguration wechat_configuration = 8;
+  optional SlackMessagingConfiguration slack_configuration = 9;
+}
+
+message CreateMessagingConnectionResponse {
+  MessagingConnection connection = 1;
+}
+
+message BeginMessagingCredentialUploadRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message BeginMessagingCredentialUploadResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message CommitMessagingCredentialRequest {
+  string credential_upload_ticket_id = 1;
+  bool enable = 2;
+}
+
+message CommitMessagingCredentialResponse {
+  MessagingConnection connection = 1;
+}
+
+message ClearMessagingCredentialRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message ClearMessagingCredentialResponse {
+  MessagingConnection connection = 1;
+}
+
+message SetMessagingConnectionEnabledRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  bool enabled = 4;
+}
+
+message SetMessagingConnectionEnabledResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateTelegramMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  TelegramMessagingConfiguration configuration = 5;
+}
+
+message UpdateTelegramMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateDiscordMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  DiscordMessagingConfiguration configuration = 5;
+}
+
+message UpdateDiscordMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateDingTalkMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  DingTalkMessagingConfiguration configuration = 4;
+}
+
+message UpdateDingTalkMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateFeishuMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  FeishuMessagingConfiguration configuration = 4;
+}
+
+message UpdateFeishuMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateWeComMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  WeComMessagingConfiguration configuration = 4;
+}
+
+message UpdateWeComMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateSlackMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  SlackMessagingConfiguration configuration = 5;
+}
+
+message UpdateSlackMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message WeChatAuthorizationAttempt {
+  string attempt_id = 1;
+  string connection_id = 2;
+  uint64 generation = 3;
+  uint64 revision = 4;
+  WeChatAuthorizationStatus status = 5;
+  optional string qr_code_url = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  bool verification_retry = 9;
+  optional string error_code = 10;
+  optional string error_summary = 11;
+  optional MessagingConnection connection = 12;
+}
+
+message BeginWeChatAuthorizationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message BeginWeChatAuthorizationResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message GetWeChatAuthorizationRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+}
+
+message GetWeChatAuthorizationResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message BeginWeChatVerificationInputRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+}
+
+message BeginWeChatVerificationInputResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message SubmitWeChatVerificationCodeRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+  string credential_input_ticket_id = 4;
+}
+
+message SubmitWeChatVerificationCodeResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message CancelWeChatAuthorizationRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+}
+
+message CancelWeChatAuthorizationResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message TestMessagingConnectionRequest {
+  string connection_id = 1;
+}
+
+message TestMessagingConnectionResponse {
+  bool ok = 1;
+  MessagingConnectionTestFailure failure = 2;
+  optional string provider_account_id = 3;
+  optional string display_name = 4;
+  optional string username = 5;
+}
+
+message PutMessagingRouteRequest {
+  optional string connection_id = 1;
+  optional Revision expected_revision = 2;
+  string target_id = 3;
+  optional string provider_id = 4;
+  optional string model_id = 5;
+  optional string effort = 6;
+  bool fast_mode = 7;
+  PermissionMode permission_mode = 8;
+  bool plan_mode = 9;
+}
+
+message PutMessagingRouteResponse {
+  MessagingRoute route = 1;
+}

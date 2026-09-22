@@ -27,6 +27,33 @@ describe("translate", () => {
     expect(translate("zh-CN", "workspace.rename")).toBe("重命名");
   });
 
+  it("localizes the complete WeCom credential and ownership flow", () => {
+    expect(translate("en", "messaging.addWeCom")).toBe("Add WeCom");
+    expect(translate("en", "messaging.wecomBotId")).toBe("WeCom Bot ID");
+    expect(translate("en", "messaging.wecomSecretSafety")).toContain("cleared from this form immediately");
+    expect(translate("zh-CN", "messaging.addWeCom")).toBe("添加企业微信");
+    expect(translate("zh-CN", "messaging.wecomAwaitingOwner")).toContain("首位私聊用户");
+    expect(translate("zh-CN", "messaging.status.wecomIdle")).toBe("需要机器人密钥");
+    expect(translate("en-XA", "messaging.wecomConfigureTitle")).toMatch(/^［.*··］$/u);
+  });
+
+  it("localizes WeChat QR authorization, verification, and recovery across three locales", () => {
+    expect(translate("en", "messaging.addWeChat")).toBe("Add WeChat");
+    expect(translate("en", "messaging.wechatVerificationSafety")).toContain("one-shot protected channel");
+    expect(translate("zh-CN", "messaging.wechatRebindBody")).toContain("现有连接保持工作");
+    expect(translate("zh-CN", "messaging.wechatStatus.verificationRequired")).toBe("需要验证码");
+    expect(translate("en-XA", "messaging.wechatStatus.expired")).toMatch(/^［.*··］$/u);
+  });
+
+  it("localizes Slack owner, paired-token, channel policy, and recovery across three locales", () => {
+    expect(translate("en", "messaging.addSlack")).toBe("Add Slack");
+    expect(translate("en", "messaging.slackSecretSafety")).toContain("one protected upload");
+    expect(translate("en", "messaging.slackScopes")).toContain("connections:write");
+    expect(translate("zh-CN", "messaging.slackOwnerIdBody")).toContain("U 或 W");
+    expect(translate("zh-CN", "messaging.slackClearBody")).toContain("两个令牌");
+    expect(translate("en-XA", "messaging.slackGroupSafety")).toMatch(/^［.*··］$/u);
+  });
+
   it("keeps every shared Backend surface neutral while retaining Pi-owned feature names", () => {
     const sharedKeys = [
       "session.deleteWarning",

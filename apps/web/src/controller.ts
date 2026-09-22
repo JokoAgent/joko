@@ -94,6 +94,7 @@ export type AppRoute =
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
+  | { readonly kind: "partners"; readonly partnerId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
   | { readonly kind: "tools"; readonly extensionId?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
@@ -2292,6 +2293,231 @@ export function useAppController(): AppController {
     saveProviderCredentialSurface: (backendId, providerId, surfaceId, secret) => gateway().saveProviderCredentialSurface(backendId, providerId, surfaceId, secret),
     clearProviderCredentialSurface: (backendId, providerId, surfaceId) => gateway().clearProviderCredentialSurface(backendId, providerId, surfaceId),
     deleteCredential: (credentialId) => gateway().deleteCredential(credentialId),
+    getPartnerDirectory: (signal) => gateway().getPartnerDirectory(signal),
+    listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
+    getPartner: (partnerId, signal) => gateway().getPartner(partnerId, signal),
+    createPartner: (expectedDirectoryRevision, draft, signal) =>
+      gateway().createPartner(expectedDirectoryRevision, draft, signal),
+    updatePartner: (partnerId, expectedRevision, patch, signal) =>
+      gateway().updatePartner(partnerId, expectedRevision, patch, signal),
+    setPartnerLifecycle: (partnerId, expectedRevision, lifecycle, signal) =>
+      gateway().setPartnerLifecycle(partnerId, expectedRevision, lifecycle, signal),
+    retryPartnerInitialization: (partnerId, expectedRevision, signal) =>
+      gateway().retryPartnerInitialization(partnerId, expectedRevision, signal),
+    updatePartnerDefaults: (expectedDirectoryRevision, capabilities, signal) =>
+      gateway().updatePartnerDefaults(expectedDirectoryRevision, capabilities, signal),
+    listPartnerSessions: (partnerId, signal) => gateway().listPartnerSessions(partnerId, signal),
+    markPartnerRead: (partnerId, throughCursor, signal) => gateway().markPartnerRead(partnerId, throughCursor, signal),
+    listPartnerPrivateThreads: (partnerId, signal) => gateway().listPartnerPrivateThreads(partnerId, signal),
+    getPartnerPrivateThread: (partnerId, threadId, signal) =>
+      gateway().getPartnerPrivateThread(partnerId, threadId, signal),
+    markPartnerPrivateThreadRead: (partnerId, threadId, throughSequence, signal) =>
+      gateway().markPartnerPrivateThreadRead(partnerId, threadId, throughSequence, signal),
+    listPartnerDelegations: (partnerId, signal) => gateway().listPartnerDelegations(partnerId, signal),
+    getPartnerDelegation: (partnerId, delegationId, signal) =>
+      gateway().getPartnerDelegation(partnerId, delegationId, signal),
+    cancelPartnerDelegation: (partnerId, delegationId, expectedRevision, signal) =>
+      gateway().cancelPartnerDelegation(partnerId, delegationId, expectedRevision, signal),
+    listCollaborationGoals: (sessionId, includeArchived, signal) =>
+      gateway().listCollaborationGoals(sessionId, includeArchived, signal),
+    getCollaborationGoal: (goalId, viewerSessionId, signal) =>
+      gateway().getCollaborationGoal(goalId, viewerSessionId, signal),
+    createCollaborationGoal: (leadSessionId, expectedSessionGeneration, title, objective, maximumWorkers, signal) =>
+      gateway().createCollaborationGoal(leadSessionId, expectedSessionGeneration, title, objective, maximumWorkers, signal),
+    setCollaborationGoalStatus: (goal, status, signal) => gateway().setCollaborationGoalStatus(goal, status, signal),
+    createCollaborationWorker: (goal, draft, signal) => gateway().createCollaborationWorker(goal, draft, signal),
+    updateCollaborationWorker: (goal, worker, patch, signal) =>
+      gateway().updateCollaborationWorker(goal, worker, patch, signal),
+    focusCollaborationWorker: (goal, worker, signal) => gateway().focusCollaborationWorker(goal, worker, signal),
+    wakeCollaborationWorker: (goal, worker, signal) => gateway().wakeCollaborationWorker(goal, worker, signal),
+    stopCollaborationWorker: (goal, worker, signal) => gateway().stopCollaborationWorker(goal, worker, signal),
+    releaseCollaborationWorker: (goal, worker, signal) => gateway().releaseCollaborationWorker(goal, worker, signal),
+    archiveCollaborationWorker: (goal, worker, signal) => gateway().archiveCollaborationWorker(goal, worker, signal),
+    sendCollaborationWorkerMessage: (goal, worker, message, signal) =>
+      gateway().sendCollaborationWorkerMessage(goal, worker, message, signal),
+    interruptCollaborationWorker: (goal, worker, message, signal) =>
+      gateway().interruptCollaborationWorker(goal, worker, message, signal),
+    editCollaborationDispatch: (dispatch, queueItem, message, signal) =>
+      gateway().editCollaborationDispatch(dispatch, queueItem, message, signal),
+    cancelCollaborationDispatch: (dispatch, queueItem, signal) =>
+      gateway().cancelCollaborationDispatch(dispatch, queueItem, signal),
+    mergeCollaborationDispatches: (goal, worker, entries, signal) =>
+      gateway().mergeCollaborationDispatches(goal, worker, entries, signal),
+    getContactDirectory: (signal) => gateway().getContactDirectory(signal),
+    setContactDirectoryEnabled: (expectedRevision, enabled, signal) =>
+      gateway().setContactDirectoryEnabled(expectedRevision, enabled, signal),
+    listContacts: (options, signal) => gateway().listContacts(options, signal),
+    getContact: (contactId, signal) => gateway().getContact(contactId, signal),
+    findSimilarContacts: (contact, signal) => gateway().findSimilarContacts(contact, signal),
+    createContact: (expectedDirectoryRevision, contact, confirmedNameCandidateIds, signal) =>
+      gateway().createContact(expectedDirectoryRevision, contact, confirmedNameCandidateIds, signal),
+    updateContact: (contactId, expectedRevision, patch, signal) =>
+      gateway().updateContact(contactId, expectedRevision, patch, signal),
+    confirmContact: (contactId, expectedRevision, signal) => gateway().confirmContact(contactId, expectedRevision, signal),
+    deleteContact: (contactId, expectedRevision, signal) => gateway().deleteContact(contactId, expectedRevision, signal),
+    addContactIdentity: (contactId, expectedContactRevision, identity, signal) =>
+      gateway().addContactIdentity(contactId, expectedContactRevision, identity, signal),
+    removeContactIdentity: (contactId, expectedContactRevision, contactIdentityId, signal) =>
+      gateway().removeContactIdentity(contactId, expectedContactRevision, contactIdentityId, signal),
+    appendContactEvent: (contactId, expectedContactRevision, event, signal) =>
+      gateway().appendContactEvent(contactId, expectedContactRevision, event, signal),
+    removeContactEvent: (contactId, expectedContactRevision, contactEventId, signal) =>
+      gateway().removeContactEvent(contactId, expectedContactRevision, contactEventId, signal),
+    listContactGroups: (signal) => gateway().listContactGroups(signal),
+    createContactGroup: (expectedDirectoryRevision, name, description, signal) =>
+      gateway().createContactGroup(expectedDirectoryRevision, name, description, signal),
+    updateContactGroup: (contactGroupId, expectedRevision, name, description, signal) =>
+      gateway().updateContactGroup(contactGroupId, expectedRevision, name, description, signal),
+    deleteContactGroup: (contactGroupId, expectedRevision, signal) =>
+      gateway().deleteContactGroup(contactGroupId, expectedRevision, signal),
+    setContactGroupMembership: (contactId, expectedContactRevision, contactGroupId, member, signal) =>
+      gateway().setContactGroupMembership(contactId, expectedContactRevision, contactGroupId, member, signal),
+    addContactRelation: (fromContactId, expectedFromRevision, toContactId, relation, note, signal) =>
+      gateway().addContactRelation(fromContactId, expectedFromRevision, toContactId, relation, note, signal),
+    updateContactRelation: (ownerContactId, expectedOwnerRevision, contactRelationId, expectedRelationRevision, relation, note, signal) =>
+      gateway().updateContactRelation(ownerContactId, expectedOwnerRevision, contactRelationId, expectedRelationRevision, relation, note, signal),
+    removeContactRelation: (ownerContactId, expectedOwnerRevision, contactRelationId, signal) =>
+      gateway().removeContactRelation(ownerContactId, expectedOwnerRevision, contactRelationId, signal),
+    scanContactDuplicates: (limit, signal) => gateway().scanContactDuplicates(limit, signal),
+    mergeContacts: (targetContactId, expectedTargetRevision, mergedContactId, expectedMergedRevision, signal) =>
+      gateway().mergeContacts(targetContactId, expectedTargetRevision, mergedContactId, expectedMergedRevision, signal),
+    previewContactVCardImport: (vcardText, signal) => gateway().previewContactVCardImport(vcardText, signal),
+    commitContactVCardImport: (previewId, expectedDirectoryRevision, decisions, signal) =>
+      gateway().commitContactVCardImport(previewId, expectedDirectoryRevision, decisions, signal),
+    exportContactsVCard: (contactIds, signal) => gateway().exportContactsVCard(contactIds, signal),
+    getContactSyncStatus: (signal) => gateway().getContactSyncStatus(signal),
+    setContactSyncEnabled: (expectedConfigurationRevision, enabled, signal) =>
+      gateway().setContactSyncEnabled(expectedConfigurationRevision, enabled, signal),
+    grantContactSyncPeer: (nodeId, expectedFingerprint, signal) =>
+      gateway().grantContactSyncPeer(nodeId, expectedFingerprint, signal),
+    revokeContactSyncPeer: (peerId, expectedRevision, signal) =>
+      gateway().revokeContactSyncPeer(peerId, expectedRevision, signal),
+    syncContactsNow: (peerId, signal) => gateway().syncContactsNow(peerId, signal),
+    getMessagingSettings: (signal) => gateway().getMessagingSettings(signal),
+    createTelegramMessagingConnection: (ownerProviderUserId, configuration, signal) =>
+      gateway().createTelegramMessagingConnection(ownerProviderUserId, configuration, signal),
+    createDiscordMessagingConnection: (ownerProviderUserId, configuration, signal) =>
+      gateway().createDiscordMessagingConnection(ownerProviderUserId, configuration, signal),
+    createDingTalkMessagingConnection: (configuration, signal) =>
+      gateway().createDingTalkMessagingConnection(configuration, signal),
+    createFeishuMessagingConnection: (channel, configuration, signal) =>
+      gateway().createFeishuMessagingConnection(channel, configuration, signal),
+    createWeComMessagingConnection: (configuration, signal) =>
+      gateway().createWeComMessagingConnection(configuration, signal),
+    createWeChatMessagingConnection: (signal) => gateway().createWeChatMessagingConnection(signal),
+    createSlackMessagingConnection: (ownerProviderUserId, configuration, signal) =>
+      gateway().createSlackMessagingConnection(ownerProviderUserId, configuration, signal),
+    beginWeChatAuthorization: (connectionId, expectedRevision, expectedGeneration, signal) =>
+      gateway().beginWeChatAuthorization(connectionId, expectedRevision, expectedGeneration, signal),
+    getWeChatAuthorization: (attempt, signal) => gateway().getWeChatAuthorization(attempt, signal),
+    submitWeChatVerificationCode: (attempt, code, signal) =>
+      gateway().submitWeChatVerificationCode(attempt, code, signal),
+    cancelWeChatAuthorization: (attempt, signal) => gateway().cancelWeChatAuthorization(attempt, signal),
+    saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
+      gateway().saveMessagingCredential(
+        connectionId,
+        expectedRevision,
+        expectedGeneration,
+        secret,
+        enable,
+        signal
+      ),
+    clearMessagingCredential: (connectionId, expectedRevision, expectedGeneration, signal) =>
+      gateway().clearMessagingCredential(connectionId, expectedRevision, expectedGeneration, signal),
+    setMessagingConnectionEnabled: (connectionId, expectedRevision, expectedGeneration, enabled, signal) =>
+      gateway().setMessagingConnectionEnabled(
+        connectionId,
+        expectedRevision,
+        expectedGeneration,
+        enabled,
+        signal
+      ),
+    updateTelegramMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ) => gateway().updateTelegramMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ),
+    updateDiscordMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ) => gateway().updateDiscordMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ),
+    updateDingTalkMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ) => gateway().updateDingTalkMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ),
+    updateFeishuMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ) => gateway().updateFeishuMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ),
+    updateWeComMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ) => gateway().updateWeComMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ),
+    updateSlackMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ) => gateway().updateSlackMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ),
+    testMessagingConnection: (connectionId, signal) => gateway().testMessagingConnection(connectionId, signal),
+    putMessagingRoute: (draft, signal) => gateway().putMessagingRoute(draft, signal),
     ...remoteHostApi,
     ...mcpApi,
     updatePiSettings: (backendId, patch) => gateway().updatePiSettings(backendId, patch),
@@ -2976,6 +3202,7 @@ export function routeFromHash(hash: string): AppRoute {
     };
   }
   if (parts[0] === "projects") return { kind: "projects", ...(parts[1] === undefined ? {} : { projectId: parts[1] }) };
+  if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
     return {
@@ -3035,6 +3262,7 @@ export function appRouteHash(route: AppRoute): string {
     return `#/tasks/new${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "projects") return route.projectId === undefined ? "#/projects" : `#/projects/${encodeURIComponent(route.projectId)}`;
+  if (route.kind === "partners") return route.partnerId === undefined ? "#/partners" : `#/partners/${encodeURIComponent(route.partnerId)}`;
   if (route.kind === "schedules") {
     const query = new URLSearchParams();
     if (route.scheduleId !== undefined) query.set("focus", route.scheduleId);

@@ -1154,7 +1154,7 @@ describe("PiEventTranslator", () => {
     } as unknown as PiRpcEvent);
 
     const results = events.filter((event) => event.type === "tool_result");
-    expect(results[0]).toHaveProperty("artifact", undefined);
+    expect(results[0]).not.toHaveProperty("artifact");
     expect(results[1]).toMatchObject({ artifact: completeOutput });
     expect(storeArtifact).not.toHaveBeenCalled();
   });

@@ -1,0 +1,33 @@
+{
+  "name": "@joko/messaging",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./dingtalk": "./src/dingtalk/index.ts",
+    "./discord": "./src/discord/index.ts",
+    "./feishu": "./src/feishu/index.ts",
+    "./telegram": "./src/telegram/index.ts",
+    "./wecom": "./src/wecom/index.ts",
+    "./wechat": "./src/wechat/index.ts",
+    "./slack": "./src/slack/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.71.1",
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "silk-wasm": "3.7.1",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

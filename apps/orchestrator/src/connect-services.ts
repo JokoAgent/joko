@@ -394,6 +394,10 @@ import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
 import type { TerminalProvider } from "@joko/tool-terminal";
 import { createManagedModelRuntimeConnectService } from "./managed-model-runtime-connect-service.js";
+import { createMessagingConnectService } from "./messaging-connect-service.js";
+import { createContactConnectService } from "./contact-connect-service.js";
+import { createPartnerConnectService } from "./partner-connect-service.js";
+import { createCollaborationConnectService } from "./collaboration-connect-service.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
@@ -667,6 +671,10 @@ export interface ConnectServiceSet {
   readonly historyMaintenance: ServiceImpl<typeof contract.HistoryMaintenanceService>;
   readonly credential: ServiceImpl<typeof contract.CredentialService>;
   readonly settings: ServiceImpl<typeof contract.SettingsService>;
+  readonly messaging: ServiceImpl<typeof contract.MessagingService>;
+  readonly contact: ServiceImpl<typeof contract.ContactService>;
+  readonly partner: ServiceImpl<typeof contract.PartnerService>;
+  readonly collaborationGoal: ServiceImpl<typeof contract.CollaborationService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
   readonly extension: ServiceImpl<typeof contract.ExtensionService>;
@@ -997,6 +1005,10 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.HistoryMaintenanceService, withConnectErrors(services.historyMaintenance));
   router.service(contract.CredentialService, withConnectErrors(services.credential));
   router.service(contract.SettingsService, withConnectErrors(services.settings));
+  router.service(contract.MessagingService, withConnectErrors(services.messaging));
+  router.service(contract.ContactService, withConnectErrors(services.contact));
+  router.service(contract.PartnerService, withConnectErrors(services.partner));
+  router.service(contract.CollaborationService, withConnectErrors(services.collaborationGoal));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
   router.service(contract.ExtensionService, withConnectErrors(services.extension));
@@ -1199,6 +1211,31 @@ export function createConnectServices(application: OrchestratorApplication): Con
   }));
   const managedModelRuntime = createManagedModelRuntimeConnectService(
     dependencies.managedModelRuntime,
+    (context) => authenticate(context)
+  );
+  const messaging = createMessagingConnectService(
+    application.messaging,
+    (context) => ({ connectionId: authenticate(context).id }),
+    {
+      ...(dependencies.credentials === undefined ? {} : { credentials: dependencies.credentials }),
+      ...(application.messagingCreateWeChatAuthorization === undefined
+        ? {}
+        : { createWeChatAuthorization: application.messagingCreateWeChatAuthorization }),
+      onClientRevoked: (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
+      registerCleanup: (cleanup) => { application.registerServiceCleanup?.(cleanup); }
+    }
+  );
+  const contact = createContactConnectService(
+    application.contacts,
+    (context) => authenticate(context),
+    application.contactSync
+  );
+  const partner = createPartnerConnectService(
+    application.partners,
+    (context) => authenticate(context)
+  );
+  const collaborationGoal = createCollaborationConnectService(
+    application.collaborationGoals,
     (context) => authenticate(context)
   );
   const worktree = createWorktreeConnectService(
@@ -4804,7 +4841,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -11930,6 +11967,7 @@ function protoDynamicToolFieldType(value: DynamicInputFieldType): contract.ToolF
     case "object": return contract.ToolFieldType.OBJECT;
     case "array": return contract.ToolFieldType.ARRAY;
     case "blob": return contract.ToolFieldType.BLOB;
+    case "unknown": return contract.ToolFieldType.UNSPECIFIED;
   }
 }
 

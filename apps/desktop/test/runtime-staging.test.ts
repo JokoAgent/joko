@@ -405,12 +405,33 @@ async function claudeSessionRuntimeFixture() {
   }
   const zodRoot = dirname(adapterRequire.resolve("zod/package.json"));
   await copyRegularTree(realpathSync(zodRoot), resolve(runtimeRoot, "node_modules/zod"));
+  const mcpManifest = realpathSync(resolve(import.meta.dirname, "../../../packages/adapter-claude-code/node_modules/@modelcontextprotocol/sdk/package.json"));
+  mkdirSync(resolve(runtimeRoot, "node_modules/@modelcontextprotocol"), { recursive: true });
+  await copyRegularTree(dirname(mcpManifest), resolve(runtimeRoot, "node_modules/@modelcontextprotocol/sdk"));
+  const mcpRequire = createRequire(mcpManifest);
+  const ajvRoot = packageRoot(mcpRequire, "ajv");
+  const ajvRequire = createRequire(resolve(ajvRoot, "package.json"));
+  for (const name of ["ajv", "ajv-formats", "zod-to-json-schema", "fast-deep-equal", "fast-uri", "json-schema-traverse"]) {
+    const source = packageRoot(name === "fast-deep-equal" || name === "fast-uri" || name === "json-schema-traverse" ? ajvRequire : mcpRequire, name);
+    await copyRegularTree(source, resolve(runtimeRoot, "node_modules", name));
+  }
   const sdkRoot = dirname(adapterRequire.resolve("@anthropic-ai/claude-agent-sdk"));
   mkdirSync(resolve(runtimeRoot, "node_modules/@anthropic-ai"));
   await copyRegularTree(realpathSync(sdkRoot), resolve(runtimeRoot, "node_modules/@anthropic-ai/claude-agent-sdk"));
   const smokePath = resolve(runtimeRoot, "session-sdk-smoke.mjs");
   writeFileSync(smokePath, claudeSessionElectronSmokeSource(process.platform, process.arch));
   return { runtimeRoot, smokePath };
+}
+
+function packageRoot(loader: NodeRequire, name: string): string {
+  let directory = dirname(realpathSync(loader.resolve(name)));
+  for (;;) {
+    const manifest = resolve(directory, "package.json");
+    if (existsSync(manifest) && (JSON.parse(readFileSync(manifest, "utf8")) as { name?: string }).name === name) return directory;
+    const parent = dirname(directory);
+    if (parent === directory) throw new Error(`Cannot locate the installed ${name} package root.`);
+    directory = parent;
+  }
 }
 
 function runNativeProbe(fixture: { readonly runtimeRoot: string; readonly smokePath: string }): SpawnSyncReturns<string> {

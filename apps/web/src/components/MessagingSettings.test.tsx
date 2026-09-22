@@ -1,0 +1,1045 @@
+// @vitest-environment jsdom
+
+import { Code, ConnectError } from "@connectrpc/connect";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { AppController } from "../controller.js";
+import { translate } from "../i18n.js";
+import {
+  emptySnapshot,
+  type AppSnapshot,
+  type MessagingConnectionView,
+  type MessagingRouteView,
+  type MessagingSettingsView,
+  type WeChatAuthorizationAttemptView
+} from "../model.js";
+import { MessagingSettings } from "./MessagingSettings.js";
+
+const roots: Root[] = [];
+
+beforeEach(() => {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+});
+
+afterEach(async () => {
+  for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
+  document.body.replaceChildren();
+  vi.restoreAllMocks();
+  Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+});
+
+describe("Messaging settings", () => {
+  it("renders the complete capability and runtime state, reports test failures, and saves a new-only route", async () => {
+    const connection = telegramConnection({
+      runtimeStatus: "conflict",
+      errorCode: "telegram.poll_conflict",
+      errorSummary: "Another poller owns this bot token."
+    });
+    const settings = messagingSettings([connection]);
+    const route = messagingRoute();
+    const controller = controllerFixture(settings, {
+      testMessagingConnection: vi.fn(async () => ({ ok: false as const, failure: "connectionFailed" as const })),
+      putMessagingRoute: vi.fn(async () => route)
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    expect(container.querySelectorAll(".messaging-channel")).toHaveLength(8);
+    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(6);
+    expect(container.textContent).toContain("Conflict");
+    expect(container.textContent).toContain("Another poller owns this bot token.");
+
+    await act(async () => button(container, "Test").click());
+    expect(controller.testMessagingConnection).toHaveBeenCalledWith("telegram-one");
+    const testResult = required(container.querySelector<HTMLElement>(".messaging-test-result"));
+    expect(testResult.classList.contains("is-error")).toBe(true);
+    expect(testResult.textContent).toContain("could not be reached");
+
+    const routeTrigger = button(container, "Set route");
+    await act(async () => routeTrigger.click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("Route changes affect new conversations only");
+    await act(async () => button(dialog, "Save").click());
+    expect(controller.putMessagingRoute).toHaveBeenCalledWith({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("creates Telegram, advances directly to the one-shot token form, and clears secret UI after save", async () => {
+    const created = telegramConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = telegramConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 8n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createTelegramMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+    const trigger = buttons(container, "Add Telegram")[0]!;
+
+    await act(async () => trigger.click());
+    const owner = required(document.querySelector<HTMLInputElement>('input[inputmode="numeric"]'));
+    expect(document.activeElement).toBe(owner);
+    await change(owner, "123456789");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith("123456789", {
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "first",
+      groupActivation: {}
+    });
+
+    const token = required(document.querySelector<HTMLInputElement>('input[type="password"]'));
+    expect(document.activeElement).toBe(token);
+    await change(token, "telegram-secret");
+    await act(async () => button(document.body, "Save").click());
+    expect(save).toHaveBeenCalledWith("telegram-one", 7n, 3n, "telegram-secret", true);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("telegram-secret");
+    expect(container.textContent).toContain("Connecting");
+
+    const replace = button(container, "Replace token");
+    await act(async () => { replace.focus(); replace.click(); });
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(replace);
+  });
+
+  it("creates Discord with a strict owner ID and keeps its bot token out of rendered state", async () => {
+    const created = discordConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = discordConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 9n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createDiscordMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add Discord")[0]!.click());
+    const owner = required(document.querySelector<HTMLInputElement>('input[inputmode="numeric"]'));
+    await change(owner, "123");
+    expect(button(document.body, "Continue").disabled).toBe(true);
+    await change(owner, "987654321098765432");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith("987654321098765432", {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "first",
+      groupActivation: {}
+    });
+
+    const token = required(document.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(token, "discord-secret");
+    await act(async () => button(document.body, "Save").click());
+    expect(save).toHaveBeenCalledWith("discord-one", 8n, 4n, "discord-secret", true);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("discord-secret");
+    expect(container.textContent).toContain("Connecting");
+  });
+
+  it("creates Slack with an explicit owner and uploads both tokens atomically without retaining either field", async () => {
+    const created = slackConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = slackConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 14n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([], false, true))
+      .mockResolvedValueOnce(messagingSettings([created], false, true))
+      .mockResolvedValue(messagingSettings([saved], false, true));
+    const controller = controllerFixture(messagingSettings([], false, true), {
+      getMessagingSettings,
+      createSlackMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add Slack")[0]!.click());
+    const createDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const owner = required(createDialog.querySelector<HTMLInputElement>("input"));
+    expect(document.activeElement).toBe(owner);
+    await change(owner, "U1");
+    expect(button(createDialog, "Continue").disabled).toBe(true);
+    await change(owner, "U12345678");
+    await act(async () => button(createDialog, "Continue").click());
+    expect(create).toHaveBeenCalledWith("U12345678", {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      groupActivation: {}
+    });
+
+    const tokenDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const fields = [...tokenDialog.querySelectorAll<HTMLInputElement>('input[type="password"]')];
+    expect(fields).toHaveLength(2);
+    expect(document.activeElement).toBe(fields[0]);
+    await change(fields[0]!, "wrong-app-token");
+    await change(fields[1]!, "xoxb-secret-bot");
+    expect(button(tokenDialog, "Save").disabled).toBe(true);
+    await change(fields[0]!, "xapp-secret-app");
+    await act(async () => button(tokenDialog, "Save").click());
+    expect(save).toHaveBeenCalledWith("slack-one", 13n, 9n,
+      JSON.stringify({ format: 1, appToken: "xapp-secret-app", botToken: "xoxb-secret-bot" }), true);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("xapp-secret-app");
+    expect(document.body.textContent).not.toContain("xoxb-secret-bot");
+    expect(container.textContent).toContain("Connecting");
+
+    const replace = button(container, "Replace Slack tokens");
+    await act(async () => { replace.focus(); replace.click(); });
+    const replacementFields = [...document.querySelectorAll<HTMLInputElement>('input[type="password"]')];
+    expect(replacementFields).toHaveLength(2);
+    await change(replacementFields[0]!, "xapp-replacement");
+    await change(replacementFields[1]!, "xoxb-replacement");
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.activeElement).toBe(replace);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it("edits Slack behavior, rejects duplicate channels, and retries revision-only drift", async () => {
+    const original = slackConnection();
+    const refreshed = slackConnection({ revision: 14n });
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original], false, true))
+      .mockResolvedValueOnce(messagingSettings([original], false, true))
+      .mockResolvedValue(messagingSettings([refreshed], false, true));
+    const update = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("runtime projection changed", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, ownerProviderUserId, configuration) =>
+        slackConnection({ ownerProviderUserId, slackConfiguration: configuration }));
+    const controller = controllerFixture(messagingSettings([original], false, true), {
+      getMessagingSettings,
+      updateSlackMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const owner = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    await change(owner, "W12345678");
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    await act(async () => lifecycle.click());
+    const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
+    expect(selects).toHaveLength(1);
+    await change(required(selects[0]), "expressive");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "C12345678=always\nC12345678=disabled");
+    expect(button(dialog, "Save").disabled).toBe(true);
+    await change(groups, "C12345678=always\nG12345678=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenNthCalledWith(1, "slack-one", 13n, 9n, "W12345678", {
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive",
+      groupActivation: { C12345678: "always", G12345678: "disabled" }
+    });
+    expect(update).toHaveBeenNthCalledWith(2, "slack-one", 14n, 9n, "W12345678", expect.any(Object));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("exposes Slack test, enable, and confirmed two-token clear without mutating on cancel", async () => {
+    const original = slackConnection();
+    const disabled = slackConnection({ enabled: false, revision: 14n });
+    const cleared = slackConnection({ enabled: false, credentialConfigured: false, runtimeStatus: "idle", revision: 15n });
+    const test = vi.fn(async () => ({ ok: true as const, providerAccountId: "T12345678", displayName: "Slack bot" }));
+    const setEnabled = vi.fn(async () => disabled);
+    const clear = vi.fn(async () => cleared);
+    const controller = controllerFixture(messagingSettings([original], false, true), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([original], false, true))
+        .mockResolvedValueOnce(messagingSettings([original], false, true))
+        .mockResolvedValue(messagingSettings([disabled], false, true)),
+      testMessagingConnection: test,
+      setMessagingConnectionEnabled: setEnabled,
+      clearMessagingCredential: clear
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Test").click());
+    expect(test).toHaveBeenCalledWith("slack-one");
+    expect(container.textContent).toContain("Connected as Slack bot");
+    const toggle = required(container.querySelector<HTMLInputElement>('.messaging-switch-label input[type="checkbox"]'));
+    await act(async () => toggle.click());
+    expect(setEnabled).toHaveBeenCalledWith("slack-one", 13n, 9n, false);
+
+    await act(async () => button(container, "Clear Slack tokens").click());
+    let dialog = required(document.querySelector<HTMLElement>('[role="alertdialog"]'));
+    expect(dialog.textContent).toContain("removes both tokens");
+    await act(async () => button(dialog, "Cancel").click());
+    expect(clear).not.toHaveBeenCalled();
+    await act(async () => button(container, "Clear Slack tokens").click());
+    dialog = required(document.querySelector<HTMLElement>('[role="alertdialog"]'));
+    await act(async () => button(dialog, "Clear Slack tokens").click());
+    expect(clear).toHaveBeenCalledWith("slack-one", 14n, 9n);
+    expect(container.textContent).toContain("Needs both tokens");
+  });
+
+  it("creates DingTalk with AppKey and AppSecret while leaving ownership for the first direct message", async () => {
+    const created = dingTalkConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = dingTalkConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 10n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createDingTalkMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add DingTalk")[0]!.click());
+    const appKey = required(document.querySelector<HTMLInputElement>('input[placeholder="dingxxxxxxxx"]'));
+    expect(document.activeElement).toBe(appKey);
+    await change(appKey, "ding-new-key");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith({ appKey: "ding-new-key", groupActivation: {} });
+
+    const credentialDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(credentialDialog.textContent).toContain("DingTalk AppSecret");
+    expect(credentialDialog.textContent).not.toContain("Bot token");
+    const secret = required(credentialDialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(secret, "ding-secret");
+    await act(async () => button(credentialDialog, "Save").click());
+    expect(save).toHaveBeenCalledWith("dingtalk-one", 9n, 5n, "ding-secret", true);
+    expect(document.body.textContent).not.toContain("ding-secret");
+    expect(container.textContent).toContain("Waiting for first direct message");
+    expect(container.textContent).toContain("Replace AppSecret");
+  });
+
+  it("creates Feishu with App ID and a one-shot App Secret while leaving ownership unclaimed", async () => {
+    const created = feishuConnection({
+      enabled: false,
+      runtimeStatus: "idle",
+      credentialConfigured: false,
+      ownerProviderUserId: undefined
+    });
+    const saved = feishuConnection({
+      enabled: true,
+      runtimeStatus: "connecting",
+      credentialConfigured: true,
+      ownerProviderUserId: undefined,
+      revision: 11n
+    });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createFeishuMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add Feishu")[0]!.click());
+    const appId = required(document.querySelector<HTMLInputElement>('input[placeholder="cli_xxxxxxxx"]'));
+    expect(document.activeElement).toBe(appId);
+    await change(appId, "cli_new_feishu");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith("feishu", {
+      appId: "cli_new_feishu",
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "all",
+      groupActivation: {},
+      groupPermissionMode: "ask"
+    });
+
+    const credentialDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(credentialDialog.textContent).toContain("App Secret");
+    expect(credentialDialog.textContent).toContain("WebSocket transport generation");
+    expect(credentialDialog.textContent).not.toContain("Bot token");
+    const secret = required(credentialDialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(secret, "feishu-secret");
+    await act(async () => button(credentialDialog, "Save").click());
+    expect(save).toHaveBeenCalledWith("feishu-one", 10n, 6n, "feishu-secret", true);
+    expect(document.body.textContent).not.toContain("feishu-secret");
+    expect(container.textContent).toContain("Waiting for first direct message");
+    expect(container.textContent).toContain("Replace App Secret");
+  });
+
+  it("creates WeCom with Bot ID and clears each one-shot Bot Secret immediately", async () => {
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(390);
+    const created = wecomConnection({
+      enabled: false,
+      runtimeStatus: "idle",
+      credentialConfigured: false,
+      ownerProviderUserId: undefined
+    });
+    const saved = wecomConnection({
+      enabled: true,
+      runtimeStatus: "connecting",
+      credentialConfigured: true,
+      ownerProviderUserId: undefined,
+      revision: 12n
+    });
+    const replaced = wecomConnection({ ...saved, revision: 13n });
+    let finishFirstSave: ((connection: MessagingConnectionView) => void) | undefined;
+    const create = vi.fn(async () => created);
+    const save = vi.fn()
+      .mockImplementationOnce(() => new Promise<MessagingConnectionView>((resolve) => { finishFirstSave = resolve; }))
+      .mockResolvedValueOnce(replaced);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValueOnce(messagingSettings([created]))
+        .mockResolvedValue(messagingSettings([saved])),
+      createWeComMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add WeCom")[0]!.click());
+    const botId = required(document.querySelector<HTMLInputElement>('input[placeholder="bot_xxxxxxxx"]'));
+    expect(document.activeElement).toBe(botId);
+    await change(botId, "bot_new");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith({ botId: "bot_new" });
+
+    const credentialDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(credentialDialog.textContent).toContain("WeCom Bot Secret");
+    const secret = required(credentialDialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(secret, "wecom-secret");
+    await act(async () => {
+      button(credentialDialog, "Save").click();
+      await Promise.resolve();
+    });
+    expect(save).toHaveBeenCalledWith("wecom-one", 11n, 7n, "wecom-secret", true);
+    expect(secret.value).toBe("");
+    expect(document.body.textContent).not.toContain("wecom-secret");
+    await act(async () => finishFirstSave?.(saved));
+
+    expect(container.textContent).toContain("Waiting for first direct message");
+    await act(async () => button(container, "Replace Bot Secret").click());
+    const replacement = required(document.querySelector<HTMLInputElement>('input[type="password"]'));
+    expect(replacement.value).toBe("");
+    await change(replacement, "wecom-replacement");
+    await act(async () => button(document.body, "Save").click());
+    expect(save).toHaveBeenLastCalledWith("wecom-one", 12n, 7n, "wecom-replacement", true);
+    expect(document.body.textContent).not.toContain("wecom-replacement");
+
+    const replace = button(container, "Replace Bot Secret");
+    await act(async () => { replace.focus(); replace.click(); });
+    expect(document.activeElement).toBe(document.querySelector('input[type="password"]'));
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(replace);
+  });
+
+  it("updates WeCom Bot ID and exposes test, enable, disable, and clear actions", async () => {
+    const original = wecomConnection();
+    const configured = wecomConnection({
+      generation: 8n,
+      revision: 12n,
+      ownerProviderUserId: undefined,
+      wecomConfiguration: { botId: "bot_replacement" }
+    });
+    const disabled = wecomConnection({ ...configured, enabled: false });
+    const cleared = wecomConnection({ ...disabled, credentialConfigured: false, runtimeStatus: "idle", revision: 13n });
+    const update = vi.fn(async () => configured);
+    const test = vi.fn(async () => ({ ok: true as const, providerAccountId: "bot_wecom", displayName: "WeCom bot" }));
+    const setEnabled = vi.fn(async () => disabled);
+    const clear = vi.fn(async () => cleared);
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([original]))
+        .mockResolvedValueOnce(messagingSettings([original]))
+        .mockResolvedValueOnce(messagingSettings([configured]))
+        .mockResolvedValue(messagingSettings([disabled])),
+      updateWeComMessagingConfiguration: update,
+      testMessagingConnection: test,
+      setMessagingConnectionEnabled: setEnabled,
+      clearMessagingCredential: clear
+    });
+    const container = await renderSettings(controller, snapshot());
+    expect(container.textContent).toContain("bot_wecom");
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("WeCom identity");
+    const botId = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    expect(document.activeElement).toBe(botId);
+    await change(botId, "bot_replacement");
+    await act(async () => button(dialog, "Save").click());
+    expect(update).toHaveBeenCalledWith("wecom-one", 11n, 7n, { botId: "bot_replacement" });
+    expect(container.textContent).toContain("Waiting for first direct message");
+
+    await act(async () => button(container, "Test").click());
+    expect(test).toHaveBeenCalledWith("wecom-one");
+    expect(container.textContent).toContain("Connected as WeCom bot");
+
+    const toggle = required(container.querySelector<HTMLInputElement>('.messaging-switch-label input[type="checkbox"]'));
+    await act(async () => toggle.click());
+    expect(setEnabled).toHaveBeenCalledWith("wecom-one", 12n, 8n, false);
+
+    await act(async () => button(container, "Clear Bot Secret").click());
+    const clearDialog = required(document.querySelector<HTMLElement>('[role="alertdialog"]'));
+    await act(async () => button(clearDialog, "Clear Bot Secret").click());
+    expect(clear).toHaveBeenCalledWith("wecom-one", 12n, 8n);
+    expect(container.textContent).toContain("Needs Bot Secret");
+  });
+
+  it("fails closed when WeCom configuration drifts while its editor is open", async () => {
+    const original = wecomConnection();
+    const drifted = wecomConnection({ revision: 12n, wecomConfiguration: { botId: "bot_external" } });
+    const update = vi.fn(async () => drifted);
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([original]))
+        .mockResolvedValue(messagingSettings([drifted])),
+      updateWeComMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    await change(required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]')), "bot_local");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("The Messaging connection changed");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+  });
+
+  it("saves Discord lifecycle, reply, reaction, and approved server-channel policy together", async () => {
+    const original = discordConnection();
+    const refreshed = discordConnection({ revision: 9n });
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValue(messagingSettings([refreshed]));
+    const update = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("runtime projection changed", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, ownerProviderUserId, configuration) =>
+        discordConnection({ ownerProviderUserId, discordConfiguration: configuration }));
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings,
+      updateDiscordMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const owner = required(dialog.querySelector<HTMLInputElement>('input[inputmode="numeric"]'));
+    await change(owner, "876543210987654321");
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    await act(async () => lifecycle.click());
+    const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
+    await change(required(selects[0]), "expressive");
+    await change(required(selects[1]), "first");
+    await change(required(selects[2]), "all");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "123456789012345678/234567890123456789=always\n123456789012345678/345678901234567890=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenNthCalledWith(1, "discord-one", 8n, 4n, "876543210987654321", {
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive",
+      replyQuoteDm: "first",
+      replyQuoteGroup: "all",
+      groupActivation: {
+        "123456789012345678/234567890123456789": "always",
+        "123456789012345678/345678901234567890": "disabled"
+      }
+    });
+    expect(update).toHaveBeenNthCalledWith(2, "discord-one", 9n, 4n, "876543210987654321", expect.any(Object));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("saves DingTalk application and explicit group policy across a revision-only owner claim", async () => {
+    const original = dingTalkConnection();
+    const claimed = dingTalkConnection({ revision: 10n, ownerProviderUserId: "ding-owner" });
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValue(messagingSettings([claimed]));
+    const update = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("owner claimed while editing", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, configuration) => dingTalkConnection({
+        generation: 6n,
+        revision: 11n,
+        ownerProviderUserId: undefined,
+        dingtalkConfiguration: configuration
+      }));
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings,
+      updateDingTalkMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const appKey = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    await change(appKey, "ding-replacement-key");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "cid-primary=always\ncid-muted=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenNthCalledWith(1, "dingtalk-one", 9n, 5n, {
+      appKey: "ding-replacement-key",
+      groupActivation: { "cid-primary": "always", "cid-muted": "disabled" }
+    });
+    expect(update).toHaveBeenNthCalledWith(2, "dingtalk-one", 10n, 5n, expect.any(Object));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.textContent).toContain("Waiting for first direct message");
+  });
+
+  it("saves Lark lifecycle, reply, reaction, group permission, and approved chat policy together", async () => {
+    const original = feishuConnection({
+      id: "lark-one",
+      channel: "lark",
+      ownerProviderUserId: "ou_lark_owner",
+      feishuConfiguration: {
+        appId: "cli_lark",
+        lifecycleAnnouncements: true,
+        emojiReactions: "minimal",
+        replyQuoteDm: "off",
+        replyQuoteGroup: "all",
+        groupActivation: { oc_primary: "mention" },
+        groupPermissionMode: "ask"
+      }
+    });
+    const update = vi.fn(async (_connectionId, _revision, _generation, configuration) => feishuConnection({
+      id: "lark-one",
+      channel: "lark",
+      generation: 7n,
+      revision: 11n,
+      ownerProviderUserId: undefined,
+      feishuConfiguration: configuration
+    }));
+    const controller = controllerFixture(messagingSettings([original]), {
+      updateFeishuMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("Lark behavior");
+    expect(dialog.textContent).toContain("Group history is untrusted");
+    const appId = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    await change(appId, "cli_lark_replacement");
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    await act(async () => lifecycle.click());
+    const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
+    await change(required(selects[0]), "expressive");
+    await change(required(selects[1]), "first");
+    await change(required(selects[2]), "first");
+    await change(required(selects[3]), "bypassPermissions");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "oc_primary=always\noc_muted=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenCalledWith("lark-one", 10n, 6n, {
+      appId: "cli_lark_replacement",
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive",
+      replyQuoteDm: "first",
+      replyQuoteGroup: "first",
+      groupActivation: { oc_primary: "always", oc_muted: "disabled" },
+      groupPermissionMode: "bypassPermissions"
+    });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.textContent).toContain("Waiting for first direct message");
+  });
+
+  it("creates WeChat without a token form, presents the QR, and cancels its exact attempt", async () => {
+    const created = wechatConnection();
+    const waiting = wechatAttempt();
+    const create = vi.fn(async () => created);
+    const begin = vi.fn(async () => waiting);
+    const cancel = vi.fn(async () => ({ ...waiting, status: "cancelled" as const }));
+    const controller = controllerFixture(messagingSettings([], true), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([], true))
+        .mockResolvedValue(messagingSettings([created], true)),
+      createWeChatMessagingConnection: create,
+      beginWeChatAuthorization: begin,
+      cancelWeChatAuthorization: cancel
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Add WeChat").click());
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(begin).toHaveBeenCalledWith("wechat-one", 12n, 8n, expect.any(AbortSignal));
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("Waiting for a scan");
+    expect(dialog.querySelector('img[alt="WeChat authorization QR code"]')?.getAttribute("src"))
+      .toBe("https://ilinkai.weixin.qq.com/qr/test");
+    expect(dialog.querySelector('input[type="password"]')).toBeNull();
+    expect(container.textContent).toContain("Scan a QR code to connect WeChat");
+
+    await act(async () => button(dialog, "Cancel").click());
+    expect(cancel).toHaveBeenCalledWith(waiting);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("keeps a prior WeChat connection active through reauthorization and clears verification UI before success", async () => {
+    const previous = wechatConnection({
+      credentialConfigured: true,
+      enabled: true,
+      runtimeStatus: "connected",
+      ownerProviderUserId: "wx-user",
+      providerAccountId: "wx-bot"
+    });
+    const verification = wechatAttempt({ status: "verificationRequired", verificationRetry: true });
+    const succeeded = wechatAttempt({
+      status: "succeeded",
+      connection: wechatConnection({
+        generation: 9n,
+        revision: 13n,
+        credentialConfigured: true,
+        enabled: true,
+        runtimeStatus: "connecting",
+        ownerProviderUserId: "wx-new-user",
+        providerAccountId: "wx-new-bot"
+      })
+    });
+    const submit = vi.fn(async () => succeeded);
+    const controller = controllerFixture(messagingSettings([previous], true), {
+      beginWeChatAuthorization: vi.fn(async () => verification),
+      submitWeChatVerificationCode: submit
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Reauthorize WeChat").click());
+    expect(container.textContent).toContain("Connected WeChat bot wx-bot");
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("existing connection stays active");
+    const code = required(dialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    expect(document.activeElement).toBe(code);
+    await change(code, "654321");
+    await act(async () => button(dialog, "Submit code").click());
+    expect(submit).toHaveBeenCalledWith(verification, "654321", expect.any(AbortSignal));
+    expect(document.body.textContent).not.toContain("654321");
+    expect(container.textContent).toContain("Connected WeChat bot wx-new-bot");
+    expect(dialog.textContent).toContain("WeChat connected");
+    await act(async () => button(dialog, "Close").click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+});
+
+async function renderSettings(controller: AppController, currentSnapshot: AppSnapshot): Promise<HTMLElement> {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<MessagingSettings
+    controller={controller}
+    snapshot={currentSnapshot}
+    t={(key, values) => translate("en", key, values)}
+  />));
+  return container;
+}
+
+function controllerFixture(settings: MessagingSettingsView, overrides: Partial<AppController> = {}): AppController {
+  const unchanged = async () => telegramConnection();
+  return {
+    state: {
+      activeProfile: { id: "profile", deviceId: "device", serverId: "server", name: "Node", origin: "https://service.example" },
+      preferences: { locale: "en" }
+    },
+    getMessagingSettings: vi.fn(async () => settings),
+    createTelegramMessagingConnection: vi.fn(async () => telegramConnection()),
+    createDiscordMessagingConnection: vi.fn(async () => discordConnection()),
+    createDingTalkMessagingConnection: vi.fn(async () => dingTalkConnection()),
+    createFeishuMessagingConnection: vi.fn(async () => feishuConnection()),
+    createWeComMessagingConnection: vi.fn(async () => wecomConnection()),
+    createWeChatMessagingConnection: vi.fn(async () => wechatConnection()),
+    createSlackMessagingConnection: vi.fn(async () => slackConnection()),
+    beginWeChatAuthorization: vi.fn(async () => wechatAttempt()),
+    getWeChatAuthorization: vi.fn(async () => wechatAttempt()),
+    submitWeChatVerificationCode: vi.fn(async () => wechatAttempt()),
+    cancelWeChatAuthorization: vi.fn(async () => wechatAttempt({ status: "cancelled" })),
+    saveMessagingCredential: vi.fn(unchanged),
+    clearMessagingCredential: vi.fn(unchanged),
+    setMessagingConnectionEnabled: vi.fn(unchanged),
+    updateTelegramMessagingConfiguration: vi.fn(unchanged),
+    updateDiscordMessagingConfiguration: vi.fn(async () => discordConnection()),
+    updateDingTalkMessagingConfiguration: vi.fn(async () => dingTalkConnection()),
+    updateFeishuMessagingConfiguration: vi.fn(async () => feishuConnection()),
+    updateWeComMessagingConfiguration: vi.fn(async () => wecomConnection()),
+    updateSlackMessagingConfiguration: vi.fn(async () => slackConnection()),
+    testMessagingConnection: vi.fn(async () => ({ ok: true as const, providerAccountId: "9001", displayName: "Joko Bot" })),
+    putMessagingRoute: vi.fn(async () => messagingRoute()),
+    ...overrides
+  } as unknown as AppController;
+}
+
+function messagingSettings(connections: readonly MessagingConnectionView[], wechatAvailable = false, slackAvailable = false): MessagingSettingsView {
+  return {
+    connections,
+    routes: [],
+    channels: [
+      { channel: "telegram", available: true },
+      { channel: "discord", available: true },
+      { channel: "dingtalk", available: true },
+      { channel: "feishu", available: true },
+      { channel: "lark", available: true },
+      { channel: "wecom", available: true },
+      { channel: "wechat", available: wechatAvailable, ...(wechatAvailable ? {} : { reason: "not implemented" }) },
+      { channel: "slack", available: slackAvailable, ...(slackAvailable ? {} : { reason: "not implemented" }) }
+    ]
+  };
+}
+
+function telegramConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "telegram-one",
+    channel: "telegram",
+    generation: 3n,
+    revision: 7n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "42",
+    providerAccountId: "9001",
+    providerUsername: "joko_test_bot",
+    telegramConfiguration: {
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "first",
+      groupActivation: { "-100": "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function discordConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "discord-one",
+    channel: "discord",
+    generation: 4n,
+    revision: 8n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "987654321098765432",
+    providerAccountId: "111111111111111111",
+    providerUsername: "joko-discord",
+    discordConfiguration: {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "first",
+      groupActivation: { "123456789012345678/234567890123456789": "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function dingTalkConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "dingtalk-one",
+    channel: "dingtalk",
+    generation: 5n,
+    revision: 9n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    providerAccountId: "ding-app-key",
+    dingtalkConfiguration: {
+      appKey: "ding-app-key",
+      groupActivation: { "cid-primary": "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function feishuConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "feishu-one",
+    channel: "feishu",
+    generation: 6n,
+    revision: 10n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "ou_feishu_owner",
+    providerAccountId: "cli_feishu",
+    providerUsername: "Feishu bot",
+    feishuConfiguration: {
+      appId: "cli_feishu",
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "all",
+      groupActivation: { oc_primary: "mention" },
+      groupPermissionMode: "ask"
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function wecomConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "wecom-one",
+    channel: "wecom",
+    generation: 7n,
+    revision: 11n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "wecom-owner",
+    providerAccountId: "bot_wecom",
+    wecomConfiguration: { botId: "bot_wecom" },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function wechatConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "wechat-one",
+    channel: "wechat",
+    generation: 8n,
+    revision: 12n,
+    enabled: false,
+    runtimeStatus: "idle",
+    credentialConfigured: false,
+    wechatConfiguration: { format: 1 },
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function slackConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "slack-one",
+    channel: "slack",
+    generation: 9n,
+    revision: 13n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "U12345678",
+    providerAccountId: "T12345678",
+    providerUsername: "joko-slack",
+    slackConfiguration: {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      groupActivation: { C12345678: "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function wechatAttempt(overrides: Partial<WeChatAuthorizationAttemptView> = {}): WeChatAuthorizationAttemptView {
+  return {
+    attemptId: "wechat-attempt",
+    connectionId: "wechat-one",
+    generation: 8n,
+    revision: 12n,
+    status: "waiting",
+    qrCodeUrl: "https://ilinkai.weixin.qq.com/qr/test",
+    createdAt: 100_000,
+    expiresAt: 400_000,
+    verificationRetry: false,
+    ...overrides
+  };
+}
+
+function messagingRoute(): MessagingRouteView {
+  return {
+    scopeKey: "global",
+    targetId: "target-one",
+    backendId: "backend-one",
+    fastMode: false,
+    permissionMode: "ask",
+    planMode: false,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    revision: 1n
+  };
+}
+
+function snapshot(): AppSnapshot {
+  return {
+    ...emptySnapshot(),
+    targets: [{
+      id: "target-one",
+      revision: 1n,
+      backendId: "backend-one",
+      name: "Main workspace",
+      workspaceId: "workspace-one",
+      workspaceName: "Main workspace",
+      trusted: true,
+      pinned: false,
+      archived: false
+    }],
+    models: [{
+      backendId: "backend-one",
+      providerId: "provider-one",
+      providerName: "Provider",
+      modelId: "model-one",
+      name: "Model One",
+      available: true,
+      supportsImages: true,
+      inputModalities: ["text"],
+      outputModalities: ["text"],
+      supportsFast: true,
+      efforts: ["low", "high"],
+      contextWindow: 128_000,
+      maximumOutputTokens: 8_192,
+      inputCostMicrosPerMillion: 0,
+      outputCostMicrosPerMillion: 0,
+      currencyCode: "USD"
+    }]
+  };
+}
+
+function buttons(container: ParentNode, text: string): HTMLButtonElement[] {
+  return [...container.querySelectorAll<HTMLButtonElement>("button")].filter((candidate) => candidate.textContent?.trim() === text);
+}
+
+function button(container: ParentNode, text: string): HTMLButtonElement {
+  return required(buttons(container, text)[0]);
+}
+
+async function change(input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string): Promise<void> {
+  const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+    : input instanceof HTMLSelectElement ? HTMLSelectElement.prototype
+      : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(input, value);
+    input.dispatchEvent(new Event(input instanceof HTMLSelectElement ? "change" : "input", { bubbles: true }));
+  });
+}
+
+function required<T>(value: T | null | undefined): T {
+  if (value === null || value === undefined) throw new Error("Expected Messaging control.");
+  return value;
+}

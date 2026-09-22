@@ -648,8 +648,23 @@ export class PiEventTranslator {
       : projection.parts;
     await this.#emit(
       field === "partialResult"
-        ? { type: "tool_update", callId, name, output: inlineOutput, parts: eventParts, artifact }
-        : { type: "tool_result", callId, name, output: inlineOutput, parts: eventParts, isError, artifact },
+        ? {
+            type: "tool_update",
+            callId,
+            name,
+            output: inlineOutput,
+            parts: eventParts,
+            ...(artifact === undefined ? {} : { artifact })
+          }
+        : {
+            type: "tool_result",
+            callId,
+            name,
+            output: inlineOutput,
+            parts: eventParts,
+            isError,
+            ...(artifact === undefined ? {} : { artifact })
+          },
       metadata
     );
   }

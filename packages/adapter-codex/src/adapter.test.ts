@@ -3933,6 +3933,34 @@ describe("CodexBackendAdapter", () => {
     });
   });
 
+  it("applies the current private developer instructions when a thread resumes", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const initialContext = {
+      ...context(setup.target, events, { backendInstanceGeneration: 7 }),
+      appendSystemPrompt: "Version one identity."
+    };
+    const binding = await setup.adapter.createSession({
+      ...sessionInput(setup.target),
+      appendSystemPrompt: "Version one identity."
+    }, initialContext);
+    expect(setup.fake.transport?.requests.findLast((request) => request.method === "thread/start")?.params)
+      .toMatchObject({ developerInstructions: "Version one identity." });
+
+    await setup.adapter.closeSession(binding, { ...initialContext, binding });
+    const nextBinding = { ...binding, generation: 2 };
+    await setup.adapter.resumeSession(binding, {
+      ...context(setup.target, events, {
+        binding: nextBinding,
+        backendInstanceGeneration: 7,
+        generation: 2
+      }),
+      appendSystemPrompt: "Version two identity."
+    });
+    expect(setup.fake.transport?.requests.findLast((request) => request.method === "thread/resume")?.params)
+      .toMatchObject({ developerInstructions: "Version two identity." });
+  });
+
   it("attaches to native truth without applying fresh-task defaults", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];

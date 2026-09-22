@@ -12,6 +12,25 @@ export const COLLABORATION_POLICY_LOCALIZATIONS = {
   }
 };
 
+export const CONTACT_TOOL_POLICY_LOCALIZATIONS = {
+  "zh-CN": {
+    displayName: "通讯录",
+    description: "允许受信任任务搜索并维护本地通讯录。"
+  },
+  "zh-TW": {
+    displayName: "通訊錄",
+    description: "允許受信任工作搜尋並維護本機通訊錄。"
+  },
+  ja: {
+    displayName: "連絡先",
+    description: "信頼済みタスクによるローカル連絡先の検索と管理を許可します。"
+  },
+  ko: {
+    displayName: "연락처",
+    description: "신뢰할 수 있는 작업이 로컬 연락처를 검색하고 관리하도록 허용합니다."
+  }
+};
+
 export const MEMORY_SAVE_REQUEST_PREFIXES = ["Save in memory:", "记到 memory:"] as const;
 
 export function reviewTitlePrefix(locale: string): string {
