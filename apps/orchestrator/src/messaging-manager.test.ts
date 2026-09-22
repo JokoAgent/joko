@@ -1,9 +1,14 @@
+import { Buffer } from "node:buffer";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   MessagingTransportError,
+  type DingTalkCallbackUpdate,
+  type DingTalkNormalizationResult,
+  type DingTalkPollResult,
+  type DingTalkTransportOptions,
   type DiscordGatewayUpdate,
   type DiscordNormalizationResult,
   type DiscordPollResult,
@@ -29,6 +34,7 @@ import {
   DEFAULT_DISCORD_MESSAGING_CONFIGURATION,
   DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION,
   MessagingManager,
+  type DingTalkMessagingConfiguration,
   type MessagingManagerOptions
 } from "./messaging-manager.js";
 import { SessionHost } from "./session-host.js";
@@ -429,6 +435,133 @@ describe("MessagingManager", () => {
     }));
     expect(transport.polls).toBe(1);
   });
+
+  it("claims a DingTalk owner and runs approved DM/group media through the durable lane", async () => {
+    const transport = new FakeDingTalkTransport(dingTalkInitialBatch(true));
+    const adapter = new AttachmentFakeAdapter(true);
+    const fixture = await createFixture(undefined, () => adapter, undefined, () => transport);
+    const outboundImage = await fixture.artifacts.ingestBytes(pngBytes(), {
+      fileName: "result.png",
+      mimeType: "image/png"
+    });
+    const outboundFile = await fixture.artifacts.ingestBytes(new TextEncoder().encode("result body"), {
+      fileName: "result.txt",
+      mimeType: "text/plain"
+    });
+    adapter.blocks = [
+      { kind: "text", text: "x".repeat(7_005) },
+      { kind: "image", blob: outboundImage, alt: "Result image" },
+      { kind: "artifact", blob: outboundFile, label: "result.txt" }
+    ];
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createDingTalkConnection({
+      configuration: dingTalkConfiguration()
+    });
+    const enabled = await replaceCredential(fixture, created, "dingtalk", true);
+
+    await vi.waitFor(() => {
+      const runtime = fixture.store.getMessagingConnection(enabled.id);
+      if (runtime.runtimeStatus === "error") {
+        throw new Error(`${runtime.errorCode ?? "unknown"}: ${runtime.errorSummary ?? "unknown"}`);
+      }
+      expect(runtime).toMatchObject({
+        channel: "dingtalk",
+        runtimeStatus: "connected",
+        ownerProviderUserId: "ding-owner",
+        cursor: "ding-cursor-1"
+      });
+      expect(fixture.store.listMessagingInboundRequests()).toHaveLength(2);
+      expect(transport.sentText.filter((entry) => entry.text === "x".repeat(3_500))).toHaveLength(4);
+      expect(transport.sentAttachments.length).toBeGreaterThanOrEqual(4);
+    }, { timeout: 5_000 });
+    expect(transport.sentText.every((entry) => entry.text.length <= 3_500)).toBe(true);
+    expect(transport.sentAttachments.every((entry) => entry.fileNames.length === 1)).toBe(true);
+    expect(transport.downloadedKinds).toEqual(["image", "file"]);
+    expect(fixture.store.listMessagingConversations().map((value) => value.conversationKind).sort())
+      .toEqual(["direct", "group"]);
+    expect(JSON.stringify(fixture.store.listMessagingInboundRequests(), (_key, value: unknown) =>
+      typeof value === "bigint" ? value.toString() : value)).not.toContain("download-code");
+
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    const cleared = await fixture.manager.clearCredential({
+      connectionId: current.id,
+      expectedRevision: current.revision,
+      expectedGeneration: current.generation
+    });
+    expect(cleared.ownerProviderUserId).toBeUndefined();
+  });
+
+  it("resolves DingTalk permission and question interactions from lane-scoped text without a second Queue turn", async () => {
+    const transport = new InteractiveDingTalkTransport();
+    const adapter = new DingTalkInteractionAdapter();
+    const fixture = await createFixture(undefined, () => adapter, undefined, () => transport);
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createDingTalkConnection({ configuration: dingTalkConfiguration() });
+    await replaceCredential(fixture, created, "dingtalk-interaction", true);
+
+    await vi.waitFor(() => expect(adapter.decisions).toEqual([
+      { kind: "selected", value: "allow_once" },
+      {
+        kind: "question",
+        answers: {
+          name: { kind: "text", value: "Alice" },
+          confirm: { kind: "boolean", value: true }
+        }
+      }
+    ]), { timeout: 5_000 });
+    expect(transport.sentInteractionCards).toHaveLength(2);
+    expect(transport.sentInteractionCards[0]).toMatchObject({
+      buttons: [{ label: "allow_once" }, { label: "deny_once" }]
+    });
+    expect(transport.sentInteractionCards[1]?.buttons).toEqual([]);
+    expect(fixture.store.listMessagingInboundRequests()).toHaveLength(1);
+    expect(fixture.store.listMessagingInteractions()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "completed", providerMessageId: "ding-reply-permission" }),
+      expect.objectContaining({ status: "completed", providerMessageId: "ding-reply-question" })
+    ]));
+  });
+
+  it("reconnects a retryable DingTalk Stream failure and projects terminal credential loss", async () => {
+    const recovering = new RecoveringDingTalkTransport();
+    const fixture = await createFixture(undefined, undefined, undefined, () => recovering);
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createDingTalkConnection({ configuration: dingTalkConfiguration() });
+    const enabled = await replaceCredential(fixture, created, "dingtalk-recovery", true);
+
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(enabled.id)).toMatchObject({
+      runtimeStatus: "connected",
+      cursor: "ding-recovered"
+    }), { timeout: 5_000 });
+    expect(recovering.probes).toBeGreaterThanOrEqual(2);
+
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    const lost = new AuthLossDingTalkTransport();
+    const second = await createFixture(undefined, undefined, undefined, () => lost);
+    const lostCreated = second.manager.createDingTalkConnection({ configuration: dingTalkConfiguration() });
+    const lostEnabled = await replaceCredential(second, lostCreated, "dingtalk-auth", true);
+    await vi.waitFor(() => expect(second.store.getMessagingConnection(lostEnabled.id)).toMatchObject({
+      runtimeStatus: "auth_loss",
+      errorCode: "invalid_credential",
+      errorSummary: "DingTalk rejected the managed credential."
+    }));
+    expect(lost.polls).toBe(1);
+    expect(current.ownerProviderUserId).toBe("ding-owner");
+  });
 });
 
 class FakeTelegramTransport {
@@ -722,6 +855,241 @@ class AuthLossDiscordTransport extends FakeDiscordTransport {
   }
 }
 
+class FakeDingTalkTransport {
+  readonly channel = "dingtalk" as const;
+  readonly sentText: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+  }> = [];
+  readonly sentAttachments: Array<{ readonly address: MessagingAddress; readonly fileNames: readonly string[] }> = [];
+  readonly sentInteractionCards: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }> = [];
+  readonly clearedInteractionCards: Array<{ readonly address: MessagingAddress; readonly messageId: string }> = [];
+  readonly downloadedKinds: Array<"image" | "file"> = [];
+  #boundConnectionId = "";
+  #boundGeneration = 0;
+  #ownerUserId: string | null = null;
+  #delivered = false;
+
+  constructor(readonly batch: DingTalkNormalizationResult = dingTalkInitialBatch()) {}
+
+  get connectionId(): string { return this.#boundConnectionId; }
+  get generation(): number { return this.#boundGeneration; }
+
+  bind(options: DingTalkTransportOptions): this {
+    this.#boundConnectionId = options.connectionId;
+    this.#boundGeneration = options.generation;
+    this.#ownerUserId = options.ownerUserId;
+    return this;
+  }
+
+  async probe() {
+    return {
+      channel: "dingtalk" as const,
+      connectionId: this.#boundConnectionId,
+      generation: this.#boundGeneration,
+      providerAccountId: "ding-app-key",
+      displayName: "Joko DingTalk test bot",
+      username: null
+    };
+  }
+
+  async poll(input: { readonly cursor: string | null; readonly signal?: AbortSignal }): Promise<DingTalkPollResult> {
+    if (!this.#delivered && input.cursor === null) {
+      this.#delivered = true;
+      return {
+        updates: [{ callbackMessageId: "ding-initial", payload: {} }],
+        nextCursor: "ding-cursor-1"
+      };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  normalize(_updates: readonly DingTalkCallbackUpdate[]): DingTalkNormalizationResult {
+    if (this.batch.ownerClaimProviderUserId !== null) this.#ownerUserId = this.batch.ownerClaimProviderUserId;
+    const bindAddress = (address: MessagingAddress): MessagingAddress => ({
+      ...address,
+      connectionId: this.#boundConnectionId
+    });
+    return {
+      ...this.batch,
+      events: this.batch.events.map((event) => ({ ...event, address: bindAddress(event.address) })),
+      interactionReplyCandidates: this.batch.interactionReplyCandidates.map((event) => ({
+        ...event,
+        address: bindAddress(event.address)
+      })),
+      groupObservations: this.batch.groupObservations.map((observation) => ({
+        ...observation,
+        address: bindAddress(observation.address)
+      }))
+    };
+  }
+
+  async downloadAttachment(attachment: MessagingInboundAttachment): Promise<MessagingDownloadedAttachment> {
+    this.downloadedKinds.push(attachment.kind);
+    return attachment.kind === "image"
+      ? { bytes: pngBytes(), fileName: attachment.fileName, mimeType: "image/png" }
+      : { bytes: new TextEncoder().encode("inbound evidence"), fileName: attachment.fileName, mimeType: "text/plain" };
+  }
+
+  async sendTextPart(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+  }) {
+    this.sentText.push({
+      address: input.address,
+      text: input.text,
+      ...(input.replyToMessageId === undefined ? {} : { replyToMessageId: input.replyToMessageId })
+    });
+    return { providerMessageId: `ding-text-${this.sentText.length}`, address: input.address };
+  }
+
+  async sendAttachments(input: {
+    readonly address: MessagingAddress;
+    readonly attachments: readonly { readonly fileName: string }[];
+  }) {
+    this.sentAttachments.push({ address: input.address, fileNames: input.attachments.map((value) => value.fileName) });
+    return { providerMessageId: `ding-file-${this.sentAttachments.length}`, address: input.address };
+  }
+
+  async sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }) {
+    this.sentInteractionCards.push(input);
+    return { providerMessageId: `ding-card-${this.sentInteractionCards.length}`, address: input.address };
+  }
+
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+    this.clearedInteractionCards.push(input);
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+
+  async sendTyping(): Promise<void> {}
+  async setReaction(): Promise<void> {}
+  async answerInteraction(): Promise<void> {}
+
+  ownerAddress(): MessagingAddress {
+    if (this.#ownerUserId === null) throw new Error("DingTalk owner is not bound.");
+    return {
+      channel: "dingtalk",
+      connectionId: this.#boundConnectionId,
+      providerConversationId: this.#ownerUserId,
+      providerThreadId: null,
+      conversationKind: "direct"
+    };
+  }
+
+  async close(): Promise<void> {}
+}
+
+class InteractiveDingTalkTransport extends FakeDingTalkTransport {
+  #releasePoll: (() => void) | undefined;
+
+  constructor() {
+    super(dingTalkInitialBatch());
+  }
+
+  override async poll(input: {
+    readonly cursor: string | null;
+    readonly signal?: AbortSignal;
+  }): Promise<DingTalkPollResult> {
+    if (input.cursor === null) return super.poll(input);
+    const expectedCards = input.cursor === "ding-cursor-1" ? 1 : input.cursor === "ding-cursor-2" ? 2 : 0;
+    if (expectedCards > 0) {
+      if (this.sentInteractionCards.length < expectedCards) {
+        await new Promise<void>((resolve, reject) => {
+          this.#releasePoll = resolve;
+          const abort = () => reject(new MessagingTransportError("cancelled", "test poll cancelled", {
+            retryable: false,
+            effect: "none"
+          }));
+          if (input.signal?.aborted) abort();
+          else input.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return {
+        updates: [{
+          callbackMessageId: expectedCards === 1 ? "ding-permission-reply" : "ding-question-reply",
+          payload: {}
+        }],
+        nextCursor: expectedCards === 1 ? "ding-cursor-2" : "ding-cursor-3"
+      };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  override normalize(updates: readonly DingTalkCallbackUpdate[]): DingTalkNormalizationResult {
+    const reply = updates[0]?.callbackMessageId;
+    if (reply !== "ding-permission-reply" && reply !== "ding-question-reply") return super.normalize(updates);
+    const event = dingTalkMessage({
+      messageId: reply === "ding-permission-reply" ? "ding-reply-permission" : "ding-reply-question",
+      text: reply === "ding-permission-reply" ? "1" : "name: Alice\nconfirm: yes"
+    });
+    return {
+      events: [],
+      interactionReplyCandidates: [{
+        ...event,
+        address: { ...event.address, connectionId: this.connectionId }
+      }],
+      groupObservations: [],
+      ignored: [],
+      ownerClaimProviderUserId: null
+    };
+  }
+
+  override async sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }) {
+    const receipt = await super.sendInteractionCard(input);
+    this.#releasePoll?.();
+    this.#releasePoll = undefined;
+    return receipt;
+  }
+}
+
+class RecoveringDingTalkTransport extends FakeDingTalkTransport {
+  probes = 0;
+  polls = 0;
+
+  override async probe() {
+    this.probes += 1;
+    return super.probe();
+  }
+
+  override async poll(input: { readonly cursor: string | null; readonly signal?: AbortSignal }): Promise<DingTalkPollResult> {
+    this.polls += 1;
+    if (this.polls === 1) {
+      throw new MessagingTransportError("network", "fixture stream disconnected", {
+        retryable: true,
+        effect: "none"
+      });
+    }
+    const result = await super.poll(input);
+    return { ...result, nextCursor: "ding-recovered" };
+  }
+}
+
+class AuthLossDingTalkTransport extends FakeDingTalkTransport {
+  polls = 0;
+
+  override async poll(): Promise<DingTalkPollResult> {
+    this.polls += 1;
+    throw new MessagingTransportError("invalid_credential", "fixture credential rejected", {
+      retryable: false,
+      effect: "none"
+    });
+  }
+}
+
 class InteractiveTelegramTransport extends FakeTelegramTransport {
   #releaseInteractionPoll: (() => void) | undefined;
   #releaseStalePoll: (() => void) | undefined;
@@ -938,8 +1306,16 @@ class CrossPollAlbumTransport extends FakeTelegramTransport {
 class AttachmentFakeAdapter extends FakeBackendAdapter {
   blocks: readonly MessageBlock[] = [{ kind: "text", text: "Files are ready." }];
 
-  constructor() {
-    super(PI_LIKE_PROFILE);
+  constructor(inputFile = false) {
+    super(inputFile ? {
+      ...PI_LIKE_PROFILE,
+      id: "fake-pi-like-files",
+      displayName: "Pi-like Fake with files",
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities,
+        { key: "input.file", supported: true }
+      ]
+    } : PI_LIKE_PROFILE);
   }
 
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
@@ -1033,10 +1409,58 @@ class QuestionFakeAdapter extends FakeBackendAdapter {
   }
 }
 
+class DingTalkInteractionAdapter extends FakeBackendAdapter {
+  readonly decisions: InteractionDecision[] = [];
+
+  constructor() {
+    super(PI_LIKE_PROFILE);
+  }
+
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    queueMicrotask(() => void (async () => {
+      this.decisions.push(await context.requestInteraction({
+        id: "ding-permission-one",
+        kind: "permission",
+        title: "Run command",
+        toolName: "shell",
+        summary: "Run the approved command.",
+        risk: "high",
+        choices: ["allow_once", "deny_once"]
+      }));
+      this.decisions.push(await context.requestInteraction({
+        id: "ding-question-one",
+        kind: "question",
+        title: "Configure the run",
+        prompt: "Answer every required field.",
+        fields: [{
+          id: "name",
+          label: "Display name",
+          required: true,
+          kind: "text",
+          multiline: false
+        }, {
+          id: "confirm",
+          label: "Confirm",
+          required: true,
+          kind: "boolean",
+          defaultValue: false
+        }]
+      }));
+      await context.emit({
+        type: "message_complete",
+        role: "assistant",
+        blocks: [{ kind: "text", text: "DingTalk interactions resolved." }]
+      });
+      await context.emit({ type: "done", outcome: "completed" });
+    })());
+  }
+}
+
 async function createFixture(
   transportFactory?: (options: TelegramTransportOptions) => FakeTelegramTransport,
   adapterFactory?: () => FakeBackendAdapter,
-  discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport
+  discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport,
+  dingTalkTransportFactory?: (options: DingTalkTransportOptions) => FakeDingTalkTransport
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -1080,6 +1504,9 @@ async function createFixture(
     }),
     ...(discordTransportFactory === undefined ? {} : {
       createDiscordTransport: (input) => discordTransportFactory(input).bind(input)
+    }),
+    ...(dingTalkTransportFactory === undefined ? {} : {
+      createDingTalkTransport: (input) => dingTalkTransportFactory(input).bind(input)
     })
   };
   manager = new MessagingManager(options);
@@ -1148,6 +1575,101 @@ function directMessageBatch(): TelegramNormalizationResult {
     groupObservations: [],
     ignored: []
   };
+}
+
+function dingTalkConfiguration(): DingTalkMessagingConfiguration {
+  return {
+    format: 1,
+    appKey: "ding-app-key",
+    groupActivation: { "ding-group": "mention" }
+  };
+}
+
+function dingTalkInitialBatch(withMedia = false): DingTalkNormalizationResult {
+  const direct = dingTalkMessage({
+    messageId: "ding-message-direct",
+    text: "Hello from DingTalk",
+    ...(withMedia ? {
+      attachments: [{
+        providerFileId: "ding-image-coordinate",
+        providerUniqueFileId: null,
+        kind: "image" as const,
+        fileName: "inbound.png",
+        mimeType: "image/png",
+        byteLength: pngBytes().byteLength
+      }, {
+        providerFileId: "ding-file-coordinate",
+        providerUniqueFileId: null,
+        kind: "file" as const,
+        fileName: "inbound.txt",
+        mimeType: "text/plain",
+        byteLength: new TextEncoder().encode("inbound evidence").byteLength
+      }]
+    } : {})
+  });
+  const group = dingTalkMessage({
+    messageId: "ding-message-group",
+    text: "Help the approved group",
+    conversationId: "ding-group",
+    conversationKind: "group"
+  });
+  return {
+    events: withMedia ? [direct, group] : [direct],
+    interactionReplyCandidates: [],
+    groupObservations: withMedia ? [{
+      address: group.address,
+      messageId: group.messageId,
+      speaker: group.speaker,
+      occurredAt: group.occurredAt,
+      text: group.text,
+      attachmentNames: []
+    }] : [],
+    ignored: [],
+    ownerClaimProviderUserId: "ding-owner"
+  };
+}
+
+function dingTalkMessage(input: {
+  readonly messageId: string;
+  readonly text: string;
+  readonly conversationId?: string;
+  readonly conversationKind?: "direct" | "group";
+  readonly attachments?: readonly MessagingInboundAttachment[];
+}) {
+  const group = input.conversationKind === "group";
+  return {
+    kind: "message" as const,
+    providerRequestIds: [`dingtalk:callback:${input.messageId}`],
+    messageId: input.messageId,
+    address: {
+      channel: "dingtalk" as const,
+      connectionId: "placeholder",
+      providerConversationId: input.conversationId ?? "ding-owner",
+      providerThreadId: null,
+      conversationKind: input.conversationKind ?? "direct"
+    },
+    speaker: {
+      providerUserId: "ding-owner",
+      displayName: "DingTalk owner",
+      username: null,
+      isBot: false,
+      isOwner: true
+    },
+    occurredAt: Date.now(),
+    text: input.text,
+    ambient: false,
+    protectedContent: false,
+    attachments: input.attachments ?? [],
+    unsupported: [],
+    replyContext: null
+  };
+}
+
+function pngBytes(): Uint8Array {
+  return new Uint8Array(Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64"
+  ));
 }
 
 function albumUpdate(updateId: number, messageId: number): TelegramUpdate {

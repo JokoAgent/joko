@@ -44,7 +44,9 @@ describe("MessagingService", () => {
       .toMatchObject({ available: true, reason: "" });
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.DISCORD))
       .toMatchObject({ available: true, reason: "" });
-    expect(channels.filter((channel) => channel.available)).toHaveLength(2);
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.DINGTALK))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.filter((channel) => channel.available)).toHaveLength(3);
 
     const created = await service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
@@ -271,6 +273,106 @@ describe("MessagingService", () => {
     expect(settings.routes).toHaveLength(1);
   });
 
+  it("projects DingTalk AppKey/group rules and clears a claimed owner only when AppKey changes", async () => {
+    const fixture = await createFixture();
+    const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
+    const context = {} as HandlerContext;
+    const created = await service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      {
+        channel: contract.MessagingChannel.DINGTALK,
+        dingtalkConfiguration: create(contract.DingTalkMessagingConfigurationSchema, {
+          appKey: "ding-app-key",
+          groupActivationRules: [create(contract.DingTalkGroupActivationRuleSchema, {
+            conversationId: "group-one",
+            activation: contract.DingTalkGroupActivation.MENTION
+          })]
+        })
+      }
+    ), context);
+
+    expect(created.connection).toMatchObject({
+      channel: contract.MessagingChannel.DINGTALK,
+      generation: 1n,
+      credentialConfigured: false,
+      runtimeStatus: contract.MessagingConnectionRuntimeStatus.IDLE,
+      dingtalkConfiguration: {
+        appKey: "ding-app-key",
+        groupActivationRules: [{
+          conversationId: "group-one",
+          activation: contract.DingTalkGroupActivation.MENTION
+        }]
+      }
+    });
+    expect(created.connection?.ownerProviderUserId).toBeUndefined();
+    expect(created.connection).not.toHaveProperty("telegramConfiguration");
+    expect(created.connection).not.toHaveProperty("discordConfiguration");
+
+    const createdConnection = created.connection;
+    if (createdConnection === undefined) throw new Error("Missing created DingTalk connection.");
+    const createdConnectionId = createdConnection.connectionId;
+    if (createdConnectionId === undefined) throw new Error("Missing created DingTalk connection identity.");
+    const stored = fixture.store.getMessagingConnection(createdConnectionId);
+    fixture.store.claimMessagingConnectionOwner({
+      connectionId: stored.id,
+      expectedRevision: stored.revision,
+      expectedGeneration: stored.generation,
+      ownerProviderUserId: "ding-owner"
+    });
+    const claimedSettings = await service.getMessagingSettings(
+      create(contract.GetMessagingSettingsRequestSchema),
+      context
+    );
+    const claimed = claimedSettings.connections?.[0];
+    if (claimed === undefined) throw new Error("Missing claimed DingTalk connection.");
+    expect(claimed.ownerProviderUserId).toBe("ding-owner");
+
+    const sameApp = await service.updateDingTalkMessagingConfiguration(create(
+      contract.UpdateDingTalkMessagingConfigurationRequestSchema,
+      {
+        connectionId: claimed.connectionId,
+        expectedRevision: claimed.revision,
+        expectedGeneration: claimed.generation,
+        configuration: create(contract.DingTalkMessagingConfigurationSchema, {
+          appKey: "ding-app-key",
+          groupActivationRules: [create(contract.DingTalkGroupActivationRuleSchema, {
+            conversationId: "group-two",
+            activation: contract.DingTalkGroupActivation.ALWAYS
+          })]
+        })
+      }
+    ), context);
+    expect(sameApp.connection).toMatchObject({
+      generation: 2n,
+      ownerProviderUserId: "ding-owner",
+      dingtalkConfiguration: {
+        appKey: "ding-app-key",
+        groupActivationRules: [{
+          conversationId: "group-two",
+          activation: contract.DingTalkGroupActivation.ALWAYS
+        }]
+      }
+    });
+
+    const changedApp = await service.updateDingTalkMessagingConfiguration(create(
+      contract.UpdateDingTalkMessagingConfigurationRequestSchema,
+      {
+        connectionId: sameApp.connection!.connectionId,
+        expectedRevision: sameApp.connection!.revision,
+        expectedGeneration: sameApp.connection!.generation,
+        configuration: create(contract.DingTalkMessagingConfigurationSchema, {
+          appKey: "replacement-app-key",
+          groupActivationRules: []
+        })
+      }
+    ), context);
+    expect(changedApp.connection).toMatchObject({
+      generation: 3n,
+      dingtalkConfiguration: { appKey: "replacement-app-key", groupActivationRules: [] }
+    });
+    expect(changedApp.connection?.ownerProviderUserId).toBeUndefined();
+  });
+
   it("reports unavailable channels and nodes explicitly", async () => {
     const context = {} as HandlerContext;
     const unavailable = createMessagingConnectService(undefined, () => ({ connectionId: "desktop" }));
@@ -285,7 +387,7 @@ describe("MessagingService", () => {
     const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
     await expect(service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
-      { channel: contract.MessagingChannel.DINGTALK, ownerProviderUserId: "42" }
+      { channel: contract.MessagingChannel.FEISHU, ownerProviderUserId: "42" }
     ), context)).rejects.toSatisfy(
       (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
     );

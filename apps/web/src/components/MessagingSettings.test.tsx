@@ -45,7 +45,7 @@ describe("Messaging settings", () => {
     const container = await renderSettings(controller, snapshot());
 
     expect(container.querySelectorAll(".messaging-channel")).toHaveLength(8);
-    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(2);
+    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(3);
     expect(container.textContent).toContain("Conflict");
     expect(container.textContent).toContain("Another poller owns this bot token.");
 
@@ -150,6 +150,39 @@ describe("Messaging settings", () => {
     expect(container.textContent).toContain("Connecting");
   });
 
+  it("creates DingTalk with AppKey and AppSecret while leaving ownership for the first direct message", async () => {
+    const created = dingTalkConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = dingTalkConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 10n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createDingTalkMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add DingTalk")[0]!.click());
+    const appKey = required(document.querySelector<HTMLInputElement>('input[placeholder="dingxxxxxxxx"]'));
+    expect(document.activeElement).toBe(appKey);
+    await change(appKey, "ding-new-key");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith({ appKey: "ding-new-key", groupActivation: {} });
+
+    const credentialDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(credentialDialog.textContent).toContain("DingTalk AppSecret");
+    expect(credentialDialog.textContent).not.toContain("Bot token");
+    const secret = required(credentialDialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(secret, "ding-secret");
+    await act(async () => button(credentialDialog, "Save").click());
+    expect(save).toHaveBeenCalledWith("dingtalk-one", 9n, 5n, "ding-secret", true);
+    expect(document.body.textContent).not.toContain("ding-secret");
+    expect(container.textContent).toContain("Waiting for first direct message");
+    expect(container.textContent).toContain("Replace AppSecret");
+  });
+
   it("saves Discord lifecycle, reply, reaction, and approved server-channel policy together", async () => {
     const original = discordConnection();
     const refreshed = discordConnection({ revision: 9n });
@@ -194,6 +227,44 @@ describe("Messaging settings", () => {
     expect(update).toHaveBeenNthCalledWith(2, "discord-one", 9n, 4n, "876543210987654321", expect.any(Object));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
   });
+
+  it("saves DingTalk application and explicit group policy across a revision-only owner claim", async () => {
+    const original = dingTalkConnection();
+    const claimed = dingTalkConnection({ revision: 10n, ownerProviderUserId: "ding-owner" });
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValue(messagingSettings([claimed]));
+    const update = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("owner claimed while editing", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, configuration) => dingTalkConnection({
+        generation: 6n,
+        revision: 11n,
+        ownerProviderUserId: undefined,
+        dingtalkConfiguration: configuration
+      }));
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings,
+      updateDingTalkMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const appKey = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    await change(appKey, "ding-replacement-key");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "cid-primary=always\ncid-muted=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenNthCalledWith(1, "dingtalk-one", 9n, 5n, {
+      appKey: "ding-replacement-key",
+      groupActivation: { "cid-primary": "always", "cid-muted": "disabled" }
+    });
+    expect(update).toHaveBeenNthCalledWith(2, "dingtalk-one", 10n, 5n, expect.any(Object));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.textContent).toContain("Waiting for first direct message");
+  });
 });
 
 async function renderSettings(controller: AppController, currentSnapshot: AppSnapshot): Promise<HTMLElement> {
@@ -219,11 +290,13 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     getMessagingSettings: vi.fn(async () => settings),
     createTelegramMessagingConnection: vi.fn(async () => telegramConnection()),
     createDiscordMessagingConnection: vi.fn(async () => discordConnection()),
+    createDingTalkMessagingConnection: vi.fn(async () => dingTalkConnection()),
     saveMessagingCredential: vi.fn(unchanged),
     clearMessagingCredential: vi.fn(unchanged),
     setMessagingConnectionEnabled: vi.fn(unchanged),
     updateTelegramMessagingConfiguration: vi.fn(unchanged),
     updateDiscordMessagingConfiguration: vi.fn(async () => discordConnection()),
+    updateDingTalkMessagingConfiguration: vi.fn(async () => dingTalkConnection()),
     testMessagingConnection: vi.fn(async () => ({ ok: true as const, providerAccountId: "9001", displayName: "Joko Bot" })),
     putMessagingRoute: vi.fn(async () => messagingRoute()),
     ...overrides
@@ -237,7 +310,7 @@ function messagingSettings(connections: readonly MessagingConnectionView[]): Mes
     channels: [
       { channel: "telegram", available: true },
       { channel: "discord", available: true },
-      { channel: "dingtalk", available: false, reason: "not implemented" },
+      { channel: "dingtalk", available: true },
       { channel: "feishu", available: false, reason: "not implemented" },
       { channel: "lark", available: false, reason: "not implemented" },
       { channel: "wecom", available: false, reason: "not implemented" },
@@ -290,6 +363,27 @@ function discordConnection(overrides: Partial<MessagingConnectionView> = {}): Me
       replyQuoteDm: "off",
       replyQuoteGroup: "first",
       groupActivation: { "123456789012345678/234567890123456789": "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function dingTalkConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "dingtalk-one",
+    channel: "dingtalk",
+    generation: 5n,
+    revision: 9n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    providerAccountId: "ding-app-key",
+    dingtalkConfiguration: {
+      appKey: "ding-app-key",
+      groupActivation: { "cid-primary": "mention" }
     },
     lastConnectedAt: Date.now() - 1_000,
     createdAt: 1_000,

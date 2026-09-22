@@ -4260,6 +4260,12 @@ export interface DiscordMessagingConfigurationView {
   readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
 }
 
+export interface DingTalkMessagingConfigurationView {
+  readonly appKey: string;
+  /** Keys are exact DingTalk conversation IDs. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
 export interface MessagingConnectionView {
   readonly id: string;
   readonly channel: MessagingChannelView;
@@ -4273,6 +4279,7 @@ export interface MessagingConnectionView {
   readonly providerUsername?: string;
   readonly telegramConfiguration?: TelegramMessagingConfigurationView;
   readonly discordConfiguration?: DiscordMessagingConfigurationView;
+  readonly dingtalkConfiguration?: DingTalkMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -5513,6 +5520,10 @@ export interface OperationApi {
     configuration?: DiscordMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  createDingTalkMessagingConnection(
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
   saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -5548,6 +5559,13 @@ export interface OperationApi {
     expectedGeneration: bigint,
     ownerProviderUserId: string,
     configuration: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateDingTalkMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: DingTalkMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
   testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;

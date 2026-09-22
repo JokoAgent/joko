@@ -2398,6 +2398,8 @@ export function useAppController(): AppController {
       gateway().createTelegramMessagingConnection(ownerProviderUserId, configuration, signal),
     createDiscordMessagingConnection: (ownerProviderUserId, configuration, signal) =>
       gateway().createDiscordMessagingConnection(ownerProviderUserId, configuration, signal),
+    createDingTalkMessagingConnection: (configuration, signal) =>
+      gateway().createDingTalkMessagingConnection(configuration, signal),
     saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
       gateway().saveMessagingCredential(
         connectionId,
@@ -2444,6 +2446,19 @@ export function useAppController(): AppController {
       expectedRevision,
       expectedGeneration,
       ownerProviderUserId,
+      configuration,
+      signal
+    ),
+    updateDingTalkMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ) => gateway().updateDingTalkMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
       configuration,
       signal
     ),

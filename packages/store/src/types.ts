@@ -773,6 +773,14 @@ export interface SetMessagingConnectionEnabledInput {
   readonly updatedAt?: UnixMillis;
 }
 
+export interface ClaimMessagingConnectionOwnerInput {
+  readonly connectionId: string;
+  readonly expectedRevision: bigint;
+  readonly expectedGeneration: number;
+  readonly ownerProviderUserId: string;
+  readonly updatedAt?: UnixMillis;
+}
+
 export interface UpdateMessagingConnectionRuntimeInput {
   readonly connectionId: string;
   readonly expectedRevision: bigint;

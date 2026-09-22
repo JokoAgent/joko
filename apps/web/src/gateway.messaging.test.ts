@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
+  DingTalkGroupActivation,
   DiscordEmojiReactions,
   DiscordGroupActivation,
   DiscordReplyQuoteMode,
@@ -69,6 +70,22 @@ describe("Messaging gateway", () => {
             }
           },
           lastConnectedAt: 5_250
+        }),
+        expect.objectContaining({
+          id: "dingtalk-one",
+          channel: "dingtalk",
+          generation: 5n,
+          revision: 9n,
+          runtimeStatus: "connected",
+          credentialConfigured: true,
+          dingtalkConfiguration: {
+            appKey: "ding-app-key",
+            groupActivation: {
+              "cid-group-one": "mention",
+              "cid-group-two": "always"
+            }
+          },
+          lastConnectedAt: 6_125
         })
       ],
       routes: [expect.objectContaining({
@@ -81,7 +98,7 @@ describe("Messaging gateway", () => {
       channels: [
         { channel: "telegram", available: true },
         { channel: "discord", available: true },
-        { channel: "dingtalk", available: false, reason: "not implemented" },
+        { channel: "dingtalk", available: true },
         { channel: "feishu", available: false, reason: "not implemented" },
         { channel: "lark", available: false, reason: "not implemented" },
         { channel: "wecom", available: false, reason: "not implemented" },
@@ -105,6 +122,11 @@ describe("Messaging gateway", () => {
       groupActivation: { "456789012345678901/567890123456789012": "disabled" as const }
     };
     await fixture.gateway.createDiscordMessagingConnection("987654321098765432", discordConfiguration, signal);
+    const dingtalkConfiguration = {
+      appKey: "ding-new-app-key",
+      groupActivation: { "cid-disabled": "disabled" as const }
+    };
+    await fixture.gateway.createDingTalkMessagingConnection(dingtalkConfiguration, signal);
     await fixture.gateway.saveMessagingCredential("telegram-one", 7n, 3n, "telegram-test-token", true, signal);
     await fixture.gateway.clearMessagingCredential("telegram-one", 7n, 3n, signal);
     await fixture.gateway.setMessagingConnectionEnabled("telegram-one", 7n, 3n, false, signal);
@@ -115,6 +137,13 @@ describe("Messaging gateway", () => {
       4n,
       "876543210987654321",
       discordConfiguration,
+      signal
+    );
+    await fixture.gateway.updateDingTalkMessagingConfiguration(
+      "dingtalk-one",
+      9n,
+      5n,
+      dingtalkConfiguration,
       signal
     );
     await expect(fixture.gateway.testMessagingConnection("telegram-one", signal)).resolves.toEqual({
@@ -181,6 +210,19 @@ describe("Messaging gateway", () => {
         }]
       }
     });
+    const dingtalkCreate = fixture.requests.find((entry) => entry.method === "createMessagingConnection"
+      && entry.input.channel === MessagingChannel.DINGTALK)?.input;
+    expect(dingtalkCreate).toMatchObject({
+      channel: MessagingChannel.DINGTALK,
+      dingtalkConfiguration: {
+        appKey: "ding-new-app-key",
+        groupActivationRules: [{
+          conversationId: "cid-disabled",
+          activation: DingTalkGroupActivation.DISABLED
+        }]
+      }
+    });
+    expect(dingtalkCreate.ownerProviderUserId).toBeUndefined();
     expect(byMethod("beginMessagingCredentialUpload")).toEqual({
       connectionId: "telegram-one",
       expectedRevision: { value: 7n },
@@ -221,6 +263,18 @@ describe("Messaging gateway", () => {
           guildId: "456789012345678901",
           channelId: "567890123456789012",
           activation: DiscordGroupActivation.DISABLED
+        }]
+      }
+    });
+    expect(byMethod("updateDingTalkMessagingConfiguration")).toMatchObject({
+      connectionId: "dingtalk-one",
+      expectedRevision: { value: 9n },
+      expectedGeneration: 5n,
+      configuration: {
+        appKey: "ding-new-app-key",
+        groupActivationRules: [{
+          conversationId: "cid-disabled",
+          activation: DingTalkGroupActivation.DISABLED
         }]
       }
     });
@@ -269,7 +323,7 @@ async function mount() {
         case "getMessagingSettings": {
           const channels = channelCapabilities();
           value = {
-            connections: [connection(), discordConnection()],
+            connections: [connection(), discordConnection(), dingTalkConnection()],
             routes: [route()],
             channels: fixture.duplicateCapabilities ? [...channels, channels[0]] : channels
           };
@@ -293,13 +347,15 @@ async function mount() {
         }
         case "putMessagingRoute": value = { route: route({ connectionId: "telegram-one", scopeKey: "connection:telegram-one" }) }; break;
         case "createMessagingConnection": value = {
-          connection: input.channel === MessagingChannel.DISCORD ? discordConnection() : connection()
+          connection: input.channel === MessagingChannel.DISCORD ? discordConnection()
+            : input.channel === MessagingChannel.DINGTALK ? dingTalkConnection() : connection()
         }; break;
         case "commitMessagingCredential":
         case "clearMessagingCredential":
         case "setMessagingConnectionEnabled":
         case "updateTelegramMessagingConfiguration": value = { connection: connection() }; break;
         case "updateDiscordMessagingConfiguration": value = { connection: discordConnection() }; break;
+        case "updateDingTalkMessagingConfiguration": value = { connection: dingTalkConnection() }; break;
         default: throw new Error(`Unexpected RPC ${method.localName}`);
       }
       return response(method, create(method.output, value));
@@ -379,6 +435,29 @@ function discordConnection() {
   };
 }
 
+function dingTalkConnection() {
+  return {
+    connectionId: "dingtalk-one",
+    channel: MessagingChannel.DINGTALK,
+    generation: 5n,
+    enabled: true,
+    runtimeStatus: MessagingConnectionRuntimeStatus.CONNECTED,
+    credentialConfigured: true,
+    providerAccountId: "ding-app-key",
+    dingtalkConfiguration: {
+      appKey: "ding-app-key",
+      groupActivationRules: [
+        { conversationId: "cid-group-one", activation: DingTalkGroupActivation.MENTION },
+        { conversationId: "cid-group-two", activation: DingTalkGroupActivation.ALWAYS }
+      ]
+    },
+    lastConnectedAt: timestamp(6n, 125_000_000),
+    createdAt: timestamp(3n),
+    updatedAt: timestamp(7n),
+    revision: { value: 9n }
+  };
+}
+
 function route(overrides: Record<string, unknown> = {}) {
   return {
     scopeKey: "global",
@@ -401,7 +480,7 @@ function channelCapabilities() {
   return [
     { channel: MessagingChannel.TELEGRAM, available: true },
     { channel: MessagingChannel.DISCORD, available: true },
-    { channel: MessagingChannel.DINGTALK, available: false, reason: "not implemented" },
+    { channel: MessagingChannel.DINGTALK, available: true },
     { channel: MessagingChannel.FEISHU, available: false, reason: "not implemented" },
     { channel: MessagingChannel.LARK, available: false, reason: "not implemented" },
     { channel: MessagingChannel.WECOM, available: false, reason: "not implemented" },

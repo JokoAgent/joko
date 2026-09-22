@@ -11,8 +11,10 @@ import {
   DEFAULT_DISCORD_MESSAGING_CONFIGURATION,
   DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION,
   MessagingManagerError,
+  decodeDingTalkMessagingConfiguration,
   decodeDiscordMessagingConfiguration,
   decodeTelegramMessagingConfiguration,
+  type DingTalkMessagingConfiguration,
   type DiscordMessagingConfiguration,
   type MessagingManager,
   type TelegramMessagingConfiguration
@@ -47,8 +49,8 @@ export function createMessagingConnectService(
         routes: owner.listRoutes().map(toProtoRoute),
         channels: CHANNELS.map((channel) => create(contract.MessagingChannelCapabilitySchema, {
           channel: toProtoChannel(channel),
-          available: channel === "telegram" || channel === "discord",
-          reason: channel === "telegram" || channel === "discord" ? "" : "not_implemented"
+          available: isAvailableChannel(channel),
+          reason: isAvailableChannel(channel) ? "" : "not_implemented"
         }))
       });
     }),
@@ -58,8 +60,8 @@ export function createMessagingConnectService(
       const owner = requireManager(manager);
       const connection = request.channel === contract.MessagingChannel.TELEGRAM
         ? (() => {
-            if (request.discordConfiguration !== undefined) {
-              throw new ConnectError("Discord configuration does not belong to a Telegram connection.", Code.InvalidArgument);
+            if (request.discordConfiguration !== undefined || request.dingtalkConfiguration !== undefined) {
+              throw new ConnectError("Another channel configuration does not belong to a Telegram connection.", Code.InvalidArgument);
             }
             return owner.createTelegramConnection({
               ownerProviderUserId: request.ownerProviderUserId,
@@ -70,8 +72,8 @@ export function createMessagingConnectService(
           })()
         : request.channel === contract.MessagingChannel.DISCORD
           ? (() => {
-              if (request.telegramConfiguration !== undefined) {
-                throw new ConnectError("Telegram configuration does not belong to a Discord connection.", Code.InvalidArgument);
+              if (request.telegramConfiguration !== undefined || request.dingtalkConfiguration !== undefined) {
+                throw new ConnectError("Another channel configuration does not belong to a Discord connection.", Code.InvalidArgument);
               }
               return owner.createDiscordConnection({
                 ownerProviderUserId: request.ownerProviderUserId,
@@ -80,7 +82,22 @@ export function createMessagingConnectService(
                   : fromProtoDiscordConfiguration(request.discordConfiguration)
               });
             })()
-          : undefined;
+          : request.channel === contract.MessagingChannel.DINGTALK
+            ? (() => {
+                if (request.telegramConfiguration !== undefined || request.discordConfiguration !== undefined) {
+                  throw new ConnectError("Another channel configuration does not belong to a DingTalk connection.", Code.InvalidArgument);
+                }
+                if (request.ownerProviderUserId !== "") {
+                  throw new ConnectError("DingTalk ownership is claimed by the first direct message.", Code.InvalidArgument);
+                }
+                if (request.dingtalkConfiguration === undefined) {
+                  throw new ConnectError("DingTalk configuration is required.", Code.InvalidArgument);
+                }
+                return owner.createDingTalkConnection({
+                  configuration: fromProtoDingTalkConfiguration(request.dingtalkConfiguration)
+                });
+              })()
+            : undefined;
       if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
       }
@@ -174,6 +191,22 @@ export function createMessagingConnectService(
         configuration: fromProtoDiscordConfiguration(request.configuration)
       });
       return create(contract.UpdateDiscordMessagingConfigurationResponseSchema, {
+        connection: toProtoConnection(connection)
+      });
+    }),
+
+    updateDingTalkMessagingConfiguration: async (request, context) => messagingRpc(async () => {
+      authenticate(context);
+      if (request.configuration === undefined) {
+        throw new ConnectError("configuration is required.", Code.InvalidArgument);
+      }
+      const connection = await requireManager(manager).replaceDingTalkConfiguration({
+        connectionId: request.connectionId,
+        expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration),
+        configuration: fromProtoDingTalkConfiguration(request.configuration)
+      });
+      return create(contract.UpdateDingTalkMessagingConfigurationResponseSchema, {
         connection: toProtoConnection(connection)
       });
     }),
@@ -377,6 +410,44 @@ function toProtoDiscordConfiguration(
   });
 }
 
+function fromProtoDingTalkConfiguration(
+  value: contract.DingTalkMessagingConfiguration
+): DingTalkMessagingConfiguration {
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const mapped = rule.activation === contract.DingTalkGroupActivation.MENTION ? "mention"
+      : rule.activation === contract.DingTalkGroupActivation.ALWAYS ? "always"
+        : rule.activation === contract.DingTalkGroupActivation.DISABLED ? "disabled"
+          : undefined;
+    if (mapped === undefined || Object.hasOwn(groupActivation, rule.conversationId)) {
+      throw new ConnectError("DingTalk group activation is invalid.", Code.InvalidArgument);
+    }
+    groupActivation[rule.conversationId] = mapped;
+  }
+  return decodeDingTalkMessagingConfiguration({
+    format: 1,
+    appKey: value.appKey,
+    groupActivation
+  });
+}
+
+function toProtoDingTalkConfiguration(
+  value: DingTalkMessagingConfiguration
+): contract.DingTalkMessagingConfiguration {
+  return create(contract.DingTalkMessagingConfigurationSchema, {
+    appKey: value.appKey,
+    groupActivationRules: Object.entries(value.groupActivation).map(([conversationId, activation]) => create(
+      contract.DingTalkGroupActivationRuleSchema,
+      {
+        conversationId,
+        activation: activation === "mention" ? contract.DingTalkGroupActivation.MENTION
+          : activation === "always" ? contract.DingTalkGroupActivation.ALWAYS
+            : contract.DingTalkGroupActivation.DISABLED
+      }
+    ))
+  });
+}
+
 function toProtoConnection(value: MessagingConnectionRecord): contract.MessagingConnection {
   return create(contract.MessagingConnectionSchema, {
     connectionId: value.id,
@@ -396,6 +467,11 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
     ...(value.channel !== "discord" ? {} : {
       discordConfiguration: toProtoDiscordConfiguration(
         decodeDiscordMessagingConfiguration(value.configuration)
+      )
+    }),
+    ...(value.channel !== "dingtalk" ? {} : {
+      dingtalkConfiguration: toProtoDingTalkConfiguration(
+        decodeDingTalkMessagingConfiguration(value.configuration)
       )
     }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
@@ -436,6 +512,10 @@ function toProtoChannel(value: NativeMessagingChannel): contract.MessagingChanne
     case "wechat": return contract.MessagingChannel.WECHAT;
     case "slack": return contract.MessagingChannel.SLACK;
   }
+}
+
+function isAvailableChannel(value: NativeMessagingChannel): boolean {
+  return value === "telegram" || value === "discord" || value === "dingtalk";
 }
 
 function toProtoRuntimeStatus(

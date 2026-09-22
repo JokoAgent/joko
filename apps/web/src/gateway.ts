@@ -316,6 +316,8 @@ import {
   DiscordGroupActivation as ProtoDiscordGroupActivation,
   DiscordGroupActivationRuleSchema as ProtoDiscordGroupActivationRuleSchema,
   DiscordReplyQuoteMode as ProtoDiscordReplyQuoteMode,
+  DingTalkGroupActivation as ProtoDingTalkGroupActivation,
+  DingTalkGroupActivationRuleSchema as ProtoDingTalkGroupActivationRuleSchema,
   TelegramEmojiReactions as ProtoTelegramEmojiReactions,
   TelegramGroupActivation as ProtoTelegramGroupActivation,
   TelegramGroupActivationRuleSchema as ProtoTelegramGroupActivationRuleSchema,
@@ -398,6 +400,7 @@ import {
   type McpServerDescriptor,
   type MessagingConnection as ProtoMessagingConnection,
   type MessagingRoute as ProtoMessagingRoute,
+  type DingTalkMessagingConfiguration as ProtoDingTalkMessagingConfiguration,
   type DiscordMessagingConfiguration as ProtoDiscordMessagingConfiguration,
   type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
@@ -609,6 +612,7 @@ import type {
   MessagingRouteDraftView,
   MessagingRouteView,
   MessagingSettingsView,
+  DingTalkMessagingConfigurationView,
   DiscordMessagingConfigurationView,
   OperationApi,
   PartnerCapabilitiesView,
@@ -5906,6 +5910,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapMessagingConnection(response.connection);
   }
 
+  async createDingTalkMessagingConnection(
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.DINGTALK,
+      dingtalkConfiguration: protoDingTalkMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
   async saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -6003,6 +6020,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         expectedGeneration,
         ownerProviderUserId,
         configuration: protoDiscordMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateDingTalkMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: DingTalkMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateDingTalkMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        configuration: protoDingTalkMessagingConfiguration(configuration)
       }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
@@ -18297,11 +18333,17 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const discordConfiguration = channel === "discord"
     ? mapDiscordMessagingConfiguration(value.discordConfiguration)
     : undefined;
+  const dingtalkConfiguration = channel === "dingtalk"
+    ? mapDingTalkMessagingConfiguration(value.dingtalkConfiguration)
+    : undefined;
   if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
   }
   if (channel !== "discord" && value.discordConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Discord configuration for another Messaging channel.");
+  }
+  if (channel !== "dingtalk" && value.dingtalkConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned DingTalk configuration for another Messaging channel.");
   }
   return {
     id: value.connectionId,
@@ -18316,6 +18358,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(value.providerUsername === undefined ? {} : { providerUsername: value.providerUsername }),
     ...(telegramConfiguration === undefined ? {} : { telegramConfiguration }),
     ...(discordConfiguration === undefined ? {} : { discordConfiguration }),
+    ...(dingtalkConfiguration === undefined ? {} : { dingtalkConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -18500,6 +18543,48 @@ function protoDiscordMessagingConfiguration(
         activation: activation === "mention" ? ProtoDiscordGroupActivation.MENTION
           : activation === "always" ? ProtoDiscordGroupActivation.ALWAYS
             : ProtoDiscordGroupActivation.DISABLED
+      });
+    })
+  };
+}
+
+function mapDingTalkMessagingConfiguration(
+  value: ProtoDingTalkMessagingConfiguration | undefined
+): DingTalkMessagingConfigurationView {
+  if (value === undefined || value.appKey.trim() === "") {
+    throw new GatewayError("Orchestrator returned an invalid DingTalk configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const conversationId = rule.conversationId.trim();
+    const mapped = rule.activation === ProtoDingTalkGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoDingTalkGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoDingTalkGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || conversationId === "" || Object.hasOwn(groupActivation, conversationId)) {
+      throw new GatewayError("Orchestrator returned an invalid DingTalk group activation.");
+    }
+    groupActivation[conversationId] = mapped;
+  }
+  return { appKey: value.appKey, groupActivation };
+}
+
+function protoDingTalkMessagingConfiguration(
+  value: DingTalkMessagingConfigurationView
+): ProtoDingTalkMessagingConfiguration {
+  const appKey = value.appKey.trim();
+  if (appKey === "") throw new GatewayError("DingTalk AppKey is required.");
+  return {
+    $typeName: "joko.v1.DingTalkMessagingConfiguration",
+    appKey,
+    groupActivationRules: Object.entries(value.groupActivation).map(([conversationId, activation]) => {
+      const normalized = conversationId.trim();
+      if (normalized === "") throw new GatewayError("DingTalk conversation ID is invalid.");
+      return create(ProtoDingTalkGroupActivationRuleSchema, {
+        conversationId: normalized,
+        activation: activation === "mention" ? ProtoDingTalkGroupActivation.MENTION
+          : activation === "always" ? ProtoDingTalkGroupActivation.ALWAYS
+            : ProtoDingTalkGroupActivation.DISABLED
       });
     })
   };

@@ -149,6 +149,69 @@ describe("OperationalStore messaging", () => {
     expect(cleared.credentialReferenceId).toBeUndefined();
   });
 
+  it("claims an initially unknown owner without changing generation and can explicitly clear it", () => {
+    const fixture = createFixture();
+    const initial = fixture.store.createMessagingConnection({
+      id: "dingtalk-1",
+      channel: "dingtalk",
+      configuration: { format: 1, appKey: "ding-app-key", groupActivation: {} },
+      createdAt: 10
+    });
+    const claimed = fixture.store.claimMessagingConnectionOwner({
+      connectionId: initial.id,
+      expectedRevision: initial.revision,
+      expectedGeneration: initial.generation,
+      ownerProviderUserId: "owner-1",
+      updatedAt: 11
+    });
+
+    expect(claimed).toMatchObject({ generation: 1, ownerProviderUserId: "owner-1", updatedAt: 11 });
+    expect(fixture.store.claimMessagingConnectionOwner({
+      connectionId: initial.id,
+      expectedRevision: initial.revision,
+      expectedGeneration: initial.generation,
+      ownerProviderUserId: "owner-1",
+      updatedAt: 12
+    })).toEqual(claimed);
+    expect(() => fixture.store.claimMessagingConnectionOwner({
+      connectionId: initial.id,
+      expectedRevision: claimed.revision,
+      expectedGeneration: claimed.generation,
+      ownerProviderUserId: "owner-2",
+      updatedAt: 12
+    })).toThrowError("Messaging connection ownership has already been claimed.");
+
+    const replaced = fixture.store.replaceMessagingConfiguration({
+      connectionId: claimed.id,
+      expectedRevision: claimed.revision,
+      expectedGeneration: claimed.generation,
+      configuration: { format: 1, appKey: "replacement-key", groupActivation: {} },
+      ownerProviderUserId: null,
+      updatedAt: 13
+    });
+    expect(replaced).toMatchObject({ generation: 2 });
+    expect(replaced.ownerProviderUserId).toBeUndefined();
+
+    const credential = fixture.store.replaceMessagingCredential({
+      connectionId: replaced.id,
+      expectedRevision: replaced.revision,
+      expectedGeneration: replaced.generation,
+      credentialReferenceId: "managed-dingtalk-secret",
+      credentialGeneration: "3".repeat(64),
+      ownerProviderUserId: "owner-3",
+      enable: true,
+      updatedAt: 14
+    });
+    const cleared = fixture.store.clearMessagingCredential({
+      connectionId: credential.id,
+      expectedRevision: credential.revision,
+      expectedGeneration: credential.generation,
+      clearOwner: true,
+      updatedAt: 15
+    });
+    expect(cleared.ownerProviderUserId).toBeUndefined();
+  });
+
   it("retires old-generation inbound and external effects without replaying uncertain claims", () => {
     const fixture = createActiveFixture();
     const preparing = fixture.store.createMessagingInboundRequest({

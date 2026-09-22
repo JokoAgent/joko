@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./dingtalk": "./src/dingtalk/index.ts",
     "./discord": "./src/discord/index.ts",
     "./telegram": "./src/telegram/index.ts"
   },

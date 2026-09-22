@@ -1,11 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { fileTypeFromBuffer } from "file-type";
 import {
+  DingTalkTransport,
   DiscordTransport,
   MessagingTransportError,
   TelegramTransport,
+  splitDingTalkText,
   splitDiscordText,
   splitTelegramText,
+  type DingTalkCallbackUpdate,
+  type DingTalkNormalizationResult,
+  type DingTalkPollResult,
+  type DingTalkTransportOptions,
   type MessagingAddress,
   type MessagingConnectionProbe,
   type MessagingDownloadedAttachment,
@@ -88,8 +94,18 @@ export const DEFAULT_DISCORD_MESSAGING_CONFIGURATION: DiscordMessagingConfigurat
   groupActivation: Object.freeze({})
 });
 
-type SupportedMessagingChannel = "telegram" | "discord";
-type SupportedMessagingConfiguration = TelegramMessagingConfiguration | DiscordMessagingConfiguration;
+export interface DingTalkMessagingConfiguration {
+  readonly format: 1;
+  readonly appKey: string;
+  /** Only explicit conversation entries authorize group traffic. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk";
+type SupportedMessagingConfiguration =
+  | TelegramMessagingConfiguration
+  | DiscordMessagingConfiguration
+  | DingTalkMessagingConfiguration;
 
 export type MessagingConnectionTestResult =
   | {
@@ -188,8 +204,22 @@ interface DiscordTransportPort extends MessagingTransportEffectsPort {
   ownerAddress(): MessagingAddress;
 }
 
-type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort;
-type MessagingNormalizationResult = TelegramNormalizationResult | DiscordNormalizationResult;
+interface DingTalkTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "dingtalk";
+  poll(input: {
+    readonly cursor: string | null;
+    readonly timeoutSeconds?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<DingTalkPollResult>;
+  normalize(updates: readonly DingTalkCallbackUpdate[]): DingTalkNormalizationResult;
+  ownerAddress(): MessagingAddress;
+}
+
+type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort;
+type MessagingNormalizationResult =
+  | TelegramNormalizationResult
+  | DiscordNormalizationResult
+  | DingTalkNormalizationResult;
 
 interface CredentialTicketBinding {
   readonly clientConnectionId: string;
@@ -244,11 +274,15 @@ export interface MessagingManagerOptions {
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
   readonly createDiscordTransport?: (options: DiscordTransportOptions) => DiscordTransportPort;
+  readonly createDingTalkTransport?: (options: DingTalkTransportOptions) => DingTalkTransportPort;
   /** Test-only transport seams. Production always uses the providers' official direct endpoints. */
   readonly telegramFetch?: typeof fetch;
   readonly telegramApiBaseUrl?: string;
   readonly discordFetch?: typeof fetch;
   readonly discordApiBaseUrl?: string;
+  readonly dingTalkFetch?: typeof fetch;
+  readonly dingTalkApiBaseUrl?: string;
+  readonly dingTalkOapiBaseUrl?: string;
   readonly pollTimeoutSeconds?: number;
   readonly retryDelayMs?: number;
   readonly now?: () => number;
@@ -267,6 +301,7 @@ export class MessagingManager {
   readonly #artifacts: MessagingManagerOptions["artifacts"];
   readonly #createTelegramTransport: NonNullable<MessagingManagerOptions["createTelegramTransport"]>;
   readonly #createDiscordTransport: NonNullable<MessagingManagerOptions["createDiscordTransport"]>;
+  readonly #createDingTalkTransport: NonNullable<MessagingManagerOptions["createDingTalkTransport"]>;
   readonly #pollTimeoutSeconds: number;
   readonly #retryDelayMs: number;
   readonly #now: () => number;
@@ -300,6 +335,15 @@ export class MessagingManager {
       ...input,
       ...(discordFetch === undefined ? {} : { fetch: discordFetch }),
       ...(discordApiBaseUrl === undefined ? {} : { apiBaseUrl: discordApiBaseUrl })
+    }));
+    const dingTalkFetch = options.dingTalkFetch;
+    const dingTalkApiBaseUrl = options.dingTalkApiBaseUrl;
+    const dingTalkOapiBaseUrl = options.dingTalkOapiBaseUrl;
+    this.#createDingTalkTransport = options.createDingTalkTransport ?? ((input) => new DingTalkTransport({
+      ...input,
+      ...(dingTalkFetch === undefined ? {} : { fetch: dingTalkFetch }),
+      ...(dingTalkApiBaseUrl === undefined ? {} : { apiBaseUrl: dingTalkApiBaseUrl }),
+      ...(dingTalkOapiBaseUrl === undefined ? {} : { oapiBaseUrl: dingTalkOapiBaseUrl })
     }));
   }
 
@@ -370,6 +414,16 @@ export class MessagingManager {
     });
   }
 
+  createDingTalkConnection(input: {
+    readonly configuration: DingTalkMessagingConfiguration;
+  }): MessagingConnectionRecord {
+    this.#assertReady();
+    return this.#store.createMessagingConnection({
+      channel: "dingtalk",
+      configuration: decodeDingTalkConfiguration(input.configuration)
+    });
+  }
+
   beginCredentialUpload(input: {
     readonly clientConnectionId: string;
     readonly messagingConnectionId: string;
@@ -424,7 +478,7 @@ export class MessagingManager {
       try {
         const credential = await this.#credentials.commitNewManagedUpload({
           credentialUploadTicketId: ticketId,
-          displayName: `${channelDisplayName(current.channel)} bot token`,
+          displayName: credentialDisplayName(current.channel),
           kind: "api_key",
           connectionId: binding.clientConnectionId,
           servicePurpose: credentialPurpose(current),
@@ -468,6 +522,7 @@ export class MessagingManager {
         connectionId: current.id,
         expectedRevision: current.revision,
         expectedGeneration: current.generation,
+        clearOwner: current.channel === "dingtalk",
         updatedAt: this.#now()
       });
       this.#restartWorker(updated.id);
@@ -540,6 +595,33 @@ export class MessagingManager {
         expectedGeneration: current.generation,
         configuration: decodeDiscordConfiguration(input.configuration),
         ownerProviderUserId: discordUserId(input.ownerProviderUserId),
+        updatedAt: this.#now()
+      });
+      this.#restartWorker(updated.id);
+      return updated;
+    });
+  }
+
+  replaceDingTalkConfiguration(input: {
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly configuration: DingTalkMessagingConfiguration;
+  }): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
+      assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      if (current.channel !== "dingtalk") throw unavailableChannel();
+      const previous = decodeDingTalkConnection(current);
+      const configuration = decodeDingTalkConfiguration(input.configuration);
+      const updated = this.#store.replaceMessagingConfiguration({
+        connectionId: current.id,
+        expectedRevision: current.revision,
+        expectedGeneration: current.generation,
+        configuration,
+        ...(previous.appKey === configuration.appKey
+          ? {}
+          : { ownerProviderUserId: null }),
         updatedAt: this.#now()
       });
       this.#restartWorker(updated.id);
@@ -652,7 +734,11 @@ export class MessagingManager {
         const text = boundedOutboundText(output.text, channel);
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
         if (text !== "" && text.trim() !== "NO_REPLY") {
-          const parts = channel === "discord" ? splitDiscordText(text) : splitTelegramText(text);
+          const parts = channel === "discord"
+            ? splitDiscordText(text)
+            : channel === "dingtalk"
+              ? splitDingTalkText(text)
+              : splitTelegramText(text);
           for (const part of parts) {
             const partIndex = deliveries.length;
             deliveries.push({
@@ -670,14 +756,15 @@ export class MessagingManager {
         }
         const images = output.attachments.filter((attachment) => attachment.kind === "image");
         const files = output.attachments.filter((attachment) => attachment.kind === "file");
-        for (let index = 0; index < images.length; index += 10) {
+        const imageBatchSize = channel === "dingtalk" ? 1 : 10;
+        for (let index = 0; index < images.length; index += imageBatchSize) {
           const partIndex = deliveries.length;
           deliveries.push({
             kind: "file",
             payload: {
               format: 1,
               address: addressFor(connection, conversation),
-              files: images.slice(index, index + 10),
+              files: images.slice(index, index + imageBatchSize),
               ...shouldQuote(configuration, conversation, partIndex)
                 ? { replyToMessageId: current.providerMessageId }
                 : {}
@@ -713,7 +800,7 @@ export class MessagingManager {
             createdAt: now
           });
         });
-        if (configuration.emojiReactions !== "off" && current.providerMessageId !== undefined) {
+        if (reactionMode(configuration) !== "off" && current.providerMessageId !== undefined) {
           if (connection.channel === "discord") {
             enqueueReaction(store, connection, conversation, {
               dedupeKey: `run:${input.runId}:ack-clear`,
@@ -744,7 +831,7 @@ export class MessagingManager {
           ...(status === "failed" ? { errorCode: "run_failed" } : {}),
           updatedAt: now
         });
-        if (configuration.emojiReactions !== "off" && current.providerMessageId !== undefined) {
+        if (reactionMode(configuration) !== "off" && current.providerMessageId !== undefined) {
           if (connection.channel === "discord") {
             enqueueReaction(store, connection, conversation, {
               dedupeKey: `run:${input.runId}:ack-clear`,
@@ -868,6 +955,14 @@ export class MessagingManager {
         const result = await this.#pollTelegramBatch(transport, connection.cursor ?? null, signal);
         nextCursor = result.nextCursor;
         normalized = transport.normalize(result.updates);
+      } else if (transport.channel === "discord") {
+        const result = await transport.poll({
+          cursor: connection.cursor ?? null,
+          timeoutSeconds: this.#pollTimeoutSeconds,
+          signal
+        });
+        nextCursor = result.nextCursor;
+        normalized = transport.normalize(result.updates);
       } else {
         const result = await transport.poll({
           cursor: connection.cursor ?? null,
@@ -877,6 +972,11 @@ export class MessagingManager {
         nextCursor = result.nextCursor;
         normalized = transport.normalize(result.updates);
       }
+      // A provider can surface a response immediately after accepting an
+      // outbound interaction while the parallel delivery flight is still
+      // committing its receipt. Fence that flight before matching inbound
+      // replies so the durable sent interaction is visible.
+      await this.#deliveryFlights.get(connection.id);
       await this.#processMessagingBatch(connection, transport, normalized, signal);
       const latest = this.#requireWorkerConnection(transport.connectionId, transport.generation);
       if (
@@ -937,48 +1037,93 @@ export class MessagingManager {
     batch: MessagingNormalizationResult,
     signal: AbortSignal
   ): Promise<void> {
+    let activeConnection = connection;
+    if ("ownerClaimProviderUserId" in batch && batch.ownerClaimProviderUserId !== null) {
+      if (connection.channel !== "dingtalk") throw invalid("Only DingTalk can claim an owner from an inbound message.");
+      activeConnection = this.#store.claimMessagingConnectionOwner({
+        connectionId: connection.id,
+        expectedRevision: connection.revision,
+        expectedGeneration: connection.generation,
+        ownerProviderUserId: batch.ownerClaimProviderUserId,
+        updatedAt: this.#now()
+      });
+    }
+    const replyCandidates = "interactionReplyCandidates" in batch
+      ? batch.interactionReplyCandidates
+      : [];
     const interactionReplyMessageIds = new Set<string>();
     for (const event of batch.events) {
-      if (event.kind === "message" && this.#findRepliedInteractionDelivery(connection, event) !== undefined) {
+      if (event.kind === "message" && this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
+        interactionReplyMessageIds.add(event.messageId);
+      }
+    }
+    for (const event of replyCandidates) {
+      if (this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
         interactionReplyMessageIds.add(event.messageId);
       }
     }
     for (const observation of batch.groupObservations) {
       signal.throwIfAborted();
       if (interactionReplyMessageIds.has(observation.messageId)) continue;
-      const conversation = this.#ensureConversation(connection, observation.address, observation.occurredAt);
+      const conversation = this.#ensureConversation(activeConnection, observation.address, observation.occurredAt);
       this.#appendGroupObservation(conversation, observation);
     }
     for (const event of batch.events) {
       signal.throwIfAborted();
       if (event.kind === "message") {
-        if (!await this.#settleTextInteraction(connection, event)) {
-          await this.#admitMessage(connection, transport, event, signal);
+        if (!await this.#settleTextInteraction(activeConnection, event)) {
+          await this.#admitMessage(activeConnection, transport, event, signal);
         }
       }
-      else await this.#settleInteraction(connection, transport, event, signal);
+      else await this.#settleInteraction(activeConnection, transport, event, signal);
+    }
+    for (const event of replyCandidates) {
+      signal.throwIfAborted();
+      const delivery = this.#findTextInteractionDelivery(activeConnection, event);
+      if (delivery !== undefined) await this.#settleTextInteraction(activeConnection, event, delivery);
     }
   }
 
-  #findRepliedInteractionDelivery(
+  #findTextInteractionDelivery(
     connection: MessagingConnectionRecord,
     event: MessagingInboundMessage
   ): MessagingDeliveryRecord | undefined {
-    if (event.replyContext === null) return undefined;
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
-    return this.#store.findSentMessagingInteractionDelivery({
+    if (event.replyContext !== null) {
+      const exact = this.#store.findSentMessagingInteractionDelivery({
+        connectionId: connection.id,
+        channelGeneration: connection.generation,
+        conversationId: conversation.id,
+        providerMessageId: event.replyContext.providerMessageId
+      });
+      if (exact !== undefined) return exact;
+    }
+    if (connection.channel !== "dingtalk" || !event.speaker.isOwner) return undefined;
+    const open = this.#store.listMessagingDeliveries({
       connectionId: connection.id,
-      channelGeneration: connection.generation,
-      conversationId: conversation.id,
-      providerMessageId: event.replyContext.providerMessageId
+      statuses: ["sent"],
+      limit: 1_000
+    }).filter((delivery) => {
+      if (delivery.channelGeneration !== connection.generation
+        || delivery.conversationId !== conversation.id || delivery.kind !== "interaction") return false;
+      try {
+        const card = interactionDeliveryPayload(delivery.payload);
+        if (card.action !== "open") return false;
+        const interaction = this.#store.findInteraction(card.interactionId);
+        return interaction?.status === "open" && interaction.generation === card.interactionGeneration;
+      } catch {
+        return false;
+      }
     });
+    return open.length === 1 ? open[0] : undefined;
   }
 
   async #settleTextInteraction(
     connection: MessagingConnectionRecord,
-    event: MessagingInboundMessage
+    event: MessagingInboundMessage,
+    knownDelivery?: MessagingDeliveryRecord
   ): Promise<boolean> {
-    const delivery = this.#findRepliedInteractionDelivery(connection, event);
+    const delivery = knownDelivery ?? this.#findTextInteractionDelivery(connection, event);
     if (delivery === undefined) return false;
     const conversation = this.#store.getMessagingConversation(delivery.conversationId);
     const responseDigest = operationBodyHash({ text: event.text });
@@ -1017,9 +1162,9 @@ export class MessagingManager {
       } else if (
         card.action === "open" && conversation.status === "active" && conversation.sessionId !== undefined
         && pending.sessionId === conversation.sessionId && pending.status === "open"
-        && pending.generation === card.interactionGeneration && pending.payload.kind === "question"
+        && pending.generation === card.interactionGeneration
       ) {
-        const parsed = parseTelegramQuestionReply(pending.payload.fields, event.text);
+        const parsed = parseMessagingTextInteraction(card, pending, event.text);
         if (parsed.submission === undefined) {
           outcomeCode = "invalid_response";
           notice = parsed.message;
@@ -1162,7 +1307,7 @@ export class MessagingManager {
     if (execution.value.queueItemId === "") throw new Error("Messaging Queue admission failed.");
 
     const configuration = decodeSupportedConnection(connection);
-    if (configuration.emojiReactions !== "off") {
+    if (reactionMode(configuration) !== "off") {
       this.#store.transaction((store) => enqueueReaction(store, connection, activeConversation, {
         dedupeKey: `request:${request.id}:ack`,
         messageId: event.messageId,
@@ -1412,11 +1557,10 @@ export class MessagingManager {
   }
 
   #transportFor(connection: MessagingConnectionRecord): MessagingTransportPort {
-    const configuration = decodeSupportedConnection(connection);
+    decodeSupportedConnection(connection);
     if (
       connection.credentialReferenceId === undefined ||
-      connection.credentialGeneration === undefined ||
-      connection.ownerProviderUserId === undefined
+      connection.credentialGeneration === undefined
     ) throw credentialUnavailable();
     const descriptor = this.#credentials.find(connection.credentialReferenceId);
     if (
@@ -1425,6 +1569,8 @@ export class MessagingManager {
     ) throw credentialUnavailable();
     const token = this.#credentials.resolve(connection.credentialReferenceId);
     if (connection.channel === "telegram") {
+      const configuration = decodeTelegramConnection(connection);
+      if (connection.ownerProviderUserId === undefined) throw credentialUnavailable();
       return this.#createTelegramTransport({
         token,
         connectionId: connection.id,
@@ -1434,11 +1580,26 @@ export class MessagingManager {
         now: this.#now
       });
     }
-    return this.#createDiscordTransport({
-      token,
+    if (connection.channel === "discord") {
+      const configuration = decodeDiscordConnection(connection);
+      if (connection.ownerProviderUserId === undefined) throw credentialUnavailable();
+      return this.#createDiscordTransport({
+        token,
+        connectionId: connection.id,
+        generation: connection.generation,
+        ownerUserId: discordUserId(connection.ownerProviderUserId),
+        groupActivation: configuration.groupActivation,
+        initialCursor: connection.cursor ?? null,
+        now: this.#now
+      });
+    }
+    const configuration = decodeDingTalkConnection(connection);
+    return this.#createDingTalkTransport({
+      appKey: configuration.appKey,
+      appSecret: token,
       connectionId: connection.id,
       generation: connection.generation,
-      ownerUserId: discordUserId(connection.ownerProviderUserId),
+      ownerUserId: connection.ownerProviderUserId ?? null,
       groupActivation: configuration.groupActivation,
       initialCursor: connection.cursor ?? null,
       now: this.#now
@@ -2097,7 +2258,7 @@ function messagingInteractionCard(
     return undefined;
   }
   if (buttons.length > 100 || (buttons.length < 1 && payload.kind !== "question")) return undefined;
-  const visibleButtons = channel === "discord" ? buttons.slice(0, 25) : buttons;
+  const visibleButtons = channel === "discord" || channel === "dingtalk" ? buttons.slice(0, 25) : buttons;
   return {
     interactionId: interaction.id,
     interactionGeneration: interaction.generation,
@@ -2164,6 +2325,30 @@ function parseTelegramQuestionReply(
     answers.push({ fieldId: field.id, value: parsed.value });
   }
   return { submission: { kind: "question", answers }, message: "Response recorded." };
+}
+
+function parseMessagingTextInteraction(
+  card: Extract<MessagingInteractionDeliveryPayload, { readonly action: "open" }>,
+  interaction: InteractionRecord,
+  source: string
+): { readonly submission?: InteractionDecisionSubmission; readonly message: string } {
+  const normalized = source.normalize("NFC").trim();
+  const ordinal = /^(?:0|[1-9][0-9]{0,2})$/u.test(normalized) ? Number(normalized) : Number.NaN;
+  const matchingButtons = Number.isSafeInteger(ordinal) && ordinal >= 1 && ordinal <= card.buttons.length
+    ? [card.buttons[ordinal - 1]!]
+    : card.buttons.filter((button) =>
+        button.label.trim().toLocaleLowerCase("en-US") === normalized.toLocaleLowerCase("en-US"));
+  if (matchingButtons.length === 1) {
+    return { submission: matchingButtons[0]!.submission, message: "Response recorded." };
+  }
+  if (interaction.payload.kind === "question") {
+    return parseTelegramQuestionReply(interaction.payload.fields, source);
+  }
+  return {
+    message: card.buttons.length === 0
+      ? "This request cannot be answered from this channel."
+      : "Reply with one advertised choice number or label."
+  };
 }
 
 function parseTelegramQuestionField(
@@ -2323,13 +2508,21 @@ function shouldQuote(
   conversation: MessagingConversationRecord,
   partIndex: number
 ): boolean {
+  if (!("replyQuoteDm" in configuration)) return false;
   if (conversation.conversationKind === "direct") return configuration.replyQuoteDm === "first" && partIndex === 0;
   return configuration.replyQuoteGroup === "all" || (configuration.replyQuoteGroup === "first" && partIndex === 0);
+}
+
+function reactionMode(
+  configuration: SupportedMessagingConfiguration
+): "off" | "minimal" | "expressive" {
+  return "emojiReactions" in configuration ? configuration.emojiReactions : "off";
 }
 
 function decodeSupportedConnection(connection: MessagingConnectionRecord): SupportedMessagingConfiguration {
   if (connection.channel === "telegram") return decodeTelegramConnection(connection);
   if (connection.channel === "discord") return decodeDiscordConnection(connection);
+  if (connection.channel === "dingtalk") return decodeDingTalkConnection(connection);
   throw unavailableChannel();
 }
 
@@ -2441,6 +2634,42 @@ export function decodeDiscordMessagingConfiguration(value: unknown): DiscordMess
   return decodeDiscordConfiguration(value);
 }
 
+function decodeDingTalkConnection(connection: MessagingConnectionRecord): DingTalkMessagingConfiguration {
+  if (connection.channel !== "dingtalk") throw unavailableChannel();
+  if (connection.ownerProviderUserId !== undefined) {
+    dingTalkProviderId(connection.ownerProviderUserId, "owner identity", 512);
+  }
+  return decodeDingTalkConfiguration(connection.configuration);
+}
+
+function decodeDingTalkConfiguration(value: unknown): DingTalkMessagingConfiguration {
+  if (!isRecord(value) || value["format"] !== 1) throw invalid("DingTalk configuration is invalid.");
+  const keys = Object.keys(value).sort();
+  const expected = ["appKey", "format", "groupActivation"].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw invalid("DingTalk configuration contains unsupported fields.");
+  }
+  const appKey = dingTalkProviderId(value["appKey"], "app key", 256);
+  const rawActivation = value["groupActivation"];
+  if (!isRecord(rawActivation) || Object.keys(rawActivation).length > 1_000) {
+    throw invalid("DingTalk group activation map is invalid.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const [conversationId, activation] of Object.entries(rawActivation)) {
+    const id = dingTalkProviderId(conversationId, "group identity", 512);
+    if (!isOneOf(activation, ["mention", "always", "disabled"] as const)) {
+      throw invalid("DingTalk group activation mode is invalid.");
+    }
+    groupActivation[id] = activation;
+  }
+  return { format: 1, appKey, groupActivation };
+}
+
+/** Strict current-v1 decoder shared by the authenticated contract projection. */
+export function decodeDingTalkMessagingConfiguration(value: unknown): DingTalkMessagingConfiguration {
+  return decodeDingTalkConfiguration(value);
+}
+
 async function verifiedAttachmentMime(
   channel: SupportedMessagingChannel,
   kind: "image" | "file",
@@ -2494,7 +2723,7 @@ function runtimeFailure(error: unknown, channel: string): {
       return { status: "auth_loss", code: "invalid_credential", summary: `${name} rejected the managed credential.`, retryable: false };
     }
     if (error.code === "conflict") {
-      return { status: "conflict", code: "polling_conflict", summary: "Another client is polling this Telegram bot.", retryable: true };
+      return { status: "conflict", code: "polling_conflict", summary: `Another client is connected to this ${name} bot.`, retryable: true };
     }
     return {
       status: "error",
@@ -2606,8 +2835,17 @@ function discordUserId(value: string): string {
   return normalized;
 }
 
+function dingTalkProviderId(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== "string") throw invalid(`DingTalk ${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length < 1 || normalized.length > maximum || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw invalid(`DingTalk ${label} is invalid.`);
+  }
+  return normalized;
+}
+
 function isSupportedMessagingChannel(value: string): value is SupportedMessagingChannel {
-  return value === "telegram" || value === "discord";
+  return value === "telegram" || value === "discord" || value === "dingtalk";
 }
 
 function requiredSupportedMessagingChannel(value: string): SupportedMessagingChannel {
@@ -2618,7 +2856,12 @@ function requiredSupportedMessagingChannel(value: string): SupportedMessagingCha
 function channelDisplayName(value: string): string {
   if (value === "telegram") return "Telegram";
   if (value === "discord") return "Discord";
+  if (value === "dingtalk") return "DingTalk";
   return "Messaging provider";
+}
+
+function credentialDisplayName(channel: SupportedMessagingChannel): string {
+  return channel === "dingtalk" ? "DingTalk App Secret" : `${channelDisplayName(channel)} bot token`;
 }
 
 function credentialPurpose(connection: MessagingConnectionRecord): string {
@@ -2663,7 +2906,7 @@ function isOneOf<const T extends readonly string[]>(value: unknown, options: T):
 
 function validAddress(value: unknown): value is MessagingAddress {
   if (!isRecord(value)) return false;
-  return isOneOf(value["channel"], ["telegram", "discord"] as const) && typeof value["connectionId"] === "string" &&
+  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk"] as const) && typeof value["connectionId"] === "string" &&
     typeof value["providerConversationId"] === "string" &&
     (value["providerThreadId"] === null || typeof value["providerThreadId"] === "string") &&
     isOneOf(value["conversationKind"], ["direct", "group", "channel"] as const);

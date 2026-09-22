@@ -105,6 +105,7 @@ import type {
   CreateCollaborationGoalInput,
   CreateCollaborationWorkerInput,
   CreateMessagingConnectionInput,
+  ClaimMessagingConnectionOwnerInput,
   CreateMessagingInboundRequestInput,
   CreateRemoteHostInput,
   CreateDeviceInput,
@@ -4570,6 +4571,7 @@ export class OperationalStore {
     readonly connectionId: string;
     readonly expectedRevision: bigint;
     readonly expectedGeneration: number;
+    readonly clearOwner?: boolean;
     readonly updatedAt?: number;
   }): MessagingConnectionRecord {
     return this.transaction(() => {
@@ -4587,12 +4589,14 @@ export class OperationalStore {
         UPDATE messaging_channels
         SET generation = ?, enabled = 0, runtime_status = 'idle',
             credential_reference_id = NULL, credential_generation = NULL,
+            owner_provider_user_id = ?,
             provider_account_id = NULL, provider_username = NULL,
             cursor = NULL, error_code = NULL, error_summary = NULL, last_connected_at = NULL,
             updated_at = ?, revision = ?
         WHERE id = ? AND revision = ? AND generation = ?
       `).run(
         nextGeneration,
+        input.clearOwner === true ? null : current.ownerProviderUserId ?? null,
         at,
         asSqlInteger(this.requireActiveRevision()),
         current.id,
@@ -4658,7 +4662,7 @@ export class OperationalStore {
     readonly expectedRevision: bigint;
     readonly expectedGeneration: number;
     readonly configuration: unknown;
-    readonly ownerProviderUserId?: string;
+    readonly ownerProviderUserId?: string | null;
     readonly updatedAt?: number;
   }): MessagingConnectionRecord {
     return this.transaction(() => {
@@ -4668,7 +4672,9 @@ export class OperationalStore {
       const configurationJson = messagingConfigurationJson(input.configuration);
       const owner = input.ownerProviderUserId === undefined
         ? current.ownerProviderUserId ?? null
-        : messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
+        : input.ownerProviderUserId === null
+          ? null
+          : messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
       const at = Math.max(current.createdAt, messagingTimestamp(
         input.updatedAt ?? this.now(),
         "connection configuration time"
@@ -4703,6 +4709,37 @@ export class OperationalStore {
         current.id,
         current.generation
       );
+      return this.getMessagingConnection(current.id);
+    });
+  }
+
+  claimMessagingConnectionOwner(input: ClaimMessagingConnectionOwnerInput): MessagingConnectionRecord {
+    return this.write(() => {
+      const current = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(current, input.expectedGeneration);
+      const owner = messagingIdentity(input.ownerProviderUserId, "owner user ID", 512);
+      if (current.ownerProviderUserId === owner) return current;
+      if (current.ownerProviderUserId !== undefined) {
+        throw new StoreError("Messaging connection ownership has already been claimed.");
+      }
+      assertMessagingRevision("Messaging connection", current.id, current.revision, input.expectedRevision);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "connection ownership claim time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_channels
+        SET owner_provider_user_id = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND generation = ? AND owner_provider_user_id IS NULL
+      `).run(
+        owner,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        current.generation
+      );
+      if (result.changes !== 1) throw messagingRevisionConflict(this, current);
       return this.getMessagingConnection(current.id);
     });
   }

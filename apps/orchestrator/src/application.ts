@@ -430,6 +430,8 @@ export interface OrchestratorApplicationDependencies {
   /** Test-only direct-Messaging loopback seams; not sourced from product configuration. */
   readonly messagingTelegramApiBaseUrl?: string;
   readonly messagingDiscordApiBaseUrl?: string;
+  readonly messagingDingTalkApiBaseUrl?: string;
+  readonly messagingDingTalkOapiBaseUrl?: string;
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -1307,6 +1309,12 @@ export async function createOrchestratorApplication(
     ...(dependencies.messagingDiscordApiBaseUrl === undefined
       ? {}
       : { discordApiBaseUrl: dependencies.messagingDiscordApiBaseUrl }),
+    ...(dependencies.messagingDingTalkApiBaseUrl === undefined
+      ? {}
+      : { dingTalkApiBaseUrl: dependencies.messagingDingTalkApiBaseUrl }),
+    ...(dependencies.messagingDingTalkOapiBaseUrl === undefined
+      ? {}
+      : { dingTalkOapiBaseUrl: dependencies.messagingDingTalkOapiBaseUrl }),
     ...(dependencies.messagingPollTimeoutSeconds === undefined
       ? {}
       : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),

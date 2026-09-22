@@ -4785,6 +4785,7 @@ const en = {
   ,"messaging.comingSoon": "Not available yet"
   ,"messaging.addTelegram": "Add Telegram"
   ,"messaging.addDiscord": "Add Discord"
+  ,"messaging.addDingTalk": "Add DingTalk"
   ,"messaging.loadFailed": "Could not load Messaging settings."
   ,"messaging.actionFailed": "Could not complete the Messaging action."
   ,"messaging.connectionChanged": "The Messaging connection changed. Review the refreshed settings and try again."
@@ -4799,7 +4800,7 @@ const en = {
   ,"messaging.connections": "Connections"
   ,"messaging.connectionsBody": "Each external account has an independent credential, transport generation, and conversation-to-task mapping."
   ,"messaging.emptyTitle": "No messaging connections"
-  ,"messaging.emptyBody": "Add Telegram or Discord to receive direct messages and group conversations in Joko tasks."
+  ,"messaging.emptyBody": "Add Telegram, Discord, or DingTalk to receive direct messages and group conversations in Joko tasks."
   ,"messaging.ownerIdentity": "Owner ID {id}"
   ,"messaging.toggleConnection": "Enable or disable this Messaging connection"
   ,"messaging.credential": "Credential"
@@ -4821,14 +4822,32 @@ const en = {
   ,"messaging.discordOwnerId": "Discord owner user ID"
   ,"messaging.discordOwnerIdBody": "Use the 17–20 digit Discord user ID, not a display name or username."
   ,"messaging.discordDeveloperPortal": "Open the Discord Developer Portal"
+  ,"messaging.dingtalkCreateTitle": "Add DingTalk"
+  ,"messaging.dingtalkCreateBody": "Enter the application identity now. The first direct-message sender claims the owner identity; only explicitly approved group conversations are admitted."
+  ,"messaging.dingtalkAppKey": "DingTalk AppKey"
+  ,"messaging.dingtalkAppKeyBody": "Use the AppKey (client ID) from the DingTalk developer console. The AppSecret is added separately through the protected credential form."
+  ,"messaging.dingtalkOwnerId": "DingTalk owner user ID"
+  ,"messaging.dingtalkAwaitingOwner": "Waiting for first direct message"
   ,"messaging.botToken": "Bot token"
   ,"messaging.credentialBody": "Replacing the token retires the previous transport generation and its pending work."
   ,"messaging.enableAfterSave": "Connect after saving"
   ,"messaging.secretSafety": "The token uses a one-shot managed credential channel and is never stored in settings or task history."
+  ,"messaging.dingtalkAppSecret": "DingTalk AppSecret"
+  ,"messaging.dingtalkAddCredential": "Add AppSecret"
+  ,"messaging.dingtalkReplaceCredential": "Replace AppSecret"
+  ,"messaging.dingtalkClearCredential": "Clear AppSecret"
+  ,"messaging.dingtalkCredentialBody": "Replacing the AppSecret retires the previous Stream transport generation and its pending work."
+  ,"messaging.dingtalkSecretSafety": "The AppSecret uses a one-shot managed credential channel and is never stored in settings or task history."
   ,"messaging.configureTitle": "Telegram behavior"
   ,"messaging.configureBody": "Configure replies, reactions, and the activation policy for each group."
   ,"messaging.discordConfigureTitle": "Discord behavior"
   ,"messaging.discordConfigureBody": "Configure lifecycle notices, replies, reactions, and the activation policy for approved server channels."
+  ,"messaging.dingtalkConfigureTitle": "DingTalk behavior"
+  ,"messaging.dingtalkConfigureBody": "Configure the application identity and activation policy for explicitly approved group conversations."
+  ,"messaging.dingtalkAppKeyChangeBody": "Changing the AppKey retires the active transport and clears the claimed owner. The next direct-message sender claims ownership again."
+  ,"messaging.dingtalkGroupActivation": "Group conversation activation rules"
+  ,"messaging.dingtalkGroupActivationBody": "Enter one approved conversation ID per line as conversationId=mention, conversationId=always, or conversationId=disabled. Unlisted group conversations are rejected."
+  ,"messaging.dingtalkGroupActivationInvalid": "Use one unique, non-empty conversation ID per line with mention, always, or disabled."
   ,"messaging.lifecycleAnnouncements": "Lifecycle announcements"
   ,"messaging.lifecycleAnnouncementsBody": "Post online, offline, and recovery notices to the owner conversation when a route is available."
   ,"messaging.emojiReactions": "Acknowledgement reactions"
@@ -4845,6 +4864,7 @@ const en = {
   ,"messaging.discordGroupActivationBody": "Enter one approved server/channel pair per line as guildId/channelId=mention, =always, or =disabled. Unlisted server channels are rejected."
   ,"messaging.discordGroupActivationInvalid": "Use one unique pair of 17–20 digit server and channel IDs per line with mention, always, or disabled."
   ,"messaging.clearTitle": "Clear bot token?"
+  ,"messaging.dingtalkClearTitle": "Clear DingTalk AppSecret?"
   ,"messaging.clearBody": "The connection goes offline immediately. Existing tasks remain visible, but this transport and its pending work are retired."
   ,"messaging.target": "Workspace"
   ,"messaging.model": "Model"
@@ -4864,6 +4884,7 @@ const en = {
   ,"messaging.testFailure.channelUnavailable": "This channel is not available on the node."
   ,"messaging.testFailure.connectionFailed": "The provider could not be reached or rejected the token."
   ,"messaging.status.idle": "Needs token"
+  ,"messaging.status.dingtalkIdle": "Needs AppSecret"
   ,"messaging.status.connecting": "Connecting"
   ,"messaging.status.connected": "Connected"
   ,"messaging.status.offline": "Offline"
@@ -7736,6 +7757,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.comingSoon": "尚不可用",
     "messaging.addTelegram": "添加 Telegram",
     "messaging.addDiscord": "添加 Discord",
+    "messaging.addDingTalk": "添加钉钉",
     "messaging.loadFailed": "无法加载消息渠道设置。",
     "messaging.actionFailed": "无法完成消息渠道操作。",
     "messaging.connectionChanged": "消息连接已发生变化。请检查刷新的设置后重试。",
@@ -7750,7 +7772,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.connections": "连接",
     "messaging.connectionsBody": "每个外部账号都有独立凭证、传输代际和会话到任务的映射。",
     "messaging.emptyTitle": "没有消息连接",
-    "messaging.emptyBody": "添加 Telegram 或 Discord，将私聊与群组会话接入 Joko 任务。",
+    "messaging.emptyBody": "添加 Telegram、Discord 或钉钉，将私聊与群组会话接入 Joko 任务。",
     "messaging.ownerIdentity": "所有者 ID {id}",
     "messaging.toggleConnection": "启用或停用此消息连接",
     "messaging.credential": "凭证",
@@ -7772,14 +7794,32 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.discordOwnerId": "Discord 所有者用户 ID",
     "messaging.discordOwnerIdBody": "请使用 17–20 位 Discord 用户 ID，不要使用显示名或用户名。",
     "messaging.discordDeveloperPortal": "打开 Discord Developer Portal",
+    "messaging.dingtalkCreateTitle": "添加钉钉",
+    "messaging.dingtalkCreateBody": "先填写应用身份。第一位发送私聊的用户会认领所有者身份；只有明确批准的群会话才能接入。",
+    "messaging.dingtalkAppKey": "钉钉 AppKey",
+    "messaging.dingtalkAppKeyBody": "请使用钉钉开发者后台中的 AppKey（客户端 ID）。AppSecret 会通过受保护的凭证表单单独添加。",
+    "messaging.dingtalkOwnerId": "钉钉所有者用户 ID",
+    "messaging.dingtalkAwaitingOwner": "等待首位私聊用户认领",
     "messaging.botToken": "机器人令牌",
     "messaging.credentialBody": "替换令牌会退休旧传输代际及其待处理工作。",
     "messaging.enableAfterSave": "保存后连接",
     "messaging.secretSafety": "令牌仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
+    "messaging.dingtalkAppSecret": "钉钉 AppSecret",
+    "messaging.dingtalkAddCredential": "添加 AppSecret",
+    "messaging.dingtalkReplaceCredential": "替换 AppSecret",
+    "messaging.dingtalkClearCredential": "清除 AppSecret",
+    "messaging.dingtalkCredentialBody": "替换 AppSecret 会退休旧的 Stream 传输代际及其待处理工作。",
+    "messaging.dingtalkSecretSafety": "AppSecret 仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
     "messaging.configureTitle": "Telegram 行为",
     "messaging.configureBody": "配置回复、反应及每个群组的激活策略。",
     "messaging.discordConfigureTitle": "Discord 行为",
     "messaging.discordConfigureBody": "配置生命周期通知、回复、反应以及已批准服务器频道的激活策略。",
+    "messaging.dingtalkConfigureTitle": "钉钉行为",
+    "messaging.dingtalkConfigureBody": "配置应用身份，以及明确批准的群会话激活策略。",
+    "messaging.dingtalkAppKeyChangeBody": "修改 AppKey 会退休当前传输并清除已认领的所有者；下一位发送私聊的用户会重新认领。",
+    "messaging.dingtalkGroupActivation": "群会话激活规则",
+    "messaging.dingtalkGroupActivationBody": "每行输入一个已批准的会话 ID，格式为 conversationId=mention、conversationId=always 或 conversationId=disabled。未列出的群会话会被拒绝。",
+    "messaging.dingtalkGroupActivationInvalid": "每行使用一个唯一且非空的会话 ID，并选择 mention、always 或 disabled。",
     "messaging.lifecycleAnnouncements": "生命周期通知",
     "messaging.lifecycleAnnouncementsBody": "存在可用路由时，在所有者会话中发布上线、离线和恢复通知。",
     "messaging.emojiReactions": "确认反应",
@@ -7796,6 +7836,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.discordGroupActivationBody": "每行输入一个已批准的服务器/频道组合，格式为 guildId/channelId=mention、=always 或 =disabled。未列出的服务器频道会被拒绝。",
     "messaging.discordGroupActivationInvalid": "每行使用一组唯一的 17–20 位服务器与频道 ID，并选择 mention、always 或 disabled。",
     "messaging.clearTitle": "清除机器人令牌？",
+    "messaging.dingtalkClearTitle": "清除钉钉 AppSecret？",
     "messaging.clearBody": "连接会立即离线。现有任务仍可见，但当前传输及其待处理工作会被退休。",
     "messaging.target": "工作区",
     "messaging.model": "模型",
@@ -7815,6 +7856,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.testFailure.channelUnavailable": "此节点尚不支持该渠道。",
     "messaging.testFailure.connectionFailed": "无法访问提供方，或令牌被拒绝。",
     "messaging.status.idle": "需要令牌",
+    "messaging.status.dingtalkIdle": "需要 AppSecret",
     "messaging.status.connecting": "正在连接",
     "messaging.status.connected": "已连接",
     "messaging.status.offline": "离线",

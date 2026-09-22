@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright-core";
 import {
+  DingTalkGroupActivation,
   DiscordEmojiReactions,
   DiscordGroupActivation,
   DiscordReplyQuoteMode,
@@ -11,6 +12,12 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
+import {
+  DINGTALK_SYSTEM_APP_KEY,
+  DINGTALK_SYSTEM_APP_SECRET,
+  DINGTALK_SYSTEM_GROUP_ID,
+  DingTalkSystemFixture
+} from "./dingtalk-system-fixture.js";
 import {
   DISCORD_SYSTEM_GUILD_ID,
   DISCORD_SYSTEM_OWNER_ID,
@@ -33,6 +40,7 @@ describe("mounted Messaging Settings product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let telegram: TelegramSystemFixture | undefined;
   let discord: DiscordSystemFixture | undefined;
+  let dingtalk: DingTalkSystemFixture | undefined;
   let browser: Browser | undefined;
 
   afterEach(async () => {
@@ -44,17 +52,22 @@ describe("mounted Messaging Settings product chain", () => {
     telegram = undefined;
     await discord?.close();
     discord = undefined;
+    await dingtalk?.close();
+    dingtalk = undefined;
   });
 
-  mountedIt("configures the complete Telegram and Discord matrix through wide and narrow production Web", { timeout: 120_000 }, async () => {
+  mountedIt("configures the complete Telegram, Discord, and DingTalk matrix through wide and narrow production Web", { timeout: 120_000 }, async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
     telegram = await TelegramSystemFixture.start();
     discord = await DiscordSystemFixture.start();
+    dingtalk = await DingTalkSystemFixture.start();
     fixture = await RealPiSystemFixture.start({
       webDirectory,
       telegramApiBaseUrl: telegram.baseUrl,
       discordApiBaseUrl: discord.apiBaseUrl,
+      dingTalkApiBaseUrl: dingtalk.baseUrl,
+      dingTalkOapiBaseUrl: dingtalk.baseUrl,
       messagingPollTimeoutSeconds: 1,
       messagingRetryDelayMs: 250
     });
@@ -82,9 +95,10 @@ describe("mounted Messaging Settings product chain", () => {
     });
     browserErrors.splice(0);
     expect(await settings.locator(".messaging-channel").count()).toBe(8);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(2);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(3);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Discord", { exact: true }).waitFor({ state: "visible" });
+    await settings.getByText("DingTalk", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Slack", { exact: true }).waitFor({ state: "visible" });
 
     await settings.getByRole("button", { name: "Set route", exact: true }).click();
@@ -211,6 +225,59 @@ describe("mounted Messaging Settings product chain", () => {
     await page.keyboard.press("Escape");
     await discordConfigurationDialog.waitFor({ state: "hidden" });
 
+    await settings.getByRole("button", { name: "Add DingTalk", exact: true }).first().click();
+    const dingtalkCreateDialog = page.getByRole("dialog", { name: "Add DingTalk" });
+    await dingtalkCreateDialog.getByLabel("DingTalk AppKey").fill(DINGTALK_SYSTEM_APP_KEY);
+    await dingtalkCreateDialog.getByRole("button", { name: "Continue", exact: true }).click();
+    const dingtalkCredentialDialog = page.getByRole("dialog", { name: "Add AppSecret" });
+    await dingtalkCredentialDialog.getByLabel("DingTalk AppSecret").fill(DINGTALK_SYSTEM_APP_SECRET);
+    await dingtalkCredentialDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await dingtalkCredentialDialog.waitFor({ state: "hidden" });
+    expect(await page.locator("body").innerText()).not.toContain(DINGTALK_SYSTEM_APP_SECRET);
+
+    const dingtalkCard = settings.locator(".messaging-connection-card").filter({ hasText: "DingTalk" });
+    await dingtalkCard.getByText("Connected", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    await dingtalkCard.getByText("Waiting for first direct message", { exact: true }).first().waitFor({ state: "visible" });
+    await dingtalkCard.getByRole("button", { name: "Test", exact: true }).click();
+    await dingtalkCard.getByText("Connected as DingTalk bot.", { exact: true }).waitFor({
+      state: "visible",
+      timeout: 15_000
+    });
+
+    await dingtalkCard.getByRole("button", { name: "Configure", exact: true }).click();
+    let dingtalkConfigurationDialog = page.getByRole("dialog", { name: "DingTalk behavior" });
+    expect(await dingtalkConfigurationDialog.getByLabel("DingTalk AppKey").inputValue())
+      .toBe(DINGTALK_SYSTEM_APP_KEY);
+    await dingtalkConfigurationDialog.getByLabel("Group conversation activation rules").fill(
+      `${DINGTALK_SYSTEM_GROUP_ID}=always\ncid-ding-muted=disabled`
+    );
+    await dingtalkConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await dingtalkConfigurationDialog.waitFor({ state: "hidden" });
+
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.dingtalkConfiguration?.appKey === DINGTALK_SYSTEM_APP_KEY
+        && connection.ownerProviderUserId === undefined
+        && connection.dingtalkConfiguration.groupActivationRules.some((rule) =>
+          rule.conversationId === DINGTALK_SYSTEM_GROUP_ID
+          && rule.activation === DingTalkGroupActivation.ALWAYS)
+        && connection.dingtalkConfiguration.groupActivationRules.some((rule) =>
+          rule.conversationId === "cid-ding-muted"
+          && rule.activation === DingTalkGroupActivation.DISABLED)),
+      "the mounted DingTalk behavior matrix",
+      15_000
+    );
+
+    await dingtalkCard.getByRole("button", { name: "Configure", exact: true }).click();
+    dingtalkConfigurationDialog = page.getByRole("dialog", { name: "DingTalk behavior" });
+    expect(await dingtalkConfigurationDialog.getByLabel("DingTalk AppKey").inputValue())
+      .toBe(DINGTALK_SYSTEM_APP_KEY);
+    expect(await dingtalkConfigurationDialog.getByLabel("Group conversation activation rules").inputValue())
+      .toBe(`${DINGTALK_SYSTEM_GROUP_ID}=always\ncid-ding-muted=disabled`);
+    await page.keyboard.press("Escape");
+    await dingtalkConfigurationDialog.waitFor({ state: "hidden" });
+
     await card.getByRole("button", { name: "Clear token", exact: true }).click();
     const clearDialog = page.getByRole("alertdialog", { name: "Clear bot token?" });
     await clearDialog.getByText("The connection goes offline immediately", { exact: false }).waitFor({ state: "visible" });
@@ -230,13 +297,35 @@ describe("mounted Messaging Settings product chain", () => {
       15_000
     );
 
+    await dingtalkCard.getByRole("button", { name: "Clear AppSecret", exact: true }).click();
+    const dingtalkClearDialog = page.getByRole("alertdialog", { name: "Clear DingTalk AppSecret?" });
+    await dingtalkClearDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await dingtalkClearDialog.waitFor({ state: "hidden" });
+    await dingtalkCard.getByRole("button", { name: "Clear AppSecret", exact: true }).click();
+    const confirmedDingTalkClearDialog = page.getByRole("alertdialog", { name: "Clear DingTalk AppSecret?" });
+    await confirmedDingTalkClearDialog.getByRole("button", { name: "Clear AppSecret", exact: true }).click();
+    await confirmedDingTalkClearDialog.waitFor({ state: "hidden" });
+    await dingtalkCard.getByText("Needs AppSecret", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.channel === MessagingChannel.DINGTALK
+        && connection.ownerProviderUserId === undefined
+        && !connection.credentialConfigured
+        && !connection.enabled),
+      "the mounted DingTalk credential and provisional owner clear",
+      15_000
+    );
+
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     await page.setViewportSize({ width: 390, height: 844 });
     await card.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     await discordCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
+    await dingtalkCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(await card.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await discordCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    expect(await dingtalkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
 
     const durableProjection = JSON.stringify({
@@ -246,6 +335,7 @@ describe("mounted Messaging Settings product chain", () => {
     }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
     expect(durableProjection).not.toContain(TELEGRAM_SYSTEM_TOKEN);
     expect(durableProjection).not.toContain(DISCORD_SYSTEM_TOKEN);
+    expect(durableProjection).not.toContain(DINGTALK_SYSTEM_APP_SECRET);
   });
 });
 

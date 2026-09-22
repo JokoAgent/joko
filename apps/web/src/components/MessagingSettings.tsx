@@ -16,6 +16,7 @@ import {
 import type { AppController } from "../controller.js";
 import type {
   AppSnapshot,
+  DingTalkMessagingConfigurationView,
   DiscordMessagingConfigurationView,
   MessagingChannelView,
   MessagingConnectionTestResultView,
@@ -55,7 +56,7 @@ const DEFAULT_DISCORD_CONFIGURATION: DiscordMessagingConfigurationView = Object.
 });
 
 type MessagingDialog =
-  | { readonly kind: "create"; readonly channel: "telegram" | "discord" }
+  | { readonly kind: "create"; readonly channel: "telegram" | "discord" | "dingtalk" }
   | { readonly kind: "credential"; readonly connectionId: string }
   | { readonly kind: "configuration"; readonly connectionId: string }
   | { readonly kind: "clear"; readonly connectionId: string }
@@ -172,14 +173,18 @@ export function MessagingSettings({ controller, snapshot, t }: {
     capability.channel === "telegram" && capability.available) === true;
   const discordAvailable = settings?.channels.some((capability) =>
     capability.channel === "discord" && capability.available) === true;
+  const dingtalkAvailable = settings?.channels.some((capability) =>
+    capability.channel === "dingtalk" && capability.available) === true;
 
   const createConnection = async (
-    channel: "telegram" | "discord",
-    ownerProviderUserId: string
+    channel: "telegram" | "discord" | "dingtalk",
+    identity: string
   ): Promise<void> => {
     const connection = await run(`create:${channel}`, () => channel === "telegram"
-      ? controller.createTelegramMessagingConnection(ownerProviderUserId, DEFAULT_TELEGRAM_CONFIGURATION)
-      : controller.createDiscordMessagingConnection(ownerProviderUserId, DEFAULT_DISCORD_CONFIGURATION));
+      ? controller.createTelegramMessagingConnection(identity, DEFAULT_TELEGRAM_CONFIGURATION)
+      : channel === "discord"
+        ? controller.createDiscordMessagingConnection(identity, DEFAULT_DISCORD_CONFIGURATION)
+        : controller.createDingTalkMessagingConnection({ appKey: identity, groupActivation: {} }));
     if (connection === undefined) return;
     replaceConnection(connection);
     setDialog({ kind: "credential", connectionId: connection.id });
@@ -323,6 +328,38 @@ export function MessagingSettings({ controller, snapshot, t }: {
     setDialog(undefined);
   };
 
+  const updateDingTalkConfiguration = async (
+    connection: MessagingConnectionView,
+    configuration: DingTalkMessagingConfigurationView
+  ): Promise<void> => {
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.updateDingTalkMessagingConfiguration(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        configuration
+      );
+      let candidate = await refreshConnection(connection);
+      if (dingtalkConfigurationEqual(candidate.dingtalkConfiguration, configuration)) return candidate;
+      if (candidate.generation !== connection.generation
+        || !dingtalkConfigurationEqual(candidate.dingtalkConfiguration, connection.dingtalkConfiguration)) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (dingtalkConfigurationEqual(candidate.dingtalkConfiguration, configuration)) return candidate;
+        if (candidate.generation !== connection.generation
+          || !dingtalkConfigurationEqual(candidate.dingtalkConfiguration, connection.dingtalkConfiguration)) throw reason;
+        return save(candidate);
+      }
+    });
+    if (updated === undefined) return;
+    replaceConnection(updated);
+    setDialog(undefined);
+  };
+
   const clearCredential = async (connection: MessagingConnectionView): Promise<void> => {
     const updated = await run(`clear:${connection.id}`, async () => {
       const clear = (candidate: MessagingConnectionView) => controller.clearMessagingCredential(
@@ -382,6 +419,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
         {discordAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "discord" })}>
           <Plus aria-hidden="true" />{t("messaging.addDiscord")}
         </Button>}
+        {dingtalkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "dingtalk" })}>
+          <Plus aria-hidden="true" />{t("messaging.addDingTalk")}
+        </Button>}
       </div>
     </header>
 
@@ -422,6 +462,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
           {discordAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "discord" })}>
             <Plus aria-hidden="true" />{t("messaging.addDiscord")}
           </Button>}
+          {dingtalkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "dingtalk" })}>
+            <Plus aria-hidden="true" />{t("messaging.addDingTalk")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -434,11 +477,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
                   <div>
                     <div className="messaging-connection-card__title-row">
                       <h4>{channelLabel(connection.channel)}</h4>
-                      <ConnectionStatus status={connection.runtimeStatus} t={t} />
+                      <ConnectionStatus status={connection.runtimeStatus} channel={connection.channel} t={t} />
                     </div>
-                    <p>{connection.providerUsername === undefined
-                      ? t("messaging.ownerIdentity", { id: connection.ownerProviderUserId ?? "—" })
-                      : `@${connection.providerUsername}`}</p>
+                    <p>{connection.channel === "dingtalk"
+                      ? connection.ownerProviderUserId === undefined
+                        ? t("messaging.dingtalkAwaitingOwner")
+                        : t("messaging.ownerIdentity", { id: connection.ownerProviderUserId })
+                      : connection.providerUsername === undefined
+                        ? t("messaging.ownerIdentity", { id: connection.ownerProviderUserId ?? "—" })
+                        : `@${connection.providerUsername}`}</p>
                   </div>
                 </div>
                 <label className="messaging-switch-label">
@@ -459,7 +506,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <span><strong>{t("messaging.lastConnected")}</strong>{connection.lastConnectedAt === undefined
                   ? t("common.none")
                   : formatRelativeTime(connection.lastConnectedAt, controller.state.preferences.locale)}</span>
-                <span><strong>{t(connection.channel === "discord" ? "messaging.discordOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId ?? "—"}</span>
+                <span><strong>{t(connection.channel === "discord" ? "messaging.discordOwnerId"
+                  : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId
+                    ?? (connection.channel === "dingtalk" ? t("messaging.dingtalkAwaitingOwner") : "—")}</span>
               </div>
 
               {(connection.runtimeStatus === "conflict" || connection.runtimeStatus === "authLoss" || connection.runtimeStatus === "error") &&
@@ -485,10 +534,10 @@ export function MessagingSettings({ controller, snapshot, t }: {
                   <Settings2 aria-hidden="true" />{t("messaging.configure")}
                 </Button>
                 <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "credential", connectionId: connection.id })}>
-                  <KeyRound aria-hidden="true" />{connection.credentialConfigured ? t("messaging.replaceCredential") : t("messaging.addCredential")}
+                  <KeyRound aria-hidden="true" />{messagingCredentialActionLabel(connection, t)}
                 </Button>
                 {connection.credentialConfigured && <Button tone="ghost" disabled={pending} onClick={() => setDialog({ kind: "clear", connectionId: connection.id })}>
-                  <Trash2 aria-hidden="true" />{t("messaging.clearCredential")}
+                  <Trash2 aria-hidden="true" />{connection.channel === "dingtalk" ? t("messaging.dingtalkClearCredential") : t("messaging.clearCredential")}
                 </Button>}
               </footer>
             </article>;
@@ -527,8 +576,17 @@ export function MessagingSettings({ controller, snapshot, t }: {
       onClose={() => setDialog(undefined)}
       onSubmit={(ownerId, configuration) => { void updateDiscordConfiguration(connectionForDialog, ownerId, configuration); }}
     />}
+    {connectionForDialog !== undefined && connectionForDialog.dingtalkConfiguration !== undefined && <DingTalkConfigurationDialog
+      open={dialog?.kind === "configuration"}
+      connection={connectionForDialog}
+      busy={busy === `configuration:${connectionForDialog.id}`}
+      t={t}
+      onClose={() => setDialog(undefined)}
+      onSubmit={(configuration) => { void updateDingTalkConfiguration(connectionForDialog, configuration); }}
+    />}
     {connectionForDialog !== undefined && <ClearCredentialDialog
       open={dialog?.kind === "clear"}
+      connection={connectionForDialog}
       busy={busy === `clear:${connectionForDialog.id}`}
       t={t}
       onClose={() => setDialog(undefined)}
@@ -554,12 +612,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
   </section>;
 }
 
-function ConnectionStatus({ status, t }: {
+function ConnectionStatus({ status, channel, t }: {
   readonly status: MessagingConnectionView["runtimeStatus"];
+  readonly channel: MessagingChannelView;
   readonly t: Translator;
 }): JSX.Element {
   return <span className={cx("messaging-status", `messaging-status--${status}`)}>
-    <span aria-hidden="true" />{t(`messaging.status.${status}`)}
+    <span aria-hidden="true" />{t(status === "idle" && channel === "dingtalk"
+      ? "messaging.status.dingtalkIdle"
+      : `messaging.status.${status}`)}
   </span>;
 }
 
@@ -587,30 +648,36 @@ function RouteSummary({ route, fallback, snapshot, t, compact = false }: {
 
 function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
   readonly open: boolean;
-  readonly channel: "telegram" | "discord";
+  readonly channel: "telegram" | "discord" | "dingtalk";
   readonly busy: boolean;
   readonly t: Translator;
   readonly onClose: () => void;
-  readonly onSubmit: (channel: "telegram" | "discord", ownerId: string) => void;
+  readonly onSubmit: (channel: "telegram" | "discord" | "dingtalk", identity: string) => void;
 }): JSX.Element {
-  const [ownerId, setOwnerId] = useState("");
+  const [identity, setIdentity] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) setOwnerId(""); }, [channel, open]);
+  useEffect(() => { if (open) setIdentity(""); }, [channel, open]);
   const valid = channel === "discord"
-    ? /^[1-9][0-9]{16,19}$/u.test(ownerId.trim())
-    : /^[1-9][0-9]{0,15}$/u.test(ownerId.trim());
+    ? /^[1-9][0-9]{16,19}$/u.test(identity.trim())
+    : channel === "dingtalk"
+      ? validDingTalkProviderId(identity, 256)
+      : /^[1-9][0-9]{0,15}$/u.test(identity.trim());
   return <Modal
     open={open}
-    title={channel === "discord" ? t("messaging.discordCreateTitle") : t("messaging.createTitle")}
-    description={channel === "discord" ? t("messaging.discordCreateBody") : t("messaging.createBody")}
+    title={channel === "discord" ? t("messaging.discordCreateTitle")
+      : channel === "dingtalk" ? t("messaging.dingtalkCreateTitle") : t("messaging.createTitle")}
+    description={channel === "discord" ? t("messaging.discordCreateBody")
+      : channel === "dingtalk" ? t("messaging.dingtalkCreateBody") : t("messaging.createBody")}
     closeLabel={t("common.close")}
     onClose={onClose}
     initialFocus={() => inputRef.current}
     showClose
   >
-    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSubmit(channel, ownerId.trim()); }}>
-      <label><span>{channel === "discord" ? t("messaging.discordOwnerId") : t("messaging.ownerId")}</span><input ref={inputRef} value={ownerId} onChange={(event) => setOwnerId(event.target.value)} inputMode="numeric" autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : "123456789"} /></label>
-      <p className="messaging-form__hint">{channel === "discord" ? t("messaging.discordOwnerIdBody") : t("messaging.ownerIdBody")}</p>
+    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSubmit(channel, identity.trim()); }}>
+      <label><span>{channel === "discord" ? t("messaging.discordOwnerId")
+        : channel === "dingtalk" ? t("messaging.dingtalkAppKey") : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "dingtalk" ? "text" : "numeric"} autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : "123456789"} /></label>
+      <p className="messaging-form__hint">{channel === "discord" ? t("messaging.discordOwnerIdBody")
+        : channel === "dingtalk" ? t("messaging.dingtalkAppKeyBody") : t("messaging.ownerIdBody")}</p>
       {channel === "discord" && <p className="messaging-form__hint"><a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">{t("messaging.discordDeveloperPortal")}</a></p>}
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.continue")}</Button></div>
     </form>
@@ -629,11 +696,11 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
   const [enable, setEnable] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (open) { setSecret(""); setEnable(true); } }, [open, connection.id]);
-  return <Modal open={open} title={connection.credentialConfigured ? t("messaging.replaceCredential") : t("messaging.addCredential")} description={t("messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
+  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
     <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (secret.trim() !== "") onSubmit(secret, enable); }}>
-      <label><span>{t("messaging.botToken")}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
+      <label><span>{t(connection.channel === "dingtalk" ? "messaging.dingtalkAppSecret" : "messaging.botToken")}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
       <label className="messaging-choice-row"><CheckboxControl checked={enable} onChange={(event) => setEnable(event.target.checked)} aria-label={t("messaging.enableAfterSave")} /><span>{t("messaging.enableAfterSave")}</span></label>
-      <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t("messaging.secretSafety")}</p>
+      <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t(connection.channel === "dingtalk" ? "messaging.dingtalkSecretSafety" : "messaging.secretSafety")}</p>
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={secret.trim() === "" || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
     </form>
   </Modal>;
@@ -738,15 +805,51 @@ function DiscordConfigurationDialog({ open, connection, busy, t, onClose, onSubm
   </Modal>;
 }
 
-function ClearCredentialDialog({ open, busy, t, onClose, onConfirm }: {
+function DingTalkConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
   readonly open: boolean;
+  readonly connection: MessagingConnectionView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onSubmit: (configuration: DingTalkMessagingConfigurationView) => void;
+}): JSX.Element {
+  const initial = connection.dingtalkConfiguration!;
+  const [appKey, setAppKey] = useState(initial.appKey);
+  const [groups, setGroups] = useState(groupActivationText(initial.groupActivation));
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const current = connection.dingtalkConfiguration!;
+    setAppKey(current.appKey);
+    setGroups(groupActivationText(current.groupActivation));
+  }, [connection, open]);
+  const parsedGroups = parseDingTalkGroupActivation(groups);
+  const valid = validDingTalkProviderId(appKey, 256) && parsedGroups !== undefined;
+  return <Modal open={open} title={t("messaging.dingtalkConfigureTitle")} description={t("messaging.dingtalkConfigureBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose size="large">
+    <form className="messaging-form messaging-form--grid" onSubmit={(event) => {
+      event.preventDefault();
+      if (valid && parsedGroups !== undefined) onSubmit({ appKey: appKey.trim(), groupActivation: parsedGroups });
+    }}>
+      <label className="messaging-form__wide"><span>{t("messaging.dingtalkAppKey")}</span><input ref={inputRef} value={appKey} onChange={(event) => setAppKey(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+      <p className="messaging-form__hint messaging-form__wide">{t("messaging.dingtalkAppKeyChangeBody")}</p>
+      <label className="messaging-form__wide"><span>{t("messaging.dingtalkGroupActivation")}</span><textarea value={groups} onChange={(event) => setGroups(event.target.value)} rows={5} placeholder={"cidxxxxxxxx=mention\ncidyyyyyyyy=always"} aria-invalid={parsedGroups === undefined} /></label>
+      <p className="messaging-form__hint messaging-form__wide">{parsedGroups === undefined ? t("messaging.dingtalkGroupActivationInvalid") : t("messaging.dingtalkGroupActivationBody")}</p>
+      <div className="modal__actions messaging-form__wide"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
+    </form>
+  </Modal>;
+}
+
+function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }: {
+  readonly open: boolean;
+  readonly connection: MessagingConnectionView;
   readonly busy: boolean;
   readonly t: Translator;
   readonly onClose: () => void;
   readonly onConfirm: () => void;
 }): JSX.Element {
-  return <Modal open={open} title={t("messaging.clearTitle")} description={t("messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
-    <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t("messaging.clearCredential")}</Button></div>
+  const dingtalk = connection.channel === "dingtalk";
+  return <Modal open={open} title={t(dingtalk ? "messaging.dingtalkClearTitle" : "messaging.clearTitle")} description={t("messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
+    <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(dingtalk ? "messaging.dingtalkClearCredential" : "messaging.clearCredential")}</Button></div>
   </Modal>;
 }
 
@@ -877,6 +980,25 @@ function parseDiscordGroupActivation(value: string): Record<string, "mention" | 
   return result;
 }
 
+function parseDingTalkGroupActivation(value: string): Record<string, "mention" | "always" | "disabled"> | undefined {
+  const result: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rawLine of value.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    const match = /^(.+?)\s*=\s*(mention|always|disabled)$/u.exec(line);
+    const conversationId = match?.[1]?.trim();
+    if (match === null || conversationId === undefined || !validDingTalkProviderId(conversationId, 512)
+      || Object.hasOwn(result, conversationId)) return undefined;
+    result[conversationId] = match[2]! as "mention" | "always" | "disabled";
+  }
+  return result;
+}
+
+function validDingTalkProviderId(value: string, maximum: number): boolean {
+  const normalized = value.trim();
+  return normalized.length >= 1 && normalized.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(normalized);
+}
+
 function telegramConfigurationEqual(
   left: TelegramMessagingConfigurationView | undefined,
   right: TelegramMessagingConfigurationView | undefined
@@ -898,6 +1020,21 @@ function discordConfigurationEqual(
     && left.replyQuoteDm === right.replyQuoteDm
     && left.replyQuoteGroup === right.replyQuoteGroup
     && activationRulesEqual(left.groupActivation, right.groupActivation);
+}
+
+function dingtalkConfigurationEqual(
+  left: DingTalkMessagingConfigurationView | undefined,
+  right: DingTalkMessagingConfigurationView | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.appKey === right.appKey && activationRulesEqual(left.groupActivation, right.groupActivation);
+}
+
+function messagingCredentialActionLabel(connection: MessagingConnectionView, t: Translator): string {
+  if (connection.channel === "dingtalk") {
+    return t(connection.credentialConfigured ? "messaging.dingtalkReplaceCredential" : "messaging.dingtalkAddCredential");
+  }
+  return t(connection.credentialConfigured ? "messaging.replaceCredential" : "messaging.addCredential");
 }
 
 function activationRulesEqual(
