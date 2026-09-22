@@ -139,6 +139,17 @@ describe("gamepad UI target ownership", () => {
     delete document.body.dataset.appShortcutRecording;
     pressSkills(); expect(navigate).toHaveBeenCalledTimes(2);
   });
+  it("keeps schedule navigation in the same host boundary", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (): void => input({ kind: "action", action: "open-schedules", phase: "press" });
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus();
+    press(); expect(navigate).not.toHaveBeenCalled();
+    frame.remove(); document.body.focus();
+    document.body.dataset.appShortcutRecording = "1"; press(); expect(navigate).not.toHaveBeenCalled();
+    delete document.body.dataset.appShortcutRecording;
+    press(); expect(navigate).toHaveBeenCalledWith("open-schedules");
+  });
   it("focuses the real new-task composer without selecting another task", () => {
     document.body.innerHTML = '<main class="new-task-page"><div data-composer-editor="true" tabindex="0"></div></main>';
     createGamepadDomInput(document, vi.fn())({ kind: "action", action: "focus-composer", phase: "press" });

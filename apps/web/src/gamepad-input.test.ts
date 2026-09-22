@@ -113,6 +113,14 @@ describe("gamepad preference authority", () => {
 });
 
 describe("gamepad input ownership", () => {
+  it("maps the standard home button to schedule management after a neutral sample", () => {
+    expect(createDefaultGamepadPreferences().buttons[16]).toBe("open-schedules");
+    const { sample } = sampler();
+    expect(sample([pad({ down: [16] })]).effects).toEqual([]);
+    sample();
+    expect(sample([pad({ down: [16] })]).effects).toEqual([{ kind: "action", action: "open-schedules", phase: "press" }]);
+    expect(sample([pad({ down: [16] })]).effects).toEqual([]);
+  });
   it("requires neutral input after initial connection and dispatches each button edge once", () => {
     const { sample } = sampler();
     expect(sample([pad({ down: [0] })]).effects).toEqual([]);

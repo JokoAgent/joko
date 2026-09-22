@@ -104,6 +104,15 @@ describe("gamepad settings", () => {
     await act(async () => option?.click());
     expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-skills");
   });
+  it("offers the schedule manager as a persistent standard gamepad action", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const option = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Open schedules");
+    expect(option).toBeDefined();
+    await act(async () => option?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-schedules");
+  });
 
   it("retains the committed binding and keyboard focus on save failure, then allows a successful retry", async () => {
     const container = await renderSettings();

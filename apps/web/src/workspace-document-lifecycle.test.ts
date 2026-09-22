@@ -10,6 +10,7 @@ describe("workspace document route lifecycle", () => {
     expect(workspaceRouteLeaveRequest(from, { kind: "session", sessionId: "s1" })?.reason).toBe("route-change");
     const skillsRoute = { kind: "tools", tab: "skills" } as const;
     expect(workspaceRouteLeaveRequest(from, skillsRoute)?.reason).toBe("route-change");
+    expect(workspaceRouteLeaveRequest(from, { kind: "schedules" })?.reason).toBe("route-change");
     expect(workspaceRouteLeaveRequest({ kind: "session", sessionId: "s1" }, from)).toBeUndefined();
   });
 
