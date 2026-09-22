@@ -55,7 +55,7 @@ import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
 import { NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
-import { useGamepadActions } from "../gamepad-actions.js";
+import { currentGamepadTaskRoot, useGamepadActions } from "../gamepad-actions.js";
 import { collectConversationMarkdown, ConversationMarkdownError } from "../conversation-markdown.js";
 import { writeClipboardText } from "../clipboard-action.js";
 import { modelSourceAccess } from "../model-source-access.js";
@@ -1610,6 +1610,13 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     })();
   };
   const gamepadConnected = controller.state.ready && controller.state.connectionState === "connected";
+  useAppShortcut("copy-conversation-markdown", controller.state.preferences.appShortcutOverrides, () => {
+    const doc = paneRef.current?.ownerDocument;
+    if (!gamepadConnected || doc === undefined || doc.body.classList.contains("modal-open")
+      || currentGamepadTaskRoot(doc) !== paneRef.current) return false;
+    copyConversationMarkdown();
+    return true;
+  }, { stopImmediate: true });
   useGamepadActions(paneRef, `${timelineResourceOwnerKey}:${session.generation}`, "session", {
     "scroll-bottom": () => setFollowLatestSignal((current) => current + 1),
     ...(gamepadConnected ? {

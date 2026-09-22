@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
+import type { AppShortcutOverrides } from "../app-shortcuts.js";
 import { dispatchGamepadOwnedAction, type GamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type ModelView, type SessionView, type TimelineItemView } from "../model.js";
@@ -121,6 +122,28 @@ describe("session gamepad actions", () => {
     expect(view.host.textContent).not.toContain("session.conversationCopy.copied");
   });
 
+  it("routes a saved keyboard binding only to the focused task pane", async () => {
+    const overrides: AppShortcutOverrides = { "copy-conversation-markdown": { code: "KeyY", key: "y", meta: false, ctrl: true, alt: false, shift: false } };
+    const first = await mount(overrides);
+    const second = await mount(overrides);
+    await second.render({ ...session, id: "other-task" });
+    const writeText = vi.fn(async (_value: string) => undefined);
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+    second.api.loadSessionTimelinePage.mockResolvedValueOnce({ items: [message] });
+    const keydown = new KeyboardEvent("keydown", { key: "y", code: "KeyY", ctrlKey: true, bubbles: true, cancelable: true });
+    second.host.querySelector<HTMLButtonElement>("button")!.focus();
+    await act(async () => { second.host.querySelector<HTMLButtonElement>("button")!.dispatchEvent(keydown); });
+    await vi.waitFor(() => expect(writeText).toHaveBeenCalledOnce());
+    expect(keydown.defaultPrevented).toBe(true);
+    expect(first.api.loadSessionTimelinePage).not.toHaveBeenCalled();
+    expect(second.api.loadSessionTimelinePage).toHaveBeenCalledExactlyOnceWith("other-task", undefined, 500);
+    document.body.classList.add("modal-open");
+    const blocked = new KeyboardEvent("keydown", { key: "y", code: "KeyY", ctrlKey: true, bubbles: true, cancelable: true });
+    await act(async () => { second.host.querySelector<HTMLButtonElement>("button")!.dispatchEvent(blocked); });
+    expect(blocked.defaultPrevented).toBe(false);
+    expect(second.api.loadSessionTimelinePage).toHaveBeenCalledOnce();
+  });
+
   it("exposes clone and message fork for an isolated workspace only when the backend can derive it", async () => {
     const view = await mount();
     const isolatedSession: SessionView = {
@@ -172,7 +195,7 @@ describe("session gamepad actions", () => {
   });
 });
 
-async function mount() {
+async function mount(overrides: AppShortcutOverrides = {}) {
   const api = { setModel: vi.fn<AppController["setModel"]>(async () => undefined), setPlanMode: vi.fn(async () => undefined),
     pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkSession: vi.fn<AppController["forkSession"]>(async () => "forked"),
     loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
@@ -181,7 +204,7 @@ async function mount() {
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
   const render = async (current = session, currentBackend = backend, readOnly = false) => {
     const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model], timelineBySession: new Map([[current.id, [message]]]) };
-    const controller = { ...api, state: { ready: true, connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES, snapshot, route: { kind: "session", sessionId: current.id } } } as unknown as AppController;
+    const controller = { ...api, state: { ready: true, connectionState: "connected", preferences: { ...DEFAULT_UI_PREFERENCES, appShortcutOverrides: overrides }, snapshot, route: { kind: "session", sessionId: current.id } } } as unknown as AppController;
     await act(async () => root.render(<SessionPane controller={controller} session={current} backend={currentBackend} reviewReadOnly={readOnly} models={[model]} timeline={[message]}
       timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined} extensionWidgets={[]} extensionStatuses={[]}
       queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]} remainingInteractions={0} navigationOpen inspectorOpen t={(key) => key}
