@@ -38,6 +38,7 @@
     "@joko/core": "workspace:*",
     "@joko/git-safety": "workspace:*",
     "@joko/local-model-runtime": "workspace:*",
+    "@joko/messaging": "workspace:*",
     "@joko/outbound-network": "workspace:*",
     "@joko/remote-ssh": "workspace:*",
     "@joko/runtime-governance": "workspace:*",

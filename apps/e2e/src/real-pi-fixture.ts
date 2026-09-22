@@ -59,6 +59,9 @@ export interface RealPiSystemFixtureOptions {
     readonly promptTokens: number;
     readonly completionTokens: number;
   };
+  /** Loopback-only endpoint used by the Messaging product-chain fixture. */
+  readonly telegramApiBaseUrl?: string;
+  readonly messagingRetryDelayMs?: number;
 }
 
 /**
@@ -185,7 +188,14 @@ export class RealPiSystemFixture {
         webDirectory: options.webDirectory ?? join(rootDirectory, "web-not-used-by-connect-e2e"),
         corsOrigins: []
       };
-      application = await createOrchestratorApplication(config);
+      application = await createOrchestratorApplication(config, {
+        ...(options.telegramApiBaseUrl === undefined
+          ? {}
+          : { messagingTelegramApiBaseUrl: options.telegramApiBaseUrl }),
+        ...(options.messagingRetryDelayMs === undefined
+          ? {}
+          : { messagingRetryDelayMs: options.messagingRetryDelayMs })
+      });
       if (application.providers === undefined || application.refreshPiGeneration === undefined) {
         throw new Error("Production Orchestrator composition did not expose managed Pi Provider generation.");
       }

@@ -4225,6 +4225,101 @@ export interface VoiceInputServiceSettingsDraft {
   readonly expectedRevision: bigint;
 }
 
+export type MessagingChannelView =
+  | "telegram"
+  | "discord"
+  | "dingtalk"
+  | "feishu"
+  | "lark"
+  | "wecom"
+  | "wechat"
+  | "slack";
+
+export type MessagingConnectionRuntimeStatusView =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "offline"
+  | "conflict"
+  | "authLoss"
+  | "error";
+
+export interface TelegramMessagingConfigurationView {
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export interface MessagingConnectionView {
+  readonly id: string;
+  readonly channel: MessagingChannelView;
+  readonly generation: bigint;
+  readonly revision: bigint;
+  readonly enabled: boolean;
+  readonly runtimeStatus: MessagingConnectionRuntimeStatusView;
+  readonly credentialConfigured: boolean;
+  readonly ownerProviderUserId?: string;
+  readonly providerAccountId?: string;
+  readonly providerUsername?: string;
+  readonly telegramConfiguration?: TelegramMessagingConfigurationView;
+  readonly errorCode?: string;
+  readonly errorSummary?: string;
+  readonly lastConnectedAt?: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface MessagingRouteView {
+  readonly scopeKey: string;
+  readonly connectionId?: string;
+  readonly targetId: string;
+  readonly backendId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly revision: bigint;
+}
+
+export interface MessagingRouteDraftView {
+  readonly connectionId?: string;
+  readonly expectedRevision?: bigint;
+  readonly targetId: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: PermissionMode;
+  readonly planMode: boolean;
+}
+
+export interface MessagingSettingsView {
+  readonly connections: readonly MessagingConnectionView[];
+  readonly routes: readonly MessagingRouteView[];
+  readonly channels: readonly {
+    readonly channel: MessagingChannelView;
+    readonly available: boolean;
+    readonly reason?: string;
+  }[];
+}
+
+export type MessagingConnectionTestResultView =
+  | {
+      readonly ok: true;
+      readonly providerAccountId: string;
+      readonly displayName: string;
+      readonly username?: string;
+    }
+  | {
+      readonly ok: false;
+      readonly failure: "invalid" | "conflict" | "credentialUnavailable" | "channelUnavailable" | "connectionFailed";
+    };
+
 export interface VoiceInputRefinementContextView {
   readonly instructions?: string;
   readonly dictionaryTerms: readonly string[];
@@ -5397,6 +5492,43 @@ export interface OperationApi {
   clearProviderCredentialSurface(backendId: string, providerId: string, surfaceId: string): Promise<void>;
   saveCredential(draft: CredentialDraft, signal?: AbortSignal): Promise<void>;
   deleteCredential(credentialId: string): Promise<void>;
+  getMessagingSettings(signal?: AbortSignal): Promise<MessagingSettingsView>;
+  createTelegramMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  saveMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    secret: string,
+    enable: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  clearMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  setMessagingConnectionEnabled(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    enabled: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateTelegramMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;
+  putMessagingRoute(draft: MessagingRouteDraftView, signal?: AbortSignal): Promise<MessagingRouteView>;
   getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;
   listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
   getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;

@@ -11,6 +11,7 @@ import "joko/v1/event.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/managed_model_runtime.proto";
+import "joko/v1/messaging.proto";
 import "joko/v1/mobile_push.proto";
 import "joko/v1/model.proto";
 import "joko/v1/operation.proto";
@@ -191,6 +192,20 @@ service CredentialService {
 
 service SettingsService {
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+}
+
+// Authenticated node-owned third-party Messaging authority. Credentials enter
+// only through connection-bound one-shot upload tickets and are never projected.
+service MessagingService {
+  rpc GetMessagingSettings(GetMessagingSettingsRequest) returns (GetMessagingSettingsResponse);
+  rpc CreateMessagingConnection(CreateMessagingConnectionRequest) returns (CreateMessagingConnectionResponse);
+  rpc BeginMessagingCredentialUpload(BeginMessagingCredentialUploadRequest) returns (BeginMessagingCredentialUploadResponse);
+  rpc CommitMessagingCredential(CommitMessagingCredentialRequest) returns (CommitMessagingCredentialResponse);
+  rpc ClearMessagingCredential(ClearMessagingCredentialRequest) returns (ClearMessagingCredentialResponse);
+  rpc SetMessagingConnectionEnabled(SetMessagingConnectionEnabledRequest) returns (SetMessagingConnectionEnabledResponse);
+  rpc UpdateTelegramMessagingConfiguration(UpdateTelegramMessagingConfigurationRequest) returns (UpdateTelegramMessagingConfigurationResponse);
+  rpc TestMessagingConnection(TestMessagingConnectionRequest) returns (TestMessagingConnectionResponse);
+  rpc PutMessagingRoute(PutMessagingRouteRequest) returns (PutMessagingRouteResponse);
 }
 
 // Authenticated, node-local contact authority. Device address-book access is

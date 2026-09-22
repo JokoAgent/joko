@@ -3926,6 +3926,42 @@ describe("SessionHost", () => {
     });
   });
 
+  it("notifies a service projection after a known Backend dispatch failure is durable", async () => {
+    const settled = vi.fn();
+    const fixture = await createFixture(new RejectingSendFakeAdapter(), {
+      onServiceRunSettled: settled
+    });
+    const sessionId = (await fixture.host.createServiceSession({
+      operationId: "create-failing-service-task",
+      serviceKind: "messaging",
+      targetId: "target-one",
+      title: "Failing Messaging task",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const admitted = fixture.host.enqueueServiceInput({
+      operationId: "failing-service-input",
+      sessionId,
+      source: "system",
+      prompt: {
+        text: "dispatch this service input",
+        images: [],
+        files: [],
+        mentions: [],
+        disposition: "prompt"
+      }
+    });
+
+    await eventually(() => fixture.store.getRun(admitted.value.runId).descriptor.state === "failed");
+    await eventually(() => settled.mock.calls.length === 1);
+    expect(settled).toHaveBeenCalledWith({
+      sessionId,
+      runId: admitted.value.runId,
+      outcome: "failed"
+    });
+  });
+
   it("persists the authenticated origin task on service handoff admission", async () => {
     const fixture = await createFixture();
     const originSessionId = (await fixture.host.createSession({
@@ -12176,6 +12212,19 @@ async function createFixture(
     readonly sessionRuntimeRecoveryDelayMs?: (attempt: number) => number;
     readonly backendDispatchBlocked?: (backendId: string) => boolean;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
+    readonly onServiceRunSettled?: (input: {
+      readonly sessionId: string;
+      readonly runId: string;
+      readonly outcome: "completed" | "aborted" | "failed";
+    }) => Promise<void> | void;
+    readonly onServiceInteractionOpened?: (input: {
+      readonly sessionId: string;
+      readonly interactionId: string;
+    }) => Promise<void> | void;
+    readonly onServiceInteractionSettled?: (input: {
+      readonly sessionId: string;
+      readonly interactionId: string;
+    }) => Promise<void> | void;
     readonly additionalAdapters?: readonly FakeBackendAdapter[];
   } = {}
 ) {
@@ -12206,6 +12255,16 @@ async function createFixture(
     rmSync(directory, { recursive: true, force: true });
   });
   return { store, adapter, host, artifacts, connection, directory };
+}
+
+class RejectingSendFakeAdapter extends FakeBackendAdapter {
+  constructor() {
+    super(PI_LIKE_PROFILE);
+  }
+
+  override async send(): Promise<void> {
+    throw new Error("known service dispatch failure");
+  }
 }
 
 async function createMultiAdapterFixture(adapters: readonly FakeBackendAdapter[]) {

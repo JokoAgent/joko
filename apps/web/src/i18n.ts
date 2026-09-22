@@ -4778,6 +4778,84 @@ const en = {
   ,"timeline.generatedFiles": "Generated files"
   ,"timeline.generatedFilesCount": "{count} files"
   ,"timeline.openGeneratedFile": "Open {name}"
+  ,"settings.messaging": "Messaging"
+  ,"settings.messagingBody": "Connect third-party messaging channels to visible Joko tasks with durable delivery, explicit routing, and managed credentials."
+  ,"messaging.channels": "Channel availability"
+  ,"messaging.channelAvailability": "Messaging channel availability"
+  ,"messaging.comingSoon": "Not available yet"
+  ,"messaging.addTelegram": "Add Telegram"
+  ,"messaging.loadFailed": "Could not load Messaging settings."
+  ,"messaging.actionFailed": "Could not complete the Messaging action."
+  ,"messaging.defaultRoute": "Default route"
+  ,"messaging.connectionRoute": "Connection route"
+  ,"messaging.routeBody": "Choose the workspace, model, and execution policy used only when a new conversation creates its task."
+  ,"messaging.routeNewOnly": "Route changes affect new conversations only; existing Messaging tasks keep their original execution binding."
+  ,"messaging.setRoute": "Set route"
+  ,"messaging.editRoute": "Edit route"
+  ,"messaging.noRoute": "No route is configured. Incoming messages wait durably until a route is available."
+  ,"messaging.inherited": "Inherited"
+  ,"messaging.connections": "Connections"
+  ,"messaging.connectionsBody": "Each external account has an independent credential, transport generation, and conversation-to-task mapping."
+  ,"messaging.emptyTitle": "No messaging connections"
+  ,"messaging.emptyBody": "Add Telegram to receive direct messages, groups, and topics in Joko tasks."
+  ,"messaging.ownerIdentity": "Owner ID {id}"
+  ,"messaging.toggleConnection": "Enable or disable this Messaging connection"
+  ,"messaging.credential": "Credential"
+  ,"messaging.credentialConfigured": "Configured"
+  ,"messaging.credentialMissing": "Not configured"
+  ,"messaging.lastConnected": "Last connected"
+  ,"messaging.ownerId": "Telegram owner user ID"
+  ,"messaging.runtimeError": "The Messaging connection needs attention."
+  ,"messaging.test": "Test"
+  ,"messaging.configure": "Configure"
+  ,"messaging.replaceCredential": "Replace token"
+  ,"messaging.addCredential": "Add token"
+  ,"messaging.clearCredential": "Clear token"
+  ,"messaging.createTitle": "Add Telegram"
+  ,"messaging.createBody": "The owner identity is the only user allowed to start direct-message tasks."
+  ,"messaging.ownerIdBody": "Use the numeric Telegram user ID, not a display name or @username."
+  ,"messaging.botToken": "Bot token"
+  ,"messaging.credentialBody": "Replacing the token retires the previous transport generation and its pending work."
+  ,"messaging.enableAfterSave": "Connect after saving"
+  ,"messaging.secretSafety": "The token uses a one-shot managed credential channel and is never stored in settings or task history."
+  ,"messaging.configureTitle": "Telegram behavior"
+  ,"messaging.configureBody": "Configure replies, reactions, and the activation policy for each group."
+  ,"messaging.emojiReactions": "Acknowledgement reactions"
+  ,"messaging.reactionsMinimal": "Minimal"
+  ,"messaging.reactionsExpressive": "Expressive"
+  ,"messaging.dmQuote": "Direct-message replies"
+  ,"messaging.groupQuote": "Group replies"
+  ,"messaging.quoteFirst": "Quote first part"
+  ,"messaging.quoteAll": "Quote every part"
+  ,"messaging.groupActivation": "Group activation rules"
+  ,"messaging.groupActivationBody": "Enter one numeric chat ID per line as chatId=mention, chatId=always, or chatId=disabled. Unlisted groups require a mention."
+  ,"messaging.groupActivationInvalid": "Use one unique numeric chat ID per line with mention, always, or disabled."
+  ,"messaging.clearTitle": "Clear Telegram token?"
+  ,"messaging.clearBody": "The connection goes offline immediately. Existing tasks remain visible, but this transport and its pending work are retired."
+  ,"messaging.target": "Workspace"
+  ,"messaging.model": "Model"
+  ,"messaging.backendDefaultModel": "Backend default"
+  ,"messaging.effort": "Reasoning effort"
+  ,"messaging.permission": "Permission mode"
+  ,"messaging.permissionAsk": "Ask"
+  ,"messaging.permissionAuto": "Auto"
+  ,"messaging.permissionBypass": "Bypass permissions"
+  ,"messaging.fastMode": "Fast mode"
+  ,"messaging.planMode": "Plan mode"
+  ,"messaging.noTargets": "No available workspace can receive new Messaging tasks."
+  ,"messaging.testPassed": "Connected as {name}."
+  ,"messaging.testFailure.invalid": "The connection configuration is invalid."
+  ,"messaging.testFailure.conflict": "The connection changed while it was being tested."
+  ,"messaging.testFailure.credentialUnavailable": "The bot token is unavailable."
+  ,"messaging.testFailure.channelUnavailable": "This channel is not available on the node."
+  ,"messaging.testFailure.connectionFailed": "The provider could not be reached or rejected the token."
+  ,"messaging.status.idle": "Needs token"
+  ,"messaging.status.connecting": "Connecting"
+  ,"messaging.status.connected": "Connected"
+  ,"messaging.status.offline": "Offline"
+  ,"messaging.status.conflict": "Conflict"
+  ,"messaging.status.authLoss": "Authorization lost"
+  ,"messaging.status.error": "Error"
 } as const;
 
 export type MessageKey = keyof typeof en;
@@ -7636,7 +7714,85 @@ const zhBase: Record<MessageKey, string> = {
     "settings.customProvider.advancedModelOptions": "高级模型选项",
     "settings.customProvider.advancedProvider": "高级供应商设置",
     "settings.customProvider.savedCredential": "已保存的凭证",
-    "settings.customProvider.newCredential": "使用上方输入的 API 密钥"
+    "settings.customProvider.newCredential": "使用上方输入的 API 密钥",
+    "settings.messaging": "消息渠道",
+    "settings.messagingBody": "将第三方消息渠道连接到可见的 Joko 任务，并使用持久投递、明确路由和受管凭证。",
+    "messaging.channels": "渠道可用性",
+    "messaging.channelAvailability": "消息渠道可用性",
+    "messaging.comingSoon": "尚不可用",
+    "messaging.addTelegram": "添加 Telegram",
+    "messaging.loadFailed": "无法加载消息渠道设置。",
+    "messaging.actionFailed": "无法完成消息渠道操作。",
+    "messaging.defaultRoute": "默认路由",
+    "messaging.connectionRoute": "连接路由",
+    "messaging.routeBody": "选择新会话创建任务时使用的工作区、模型和执行策略。",
+    "messaging.routeNewOnly": "路由修改只影响新会话；现有消息任务保留原来的执行绑定。",
+    "messaging.setRoute": "设置路由",
+    "messaging.editRoute": "编辑路由",
+    "messaging.noRoute": "尚未配置路由。收到的消息会持久等待，直到路由可用。",
+    "messaging.inherited": "继承",
+    "messaging.connections": "连接",
+    "messaging.connectionsBody": "每个外部账号都有独立凭证、传输代际和会话到任务的映射。",
+    "messaging.emptyTitle": "没有消息连接",
+    "messaging.emptyBody": "添加 Telegram，将私聊、群聊和话题接入 Joko 任务。",
+    "messaging.ownerIdentity": "所有者 ID {id}",
+    "messaging.toggleConnection": "启用或停用此消息连接",
+    "messaging.credential": "凭证",
+    "messaging.credentialConfigured": "已配置",
+    "messaging.credentialMissing": "未配置",
+    "messaging.lastConnected": "最近连接",
+    "messaging.ownerId": "Telegram 所有者用户 ID",
+    "messaging.runtimeError": "此消息连接需要处理。",
+    "messaging.test": "测试",
+    "messaging.configure": "配置",
+    "messaging.replaceCredential": "替换令牌",
+    "messaging.addCredential": "添加令牌",
+    "messaging.clearCredential": "清除令牌",
+    "messaging.createTitle": "添加 Telegram",
+    "messaging.createBody": "只有所有者身份可以从私聊发起任务。",
+    "messaging.ownerIdBody": "请使用 Telegram 数字用户 ID，不要使用显示名或 @用户名。",
+    "messaging.botToken": "机器人令牌",
+    "messaging.credentialBody": "替换令牌会退休旧传输代际及其待处理工作。",
+    "messaging.enableAfterSave": "保存后连接",
+    "messaging.secretSafety": "令牌仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
+    "messaging.configureTitle": "Telegram 行为",
+    "messaging.configureBody": "配置回复、反应及每个群组的激活策略。",
+    "messaging.emojiReactions": "确认反应",
+    "messaging.reactionsMinimal": "精简",
+    "messaging.reactionsExpressive": "丰富",
+    "messaging.dmQuote": "私聊回复",
+    "messaging.groupQuote": "群聊回复",
+    "messaging.quoteFirst": "引用第一段",
+    "messaging.quoteAll": "引用每一段",
+    "messaging.groupActivation": "群组激活规则",
+    "messaging.groupActivationBody": "每行输入一个数字聊天 ID，格式为 chatId=mention、chatId=always 或 chatId=disabled。未列出的群组需要提及机器人。",
+    "messaging.groupActivationInvalid": "每行使用一个唯一数字聊天 ID，并选择 mention、always 或 disabled。",
+    "messaging.clearTitle": "清除 Telegram 令牌？",
+    "messaging.clearBody": "连接会立即离线。现有任务仍可见，但当前传输及其待处理工作会被退休。",
+    "messaging.target": "工作区",
+    "messaging.model": "模型",
+    "messaging.backendDefaultModel": "Backend 默认模型",
+    "messaging.effort": "推理强度",
+    "messaging.permission": "权限模式",
+    "messaging.permissionAsk": "询问",
+    "messaging.permissionAuto": "自动",
+    "messaging.permissionBypass": "绕过权限",
+    "messaging.fastMode": "Fast 模式",
+    "messaging.planMode": "计划模式",
+    "messaging.noTargets": "没有可用于接收新消息任务的工作区。",
+    "messaging.testPassed": "已连接为 {name}。",
+    "messaging.testFailure.invalid": "连接配置无效。",
+    "messaging.testFailure.conflict": "测试期间连接已发生变化。",
+    "messaging.testFailure.credentialUnavailable": "机器人令牌不可用。",
+    "messaging.testFailure.channelUnavailable": "此节点尚不支持该渠道。",
+    "messaging.testFailure.connectionFailed": "无法访问提供方，或令牌被拒绝。",
+    "messaging.status.idle": "需要令牌",
+    "messaging.status.connecting": "正在连接",
+    "messaging.status.connected": "已连接",
+    "messaging.status.offline": "离线",
+    "messaging.status.conflict": "冲突",
+    "messaging.status.authLoss": "授权失效",
+    "messaging.status.error": "错误"
   }
 };
 

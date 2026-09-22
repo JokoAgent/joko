@@ -394,6 +394,7 @@ import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
 import type { TerminalProvider } from "@joko/tool-terminal";
 import { createManagedModelRuntimeConnectService } from "./managed-model-runtime-connect-service.js";
+import { createMessagingConnectService } from "./messaging-connect-service.js";
 import { createContactConnectService } from "./contact-connect-service.js";
 import { createPartnerConnectService } from "./partner-connect-service.js";
 import { createCollaborationConnectService } from "./collaboration-connect-service.js";
@@ -670,6 +671,7 @@ export interface ConnectServiceSet {
   readonly historyMaintenance: ServiceImpl<typeof contract.HistoryMaintenanceService>;
   readonly credential: ServiceImpl<typeof contract.CredentialService>;
   readonly settings: ServiceImpl<typeof contract.SettingsService>;
+  readonly messaging: ServiceImpl<typeof contract.MessagingService>;
   readonly contact: ServiceImpl<typeof contract.ContactService>;
   readonly partner: ServiceImpl<typeof contract.PartnerService>;
   readonly collaborationGoal: ServiceImpl<typeof contract.CollaborationService>;
@@ -1003,6 +1005,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.HistoryMaintenanceService, withConnectErrors(services.historyMaintenance));
   router.service(contract.CredentialService, withConnectErrors(services.credential));
   router.service(contract.SettingsService, withConnectErrors(services.settings));
+  router.service(contract.MessagingService, withConnectErrors(services.messaging));
   router.service(contract.ContactService, withConnectErrors(services.contact));
   router.service(contract.PartnerService, withConnectErrors(services.partner));
   router.service(contract.CollaborationService, withConnectErrors(services.collaborationGoal));
@@ -1209,6 +1212,10 @@ export function createConnectServices(application: OrchestratorApplication): Con
   const managedModelRuntime = createManagedModelRuntimeConnectService(
     dependencies.managedModelRuntime,
     (context) => authenticate(context)
+  );
+  const messaging = createMessagingConnectService(
+    application.messaging,
+    (context) => ({ connectionId: authenticate(context).id })
   );
   const contact = createContactConnectService(
     application.contacts,
@@ -4826,7 +4833,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
+  return { connection, event, operation, backend, target, session, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {

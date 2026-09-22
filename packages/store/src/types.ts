@@ -703,6 +703,317 @@ export interface MergeCollaborationDispatchesInput {
   readonly updatedAt?: UnixMillis;
 }
 
+export const MESSAGING_CHANNELS = [
+  "telegram",
+  "discord",
+  "dingtalk",
+  "feishu",
+  "lark",
+  "wecom",
+  "wechat",
+  "slack"
+] as const;
+
+export type MessagingChannel = (typeof MESSAGING_CHANNELS)[number];
+export type MessagingConnectionRuntimeStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "offline"
+  | "conflict"
+  | "auth_loss"
+  | "error";
+
+export interface MessagingConnectionRecord {
+  readonly id: string;
+  readonly channel: MessagingChannel;
+  /** Invalidates every in-flight transport effect when configuration ownership changes. */
+  readonly generation: number;
+  readonly enabled: boolean;
+  readonly runtimeStatus: MessagingConnectionRuntimeStatus;
+  readonly credentialReferenceId?: string;
+  readonly credentialGeneration?: string;
+  readonly ownerProviderUserId?: string;
+  readonly providerAccountId?: string;
+  readonly providerUsername?: string;
+  readonly configuration: unknown;
+  readonly cursor?: string;
+  readonly errorCode?: string;
+  readonly errorSummary?: string;
+  readonly lastConnectedAt?: UnixMillis;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface CreateMessagingConnectionInput {
+  readonly id?: string;
+  readonly channel: MessagingChannel;
+  readonly configuration: unknown;
+  readonly ownerProviderUserId?: string;
+  readonly createdAt?: UnixMillis;
+}
+
+export interface ReplaceMessagingCredentialInput {
+  readonly connectionId: string;
+  readonly expectedRevision: bigint;
+  readonly expectedGeneration: number;
+  readonly credentialReferenceId: string;
+  readonly credentialGeneration: string;
+  readonly ownerProviderUserId?: string;
+  readonly enable: boolean;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface SetMessagingConnectionEnabledInput {
+  readonly connectionId: string;
+  readonly expectedRevision: bigint;
+  readonly expectedGeneration: number;
+  readonly enabled: boolean;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface UpdateMessagingConnectionRuntimeInput {
+  readonly connectionId: string;
+  readonly expectedRevision: bigint;
+  readonly expectedGeneration: number;
+  readonly runtimeStatus: Exclude<MessagingConnectionRuntimeStatus, "idle" | "offline">;
+  readonly cursor?: string | null;
+  readonly providerAccountId?: string | null;
+  readonly providerUsername?: string | null;
+  readonly error?: { readonly code: string; readonly summary: string } | null;
+  readonly connectedAt?: UnixMillis;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface MessagingRouteRecord {
+  readonly scopeKey: string;
+  readonly connectionId?: string;
+  readonly targetId: TargetId;
+  readonly backendId: BackendId;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly planMode: boolean;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface PutMessagingRouteInput {
+  readonly connectionId?: string;
+  readonly expectedRevision?: bigint;
+  readonly targetId: TargetId;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode: boolean;
+  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly planMode: boolean;
+  readonly updatedAt?: UnixMillis;
+}
+
+export type MessagingConversationStatus = "observed" | "active" | "retired";
+export type MessagingConversationKind = "direct" | "group" | "channel";
+
+export interface MessagingConversationRecord {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly channelGeneration: number;
+  readonly providerConversationId: string;
+  readonly providerThreadId: string;
+  readonly conversationKind: MessagingConversationKind;
+  readonly status: MessagingConversationStatus;
+  readonly sessionId?: SessionId;
+  readonly sessionGeneration?: number;
+  readonly routeScopeKey?: string;
+  readonly targetId?: TargetId;
+  readonly backendId?: BackendId;
+  readonly providerId?: string;
+  readonly modelId?: string;
+  readonly effort?: string;
+  readonly fastMode?: boolean;
+  readonly permissionMode?: "ask" | "auto" | "bypassPermissions";
+  readonly planMode?: boolean;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly retiredAt?: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface EnsureMessagingConversationInput {
+  readonly id?: string;
+  readonly connectionId: string;
+  readonly expectedChannelGeneration: number;
+  readonly providerConversationId: string;
+  readonly providerThreadId?: string;
+  readonly conversationKind: MessagingConversationKind;
+  readonly observedAt?: UnixMillis;
+}
+
+export interface BindMessagingConversationInput {
+  readonly conversationId: string;
+  readonly expectedRevision: bigint;
+  readonly expectedChannelGeneration: number;
+  readonly sessionId: SessionId;
+  readonly expectedSessionGeneration: number;
+  readonly routeScopeKey: string;
+  readonly updatedAt?: UnixMillis;
+}
+
+export type MessagingInboundRequestStatus =
+  | "preparing"
+  | "queued"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "dispatch_unknown";
+
+export interface MessagingInboundRequestRecord {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly channelGeneration: number;
+  readonly conversationId?: string;
+  readonly providerMessageId?: string;
+  readonly providerRequestIds: readonly string[];
+  readonly bodyHash: string;
+  readonly protectedContent: boolean;
+  readonly status: MessagingInboundRequestStatus;
+  readonly operationId?: OperationId;
+  readonly runId?: RunId;
+  readonly attemptId?: AttemptId;
+  readonly queueItemId?: QueueItemId;
+  readonly artifactIds: readonly string[];
+  readonly errorCode?: string;
+  readonly occurredAt: UnixMillis;
+  readonly receivedAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface CreateMessagingInboundRequestInput {
+  readonly id?: string;
+  readonly connectionId: string;
+  readonly expectedChannelGeneration: number;
+  readonly conversationId?: string;
+  readonly providerRequestIds: readonly string[];
+  readonly providerMessageId?: string;
+  readonly bodyHash: string;
+  readonly protectedContent: boolean;
+  readonly occurredAt: UnixMillis;
+  readonly receivedAt?: UnixMillis;
+}
+
+export interface MessagingInboundRequestCreation {
+  readonly created: boolean;
+  readonly request: MessagingInboundRequestRecord;
+}
+
+export interface BindMessagingInboundAdmissionInput {
+  readonly requestId: string;
+  readonly expectedRevision: bigint;
+  readonly conversationId: string;
+  readonly operationId: OperationId;
+  readonly runId: RunId;
+  readonly attemptId: AttemptId;
+  readonly queueItemId: QueueItemId;
+  readonly updatedAt?: UnixMillis;
+}
+
+export interface MessagingGroupObservationRecord {
+  readonly conversationId: string;
+  readonly providerMessageId: string;
+  readonly providerUserId: string;
+  readonly displayName: string;
+  readonly username?: string;
+  readonly isBot: boolean;
+  readonly text: string;
+  readonly attachmentNames: readonly string[];
+  readonly occurredAt: UnixMillis;
+  readonly createdAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface AppendMessagingGroupObservationInput {
+  readonly conversationId: string;
+  readonly providerMessageId: string;
+  readonly providerUserId: string;
+  readonly displayName: string;
+  readonly username?: string;
+  readonly isBot: boolean;
+  readonly text: string;
+  readonly attachmentNames: readonly string[];
+  /** Protected content is rejected rather than silently retained. */
+  readonly protectedContent: boolean;
+  readonly occurredAt: UnixMillis;
+  readonly maximumEntries?: number;
+  readonly createdAt?: UnixMillis;
+}
+
+export type MessagingDeliveryKind = "text" | "file" | "reaction" | "interaction" | "notice";
+export type MessagingDeliveryStatus = "pending" | "dispatching" | "sent" | "failed" | "cancelled" | "unknown";
+
+export interface MessagingDeliveryRecord {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly channelGeneration: number;
+  readonly conversationId: string;
+  readonly dedupeKey: string;
+  readonly kind: MessagingDeliveryKind;
+  readonly partIndex: number;
+  readonly partCount: number;
+  readonly payloadHash: string;
+  readonly payload: unknown;
+  readonly status: MessagingDeliveryStatus;
+  readonly availableAt: UnixMillis;
+  readonly attempts: number;
+  readonly claimToken?: string;
+  readonly claimedAt?: UnixMillis;
+  readonly providerMessageId?: string;
+  readonly errorCode?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+export interface EnqueueMessagingDeliveryInput {
+  readonly id?: string;
+  readonly connectionId: string;
+  readonly expectedChannelGeneration: number;
+  readonly conversationId: string;
+  readonly dedupeKey: string;
+  readonly kind: MessagingDeliveryKind;
+  readonly partIndex: number;
+  readonly partCount: number;
+  readonly payloadHash: string;
+  readonly payload: unknown;
+  readonly availableAt?: UnixMillis;
+  readonly createdAt?: UnixMillis;
+  readonly maximumPending?: number;
+}
+
+export interface MessagingInteractionRecord {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly channelGeneration: number;
+  readonly conversationId: string;
+  readonly providerRequestId: string;
+  readonly providerInteractionId: string;
+  readonly providerMessageId: string;
+  readonly actionHash: string;
+  readonly payload: unknown;
+  readonly status: "pending" | "claimed" | "completed" | "failed" | "expired" | "duplicate" | "unknown";
+  readonly claimToken?: string;
+  readonly claimedAt?: UnixMillis;
+  readonly expiresAt: UnixMillis;
+  readonly outcomeCode?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
 export type MakerMemoryKind = "user" | "feedback" | "project" | "reference" | "digest";
 
 /** Owner-private memory content. Callers must never copy these fields into Events or diagnostics. */

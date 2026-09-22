@@ -487,7 +487,7 @@ export interface CreateScheduledSessionInput {
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
   readonly operationId: string;
-  readonly serviceKind: "session_handoff" | "partner" | "collaboration";
+  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging";
   readonly targetId: string;
   readonly title: string;
   readonly providerId?: string;
@@ -803,6 +803,19 @@ export class SessionHost {
   readonly #sessionRuntimeRecoveryDelayMs: (attempt: number) => number;
   readonly #backendDispatchBlocked: (backendId: string) => boolean;
   readonly #onBackendMayBeIdle: ((backendId: string) => void) | undefined;
+  readonly #onServiceRunSettled: ((input: {
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly outcome: "completed" | "aborted" | "failed";
+  }) => Promise<void> | void) | undefined;
+  readonly #onServiceInteractionOpened: ((input: {
+    readonly sessionId: string;
+    readonly interactionId: string;
+  }) => Promise<void> | void) | undefined;
+  readonly #onServiceInteractionSettled: ((input: {
+    readonly sessionId: string;
+    readonly interactionId: string;
+  }) => Promise<void> | void) | undefined;
   readonly #monotonicNow: () => number;
   readonly #runSilenceTimeoutMs: number;
   readonly #backendRetirementTimeoutMs: number;
@@ -861,6 +874,22 @@ export class SessionHost {
       readonly backendDispatchBlocked?: (backendId: string) => boolean;
       /** Content-free settle signal for an external deferred replacement owner. */
       readonly onBackendMayBeIdle?: (backendId: string) => void;
+      /** Post-commit notification for service-owned projections such as Messaging outboxes. */
+      readonly onServiceRunSettled?: (input: {
+        readonly sessionId: string;
+        readonly runId: string;
+        readonly outcome: "completed" | "aborted" | "failed";
+      }) => Promise<void> | void;
+      /** Post-commit notification for service-owned interaction projections. */
+      readonly onServiceInteractionOpened?: (input: {
+        readonly sessionId: string;
+        readonly interactionId: string;
+      }) => Promise<void> | void;
+      /** Post-commit notification used to retire service-owned interaction projections. */
+      readonly onServiceInteractionSettled?: (input: {
+        readonly sessionId: string;
+        readonly interactionId: string;
+      }) => Promise<void> | void;
       /** Registry-probed descriptors, including unavailable instance shadows. */
       readonly backendDescriptors?: readonly BackendDescriptor[];
     } = {}
@@ -887,6 +916,9 @@ export class SessionHost {
       ?? sessionRuntimeRecoveryDelayMs;
     this.#backendDispatchBlocked = options.backendDispatchBlocked ?? (() => false);
     this.#onBackendMayBeIdle = options.onBackendMayBeIdle;
+    this.#onServiceRunSettled = options.onServiceRunSettled;
+    this.#onServiceInteractionOpened = options.onServiceInteractionOpened;
+    this.#onServiceInteractionSettled = options.onServiceInteractionSettled;
     this.#monotonicNow = options.monotonicNow ?? (() => performance.now());
     const runSilenceTimeoutMs = options.runSilenceTimeoutMs ?? DEFAULT_RUN_SILENCE_TIMEOUT_MS;
     if (!Number.isSafeInteger(runSilenceTimeoutMs) || runSilenceTimeoutMs < 0) {
@@ -7137,6 +7169,7 @@ export class SessionHost {
         traceId,
         operationId
       );
+      this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       this.#pendingInteractions.delete(id);
       clearPendingInteractionExpiry(pending);
       pending.resolve({ kind: "cancelled" });
@@ -7157,6 +7190,7 @@ export class SessionHost {
       }
       continuation = this.commitPostTurnPlanReviewContinuation(store, interaction, decision);
     });
+    this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
     if (pending?.generation === generation) {
       this.#pendingInteractions.delete(id);
       clearPendingInteractionExpiry(pending);
@@ -7273,6 +7307,7 @@ export class SessionHost {
       throw new InvalidStateTransitionError("interaction", interaction.status, "dismissed");
     }
     this.#store.dismissInteraction(id, generation, reason, traceId, operationId);
+    this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
     const pending = this.#pendingInteractions.get(id);
     if (pending?.generation === generation) {
       this.#pendingInteractions.delete(id);
@@ -7302,6 +7337,7 @@ export class SessionHost {
           reason,
           `interaction-policy:${interaction.id}`
         );
+        this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       } catch (error) {
         // A newer native binding already fences this interaction in the
         // durable store. Still release any in-memory waiter so a stale bridge
@@ -8286,7 +8322,9 @@ export class SessionHost {
           ? "create_partner_session"
           : input.serviceKind === "collaboration"
             ? "create_collaboration_worker_session"
-            : "create_session_handoff"
+            : input.serviceKind === "messaging"
+              ? "create_messaging_session"
+              : "create_session_handoff"
         : "create_scheduled_session";
     const claim = authorized
       ? this.#store.claimAuthorizedDeferredEffectOperation<{ readonly sessionId: string }>(
@@ -10221,6 +10259,7 @@ export class SessionHost {
           });
           if (!uncertain) {
             removeNativeDispatchRecoveryEntry(this.#store, sessionId, run.descriptor.id);
+            await this.notifyServiceRunSettled(sessionId, run.descriptor.id, "failed");
           }
           if (recoveryTrigger?.reason === "context_overflow") this.ensureContextOverflowReplay(sessionId);
           if (this.isReviewReadOnlySession(sessionId)) {
@@ -10792,7 +10831,33 @@ export class SessionHost {
         if (pending.abortSignal.aborted) pending.abortListener();
       }
       this.refreshRunSilenceWatchdog(sessionId);
+      if (this.#onServiceInteractionOpened !== undefined) {
+        queueMicrotask(() => void Promise.resolve()
+          .then(() => this.#onServiceInteractionOpened?.({
+            sessionId,
+            interactionId: interaction.id
+          }))
+          .catch((error: unknown) => this.recordFailure("service-interaction-opened", error)));
+      }
     });
+  }
+
+  private notifyServiceInteractionSettled(sessionId: string, interactionId: string): void {
+    if (this.#onServiceInteractionSettled === undefined) return;
+    queueMicrotask(() => void Promise.resolve()
+      .then(() => this.#onServiceInteractionSettled?.({ sessionId, interactionId }))
+      .catch((error: unknown) => this.recordFailure("service-interaction-settled", error)));
+  }
+
+  private async notifyServiceRunSettled(
+    sessionId: string,
+    runId: string,
+    outcome: "completed" | "aborted" | "failed"
+  ): Promise<void> {
+    if (this.#onServiceRunSettled === undefined) return;
+    await Promise.resolve()
+      .then(() => this.#onServiceRunSettled?.({ sessionId, runId, outcome }))
+      .catch((error: unknown) => this.recordFailure("service-run-settled", error));
   }
 
   private cancelPendingInteractionFromAdapter(id: string, generation: number): void {
@@ -10807,6 +10872,7 @@ export class SessionHost {
           "The Backend cancelled its native interaction request.",
           `interaction-backend-cancelled:${id}`
         );
+        this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       }
     } catch (error) {
       if (!(error instanceof StaleGenerationError)) this.recordFailure("interaction_backend_cancel", error);
@@ -10830,6 +10896,7 @@ export class SessionHost {
           TIMED_EXTENSION_INTERACTION_EXPIRED_REASON,
           `interaction-expired:${id}`
         );
+        this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
       }
     } catch (error) {
       if (!(error instanceof StaleGenerationError)) this.recordFailure("interaction_expiry", error);
@@ -10914,6 +10981,7 @@ export class SessionHost {
       else if (this.#sessionRuntimeRecoveries.get(sessionId)?.currentRunId === run.descriptor.id) {
         this.#clearSessionRuntimeRecovery(sessionId, "succeeded");
       }
+      await this.notifyServiceRunSettled(sessionId, run.descriptor.id, outcome);
     }
     if (outcome === "failed") this.ensureContextOverflowReplay(sessionId);
     await this.#applyPendingSessionRuntimeControl(sessionId);
@@ -11505,6 +11573,7 @@ export class SessionHost {
             target: this.targetForSession(recoveredSession)
           }).catch((error: unknown) => this.recordFailure("workspace-change-set", error));
         }
+        await this.notifyServiceRunSettled(sessionId, recoveredRunId, recovered.outcome);
         if (recovered.outcome === "failed") this.ensureContextOverflowReplay(sessionId);
         this.refreshRunSilenceWatchdog(sessionId);
         void this.reconcileScheduledWorktrees();

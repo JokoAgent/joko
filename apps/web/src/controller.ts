@@ -2393,6 +2393,45 @@ export function useAppController(): AppController {
     revokeContactSyncPeer: (peerId, expectedRevision, signal) =>
       gateway().revokeContactSyncPeer(peerId, expectedRevision, signal),
     syncContactsNow: (peerId, signal) => gateway().syncContactsNow(peerId, signal),
+    getMessagingSettings: (signal) => gateway().getMessagingSettings(signal),
+    createTelegramMessagingConnection: (ownerProviderUserId, configuration, signal) =>
+      gateway().createTelegramMessagingConnection(ownerProviderUserId, configuration, signal),
+    saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
+      gateway().saveMessagingCredential(
+        connectionId,
+        expectedRevision,
+        expectedGeneration,
+        secret,
+        enable,
+        signal
+      ),
+    clearMessagingCredential: (connectionId, expectedRevision, expectedGeneration, signal) =>
+      gateway().clearMessagingCredential(connectionId, expectedRevision, expectedGeneration, signal),
+    setMessagingConnectionEnabled: (connectionId, expectedRevision, expectedGeneration, enabled, signal) =>
+      gateway().setMessagingConnectionEnabled(
+        connectionId,
+        expectedRevision,
+        expectedGeneration,
+        enabled,
+        signal
+      ),
+    updateTelegramMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ) => gateway().updateTelegramMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ),
+    testMessagingConnection: (connectionId, signal) => gateway().testMessagingConnection(connectionId, signal),
+    putMessagingRoute: (draft, signal) => gateway().putMessagingRoute(draft, signal),
     ...remoteHostApi,
     ...mcpApi,
     updatePiSettings: (backendId, patch) => gateway().updatePiSettings(backendId, patch),

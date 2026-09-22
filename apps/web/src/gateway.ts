@@ -152,6 +152,10 @@ import {
   ManagedModelRuntimeTransferKind,
   ManagedModelRuntimeTransferPhase,
   ManagedProcessPriority,
+  MessagingChannel as ProtoMessagingChannel,
+  MessagingConnectionRuntimeStatus as ProtoMessagingConnectionRuntimeStatus,
+  MessagingConnectionTestFailure as ProtoMessagingConnectionTestFailure,
+  MessagingService,
   ModelInputModality,
   ModelOutputModality,
   ModelPriceCurrency,
@@ -308,6 +312,10 @@ import {
   VoiceInputTerminalOutcome,
   VoiceInputTextSource,
   VoiceInputTranscriptionProtocol,
+  TelegramEmojiReactions as ProtoTelegramEmojiReactions,
+  TelegramGroupActivation as ProtoTelegramGroupActivation,
+  TelegramGroupActivationRuleSchema as ProtoTelegramGroupActivationRuleSchema,
+  TelegramReplyQuoteMode as ProtoTelegramReplyQuoteMode,
   WorktreeEligibility,
   WorktreeService,
   WorktreeSourceStrategy,
@@ -384,6 +392,9 @@ import {
   type ManagedResource,
   type ManagedModelRuntime,
   type McpServerDescriptor,
+  type MessagingConnection as ProtoMessagingConnection,
+  type MessagingRoute as ProtoMessagingRoute,
+  type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
   type ModelDescriptor,
@@ -588,6 +599,11 @@ import type {
   ModelPriceQuoteView,
   ModelView,
   ManagedModelRuntimeView,
+  MessagingConnectionTestResultView,
+  MessagingConnectionView,
+  MessagingRouteDraftView,
+  MessagingRouteView,
+  MessagingSettingsView,
   OperationApi,
   PartnerCapabilitiesView,
   PartnerActivityView,
@@ -788,6 +804,7 @@ import type {
   VoiceInputDictionaryLearningActionView,
   VoiceInputRefinementContextView,
   VoiceInputServiceSettingsDraft,
+  TelegramMessagingConfigurationView,
   VoiceInputTranscriptionProtocolView,
   TargetDraft,
   TargetWorktreeProbeView,
@@ -5827,6 +5844,165 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async deleteCredential(credentialId: string): Promise<void> {
     await this.submit({ case: "deleteCredential", value: { credentialReferenceId: credentialId } }, true);
+  }
+
+  async getMessagingSettings(signal?: AbortSignal): Promise<MessagingSettingsView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .getMessagingSettings({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const channels = response.channels.map((value) => ({
+      channel: mapMessagingChannel(value.channel),
+      available: value.available,
+      ...(value.reason === "" ? {} : { reason: value.reason })
+    }));
+    if (new Set(channels.map((value) => value.channel)).size !== channels.length) {
+      throw new GatewayError("Orchestrator returned duplicate Messaging channel capabilities.");
+    }
+    return {
+      connections: response.connections.map(mapMessagingConnection),
+      routes: response.routes.map(mapMessagingRoute),
+      channels
+    };
+  }
+
+  async createTelegramMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.TELEGRAM,
+      ownerProviderUserId,
+      ...(configuration === undefined ? {} : {
+        telegramConfiguration: protoTelegramMessagingConfiguration(configuration)
+      })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async saveMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    secret: string,
+    enable: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    if (secret.length === 0) throw new GatewayError("Messaging credential value is required.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(MessagingService, scope.transport);
+    const begun = await client.beginMessagingCredentialUpload({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration
+    }, { signal: scope.signal });
+    const ticketId = await this.uploadCredentialTicket(secret, begun.ticket, scope);
+    scope.signal.throwIfAborted();
+    const response = await client.commitMessagingCredential({
+      credentialUploadTicketId: ticketId,
+      enable
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async clearMessagingCredential(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).clearMessagingCredential({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async setMessagingConnectionEnabled(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    enabled: boolean,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).setMessagingConnectionEnabled({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration,
+      enabled
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateTelegramMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateTelegramMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        ownerProviderUserId,
+        configuration: protoTelegramMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async testMessagingConnection(
+    connectionId: string,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionTestResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .testMessagingConnection({ connectionId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.ok) return { ok: false, failure: mapMessagingTestFailure(response.failure) };
+    if (response.providerAccountId === undefined || response.providerAccountId === ""
+      || response.displayName === undefined || response.displayName === "") {
+      throw new GatewayError("Orchestrator returned an incomplete Messaging connection test result.");
+    }
+    return {
+      ok: true,
+      providerAccountId: response.providerAccountId,
+      displayName: response.displayName,
+      ...(response.username === undefined ? {} : { username: response.username })
+    };
+  }
+
+  async putMessagingRoute(
+    draft: MessagingRouteDraftView,
+    signal?: AbortSignal
+  ): Promise<MessagingRouteView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).putMessagingRoute({
+      ...(draft.connectionId === undefined ? {} : { connectionId: draft.connectionId }),
+      ...(draft.expectedRevision === undefined ? {} : { expectedRevision: { value: draft.expectedRevision } }),
+      targetId: draft.targetId,
+      ...(draft.providerId === undefined ? {} : { providerId: draft.providerId }),
+      ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
+      ...(draft.effort === undefined ? {} : { effort: draft.effort }),
+      fastMode: draft.fastMode,
+      permissionMode: protoPermission(draft.permissionMode),
+      planMode: draft.planMode
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingRoute(response.route);
   }
 
   async getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView> {
@@ -18058,6 +18234,176 @@ function protoContactVCardImportDecision(value: ContactVCardImportDecisionView) 
     ...(value.organizationTargetEntryId === undefined ? {} : { organizationTargetEntryId: value.organizationTargetEntryId }),
     confirmedOrganizationCandidateIds: [...(value.confirmedOrganizationCandidateIds ?? [])]
   };
+}
+
+function mapMessagingConnection(value: ProtoMessagingConnection | undefined): MessagingConnectionView {
+  if (value === undefined || value.connectionId.trim() === "") {
+    throw new GatewayError("Orchestrator returned no Messaging connection.");
+  }
+  if (value.generation < 1n || value.revision === undefined || value.revision.value < 1n) {
+    throw new GatewayError("Orchestrator returned an unfenced Messaging connection.");
+  }
+  const createdAt = requiredMessagingTimestamp(value.createdAt, "created_at");
+  const updatedAt = requiredMessagingTimestamp(value.updatedAt, "updated_at");
+  if (updatedAt < createdAt) throw new GatewayError("Orchestrator returned an invalid Messaging connection timeline.");
+  const channel = mapMessagingChannel(value.channel);
+  const telegramConfiguration = channel === "telegram"
+    ? mapTelegramMessagingConfiguration(value.telegramConfiguration)
+    : undefined;
+  return {
+    id: value.connectionId,
+    channel,
+    generation: value.generation,
+    revision: value.revision.value,
+    enabled: value.enabled,
+    runtimeStatus: mapMessagingRuntimeStatus(value.runtimeStatus),
+    credentialConfigured: value.credentialConfigured,
+    ...(value.ownerProviderUserId === undefined ? {} : { ownerProviderUserId: value.ownerProviderUserId }),
+    ...(value.providerAccountId === undefined ? {} : { providerAccountId: value.providerAccountId }),
+    ...(value.providerUsername === undefined ? {} : { providerUsername: value.providerUsername }),
+    ...(telegramConfiguration === undefined ? {} : { telegramConfiguration }),
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
+    ...(value.lastConnectedAt === undefined
+      ? {}
+      : { lastConnectedAt: requiredMessagingTimestamp(value.lastConnectedAt, "last_connected_at") }),
+    createdAt,
+    updatedAt
+  };
+}
+
+function mapMessagingRoute(value: ProtoMessagingRoute | undefined): MessagingRouteView {
+  if (value === undefined || value.scopeKey.trim() === "" || value.targetId.trim() === ""
+    || value.backendId.trim() === "" || value.revision === undefined || value.revision.value < 1n) {
+    throw new GatewayError("Orchestrator returned an invalid Messaging route.");
+  }
+  return {
+    scopeKey: value.scopeKey,
+    ...(value.connectionId === undefined ? {} : { connectionId: value.connectionId }),
+    targetId: value.targetId,
+    backendId: value.backendId,
+    ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
+    ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
+    ...(value.effort === undefined ? {} : { effort: value.effort }),
+    fastMode: value.fastMode,
+    permissionMode: uiPermission(value.permissionMode),
+    planMode: value.planMode,
+    createdAt: requiredMessagingTimestamp(value.createdAt, "route.created_at"),
+    updatedAt: requiredMessagingTimestamp(value.updatedAt, "route.updated_at"),
+    revision: value.revision.value
+  };
+}
+
+function mapMessagingChannel(value: ProtoMessagingChannel): import("./model.js").MessagingChannelView {
+  switch (value) {
+    case ProtoMessagingChannel.TELEGRAM: return "telegram";
+    case ProtoMessagingChannel.DISCORD: return "discord";
+    case ProtoMessagingChannel.DINGTALK: return "dingtalk";
+    case ProtoMessagingChannel.FEISHU: return "feishu";
+    case ProtoMessagingChannel.LARK: return "lark";
+    case ProtoMessagingChannel.WECOM: return "wecom";
+    case ProtoMessagingChannel.WECHAT: return "wechat";
+    case ProtoMessagingChannel.SLACK: return "slack";
+    default: throw new GatewayError("Orchestrator returned an unknown Messaging channel.");
+  }
+}
+
+function mapMessagingRuntimeStatus(
+  value: ProtoMessagingConnectionRuntimeStatus
+): import("./model.js").MessagingConnectionRuntimeStatusView {
+  switch (value) {
+    case ProtoMessagingConnectionRuntimeStatus.IDLE: return "idle";
+    case ProtoMessagingConnectionRuntimeStatus.CONNECTING: return "connecting";
+    case ProtoMessagingConnectionRuntimeStatus.CONNECTED: return "connected";
+    case ProtoMessagingConnectionRuntimeStatus.OFFLINE: return "offline";
+    case ProtoMessagingConnectionRuntimeStatus.CONFLICT: return "conflict";
+    case ProtoMessagingConnectionRuntimeStatus.AUTH_LOSS: return "authLoss";
+    case ProtoMessagingConnectionRuntimeStatus.ERROR: return "error";
+    default: throw new GatewayError("Orchestrator returned an unknown Messaging runtime status.");
+  }
+}
+
+function mapTelegramMessagingConfiguration(
+  value: ProtoTelegramMessagingConfiguration | undefined
+): TelegramMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator omitted Telegram configuration.");
+  const emojiReactions = value.emojiReactions === ProtoTelegramEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoTelegramEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoTelegramEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === ProtoTelegramReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteDm === ProtoTelegramReplyQuoteMode.FIRST ? "first" as const
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === ProtoTelegramReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteGroup === ProtoTelegramReplyQuoteMode.FIRST ? "first" as const
+      : value.replyQuoteGroup === ProtoTelegramReplyQuoteMode.ALL ? "all" as const
+        : undefined;
+  if (emojiReactions === undefined || replyQuoteDm === undefined || replyQuoteGroup === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Telegram configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const chatId = rule.chatId;
+    const mapped = rule.activation === ProtoTelegramGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoTelegramGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoTelegramGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || Object.hasOwn(groupActivation, chatId)) {
+      throw new GatewayError("Orchestrator returned an invalid Telegram group activation.");
+    }
+    groupActivation[chatId] = mapped;
+  }
+  return { emojiReactions, replyQuoteDm, replyQuoteGroup, groupActivation };
+}
+
+function protoTelegramMessagingConfiguration(
+  value: TelegramMessagingConfigurationView
+): ProtoTelegramMessagingConfiguration {
+  return {
+    $typeName: "joko.v1.TelegramMessagingConfiguration",
+    emojiReactions: value.emojiReactions === "off" ? ProtoTelegramEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoTelegramEmojiReactions.MINIMAL
+        : ProtoTelegramEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? ProtoTelegramReplyQuoteMode.OFF
+      : ProtoTelegramReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? ProtoTelegramReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? ProtoTelegramReplyQuoteMode.FIRST
+        : ProtoTelegramReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([chatId, activation]) => create(
+      ProtoTelegramGroupActivationRuleSchema,
+      {
+        chatId,
+        activation: activation === "mention" ? ProtoTelegramGroupActivation.MENTION
+          : activation === "always" ? ProtoTelegramGroupActivation.ALWAYS
+            : ProtoTelegramGroupActivation.DISABLED
+      }
+    ))
+  };
+}
+
+function mapMessagingTestFailure(
+  value: ProtoMessagingConnectionTestFailure
+): Extract<MessagingConnectionTestResultView, { readonly ok: false }>["failure"] {
+  switch (value) {
+    case ProtoMessagingConnectionTestFailure.INVALID: return "invalid";
+    case ProtoMessagingConnectionTestFailure.CONFLICT: return "conflict";
+    case ProtoMessagingConnectionTestFailure.CREDENTIAL_UNAVAILABLE: return "credentialUnavailable";
+    case ProtoMessagingConnectionTestFailure.CHANNEL_UNAVAILABLE: return "channelUnavailable";
+    case ProtoMessagingConnectionTestFailure.CONNECTION_FAILED: return "connectionFailed";
+    default: throw new GatewayError("Orchestrator returned an unknown Messaging test failure.");
+  }
+}
+
+function requiredMessagingTimestamp(
+  value: { readonly seconds: bigint; readonly nanos: number } | undefined,
+  label: string
+): number {
+  const mapped = timestampMs(value);
+  if (value === undefined || !Number.isSafeInteger(mapped) || mapped < 0) {
+    throw new GatewayError(`Orchestrator returned an invalid Messaging ${label} timestamp.`);
+  }
+  return mapped;
 }
 
 function asRecord(value: unknown): Record<string, any> {

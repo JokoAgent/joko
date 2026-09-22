@@ -10,6 +10,7 @@ import {
   EventService,
   ExtensionService,
   InteractionService,
+  MessagingService,
   OperationService,
   PartnerService,
   PiService,
@@ -46,6 +47,7 @@ export interface E2eClients {
   readonly queue: Client<typeof QueueService>;
   readonly scheduler: Client<typeof SchedulerService>;
   readonly interaction: Client<typeof InteractionService>;
+  readonly messaging: Client<typeof MessagingService>;
   readonly workspace: Client<typeof WorkspaceContractService>;
   readonly artifact: Client<typeof ArtifactService>;
   readonly tool: Client<typeof ToolService>;
@@ -95,6 +97,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     queue: createClient(QueueService, transport),
     scheduler: createClient(SchedulerService, transport),
     interaction: createClient(InteractionService, transport),
+    messaging: createClient(MessagingService, transport),
     workspace: createClient(WorkspaceContractService, transport),
     artifact: createClient(ArtifactService, transport),
     tool: createClient(ToolService, transport),

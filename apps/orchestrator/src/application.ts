@@ -135,6 +135,7 @@ import {
   resolveAuthenticatedLspTarget
 } from "./lsp-tool-bridge.js";
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { MessagingManager } from "./messaging-manager.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
@@ -350,6 +351,8 @@ export interface OrchestratorApplication {
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
+  /** Direct third-party Messaging transport, durable admission and delivery owner. */
+  readonly messaging?: MessagingManager;
   readonly collaboration?: CollaborationManager;
   /** Durable Goal/lead/worker scheduling authority. */
   readonly collaborationGoals?: CollaborationGoalManager;
@@ -424,6 +427,10 @@ export interface OrchestratorApplicationDependencies {
   readonly providerAccountUsageFetch?: typeof fetch;
   /** Test-only transport seam; production uses the configured generic APNs provider. */
   readonly mobilePushProvider?: MobilePushProviderPort;
+  /** Test-only direct-Messaging loopback seams; not sourced from product configuration. */
+  readonly messagingTelegramApiBaseUrl?: string;
+  readonly messagingPollTimeoutSeconds?: number;
+  readonly messagingRetryDelayMs?: number;
 }
 
 export type OutboundProxyResolver = (
@@ -1224,6 +1231,7 @@ export async function createOrchestratorApplication(
   const workspaceCapture = new DurableWorkspaceRunCapture(store, workspaceChanges, workspaces, gitSafety);
   let androidRuntimeForSessionCleanup: AndroidRuntimeSupervisor | undefined;
   let computerBridgeForSessionCleanup: ComputerToolBridgeProvider | undefined;
+  let messaging: MessagingManager | undefined;
   const configuredProviderRouteEnabled = (backendId: string, providerId: string): boolean => {
     const backend = store.getBackend(backendId).descriptor;
     if (backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true) return true;
@@ -1282,7 +1290,25 @@ export async function createOrchestratorApplication(
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
     },
+    onServiceRunSettled: (input) => messaging?.onRunSettled(input),
+    onServiceInteractionOpened: (input) => messaging?.onInteractionOpened(input),
+    onServiceInteractionSettled: (input) => messaging?.onInteractionSettled(input),
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
+  });
+  messaging = new MessagingManager({
+    store,
+    credentials,
+    sessionHost,
+    artifacts,
+    ...(dependencies.messagingTelegramApiBaseUrl === undefined
+      ? {}
+      : { telegramApiBaseUrl: dependencies.messagingTelegramApiBaseUrl }),
+    ...(dependencies.messagingPollTimeoutSeconds === undefined
+      ? {}
+      : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),
+    ...(dependencies.messagingRetryDelayMs === undefined
+      ? {}
+      : { retryDelayMs: dependencies.messagingRetryDelayMs })
   });
   const partners = new PartnerManager({
     store: partnerStore,
@@ -1864,6 +1890,7 @@ export async function createOrchestratorApplication(
         await sessionHost.registerTarget(target, { workspaceId: config.workspace.id });
       }
     }
+    await messaging.initialize();
     await collaborationGoals.initialize();
     await partners.recoverPending();
 
@@ -2073,6 +2100,7 @@ export async function createOrchestratorApplication(
     providerAccountUsage.invalidate();
     await managedModelRuntimeSystem.close().catch(() => undefined);
     await collaborationGoals.close().catch(() => undefined);
+    await messaging.close().catch(() => undefined);
     await sessionHost.dispose().catch(() => undefined);
     sessionWorktrees.dispose();
     await generationGcTail.catch(() => undefined);
@@ -2161,6 +2189,7 @@ export async function createOrchestratorApplication(
     skillMarket,
     skillMarketSync,
     skillPublication,
+    messaging,
     collaboration,
     collaborationGoals,
     contacts,
@@ -2236,6 +2265,7 @@ export async function createOrchestratorApplication(
         await attempt(() => providerAccountUsage.invalidate());
         await attempt(() => managedModelRuntimeSystem.close());
         await attempt(() => collaborationGoals.close());
+        await attempt(() => messaging.close());
         await refreshTail.catch(() => undefined);
         await backendLifecycleTail.catch(() => undefined);
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.

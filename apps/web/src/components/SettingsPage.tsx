@@ -20,6 +20,7 @@ import {
   KeyRound,
   Keyboard,
   ListOrdered,
+  MessageCircleMore,
   Mic,
   Monitor,
   MonitorCog,
@@ -76,6 +77,7 @@ import { RuntimeProcessMonitor } from "./RuntimeProcessMonitor.js";
 import { RemoteHostsSettings } from "./RemoteHostsSettings.js";
 import { SshKeySettings } from "./SshKeySettings.js";
 import { ContactsSettings } from "./ContactsSettings.js";
+import { MessagingSettings } from "./MessagingSettings.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelPriceOverrideDialog, type ModelPriceVariant } from "./ModelPriceOverrideDialog.js";
 import { PiPackagesSection } from "./PiPackagesSection.js";
@@ -108,6 +110,7 @@ export const SETTINGS_NAV_SECTION_IDS = [
   "taskStatus",
   "import",
   "contacts",
+  "messaging",
   "connections",
   "tools",
   "automation",
@@ -237,6 +240,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
     ...(nativeTaskStatusVisible ? [{ id: "taskStatus" as const, label: t("settings.nativeTaskStatus.title"), icon: <MonitorUp /> }] : []),
     { id: "import", label: t("portable.importTitle"), icon: <FileInput /> },
     { id: "contacts", label: t("contacts.title"), icon: <UsersRound /> },
+    { id: "messaging", label: t("settings.messaging"), icon: <MessageCircleMore /> },
     { id: "connections", label: t("settings.connections"), icon: <Network /> },
     { id: "tools", label: t("settings.toolPolicies.nav"), icon: <Wrench /> },
     { id: "automation", label: t("settings.automation"), icon: <MonitorCog /> },
@@ -297,6 +301,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "automation" && <AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} />}
             {section === "import" && <TaskImportSettings controller={controller} snapshot={snapshot} onImportPortable={onImportPortableSession} runAction={runAction} onSuccess={showSuccess} t={t} />}
             {section === "contacts" && <SettingsPageSection id="contacts"><ContactsSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} locale={locale} t={t} /></SettingsPageSection>}
+            {section === "messaging" && <SettingsPageSection id="messaging"><MessagingSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}
             {section === "about" && <><SettingsPageSection id="about"><AboutSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection><SettingsPageSection id="backends"><SettingsSectionHeading title={t("settings.backends")} body={t("settings.backendsBody")} /><BackendSettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="diagnostics"><DiagnosticSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection><SettingsPageSection id="runtime"><RuntimeProcessMonitor controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
           </div>
         </div>

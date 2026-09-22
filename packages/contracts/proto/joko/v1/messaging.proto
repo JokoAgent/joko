@@ -1,0 +1,212 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+import "joko/v1/operation.proto";
+
+enum MessagingChannel {
+  MESSAGING_CHANNEL_UNSPECIFIED = 0;
+  MESSAGING_CHANNEL_TELEGRAM = 1;
+  MESSAGING_CHANNEL_DISCORD = 2;
+  MESSAGING_CHANNEL_DINGTALK = 3;
+  MESSAGING_CHANNEL_FEISHU = 4;
+  MESSAGING_CHANNEL_LARK = 5;
+  MESSAGING_CHANNEL_WECOM = 6;
+  MESSAGING_CHANNEL_WECHAT = 7;
+  MESSAGING_CHANNEL_SLACK = 8;
+}
+
+enum MessagingConnectionRuntimeStatus {
+  MESSAGING_CONNECTION_RUNTIME_STATUS_UNSPECIFIED = 0;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_IDLE = 1;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_CONNECTING = 2;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_CONNECTED = 3;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_OFFLINE = 4;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_CONFLICT = 5;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_AUTH_LOSS = 6;
+  MESSAGING_CONNECTION_RUNTIME_STATUS_ERROR = 7;
+}
+
+enum TelegramEmojiReactions {
+  TELEGRAM_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  TELEGRAM_EMOJI_REACTIONS_OFF = 1;
+  TELEGRAM_EMOJI_REACTIONS_MINIMAL = 2;
+  TELEGRAM_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum TelegramReplyQuoteMode {
+  TELEGRAM_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+  TELEGRAM_REPLY_QUOTE_MODE_OFF = 1;
+  TELEGRAM_REPLY_QUOTE_MODE_FIRST = 2;
+  TELEGRAM_REPLY_QUOTE_MODE_ALL = 3;
+}
+
+enum TelegramGroupActivation {
+  TELEGRAM_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  TELEGRAM_GROUP_ACTIVATION_MENTION = 1;
+  TELEGRAM_GROUP_ACTIVATION_ALWAYS = 2;
+  TELEGRAM_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+enum MessagingConnectionTestFailure {
+  MESSAGING_CONNECTION_TEST_FAILURE_UNSPECIFIED = 0;
+  MESSAGING_CONNECTION_TEST_FAILURE_INVALID = 1;
+  MESSAGING_CONNECTION_TEST_FAILURE_CONFLICT = 2;
+  MESSAGING_CONNECTION_TEST_FAILURE_CREDENTIAL_UNAVAILABLE = 3;
+  MESSAGING_CONNECTION_TEST_FAILURE_CHANNEL_UNAVAILABLE = 4;
+  MESSAGING_CONNECTION_TEST_FAILURE_CONNECTION_FAILED = 5;
+}
+
+message TelegramMessagingConfiguration {
+  TelegramEmojiReactions emoji_reactions = 1;
+  TelegramReplyQuoteMode reply_quote_dm = 2;
+  TelegramReplyQuoteMode reply_quote_group = 3;
+  repeated TelegramGroupActivationRule group_activation_rules = 4;
+}
+
+message TelegramGroupActivationRule {
+  string chat_id = 1;
+  TelegramGroupActivation activation = 2;
+}
+
+message MessagingChannelCapability {
+  MessagingChannel channel = 1;
+  bool available = 2;
+  string reason = 3;
+}
+
+message MessagingConnection {
+  string connection_id = 1;
+  MessagingChannel channel = 2;
+  uint64 generation = 3;
+  bool enabled = 4;
+  MessagingConnectionRuntimeStatus runtime_status = 5;
+  bool credential_configured = 6;
+  optional string owner_provider_user_id = 7;
+  optional string provider_account_id = 8;
+  optional string provider_username = 9;
+  optional TelegramMessagingConfiguration telegram_configuration = 10;
+  optional string error_code = 11;
+  optional string error_summary = 12;
+  optional google.protobuf.Timestamp last_connected_at = 13;
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp updated_at = 15;
+  Revision revision = 16;
+}
+
+message MessagingRoute {
+  string scope_key = 1;
+  optional string connection_id = 2;
+  string target_id = 3;
+  string backend_id = 4;
+  optional string provider_id = 5;
+  optional string model_id = 6;
+  optional string effort = 7;
+  bool fast_mode = 8;
+  PermissionMode permission_mode = 9;
+  bool plan_mode = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  Revision revision = 13;
+}
+
+message GetMessagingSettingsRequest {}
+
+message GetMessagingSettingsResponse {
+  repeated MessagingConnection connections = 1;
+  repeated MessagingRoute routes = 2;
+  repeated MessagingChannelCapability channels = 3;
+}
+
+message CreateMessagingConnectionRequest {
+  MessagingChannel channel = 1;
+  string owner_provider_user_id = 2;
+  optional TelegramMessagingConfiguration telegram_configuration = 3;
+}
+
+message CreateMessagingConnectionResponse {
+  MessagingConnection connection = 1;
+}
+
+message BeginMessagingCredentialUploadRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message BeginMessagingCredentialUploadResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message CommitMessagingCredentialRequest {
+  string credential_upload_ticket_id = 1;
+  bool enable = 2;
+}
+
+message CommitMessagingCredentialResponse {
+  MessagingConnection connection = 1;
+}
+
+message ClearMessagingCredentialRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message ClearMessagingCredentialResponse {
+  MessagingConnection connection = 1;
+}
+
+message SetMessagingConnectionEnabledRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  bool enabled = 4;
+}
+
+message SetMessagingConnectionEnabledResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateTelegramMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  TelegramMessagingConfiguration configuration = 5;
+}
+
+message UpdateTelegramMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message TestMessagingConnectionRequest {
+  string connection_id = 1;
+}
+
+message TestMessagingConnectionResponse {
+  bool ok = 1;
+  MessagingConnectionTestFailure failure = 2;
+  optional string provider_account_id = 3;
+  optional string display_name = 4;
+  optional string username = 5;
+}
+
+message PutMessagingRouteRequest {
+  optional string connection_id = 1;
+  optional Revision expected_revision = 2;
+  string target_id = 3;
+  optional string provider_id = 4;
+  optional string model_id = 5;
+  optional string effort = 6;
+  bool fast_mode = 7;
+  PermissionMode permission_mode = 8;
+  bool plan_mode = 9;
+}
+
+message PutMessagingRouteResponse {
+  MessagingRoute route = 1;
+}

@@ -7,6 +7,7 @@ export * from "./gen/joko/v1/event_pb.js";
 export * from "./gen/joko/v1/extension_pb.js";
 export * from "./gen/joko/v1/interaction_pb.js";
 export * from "./gen/joko/v1/managed_model_runtime_pb.js";
+export * from "./gen/joko/v1/messaging_pb.js";
 export * from "./gen/joko/v1/mobile_push_pb.js";
 export * from "./gen/joko/v1/model_pb.js";
 export * from "./gen/joko/v1/objective_pb.js";
