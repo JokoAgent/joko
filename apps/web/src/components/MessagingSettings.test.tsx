@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { Code, ConnectError } from "@connectrpc/connect";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -44,7 +45,7 @@ describe("Messaging settings", () => {
     const container = await renderSettings(controller, snapshot());
 
     expect(container.querySelectorAll(".messaging-channel")).toHaveLength(8);
-    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(1);
+    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(2);
     expect(container.textContent).toContain("Conflict");
     expect(container.textContent).toContain("Another poller owns this bot token.");
 
@@ -74,6 +75,9 @@ describe("Messaging settings", () => {
     const create = vi.fn(async () => created);
     const save = vi.fn(async () => saved);
     const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
       createTelegramMessagingConnection: create,
       saveMessagingCredential: save
     });
@@ -108,6 +112,88 @@ describe("Messaging settings", () => {
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(document.activeElement).toBe(replace);
   });
+
+  it("creates Discord with a strict owner ID and keeps its bot token out of rendered state", async () => {
+    const created = discordConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = discordConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 9n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValue(messagingSettings([created])),
+      createDiscordMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add Discord")[0]!.click());
+    const owner = required(document.querySelector<HTMLInputElement>('input[inputmode="numeric"]'));
+    await change(owner, "123");
+    expect(button(document.body, "Continue").disabled).toBe(true);
+    await change(owner, "987654321098765432");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith("987654321098765432", {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "first",
+      groupActivation: {}
+    });
+
+    const token = required(document.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(token, "discord-secret");
+    await act(async () => button(document.body, "Save").click());
+    expect(save).toHaveBeenCalledWith("discord-one", 8n, 4n, "discord-secret", true);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("discord-secret");
+    expect(container.textContent).toContain("Connecting");
+  });
+
+  it("saves Discord lifecycle, reply, reaction, and approved server-channel policy together", async () => {
+    const original = discordConnection();
+    const refreshed = discordConnection({ revision: 9n });
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValue(messagingSettings([refreshed]));
+    const update = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("runtime projection changed", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, ownerProviderUserId, configuration) =>
+        discordConnection({ ownerProviderUserId, discordConfiguration: configuration }));
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings,
+      updateDiscordMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const owner = required(dialog.querySelector<HTMLInputElement>('input[inputmode="numeric"]'));
+    await change(owner, "876543210987654321");
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    await act(async () => lifecycle.click());
+    const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
+    await change(required(selects[0]), "expressive");
+    await change(required(selects[1]), "first");
+    await change(required(selects[2]), "all");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "123456789012345678/234567890123456789=always\n123456789012345678/345678901234567890=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenNthCalledWith(1, "discord-one", 8n, 4n, "876543210987654321", {
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive",
+      replyQuoteDm: "first",
+      replyQuoteGroup: "all",
+      groupActivation: {
+        "123456789012345678/234567890123456789": "always",
+        "123456789012345678/345678901234567890": "disabled"
+      }
+    });
+    expect(update).toHaveBeenNthCalledWith(2, "discord-one", 9n, 4n, "876543210987654321", expect.any(Object));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
 });
 
 async function renderSettings(controller: AppController, currentSnapshot: AppSnapshot): Promise<HTMLElement> {
@@ -132,10 +218,12 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     },
     getMessagingSettings: vi.fn(async () => settings),
     createTelegramMessagingConnection: vi.fn(async () => telegramConnection()),
+    createDiscordMessagingConnection: vi.fn(async () => discordConnection()),
     saveMessagingCredential: vi.fn(unchanged),
     clearMessagingCredential: vi.fn(unchanged),
     setMessagingConnectionEnabled: vi.fn(unchanged),
     updateTelegramMessagingConfiguration: vi.fn(unchanged),
+    updateDiscordMessagingConfiguration: vi.fn(async () => discordConnection()),
     testMessagingConnection: vi.fn(async () => ({ ok: true as const, providerAccountId: "9001", displayName: "Joko Bot" })),
     putMessagingRoute: vi.fn(async () => messagingRoute()),
     ...overrides
@@ -148,7 +236,7 @@ function messagingSettings(connections: readonly MessagingConnectionView[]): Mes
     routes: [],
     channels: [
       { channel: "telegram", available: true },
-      { channel: "discord", available: false, reason: "not implemented" },
+      { channel: "discord", available: true },
       { channel: "dingtalk", available: false, reason: "not implemented" },
       { channel: "feishu", available: false, reason: "not implemented" },
       { channel: "lark", available: false, reason: "not implemented" },
@@ -176,6 +264,32 @@ function telegramConnection(overrides: Partial<MessagingConnectionView> = {}): M
       replyQuoteDm: "off",
       replyQuoteGroup: "first",
       groupActivation: { "-100": "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function discordConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "discord-one",
+    channel: "discord",
+    generation: 4n,
+    revision: 8n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "987654321098765432",
+    providerAccountId: "111111111111111111",
+    providerUsername: "joko-discord",
+    discordConfiguration: {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      replyQuoteDm: "off",
+      replyQuoteGroup: "first",
+      groupActivation: { "123456789012345678/234567890123456789": "mention" }
     },
     lastConnectedAt: Date.now() - 1_000,
     createdAt: 1_000,
@@ -241,12 +355,14 @@ function button(container: ParentNode, text: string): HTMLButtonElement {
   return required(buttons(container, text)[0]);
 }
 
-async function change(input: HTMLInputElement | HTMLTextAreaElement, value: string): Promise<void> {
-  const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+async function change(input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string): Promise<void> {
+  const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+    : input instanceof HTMLSelectElement ? HTMLSelectElement.prototype
+      : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
   await act(async () => {
     setter?.call(input, value);
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event(input instanceof HTMLSelectElement ? "change" : "input", { bubbles: true }));
   });
 }
 

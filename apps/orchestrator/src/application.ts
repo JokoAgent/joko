@@ -429,6 +429,7 @@ export interface OrchestratorApplicationDependencies {
   readonly mobilePushProvider?: MobilePushProviderPort;
   /** Test-only direct-Messaging loopback seams; not sourced from product configuration. */
   readonly messagingTelegramApiBaseUrl?: string;
+  readonly messagingDiscordApiBaseUrl?: string;
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -1303,6 +1304,9 @@ export async function createOrchestratorApplication(
     ...(dependencies.messagingTelegramApiBaseUrl === undefined
       ? {}
       : { telegramApiBaseUrl: dependencies.messagingTelegramApiBaseUrl }),
+    ...(dependencies.messagingDiscordApiBaseUrl === undefined
+      ? {}
+      : { discordApiBaseUrl: dependencies.messagingDiscordApiBaseUrl }),
     ...(dependencies.messagingPollTimeoutSeconds === undefined
       ? {}
       : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),

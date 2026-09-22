@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type JSX } from "react";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   Bot,
   CheckCircle2,
@@ -15,6 +16,7 @@ import {
 import type { AppController } from "../controller.js";
 import type {
   AppSnapshot,
+  DiscordMessagingConfigurationView,
   MessagingChannelView,
   MessagingConnectionTestResultView,
   MessagingConnectionView,
@@ -44,8 +46,16 @@ const DEFAULT_TELEGRAM_CONFIGURATION: TelegramMessagingConfigurationView = Objec
   groupActivation: Object.freeze({})
 });
 
+const DEFAULT_DISCORD_CONFIGURATION: DiscordMessagingConfigurationView = Object.freeze({
+  lifecycleAnnouncements: true,
+  emojiReactions: "minimal",
+  replyQuoteDm: "off",
+  replyQuoteGroup: "first",
+  groupActivation: Object.freeze({})
+});
+
 type MessagingDialog =
-  | { readonly kind: "create" }
+  | { readonly kind: "create"; readonly channel: "telegram" | "discord" }
   | { readonly kind: "credential"; readonly connectionId: string }
   | { readonly kind: "configuration"; readonly connectionId: string }
   | { readonly kind: "clear"; readonly connectionId: string }
@@ -136,41 +146,95 @@ export function MessagingSettings({ controller, snapshot, t }: {
     }
   };
 
+  const refreshConnection = async (original: MessagingConnectionView): Promise<MessagingConnectionView> => {
+    const refreshed = await controller.getMessagingSettings();
+    setSettings(refreshed);
+    const latest = refreshed.connections.find((candidate) => candidate.id === original.id);
+    if (latest === undefined || latest.channel !== original.channel) {
+      throw new Error(t("messaging.connectionChanged"));
+    }
+    return latest;
+  };
+
+  const refreshAfterRevisionConflict = async (
+    reason: unknown,
+    original: MessagingConnectionView
+  ): Promise<MessagingConnectionView> => {
+    if (ConnectError.from(reason).code !== Code.Aborted) throw reason;
+    return refreshConnection(original);
+  };
+
   const connectionForDialog = dialog !== undefined && "connectionId" in dialog
     ? settings?.connections.find((value) => value.id === dialog.connectionId)
     : undefined;
   const globalRoute = settings?.routes.find((route) => route.connectionId === undefined);
+  const telegramAvailable = settings?.channels.some((capability) =>
+    capability.channel === "telegram" && capability.available) === true;
+  const discordAvailable = settings?.channels.some((capability) =>
+    capability.channel === "discord" && capability.available) === true;
 
-  const createTelegram = async (ownerProviderUserId: string): Promise<void> => {
-    const connection = await run("create", () => controller.createTelegramMessagingConnection(
-      ownerProviderUserId,
-      DEFAULT_TELEGRAM_CONFIGURATION
-    ));
+  const createConnection = async (
+    channel: "telegram" | "discord",
+    ownerProviderUserId: string
+  ): Promise<void> => {
+    const connection = await run(`create:${channel}`, () => channel === "telegram"
+      ? controller.createTelegramMessagingConnection(ownerProviderUserId, DEFAULT_TELEGRAM_CONFIGURATION)
+      : controller.createDiscordMessagingConnection(ownerProviderUserId, DEFAULT_DISCORD_CONFIGURATION));
     if (connection === undefined) return;
     replaceConnection(connection);
     setDialog({ kind: "credential", connectionId: connection.id });
   };
 
   const saveCredential = async (connection: MessagingConnectionView, secret: string, enable: boolean): Promise<void> => {
-    const updated = await run(`credential:${connection.id}`, () => controller.saveMessagingCredential(
-      connection.id,
-      connection.revision,
-      connection.generation,
-      secret,
-      enable
-    ));
+    const updated = await run(`credential:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.saveMessagingCredential(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        secret,
+        enable
+      );
+      let candidate = await refreshConnection(connection);
+      if (candidate.generation !== connection.generation
+        || candidate.credentialConfigured !== connection.credentialConfigured) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (candidate.generation !== connection.generation
+          || candidate.credentialConfigured !== connection.credentialConfigured) throw reason;
+        return save(candidate);
+      }
+    });
     if (updated === undefined) return;
     replaceConnection(updated);
     setDialog(undefined);
   };
 
   const setEnabled = async (connection: MessagingConnectionView, enabled: boolean): Promise<void> => {
-    const updated = await run(`enabled:${connection.id}`, () => controller.setMessagingConnectionEnabled(
-      connection.id,
-      connection.revision,
-      connection.generation,
-      enabled
-    ));
+    const updated = await run(`enabled:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.setMessagingConnectionEnabled(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        enabled
+      );
+      let candidate = await refreshConnection(connection);
+      if (candidate.enabled === enabled) return candidate;
+      if (candidate.generation !== connection.generation || candidate.enabled !== connection.enabled) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (candidate.enabled === enabled) return candidate;
+        if (candidate.generation !== connection.generation || candidate.enabled !== connection.enabled) throw reason;
+        return save(candidate);
+      }
+    });
     if (updated !== undefined) replaceConnection(updated);
   };
 
@@ -183,29 +247,105 @@ export function MessagingSettings({ controller, snapshot, t }: {
     }));
   };
 
-  const updateConfiguration = async (
+  const updateTelegramConfiguration = async (
     connection: MessagingConnectionView,
     ownerProviderUserId: string,
     configuration: TelegramMessagingConfigurationView
   ): Promise<void> => {
-    const updated = await run(`configuration:${connection.id}`, () => controller.updateTelegramMessagingConfiguration(
-      connection.id,
-      connection.revision,
-      connection.generation,
-      ownerProviderUserId,
-      configuration
-    ));
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.updateTelegramMessagingConfiguration(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        ownerProviderUserId,
+        configuration
+      );
+      let candidate = await refreshConnection(connection);
+      if (candidate.ownerProviderUserId === ownerProviderUserId
+        && telegramConfigurationEqual(candidate.telegramConfiguration, configuration)) return candidate;
+      if (candidate.generation !== connection.generation
+        || candidate.ownerProviderUserId !== connection.ownerProviderUserId
+        || !telegramConfigurationEqual(candidate.telegramConfiguration, connection.telegramConfiguration)) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (candidate.ownerProviderUserId === ownerProviderUserId
+          && telegramConfigurationEqual(candidate.telegramConfiguration, configuration)) return candidate;
+        if (candidate.generation !== connection.generation
+          || candidate.ownerProviderUserId !== connection.ownerProviderUserId
+          || !telegramConfigurationEqual(candidate.telegramConfiguration, connection.telegramConfiguration)) throw reason;
+        return save(candidate);
+      }
+    });
+    if (updated === undefined) return;
+    replaceConnection(updated);
+    setDialog(undefined);
+  };
+
+  const updateDiscordConfiguration = async (
+    connection: MessagingConnectionView,
+    ownerProviderUserId: string,
+    configuration: DiscordMessagingConfigurationView
+  ): Promise<void> => {
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.updateDiscordMessagingConfiguration(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        ownerProviderUserId,
+        configuration
+      );
+      let candidate = await refreshConnection(connection);
+      if (candidate.ownerProviderUserId === ownerProviderUserId
+        && discordConfigurationEqual(candidate.discordConfiguration, configuration)) return candidate;
+      if (candidate.generation !== connection.generation
+        || candidate.ownerProviderUserId !== connection.ownerProviderUserId
+        || !discordConfigurationEqual(candidate.discordConfiguration, connection.discordConfiguration)) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (candidate.ownerProviderUserId === ownerProviderUserId
+          && discordConfigurationEqual(candidate.discordConfiguration, configuration)) return candidate;
+        if (candidate.generation !== connection.generation
+          || candidate.ownerProviderUserId !== connection.ownerProviderUserId
+          || !discordConfigurationEqual(candidate.discordConfiguration, connection.discordConfiguration)) throw reason;
+        return save(candidate);
+      }
+    });
     if (updated === undefined) return;
     replaceConnection(updated);
     setDialog(undefined);
   };
 
   const clearCredential = async (connection: MessagingConnectionView): Promise<void> => {
-    const updated = await run(`clear:${connection.id}`, () => controller.clearMessagingCredential(
-      connection.id,
-      connection.revision,
-      connection.generation
-    ));
+    const updated = await run(`clear:${connection.id}`, async () => {
+      const clear = (candidate: MessagingConnectionView) => controller.clearMessagingCredential(
+        candidate.id,
+        candidate.revision,
+        candidate.generation
+      );
+      let candidate = await refreshConnection(connection);
+      if (!candidate.credentialConfigured) return candidate;
+      if (candidate.generation !== connection.generation
+        || candidate.credentialConfigured !== connection.credentialConfigured) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await clear(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (!candidate.credentialConfigured) return candidate;
+        if (candidate.generation !== connection.generation
+          || candidate.credentialConfigured !== connection.credentialConfigured) throw reason;
+        return clear(candidate);
+      }
+    });
     if (updated === undefined) return;
     replaceConnection(updated);
     setDialog(undefined);
@@ -236,9 +376,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
           <RefreshCw aria-hidden="true" className={refreshing ? "is-spinning" : undefined} />
           {t("common.refresh")}
         </Button>
-        <Button tone="primary" onClick={() => setDialog({ kind: "create" })}>
+        {telegramAvailable && <Button tone="secondary" onClick={() => setDialog({ kind: "create", channel: "telegram" })}>
           <Plus aria-hidden="true" />{t("messaging.addTelegram")}
-        </Button>
+        </Button>}
+        {discordAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "discord" })}>
+          <Plus aria-hidden="true" />{t("messaging.addDiscord")}
+        </Button>}
       </div>
     </header>
 
@@ -273,9 +416,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
           <Bot aria-hidden="true" />
           <h3>{t("messaging.emptyTitle")}</h3>
           <p>{t("messaging.emptyBody")}</p>
-          <Button tone="primary" onClick={() => setDialog({ kind: "create" })}>
+          {telegramAvailable && <Button tone="secondary" onClick={() => setDialog({ kind: "create", channel: "telegram" })}>
             <Plus aria-hidden="true" />{t("messaging.addTelegram")}
-          </Button>
+          </Button>}
+          {discordAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "discord" })}>
+            <Plus aria-hidden="true" />{t("messaging.addDiscord")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -313,7 +459,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <span><strong>{t("messaging.lastConnected")}</strong>{connection.lastConnectedAt === undefined
                   ? t("common.none")
                   : formatRelativeTime(connection.lastConnectedAt, controller.state.preferences.locale)}</span>
-                <span><strong>{t("messaging.ownerId")}</strong>{connection.ownerProviderUserId ?? "—"}</span>
+                <span><strong>{t(connection.channel === "discord" ? "messaging.discordOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId ?? "—"}</span>
               </div>
 
               {(connection.runtimeStatus === "conflict" || connection.runtimeStatus === "authLoss" || connection.runtimeStatus === "error") &&
@@ -349,12 +495,13 @@ export function MessagingSettings({ controller, snapshot, t }: {
           })}
         </div>}
 
-    <CreateTelegramDialog
+    <CreateConnectionDialog
       open={dialog?.kind === "create"}
-      busy={busy === "create"}
+      channel={dialog?.kind === "create" ? dialog.channel : "telegram"}
+      busy={dialog?.kind === "create" && busy === `create:${dialog.channel}`}
       t={t}
       onClose={() => setDialog(undefined)}
-      onSubmit={(ownerId) => { void createTelegram(ownerId); }}
+      onSubmit={(channel, ownerId) => { void createConnection(channel, ownerId); }}
     />
     {connectionForDialog !== undefined && <CredentialDialog
       open={dialog?.kind === "credential"}
@@ -370,7 +517,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
       busy={busy === `configuration:${connectionForDialog.id}`}
       t={t}
       onClose={() => setDialog(undefined)}
-      onSubmit={(ownerId, configuration) => { void updateConfiguration(connectionForDialog, ownerId, configuration); }}
+      onSubmit={(ownerId, configuration) => { void updateTelegramConfiguration(connectionForDialog, ownerId, configuration); }}
+    />}
+    {connectionForDialog !== undefined && connectionForDialog.discordConfiguration !== undefined && <DiscordConfigurationDialog
+      open={dialog?.kind === "configuration"}
+      connection={connectionForDialog}
+      busy={busy === `configuration:${connectionForDialog.id}`}
+      t={t}
+      onClose={() => setDialog(undefined)}
+      onSubmit={(ownerId, configuration) => { void updateDiscordConfiguration(connectionForDialog, ownerId, configuration); }}
     />}
     {connectionForDialog !== undefined && <ClearCredentialDialog
       open={dialog?.kind === "clear"}
@@ -430,29 +585,33 @@ function RouteSummary({ route, fallback, snapshot, t, compact = false }: {
   </p>;
 }
 
-function CreateTelegramDialog({ open, busy, t, onClose, onSubmit }: {
+function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
   readonly open: boolean;
+  readonly channel: "telegram" | "discord";
   readonly busy: boolean;
   readonly t: Translator;
   readonly onClose: () => void;
-  readonly onSubmit: (ownerId: string) => void;
+  readonly onSubmit: (channel: "telegram" | "discord", ownerId: string) => void;
 }): JSX.Element {
   const [ownerId, setOwnerId] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) setOwnerId(""); }, [open]);
-  const valid = /^\d+$/u.test(ownerId.trim());
+  useEffect(() => { if (open) setOwnerId(""); }, [channel, open]);
+  const valid = channel === "discord"
+    ? /^[1-9][0-9]{16,19}$/u.test(ownerId.trim())
+    : /^[1-9][0-9]{0,15}$/u.test(ownerId.trim());
   return <Modal
     open={open}
-    title={t("messaging.createTitle")}
-    description={t("messaging.createBody")}
+    title={channel === "discord" ? t("messaging.discordCreateTitle") : t("messaging.createTitle")}
+    description={channel === "discord" ? t("messaging.discordCreateBody") : t("messaging.createBody")}
     closeLabel={t("common.close")}
     onClose={onClose}
     initialFocus={() => inputRef.current}
     showClose
   >
-    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSubmit(ownerId.trim()); }}>
-      <label><span>{t("messaging.ownerId")}</span><input ref={inputRef} value={ownerId} onChange={(event) => setOwnerId(event.target.value)} inputMode="numeric" autoComplete="off" placeholder="123456789" /></label>
-      <p className="messaging-form__hint">{t("messaging.ownerIdBody")}</p>
+    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSubmit(channel, ownerId.trim()); }}>
+      <label><span>{channel === "discord" ? t("messaging.discordOwnerId") : t("messaging.ownerId")}</span><input ref={inputRef} value={ownerId} onChange={(event) => setOwnerId(event.target.value)} inputMode="numeric" autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : "123456789"} /></label>
+      <p className="messaging-form__hint">{channel === "discord" ? t("messaging.discordOwnerIdBody") : t("messaging.ownerIdBody")}</p>
+      {channel === "discord" && <p className="messaging-form__hint"><a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">{t("messaging.discordDeveloperPortal")}</a></p>}
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.continue")}</Button></div>
     </form>
   </Modal>;
@@ -522,6 +681,58 @@ function TelegramConfigurationDialog({ open, connection, busy, t, onClose, onSub
       <label><span>{t("messaging.groupQuote")}</span><SelectControl value={groupQuote} onChange={(event) => setGroupQuote(event.target.value as typeof groupQuote)}><option value="off">{t("common.off")}</option><option value="first">{t("messaging.quoteFirst")}</option><option value="all">{t("messaging.quoteAll")}</option></SelectControl></label>
       <label className="messaging-form__wide"><span>{t("messaging.groupActivation")}</span><textarea value={groups} onChange={(event) => setGroups(event.target.value)} rows={5} placeholder={"-100123=mention\n-100456=always"} aria-invalid={parsedGroups === undefined} /></label>
       <p className="messaging-form__hint messaging-form__wide">{parsedGroups === undefined ? t("messaging.groupActivationInvalid") : t("messaging.groupActivationBody")}</p>
+      <div className="modal__actions messaging-form__wide"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
+    </form>
+  </Modal>;
+}
+
+function DiscordConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
+  readonly open: boolean;
+  readonly connection: MessagingConnectionView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onSubmit: (ownerId: string, configuration: DiscordMessagingConfigurationView) => void;
+}): JSX.Element {
+  const initial = connection.discordConfiguration ?? DEFAULT_DISCORD_CONFIGURATION;
+  const [ownerId, setOwnerId] = useState(connection.ownerProviderUserId ?? "");
+  const [lifecycleAnnouncements, setLifecycleAnnouncements] = useState(initial.lifecycleAnnouncements);
+  const [emoji, setEmoji] = useState(initial.emojiReactions);
+  const [dmQuote, setDmQuote] = useState(initial.replyQuoteDm);
+  const [groupQuote, setGroupQuote] = useState(initial.replyQuoteGroup);
+  const [groups, setGroups] = useState(groupActivationText(initial.groupActivation));
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const current = connection.discordConfiguration ?? DEFAULT_DISCORD_CONFIGURATION;
+    setOwnerId(connection.ownerProviderUserId ?? "");
+    setLifecycleAnnouncements(current.lifecycleAnnouncements);
+    setEmoji(current.emojiReactions);
+    setDmQuote(current.replyQuoteDm);
+    setGroupQuote(current.replyQuoteGroup);
+    setGroups(groupActivationText(current.groupActivation));
+  }, [connection, open]);
+  const parsedGroups = parseDiscordGroupActivation(groups);
+  const valid = /^[1-9][0-9]{16,19}$/u.test(ownerId.trim()) && parsedGroups !== undefined;
+  return <Modal open={open} title={t("messaging.discordConfigureTitle")} description={t("messaging.discordConfigureBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose size="large">
+    <form className="messaging-form messaging-form--grid" onSubmit={(event) => {
+      event.preventDefault();
+      if (valid && parsedGroups !== undefined) onSubmit(ownerId.trim(), {
+        lifecycleAnnouncements,
+        emojiReactions: emoji,
+        replyQuoteDm: dmQuote,
+        replyQuoteGroup: groupQuote,
+        groupActivation: parsedGroups
+      });
+    }}>
+      <label className="messaging-form__wide"><span>{t("messaging.discordOwnerId")}</span><input ref={inputRef} value={ownerId} onChange={(event) => setOwnerId(event.target.value)} inputMode="numeric" /></label>
+      <label><span>{t("messaging.emojiReactions")}</span><SelectControl value={emoji} onChange={(event) => setEmoji(event.target.value as typeof emoji)}><option value="off">{t("common.off")}</option><option value="minimal">{t("messaging.reactionsMinimal")}</option><option value="expressive">{t("messaging.reactionsExpressive")}</option></SelectControl></label>
+      <label><span>{t("messaging.dmQuote")}</span><SelectControl value={dmQuote} onChange={(event) => setDmQuote(event.target.value as typeof dmQuote)}><option value="off">{t("common.off")}</option><option value="first">{t("messaging.quoteFirst")}</option></SelectControl></label>
+      <label><span>{t("messaging.groupQuote")}</span><SelectControl value={groupQuote} onChange={(event) => setGroupQuote(event.target.value as typeof groupQuote)}><option value="off">{t("common.off")}</option><option value="first">{t("messaging.quoteFirst")}</option><option value="all">{t("messaging.quoteAll")}</option></SelectControl></label>
+      <label className="messaging-choice-row"><CheckboxControl checked={lifecycleAnnouncements} onChange={(event) => setLifecycleAnnouncements(event.target.checked)} aria-label={t("messaging.lifecycleAnnouncements")} /><span>{t("messaging.lifecycleAnnouncements")}</span></label>
+      <p className="messaging-form__hint">{t("messaging.lifecycleAnnouncementsBody")}</p>
+      <label className="messaging-form__wide"><span>{t("messaging.discordGroupActivation")}</span><textarea value={groups} onChange={(event) => setGroups(event.target.value)} rows={5} placeholder={"123456789012345678/234567890123456789=mention\n123456789012345678/345678901234567890=always"} aria-invalid={parsedGroups === undefined} /></label>
+      <p className="messaging-form__hint messaging-form__wide">{parsedGroups === undefined ? t("messaging.discordGroupActivationInvalid") : t("messaging.discordGroupActivationBody")}</p>
       <div className="modal__actions messaging-form__wide"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
     </form>
   </Modal>;
@@ -635,7 +846,7 @@ function testResultLabel(value: MessagingConnectionTestResultView, t: Translator
   return t(`messaging.testFailure.${value.failure}`);
 }
 
-function groupActivationText(value: TelegramMessagingConfigurationView["groupActivation"]): string {
+function groupActivationText(value: Readonly<Record<string, "mention" | "always" | "disabled">>): string {
   return Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
     .map(([chatId, activation]) => `${chatId}=${activation}`).join("\n");
 }
@@ -650,6 +861,53 @@ function parseGroupActivation(value: string): Record<string, "mention" | "always
     result[match[1]!] = match[2]! as "mention" | "always" | "disabled";
   }
   return result;
+}
+
+function parseDiscordGroupActivation(value: string): Record<string, "mention" | "always" | "disabled"> | undefined {
+  const result: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rawLine of value.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    const match = /^([1-9][0-9]{16,19})\/([1-9][0-9]{16,19})\s*=\s*(mention|always|disabled)$/u.exec(line);
+    if (match === null) return undefined;
+    const key = `${match[1]!}/${match[2]!}`;
+    if (result[key] !== undefined) return undefined;
+    result[key] = match[3]! as "mention" | "always" | "disabled";
+  }
+  return result;
+}
+
+function telegramConfigurationEqual(
+  left: TelegramMessagingConfigurationView | undefined,
+  right: TelegramMessagingConfigurationView | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.emojiReactions === right.emojiReactions
+    && left.replyQuoteDm === right.replyQuoteDm
+    && left.replyQuoteGroup === right.replyQuoteGroup
+    && activationRulesEqual(left.groupActivation, right.groupActivation);
+}
+
+function discordConfigurationEqual(
+  left: DiscordMessagingConfigurationView | undefined,
+  right: DiscordMessagingConfigurationView | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.lifecycleAnnouncements === right.lifecycleAnnouncements
+    && left.emojiReactions === right.emojiReactions
+    && left.replyQuoteDm === right.replyQuoteDm
+    && left.replyQuoteGroup === right.replyQuoteGroup
+    && activationRulesEqual(left.groupActivation, right.groupActivation);
+}
+
+function activationRulesEqual(
+  left: Readonly<Record<string, "mention" | "always" | "disabled">>,
+  right: Readonly<Record<string, "mention" | "always" | "disabled">>
+): boolean {
+  const leftEntries = Object.entries(left).sort(([a], [b]) => a.localeCompare(b));
+  const rightEntries = Object.entries(right).sort(([a], [b]) => a.localeCompare(b));
+  return leftEntries.length === rightEntries.length
+    && leftEntries.every(([key, value], index) => rightEntries[index]?.[0] === key && rightEntries[index]?.[1] === value);
 }
 
 function modelSelectionKey(providerId?: string, modelId?: string): string {

@@ -8,9 +8,12 @@ import type {
 } from "@joko/store";
 
 import {
+  DEFAULT_DISCORD_MESSAGING_CONFIGURATION,
   DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION,
   MessagingManagerError,
+  decodeDiscordMessagingConfiguration,
   decodeTelegramMessagingConfiguration,
+  type DiscordMessagingConfiguration,
   type MessagingManager,
   type TelegramMessagingConfiguration
 } from "./messaging-manager.js";
@@ -44,23 +47,43 @@ export function createMessagingConnectService(
         routes: owner.listRoutes().map(toProtoRoute),
         channels: CHANNELS.map((channel) => create(contract.MessagingChannelCapabilitySchema, {
           channel: toProtoChannel(channel),
-          available: channel === "telegram",
-          reason: channel === "telegram" ? "" : "not_implemented"
+          available: channel === "telegram" || channel === "discord",
+          reason: channel === "telegram" || channel === "discord" ? "" : "not_implemented"
         }))
       });
     }),
 
     createMessagingConnection: async (request, context) => messagingRpc(async () => {
       authenticate(context);
-      if (request.channel !== contract.MessagingChannel.TELEGRAM) {
+      const owner = requireManager(manager);
+      const connection = request.channel === contract.MessagingChannel.TELEGRAM
+        ? (() => {
+            if (request.discordConfiguration !== undefined) {
+              throw new ConnectError("Discord configuration does not belong to a Telegram connection.", Code.InvalidArgument);
+            }
+            return owner.createTelegramConnection({
+              ownerProviderUserId: request.ownerProviderUserId,
+              configuration: request.telegramConfiguration === undefined
+                ? DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION
+                : fromProtoTelegramConfiguration(request.telegramConfiguration)
+            });
+          })()
+        : request.channel === contract.MessagingChannel.DISCORD
+          ? (() => {
+              if (request.telegramConfiguration !== undefined) {
+                throw new ConnectError("Telegram configuration does not belong to a Discord connection.", Code.InvalidArgument);
+              }
+              return owner.createDiscordConnection({
+                ownerProviderUserId: request.ownerProviderUserId,
+                configuration: request.discordConfiguration === undefined
+                  ? DEFAULT_DISCORD_MESSAGING_CONFIGURATION
+                  : fromProtoDiscordConfiguration(request.discordConfiguration)
+              });
+            })()
+          : undefined;
+      if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
       }
-      const connection = requireManager(manager).createTelegramConnection({
-        ownerProviderUserId: request.ownerProviderUserId,
-        configuration: request.telegramConfiguration === undefined
-          ? DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION
-          : fromProtoTelegramConfiguration(request.telegramConfiguration)
-      });
       return create(contract.CreateMessagingConnectionResponseSchema, {
         connection: toProtoConnection(connection)
       });
@@ -134,6 +157,23 @@ export function createMessagingConnectService(
         configuration: fromProtoTelegramConfiguration(request.configuration)
       });
       return create(contract.UpdateTelegramMessagingConfigurationResponseSchema, {
+        connection: toProtoConnection(connection)
+      });
+    }),
+
+    updateDiscordMessagingConfiguration: async (request, context) => messagingRpc(async () => {
+      authenticate(context);
+      if (request.configuration === undefined) {
+        throw new ConnectError("configuration is required.", Code.InvalidArgument);
+      }
+      const connection = await requireManager(manager).replaceDiscordConfiguration({
+        connectionId: request.connectionId,
+        expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration),
+        ownerProviderUserId: request.ownerProviderUserId,
+        configuration: fromProtoDiscordConfiguration(request.configuration)
+      });
+      return create(contract.UpdateDiscordMessagingConfigurationResponseSchema, {
         connection: toProtoConnection(connection)
       });
     }),
@@ -271,6 +311,72 @@ function toProtoTelegramConfiguration(
   });
 }
 
+function fromProtoDiscordConfiguration(
+  value: contract.DiscordMessagingConfiguration
+): DiscordMessagingConfiguration {
+  const emojiReactions = value.emojiReactions === contract.DiscordEmojiReactions.OFF ? "off"
+    : value.emojiReactions === contract.DiscordEmojiReactions.MINIMAL ? "minimal"
+      : value.emojiReactions === contract.DiscordEmojiReactions.EXPRESSIVE ? "expressive"
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === contract.DiscordReplyQuoteMode.OFF ? "off"
+    : value.replyQuoteDm === contract.DiscordReplyQuoteMode.FIRST ? "first"
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === contract.DiscordReplyQuoteMode.OFF ? "off"
+    : value.replyQuoteGroup === contract.DiscordReplyQuoteMode.FIRST ? "first"
+      : value.replyQuoteGroup === contract.DiscordReplyQuoteMode.ALL ? "all"
+        : undefined;
+  if (emojiReactions === undefined || replyQuoteDm === undefined || replyQuoteGroup === undefined) {
+    throw new ConnectError("Discord configuration is invalid.", Code.InvalidArgument);
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const key = `${rule.guildId}/${rule.channelId}`;
+    const mapped = rule.activation === contract.DiscordGroupActivation.MENTION ? "mention"
+      : rule.activation === contract.DiscordGroupActivation.ALWAYS ? "always"
+        : rule.activation === contract.DiscordGroupActivation.DISABLED ? "disabled"
+          : undefined;
+    if (mapped === undefined || Object.hasOwn(groupActivation, key)) {
+      throw new ConnectError("Discord group activation is invalid.", Code.InvalidArgument);
+    }
+    groupActivation[key] = mapped;
+  }
+  return decodeDiscordMessagingConfiguration({
+    format: 1,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation
+  });
+}
+
+function toProtoDiscordConfiguration(
+  value: DiscordMessagingConfiguration
+): contract.DiscordMessagingConfiguration {
+  return create(contract.DiscordMessagingConfigurationSchema, {
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? contract.DiscordEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? contract.DiscordEmojiReactions.MINIMAL
+        : contract.DiscordEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? contract.DiscordReplyQuoteMode.OFF
+      : contract.DiscordReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? contract.DiscordReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? contract.DiscordReplyQuoteMode.FIRST
+        : contract.DiscordReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([key, activation]) => {
+      const [guildId, channelId] = key.split("/", 2) as [string, string];
+      return create(contract.DiscordGroupActivationRuleSchema, {
+        guildId,
+        channelId,
+        activation: activation === "mention" ? contract.DiscordGroupActivation.MENTION
+          : activation === "always" ? contract.DiscordGroupActivation.ALWAYS
+            : contract.DiscordGroupActivation.DISABLED
+      });
+    })
+  });
+}
+
 function toProtoConnection(value: MessagingConnectionRecord): contract.MessagingConnection {
   return create(contract.MessagingConnectionSchema, {
     connectionId: value.id,
@@ -285,6 +391,11 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
     ...(value.channel !== "telegram" ? {} : {
       telegramConfiguration: toProtoTelegramConfiguration(
         decodeTelegramMessagingConfiguration(value.configuration)
+      )
+    }),
+    ...(value.channel !== "discord" ? {} : {
+      discordConfiguration: toProtoDiscordConfiguration(
+        decodeDiscordMessagingConfiguration(value.configuration)
       )
     }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),

@@ -204,6 +204,7 @@ service MessagingService {
   rpc ClearMessagingCredential(ClearMessagingCredentialRequest) returns (ClearMessagingCredentialResponse);
   rpc SetMessagingConnectionEnabled(SetMessagingConnectionEnabledRequest) returns (SetMessagingConnectionEnabledResponse);
   rpc UpdateTelegramMessagingConfiguration(UpdateTelegramMessagingConfigurationRequest) returns (UpdateTelegramMessagingConfigurationResponse);
+  rpc UpdateDiscordMessagingConfiguration(UpdateDiscordMessagingConfigurationRequest) returns (UpdateDiscordMessagingConfigurationResponse);
   rpc TestMessagingConnection(TestMessagingConnectionRequest) returns (TestMessagingConnectionResponse);
   rpc PutMessagingRoute(PutMessagingRouteRequest) returns (PutMessagingRouteResponse);
 }

@@ -61,6 +61,9 @@ export interface RealPiSystemFixtureOptions {
   };
   /** Loopback-only endpoint used by the Messaging product-chain fixture. */
   readonly telegramApiBaseUrl?: string;
+  /** Loopback-only endpoint used by the Discord Messaging product-chain fixture. */
+  readonly discordApiBaseUrl?: string;
+  readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
 
@@ -192,6 +195,12 @@ export class RealPiSystemFixture {
         ...(options.telegramApiBaseUrl === undefined
           ? {}
           : { messagingTelegramApiBaseUrl: options.telegramApiBaseUrl }),
+        ...(options.discordApiBaseUrl === undefined
+          ? {}
+          : { messagingDiscordApiBaseUrl: options.discordApiBaseUrl }),
+        ...(options.messagingPollTimeoutSeconds === undefined
+          ? {}
+          : { messagingPollTimeoutSeconds: options.messagingPollTimeoutSeconds }),
         ...(options.messagingRetryDelayMs === undefined
           ? {}
           : { messagingRetryDelayMs: options.messagingRetryDelayMs })

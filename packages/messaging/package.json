@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./discord": "./src/discord/index.ts",
     "./telegram": "./src/telegram/index.ts"
   },
   "scripts": {
@@ -12,8 +13,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "ws": "8.21.3"
+  },
   "devDependencies": {
     "@types/node": "24.12.4",
+    "@types/ws": "8.18.1",
     "typescript": "5.9.3",
     "vitest": "4.1.9"
   }

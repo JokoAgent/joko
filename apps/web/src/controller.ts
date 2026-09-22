@@ -2396,6 +2396,8 @@ export function useAppController(): AppController {
     getMessagingSettings: (signal) => gateway().getMessagingSettings(signal),
     createTelegramMessagingConnection: (ownerProviderUserId, configuration, signal) =>
       gateway().createTelegramMessagingConnection(ownerProviderUserId, configuration, signal),
+    createDiscordMessagingConnection: (ownerProviderUserId, configuration, signal) =>
+      gateway().createDiscordMessagingConnection(ownerProviderUserId, configuration, signal),
     saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
       gateway().saveMessagingCredential(
         connectionId,
@@ -2423,6 +2425,21 @@ export function useAppController(): AppController {
       configuration,
       signal
     ) => gateway().updateTelegramMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ),
+    updateDiscordMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ) => gateway().updateDiscordMessagingConfiguration(
       connectionId,
       expectedRevision,
       expectedGeneration,

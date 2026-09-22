@@ -4251,6 +4251,15 @@ export interface TelegramMessagingConfigurationView {
   readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
 }
 
+export interface DiscordMessagingConfigurationView {
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  /** Keys are exact guild/root-channel pairs formatted as guild/channel. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
 export interface MessagingConnectionView {
   readonly id: string;
   readonly channel: MessagingChannelView;
@@ -4263,6 +4272,7 @@ export interface MessagingConnectionView {
   readonly providerAccountId?: string;
   readonly providerUsername?: string;
   readonly telegramConfiguration?: TelegramMessagingConfigurationView;
+  readonly discordConfiguration?: DiscordMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -5498,6 +5508,11 @@ export interface OperationApi {
     configuration?: TelegramMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  createDiscordMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
   saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -5525,6 +5540,14 @@ export interface OperationApi {
     expectedGeneration: bigint,
     ownerProviderUserId: string,
     configuration: TelegramMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateDiscordMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: DiscordMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
   testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;

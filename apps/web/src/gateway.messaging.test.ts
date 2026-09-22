@@ -1,6 +1,9 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
+  DiscordEmojiReactions,
+  DiscordGroupActivation,
+  DiscordReplyQuoteMode,
   MessagingChannel,
   MessagingConnectionRuntimeStatus,
   MessagingConnectionTestFailure,
@@ -32,21 +35,42 @@ describe("Messaging gateway", () => {
     const signal = new AbortController().signal;
 
     await expect(fixture.gateway.getMessagingSettings(signal)).resolves.toEqual({
-      connections: [expect.objectContaining({
-        id: "telegram-one",
-        channel: "telegram",
-        generation: 3n,
-        revision: 7n,
-        runtimeStatus: "connected",
-        credentialConfigured: true,
-        telegramConfiguration: {
-          emojiReactions: "minimal",
-          replyQuoteDm: "off",
-          replyQuoteGroup: "first",
-          groupActivation: { "-100": "mention", "-200": "always" }
-        },
-        lastConnectedAt: 4_500
-      })],
+      connections: [
+        expect.objectContaining({
+          id: "telegram-one",
+          channel: "telegram",
+          generation: 3n,
+          revision: 7n,
+          runtimeStatus: "connected",
+          credentialConfigured: true,
+          telegramConfiguration: {
+            emojiReactions: "minimal",
+            replyQuoteDm: "off",
+            replyQuoteGroup: "first",
+            groupActivation: { "-100": "mention", "-200": "always" }
+          },
+          lastConnectedAt: 4_500
+        }),
+        expect.objectContaining({
+          id: "discord-one",
+          channel: "discord",
+          generation: 4n,
+          revision: 8n,
+          runtimeStatus: "connected",
+          credentialConfigured: true,
+          discordConfiguration: {
+            lifecycleAnnouncements: true,
+            emojiReactions: "expressive",
+            replyQuoteDm: "first",
+            replyQuoteGroup: "all",
+            groupActivation: {
+              "123456789012345678/234567890123456789": "mention",
+              "123456789012345678/345678901234567890": "always"
+            }
+          },
+          lastConnectedAt: 5_250
+        })
+      ],
       routes: [expect.objectContaining({
         scopeKey: "global",
         targetId: "target-one",
@@ -56,7 +80,7 @@ describe("Messaging gateway", () => {
       })],
       channels: [
         { channel: "telegram", available: true },
-        { channel: "discord", available: false, reason: "not implemented" },
+        { channel: "discord", available: true },
         { channel: "dingtalk", available: false, reason: "not implemented" },
         { channel: "feishu", available: false, reason: "not implemented" },
         { channel: "lark", available: false, reason: "not implemented" },
@@ -73,10 +97,26 @@ describe("Messaging gateway", () => {
       groupActivation: { "-300": "disabled" as const }
     };
     await fixture.gateway.createTelegramMessagingConnection("42", configuration, signal);
+    const discordConfiguration = {
+      lifecycleAnnouncements: false,
+      emojiReactions: "minimal" as const,
+      replyQuoteDm: "off" as const,
+      replyQuoteGroup: "first" as const,
+      groupActivation: { "456789012345678901/567890123456789012": "disabled" as const }
+    };
+    await fixture.gateway.createDiscordMessagingConnection("987654321098765432", discordConfiguration, signal);
     await fixture.gateway.saveMessagingCredential("telegram-one", 7n, 3n, "telegram-test-token", true, signal);
     await fixture.gateway.clearMessagingCredential("telegram-one", 7n, 3n, signal);
     await fixture.gateway.setMessagingConnectionEnabled("telegram-one", 7n, 3n, false, signal);
     await fixture.gateway.updateTelegramMessagingConfiguration("telegram-one", 7n, 3n, "84", configuration, signal);
+    await fixture.gateway.updateDiscordMessagingConfiguration(
+      "discord-one",
+      8n,
+      4n,
+      "876543210987654321",
+      discordConfiguration,
+      signal
+    );
     await expect(fixture.gateway.testMessagingConnection("telegram-one", signal)).resolves.toEqual({
       ok: true,
       providerAccountId: "9001",
@@ -125,6 +165,22 @@ describe("Messaging gateway", () => {
         }]
       }
     });
+    expect(fixture.requests.find((entry) => entry.method === "createMessagingConnection"
+      && entry.input.channel === MessagingChannel.DISCORD)?.input).toMatchObject({
+      channel: MessagingChannel.DISCORD,
+      ownerProviderUserId: "987654321098765432",
+      discordConfiguration: {
+        lifecycleAnnouncements: false,
+        emojiReactions: DiscordEmojiReactions.MINIMAL,
+        replyQuoteDm: DiscordReplyQuoteMode.OFF,
+        replyQuoteGroup: DiscordReplyQuoteMode.FIRST,
+        groupActivationRules: [{
+          guildId: "456789012345678901",
+          channelId: "567890123456789012",
+          activation: DiscordGroupActivation.DISABLED
+        }]
+      }
+    });
     expect(byMethod("beginMessagingCredentialUpload")).toEqual({
       connectionId: "telegram-one",
       expectedRevision: { value: 7n },
@@ -150,6 +206,23 @@ describe("Messaging gateway", () => {
       expectedRevision: { value: 7n },
       expectedGeneration: 3n,
       ownerProviderUserId: "84"
+    });
+    expect(byMethod("updateDiscordMessagingConfiguration")).toMatchObject({
+      connectionId: "discord-one",
+      expectedRevision: { value: 8n },
+      expectedGeneration: 4n,
+      ownerProviderUserId: "876543210987654321",
+      configuration: {
+        lifecycleAnnouncements: false,
+        emojiReactions: DiscordEmojiReactions.MINIMAL,
+        replyQuoteDm: DiscordReplyQuoteMode.OFF,
+        replyQuoteGroup: DiscordReplyQuoteMode.FIRST,
+        groupActivationRules: [{
+          guildId: "456789012345678901",
+          channelId: "567890123456789012",
+          activation: DiscordGroupActivation.DISABLED
+        }]
+      }
     });
     expect(byMethod("putMessagingRoute")).toEqual({
       connectionId: "telegram-one",
@@ -196,7 +269,7 @@ async function mount() {
         case "getMessagingSettings": {
           const channels = channelCapabilities();
           value = {
-            connections: [connection()],
+            connections: [connection(), discordConnection()],
             routes: [route()],
             channels: fixture.duplicateCapabilities ? [...channels, channels[0]] : channels
           };
@@ -219,11 +292,14 @@ async function mount() {
           break;
         }
         case "putMessagingRoute": value = { route: route({ connectionId: "telegram-one", scopeKey: "connection:telegram-one" }) }; break;
-        case "createMessagingConnection":
+        case "createMessagingConnection": value = {
+          connection: input.channel === MessagingChannel.DISCORD ? discordConnection() : connection()
+        }; break;
         case "commitMessagingCredential":
         case "clearMessagingCredential":
         case "setMessagingConnectionEnabled":
         case "updateTelegramMessagingConfiguration": value = { connection: connection() }; break;
+        case "updateDiscordMessagingConfiguration": value = { connection: discordConnection() }; break;
         default: throw new Error(`Unexpected RPC ${method.localName}`);
       }
       return response(method, create(method.output, value));
@@ -267,6 +343,42 @@ function connection() {
   };
 }
 
+function discordConnection() {
+  return {
+    connectionId: "discord-one",
+    channel: MessagingChannel.DISCORD,
+    generation: 4n,
+    enabled: true,
+    runtimeStatus: MessagingConnectionRuntimeStatus.CONNECTED,
+    credentialConfigured: true,
+    ownerProviderUserId: "987654321098765432",
+    providerAccountId: "111111111111111111",
+    providerUsername: "joko-discord",
+    discordConfiguration: {
+      lifecycleAnnouncements: true,
+      emojiReactions: DiscordEmojiReactions.EXPRESSIVE,
+      replyQuoteDm: DiscordReplyQuoteMode.FIRST,
+      replyQuoteGroup: DiscordReplyQuoteMode.ALL,
+      groupActivationRules: [
+        {
+          guildId: "123456789012345678",
+          channelId: "234567890123456789",
+          activation: DiscordGroupActivation.MENTION
+        },
+        {
+          guildId: "123456789012345678",
+          channelId: "345678901234567890",
+          activation: DiscordGroupActivation.ALWAYS
+        }
+      ]
+    },
+    lastConnectedAt: timestamp(5n, 250_000_000),
+    createdAt: timestamp(2n),
+    updatedAt: timestamp(6n),
+    revision: { value: 8n }
+  };
+}
+
 function route(overrides: Record<string, unknown> = {}) {
   return {
     scopeKey: "global",
@@ -288,7 +400,7 @@ function route(overrides: Record<string, unknown> = {}) {
 function channelCapabilities() {
   return [
     { channel: MessagingChannel.TELEGRAM, available: true },
-    { channel: MessagingChannel.DISCORD, available: false, reason: "not implemented" },
+    { channel: MessagingChannel.DISCORD, available: true },
     { channel: MessagingChannel.DINGTALK, available: false, reason: "not implemented" },
     { channel: MessagingChannel.FEISHU, available: false, reason: "not implemented" },
     { channel: MessagingChannel.LARK, available: false, reason: "not implemented" },

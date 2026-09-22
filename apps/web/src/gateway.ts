@@ -312,6 +312,10 @@ import {
   VoiceInputTerminalOutcome,
   VoiceInputTextSource,
   VoiceInputTranscriptionProtocol,
+  DiscordEmojiReactions as ProtoDiscordEmojiReactions,
+  DiscordGroupActivation as ProtoDiscordGroupActivation,
+  DiscordGroupActivationRuleSchema as ProtoDiscordGroupActivationRuleSchema,
+  DiscordReplyQuoteMode as ProtoDiscordReplyQuoteMode,
   TelegramEmojiReactions as ProtoTelegramEmojiReactions,
   TelegramGroupActivation as ProtoTelegramGroupActivation,
   TelegramGroupActivationRuleSchema as ProtoTelegramGroupActivationRuleSchema,
@@ -394,6 +398,7 @@ import {
   type McpServerDescriptor,
   type MessagingConnection as ProtoMessagingConnection,
   type MessagingRoute as ProtoMessagingRoute,
+  type DiscordMessagingConfiguration as ProtoDiscordMessagingConfiguration,
   type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
@@ -604,6 +609,7 @@ import type {
   MessagingRouteDraftView,
   MessagingRouteView,
   MessagingSettingsView,
+  DiscordMessagingConfigurationView,
   OperationApi,
   PartnerCapabilitiesView,
   PartnerActivityView,
@@ -5883,6 +5889,23 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapMessagingConnection(response.connection);
   }
 
+  async createDiscordMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.DISCORD,
+      ownerProviderUserId,
+      ...(configuration === undefined ? {} : {
+        discordConfiguration: protoDiscordMessagingConfiguration(configuration)
+      })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
   async saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -5959,6 +5982,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         expectedGeneration,
         ownerProviderUserId,
         configuration: protoTelegramMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateDiscordMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: DiscordMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateDiscordMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        ownerProviderUserId,
+        configuration: protoDiscordMessagingConfiguration(configuration)
       }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
@@ -18250,6 +18294,15 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const telegramConfiguration = channel === "telegram"
     ? mapTelegramMessagingConfiguration(value.telegramConfiguration)
     : undefined;
+  const discordConfiguration = channel === "discord"
+    ? mapDiscordMessagingConfiguration(value.discordConfiguration)
+    : undefined;
+  if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
+  }
+  if (channel !== "discord" && value.discordConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Discord configuration for another Messaging channel.");
+  }
   return {
     id: value.connectionId,
     channel,
@@ -18262,6 +18315,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(value.providerAccountId === undefined ? {} : { providerAccountId: value.providerAccountId }),
     ...(value.providerUsername === undefined ? {} : { providerUsername: value.providerUsername }),
     ...(telegramConfiguration === undefined ? {} : { telegramConfiguration }),
+    ...(discordConfiguration === undefined ? {} : { discordConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -18379,6 +18433,75 @@ function protoTelegramMessagingConfiguration(
             : ProtoTelegramGroupActivation.DISABLED
       }
     ))
+  };
+}
+
+function mapDiscordMessagingConfiguration(
+  value: ProtoDiscordMessagingConfiguration | undefined
+): DiscordMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator omitted Discord configuration.");
+  const emojiReactions = value.emojiReactions === ProtoDiscordEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoDiscordEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoDiscordEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  const replyQuoteDm = value.replyQuoteDm === ProtoDiscordReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteDm === ProtoDiscordReplyQuoteMode.FIRST ? "first" as const
+      : undefined;
+  const replyQuoteGroup = value.replyQuoteGroup === ProtoDiscordReplyQuoteMode.OFF ? "off" as const
+    : value.replyQuoteGroup === ProtoDiscordReplyQuoteMode.FIRST ? "first" as const
+      : value.replyQuoteGroup === ProtoDiscordReplyQuoteMode.ALL ? "all" as const
+        : undefined;
+  if (emojiReactions === undefined || replyQuoteDm === undefined || replyQuoteGroup === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Discord configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const key = `${rule.guildId}/${rule.channelId}`;
+    const mapped = rule.activation === ProtoDiscordGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoDiscordGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoDiscordGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || !/^[1-9][0-9]{16,19}\/[1-9][0-9]{16,19}$/u.test(key)
+      || Object.hasOwn(groupActivation, key)) {
+      throw new GatewayError("Orchestrator returned an invalid Discord group activation.");
+    }
+    groupActivation[key] = mapped;
+  }
+  return {
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation
+  };
+}
+
+function protoDiscordMessagingConfiguration(
+  value: DiscordMessagingConfigurationView
+): ProtoDiscordMessagingConfiguration {
+  return {
+    $typeName: "joko.v1.DiscordMessagingConfiguration",
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? ProtoDiscordEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoDiscordEmojiReactions.MINIMAL
+        : ProtoDiscordEmojiReactions.EXPRESSIVE,
+    replyQuoteDm: value.replyQuoteDm === "off"
+      ? ProtoDiscordReplyQuoteMode.OFF
+      : ProtoDiscordReplyQuoteMode.FIRST,
+    replyQuoteGroup: value.replyQuoteGroup === "off" ? ProtoDiscordReplyQuoteMode.OFF
+      : value.replyQuoteGroup === "first" ? ProtoDiscordReplyQuoteMode.FIRST
+        : ProtoDiscordReplyQuoteMode.ALL,
+    groupActivationRules: Object.entries(value.groupActivation).map(([key, activation]) => {
+      const match = /^([1-9][0-9]{16,19})\/([1-9][0-9]{16,19})$/u.exec(key);
+      if (match === null) throw new GatewayError("Discord group activation key is invalid.");
+      return create(ProtoDiscordGroupActivationRuleSchema, {
+        guildId: match[1]!,
+        channelId: match[2]!,
+        activation: activation === "mention" ? ProtoDiscordGroupActivation.MENTION
+          : activation === "always" ? ProtoDiscordGroupActivation.ALWAYS
+            : ProtoDiscordGroupActivation.DISABLED
+      });
+    })
   };
 }
 

@@ -24,7 +24,7 @@ afterEach(async () => {
 });
 
 describe("MessagingService", () => {
-  it("binds credential upload to the authenticated client and projects safe Telegram settings", async () => {
+  it("binds credential upload to the authenticated client and projects safe Telegram and Discord settings", async () => {
     const fixture = await createFixture();
     let clientConnectionId = "desktop-one";
     const service = createMessagingConnectService(
@@ -42,7 +42,9 @@ describe("MessagingService", () => {
     expect(channels).toHaveLength(8);
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.TELEGRAM))
       .toMatchObject({ available: true, reason: "" });
-    expect(channels.filter((channel) => channel.available)).toHaveLength(1);
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.DISCORD))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.filter((channel) => channel.available)).toHaveLength(2);
 
     const created = await service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
@@ -192,7 +194,80 @@ describe("MessagingService", () => {
       create(contract.GetMessagingSettingsRequestSchema),
       context
     );
-    expect(settings.connections).toHaveLength(1);
+    const discord = await service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      {
+        channel: contract.MessagingChannel.DISCORD,
+        ownerProviderUserId: "111111111111111111",
+        discordConfiguration: create(contract.DiscordMessagingConfigurationSchema, {
+          lifecycleAnnouncements: true,
+          emojiReactions: contract.DiscordEmojiReactions.MINIMAL,
+          replyQuoteDm: contract.DiscordReplyQuoteMode.OFF,
+          replyQuoteGroup: contract.DiscordReplyQuoteMode.FIRST,
+          groupActivationRules: [create(contract.DiscordGroupActivationRuleSchema, {
+            guildId: "222222222222222222",
+            channelId: "333333333333333333",
+            activation: contract.DiscordGroupActivation.MENTION
+          })]
+        })
+      }
+    ), context);
+    expect(discord.connection).toMatchObject({
+      channel: contract.MessagingChannel.DISCORD,
+      ownerProviderUserId: "111111111111111111",
+      discordConfiguration: {
+        lifecycleAnnouncements: true,
+        emojiReactions: contract.DiscordEmojiReactions.MINIMAL,
+        groupActivationRules: [{
+          guildId: "222222222222222222",
+          channelId: "333333333333333333",
+          activation: contract.DiscordGroupActivation.MENTION
+        }]
+      }
+    });
+    expect(discord.connection).not.toHaveProperty("telegramConfiguration");
+
+    const discordUpdated = await service.updateDiscordMessagingConfiguration(create(
+      contract.UpdateDiscordMessagingConfigurationRequestSchema,
+      {
+        connectionId: discord.connection!.connectionId,
+        expectedRevision: discord.connection!.revision,
+        expectedGeneration: discord.connection!.generation,
+        ownerProviderUserId: "444444444444444444",
+        configuration: create(contract.DiscordMessagingConfigurationSchema, {
+          lifecycleAnnouncements: false,
+          emojiReactions: contract.DiscordEmojiReactions.EXPRESSIVE,
+          replyQuoteDm: contract.DiscordReplyQuoteMode.FIRST,
+          replyQuoteGroup: contract.DiscordReplyQuoteMode.ALL,
+          groupActivationRules: [create(contract.DiscordGroupActivationRuleSchema, {
+            guildId: "555555555555555555",
+            channelId: "666666666666666666",
+            activation: contract.DiscordGroupActivation.ALWAYS
+          })]
+        })
+      }
+    ), context);
+    expect(discordUpdated.connection).toMatchObject({
+      generation: 2n,
+      ownerProviderUserId: "444444444444444444",
+      discordConfiguration: {
+        lifecycleAnnouncements: false,
+        emojiReactions: contract.DiscordEmojiReactions.EXPRESSIVE,
+        replyQuoteDm: contract.DiscordReplyQuoteMode.FIRST,
+        replyQuoteGroup: contract.DiscordReplyQuoteMode.ALL,
+        groupActivationRules: [{
+          guildId: "555555555555555555",
+          channelId: "666666666666666666",
+          activation: contract.DiscordGroupActivation.ALWAYS
+        }]
+      }
+    });
+
+    const settingsAfterDiscord = await service.getMessagingSettings(
+      create(contract.GetMessagingSettingsRequestSchema),
+      context
+    );
+    expect(settingsAfterDiscord.connections).toHaveLength(2);
     expect(settings.routes).toHaveLength(1);
   });
 
@@ -210,7 +285,7 @@ describe("MessagingService", () => {
     const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
     await expect(service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
-      { channel: contract.MessagingChannel.DISCORD, ownerProviderUserId: "42" }
+      { channel: contract.MessagingChannel.DINGTALK, ownerProviderUserId: "42" }
     ), context)).rejects.toSatisfy(
       (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
     );

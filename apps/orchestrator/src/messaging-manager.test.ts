@@ -4,6 +4,10 @@ import { join } from "node:path";
 
 import {
   MessagingTransportError,
+  type DiscordGatewayUpdate,
+  type DiscordNormalizationResult,
+  type DiscordPollResult,
+  type DiscordTransportOptions,
   type MessagingAddress,
   type MessagingDownloadedAttachment,
   type MessagingInboundAttachment,
@@ -22,6 +26,7 @@ import { ArtifactStore } from "./artifact-store.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import {
+  DEFAULT_DISCORD_MESSAGING_CONFIGURATION,
   DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION,
   MessagingManager,
   type MessagingManagerOptions
@@ -355,9 +360,79 @@ describe("MessagingManager", () => {
     expect(JSON.stringify(callbacks, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value))
       .not.toContain("Alice");
   });
+
+  it("runs Discord through the same durable admission and effect ledger, including lifecycle disconnect", async () => {
+    const transport = new FakeDiscordTransport();
+    const fixture = await createFixture(undefined, undefined, () => transport);
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createDiscordConnection({
+      ownerProviderUserId: "111111111111111111",
+      configuration: DEFAULT_DISCORD_MESSAGING_CONFIGURATION
+    });
+    const enabled = await replaceCredential(fixture, created, "discord", true);
+
+    await vi.waitFor(() => {
+      const runtime = fixture.store.getMessagingConnection(enabled.id);
+      if (runtime.runtimeStatus === "error") {
+        throw new Error(`${runtime.errorCode ?? "unknown"}: ${runtime.errorSummary ?? "unknown"}`);
+      }
+      expect(runtime).toMatchObject({
+        channel: "discord",
+        runtimeStatus: "connected",
+        cursor: "discord-cursor-1"
+      });
+      expect(fixture.store.listMessagingInboundRequests()).toHaveLength(1);
+      expect(transport.sentText.some((entry) => entry.text.includes("Reply from fake"))).toBe(true);
+      expect(transport.reactions.map((entry) => entry.emoji)).toEqual(["👀", null, "✅"]);
+    });
+    expect(transport.initialCursor).toBeNull();
+    expect(transport.sentText[0]).toMatchObject({
+      text: "Joko is connected and ready on Discord.",
+      address: { channel: "discord", providerConversationId: "444444444444444444" }
+    });
+    expect(fixture.store.listMessagingDeliveries()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "notice", status: "sent" }),
+      expect.objectContaining({ kind: "text", status: "sent" })
+    ]));
+
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    const disabled = await fixture.manager.setEnabled({
+      connectionId: current.id,
+      expectedRevision: current.revision,
+      expectedGeneration: current.generation,
+      enabled: false
+    });
+    expect(disabled.enabled).toBe(false);
+    expect(transport.sentText.some((entry) => entry.text === "Joko's Discord connection is being disabled.")).toBe(true);
+    expect(fixture.store.listMessagingDeliveries().filter((delivery) => delivery.kind === "notice"))
+      .toHaveLength(2);
+  });
+
+  it("projects terminal Discord Gateway credential loss without retrying the retired worker", async () => {
+    const transport = new AuthLossDiscordTransport();
+    const fixture = await createFixture(undefined, undefined, () => transport);
+    const created = fixture.manager.createDiscordConnection({
+      ownerProviderUserId: "111111111111111111",
+      configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, lifecycleAnnouncements: false }
+    });
+    const enabled = await replaceCredential(fixture, created, "discord-auth-loss", true);
+
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(enabled.id)).toMatchObject({
+      runtimeStatus: "auth_loss",
+      errorCode: "invalid_credential",
+      errorSummary: "Discord rejected the managed credential."
+    }));
+    expect(transport.polls).toBe(1);
+  });
 });
 
 class FakeTelegramTransport {
+  readonly channel = "telegram" as const;
   readonly connectionId = "";
   readonly generation = 0;
   readonly sentText: Array<{
@@ -500,6 +575,150 @@ class StableEmptyTelegramTransport extends FakeTelegramTransport {
     await new Promise((resolve) => setTimeout(resolve, 1));
     input.signal?.throwIfAborted();
     return { updates: [], nextCursor: input.cursor ?? "1" };
+  }
+}
+
+class FakeDiscordTransport {
+  readonly channel = "discord" as const;
+  readonly connectionId = "";
+  readonly generation = 0;
+  readonly sentText: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+  }> = [];
+  readonly reactions: Array<{ readonly messageId: string; readonly emoji: string | null }> = [];
+  readonly initialCursor: string | null = null;
+  #boundConnectionId = "";
+  #boundGeneration = 0;
+
+  bind(options: DiscordTransportOptions): this {
+    this.#boundConnectionId = options.connectionId;
+    this.#boundGeneration = options.generation;
+    Object.defineProperties(this, {
+      connectionId: { value: options.connectionId },
+      generation: { value: options.generation },
+      initialCursor: { value: options.initialCursor ?? null }
+    });
+    return this;
+  }
+
+  async probe() {
+    return {
+      channel: "discord" as const,
+      connectionId: this.#boundConnectionId,
+      generation: this.#boundGeneration,
+      providerAccountId: "222222222222222222",
+      displayName: "Joko Discord test bot",
+      username: "joko_test_bot",
+      ownerConversationId: "444444444444444444"
+    };
+  }
+
+  async poll(input: { readonly cursor: string | null; readonly signal?: AbortSignal }): Promise<DiscordPollResult> {
+    if (input.cursor === null) {
+      return {
+        updates: [{
+          sequence: 1,
+          eventType: "MESSAGE_CREATE",
+          message: {
+            id: "999999999999999991",
+            channel_id: "444444444444444444",
+            author: { id: "111111111111111111", username: "owner" },
+            content: "Hello from Discord",
+            timestamp: new Date().toISOString()
+          },
+          channel: { id: "444444444444444444", type: 1 }
+        }],
+        nextCursor: "discord-cursor-1"
+      };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  normalize(_updates: readonly DiscordGatewayUpdate[]): DiscordNormalizationResult {
+    return {
+      events: [{
+        kind: "message",
+        providerRequestIds: ["discord:message:999999999999999991"],
+        messageId: "999999999999999991",
+        address: this.ownerAddress(),
+        speaker: {
+          providerUserId: "111111111111111111",
+          displayName: "Owner",
+          username: "owner",
+          isBot: false,
+          isOwner: true
+        },
+        occurredAt: Date.now(),
+        text: "Hello from Discord",
+        ambient: false,
+        protectedContent: false,
+        attachments: [],
+        unsupported: [],
+        replyContext: null
+      }],
+      groupObservations: [],
+      ignored: []
+    };
+  }
+
+  ownerAddress(): MessagingAddress {
+    return {
+      channel: "discord",
+      connectionId: this.#boundConnectionId,
+      providerConversationId: "444444444444444444",
+      providerThreadId: null,
+      conversationKind: "direct"
+    };
+  }
+
+  async downloadAttachment(_attachment: MessagingInboundAttachment): Promise<MessagingDownloadedAttachment> {
+    throw new Error("No attachment was expected.");
+  }
+
+  async sendTextPart(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+  }) {
+    this.sentText.push({
+      address: input.address,
+      text: input.text,
+      ...(input.replyToMessageId === undefined ? {} : { replyToMessageId: input.replyToMessageId })
+    });
+    return { providerMessageId: `discord-sent-${this.sentText.length}`, address: input.address };
+  }
+
+  async sendAttachments(input: { readonly address: MessagingAddress }) {
+    return { providerMessageId: "discord-file", address: input.address };
+  }
+
+  async sendInteractionCard(input: { readonly address: MessagingAddress }) {
+    return { providerMessageId: "discord-card", address: input.address };
+  }
+
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+
+  async sendTyping(): Promise<void> {}
+  async setReaction(input: { readonly messageId: string; readonly emoji: string | null }): Promise<void> {
+    this.reactions.push({ messageId: input.messageId, emoji: input.emoji });
+  }
+  async answerInteraction(): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+class AuthLossDiscordTransport extends FakeDiscordTransport {
+  polls = 0;
+
+  override async poll(): Promise<DiscordPollResult> {
+    this.polls += 1;
+    throw new MessagingTransportError("invalid_credential", "fixture credential rejected", {
+      retryable: false,
+      effect: "none"
+    });
   }
 }
 
@@ -816,7 +1035,8 @@ class QuestionFakeAdapter extends FakeBackendAdapter {
 
 async function createFixture(
   transportFactory?: (options: TelegramTransportOptions) => FakeTelegramTransport,
-  adapterFactory?: () => FakeBackendAdapter
+  adapterFactory?: () => FakeBackendAdapter,
+  discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -857,6 +1077,9 @@ async function createFixture(
     pollTimeoutSeconds: 0,
     ...(transportFactory === undefined ? {} : {
       createTelegramTransport: (input) => transportFactory(input).bind(input)
+    }),
+    ...(discordTransportFactory === undefined ? {} : {
+      createDiscordTransport: (input) => discordTransportFactory(input).bind(input)
     })
   };
   manager = new MessagingManager(options);

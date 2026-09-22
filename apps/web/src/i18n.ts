@@ -4784,8 +4784,10 @@ const en = {
   ,"messaging.channelAvailability": "Messaging channel availability"
   ,"messaging.comingSoon": "Not available yet"
   ,"messaging.addTelegram": "Add Telegram"
+  ,"messaging.addDiscord": "Add Discord"
   ,"messaging.loadFailed": "Could not load Messaging settings."
   ,"messaging.actionFailed": "Could not complete the Messaging action."
+  ,"messaging.connectionChanged": "The Messaging connection changed. Review the refreshed settings and try again."
   ,"messaging.defaultRoute": "Default route"
   ,"messaging.connectionRoute": "Connection route"
   ,"messaging.routeBody": "Choose the workspace, model, and execution policy used only when a new conversation creates its task."
@@ -4797,7 +4799,7 @@ const en = {
   ,"messaging.connections": "Connections"
   ,"messaging.connectionsBody": "Each external account has an independent credential, transport generation, and conversation-to-task mapping."
   ,"messaging.emptyTitle": "No messaging connections"
-  ,"messaging.emptyBody": "Add Telegram to receive direct messages, groups, and topics in Joko tasks."
+  ,"messaging.emptyBody": "Add Telegram or Discord to receive direct messages and group conversations in Joko tasks."
   ,"messaging.ownerIdentity": "Owner ID {id}"
   ,"messaging.toggleConnection": "Enable or disable this Messaging connection"
   ,"messaging.credential": "Credential"
@@ -4814,12 +4816,21 @@ const en = {
   ,"messaging.createTitle": "Add Telegram"
   ,"messaging.createBody": "The owner identity is the only user allowed to start direct-message tasks."
   ,"messaging.ownerIdBody": "Use the numeric Telegram user ID, not a display name or @username."
+  ,"messaging.discordCreateTitle": "Add Discord"
+  ,"messaging.discordCreateBody": "The owner identity is the only user allowed to start direct-message tasks. Approved server channels can join existing or create routed tasks."
+  ,"messaging.discordOwnerId": "Discord owner user ID"
+  ,"messaging.discordOwnerIdBody": "Use the 17–20 digit Discord user ID, not a display name or username."
+  ,"messaging.discordDeveloperPortal": "Open the Discord Developer Portal"
   ,"messaging.botToken": "Bot token"
   ,"messaging.credentialBody": "Replacing the token retires the previous transport generation and its pending work."
   ,"messaging.enableAfterSave": "Connect after saving"
   ,"messaging.secretSafety": "The token uses a one-shot managed credential channel and is never stored in settings or task history."
   ,"messaging.configureTitle": "Telegram behavior"
   ,"messaging.configureBody": "Configure replies, reactions, and the activation policy for each group."
+  ,"messaging.discordConfigureTitle": "Discord behavior"
+  ,"messaging.discordConfigureBody": "Configure lifecycle notices, replies, reactions, and the activation policy for approved server channels."
+  ,"messaging.lifecycleAnnouncements": "Lifecycle announcements"
+  ,"messaging.lifecycleAnnouncementsBody": "Post online, offline, and recovery notices to the owner conversation when a route is available."
   ,"messaging.emojiReactions": "Acknowledgement reactions"
   ,"messaging.reactionsMinimal": "Minimal"
   ,"messaging.reactionsExpressive": "Expressive"
@@ -4830,7 +4841,10 @@ const en = {
   ,"messaging.groupActivation": "Group activation rules"
   ,"messaging.groupActivationBody": "Enter one numeric chat ID per line as chatId=mention, chatId=always, or chatId=disabled. Unlisted groups require a mention."
   ,"messaging.groupActivationInvalid": "Use one unique numeric chat ID per line with mention, always, or disabled."
-  ,"messaging.clearTitle": "Clear Telegram token?"
+  ,"messaging.discordGroupActivation": "Server channel activation rules"
+  ,"messaging.discordGroupActivationBody": "Enter one approved server/channel pair per line as guildId/channelId=mention, =always, or =disabled. Unlisted server channels are rejected."
+  ,"messaging.discordGroupActivationInvalid": "Use one unique pair of 17–20 digit server and channel IDs per line with mention, always, or disabled."
+  ,"messaging.clearTitle": "Clear bot token?"
   ,"messaging.clearBody": "The connection goes offline immediately. Existing tasks remain visible, but this transport and its pending work are retired."
   ,"messaging.target": "Workspace"
   ,"messaging.model": "Model"
@@ -7721,8 +7735,10 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.channelAvailability": "消息渠道可用性",
     "messaging.comingSoon": "尚不可用",
     "messaging.addTelegram": "添加 Telegram",
+    "messaging.addDiscord": "添加 Discord",
     "messaging.loadFailed": "无法加载消息渠道设置。",
     "messaging.actionFailed": "无法完成消息渠道操作。",
+    "messaging.connectionChanged": "消息连接已发生变化。请检查刷新的设置后重试。",
     "messaging.defaultRoute": "默认路由",
     "messaging.connectionRoute": "连接路由",
     "messaging.routeBody": "选择新会话创建任务时使用的工作区、模型和执行策略。",
@@ -7734,7 +7750,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.connections": "连接",
     "messaging.connectionsBody": "每个外部账号都有独立凭证、传输代际和会话到任务的映射。",
     "messaging.emptyTitle": "没有消息连接",
-    "messaging.emptyBody": "添加 Telegram，将私聊、群聊和话题接入 Joko 任务。",
+    "messaging.emptyBody": "添加 Telegram 或 Discord，将私聊与群组会话接入 Joko 任务。",
     "messaging.ownerIdentity": "所有者 ID {id}",
     "messaging.toggleConnection": "启用或停用此消息连接",
     "messaging.credential": "凭证",
@@ -7751,12 +7767,21 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.createTitle": "添加 Telegram",
     "messaging.createBody": "只有所有者身份可以从私聊发起任务。",
     "messaging.ownerIdBody": "请使用 Telegram 数字用户 ID，不要使用显示名或 @用户名。",
+    "messaging.discordCreateTitle": "添加 Discord",
+    "messaging.discordCreateBody": "只有所有者身份可以从私聊发起任务；已批准的服务器频道可加入现有任务或创建已路由任务。",
+    "messaging.discordOwnerId": "Discord 所有者用户 ID",
+    "messaging.discordOwnerIdBody": "请使用 17–20 位 Discord 用户 ID，不要使用显示名或用户名。",
+    "messaging.discordDeveloperPortal": "打开 Discord Developer Portal",
     "messaging.botToken": "机器人令牌",
     "messaging.credentialBody": "替换令牌会退休旧传输代际及其待处理工作。",
     "messaging.enableAfterSave": "保存后连接",
     "messaging.secretSafety": "令牌仅通过一次性受管凭证通道传输，不会写入设置或任务历史。",
     "messaging.configureTitle": "Telegram 行为",
     "messaging.configureBody": "配置回复、反应及每个群组的激活策略。",
+    "messaging.discordConfigureTitle": "Discord 行为",
+    "messaging.discordConfigureBody": "配置生命周期通知、回复、反应以及已批准服务器频道的激活策略。",
+    "messaging.lifecycleAnnouncements": "生命周期通知",
+    "messaging.lifecycleAnnouncementsBody": "存在可用路由时，在所有者会话中发布上线、离线和恢复通知。",
     "messaging.emojiReactions": "确认反应",
     "messaging.reactionsMinimal": "精简",
     "messaging.reactionsExpressive": "丰富",
@@ -7767,7 +7792,10 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.groupActivation": "群组激活规则",
     "messaging.groupActivationBody": "每行输入一个数字聊天 ID，格式为 chatId=mention、chatId=always 或 chatId=disabled。未列出的群组需要提及机器人。",
     "messaging.groupActivationInvalid": "每行使用一个唯一数字聊天 ID，并选择 mention、always 或 disabled。",
-    "messaging.clearTitle": "清除 Telegram 令牌？",
+    "messaging.discordGroupActivation": "服务器频道激活规则",
+    "messaging.discordGroupActivationBody": "每行输入一个已批准的服务器/频道组合，格式为 guildId/channelId=mention、=always 或 =disabled。未列出的服务器频道会被拒绝。",
+    "messaging.discordGroupActivationInvalid": "每行使用一组唯一的 17–20 位服务器与频道 ID，并选择 mention、always 或 disabled。",
+    "messaging.clearTitle": "清除机器人令牌？",
     "messaging.clearBody": "连接会立即离线。现有任务仍可见，但当前传输及其待处理工作会被退休。",
     "messaging.target": "工作区",
     "messaging.model": "模型",

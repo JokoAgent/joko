@@ -18,7 +18,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/messaging.proto.
  */
 export const file_joko_v1_messaging: GenFile = /*@__PURE__*/
-  fileDesc("Chdqb2tvL3YxL21lc3NhZ2luZy5wcm90bxIHam9rby52MSKVAgoeVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uEjgKD2Vtb2ppX3JlYWN0aW9ucxgBIAEoDjIfLmpva28udjEuVGVsZWdyYW1FbW9qaVJlYWN0aW9ucxI3Cg5yZXBseV9xdW90ZV9kbRgCIAEoDjIfLmpva28udjEuVGVsZWdyYW1SZXBseVF1b3RlTW9kZRI6ChFyZXBseV9xdW90ZV9ncm91cBgDIAEoDjIfLmpva28udjEuVGVsZWdyYW1SZXBseVF1b3RlTW9kZRJEChZncm91cF9hY3RpdmF0aW9uX3J1bGVzGAQgAygLMiQuam9rby52MS5UZWxlZ3JhbUdyb3VwQWN0aXZhdGlvblJ1bGUiZAobVGVsZWdyYW1Hcm91cEFjdGl2YXRpb25SdWxlEg8KB2NoYXRfaWQYASABKAkSNAoKYWN0aXZhdGlvbhgCIAEoDjIgLmpva28udjEuVGVsZWdyYW1Hcm91cEFjdGl2YXRpb24iawoaTWVzc2FnaW5nQ2hhbm5lbENhcGFiaWxpdHkSKgoHY2hhbm5lbBgBIAEoDjIZLmpva28udjEuTWVzc2FnaW5nQ2hhbm5lbBIRCglhdmFpbGFibGUYAiABKAgSDgoGcmVhc29uGAMgASgJIqUGChNNZXNzYWdpbmdDb25uZWN0aW9uEhUKDWNvbm5lY3Rpb25faWQYASABKAkSKgoHY2hhbm5lbBgCIAEoDjIZLmpva28udjEuTWVzc2FnaW5nQ2hhbm5lbBISCgpnZW5lcmF0aW9uGAMgASgEEg8KB2VuYWJsZWQYBCABKAgSQQoOcnVudGltZV9zdGF0dXMYBSABKA4yKS5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb25SdW50aW1lU3RhdHVzEh0KFWNyZWRlbnRpYWxfY29uZmlndXJlZBgGIAEoCBIjChZvd25lcl9wcm92aWRlcl91c2VyX2lkGAcgASgJSACIAQESIAoTcHJvdmlkZXJfYWNjb3VudF9pZBgIIAEoCUgBiAEBEh4KEXByb3ZpZGVyX3VzZXJuYW1lGAkgASgJSAKIAQESTAoWdGVsZWdyYW1fY29uZmlndXJhdGlvbhgKIAEoCzInLmpva28udjEuVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uSAOIAQESFwoKZXJyb3JfY29kZRgLIAEoCUgEiAEBEhoKDWVycm9yX3N1bW1hcnkYDCABKAlIBYgBARI6ChFsYXN0X2Nvbm5lY3RlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIBogBARIuCgpjcmVhdGVkX2F0GA4gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GA8gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIjCghyZXZpc2lvbhgQIAEoCzIRLmpva28udjEuUmV2aXNpb25CGQoXX293bmVyX3Byb3ZpZGVyX3VzZXJfaWRCFgoUX3Byb3ZpZGVyX2FjY291bnRfaWRCFAoSX3Byb3ZpZGVyX3VzZXJuYW1lQhkKF190ZWxlZ3JhbV9jb25maWd1cmF0aW9uQg0KC19lcnJvcl9jb2RlQhAKDl9lcnJvcl9zdW1tYXJ5QhQKEl9sYXN0X2Nvbm5lY3RlZF9hdCLDAwoOTWVzc2FnaW5nUm91dGUSEQoJc2NvcGVfa2V5GAEgASgJEhoKDWNvbm5lY3Rpb25faWQYAiABKAlIAIgBARIRCgl0YXJnZXRfaWQYAyABKAkSEgoKYmFja2VuZF9pZBgEIAEoCRIYCgtwcm92aWRlcl9pZBgFIAEoCUgBiAEBEhUKCG1vZGVsX2lkGAYgASgJSAKIAQESEwoGZWZmb3J0GAcgASgJSAOIAQESEQoJZmFzdF9tb2RlGAggASgIEjAKD3Blcm1pc3Npb25fbW9kZRgJIAEoDjIXLmpva28udjEuUGVybWlzc2lvbk1vZGUSEQoJcGxhbl9tb2RlGAogASgIEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEiMKCHJldmlzaW9uGA0gASgLMhEuam9rby52MS5SZXZpc2lvbkIQCg5fY29ubmVjdGlvbl9pZEIOCgxfcHJvdmlkZXJfaWRCCwoJX21vZGVsX2lkQgkKB19lZmZvcnQiHQobR2V0TWVzc2FnaW5nU2V0dGluZ3NSZXF1ZXN0IrEBChxHZXRNZXNzYWdpbmdTZXR0aW5nc1Jlc3BvbnNlEjEKC2Nvbm5lY3Rpb25zGAEgAygLMhwuam9rby52MS5NZXNzYWdpbmdDb25uZWN0aW9uEicKBnJvdXRlcxgCIAMoCzIXLmpva28udjEuTWVzc2FnaW5nUm91dGUSNQoIY2hhbm5lbHMYAyADKAsyIy5qb2tvLnYxLk1lc3NhZ2luZ0NoYW5uZWxDYXBhYmlsaXR5ItcBCiBDcmVhdGVNZXNzYWdpbmdDb25uZWN0aW9uUmVxdWVzdBIqCgdjaGFubmVsGAEgASgOMhkuam9rby52MS5NZXNzYWdpbmdDaGFubmVsEh4KFm93bmVyX3Byb3ZpZGVyX3VzZXJfaWQYAiABKAkSTAoWdGVsZWdyYW1fY29uZmlndXJhdGlvbhgDIAEoCzInLmpva28udjEuVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uSACIAQFCGQoXX3RlbGVncmFtX2NvbmZpZ3VyYXRpb24iVQohQ3JlYXRlTWVzc2FnaW5nQ29ubmVjdGlvblJlc3BvbnNlEjAKCmNvbm5lY3Rpb24YASABKAsyHC5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb24iiQEKJUJlZ2luTWVzc2FnaW5nQ3JlZGVudGlhbFVwbG9hZFJlcXVlc3QSFQoNY29ubmVjdGlvbl9pZBgBIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SGwoTZXhwZWN0ZWRfZ2VuZXJhdGlvbhgDIAEoBCJZCiZCZWdpbk1lc3NhZ2luZ0NyZWRlbnRpYWxVcGxvYWRSZXNwb25zZRIvCgZ0aWNrZXQYASABKAsyHy5qb2tvLnYxLkNyZWRlbnRpYWxVcGxvYWRUaWNrZXQiVwogQ29tbWl0TWVzc2FnaW5nQ3JlZGVudGlhbFJlcXVlc3QSIwobY3JlZGVudGlhbF91cGxvYWRfdGlja2V0X2lkGAEgASgJEg4KBmVuYWJsZRgCIAEoCCJVCiFDb21taXRNZXNzYWdpbmdDcmVkZW50aWFsUmVzcG9uc2USMAoKY29ubmVjdGlvbhgBIAEoCzIcLmpva28udjEuTWVzc2FnaW5nQ29ubmVjdGlvbiKDAQofQ2xlYXJNZXNzYWdpbmdDcmVkZW50aWFsUmVxdWVzdBIVCg1jb25uZWN0aW9uX2lkGAEgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIbChNleHBlY3RlZF9nZW5lcmF0aW9uGAMgASgEIlQKIENsZWFyTWVzc2FnaW5nQ3JlZGVudGlhbFJlc3BvbnNlEjAKCmNvbm5lY3Rpb24YASABKAsyHC5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb24imQEKJFNldE1lc3NhZ2luZ0Nvbm5lY3Rpb25FbmFibGVkUmVxdWVzdBIVCg1jb25uZWN0aW9uX2lkGAEgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIbChNleHBlY3RlZF9nZW5lcmF0aW9uGAMgASgEEg8KB2VuYWJsZWQYBCABKAgiWQolU2V0TWVzc2FnaW5nQ29ubmVjdGlvbkVuYWJsZWRSZXNwb25zZRIwCgpjb25uZWN0aW9uGAEgASgLMhwuam9rby52MS5NZXNzYWdpbmdDb25uZWN0aW9uIu8BCitVcGRhdGVUZWxlZ3JhbU1lc3NhZ2luZ0NvbmZpZ3VyYXRpb25SZXF1ZXN0EhUKDWNvbm5lY3Rpb25faWQYASABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhsKE2V4cGVjdGVkX2dlbmVyYXRpb24YAyABKAQSHgoWb3duZXJfcHJvdmlkZXJfdXNlcl9pZBgEIAEoCRI+Cg1jb25maWd1cmF0aW9uGAUgASgLMicuam9rby52MS5UZWxlZ3JhbU1lc3NhZ2luZ0NvbmZpZ3VyYXRpb24iYAosVXBkYXRlVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uUmVzcG9uc2USMAoKY29ubmVjdGlvbhgBIAEoCzIcLmpva28udjEuTWVzc2FnaW5nQ29ubmVjdGlvbiI3Ch5UZXN0TWVzc2FnaW5nQ29ubmVjdGlvblJlcXVlc3QSFQoNY29ubmVjdGlvbl9pZBgBIAEoCSLxAQofVGVzdE1lc3NhZ2luZ0Nvbm5lY3Rpb25SZXNwb25zZRIKCgJvaxgBIAEoCBI4CgdmYWlsdXJlGAIgASgOMicuam9rby52MS5NZXNzYWdpbmdDb25uZWN0aW9uVGVzdEZhaWx1cmUSIAoTcHJvdmlkZXJfYWNjb3VudF9pZBgDIAEoCUgAiAEBEhkKDGRpc3BsYXlfbmFtZRgEIAEoCUgBiAEBEhUKCHVzZXJuYW1lGAUgASgJSAKIAQFCFgoUX3Byb3ZpZGVyX2FjY291bnRfaWRCDwoNX2Rpc3BsYXlfbmFtZUILCglfdXNlcm5hbWUi6gIKGFB1dE1lc3NhZ2luZ1JvdXRlUmVxdWVzdBIaCg1jb25uZWN0aW9uX2lkGAEgASgJSACIAQESMQoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uSAGIAQESEQoJdGFyZ2V0X2lkGAMgASgJEhgKC3Byb3ZpZGVyX2lkGAQgASgJSAKIAQESFQoIbW9kZWxfaWQYBSABKAlIA4gBARITCgZlZmZvcnQYBiABKAlIBIgBARIRCglmYXN0X21vZGUYByABKAgSMAoPcGVybWlzc2lvbl9tb2RlGAggASgOMhcuam9rby52MS5QZXJtaXNzaW9uTW9kZRIRCglwbGFuX21vZGUYCSABKAhCEAoOX2Nvbm5lY3Rpb25faWRCFAoSX2V4cGVjdGVkX3JldmlzaW9uQg4KDF9wcm92aWRlcl9pZEILCglfbW9kZWxfaWRCCQoHX2VmZm9ydCJDChlQdXRNZXNzYWdpbmdSb3V0ZVJlc3BvbnNlEiYKBXJvdXRlGAEgASgLMhcuam9rby52MS5NZXNzYWdpbmdSb3V0ZSqmAgoQTWVzc2FnaW5nQ2hhbm5lbBIhCh1NRVNTQUdJTkdfQ0hBTk5FTF9VTlNQRUNJRklFRBAAEh4KGk1FU1NBR0lOR19DSEFOTkVMX1RFTEVHUkFNEAESHQoZTUVTU0FHSU5HX0NIQU5ORUxfRElTQ09SRBACEh4KGk1FU1NBR0lOR19DSEFOTkVMX0RJTkdUQUxLEAMSHAoYTUVTU0FHSU5HX0NIQU5ORUxfRkVJU0hVEAQSGgoWTUVTU0FHSU5HX0NIQU5ORUxfTEFSSxAFEhsKF01FU1NBR0lOR19DSEFOTkVMX1dFQ09NEAYSHAoYTUVTU0FHSU5HX0NIQU5ORUxfV0VDSEFUEAcSGwoXTUVTU0FHSU5HX0NIQU5ORUxfU0xBQ0sQCCqxAwogTWVzc2FnaW5nQ29ubmVjdGlvblJ1bnRpbWVTdGF0dXMSMwovTUVTU0FHSU5HX0NPTk5FQ1RJT05fUlVOVElNRV9TVEFUVVNfVU5TUEVDSUZJRUQQABIsCihNRVNTQUdJTkdfQ09OTkVDVElPTl9SVU5USU1FX1NUQVRVU19JRExFEAESMgouTUVTU0FHSU5HX0NPTk5FQ1RJT05fUlVOVElNRV9TVEFUVVNfQ09OTkVDVElORxACEjEKLU1FU1NBR0lOR19DT05ORUNUSU9OX1JVTlRJTUVfU1RBVFVTX0NPTk5FQ1RFRBADEi8KK01FU1NBR0lOR19DT05ORUNUSU9OX1JVTlRJTUVfU1RBVFVTX09GRkxJTkUQBBIwCixNRVNTQUdJTkdfQ09OTkVDVElPTl9SVU5USU1FX1NUQVRVU19DT05GTElDVBAFEjEKLU1FU1NBR0lOR19DT05ORUNUSU9OX1JVTlRJTUVfU1RBVFVTX0FVVEhfTE9TUxAGEi0KKU1FU1NBR0lOR19DT05ORUNUSU9OX1JVTlRJTUVfU1RBVFVTX0VSUk9SEAcqswEKFlRlbGVncmFtRW1vamlSZWFjdGlvbnMSKAokVEVMRUdSQU1fRU1PSklfUkVBQ1RJT05TX1VOU1BFQ0lGSUVEEAASIAocVEVMRUdSQU1fRU1PSklfUkVBQ1RJT05TX09GRhABEiQKIFRFTEVHUkFNX0VNT0pJX1JFQUNUSU9OU19NSU5JTUFMEAISJwojVEVMRUdSQU1fRU1PSklfUkVBQ1RJT05TX0VYUFJFU1NJVkUQAyquAQoWVGVsZWdyYW1SZXBseVF1b3RlTW9kZRIpCiVURUxFR1JBTV9SRVBMWV9RVU9URV9NT0RFX1VOU1BFQ0lGSUVEEAASIQodVEVMRUdSQU1fUkVQTFlfUVVPVEVfTU9ERV9PRkYQARIjCh9URUxFR1JBTV9SRVBMWV9RVU9URV9NT0RFX0ZJUlNUEAISIQodVEVMRUdSQU1fUkVQTFlfUVVPVEVfTU9ERV9BTEwQAyq5AQoXVGVsZWdyYW1Hcm91cEFjdGl2YXRpb24SKQolVEVMRUdSQU1fR1JPVVBfQUNUSVZBVElPTl9VTlNQRUNJRklFRBAAEiUKIVRFTEVHUkFNX0dST1VQX0FDVElWQVRJT05fTUVOVElPThABEiQKIFRFTEVHUkFNX0dST1VQX0FDVElWQVRJT05fQUxXQVlTEAISJgoiVEVMRUdSQU1fR1JPVVBfQUNUSVZBVElPTl9ESVNBQkxFRBADKuQCCh5NZXNzYWdpbmdDb25uZWN0aW9uVGVzdEZhaWx1cmUSMQotTUVTU0FHSU5HX0NPTk5FQ1RJT05fVEVTVF9GQUlMVVJFX1VOU1BFQ0lGSUVEEAASLQopTUVTU0FHSU5HX0NPTk5FQ1RJT05fVEVTVF9GQUlMVVJFX0lOVkFMSUQQARIuCipNRVNTQUdJTkdfQ09OTkVDVElPTl9URVNUX0ZBSUxVUkVfQ09ORkxJQ1QQAhI8CjhNRVNTQUdJTkdfQ09OTkVDVElPTl9URVNUX0ZBSUxVUkVfQ1JFREVOVElBTF9VTkFWQUlMQUJMRRADEjkKNU1FU1NBR0lOR19DT05ORUNUSU9OX1RFU1RfRkFJTFVSRV9DSEFOTkVMX1VOQVZBSUxBQkxFEAQSNwozTUVTU0FHSU5HX0NPTk5FQ1RJT05fVEVTVF9GQUlMVVJFX0NPTk5FQ1RJT05fRkFJTEVEEAViBnByb3RvMw", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_operation]);
+  fileDesc("Chdqb2tvL3YxL21lc3NhZ2luZy5wcm90bxIHam9rby52MSKVAgoeVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uEjgKD2Vtb2ppX3JlYWN0aW9ucxgBIAEoDjIfLmpva28udjEuVGVsZWdyYW1FbW9qaVJlYWN0aW9ucxI3Cg5yZXBseV9xdW90ZV9kbRgCIAEoDjIfLmpva28udjEuVGVsZWdyYW1SZXBseVF1b3RlTW9kZRI6ChFyZXBseV9xdW90ZV9ncm91cBgDIAEoDjIfLmpva28udjEuVGVsZWdyYW1SZXBseVF1b3RlTW9kZRJEChZncm91cF9hY3RpdmF0aW9uX3J1bGVzGAQgAygLMiQuam9rby52MS5UZWxlZ3JhbUdyb3VwQWN0aXZhdGlvblJ1bGUiZAobVGVsZWdyYW1Hcm91cEFjdGl2YXRpb25SdWxlEg8KB2NoYXRfaWQYASABKAkSNAoKYWN0aXZhdGlvbhgCIAEoDjIgLmpva28udjEuVGVsZWdyYW1Hcm91cEFjdGl2YXRpb24isQIKHURpc2NvcmRNZXNzYWdpbmdDb25maWd1cmF0aW9uEh8KF2xpZmVjeWNsZV9hbm5vdW5jZW1lbnRzGAEgASgIEjcKD2Vtb2ppX3JlYWN0aW9ucxgCIAEoDjIeLmpva28udjEuRGlzY29yZEVtb2ppUmVhY3Rpb25zEjYKDnJlcGx5X3F1b3RlX2RtGAMgASgOMh4uam9rby52MS5EaXNjb3JkUmVwbHlRdW90ZU1vZGUSOQoRcmVwbHlfcXVvdGVfZ3JvdXAYBCABKA4yHi5qb2tvLnYxLkRpc2NvcmRSZXBseVF1b3RlTW9kZRJDChZncm91cF9hY3RpdmF0aW9uX3J1bGVzGAUgAygLMiMuam9rby52MS5EaXNjb3JkR3JvdXBBY3RpdmF0aW9uUnVsZSJ3ChpEaXNjb3JkR3JvdXBBY3RpdmF0aW9uUnVsZRIQCghndWlsZF9pZBgBIAEoCRISCgpjaGFubmVsX2lkGAIgASgJEjMKCmFjdGl2YXRpb24YAyABKA4yHy5qb2tvLnYxLkRpc2NvcmRHcm91cEFjdGl2YXRpb24iawoaTWVzc2FnaW5nQ2hhbm5lbENhcGFiaWxpdHkSKgoHY2hhbm5lbBgBIAEoDjIZLmpva28udjEuTWVzc2FnaW5nQ2hhbm5lbBIRCglhdmFpbGFibGUYAiABKAgSDgoGcmVhc29uGAMgASgJIosHChNNZXNzYWdpbmdDb25uZWN0aW9uEhUKDWNvbm5lY3Rpb25faWQYASABKAkSKgoHY2hhbm5lbBgCIAEoDjIZLmpva28udjEuTWVzc2FnaW5nQ2hhbm5lbBISCgpnZW5lcmF0aW9uGAMgASgEEg8KB2VuYWJsZWQYBCABKAgSQQoOcnVudGltZV9zdGF0dXMYBSABKA4yKS5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb25SdW50aW1lU3RhdHVzEh0KFWNyZWRlbnRpYWxfY29uZmlndXJlZBgGIAEoCBIjChZvd25lcl9wcm92aWRlcl91c2VyX2lkGAcgASgJSACIAQESIAoTcHJvdmlkZXJfYWNjb3VudF9pZBgIIAEoCUgBiAEBEh4KEXByb3ZpZGVyX3VzZXJuYW1lGAkgASgJSAKIAQESTAoWdGVsZWdyYW1fY29uZmlndXJhdGlvbhgKIAEoCzInLmpva28udjEuVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uSAOIAQESFwoKZXJyb3JfY29kZRgLIAEoCUgEiAEBEhoKDWVycm9yX3N1bW1hcnkYDCABKAlIBYgBARI6ChFsYXN0X2Nvbm5lY3RlZF9hdBgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBIBogBARIuCgpjcmVhdGVkX2F0GA4gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GA8gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIjCghyZXZpc2lvbhgQIAEoCzIRLmpva28udjEuUmV2aXNpb24SSgoVZGlzY29yZF9jb25maWd1cmF0aW9uGBEgASgLMiYuam9rby52MS5EaXNjb3JkTWVzc2FnaW5nQ29uZmlndXJhdGlvbkgHiAEBQhkKF19vd25lcl9wcm92aWRlcl91c2VyX2lkQhYKFF9wcm92aWRlcl9hY2NvdW50X2lkQhQKEl9wcm92aWRlcl91c2VybmFtZUIZChdfdGVsZWdyYW1fY29uZmlndXJhdGlvbkINCgtfZXJyb3JfY29kZUIQCg5fZXJyb3Jfc3VtbWFyeUIUChJfbGFzdF9jb25uZWN0ZWRfYXRCGAoWX2Rpc2NvcmRfY29uZmlndXJhdGlvbiLDAwoOTWVzc2FnaW5nUm91dGUSEQoJc2NvcGVfa2V5GAEgASgJEhoKDWNvbm5lY3Rpb25faWQYAiABKAlIAIgBARIRCgl0YXJnZXRfaWQYAyABKAkSEgoKYmFja2VuZF9pZBgEIAEoCRIYCgtwcm92aWRlcl9pZBgFIAEoCUgBiAEBEhUKCG1vZGVsX2lkGAYgASgJSAKIAQESEwoGZWZmb3J0GAcgASgJSAOIAQESEQoJZmFzdF9tb2RlGAggASgIEjAKD3Blcm1pc3Npb25fbW9kZRgJIAEoDjIXLmpva28udjEuUGVybWlzc2lvbk1vZGUSEQoJcGxhbl9tb2RlGAogASgIEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEiMKCHJldmlzaW9uGA0gASgLMhEuam9rby52MS5SZXZpc2lvbkIQCg5fY29ubmVjdGlvbl9pZEIOCgxfcHJvdmlkZXJfaWRCCwoJX21vZGVsX2lkQgkKB19lZmZvcnQiHQobR2V0TWVzc2FnaW5nU2V0dGluZ3NSZXF1ZXN0IrEBChxHZXRNZXNzYWdpbmdTZXR0aW5nc1Jlc3BvbnNlEjEKC2Nvbm5lY3Rpb25zGAEgAygLMhwuam9rby52MS5NZXNzYWdpbmdDb25uZWN0aW9uEicKBnJvdXRlcxgCIAMoCzIXLmpva28udjEuTWVzc2FnaW5nUm91dGUSNQoIY2hhbm5lbHMYAyADKAsyIy5qb2tvLnYxLk1lc3NhZ2luZ0NoYW5uZWxDYXBhYmlsaXR5Ir0CCiBDcmVhdGVNZXNzYWdpbmdDb25uZWN0aW9uUmVxdWVzdBIqCgdjaGFubmVsGAEgASgOMhkuam9rby52MS5NZXNzYWdpbmdDaGFubmVsEh4KFm93bmVyX3Byb3ZpZGVyX3VzZXJfaWQYAiABKAkSTAoWdGVsZWdyYW1fY29uZmlndXJhdGlvbhgDIAEoCzInLmpva28udjEuVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uSACIAQESSgoVZGlzY29yZF9jb25maWd1cmF0aW9uGAQgASgLMiYuam9rby52MS5EaXNjb3JkTWVzc2FnaW5nQ29uZmlndXJhdGlvbkgBiAEBQhkKF190ZWxlZ3JhbV9jb25maWd1cmF0aW9uQhgKFl9kaXNjb3JkX2NvbmZpZ3VyYXRpb24iVQohQ3JlYXRlTWVzc2FnaW5nQ29ubmVjdGlvblJlc3BvbnNlEjAKCmNvbm5lY3Rpb24YASABKAsyHC5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb24iiQEKJUJlZ2luTWVzc2FnaW5nQ3JlZGVudGlhbFVwbG9hZFJlcXVlc3QSFQoNY29ubmVjdGlvbl9pZBgBIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SGwoTZXhwZWN0ZWRfZ2VuZXJhdGlvbhgDIAEoBCJZCiZCZWdpbk1lc3NhZ2luZ0NyZWRlbnRpYWxVcGxvYWRSZXNwb25zZRIvCgZ0aWNrZXQYASABKAsyHy5qb2tvLnYxLkNyZWRlbnRpYWxVcGxvYWRUaWNrZXQiVwogQ29tbWl0TWVzc2FnaW5nQ3JlZGVudGlhbFJlcXVlc3QSIwobY3JlZGVudGlhbF91cGxvYWRfdGlja2V0X2lkGAEgASgJEg4KBmVuYWJsZRgCIAEoCCJVCiFDb21taXRNZXNzYWdpbmdDcmVkZW50aWFsUmVzcG9uc2USMAoKY29ubmVjdGlvbhgBIAEoCzIcLmpva28udjEuTWVzc2FnaW5nQ29ubmVjdGlvbiKDAQofQ2xlYXJNZXNzYWdpbmdDcmVkZW50aWFsUmVxdWVzdBIVCg1jb25uZWN0aW9uX2lkGAEgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIbChNleHBlY3RlZF9nZW5lcmF0aW9uGAMgASgEIlQKIENsZWFyTWVzc2FnaW5nQ3JlZGVudGlhbFJlc3BvbnNlEjAKCmNvbm5lY3Rpb24YASABKAsyHC5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb24imQEKJFNldE1lc3NhZ2luZ0Nvbm5lY3Rpb25FbmFibGVkUmVxdWVzdBIVCg1jb25uZWN0aW9uX2lkGAEgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIbChNleHBlY3RlZF9nZW5lcmF0aW9uGAMgASgEEg8KB2VuYWJsZWQYBCABKAgiWQolU2V0TWVzc2FnaW5nQ29ubmVjdGlvbkVuYWJsZWRSZXNwb25zZRIwCgpjb25uZWN0aW9uGAEgASgLMhwuam9rby52MS5NZXNzYWdpbmdDb25uZWN0aW9uIu8BCitVcGRhdGVUZWxlZ3JhbU1lc3NhZ2luZ0NvbmZpZ3VyYXRpb25SZXF1ZXN0EhUKDWNvbm5lY3Rpb25faWQYASABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhsKE2V4cGVjdGVkX2dlbmVyYXRpb24YAyABKAQSHgoWb3duZXJfcHJvdmlkZXJfdXNlcl9pZBgEIAEoCRI+Cg1jb25maWd1cmF0aW9uGAUgASgLMicuam9rby52MS5UZWxlZ3JhbU1lc3NhZ2luZ0NvbmZpZ3VyYXRpb24iYAosVXBkYXRlVGVsZWdyYW1NZXNzYWdpbmdDb25maWd1cmF0aW9uUmVzcG9uc2USMAoKY29ubmVjdGlvbhgBIAEoCzIcLmpva28udjEuTWVzc2FnaW5nQ29ubmVjdGlvbiLtAQoqVXBkYXRlRGlzY29yZE1lc3NhZ2luZ0NvbmZpZ3VyYXRpb25SZXF1ZXN0EhUKDWNvbm5lY3Rpb25faWQYASABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhsKE2V4cGVjdGVkX2dlbmVyYXRpb24YAyABKAQSHgoWb3duZXJfcHJvdmlkZXJfdXNlcl9pZBgEIAEoCRI9Cg1jb25maWd1cmF0aW9uGAUgASgLMiYuam9rby52MS5EaXNjb3JkTWVzc2FnaW5nQ29uZmlndXJhdGlvbiJfCitVcGRhdGVEaXNjb3JkTWVzc2FnaW5nQ29uZmlndXJhdGlvblJlc3BvbnNlEjAKCmNvbm5lY3Rpb24YASABKAsyHC5qb2tvLnYxLk1lc3NhZ2luZ0Nvbm5lY3Rpb24iNwoeVGVzdE1lc3NhZ2luZ0Nvbm5lY3Rpb25SZXF1ZXN0EhUKDWNvbm5lY3Rpb25faWQYASABKAki8QEKH1Rlc3RNZXNzYWdpbmdDb25uZWN0aW9uUmVzcG9uc2USCgoCb2sYASABKAgSOAoHZmFpbHVyZRgCIAEoDjInLmpva28udjEuTWVzc2FnaW5nQ29ubmVjdGlvblRlc3RGYWlsdXJlEiAKE3Byb3ZpZGVyX2FjY291bnRfaWQYAyABKAlIAIgBARIZCgxkaXNwbGF5X25hbWUYBCABKAlIAYgBARIVCgh1c2VybmFtZRgFIAEoCUgCiAEBQhYKFF9wcm92aWRlcl9hY2NvdW50X2lkQg8KDV9kaXNwbGF5X25hbWVCCwoJX3VzZXJuYW1lIuoCChhQdXRNZXNzYWdpbmdSb3V0ZVJlcXVlc3QSGgoNY29ubmVjdGlvbl9pZBgBIAEoCUgAiAEBEjEKEWV4cGVjdGVkX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbkgBiAEBEhEKCXRhcmdldF9pZBgDIAEoCRIYCgtwcm92aWRlcl9pZBgEIAEoCUgCiAEBEhUKCG1vZGVsX2lkGAUgASgJSAOIAQESEwoGZWZmb3J0GAYgASgJSASIAQESEQoJZmFzdF9tb2RlGAcgASgIEjAKD3Blcm1pc3Npb25fbW9kZRgIIAEoDjIXLmpva28udjEuUGVybWlzc2lvbk1vZGUSEQoJcGxhbl9tb2RlGAkgASgIQhAKDl9jb25uZWN0aW9uX2lkQhQKEl9leHBlY3RlZF9yZXZpc2lvbkIOCgxfcHJvdmlkZXJfaWRCCwoJX21vZGVsX2lkQgkKB19lZmZvcnQiQwoZUHV0TWVzc2FnaW5nUm91dGVSZXNwb25zZRImCgVyb3V0ZRgBIAEoCzIXLmpva28udjEuTWVzc2FnaW5nUm91dGUqpgIKEE1lc3NhZ2luZ0NoYW5uZWwSIQodTUVTU0FHSU5HX0NIQU5ORUxfVU5TUEVDSUZJRUQQABIeChpNRVNTQUdJTkdfQ0hBTk5FTF9URUxFR1JBTRABEh0KGU1FU1NBR0lOR19DSEFOTkVMX0RJU0NPUkQQAhIeChpNRVNTQUdJTkdfQ0hBTk5FTF9ESU5HVEFMSxADEhwKGE1FU1NBR0lOR19DSEFOTkVMX0ZFSVNIVRAEEhoKFk1FU1NBR0lOR19DSEFOTkVMX0xBUksQBRIbChdNRVNTQUdJTkdfQ0hBTk5FTF9XRUNPTRAGEhwKGE1FU1NBR0lOR19DSEFOTkVMX1dFQ0hBVBAHEhsKF01FU1NBR0lOR19DSEFOTkVMX1NMQUNLEAgqsQMKIE1lc3NhZ2luZ0Nvbm5lY3Rpb25SdW50aW1lU3RhdHVzEjMKL01FU1NBR0lOR19DT05ORUNUSU9OX1JVTlRJTUVfU1RBVFVTX1VOU1BFQ0lGSUVEEAASLAooTUVTU0FHSU5HX0NPTk5FQ1RJT05fUlVOVElNRV9TVEFUVVNfSURMRRABEjIKLk1FU1NBR0lOR19DT05ORUNUSU9OX1JVTlRJTUVfU1RBVFVTX0NPTk5FQ1RJTkcQAhIxCi1NRVNTQUdJTkdfQ09OTkVDVElPTl9SVU5USU1FX1NUQVRVU19DT05ORUNURUQQAxIvCitNRVNTQUdJTkdfQ09OTkVDVElPTl9SVU5USU1FX1NUQVRVU19PRkZMSU5FEAQSMAosTUVTU0FHSU5HX0NPTk5FQ1RJT05fUlVOVElNRV9TVEFUVVNfQ09ORkxJQ1QQBRIxCi1NRVNTQUdJTkdfQ09OTkVDVElPTl9SVU5USU1FX1NUQVRVU19BVVRIX0xPU1MQBhItCilNRVNTQUdJTkdfQ09OTkVDVElPTl9SVU5USU1FX1NUQVRVU19FUlJPUhAHKrMBChZUZWxlZ3JhbUVtb2ppUmVhY3Rpb25zEigKJFRFTEVHUkFNX0VNT0pJX1JFQUNUSU9OU19VTlNQRUNJRklFRBAAEiAKHFRFTEVHUkFNX0VNT0pJX1JFQUNUSU9OU19PRkYQARIkCiBURUxFR1JBTV9FTU9KSV9SRUFDVElPTlNfTUlOSU1BTBACEicKI1RFTEVHUkFNX0VNT0pJX1JFQUNUSU9OU19FWFBSRVNTSVZFEAMqrgEKFlRlbGVncmFtUmVwbHlRdW90ZU1vZGUSKQolVEVMRUdSQU1fUkVQTFlfUVVPVEVfTU9ERV9VTlNQRUNJRklFRBAAEiEKHVRFTEVHUkFNX1JFUExZX1FVT1RFX01PREVfT0ZGEAESIwofVEVMRUdSQU1fUkVQTFlfUVVPVEVfTU9ERV9GSVJTVBACEiEKHVRFTEVHUkFNX1JFUExZX1FVT1RFX01PREVfQUxMEAMquQEKF1RlbGVncmFtR3JvdXBBY3RpdmF0aW9uEikKJVRFTEVHUkFNX0dST1VQX0FDVElWQVRJT05fVU5TUEVDSUZJRUQQABIlCiFURUxFR1JBTV9HUk9VUF9BQ1RJVkFUSU9OX01FTlRJT04QARIkCiBURUxFR1JBTV9HUk9VUF9BQ1RJVkFUSU9OX0FMV0FZUxACEiYKIlRFTEVHUkFNX0dST1VQX0FDVElWQVRJT05fRElTQUJMRUQQAyquAQoVRGlzY29yZEVtb2ppUmVhY3Rpb25zEicKI0RJU0NPUkRfRU1PSklfUkVBQ1RJT05TX1VOU1BFQ0lGSUVEEAASHwobRElTQ09SRF9FTU9KSV9SRUFDVElPTlNfT0ZGEAESIwofRElTQ09SRF9FTU9KSV9SRUFDVElPTlNfTUlOSU1BTBACEiYKIkRJU0NPUkRfRU1PSklfUkVBQ1RJT05TX0VYUFJFU1NJVkUQAyqpAQoVRGlzY29yZFJlcGx5UXVvdGVNb2RlEigKJERJU0NPUkRfUkVQTFlfUVVPVEVfTU9ERV9VTlNQRUNJRklFRBAAEiAKHERJU0NPUkRfUkVQTFlfUVVPVEVfTU9ERV9PRkYQARIiCh5ESVNDT1JEX1JFUExZX1FVT1RFX01PREVfRklSU1QQAhIgChxESVNDT1JEX1JFUExZX1FVT1RFX01PREVfQUxMEAMqtAEKFkRpc2NvcmRHcm91cEFjdGl2YXRpb24SKAokRElTQ09SRF9HUk9VUF9BQ1RJVkFUSU9OX1VOU1BFQ0lGSUVEEAASJAogRElTQ09SRF9HUk9VUF9BQ1RJVkFUSU9OX01FTlRJT04QARIjCh9ESVNDT1JEX0dST1VQX0FDVElWQVRJT05fQUxXQVlTEAISJQohRElTQ09SRF9HUk9VUF9BQ1RJVkFUSU9OX0RJU0FCTEVEEAMq5AIKHk1lc3NhZ2luZ0Nvbm5lY3Rpb25UZXN0RmFpbHVyZRIxCi1NRVNTQUdJTkdfQ09OTkVDVElPTl9URVNUX0ZBSUxVUkVfVU5TUEVDSUZJRUQQABItCilNRVNTQUdJTkdfQ09OTkVDVElPTl9URVNUX0ZBSUxVUkVfSU5WQUxJRBABEi4KKk1FU1NBR0lOR19DT05ORUNUSU9OX1RFU1RfRkFJTFVSRV9DT05GTElDVBACEjwKOE1FU1NBR0lOR19DT05ORUNUSU9OX1RFU1RfRkFJTFVSRV9DUkVERU5USUFMX1VOQVZBSUxBQkxFEAMSOQo1TUVTU0FHSU5HX0NPTk5FQ1RJT05fVEVTVF9GQUlMVVJFX0NIQU5ORUxfVU5BVkFJTEFCTEUQBBI3CjNNRVNTQUdJTkdfQ09OTkVDVElPTl9URVNUX0ZBSUxVUkVfQ09OTkVDVElPTl9GQUlMRUQQBWIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_operation]);
 
 /**
  * @generated from message joko.v1.TelegramMessagingConfiguration
@@ -75,6 +75,70 @@ export const TelegramGroupActivationRuleSchema: GenMessage<TelegramGroupActivati
   messageDesc(file_joko_v1_messaging, 1);
 
 /**
+ * @generated from message joko.v1.DiscordMessagingConfiguration
+ */
+export type DiscordMessagingConfiguration = Message<"joko.v1.DiscordMessagingConfiguration"> & {
+  /**
+   * @generated from field: bool lifecycle_announcements = 1;
+   */
+  lifecycleAnnouncements: boolean;
+
+  /**
+   * @generated from field: joko.v1.DiscordEmojiReactions emoji_reactions = 2;
+   */
+  emojiReactions: DiscordEmojiReactions;
+
+  /**
+   * @generated from field: joko.v1.DiscordReplyQuoteMode reply_quote_dm = 3;
+   */
+  replyQuoteDm: DiscordReplyQuoteMode;
+
+  /**
+   * @generated from field: joko.v1.DiscordReplyQuoteMode reply_quote_group = 4;
+   */
+  replyQuoteGroup: DiscordReplyQuoteMode;
+
+  /**
+   * @generated from field: repeated joko.v1.DiscordGroupActivationRule group_activation_rules = 5;
+   */
+  groupActivationRules: DiscordGroupActivationRule[];
+};
+
+/**
+ * Describes the message joko.v1.DiscordMessagingConfiguration.
+ * Use `create(DiscordMessagingConfigurationSchema)` to create a new message.
+ */
+export const DiscordMessagingConfigurationSchema: GenMessage<DiscordMessagingConfiguration> = /*@__PURE__*/
+  messageDesc(file_joko_v1_messaging, 2);
+
+/**
+ * @generated from message joko.v1.DiscordGroupActivationRule
+ */
+export type DiscordGroupActivationRule = Message<"joko.v1.DiscordGroupActivationRule"> & {
+  /**
+   * @generated from field: string guild_id = 1;
+   */
+  guildId: string;
+
+  /**
+   * @generated from field: string channel_id = 2;
+   */
+  channelId: string;
+
+  /**
+   * @generated from field: joko.v1.DiscordGroupActivation activation = 3;
+   */
+  activation: DiscordGroupActivation;
+};
+
+/**
+ * Describes the message joko.v1.DiscordGroupActivationRule.
+ * Use `create(DiscordGroupActivationRuleSchema)` to create a new message.
+ */
+export const DiscordGroupActivationRuleSchema: GenMessage<DiscordGroupActivationRule> = /*@__PURE__*/
+  messageDesc(file_joko_v1_messaging, 3);
+
+/**
  * @generated from message joko.v1.MessagingChannelCapability
  */
 export type MessagingChannelCapability = Message<"joko.v1.MessagingChannelCapability"> & {
@@ -99,7 +163,7 @@ export type MessagingChannelCapability = Message<"joko.v1.MessagingChannelCapabi
  * Use `create(MessagingChannelCapabilitySchema)` to create a new message.
  */
 export const MessagingChannelCapabilitySchema: GenMessage<MessagingChannelCapability> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 2);
+  messageDesc(file_joko_v1_messaging, 4);
 
 /**
  * @generated from message joko.v1.MessagingConnection
@@ -184,6 +248,11 @@ export type MessagingConnection = Message<"joko.v1.MessagingConnection"> & {
    * @generated from field: joko.v1.Revision revision = 16;
    */
   revision?: Revision | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.DiscordMessagingConfiguration discord_configuration = 17;
+   */
+  discordConfiguration?: DiscordMessagingConfiguration | undefined;
 };
 
 /**
@@ -191,7 +260,7 @@ export type MessagingConnection = Message<"joko.v1.MessagingConnection"> & {
  * Use `create(MessagingConnectionSchema)` to create a new message.
  */
 export const MessagingConnectionSchema: GenMessage<MessagingConnection> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 3);
+  messageDesc(file_joko_v1_messaging, 5);
 
 /**
  * @generated from message joko.v1.MessagingRoute
@@ -268,7 +337,7 @@ export type MessagingRoute = Message<"joko.v1.MessagingRoute"> & {
  * Use `create(MessagingRouteSchema)` to create a new message.
  */
 export const MessagingRouteSchema: GenMessage<MessagingRoute> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 4);
+  messageDesc(file_joko_v1_messaging, 6);
 
 /**
  * @generated from message joko.v1.GetMessagingSettingsRequest
@@ -281,7 +350,7 @@ export type GetMessagingSettingsRequest = Message<"joko.v1.GetMessagingSettingsR
  * Use `create(GetMessagingSettingsRequestSchema)` to create a new message.
  */
 export const GetMessagingSettingsRequestSchema: GenMessage<GetMessagingSettingsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 5);
+  messageDesc(file_joko_v1_messaging, 7);
 
 /**
  * @generated from message joko.v1.GetMessagingSettingsResponse
@@ -308,7 +377,7 @@ export type GetMessagingSettingsResponse = Message<"joko.v1.GetMessagingSettings
  * Use `create(GetMessagingSettingsResponseSchema)` to create a new message.
  */
 export const GetMessagingSettingsResponseSchema: GenMessage<GetMessagingSettingsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 6);
+  messageDesc(file_joko_v1_messaging, 8);
 
 /**
  * @generated from message joko.v1.CreateMessagingConnectionRequest
@@ -328,6 +397,11 @@ export type CreateMessagingConnectionRequest = Message<"joko.v1.CreateMessagingC
    * @generated from field: optional joko.v1.TelegramMessagingConfiguration telegram_configuration = 3;
    */
   telegramConfiguration?: TelegramMessagingConfiguration | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.DiscordMessagingConfiguration discord_configuration = 4;
+   */
+  discordConfiguration?: DiscordMessagingConfiguration | undefined;
 };
 
 /**
@@ -335,7 +409,7 @@ export type CreateMessagingConnectionRequest = Message<"joko.v1.CreateMessagingC
  * Use `create(CreateMessagingConnectionRequestSchema)` to create a new message.
  */
 export const CreateMessagingConnectionRequestSchema: GenMessage<CreateMessagingConnectionRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 7);
+  messageDesc(file_joko_v1_messaging, 9);
 
 /**
  * @generated from message joko.v1.CreateMessagingConnectionResponse
@@ -352,7 +426,7 @@ export type CreateMessagingConnectionResponse = Message<"joko.v1.CreateMessaging
  * Use `create(CreateMessagingConnectionResponseSchema)` to create a new message.
  */
 export const CreateMessagingConnectionResponseSchema: GenMessage<CreateMessagingConnectionResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 8);
+  messageDesc(file_joko_v1_messaging, 10);
 
 /**
  * @generated from message joko.v1.BeginMessagingCredentialUploadRequest
@@ -379,7 +453,7 @@ export type BeginMessagingCredentialUploadRequest = Message<"joko.v1.BeginMessag
  * Use `create(BeginMessagingCredentialUploadRequestSchema)` to create a new message.
  */
 export const BeginMessagingCredentialUploadRequestSchema: GenMessage<BeginMessagingCredentialUploadRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 9);
+  messageDesc(file_joko_v1_messaging, 11);
 
 /**
  * @generated from message joko.v1.BeginMessagingCredentialUploadResponse
@@ -396,7 +470,7 @@ export type BeginMessagingCredentialUploadResponse = Message<"joko.v1.BeginMessa
  * Use `create(BeginMessagingCredentialUploadResponseSchema)` to create a new message.
  */
 export const BeginMessagingCredentialUploadResponseSchema: GenMessage<BeginMessagingCredentialUploadResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 10);
+  messageDesc(file_joko_v1_messaging, 12);
 
 /**
  * @generated from message joko.v1.CommitMessagingCredentialRequest
@@ -418,7 +492,7 @@ export type CommitMessagingCredentialRequest = Message<"joko.v1.CommitMessagingC
  * Use `create(CommitMessagingCredentialRequestSchema)` to create a new message.
  */
 export const CommitMessagingCredentialRequestSchema: GenMessage<CommitMessagingCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 11);
+  messageDesc(file_joko_v1_messaging, 13);
 
 /**
  * @generated from message joko.v1.CommitMessagingCredentialResponse
@@ -435,7 +509,7 @@ export type CommitMessagingCredentialResponse = Message<"joko.v1.CommitMessaging
  * Use `create(CommitMessagingCredentialResponseSchema)` to create a new message.
  */
 export const CommitMessagingCredentialResponseSchema: GenMessage<CommitMessagingCredentialResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 12);
+  messageDesc(file_joko_v1_messaging, 14);
 
 /**
  * @generated from message joko.v1.ClearMessagingCredentialRequest
@@ -462,7 +536,7 @@ export type ClearMessagingCredentialRequest = Message<"joko.v1.ClearMessagingCre
  * Use `create(ClearMessagingCredentialRequestSchema)` to create a new message.
  */
 export const ClearMessagingCredentialRequestSchema: GenMessage<ClearMessagingCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 13);
+  messageDesc(file_joko_v1_messaging, 15);
 
 /**
  * @generated from message joko.v1.ClearMessagingCredentialResponse
@@ -479,7 +553,7 @@ export type ClearMessagingCredentialResponse = Message<"joko.v1.ClearMessagingCr
  * Use `create(ClearMessagingCredentialResponseSchema)` to create a new message.
  */
 export const ClearMessagingCredentialResponseSchema: GenMessage<ClearMessagingCredentialResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 14);
+  messageDesc(file_joko_v1_messaging, 16);
 
 /**
  * @generated from message joko.v1.SetMessagingConnectionEnabledRequest
@@ -511,7 +585,7 @@ export type SetMessagingConnectionEnabledRequest = Message<"joko.v1.SetMessaging
  * Use `create(SetMessagingConnectionEnabledRequestSchema)` to create a new message.
  */
 export const SetMessagingConnectionEnabledRequestSchema: GenMessage<SetMessagingConnectionEnabledRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 15);
+  messageDesc(file_joko_v1_messaging, 17);
 
 /**
  * @generated from message joko.v1.SetMessagingConnectionEnabledResponse
@@ -528,7 +602,7 @@ export type SetMessagingConnectionEnabledResponse = Message<"joko.v1.SetMessagin
  * Use `create(SetMessagingConnectionEnabledResponseSchema)` to create a new message.
  */
 export const SetMessagingConnectionEnabledResponseSchema: GenMessage<SetMessagingConnectionEnabledResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 16);
+  messageDesc(file_joko_v1_messaging, 18);
 
 /**
  * @generated from message joko.v1.UpdateTelegramMessagingConfigurationRequest
@@ -565,7 +639,7 @@ export type UpdateTelegramMessagingConfigurationRequest = Message<"joko.v1.Updat
  * Use `create(UpdateTelegramMessagingConfigurationRequestSchema)` to create a new message.
  */
 export const UpdateTelegramMessagingConfigurationRequestSchema: GenMessage<UpdateTelegramMessagingConfigurationRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 17);
+  messageDesc(file_joko_v1_messaging, 19);
 
 /**
  * @generated from message joko.v1.UpdateTelegramMessagingConfigurationResponse
@@ -582,7 +656,61 @@ export type UpdateTelegramMessagingConfigurationResponse = Message<"joko.v1.Upda
  * Use `create(UpdateTelegramMessagingConfigurationResponseSchema)` to create a new message.
  */
 export const UpdateTelegramMessagingConfigurationResponseSchema: GenMessage<UpdateTelegramMessagingConfigurationResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 18);
+  messageDesc(file_joko_v1_messaging, 20);
+
+/**
+ * @generated from message joko.v1.UpdateDiscordMessagingConfigurationRequest
+ */
+export type UpdateDiscordMessagingConfigurationRequest = Message<"joko.v1.UpdateDiscordMessagingConfigurationRequest"> & {
+  /**
+   * @generated from field: string connection_id = 1;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision expected_revision = 2;
+   */
+  expectedRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: uint64 expected_generation = 3;
+   */
+  expectedGeneration: bigint;
+
+  /**
+   * @generated from field: string owner_provider_user_id = 4;
+   */
+  ownerProviderUserId: string;
+
+  /**
+   * @generated from field: joko.v1.DiscordMessagingConfiguration configuration = 5;
+   */
+  configuration?: DiscordMessagingConfiguration | undefined;
+};
+
+/**
+ * Describes the message joko.v1.UpdateDiscordMessagingConfigurationRequest.
+ * Use `create(UpdateDiscordMessagingConfigurationRequestSchema)` to create a new message.
+ */
+export const UpdateDiscordMessagingConfigurationRequestSchema: GenMessage<UpdateDiscordMessagingConfigurationRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_messaging, 21);
+
+/**
+ * @generated from message joko.v1.UpdateDiscordMessagingConfigurationResponse
+ */
+export type UpdateDiscordMessagingConfigurationResponse = Message<"joko.v1.UpdateDiscordMessagingConfigurationResponse"> & {
+  /**
+   * @generated from field: joko.v1.MessagingConnection connection = 1;
+   */
+  connection?: MessagingConnection | undefined;
+};
+
+/**
+ * Describes the message joko.v1.UpdateDiscordMessagingConfigurationResponse.
+ * Use `create(UpdateDiscordMessagingConfigurationResponseSchema)` to create a new message.
+ */
+export const UpdateDiscordMessagingConfigurationResponseSchema: GenMessage<UpdateDiscordMessagingConfigurationResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_messaging, 22);
 
 /**
  * @generated from message joko.v1.TestMessagingConnectionRequest
@@ -599,7 +727,7 @@ export type TestMessagingConnectionRequest = Message<"joko.v1.TestMessagingConne
  * Use `create(TestMessagingConnectionRequestSchema)` to create a new message.
  */
 export const TestMessagingConnectionRequestSchema: GenMessage<TestMessagingConnectionRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 19);
+  messageDesc(file_joko_v1_messaging, 23);
 
 /**
  * @generated from message joko.v1.TestMessagingConnectionResponse
@@ -636,7 +764,7 @@ export type TestMessagingConnectionResponse = Message<"joko.v1.TestMessagingConn
  * Use `create(TestMessagingConnectionResponseSchema)` to create a new message.
  */
 export const TestMessagingConnectionResponseSchema: GenMessage<TestMessagingConnectionResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 20);
+  messageDesc(file_joko_v1_messaging, 24);
 
 /**
  * @generated from message joko.v1.PutMessagingRouteRequest
@@ -693,7 +821,7 @@ export type PutMessagingRouteRequest = Message<"joko.v1.PutMessagingRouteRequest
  * Use `create(PutMessagingRouteRequestSchema)` to create a new message.
  */
 export const PutMessagingRouteRequestSchema: GenMessage<PutMessagingRouteRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 21);
+  messageDesc(file_joko_v1_messaging, 25);
 
 /**
  * @generated from message joko.v1.PutMessagingRouteResponse
@@ -710,7 +838,7 @@ export type PutMessagingRouteResponse = Message<"joko.v1.PutMessagingRouteRespon
  * Use `create(PutMessagingRouteResponseSchema)` to create a new message.
  */
 export const PutMessagingRouteResponseSchema: GenMessage<PutMessagingRouteResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_messaging, 22);
+  messageDesc(file_joko_v1_messaging, 26);
 
 /**
  * @generated from enum joko.v1.MessagingChannel
@@ -913,6 +1041,99 @@ export const TelegramGroupActivationSchema: GenEnum<TelegramGroupActivation> = /
   enumDesc(file_joko_v1_messaging, 4);
 
 /**
+ * @generated from enum joko.v1.DiscordEmojiReactions
+ */
+export enum DiscordEmojiReactions {
+  /**
+   * @generated from enum value: DISCORD_EMOJI_REACTIONS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: DISCORD_EMOJI_REACTIONS_OFF = 1;
+   */
+  OFF = 1,
+
+  /**
+   * @generated from enum value: DISCORD_EMOJI_REACTIONS_MINIMAL = 2;
+   */
+  MINIMAL = 2,
+
+  /**
+   * @generated from enum value: DISCORD_EMOJI_REACTIONS_EXPRESSIVE = 3;
+   */
+  EXPRESSIVE = 3,
+}
+
+/**
+ * Describes the enum joko.v1.DiscordEmojiReactions.
+ */
+export const DiscordEmojiReactionsSchema: GenEnum<DiscordEmojiReactions> = /*@__PURE__*/
+  enumDesc(file_joko_v1_messaging, 5);
+
+/**
+ * @generated from enum joko.v1.DiscordReplyQuoteMode
+ */
+export enum DiscordReplyQuoteMode {
+  /**
+   * @generated from enum value: DISCORD_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: DISCORD_REPLY_QUOTE_MODE_OFF = 1;
+   */
+  OFF = 1,
+
+  /**
+   * @generated from enum value: DISCORD_REPLY_QUOTE_MODE_FIRST = 2;
+   */
+  FIRST = 2,
+
+  /**
+   * @generated from enum value: DISCORD_REPLY_QUOTE_MODE_ALL = 3;
+   */
+  ALL = 3,
+}
+
+/**
+ * Describes the enum joko.v1.DiscordReplyQuoteMode.
+ */
+export const DiscordReplyQuoteModeSchema: GenEnum<DiscordReplyQuoteMode> = /*@__PURE__*/
+  enumDesc(file_joko_v1_messaging, 6);
+
+/**
+ * @generated from enum joko.v1.DiscordGroupActivation
+ */
+export enum DiscordGroupActivation {
+  /**
+   * @generated from enum value: DISCORD_GROUP_ACTIVATION_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: DISCORD_GROUP_ACTIVATION_MENTION = 1;
+   */
+  MENTION = 1,
+
+  /**
+   * @generated from enum value: DISCORD_GROUP_ACTIVATION_ALWAYS = 2;
+   */
+  ALWAYS = 2,
+
+  /**
+   * @generated from enum value: DISCORD_GROUP_ACTIVATION_DISABLED = 3;
+   */
+  DISABLED = 3,
+}
+
+/**
+ * Describes the enum joko.v1.DiscordGroupActivation.
+ */
+export const DiscordGroupActivationSchema: GenEnum<DiscordGroupActivation> = /*@__PURE__*/
+  enumDesc(file_joko_v1_messaging, 7);
+
+/**
  * @generated from enum joko.v1.MessagingConnectionTestFailure
  */
 export enum MessagingConnectionTestFailure {
@@ -951,5 +1172,5 @@ export enum MessagingConnectionTestFailure {
  * Describes the enum joko.v1.MessagingConnectionTestFailure.
  */
 export const MessagingConnectionTestFailureSchema: GenEnum<MessagingConnectionTestFailure> = /*@__PURE__*/
-  enumDesc(file_joko_v1_messaging, 5);
+  enumDesc(file_joko_v1_messaging, 8);
 

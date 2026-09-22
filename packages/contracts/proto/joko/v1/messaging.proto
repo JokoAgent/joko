@@ -51,6 +51,27 @@ enum TelegramGroupActivation {
   TELEGRAM_GROUP_ACTIVATION_DISABLED = 3;
 }
 
+enum DiscordEmojiReactions {
+  DISCORD_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  DISCORD_EMOJI_REACTIONS_OFF = 1;
+  DISCORD_EMOJI_REACTIONS_MINIMAL = 2;
+  DISCORD_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum DiscordReplyQuoteMode {
+  DISCORD_REPLY_QUOTE_MODE_UNSPECIFIED = 0;
+  DISCORD_REPLY_QUOTE_MODE_OFF = 1;
+  DISCORD_REPLY_QUOTE_MODE_FIRST = 2;
+  DISCORD_REPLY_QUOTE_MODE_ALL = 3;
+}
+
+enum DiscordGroupActivation {
+  DISCORD_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  DISCORD_GROUP_ACTIVATION_MENTION = 1;
+  DISCORD_GROUP_ACTIVATION_ALWAYS = 2;
+  DISCORD_GROUP_ACTIVATION_DISABLED = 3;
+}
+
 enum MessagingConnectionTestFailure {
   MESSAGING_CONNECTION_TEST_FAILURE_UNSPECIFIED = 0;
   MESSAGING_CONNECTION_TEST_FAILURE_INVALID = 1;
@@ -70,6 +91,20 @@ message TelegramMessagingConfiguration {
 message TelegramGroupActivationRule {
   string chat_id = 1;
   TelegramGroupActivation activation = 2;
+}
+
+message DiscordMessagingConfiguration {
+  bool lifecycle_announcements = 1;
+  DiscordEmojiReactions emoji_reactions = 2;
+  DiscordReplyQuoteMode reply_quote_dm = 3;
+  DiscordReplyQuoteMode reply_quote_group = 4;
+  repeated DiscordGroupActivationRule group_activation_rules = 5;
+}
+
+message DiscordGroupActivationRule {
+  string guild_id = 1;
+  string channel_id = 2;
+  DiscordGroupActivation activation = 3;
 }
 
 message MessagingChannelCapability {
@@ -95,6 +130,7 @@ message MessagingConnection {
   google.protobuf.Timestamp created_at = 14;
   google.protobuf.Timestamp updated_at = 15;
   Revision revision = 16;
+  optional DiscordMessagingConfiguration discord_configuration = 17;
 }
 
 message MessagingRoute {
@@ -125,6 +161,7 @@ message CreateMessagingConnectionRequest {
   MessagingChannel channel = 1;
   string owner_provider_user_id = 2;
   optional TelegramMessagingConfiguration telegram_configuration = 3;
+  optional DiscordMessagingConfiguration discord_configuration = 4;
 }
 
 message CreateMessagingConnectionResponse {
@@ -180,6 +217,18 @@ message UpdateTelegramMessagingConfigurationRequest {
 }
 
 message UpdateTelegramMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateDiscordMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  DiscordMessagingConfiguration configuration = 5;
+}
+
+message UpdateDiscordMessagingConfigurationResponse {
   MessagingConnection connection = 1;
 }
 

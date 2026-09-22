@@ -1,15 +1,23 @@
 import { createHash, randomUUID } from "node:crypto";
 import { fileTypeFromBuffer } from "file-type";
 import {
+  DiscordTransport,
   MessagingTransportError,
   TelegramTransport,
+  splitDiscordText,
   splitTelegramText,
   type MessagingAddress,
+  type MessagingConnectionProbe,
   type MessagingDownloadedAttachment,
   type MessagingGroupObservation,
   type MessagingInboundEvent,
   type MessagingInboundInteraction,
   type MessagingInboundMessage,
+  type MessagingSendReceipt,
+  type DiscordGatewayUpdate,
+  type DiscordNormalizationResult,
+  type DiscordPollResult,
+  type DiscordTransportOptions,
   type TelegramNormalizationResult,
   type TelegramPollResult,
   type TelegramTransportOptions,
@@ -42,6 +50,7 @@ const DEFAULT_RETRY_DELAY_MS = 2_000;
 const TELEGRAM_ALBUM_SETTLE_POLL_SECONDS = 1;
 const TELEGRAM_ALBUM_MAXIMUM_MEMBERS = 10;
 const TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS = 10;
+const DISCORD_LIFECYCLE_DRAIN_TIMEOUT_MS = 1_500;
 
 export interface TelegramMessagingConfiguration {
   readonly format: 1;
@@ -59,6 +68,28 @@ export const DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION: TelegramMessagingConfigur
   replyQuoteGroup: "first",
   groupActivation: Object.freeze({})
 });
+
+export interface DiscordMessagingConfiguration {
+  readonly format: 1;
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  readonly replyQuoteDm: "off" | "first";
+  readonly replyQuoteGroup: "off" | "first" | "all";
+  /** Only explicit guild/root-channel entries authorize guild traffic. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export const DEFAULT_DISCORD_MESSAGING_CONFIGURATION: DiscordMessagingConfiguration = Object.freeze({
+  format: 1,
+  lifecycleAnnouncements: true,
+  emojiReactions: "minimal",
+  replyQuoteDm: "off",
+  replyQuoteGroup: "first",
+  groupActivation: Object.freeze({})
+});
+
+type SupportedMessagingChannel = "telegram" | "discord";
+type SupportedMessagingConfiguration = TelegramMessagingConfiguration | DiscordMessagingConfiguration;
 
 export type MessagingConnectionTestResult =
   | {
@@ -83,33 +114,87 @@ export class MessagingManagerError extends Error {
   }
 }
 
-interface TelegramTransportPort {
+interface MessagingTransportEffectsPort {
+  readonly channel: SupportedMessagingChannel;
   readonly connectionId: string;
   readonly generation: number;
-  probe(signal?: AbortSignal): ReturnType<TelegramTransport["probe"]>;
+  probe(signal?: AbortSignal): Promise<MessagingConnectionProbe>;
+  downloadAttachment(
+    attachment: MessagingInboundMessage["attachments"][number],
+    signal?: AbortSignal
+  ): Promise<MessagingDownloadedAttachment>;
+  sendTextPart(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+    readonly signal?: AbortSignal;
+  }): Promise<MessagingSendReceipt>;
+  sendAttachments(input: {
+    readonly address: MessagingAddress;
+    readonly attachments: readonly {
+      readonly kind: "image" | "file";
+      readonly bytes: Uint8Array;
+      readonly fileName: string;
+      readonly mimeType: string;
+    }[];
+    readonly replyToMessageId?: string;
+    readonly signal?: AbortSignal;
+  }): Promise<MessagingSendReceipt>;
+  sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+    readonly signal?: AbortSignal;
+  }): Promise<MessagingSendReceipt>;
+  clearInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly messageId: string;
+    readonly signal?: AbortSignal;
+  }): Promise<MessagingSendReceipt>;
+  sendTyping(address: MessagingAddress, signal?: AbortSignal): Promise<void>;
+  setReaction(input: {
+    readonly address: MessagingAddress;
+    readonly messageId: string;
+    readonly emoji: string | null;
+    readonly signal?: AbortSignal;
+  }): Promise<void>;
+  answerInteraction(input: {
+    readonly interactionId: string;
+    readonly text?: string;
+    readonly showAlert?: boolean;
+    readonly signal?: AbortSignal;
+  }): Promise<void>;
+  close?(): Promise<void>;
+}
+
+interface TelegramTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "telegram";
   poll(input: {
     readonly cursor: string | null;
     readonly timeoutSeconds?: number;
     readonly signal?: AbortSignal;
   }): Promise<TelegramPollResult>;
   normalize(updates: readonly TelegramUpdate[]): TelegramNormalizationResult;
-  downloadAttachment(
-    attachment: MessagingInboundMessage["attachments"][number],
-    signal?: AbortSignal
-  ): Promise<MessagingDownloadedAttachment>;
-  sendTextPart(input: Parameters<TelegramTransport["sendTextPart"]>[0]): ReturnType<TelegramTransport["sendTextPart"]>;
-  sendAttachments(input: Parameters<TelegramTransport["sendAttachments"]>[0]): ReturnType<TelegramTransport["sendAttachments"]>;
-  sendInteractionCard(input: Parameters<TelegramTransport["sendInteractionCard"]>[0]): ReturnType<TelegramTransport["sendInteractionCard"]>;
-  clearInteractionCard(input: Parameters<TelegramTransport["clearInteractionCard"]>[0]): ReturnType<TelegramTransport["clearInteractionCard"]>;
-  sendTyping(address: MessagingAddress, signal?: AbortSignal): Promise<void>;
-  setReaction(input: Parameters<TelegramTransport["setReaction"]>[0]): Promise<void>;
-  answerInteraction(input: Parameters<TelegramTransport["answerInteraction"]>[0]): Promise<void>;
 }
+
+interface DiscordTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "discord";
+  poll(input: {
+    readonly cursor: string | null;
+    readonly timeoutSeconds?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<DiscordPollResult>;
+  normalize(updates: readonly DiscordGatewayUpdate[]): DiscordNormalizationResult;
+  ownerAddress(): MessagingAddress;
+}
+
+type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort;
+type MessagingNormalizationResult = TelegramNormalizationResult | DiscordNormalizationResult;
 
 interface CredentialTicketBinding {
   readonly clientConnectionId: string;
   readonly messagingConnectionId: string;
-  readonly channel: "telegram";
+  readonly channel: SupportedMessagingChannel;
   readonly expectedRevision: bigint;
   readonly expectedGeneration: number;
   readonly expiresAt: number;
@@ -119,7 +204,7 @@ interface ActiveWorker {
   readonly generation: number;
   readonly controller: AbortController;
   readonly task: Promise<void>;
-  transport?: TelegramTransportPort;
+  transport?: MessagingTransportPort;
 }
 
 interface MessagingOutboundFile {
@@ -158,9 +243,12 @@ export interface MessagingManagerOptions {
   readonly sessionHost: Pick<SessionHost, "createServiceSession" | "enqueueServiceInput" | "resolveInteraction">;
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
-  /** Test-only transport seams. Production always uses Telegram's HTTPS endpoint and host fetch. */
+  readonly createDiscordTransport?: (options: DiscordTransportOptions) => DiscordTransportPort;
+  /** Test-only transport seams. Production always uses the providers' official direct endpoints. */
   readonly telegramFetch?: typeof fetch;
   readonly telegramApiBaseUrl?: string;
+  readonly discordFetch?: typeof fetch;
+  readonly discordApiBaseUrl?: string;
   readonly pollTimeoutSeconds?: number;
   readonly retryDelayMs?: number;
   readonly now?: () => number;
@@ -178,6 +266,7 @@ export class MessagingManager {
   readonly #sessionHost: MessagingManagerOptions["sessionHost"];
   readonly #artifacts: MessagingManagerOptions["artifacts"];
   readonly #createTelegramTransport: NonNullable<MessagingManagerOptions["createTelegramTransport"]>;
+  readonly #createDiscordTransport: NonNullable<MessagingManagerOptions["createDiscordTransport"]>;
   readonly #pollTimeoutSeconds: number;
   readonly #retryDelayMs: number;
   readonly #now: () => number;
@@ -204,6 +293,13 @@ export class MessagingManager {
       ...input,
       ...(telegramFetch === undefined ? {} : { fetch: telegramFetch }),
       ...(telegramApiBaseUrl === undefined ? {} : { apiBaseUrl: telegramApiBaseUrl })
+    }));
+    const discordFetch = options.discordFetch;
+    const discordApiBaseUrl = options.discordApiBaseUrl;
+    this.#createDiscordTransport = options.createDiscordTransport ?? ((input) => new DiscordTransport({
+      ...input,
+      ...(discordFetch === undefined ? {} : { fetch: discordFetch }),
+      ...(discordApiBaseUrl === undefined ? {} : { apiBaseUrl: discordApiBaseUrl })
     }));
   }
 
@@ -259,6 +355,21 @@ export class MessagingManager {
     });
   }
 
+  createDiscordConnection(input: {
+    readonly configuration?: DiscordMessagingConfiguration;
+    readonly ownerProviderUserId: string;
+  }): MessagingConnectionRecord {
+    this.#assertReady();
+    const configuration = decodeDiscordConfiguration(
+      input.configuration ?? DEFAULT_DISCORD_MESSAGING_CONFIGURATION
+    );
+    return this.#store.createMessagingConnection({
+      channel: "discord",
+      configuration,
+      ownerProviderUserId: discordUserId(input.ownerProviderUserId)
+    });
+  }
+
   beginCredentialUpload(input: {
     readonly clientConnectionId: string;
     readonly messagingConnectionId: string;
@@ -271,8 +382,8 @@ export class MessagingManager {
       requiredIdentifier(input.messagingConnectionId, "Messaging connection")
     );
     assertConnectionFence(connection, input.expectedRevision, input.expectedGeneration);
-    if (connection.channel !== "telegram") throw unavailableChannel();
-    decodeTelegramConnection(connection);
+    if (!isSupportedMessagingChannel(connection.channel)) throw unavailableChannel();
+    decodeSupportedConnection(connection);
     const ticket = this.#credentials.createUploadTicket({
       maximumBytes: CREDENTIAL_MAXIMUM_BYTES,
       kind: "api_key",
@@ -282,7 +393,7 @@ export class MessagingManager {
     this.#tickets.set(ticket.credentialUploadTicketId, {
       clientConnectionId,
       messagingConnectionId: connection.id,
-      channel: "telegram",
+      channel: connection.channel,
       expectedRevision: connection.revision,
       expectedGeneration: connection.generation,
       expiresAt: ticket.expiresAt
@@ -313,7 +424,7 @@ export class MessagingManager {
       try {
         const credential = await this.#credentials.commitNewManagedUpload({
           credentialUploadTicketId: ticketId,
-          displayName: "Telegram bot token",
+          displayName: `${channelDisplayName(current.channel)} bot token`,
           kind: "api_key",
           connectionId: binding.clientConnectionId,
           servicePurpose: credentialPurpose(current),
@@ -352,6 +463,7 @@ export class MessagingManager {
     return this.#mutate(async () => {
       const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
       assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      await this.#announceDiscordBeforeDisconnect(current, "credential-cleared");
       const updated = this.#store.clearMessagingCredential({
         connectionId: current.id,
         expectedRevision: current.revision,
@@ -373,7 +485,8 @@ export class MessagingManager {
     return this.#mutate(async () => {
       const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
       assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
-      decodeTelegramConnection(current);
+      decodeSupportedConnection(current);
+      if (current.enabled && !input.enabled) await this.#announceDiscordBeforeDisconnect(current, "disabled");
       const updated = this.#store.setMessagingConnectionEnabled({
         connectionId: current.id,
         expectedRevision: current.revision,
@@ -410,6 +523,30 @@ export class MessagingManager {
     });
   }
 
+  replaceDiscordConfiguration(input: {
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly configuration: DiscordMessagingConfiguration;
+    readonly ownerProviderUserId: string;
+  }): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
+      assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      if (current.channel !== "discord") throw unavailableChannel();
+      const updated = this.#store.replaceMessagingConfiguration({
+        connectionId: current.id,
+        expectedRevision: current.revision,
+        expectedGeneration: current.generation,
+        configuration: decodeDiscordConfiguration(input.configuration),
+        ownerProviderUserId: discordUserId(input.ownerProviderUserId),
+        updatedAt: this.#now()
+      });
+      this.#restartWorker(updated.id);
+      return updated;
+    });
+  }
+
   putRoute(input: PutMessagingRouteInput): MessagingRouteRecord {
     this.#assertReady();
     return this.#store.putMessagingRoute(input);
@@ -418,8 +555,9 @@ export class MessagingManager {
   async testConnection(connectionId: string): Promise<MessagingConnectionTestResult> {
     this.#assertReady();
     const connection = this.#store.getMessagingConnection(requiredIdentifier(connectionId, "connection"));
+    let transport: MessagingTransportPort | undefined;
     try {
-      const transport = this.#transportFor(connection);
+      transport = this.#transportFor(connection);
       const probe = await transport.probe();
       return {
         ok: true,
@@ -429,6 +567,8 @@ export class MessagingManager {
       };
     } catch (error) {
       return { ok: false, code: managerErrorCode(error) };
+    } finally {
+      await transport?.close?.().catch(() => undefined);
     }
   }
 
@@ -441,7 +581,7 @@ export class MessagingManager {
     if (connection === undefined || connection.generation !== conversation.channelGeneration || !connection.enabled) return;
     const interaction = this.#store.getInteraction(input.interactionId);
     if (interaction.sessionId !== input.sessionId || interaction.status !== "open") return;
-    const card = telegramInteractionCard(interaction);
+    const card = messagingInteractionCard(interaction, connection.channel);
     if (card === undefined) return;
     const payload = {
       format: 1,
@@ -500,7 +640,8 @@ export class MessagingManager {
     if (conversation === undefined || conversation.sessionId !== input.sessionId) return;
     const connection = this.#store.findMessagingConnection(request.connectionId);
     if (connection === undefined || connection.generation !== request.channelGeneration) return;
-    const configuration = decodeTelegramConnection(connection);
+    const configuration = decodeSupportedConnection(connection);
+    const channel = requiredSupportedMessagingChannel(connection.channel);
     const now = this.#now();
 
     this.#store.transaction((store) => {
@@ -508,10 +649,11 @@ export class MessagingManager {
       if (current.status !== "queued") return;
       if (input.outcome === "completed") {
         const output = this.#latestAssistantOutput(input.sessionId, input.runId);
-        const text = boundedOutboundText(output.text);
+        const text = boundedOutboundText(output.text, channel);
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
         if (text !== "" && text.trim() !== "NO_REPLY") {
-          for (const part of splitTelegramText(text)) {
+          const parts = channel === "discord" ? splitDiscordText(text) : splitTelegramText(text);
+          for (const part of parts) {
             const partIndex = deliveries.length;
             deliveries.push({
               kind: "text",
@@ -572,11 +714,19 @@ export class MessagingManager {
           });
         });
         if (configuration.emojiReactions !== "off" && current.providerMessageId !== undefined) {
+          if (connection.channel === "discord") {
+            enqueueReaction(store, connection, conversation, {
+              dedupeKey: `run:${input.runId}:ack-clear`,
+              messageId: current.providerMessageId,
+              emoji: null,
+              availableAt: now
+            });
+          }
           enqueueReaction(store, connection, conversation, {
             dedupeKey: `run:${input.runId}:settled`,
             messageId: current.providerMessageId,
             emoji: "✅",
-            availableAt: now
+            availableAt: connection.channel === "discord" ? now + 1 : now
           });
         }
         current = store.updateMessagingInboundRequestStatus({
@@ -595,12 +745,22 @@ export class MessagingManager {
           updatedAt: now
         });
         if (configuration.emojiReactions !== "off" && current.providerMessageId !== undefined) {
-          enqueueReaction(store, connection, conversation, {
-            dedupeKey: `run:${input.runId}:settled`,
-            messageId: current.providerMessageId,
-            emoji: input.outcome === "aborted" ? null : "❌",
-            availableAt: now
-          });
+          if (connection.channel === "discord") {
+            enqueueReaction(store, connection, conversation, {
+              dedupeKey: `run:${input.runId}:ack-clear`,
+              messageId: current.providerMessageId,
+              emoji: null,
+              availableAt: now
+            });
+          }
+          if (connection.channel !== "discord" || input.outcome !== "aborted") {
+            enqueueReaction(store, connection, conversation, {
+              dedupeKey: `run:${input.runId}:settled`,
+              messageId: current.providerMessageId,
+              emoji: input.outcome === "aborted" ? null : "❌",
+              availableAt: connection.channel === "discord" ? now + 1 : now
+            });
+          }
         }
       }
     });
@@ -609,6 +769,12 @@ export class MessagingManager {
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    await Promise.allSettled([...this.#workers.entries()].map(async ([connectionId, worker]) => {
+      const connection = this.#store.findMessagingConnection(connectionId);
+      if (connection === undefined || worker.transport?.channel !== "discord") return;
+      await this.#enqueueDiscordLifecycleNotice(connection, worker.transport, "shutdown");
+      await this.#drainDeliveries(worker.transport, AbortSignal.timeout(DISCORD_LIFECYCLE_DRAIN_TIMEOUT_MS));
+    }));
     this.#closed = true;
     this.#tickets.clear();
     const tasks = [...this.#workers.values()].map((worker) => {
@@ -652,7 +818,7 @@ export class MessagingManager {
     while (!signal.aborted && !this.#closed) {
       const current = this.#store.findMessagingConnection(connectionId);
       if (current === undefined || !current.enabled || current.generation !== generation) return;
-      let transport: TelegramTransportPort;
+      let transport: MessagingTransportPort | undefined;
       try {
         transport = this.#transportFor(current);
         const probe = await transport.probe(signal);
@@ -670,6 +836,10 @@ export class MessagingManager {
         });
         const worker = this.#workers.get(connectionId);
         if (worker?.generation === generation) worker.transport = transport;
+        if (transport.channel === "discord") {
+          const connected = this.#requireWorkerConnection(connectionId, generation);
+          await this.#enqueueDiscordLifecycleNotice(connected, transport, "connected");
+        }
         attempt = 0;
         await this.#pollConnected(transport, signal);
       } catch (error) {
@@ -681,22 +851,36 @@ export class MessagingManager {
       } finally {
         const worker = this.#workers.get(connectionId);
         if (worker?.generation === generation) worker.transport = undefined;
+        await transport?.close?.().catch(() => undefined);
       }
     }
   }
 
-  async #pollConnected(transport: TelegramTransportPort, signal: AbortSignal): Promise<void> {
+  async #pollConnected(transport: MessagingTransportPort, signal: AbortSignal): Promise<void> {
     const initial = this.#requireWorkerConnection(transport.connectionId, transport.generation);
     this.#reconcileInteractionCards(initial);
     while (!signal.aborted && !this.#closed) {
       const connection = this.#requireWorkerConnection(transport.connectionId, transport.generation);
       await this.#drainDeliveries(transport, signal);
-      const result = await this.#pollTelegramBatch(transport, connection.cursor ?? null, signal);
-      const normalized = transport.normalize(result.updates);
-      await this.#processTelegramBatch(connection, transport, normalized, signal);
+      let nextCursor: string;
+      let normalized: MessagingNormalizationResult;
+      if (transport.channel === "telegram") {
+        const result = await this.#pollTelegramBatch(transport, connection.cursor ?? null, signal);
+        nextCursor = result.nextCursor;
+        normalized = transport.normalize(result.updates);
+      } else {
+        const result = await transport.poll({
+          cursor: connection.cursor ?? null,
+          timeoutSeconds: this.#pollTimeoutSeconds,
+          signal
+        });
+        nextCursor = result.nextCursor;
+        normalized = transport.normalize(result.updates);
+      }
+      await this.#processMessagingBatch(connection, transport, normalized, signal);
       const latest = this.#requireWorkerConnection(transport.connectionId, transport.generation);
       if (
-        latest.runtimeStatus !== "connected" || latest.cursor !== result.nextCursor
+        latest.runtimeStatus !== "connected" || latest.cursor !== nextCursor
         || latest.errorCode !== undefined || latest.errorSummary !== undefined
       ) {
         this.#store.updateMessagingConnectionRuntime({
@@ -704,7 +888,7 @@ export class MessagingManager {
           expectedRevision: latest.revision,
           expectedGeneration: latest.generation,
           runtimeStatus: "connected",
-          cursor: result.nextCursor,
+          cursor: nextCursor,
           error: null,
           updatedAt: this.#now()
         });
@@ -747,10 +931,10 @@ export class MessagingManager {
     return { updates, nextCursor: result.nextCursor };
   }
 
-  async #processTelegramBatch(
+  async #processMessagingBatch(
     connection: MessagingConnectionRecord,
-    transport: TelegramTransportPort,
-    batch: TelegramNormalizationResult,
+    transport: MessagingTransportEffectsPort,
+    batch: MessagingNormalizationResult,
     signal: AbortSignal
   ): Promise<void> {
     const interactionReplyMessageIds = new Set<string>();
@@ -804,7 +988,7 @@ export class MessagingManager {
       expectedChannelGeneration: connection.generation,
       conversationId: conversation.id,
       providerRequestId: event.providerRequestIds[0]!,
-      providerInteractionId: telegramReplyInteractionId(event),
+      providerInteractionId: messagingReplyInteractionId(event),
       providerMessageId: event.messageId,
       actionHash: operationBodyHash(payload),
       payload,
@@ -891,7 +1075,7 @@ export class MessagingManager {
 
   async #admitMessage(
     connection: MessagingConnectionRecord,
-    transport: TelegramTransportPort,
+    transport: MessagingTransportEffectsPort,
     event: MessagingInboundMessage,
     signal: AbortSignal
   ): Promise<void> {
@@ -925,7 +1109,7 @@ export class MessagingManager {
       this.#requireWorkerConnection(connection.id, connection.generation);
       const attachment = event.attachments[index]!;
       const downloaded = await transport.downloadAttachment(attachment, signal);
-      const mimeType = await verifiedAttachmentMime(attachment.kind, attachment.mimeType, downloaded);
+      const mimeType = await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded);
       this.#requireWorkerConnection(connection.id, connection.generation);
       const artifact = await this.#artifacts.ingestBytes(downloaded.bytes, {
         fileName: downloaded.fileName,
@@ -977,7 +1161,7 @@ export class MessagingManager {
     });
     if (execution.value.queueItemId === "") throw new Error("Messaging Queue admission failed.");
 
-    const configuration = decodeTelegramConnection(connection);
+    const configuration = decodeSupportedConnection(connection);
     if (configuration.emojiReactions !== "off") {
       this.#store.transaction((store) => enqueueReaction(store, connection, activeConversation, {
         dedupeKey: `request:${request.id}:ack`,
@@ -991,7 +1175,7 @@ export class MessagingManager {
 
   async #settleInteraction(
     connection: MessagingConnectionRecord,
-    transport: TelegramTransportPort,
+    transport: MessagingTransportEffectsPort,
     event: MessagingInboundInteraction,
     signal: AbortSignal
   ): Promise<void> {
@@ -1106,9 +1290,11 @@ export class MessagingManager {
   ): Promise<MessagingConversationRecord> {
     if (conversation.status === "active" && conversation.sessionId !== undefined) return conversation;
     const route = this.#store.resolveMessagingRoute(conversation.connectionId);
+    const connection = this.#store.getMessagingConnection(conversation.connectionId);
+    const channelName = channelDisplayName(connection.channel);
     const title = conversation.conversationKind === "direct"
-      ? `Telegram · ${event.speaker.displayName}`
-      : `Telegram group · ${conversation.providerConversationId}`;
+      ? `${channelName} · ${event.speaker.displayName}`
+      : `${channelName} group · ${conversation.providerConversationId}`;
     const execution = await this.#sessionHost.createServiceSession({
       operationId: `messaging-session-${conversation.id}`,
       serviceKind: "messaging",
@@ -1225,8 +1411,8 @@ export class MessagingManager {
     };
   }
 
-  #transportFor(connection: MessagingConnectionRecord): TelegramTransportPort {
-    const configuration = decodeTelegramConnection(connection);
+  #transportFor(connection: MessagingConnectionRecord): MessagingTransportPort {
+    const configuration = decodeSupportedConnection(connection);
     if (
       connection.credentialReferenceId === undefined ||
       connection.credentialGeneration === undefined ||
@@ -1238,12 +1424,23 @@ export class MessagingManager {
       descriptor.generation !== connection.credentialGeneration
     ) throw credentialUnavailable();
     const token = this.#credentials.resolve(connection.credentialReferenceId);
-    return this.#createTelegramTransport({
+    if (connection.channel === "telegram") {
+      return this.#createTelegramTransport({
+        token,
+        connectionId: connection.id,
+        generation: connection.generation,
+        ownerUserId: telegramUserId(connection.ownerProviderUserId),
+        groupActivation: configuration.groupActivation,
+        now: this.#now
+      });
+    }
+    return this.#createDiscordTransport({
       token,
       connectionId: connection.id,
       generation: connection.generation,
-      ownerUserId: telegramUserId(connection.ownerProviderUserId),
+      ownerUserId: discordUserId(connection.ownerProviderUserId),
       groupActivation: configuration.groupActivation,
+      initialCursor: connection.cursor ?? null,
       now: this.#now
     });
   }
@@ -1251,7 +1448,7 @@ export class MessagingManager {
   #runtimeFailure(connectionId: string, generation: number, error: unknown): boolean {
     const current = this.#store.findMessagingConnection(connectionId);
     if (current === undefined || !current.enabled || current.generation !== generation) return false;
-    const classification = runtimeFailure(error);
+    const classification = runtimeFailure(error, current.channel);
     try {
       this.#store.updateMessagingConnectionRuntime({
         connectionId,
@@ -1292,7 +1489,76 @@ export class MessagingManager {
     this.#deliveryFlights.set(connectionId, flight);
   }
 
-  async #drainDeliveries(transport: TelegramTransportPort, signal: AbortSignal): Promise<void> {
+  async #announceDiscordBeforeDisconnect(
+    connection: MessagingConnectionRecord,
+    phase: "credential-cleared" | "disabled"
+  ): Promise<void> {
+    if (connection.channel !== "discord" || !connection.enabled) return;
+    const worker = this.#workers.get(connection.id);
+    const transport = worker?.transport;
+    if (transport?.channel !== "discord") return;
+    await this.#enqueueDiscordLifecycleNotice(connection, transport, phase);
+    await this.#drainDeliveries(transport, AbortSignal.timeout(DISCORD_LIFECYCLE_DRAIN_TIMEOUT_MS)).catch(() => undefined);
+  }
+
+  async #enqueueDiscordLifecycleNotice(
+    connection: MessagingConnectionRecord,
+    transport: DiscordTransportPort,
+    phase: "connected" | "credential-cleared" | "disabled" | "shutdown"
+  ): Promise<void> {
+    const configuration = decodeDiscordConnection(connection);
+    if (!configuration.lifecycleAnnouncements) return;
+    const address = transport.ownerAddress();
+    let conversation = this.#ensureConversation(connection, address, this.#now());
+    if (conversation.status !== "active") {
+      const route = this.#store.findMessagingRoute(`connection:${connection.id}`)
+        ?? this.#store.findMessagingRoute("global");
+      if (route === undefined) return;
+      conversation = await this.#activateConversation(conversation, {
+        kind: "message",
+        providerRequestIds: [`discord:lifecycle:${phase}:generation:${connection.generation}`],
+        messageId: `lifecycle-${phase}-${connection.generation}`,
+        address,
+        speaker: {
+          providerUserId: connection.ownerProviderUserId ?? "discord-owner",
+          displayName: "Discord owner",
+          username: null,
+          isBot: false,
+          isOwner: true
+        },
+        occurredAt: this.#now(),
+        text: "",
+        ambient: false,
+        protectedContent: false,
+        attachments: [],
+        unsupported: [],
+        replyContext: null
+      });
+    }
+    const text = phase === "connected"
+      ? "Joko is connected and ready on Discord."
+      : phase === "credential-cleared"
+        ? "Joko is disconnecting because its Discord credential was cleared."
+        : phase === "disabled"
+          ? "Joko's Discord connection is being disabled."
+          : "Joko is disconnecting from Discord.";
+    const payload = { format: 1, address, text };
+    this.#store.enqueueMessagingDelivery({
+      connectionId: connection.id,
+      expectedChannelGeneration: connection.generation,
+      conversationId: conversation.id,
+      dedupeKey: `lifecycle:${phase}:generation:${connection.generation}`,
+      kind: "notice",
+      partIndex: 0,
+      partCount: 1,
+      payloadHash: operationBodyHash(payload),
+      payload,
+      availableAt: this.#now(),
+      createdAt: this.#now()
+    });
+  }
+
+  async #drainDeliveries(transport: MessagingTransportEffectsPort, signal: AbortSignal): Promise<void> {
     for (;;) {
       signal.throwIfAborted();
       const connection = this.#requireWorkerConnection(transport.connectionId, transport.generation);
@@ -1315,7 +1581,7 @@ export class MessagingManager {
           });
           continue;
         }
-        const providerMessageId = await dispatchTelegramDelivery(transport, delivery, this.#artifacts, signal);
+        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, signal);
         const settled = this.#store.settleMessagingDelivery({
           deliveryId: delivery.id,
           expectedRevision: delivery.revision,
@@ -1544,8 +1810,8 @@ export class MessagingManager {
   }
 }
 
-async function dispatchTelegramDelivery(
-  transport: TelegramTransportPort,
+async function dispatchMessagingDelivery(
+  transport: MessagingTransportEffectsPort,
   delivery: MessagingDeliveryRecord,
   artifacts: Pick<ArtifactStore, "readBlob">,
   signal: AbortSignal
@@ -1622,7 +1888,7 @@ async function dispatchTelegramDelivery(
     });
     return payload.messageId;
   }
-  throw new MessagingTransportError("invalid_input", "Telegram delivery kind is unsupported.", {
+  throw new MessagingTransportError("invalid_input", "Messaging delivery kind is unsupported.", {
     retryable: false,
     effect: "none"
   });
@@ -1759,7 +2025,10 @@ function interactionDeliveryPayload(value: unknown): MessagingInteractionDeliver
   };
 }
 
-function telegramInteractionCard(interaction: InteractionRecord): MessagingInteractionCard | undefined {
+function messagingInteractionCard(
+  interaction: InteractionRecord,
+  channel: string
+): MessagingInteractionCard | undefined {
   const buttons: Array<{ readonly label: string; readonly submission: InteractionDecisionSubmission }> = [];
   let text: string;
   const payload = interaction.payload;
@@ -1773,7 +2042,7 @@ function telegramInteractionCard(interaction: InteractionRecord): MessagingInter
     const details = payload.fields.map((field) =>
       `${field.label}${field.required ? " *" : ""}${field.description === undefined ? "" : `\n${field.description}`}`
     ).join("\n\n");
-    text = `${payload.title}\n\n${payload.prompt}\n\n${details}\n\n${telegramQuestionReplyInstructions(payload.fields)}`;
+    text = `${payload.title}\n\n${payload.prompt}\n\n${details}\n\n${messagingQuestionReplyInstructions(payload.fields)}`;
     if (payload.fields.length === 1) {
       const field = payload.fields[0]!;
       if (field.kind === "single" && !field.allowOther) {
@@ -1828,13 +2097,14 @@ function telegramInteractionCard(interaction: InteractionRecord): MessagingInter
     return undefined;
   }
   if (buttons.length > 100 || (buttons.length < 1 && payload.kind !== "question")) return undefined;
+  const visibleButtons = channel === "discord" ? buttons.slice(0, 25) : buttons;
   return {
     interactionId: interaction.id,
     interactionGeneration: interaction.generation,
     text: boundedInteractionText(text),
-    buttons: buttons.map((button, index) => ({
+    buttons: visibleButtons.map((button, index) => ({
       actionId: `act_${createHash("sha256")
-        .update(`telegram-interaction\0${interaction.id}\0${interaction.generation}\0${index}`)
+        .update(`${channel}-interaction\0${interaction.id}\0${interaction.generation}\0${index}`)
         .digest("hex")
         .slice(0, 32)}`,
       label: boundedInteractionLabel(button.label),
@@ -1843,7 +2113,7 @@ function telegramInteractionCard(interaction: InteractionRecord): MessagingInter
   };
 }
 
-function telegramQuestionReplyInstructions(fields: readonly InteractionQuestionField[]): string {
+function messagingQuestionReplyInstructions(fields: readonly InteractionQuestionField[]): string {
   const fieldLines = fields.map((field) => {
     const choices = field.kind === "single" || field.kind === "multiple"
       ? ` Choices: ${field.choices.map((choice) => `${replyToken(choice.id)}=${replyToken(choice.label)}`).join(", ")}.`
@@ -1973,9 +2243,9 @@ function replyToken(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 96);
 }
 
-function telegramReplyInteractionId(event: MessagingInboundMessage): string {
+function messagingReplyInteractionId(event: MessagingInboundMessage): string {
   const thread = event.address.providerThreadId === null ? "root" : event.address.providerThreadId;
-  return `reply:${event.address.providerConversationId}:${thread}:${event.messageId}`;
+  return `reply:${event.address.channel}:${event.address.providerConversationId}:${thread}:${event.messageId}`;
 }
 
 function validInteractionSubmission(value: unknown): value is InteractionDecisionSubmission {
@@ -2049,12 +2319,18 @@ function addressFor(
 }
 
 function shouldQuote(
-  configuration: TelegramMessagingConfiguration,
+  configuration: SupportedMessagingConfiguration,
   conversation: MessagingConversationRecord,
   partIndex: number
 ): boolean {
   if (conversation.conversationKind === "direct") return configuration.replyQuoteDm === "first" && partIndex === 0;
   return configuration.replyQuoteGroup === "all" || (configuration.replyQuoteGroup === "first" && partIndex === 0);
+}
+
+function decodeSupportedConnection(connection: MessagingConnectionRecord): SupportedMessagingConfiguration {
+  if (connection.channel === "telegram") return decodeTelegramConnection(connection);
+  if (connection.channel === "discord") return decodeDiscordConnection(connection);
+  throw unavailableChannel();
 }
 
 function decodeTelegramConnection(connection: MessagingConnectionRecord): TelegramMessagingConfiguration {
@@ -2103,13 +2379,77 @@ export function decodeTelegramMessagingConfiguration(value: unknown): TelegramMe
   return decodeTelegramConfiguration(value);
 }
 
+function decodeDiscordConnection(connection: MessagingConnectionRecord): DiscordMessagingConfiguration {
+  if (connection.channel !== "discord") throw unavailableChannel();
+  if (connection.ownerProviderUserId === undefined) throw invalid("Discord owner identity is required.");
+  discordUserId(connection.ownerProviderUserId);
+  return decodeDiscordConfiguration(connection.configuration);
+}
+
+function decodeDiscordConfiguration(value: unknown): DiscordMessagingConfiguration {
+  if (!isRecord(value) || value["format"] !== 1) throw invalid("Discord configuration is invalid.");
+  const keys = Object.keys(value).sort();
+  const expected = [
+    "emojiReactions",
+    "format",
+    "groupActivation",
+    "lifecycleAnnouncements",
+    "replyQuoteDm",
+    "replyQuoteGroup"
+  ].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw invalid("Discord configuration contains unsupported fields.");
+  }
+  const lifecycleAnnouncements = value["lifecycleAnnouncements"];
+  const emojiReactions = value["emojiReactions"];
+  const replyQuoteDm = value["replyQuoteDm"];
+  const replyQuoteGroup = value["replyQuoteGroup"];
+  if (typeof lifecycleAnnouncements !== "boolean") throw invalid("Discord lifecycle announcement mode is invalid.");
+  if (!isOneOf(emojiReactions, ["off", "minimal", "expressive"] as const)) {
+    throw invalid("Discord reaction mode is invalid.");
+  }
+  if (!isOneOf(replyQuoteDm, ["off", "first"] as const)) throw invalid("Discord DM quote mode is invalid.");
+  if (!isOneOf(replyQuoteGroup, ["off", "first", "all"] as const)) {
+    throw invalid("Discord group quote mode is invalid.");
+  }
+  const rawActivation = value["groupActivation"];
+  if (!isRecord(rawActivation) || Object.keys(rawActivation).length > 1_000) {
+    throw invalid("Discord group activation map is invalid.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const [key, activation] of Object.entries(rawActivation)) {
+    if (!/^[1-9][0-9]{16,19}\/[1-9][0-9]{16,19}$/u.test(key)) {
+      throw invalid("Discord group identity is invalid.");
+    }
+    if (!isOneOf(activation, ["mention", "always", "disabled"] as const)) {
+      throw invalid("Discord group activation mode is invalid.");
+    }
+    groupActivation[key] = activation;
+  }
+  return {
+    format: 1,
+    lifecycleAnnouncements,
+    emojiReactions,
+    replyQuoteDm,
+    replyQuoteGroup,
+    groupActivation
+  };
+}
+
+/** Strict current-v1 decoder shared by the authenticated contract projection. */
+export function decodeDiscordMessagingConfiguration(value: unknown): DiscordMessagingConfiguration {
+  return decodeDiscordConfiguration(value);
+}
+
 async function verifiedAttachmentMime(
+  channel: SupportedMessagingChannel,
   kind: "image" | "file",
   declared: string | null,
   downloaded: MessagingDownloadedAttachment
 ): Promise<string> {
-  if (downloaded.bytes.byteLength === 0 || downloaded.bytes.byteLength > 20 * 1024 * 1024) {
-    throw new MessagingTransportError("payload_too_large", "Telegram attachment size is invalid.", {
+  const maximumBytes = channel === "discord" ? 50 * 1024 * 1024 : 20 * 1024 * 1024;
+  if (downloaded.bytes.byteLength === 0 || downloaded.bytes.byteLength > maximumBytes) {
+    throw new MessagingTransportError("payload_too_large", "Messaging attachment size is invalid.", {
       retryable: false,
       effect: "none"
     });
@@ -2118,7 +2458,7 @@ async function verifiedAttachmentMime(
   const downloadedMime = normalizedMime(downloaded.mimeType);
   const declaredMime = declared === null ? undefined : normalizedMime(declared);
   if (kind === "image" && detected?.mime.startsWith("image/") !== true) {
-    throw new MessagingTransportError("malformed_response", "Telegram image bytes do not contain a supported image.", {
+    throw new MessagingTransportError("malformed_response", "Messaging image bytes do not contain a supported image.", {
       retryable: false,
       effect: "none"
     });
@@ -2127,7 +2467,7 @@ async function verifiedAttachmentMime(
     detected !== undefined && declaredMime !== undefined && declaredMime !== "application/octet-stream" &&
     detected.mime !== declaredMime
   ) {
-    throw new MessagingTransportError("malformed_response", "Telegram attachment type does not match its bytes.", {
+    throw new MessagingTransportError("malformed_response", "Messaging attachment type does not match its bytes.", {
       retryable: false,
       effect: "none"
     });
@@ -2142,15 +2482,16 @@ function normalizedMime(value: string): string {
     : "application/octet-stream";
 }
 
-function runtimeFailure(error: unknown): {
+function runtimeFailure(error: unknown, channel: string): {
   readonly status: "conflict" | "auth_loss" | "error";
   readonly code: string;
   readonly summary: string;
   readonly retryable: boolean;
 } {
+  const name = channelDisplayName(channel);
   if (error instanceof MessagingTransportError) {
     if (error.code === "invalid_credential") {
-      return { status: "auth_loss", code: "invalid_credential", summary: "Telegram rejected the managed credential.", retryable: false };
+      return { status: "auth_loss", code: "invalid_credential", summary: `${name} rejected the managed credential.`, retryable: false };
     }
     if (error.code === "conflict") {
       return { status: "conflict", code: "polling_conflict", summary: "Another client is polling this Telegram bot.", retryable: true };
@@ -2158,14 +2499,14 @@ function runtimeFailure(error: unknown): {
     return {
       status: "error",
       code: error.code,
-      summary: "Telegram is temporarily unavailable for this connection.",
+      summary: `${name} is temporarily unavailable for this connection.`,
       retryable: error.options.retryable
     };
   }
   if (error instanceof MessagingManagerError && error.code === "credential_unavailable") {
-    return { status: "auth_loss", code: "credential_unavailable", summary: "The managed Telegram credential is unavailable.", retryable: false };
+    return { status: "auth_loss", code: "credential_unavailable", summary: `The managed ${name} credential is unavailable.`, retryable: false };
   }
-  return { status: "error", code: "processing_failed", summary: "Telegram message processing could not continue.", retryable: true };
+  return { status: "error", code: "processing_failed", summary: `${name} message processing could not continue.`, retryable: true };
 }
 
 function retryDelay(error: unknown, attempt: number, baseline: number): number {
@@ -2206,9 +2547,9 @@ function isCancelled(error: unknown): boolean {
   return error instanceof MessagingTransportError && error.code === "cancelled";
 }
 
-function boundedOutboundText(value: string): string {
+function boundedOutboundText(value: string, channel: SupportedMessagingChannel): string {
   if (value.length <= MAXIMUM_OUTBOUND_CHARACTERS) return value;
-  return `${value.slice(0, MAXIMUM_OUTBOUND_CHARACTERS - 40).trimEnd()}\n\n[Response truncated in Telegram]`;
+  return `${value.slice(0, MAXIMUM_OUTBOUND_CHARACTERS - 40).trimEnd()}\n\n[Response truncated in ${channelDisplayName(channel)}]`;
 }
 
 function safeExternalText(value: string, maximum: number): string {
@@ -2259,6 +2600,27 @@ function telegramUserId(value: string): string {
   return normalized;
 }
 
+function discordUserId(value: string): string {
+  const normalized = value.trim();
+  if (!/^[1-9][0-9]{16,19}$/u.test(normalized)) throw invalid("Discord owner identity is invalid.");
+  return normalized;
+}
+
+function isSupportedMessagingChannel(value: string): value is SupportedMessagingChannel {
+  return value === "telegram" || value === "discord";
+}
+
+function requiredSupportedMessagingChannel(value: string): SupportedMessagingChannel {
+  if (!isSupportedMessagingChannel(value)) throw unavailableChannel();
+  return value;
+}
+
+function channelDisplayName(value: string): string {
+  if (value === "telegram") return "Telegram";
+  if (value === "discord") return "Discord";
+  return "Messaging provider";
+}
+
 function credentialPurpose(connection: MessagingConnectionRecord): string {
   return `messaging:${connection.channel}:${connection.id}:generation:${connection.generation}`;
 }
@@ -2301,7 +2663,7 @@ function isOneOf<const T extends readonly string[]>(value: unknown, options: T):
 
 function validAddress(value: unknown): value is MessagingAddress {
   if (!isRecord(value)) return false;
-  return value["channel"] === "telegram" && typeof value["connectionId"] === "string" &&
+  return isOneOf(value["channel"], ["telegram", "discord"] as const) && typeof value["connectionId"] === "string" &&
     typeof value["providerConversationId"] === "string" &&
     (value["providerThreadId"] === null || typeof value["providerThreadId"] === "string") &&
     isOneOf(value["conversationKind"], ["direct", "group", "channel"] as const);
@@ -2312,7 +2674,7 @@ function invalid(message: string): MessagingManagerError {
 }
 
 function credentialUnavailable(): MessagingManagerError {
-  return new MessagingManagerError("credential_unavailable", "Telegram managed credential is unavailable.");
+  return new MessagingManagerError("credential_unavailable", "Messaging managed credential is unavailable.");
 }
 
 function unavailableChannel(): MessagingManagerError {

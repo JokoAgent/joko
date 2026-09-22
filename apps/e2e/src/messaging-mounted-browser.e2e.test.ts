@@ -1,5 +1,9 @@
 import { chromium, type Browser, type Page } from "playwright-core";
 import {
+  DiscordEmojiReactions,
+  DiscordGroupActivation,
+  DiscordReplyQuoteMode,
+  MessagingChannel,
   TelegramEmojiReactions,
   TelegramGroupActivation,
   TelegramReplyQuoteMode
@@ -7,6 +11,13 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
+import {
+  DISCORD_SYSTEM_GUILD_ID,
+  DISCORD_SYSTEM_OWNER_ID,
+  DISCORD_SYSTEM_ROOT_CHANNEL_ID,
+  DISCORD_SYSTEM_TOKEN,
+  DiscordSystemFixture
+} from "./discord-system-fixture.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
 import {
   TELEGRAM_SYSTEM_OWNER_ID,
@@ -18,9 +29,10 @@ const MOUNTED_CHAIN_ENABLED = nonBlankEnvironment("JOKO_BROWSER_EXECUTABLE") !==
   && nonBlankEnvironment("JOKO_MOUNTED_WEB_DIR") !== undefined;
 const mountedIt = MOUNTED_CHAIN_ENABLED ? it : it.skip;
 
-describe("mounted Telegram Messaging Settings product chain", () => {
+describe("mounted Messaging Settings product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let telegram: TelegramSystemFixture | undefined;
+  let discord: DiscordSystemFixture | undefined;
   let browser: Browser | undefined;
 
   afterEach(async () => {
@@ -30,15 +42,20 @@ describe("mounted Telegram Messaging Settings product chain", () => {
     fixture = undefined;
     await telegram?.close();
     telegram = undefined;
+    await discord?.close();
+    discord = undefined;
   });
 
-  mountedIt("configures the complete Telegram matrix through wide and narrow production Web", { timeout: 120_000 }, async () => {
+  mountedIt("configures the complete Telegram and Discord matrix through wide and narrow production Web", { timeout: 120_000 }, async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
     telegram = await TelegramSystemFixture.start();
+    discord = await DiscordSystemFixture.start();
     fixture = await RealPiSystemFixture.start({
       webDirectory,
       telegramApiBaseUrl: telegram.baseUrl,
+      discordApiBaseUrl: discord.apiBaseUrl,
+      messagingPollTimeoutSeconds: 1,
       messagingRetryDelayMs: 250
     });
     const inspector = await fixture.pair("Mounted Messaging inspector");
@@ -65,7 +82,7 @@ describe("mounted Telegram Messaging Settings product chain", () => {
     });
     browserErrors.splice(0);
     expect(await settings.locator(".messaging-channel").count()).toBe(8);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(1);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(2);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Discord", { exact: true }).waitFor({ state: "visible" });
     await settings.getByText("Slack", { exact: true }).waitFor({ state: "visible" });
@@ -133,17 +150,93 @@ describe("mounted Telegram Messaging Settings product chain", () => {
     await page.keyboard.press("Escape");
     await configurationDialog.waitFor({ state: "hidden" });
 
+    await settings.getByRole("button", { name: "Add Discord", exact: true }).first().click();
+    const discordCreateDialog = page.getByRole("dialog", { name: "Add Discord" });
+    await discordCreateDialog.getByLabel("Discord owner user ID").fill(DISCORD_SYSTEM_OWNER_ID);
+    await discordCreateDialog.getByRole("button", { name: "Continue", exact: true }).click();
+    const discordCredentialDialog = page.getByRole("dialog", { name: "Add token" });
+    await discordCredentialDialog.getByLabel("Bot token").fill(DISCORD_SYSTEM_TOKEN);
+    await discordCredentialDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await discordCredentialDialog.waitFor({ state: "hidden" });
+    expect(await page.locator("body").innerText()).not.toContain(DISCORD_SYSTEM_TOKEN);
+
+    const discordCard = settings.locator(".messaging-connection-card").filter({ hasText: "Discord" });
+    await discordCard.getByText("Connected", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    await discordCard.getByText("@joko-system-bot", { exact: true }).waitFor({ state: "visible" });
+    await discordCard.getByRole("button", { name: "Test", exact: true }).click();
+    await discordCard.getByText("Connected as @joko-system-bot.", { exact: true }).waitFor({
+      state: "visible",
+      timeout: 15_000
+    });
+
+    await discordCard.getByRole("button", { name: "Configure", exact: true }).click();
+    let discordConfigurationDialog = page.getByRole("dialog", { name: "Discord behavior" });
+    await discordConfigurationDialog.getByLabel("Lifecycle announcements").uncheck();
+    await choose(page, discordConfigurationDialog, "Acknowledgement reactions", "Expressive");
+    await choose(page, discordConfigurationDialog, "Direct-message replies", "Quote first part");
+    await choose(page, discordConfigurationDialog, "Group replies", "Quote every part");
+    await discordConfigurationDialog.getByLabel("Server channel activation rules").fill(
+      `${DISCORD_SYSTEM_GUILD_ID}/${DISCORD_SYSTEM_ROOT_CHANNEL_ID}=always\n${DISCORD_SYSTEM_GUILD_ID}/676767676767676767=disabled`
+    );
+    await discordConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await discordConfigurationDialog.waitFor({ state: "hidden" });
+
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.discordConfiguration?.lifecycleAnnouncements === false
+        && connection.discordConfiguration.emojiReactions === DiscordEmojiReactions.EXPRESSIVE
+        && connection.discordConfiguration.replyQuoteDm === DiscordReplyQuoteMode.FIRST
+        && connection.discordConfiguration.replyQuoteGroup === DiscordReplyQuoteMode.ALL
+        && connection.discordConfiguration.groupActivationRules.some((rule) =>
+          rule.guildId === DISCORD_SYSTEM_GUILD_ID
+          && rule.channelId === DISCORD_SYSTEM_ROOT_CHANNEL_ID
+          && rule.activation === DiscordGroupActivation.ALWAYS)
+        && connection.discordConfiguration.groupActivationRules.some((rule) =>
+          rule.guildId === DISCORD_SYSTEM_GUILD_ID
+          && rule.channelId === "676767676767676767"
+          && rule.activation === DiscordGroupActivation.DISABLED)),
+      "the mounted Discord behavior matrix",
+      15_000
+    );
+
+    await discordCard.getByRole("button", { name: "Configure", exact: true }).click();
+    discordConfigurationDialog = page.getByRole("dialog", { name: "Discord behavior" });
+    expect(await discordConfigurationDialog.getByLabel("Lifecycle announcements").isChecked()).toBe(false);
+    expect((await discordConfigurationDialog.getByLabel("Acknowledgement reactions").textContent())?.trim()).toBe("Expressive");
+    expect((await discordConfigurationDialog.getByLabel("Direct-message replies").textContent())?.trim()).toBe("Quote first part");
+    expect((await discordConfigurationDialog.getByLabel("Group replies").textContent())?.trim()).toBe("Quote every part");
+    expect(await discordConfigurationDialog.getByLabel("Server channel activation rules").inputValue())
+      .toBe(`${DISCORD_SYSTEM_GUILD_ID}/${DISCORD_SYSTEM_ROOT_CHANNEL_ID}=always\n${DISCORD_SYSTEM_GUILD_ID}/676767676767676767=disabled`);
+    await page.keyboard.press("Escape");
+    await discordConfigurationDialog.waitFor({ state: "hidden" });
+
     await card.getByRole("button", { name: "Clear token", exact: true }).click();
-    const clearDialog = page.getByRole("alertdialog", { name: "Clear Telegram token?" });
+    const clearDialog = page.getByRole("alertdialog", { name: "Clear bot token?" });
     await clearDialog.getByText("The connection goes offline immediately", { exact: false }).waitFor({ state: "visible" });
     await clearDialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await clearDialog.waitFor({ state: "hidden" });
 
+    await discordCard.getByRole("button", { name: "Clear token", exact: true }).click();
+    const discordClearDialog = page.getByRole("alertdialog", { name: "Clear bot token?" });
+    await discordClearDialog.getByRole("button", { name: "Clear token", exact: true }).click();
+    await discordClearDialog.waitFor({ state: "hidden" });
+    await discordCard.getByText("Needs token", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.channel === MessagingChannel.DISCORD && !connection.credentialConfigured && !connection.enabled),
+      "the mounted Discord credential clear",
+      15_000
+    );
+
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     await page.setViewportSize({ width: 390, height: 844 });
     await card.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
+    await discordCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(await card.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    expect(await discordCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
 
     const durableProjection = JSON.stringify({
@@ -152,6 +245,7 @@ describe("mounted Telegram Messaging Settings product chain", () => {
       diagnostics: fixture.application.store.listDiagnostics({ limit: 200 })
     }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
     expect(durableProjection).not.toContain(TELEGRAM_SYSTEM_TOKEN);
+    expect(durableProjection).not.toContain(DISCORD_SYSTEM_TOKEN);
   });
 });
 
