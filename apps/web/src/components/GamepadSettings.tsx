@@ -1,9 +1,11 @@
 import { useEffect, useState, type JSX } from "react";
 import { Gamepad2 } from "lucide-react";
+import type { AppController } from "../controller.js";
+import type { SkillDescriptorView } from "../model.js";
 import {
   GAMEPAD_ACTIONS, GAMEPAD_DIRECTIONS, createDefaultGamepadPreferences,
   readGamepadPreferences, saveGamepadPreferences, subscribeGamepadPreferences,
-  type GamepadAction, type GamepadPreferences, type GamepadStickPreference
+  type GamepadAction, type GamepadBinding, type GamepadPreferences, type GamepadStickPreference
 } from "../gamepad-input.js";
 import { gamepadClient, useGamepadSnapshot } from "../gamepad-client.js";
 import type { Translator } from "./types.js";
@@ -12,14 +14,33 @@ import "./gamepad-settings.css";
 
 const BUTTON_NAMES = ["south", "east", "west", "north", "leftShoulder", "rightShoulder", "leftTrigger", "rightTrigger", "select", "start", "leftClick", "rightClick", "up", "down", "left", "right", "home"] as const;
 
-export function GamepadSettings({ t }: { readonly t: Translator }): JSX.Element {
+export function GamepadSettings({ t, listSkills, serverId, connected }: {
+  readonly t: Translator;
+  readonly listSkills: AppController["listSkills"];
+  readonly serverId?: string;
+  readonly connected: boolean;
+}): JSX.Element {
   const [stored, setStored] = useState(readGamepadPreferences);
   const [notice, setNotice] = useState<"saved" | "reset" | undefined>();
   const [failed, setFailed] = useState(false);
+  const [skillCatalog, setSkillCatalog] = useState<{ readonly serverId?: string; readonly state: "loading" | "ready" | "error"; readonly skills: readonly SkillDescriptorView[] }>({ state: "loading", skills: [] });
+  const [skillReload, setSkillReload] = useState(0);
   const snapshot = useGamepadSnapshot();
   useEffect(() => subscribeGamepadPreferences((next) => { setStored(next); setNotice(undefined); }), []);
   useEffect(() => { gamepadClient().reset(); return () => gamepadClient().reset(); }, []);
+  useEffect(() => {
+    const request = new AbortController();
+    setSkillCatalog({ serverId, state: "loading", skills: [] });
+    if (!connected || serverId === undefined) return () => request.abort();
+    void listSkills({ signal: request.signal }).then((catalog) => {
+      if (!request.signal.aborted) setSkillCatalog({ serverId, state: "ready", skills: catalog.skills.filter((skill) => skill.enabled && ["installed", "loaded", "updateAvailable"].includes(skill.state)) });
+    }).catch(() => {
+      if (!request.signal.aborted) setSkillCatalog({ serverId, state: "error", skills: [] });
+    });
+    return () => request.abort();
+  }, [connected, listSkills, serverId, skillReload]);
   const settings = stored.preferences;
+  const skills = skillCatalog.serverId === serverId && skillCatalog.state === "ready" && connected ? skillCatalog.skills : [];
   const save = (next: GamepadPreferences, reset = false): void => {
     setNotice(undefined); setFailed(false);
     try {
@@ -27,10 +48,26 @@ export function GamepadSettings({ t }: { readonly t: Translator }): JSX.Element 
       setStored({ preferences: next }); setNotice(reset ? "reset" : "saved");
     } catch { setFailed(true); }
   };
-  const bind = (index: number, value: GamepadAction): void => {
-    const buttons = [...settings.buttons]; buttons[index] = value;
+  const resolveBinding = (value: string): GamepadBinding | undefined => {
+    if ((GAMEPAD_ACTIONS as readonly string[]).includes(value)) return value as GamepadAction;
+    if (!connected || serverId === undefined || !value.startsWith(`skill:${serverId}:`)) return undefined;
+    const skill = skills.find((item) => item.id === value.slice(serverId.length + 7));
+    return skill === undefined ? undefined : { kind: "skill", serverId, resourceId: skill.id, name: skill.name };
+  };
+  const bind = (index: number, value: string): void => {
+    const binding = resolveBinding(value);
+    if (binding === undefined) return;
+    const buttons = [...settings.buttons]; buttons[index] = binding;
     save({ ...settings, buttons });
   };
+  const bindingValue = (binding: GamepadBinding): string => typeof binding === "string" ? binding : `skill:${binding.serverId}:${binding.resourceId}`;
+  const bindingChoices = (binding: GamepadBinding, voice: boolean): JSX.Element[] => [
+    ...choices(voice).map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>),
+    ...(typeof binding !== "string" && !skills.some((skill) => skill.id === binding.resourceId && serverId === binding.serverId)
+      ? [<option key="unavailable-skill" value={bindingValue(binding)} disabled>{t("settings.gamepad.skillUnavailable", { name: binding.name })}</option>]
+      : []),
+    ...skills.map((skill) => <option key={skill.id} value={`skill:${serverId}:${skill.id}`}>{t("settings.gamepad.skillChoice", { name: skill.name, backend: skill.backendId })}</option>)
+  ];
   const stick = (key: "leftStick" | "rightStick", value: GamepadStickPreference): void => save({ ...settings, [key]: value });
   const choices = (voice: boolean): readonly { value: GamepadAction; label: string }[] => GAMEPAD_ACTIONS
     .filter((action) => voice || action !== "voice")
@@ -46,6 +83,7 @@ export function GamepadSettings({ t }: { readonly t: Translator }): JSX.Element 
     <p className="muted">{t("settings.gamepad.preview")}</p>
     {stored.error !== undefined && <ErrorBanner message={t(`settings.gamepad.storage.${stored.error}`)} />}
     {failed && <ErrorBanner message={t("settings.gamepad.saveFailed")} />}
+    {skillCatalog.state === "error" && connected && <ErrorBanner message={t("settings.gamepad.skillsFailed")} />}
     <div className="gamepad-settings__feedback" role="status" aria-live="polite">{notice === undefined ? "" : t(`settings.gamepad.${notice}`)}</div>
     <div className="gamepad-settings__devices">
       {snapshot.devices.length === 0 ? <p className="muted">{t("settings.gamepad.noDevice")}</p> : snapshot.devices.map((device) => <p key={device.index}>
@@ -53,7 +91,7 @@ export function GamepadSettings({ t }: { readonly t: Translator }): JSX.Element 
       </p>)}
     </div>
     <div className="gamepad-settings__actions">
-      <Button tone="ghost" onClick={() => { gamepadClient().reset(); gamepadClient().sample(performance.now()); setStored(readGamepadPreferences()); }}>{t("settings.gamepad.refresh")}</Button>
+      <Button tone="ghost" onClick={() => { gamepadClient().reset(); gamepadClient().sample(performance.now()); setStored(readGamepadPreferences()); setSkillReload((current) => current + 1); }}>{t("settings.gamepad.refresh")}</Button>
       <Button tone="ghost" onClick={() => save({ ...createDefaultGamepadPreferences(), enabled: settings.enabled }, true)}>{t("settings.gamepad.restore")}</Button>
     </div>
     <h3>{t("settings.gamepad.buttons")}</h3>
@@ -61,7 +99,7 @@ export function GamepadSettings({ t }: { readonly t: Translator }): JSX.Element 
       {BUTTON_NAMES.map((name, index) => <div key={name} className={cx("gamepad-settings__binding", pressed(index) && "is-pressed")}>
         <span><small>{index + 1}</small>{t(`settings.gamepad.button.${name}`)}</span>
         <SelectControl aria-label={t("settings.gamepad.binding", { name: t(`settings.gamepad.button.${name}`) })} disabled={disabled}
-          value={settings.buttons[index] ?? "none"} onChange={(event) => bind(index, event.target.value as GamepadAction)}>{choices(true).map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}</SelectControl>
+          value={bindingValue(settings.buttons[index] ?? "none")} onChange={(event) => bind(index, event.target.value)}>{bindingChoices(settings.buttons[index] ?? "none", true)}</SelectControl>
       </div>)}
     </div>
     <div className="gamepad-settings__sticks">
@@ -78,8 +116,8 @@ export function GamepadSettings({ t }: { readonly t: Translator }): JSX.Element 
           {value.mode === "commands" && GAMEPAD_DIRECTIONS.map((direction) => <div className="gamepad-settings__binding" key={direction}>
             <span>{t(`settings.gamepad.button.${direction}`)}</span>
             <SelectControl aria-label={t("settings.gamepad.binding", { name: `${t(`settings.gamepad.${key}`)} · ${t(`settings.gamepad.button.${direction}`)}` })}
-              disabled={disabled} value={value.directions[direction]}
-              onChange={(event) => stick(key, { ...value, directions: { ...value.directions, [direction]: event.target.value as GamepadAction } })}>{choices(false).map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}</SelectControl>
+              disabled={disabled} value={bindingValue(value.directions[direction])}
+              onChange={(event) => { const binding = resolveBinding(event.target.value); if (binding !== undefined) stick(key, { ...value, directions: { ...value.directions, [direction]: binding } }); }}>{bindingChoices(value.directions[direction], false)}</SelectControl>
           </div>)}
         </section>;
       })}

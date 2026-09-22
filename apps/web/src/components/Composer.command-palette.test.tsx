@@ -7,6 +7,7 @@ import type { AppController } from "../controller.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { appendQuoteToComposerDocument, composerDocumentPlainText, composerDocumentQuotes, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
+import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
@@ -122,6 +123,7 @@ const commands: readonly RuntimeCommandView[] = [{
   name: "deploy",
   description: "Deploy an exact build",
   source: "skill",
+  resourceId: "resource-skill",
   loaded: true
 }];
 
@@ -143,6 +145,36 @@ afterEach(async () => {
   rafCallbacks.splice(0);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("inserts a bound skill only from the current task runtime catalog without sending", async () => {
+  const view = await mount(draft("Please "));
+  const target = document.querySelector<HTMLElement>("[data-gamepad-skill]");
+  expect(target).not.toBeNull();
+  const binding = { kind: "skill", serverId: "server-one", resourceId: "resource-skill", name: "Review" };
+  await act(async () => { target!.dispatchEvent(new CustomEvent(GAMEPAD_SKILL_EVENT, { detail: binding })); await Promise.resolve(); });
+  await vi.waitFor(() => expect(view.editor().value).toBe("Please /deploy"));
+  expect(view.api.listCommands).toHaveBeenCalledExactlyOnceWith("task-one");
+  expect(view.api.send).not.toHaveBeenCalled();
+
+  vi.mocked(view.api.listCommands).mockResolvedValueOnce([]);
+  await act(async () => { target!.dispatchEvent(new CustomEvent(GAMEPAD_SKILL_EVENT, { detail: binding })); await Promise.resolve(); });
+  await vi.waitFor(() => expect(document.querySelector("[role='alert']")?.textContent).toContain("settings.gamepad.skillInputUnavailable"));
+  expect(view.editor().value).toBe("Please /deploy");
+});
+
+it("discards a skill catalog response after the composer changes task", async () => {
+  const view = await mount(draft("First"));
+  let finish!: (commands: readonly RuntimeCommandView[]) => void;
+  vi.mocked(view.api.listCommands).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  const target = document.querySelector<HTMLElement>("[data-gamepad-skill]")!;
+  await act(async () => target.dispatchEvent(new CustomEvent(GAMEPAD_SKILL_EVENT, {
+    detail: { kind: "skill", serverId: "server-one", resourceId: "resource-skill", name: "Review" }
+  })));
+  await view.render({ ...baseSession, id: "task-two", generation: 2n });
+  await act(async () => { finish(commands); await Promise.resolve(); });
+  expect(view.editor().value).toBe("second task");
+  expect(view.api.send).not.toHaveBeenCalled();
 });
 
 it("replaces the complete slash run at a moved caret while preserving quote structure and mention authority", async () => {
@@ -370,12 +402,13 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
     ["task-two", draft("second task")]
   ]);
   const api = {
-    state: { connectionState: "connected", snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
+    state: { connectionState: "connected", activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
     readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
     saveDraft: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),
+    listCommands: vi.fn(async () => commands),
     listWorkspaceFiles: vi.fn(async () => ({ paths: ["notes.md"], truncated: false, revision: "1" }))
   } as unknown as AppController;
   const backend: BackendView = {

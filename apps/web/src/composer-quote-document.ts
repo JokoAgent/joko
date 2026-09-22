@@ -297,6 +297,11 @@ export function composerDocumentPlainText(document: unknown): string {
     .trim();
 }
 
+export function composerDocumentEndsWithWhitespace(document: unknown): boolean {
+  const last = composerDocumentBlocks(normalizeComposerDocument(document)).at(-1);
+  return last?.kind === "text" && /\s$/u.test(last.text);
+}
+
 export function composerDocumentQuotes(document: unknown): readonly ComposerSelectionQuoteDraft[] {
   const result: ComposerSelectionQuoteDraft[] = [];
   walkComposerNodes(normalizeComposerDocument(document).content ?? [], (node) => {

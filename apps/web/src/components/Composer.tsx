@@ -24,7 +24,7 @@ import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { mergeRejectedComposerDraft } from "../composer-draft-recovery.js";
-import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
+import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentEndsWithWhitespace, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { advertisedQueueDeliveryModes } from "./backend-control-capabilities.js";
 import { upsertComposerMention } from "../message-reference.js";
 import { normalizeSelectionQuoteDrafts } from "../selection-quote.js";
@@ -32,7 +32,7 @@ import { randomUuid } from "../web-crypto.js";
 import { promptRecommendationStore } from "../prompt-recommendation-store.js";
 import { ComposerOperationGuard, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveUserShellDraft, type ComposerSubmissionKind } from "./composer-behavior.js";
 import { QueueStrip, deliveryLabel } from "./QueueStrip.js";
-import { composerBuiltInCommand, composerCommandItems, detectComposerCommandActivation, filterComposerPaletteItems, insertComposerPaletteValue, replaceComposerCommandRun, type ComposerCommandActivation, type ComposerPaletteItem } from "./composer-palette.js";
+import { composerBuiltInCommand, composerCommandItems, detectComposerCommandActivation, filterComposerPaletteItems, replaceComposerCommandRun, type ComposerCommandActivation, type ComposerPaletteItem } from "./composer-palette.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
@@ -52,8 +52,9 @@ import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, SegmentedControl, cx, CheckboxControl, SelectControl, formatBytes } from "./ui.js";
 import { useDraftVoiceInput } from "./use-draft-voice-input.js";
 import { useHeldVoiceInput } from "./use-held-voice-input.js";
-import { useGamepadVoiceInput } from "../gamepad-client.js";
-import { useGamepadActions } from "../gamepad-actions.js";
+import { GAMEPAD_SKILL_EVENT, useGamepadVoiceInput } from "../gamepad-client.js";
+import { currentGamepadTaskRoot, useGamepadActions } from "../gamepad-actions.js";
+import { isGamepadSkillBinding, type GamepadSkillBinding } from "../gamepad-input.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
@@ -107,6 +108,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   readonly onCompact?: () => void;
 }): JSX.Element {
   const [text, setText] = useState("");
+  const [gamepadSkillError, setGamepadSkillError] = useState<string>();
   const [editorDocument, setEditorDocument] = useState<JSONContent>(emptyComposerDocument);
   const [attachments, setAttachments] = useState<readonly AttachmentDraft[]>([]);
   const [browserComments, setBrowserComments] = useState<readonly BrowserCommentDraftItem[]>([]);
@@ -403,6 +405,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   });
   const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
   const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
+  const gamepadSkillFlight = useRef<{ readonly owner: object } | undefined>(undefined);
+  const gamepadSkillState = useRef({ owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId });
+  gamepadSkillState.current = { owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId };
+  useLayoutEffect(() => { setGamepadSkillError(undefined); }, [sendOwner]);
   const sendEpochRef = useRef<object | undefined>(undefined);
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
@@ -1411,8 +1417,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     }
     markDraftEdited(session.id);
     resetHistoryNavigation();
-    const nextText = insertComposerPaletteValue(textRef.current, undefined, item);
-    const nextDocument = appendTextToComposerDocument(editorDocumentRef.current, nextText.slice(textRef.current.length));
+    const prefix = composerDocumentIsEmpty(editorDocumentRef.current) || composerDocumentEndsWithWhitespace(editorDocumentRef.current) ? "" : " ";
+    const nextDocument = appendTextToComposerDocument(editorDocumentRef.current, `${prefix}${item.value} `);
     const normalizedNextText = composerDocumentPlainText(nextDocument);
     const nextRanges = remapComposerInlineMentionRanges(textRef.current, normalizedNextText, inlineMentionRangesRef.current);
     editorDocumentRef.current = nextDocument;
@@ -1490,6 +1496,59 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       setComposerCaretTextOffset(root, root?.ownerDocument.getSelection() ?? null, offset);
     });
   };
+  const insertSkillRef = useRef(insert);
+  insertSkillRef.current = insert;
+  const receiveGamepadSkillRef = useRef<(binding: GamepadSkillBinding) => void>(() => undefined);
+  receiveGamepadSkillRef.current = (binding) => {
+    const source = gamepadSkillState.current;
+    const ownerDocument = voiceRoot?.ownerDocument;
+    const taskRoot = voiceRoot?.closest<HTMLElement>(".session-pane, .new-task-page");
+    if (ownerDocument === undefined || source.locked || source.bashMode || !source.connected
+      || source.serverId === undefined || source.serverId !== binding.serverId
+      || ownerDocument.body.classList.contains("modal-open")
+      || (taskRoot !== null && taskRoot !== undefined && currentGamepadTaskRoot(ownerDocument) !== taskRoot)) {
+      setGamepadSkillError(t("settings.gamepad.skillInputUnavailable"));
+      return;
+    }
+    if (gamepadSkillFlight.current?.owner === source.owner) return;
+    const operation = { owner: source.owner };
+    gamepadSkillFlight.current = operation;
+    setGamepadSkillError(undefined);
+    const sourceDraftDocument = editorDocumentRef.current;
+    const isCurrent = (): boolean => gamepadSkillFlight.current === operation
+      && gamepadSkillState.current.owner === source.owner
+      && !gamepadSkillState.current.locked && !gamepadSkillState.current.bashMode
+      && gamepadSkillState.current.connected && gamepadSkillState.current.serverId === binding.serverId
+      && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument
+      && editorDocumentRef.current === sourceDraftDocument
+      && !ownerDocument.body.classList.contains("modal-open")
+      && (taskRoot === null || taskRoot === undefined || currentGamepadTaskRoot(ownerDocument) === taskRoot);
+    void controller.listCommands(session.id).then((currentCommands) => {
+      if (!isCurrent()) return;
+      const matches = currentCommands.filter((command) => command.source === "skill" && command.loaded
+        && command.resourceId === binding.resourceId && (command.sessionId === undefined || command.sessionId === session.id));
+      const item = matches.length === 1 ? composerCommandItems(matches)[0] : undefined;
+      if (item === undefined) { setGamepadSkillError(t("settings.gamepad.skillInputUnavailable")); return; }
+      insertSkillRef.current(item);
+      setGamepadSkillError(undefined);
+    }).catch(() => {
+      if (isCurrent()) setGamepadSkillError(t("settings.gamepad.skillInputUnavailable"));
+    }).finally(() => {
+      if (gamepadSkillFlight.current === operation) gamepadSkillFlight.current = undefined;
+    });
+  };
+  useLayoutEffect(() => {
+    if (voiceRoot === undefined) return;
+    voiceRoot.dataset.gamepadSkill = "true";
+    const receive = (event: Event): void => {
+      if (event instanceof CustomEvent && isGamepadSkillBinding(event.detail)) receiveGamepadSkillRef.current(event.detail);
+    };
+    voiceRoot.addEventListener(GAMEPAD_SKILL_EVENT, receive);
+    return () => {
+      voiceRoot.removeEventListener(GAMEPAD_SKILL_EVENT, receive);
+      delete voiceRoot.dataset.gamepadSkill;
+    };
+  }, [voiceRoot, sendOwner]);
 
   const openInlineMentionPalette = (): void => {
     if (composerLocked || !canMention) return;
@@ -1882,6 +1941,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
           />
         )}
         {attachmentError !== undefined && <p className="composer__error" role="alert"><AlertTriangle aria-hidden="true" />{attachmentError}</p>}
+        {gamepadSkillError !== undefined && <p className="composer__error" role="alert"><AlertTriangle aria-hidden="true" />{gamepadSkillError}</p>}
         <PromptRecommendationEditorFrame
           recommendation={recommendationVisible}
           acceptLabel="Tab"

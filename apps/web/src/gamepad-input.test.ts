@@ -34,6 +34,21 @@ function sampler(engine = new GamepadInputEngine()) {
 const voice = (phase: "press" | "release" | "cancel") => ({ kind: "action", action: "voice", phase });
 
 describe("gamepad preference authority", () => {
+  it("accepts bounded skill identities and emits a single skill press after a neutral sample", () => {
+    const binding = { kind: "skill" as const, serverId: "server-one", resourceId: "resource-skill", name: "Review" };
+    const current = { ...preferences(), buttons: preferences().buttons.map((value, index) => index === 0 ? binding : value) };
+    expect(parseGamepadPreferences(current)).toEqual(current);
+    expect(parseGamepadPreferences({ ...current, buttons: current.buttons.map((value, index) => index === 0 ? { ...binding, name: "" } : value) })).toBeUndefined();
+    const { sample } = sampler();
+    expect(sample([pad({ down: [0] })], { preferences: current }).effects).toEqual([]);
+    sample([pad()], { preferences: current });
+    expect(sample([pad({ down: [0] })], { preferences: current }).effects).toEqual([{ kind: "skill", binding }]);
+    expect(sample([pad({ down: [0] })], { preferences: current }).effects).toEqual([]);
+    expect(sample([pad()], { preferences: current }).effects).toEqual([]);
+    const oversized = { ...current, buttons: Array(17).fill({ ...binding, name: "x".repeat(512) }) };
+    expect(() => saveGamepadPreferences(oversized)).toThrow("storage limit");
+    expect(window.localStorage.getItem(GAMEPAD_PREFERENCES_KEY)).toBeNull();
+  });
   it("accepts the complete current shape and rejects malformed settings without repairing persisted content", () => {
     const current = preferences();
     expect(parseGamepadPreferences(current)).toEqual(current);

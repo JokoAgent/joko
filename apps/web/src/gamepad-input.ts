@@ -6,17 +6,24 @@ export const GAMEPAD_ACTIONS = [
   "open-settings", "toggle-inspector", "scroll-bottom", "voice"
 ] as const;
 export type GamepadAction = (typeof GAMEPAD_ACTIONS)[number];
+export interface GamepadSkillBinding {
+  readonly kind: "skill";
+  readonly serverId: string;
+  readonly resourceId: string;
+  readonly name: string;
+}
+export type GamepadBinding = GamepadAction | GamepadSkillBinding;
 export const GAMEPAD_DIRECTIONS = ["up", "down", "left", "right"] as const;
 export type GamepadDirection = (typeof GAMEPAD_DIRECTIONS)[number];
 export interface GamepadStickPreference {
   readonly mode: "scroll" | "commands" | "disabled";
-  readonly directions: Readonly<Record<GamepadDirection, GamepadAction>>;
+  readonly directions: Readonly<Record<GamepadDirection, GamepadBinding>>;
 }
 export interface GamepadPreferences {
   readonly version: 1;
   readonly enabled: boolean;
   /** Browser standard mapping: face, shoulders, triggers, menu, stick clicks, D-pad, home. */
-  readonly buttons: readonly GamepadAction[];
+  readonly buttons: readonly GamepadBinding[];
   readonly leftStick: GamepadStickPreference;
   readonly rightStick: GamepadStickPreference;
 }
@@ -46,15 +53,24 @@ function recordHasKeys(value: unknown, keys: readonly string[]): value is Record
 function isAction(value: unknown): value is GamepadAction {
   return typeof value === "string" && (GAMEPAD_ACTIONS as readonly string[]).includes(value);
 }
+export function isGamepadSkillBinding(value: unknown): value is GamepadSkillBinding {
+  return recordHasKeys(value, ["kind", "serverId", "resourceId", "name"])
+    && value.kind === "skill"
+    && [value.serverId, value.resourceId, value.name].every((part) => typeof part === "string"
+      && part.trim() === part && part.length > 0 && part.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(part));
+}
+function isBinding(value: unknown): value is GamepadBinding {
+  return isAction(value) || isGamepadSkillBinding(value);
+}
 function parseStick(value: unknown): GamepadStickPreference | undefined {
   if (!recordHasKeys(value, ["mode", "directions"]) || typeof value.mode !== "string" || !["scroll", "commands", "disabled"].includes(value.mode)
     || !recordHasKeys(value.directions, GAMEPAD_DIRECTIONS)) return undefined;
   const directions = value.directions;
   // Voice requires a physical button release; an analog direction cannot own it.
-  if (!GAMEPAD_DIRECTIONS.every((direction) => isAction(directions[direction]) && directions[direction] !== "voice")) return undefined;
+  if (!GAMEPAD_DIRECTIONS.every((direction) => isBinding(directions[direction]) && directions[direction] !== "voice")) return undefined;
   return {
     mode: value.mode as GamepadStickPreference["mode"],
-    directions: Object.fromEntries(GAMEPAD_DIRECTIONS.map((direction) => [direction, directions[direction]])) as Record<GamepadDirection, GamepadAction>
+    directions: Object.fromEntries(GAMEPAD_DIRECTIONS.map((direction) => [direction, directions[direction]])) as Record<GamepadDirection, GamepadBinding>
   };
 }
 
@@ -63,7 +79,7 @@ export function parseGamepadPreferences(value: unknown): GamepadPreferences | un
   if (!recordHasKeys(value, ["version", "enabled", "buttons", "leftStick", "rightStick"])
     || value.version !== 1 || typeof value.enabled !== "boolean"
     || !Array.isArray(value.buttons) || value.buttons.length !== 17
-    || !Array.from(value.buttons).every(isAction)) return undefined;
+    || !Array.from(value.buttons).every(isBinding)) return undefined;
   const leftStick = parseStick(value.leftStick);
   const rightStick = parseStick(value.rightStick);
   if (leftStick === undefined || rightStick === undefined) return undefined;
@@ -91,7 +107,9 @@ export function readGamepadPreferences(storage?: PreferenceStorage): GamepadPref
 export function saveGamepadPreferences(preferences: GamepadPreferences, storage?: PreferenceStorage): void {
   const parsed = parseGamepadPreferences(preferences);
   if (parsed === undefined) throw new Error("Invalid gamepad preferences.");
-  (storage ?? window.localStorage).setItem(GAMEPAD_PREFERENCES_KEY, JSON.stringify(parsed));
+  const serialized = JSON.stringify(parsed);
+  if (serialized.length > MAX_PREFERENCES_LENGTH) throw new Error("Gamepad preferences exceed the storage limit.");
+  (storage ?? window.localStorage).setItem(GAMEPAD_PREFERENCES_KEY, serialized);
   if (typeof window !== "undefined") window.dispatchEvent(new Event(GAMEPAD_PREFERENCES_EVENT));
 }
 
@@ -125,6 +143,7 @@ export interface GamepadDeviceInfo {
 }
 export type GamepadInputEffect =
   | { readonly kind: "action"; readonly action: Exclude<GamepadAction, "none">; readonly phase: "press" | "release" | "cancel" }
+  | { readonly kind: "skill"; readonly binding: GamepadSkillBinding }
   /** CSS-pixel distance for this sample. A zero vector ends an active scroll. */
   | { readonly kind: "scroll"; readonly x: number; readonly y: number };
 export interface GamepadInputSample {
@@ -145,7 +164,7 @@ interface PadState {
   readonly sticksArmed: boolean[];
 }
 interface ActiveControl {
-  readonly action: Exclude<GamepadAction, "none">;
+  readonly binding: Exclude<GamepadBinding, "none">;
   readonly identity: string;
 }
 const DEAD_ZONE = 0.25;
@@ -165,9 +184,10 @@ export class GamepadInputEngine {
     const effects: GamepadInputEffect[] = [];
     let voiceCancelled = false;
     for (const control of this.controls.values()) {
-      if (control.action === "voice" && voiceCancelled) continue;
-      effects.push({ kind: "action", action: control.action, phase: "cancel" });
-      if (control.action === "voice") voiceCancelled = true;
+      if (typeof control.binding !== "string") continue;
+      if (control.binding === "voice" && voiceCancelled) continue;
+      effects.push({ kind: "action", action: control.binding, phase: "cancel" });
+      if (control.binding === "voice") voiceCancelled = true;
     }
     if (this.scrolling) effects.push({ kind: "scroll", x: 0, y: 0 });
     this.pads.clear(); this.controls.clear(); this.scrolling = false;
@@ -232,16 +252,19 @@ export class GamepadInputEngine {
     let hasVoice = false;
     let voiceInterrupted = false;
     for (const [key, old] of this.controls) {
-      if (old.action === "voice") {
+      if (old.binding === "voice") {
         hadVoice = true;
         if (!liveIdentities.has(old.identity)) voiceInterrupted = true;
-      } else if (!nextControls.has(key)) {
-        effects.push({ kind: "action", action: old.action, phase: liveIdentities.has(old.identity) ? "release" : "cancel" });
+      } else if (!nextControls.has(key) && typeof old.binding === "string") {
+        effects.push({ kind: "action", action: old.binding, phase: liveIdentities.has(old.identity) ? "release" : "cancel" });
       }
     }
     for (const [key, next] of nextControls) {
-      if (next.action === "voice") hasVoice = true;
-      else if (!this.controls.has(key)) effects.push({ kind: "action", action: next.action, phase: "press" });
+      if (next.binding === "voice") hasVoice = true;
+      else if (!this.controls.has(key)) {
+        if (typeof next.binding === "string") effects.push({ kind: "action", action: next.binding, phase: "press" });
+        else effects.push({ kind: "skill", binding: next.binding });
+      }
     }
     if (!hadVoice && hasVoice) effects.push({ kind: "action", action: "voice", phase: "press" });
     if (hadVoice && !hasVoice) effects.push({ kind: "action", action: "voice", phase: voiceInterrupted ? "cancel" : "release" });
@@ -254,8 +277,8 @@ export class GamepadInputEngine {
   }
 }
 
-function addControl(controls: Map<string, ActiveControl>, key: string, action: GamepadAction, identity: string): void {
-  if (action !== "none") controls.set(key, { action, identity });
+function addControl(controls: Map<string, ActiveControl>, key: string, binding: GamepadBinding, identity: string): void {
+  if (binding !== "none") controls.set(key, { binding, identity });
 }
 function deviceInfo(pad: GamepadSample): GamepadDeviceInfo {
   const valid = pad.buttons.length >= 17 && pad.axes.length >= 4

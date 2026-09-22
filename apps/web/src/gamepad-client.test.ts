@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { GamepadClient, createGamepadDomInput, GAMEPAD_SCROLL_EVENT, GAMEPAD_VOICE_EVENT } from "./gamepad-client.js";
+import { GamepadClient, createGamepadDomInput, GAMEPAD_SCROLL_EVENT, GAMEPAD_SKILL_EVENT, GAMEPAD_VOICE_EVENT } from "./gamepad-client.js";
 import { createDefaultGamepadPreferences, saveGamepadPreferences, type GamepadInputEffect } from "./gamepad-input.js";
 
 let pads: Gamepad[];
@@ -75,6 +75,23 @@ describe("gamepad UI target ownership", () => {
     root.innerHTML = `<main class="session-pane"><div data-timeline-session-id="${id}"></div><div data-gamepad-voice><button>Input</button><div data-composer-editor="true" tabindex="0"></div></div></main>`;
     document.body.append(root); return root;
   }
+  it("routes a skill press only to the focused composer outside modal input", () => {
+    const first = task("one"); const second = task("two");
+    first.querySelector("[data-gamepad-voice]")?.setAttribute("data-gamepad-skill", "true");
+    second.querySelector("[data-gamepad-voice]")?.setAttribute("data-gamepad-skill", "true");
+    const firstSkill = vi.fn(); const secondSkill = vi.fn();
+    first.querySelector("[data-gamepad-skill]")!.addEventListener(GAMEPAD_SKILL_EVENT, firstSkill);
+    second.querySelector("[data-gamepad-skill]")!.addEventListener(GAMEPAD_SKILL_EVENT, secondSkill);
+    const input = createGamepadDomInput(document, vi.fn());
+    const effect = { kind: "skill" as const, binding: { kind: "skill" as const, serverId: "server-one", resourceId: "resource-skill", name: "Review" } };
+    first.querySelector("button")!.focus();
+    input(effect); expect(firstSkill).toHaveBeenCalledOnce(); expect(secondSkill).not.toHaveBeenCalled();
+    document.body.classList.add("modal-open");
+    input(effect); expect(firstSkill).toHaveBeenCalledOnce();
+    document.body.classList.remove("modal-open");
+    second.querySelector("button")!.focus();
+    input(effect); expect(secondSkill).toHaveBeenCalledOnce();
+  });
   it("holds continuous scrolling on its original task and never transfers held input to another split", () => {
     const first = task("one"); const second = task("two");
     first.querySelector("button")!.focus();

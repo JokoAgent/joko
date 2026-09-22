@@ -124,6 +124,7 @@ export function useGamepadSnapshot(): GamepadClientSnapshot {
 }
 
 export const GAMEPAD_VOICE_EVENT = "joko:gamepad-voice";
+export const GAMEPAD_SKILL_EVENT = "joko:gamepad-skill";
 export const GAMEPAD_PANEL_EVENT = "joko:gamepad-panel";
 export const GAMEPAD_SCROLL_EVENT = "joko:gamepad-scroll";
 type VoicePhase = "press" | "release" | "cancel";
@@ -149,6 +150,12 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
   };
   return (effect) => {
     if (effect.kind === "scroll") { scroll(effect.x, effect.y); return; }
+    if (effect.kind === "skill") {
+      if (doc.body.classList.contains("modal-open")) return;
+      const root = currentGamepadTaskRoot(doc);
+      root?.querySelector("[data-gamepad-skill]")?.dispatchEvent(new CustomEvent(GAMEPAD_SKILL_EVENT, { detail: effect.binding }));
+      return;
+    }
     if (effect.action === "voice") {
       if (effect.phase !== "press") { voice(effect.phase); return; }
       if (doc.body.classList.contains("modal-open")) return;
