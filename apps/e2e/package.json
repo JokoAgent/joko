@@ -15,6 +15,7 @@
     "@joko/adapter-pi": "workspace:*",
     "@joko/contracts": "workspace:*",
     "@joko/core": "workspace:*",
+    "@joko/messaging": "workspace:*",
     "@joko/orchestrator": "workspace:*",
     "@joko/remote-ssh": "workspace:*",
     "@joko/store": "workspace:*",

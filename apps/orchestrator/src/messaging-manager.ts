@@ -6,10 +6,12 @@ import {
   FeishuTransport,
   MessagingTransportError,
   TelegramTransport,
+  WeComTransport,
   splitDingTalkText,
   splitDiscordText,
   splitFeishuText,
   splitTelegramText,
+  splitWeComText,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
   type DingTalkPollResult,
@@ -33,7 +35,11 @@ import {
   type TelegramNormalizationResult,
   type TelegramPollResult,
   type TelegramTransportOptions,
-  type TelegramUpdate
+  type TelegramUpdate,
+  type WeComCallbackUpdate,
+  type WeComNormalizationResult,
+  type WeComPollResult,
+  type WeComTransportOptions
 } from "@joko/messaging";
 import type { BlobRef, InteractionQuestionField, PromptInput, TurnExecutionOverrides } from "@joko/core";
 import {
@@ -63,6 +69,8 @@ const TELEGRAM_ALBUM_SETTLE_POLL_SECONDS = 1;
 const TELEGRAM_ALBUM_MAXIMUM_MEMBERS = 10;
 const TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS = 10;
 const LIFECYCLE_DRAIN_TIMEOUT_MS = 1_500;
+const WECOM_EMPTY_REPLY_TEXT = "_(Empty reply)_";
+const WECOM_ATTACHMENT_REPLY_TEXT = "Attachments follow.";
 
 export interface TelegramMessagingConfiguration {
   readonly format: 1;
@@ -130,12 +138,18 @@ export const DEFAULT_FEISHU_MESSAGING_CONFIGURATION = Object.freeze({
   groupPermissionMode: "ask"
 } as const satisfies Omit<FeishuMessagingConfiguration, "appId">);
 
-type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark";
+export interface WeComMessagingConfiguration {
+  readonly format: 1;
+  readonly botId: string;
+}
+
+type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom";
 type SupportedMessagingConfiguration =
   | TelegramMessagingConfiguration
   | DiscordMessagingConfiguration
   | DingTalkMessagingConfiguration
-  | FeishuMessagingConfiguration;
+  | FeishuMessagingConfiguration
+  | WeComMessagingConfiguration;
 
 export type MessagingConnectionTestResult =
   | {
@@ -173,6 +187,8 @@ interface MessagingTransportEffectsPort {
     readonly address: MessagingAddress;
     readonly text: string;
     readonly replyToMessageId?: string;
+    /** Exact inbound callback identity; used only by callback-capable transports. */
+    readonly callbackMessageId?: string;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   sendAttachments(input: {
@@ -208,6 +224,11 @@ interface MessagingTransportEffectsPort {
     readonly interactionId: string;
     readonly text?: string;
     readonly showAlert?: boolean;
+    readonly signal?: AbortSignal;
+  }): Promise<void>;
+  beginReply?(input: {
+    readonly address: MessagingAddress;
+    readonly messageId: string;
     readonly signal?: AbortSignal;
   }): Promise<void>;
   loadGroupHistory?(address: MessagingAddress, signal?: AbortSignal): Promise<readonly MessagingGroupObservation[]>;
@@ -257,12 +278,24 @@ interface FeishuTransportPort extends MessagingTransportEffectsPort {
   ownerAddress(): MessagingAddress;
 }
 
-type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort;
+interface WeComTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "wecom";
+  poll(input: {
+    readonly cursor: string | null;
+    readonly timeoutSeconds?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<WeComPollResult>;
+  normalize(updates: readonly WeComCallbackUpdate[]): WeComNormalizationResult;
+  ownerAddress(): MessagingAddress;
+}
+
+type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort;
 type MessagingNormalizationResult =
   | TelegramNormalizationResult
   | DiscordNormalizationResult
   | DingTalkNormalizationResult
-  | FeishuNormalizationResult;
+  | FeishuNormalizationResult
+  | WeComNormalizationResult;
 
 interface CredentialTicketBinding {
   readonly clientConnectionId: string;
@@ -319,6 +352,7 @@ export interface MessagingManagerOptions {
   readonly createDiscordTransport?: (options: DiscordTransportOptions) => DiscordTransportPort;
   readonly createDingTalkTransport?: (options: DingTalkTransportOptions) => DingTalkTransportPort;
   readonly createFeishuTransport?: (options: FeishuTransportOptions) => FeishuTransportPort;
+  readonly createWeComTransport?: (options: WeComTransportOptions) => WeComTransportPort;
   /** Test-only transport seams. Production always uses the providers' official direct endpoints. */
   readonly telegramFetch?: typeof fetch;
   readonly telegramApiBaseUrl?: string;
@@ -347,6 +381,7 @@ export class MessagingManager {
   readonly #createDiscordTransport: NonNullable<MessagingManagerOptions["createDiscordTransport"]>;
   readonly #createDingTalkTransport: NonNullable<MessagingManagerOptions["createDingTalkTransport"]>;
   readonly #createFeishuTransport: NonNullable<MessagingManagerOptions["createFeishuTransport"]>;
+  readonly #createWeComTransport: NonNullable<MessagingManagerOptions["createWeComTransport"]>;
   readonly #pollTimeoutSeconds: number;
   readonly #retryDelayMs: number;
   readonly #now: () => number;
@@ -391,6 +426,7 @@ export class MessagingManager {
       ...(dingTalkOapiBaseUrl === undefined ? {} : { oapiBaseUrl: dingTalkOapiBaseUrl })
     }));
     this.#createFeishuTransport = options.createFeishuTransport ?? ((input) => new FeishuTransport(input));
+    this.#createWeComTransport = options.createWeComTransport ?? ((input) => new WeComTransport(input));
   }
 
   async initialize(): Promise<void> {
@@ -478,6 +514,16 @@ export class MessagingManager {
     return this.#store.createMessagingConnection({
       channel: input.channel,
       configuration: decodeFeishuConfiguration(input.configuration)
+    });
+  }
+
+  createWeComConnection(input: {
+    readonly configuration: WeComMessagingConfiguration;
+  }): MessagingConnectionRecord {
+    this.#assertReady();
+    return this.#store.createMessagingConnection({
+      channel: "wecom",
+      configuration: decodeWeComConfiguration(input.configuration)
     });
   }
 
@@ -579,7 +625,8 @@ export class MessagingManager {
         connectionId: current.id,
         expectedRevision: current.revision,
         expectedGeneration: current.generation,
-        clearOwner: current.channel === "dingtalk" || current.channel === "feishu" || current.channel === "lark",
+        clearOwner: current.channel === "dingtalk" || current.channel === "feishu" || current.channel === "lark"
+          || current.channel === "wecom",
         updatedAt: this.#now()
       });
       this.#restartWorker(updated.id);
@@ -711,6 +758,31 @@ export class MessagingManager {
     });
   }
 
+  replaceWeComConfiguration(input: {
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly configuration: WeComMessagingConfiguration;
+  }): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
+      assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      if (current.channel !== "wecom") throw unavailableChannel();
+      const previous = decodeWeComConnection(current);
+      const configuration = decodeWeComConfiguration(input.configuration);
+      const updated = this.#store.replaceMessagingConfiguration({
+        connectionId: current.id,
+        expectedRevision: current.revision,
+        expectedGeneration: current.generation,
+        configuration,
+        ...(previous.botId === configuration.botId ? {} : { ownerProviderUserId: null }),
+        updatedAt: this.#now()
+      });
+      this.#restartWorker(updated.id);
+      return updated;
+    });
+  }
+
   putRoute(input: PutMessagingRouteInput): MessagingRouteRecord {
     this.#assertReady();
     return this.#store.putMessagingRoute(input);
@@ -814,15 +886,20 @@ export class MessagingManager {
       if (input.outcome === "completed") {
         const output = this.#latestAssistantOutput(input.sessionId, input.runId);
         const text = boundedOutboundText(output.text, channel);
+        const deliveryText = channel === "wecom" && text.trim() === ""
+          ? output.attachments.length > 0 ? WECOM_ATTACHMENT_REPLY_TEXT : WECOM_EMPTY_REPLY_TEXT
+          : text;
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
-        if (text !== "" && text.trim() !== "NO_REPLY") {
+        if (text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom")) {
           const parts = channel === "discord"
             ? splitDiscordText(text)
             : channel === "dingtalk"
               ? splitDingTalkText(text)
               : channel === "feishu" || channel === "lark"
                 ? splitFeishuText(text)
-                : splitTelegramText(text);
+                : channel === "wecom"
+                  ? splitWeComText(deliveryText)
+                  : splitTelegramText(text);
           for (const part of parts) {
             const partIndex = deliveries.length;
             deliveries.push({
@@ -831,6 +908,9 @@ export class MessagingManager {
                 format: 1,
                 address: addressFor(connection, conversation),
                 text: part,
+                ...(channel === "wecom" && partIndex === 0 && current.providerMessageId !== undefined
+                  ? { callbackMessageId: current.providerMessageId }
+                  : {}),
                 ...shouldQuote(configuration, conversation, partIndex)
                   ? { replyToMessageId: current.providerMessageId }
                   : {}
@@ -840,7 +920,8 @@ export class MessagingManager {
         }
         const images = output.attachments.filter((attachment) => attachment.kind === "image");
         const files = output.attachments.filter((attachment) => attachment.kind === "file");
-        const imageBatchSize = channel === "dingtalk" || channel === "feishu" || channel === "lark" ? 1 : 10;
+        const imageBatchSize = channel === "dingtalk" || channel === "feishu" || channel === "lark"
+          || channel === "wecom" ? 1 : 10;
         for (let index = 0; index < images.length; index += imageBatchSize) {
           const partIndex = deliveries.length;
           deliveries.push({
@@ -1060,6 +1141,14 @@ export class MessagingManager {
         });
         nextCursor = result.nextCursor;
         normalized = transport.normalize(result.updates);
+      } else if (transport.channel === "wecom") {
+        const result = await transport.poll({
+          cursor: connection.cursor ?? null,
+          timeoutSeconds: this.#pollTimeoutSeconds,
+          signal
+        });
+        nextCursor = result.nextCursor;
+        normalized = transport.normalize(result.updates);
       } else {
         const result = await transport.poll({
           cursor: connection.cursor ?? null,
@@ -1136,7 +1225,8 @@ export class MessagingManager {
   ): Promise<void> {
     let activeConnection = connection;
     if ("ownerClaimProviderUserId" in batch && batch.ownerClaimProviderUserId !== null) {
-      if (connection.channel !== "dingtalk" && connection.channel !== "feishu" && connection.channel !== "lark") {
+      if (connection.channel !== "dingtalk" && connection.channel !== "feishu" && connection.channel !== "lark"
+        && connection.channel !== "wecom") {
         throw invalid("This Messaging channel cannot claim an owner from an inbound message.");
       }
       activeConnection = this.#store.claimMessagingConnectionOwner({
@@ -1197,7 +1287,7 @@ export class MessagingManager {
       });
       if (exact !== undefined) return exact;
     }
-    if (connection.channel !== "dingtalk" || !event.speaker.isOwner) return undefined;
+    if ((connection.channel !== "dingtalk" && connection.channel !== "wecom") || !event.speaker.isOwner) return undefined;
     const open = this.#store.listMessagingDeliveries({
       connectionId: connection.id,
       statuses: ["sent"],
@@ -1337,6 +1427,23 @@ export class MessagingManager {
     });
     if (!creation.created && creation.request.status !== "preparing") return;
     let request = creation.request;
+
+    // WeCom callback frames are transient provider capabilities. Reserve the
+    // exact reply stream as soon as the inbound request is durably deduplicated;
+    // attachment adoption and Session admission must not consume its deadline.
+    try {
+      await transport.beginReply?.({
+        address: event.address,
+        messageId: event.messageId,
+        signal
+      });
+    } catch (error) {
+      if (isCancelled(error) || signal.aborted) throw error;
+      this.#recordFailure("CALLBACK_REPLY_START_FAILED", connection.id, error);
+    }
+    signal.throwIfAborted();
+    this.#requireWorkerConnection(connection.id, connection.generation);
+
     let activeConversation = await this.#activateConversation(conversation, event);
 
     if (activeConversation.conversationKind !== "direct" && transport.loadGroupHistory !== undefined) {
@@ -1728,6 +1835,18 @@ export class MessagingManager {
         generation: connection.generation,
         ownerUserId: connection.ownerProviderUserId ?? null,
         groupActivation: configuration.groupActivation,
+        initialCursor: connection.cursor ?? null,
+        now: this.#now
+      });
+    }
+    if (connection.channel === "wecom") {
+      const configuration = decodeWeComConnection(connection);
+      return this.#createWeComTransport({
+        botId: configuration.botId,
+        botSecret: token,
+        connectionId: connection.id,
+        generation: connection.generation,
+        ownerUserId: connection.ownerProviderUserId ?? null,
         initialCursor: connection.cursor ?? null,
         now: this.#now
       });
@@ -2159,6 +2278,7 @@ async function dispatchMessagingDelivery(
       address: payload.address,
       text: payload.text,
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
+      ...(payload.callbackMessageId === undefined ? {} : { callbackMessageId: payload.callbackMessageId }),
       signal
     });
     return receipt.providerMessageId;
@@ -2218,6 +2338,7 @@ function deliveryPayload(value: unknown):
       readonly address: MessagingAddress;
       readonly text: string;
       readonly replyToMessageId?: string;
+      readonly callbackMessageId?: string;
       readonly messageId?: never;
       readonly emoji?: never;
       readonly files?: never;
@@ -2229,6 +2350,7 @@ function deliveryPayload(value: unknown):
       readonly emoji: string | null;
       readonly text?: never;
       readonly replyToMessageId?: never;
+      readonly callbackMessageId?: never;
       readonly files?: never;
     }
   | {
@@ -2236,6 +2358,7 @@ function deliveryPayload(value: unknown):
       readonly address: MessagingAddress;
       readonly files: readonly MessagingOutboundFile[];
       readonly replyToMessageId?: string;
+      readonly callbackMessageId?: never;
       readonly text?: never;
       readonly messageId?: never;
       readonly emoji?: never;
@@ -2245,12 +2368,17 @@ function deliveryPayload(value: unknown):
   }
   if (typeof value["text"] === "string" && value["text"].length > 0) {
     const reply = value["replyToMessageId"];
+    const callback = value["callbackMessageId"];
     if (reply !== undefined && typeof reply !== "string") throw invalid("Messaging reply identity is invalid.");
+    if (callback !== undefined && (typeof callback !== "string" || callback.trim() === "" || callback.length > 512)) {
+      throw invalid("Messaging callback identity is invalid.");
+    }
     return {
       format: 1,
       address: value["address"],
       text: value["text"],
-      ...(reply === undefined ? {} : { replyToMessageId: reply })
+      ...(reply === undefined ? {} : { replyToMessageId: reply }),
+      ...(callback === undefined ? {} : { callbackMessageId: callback })
     };
   }
   if (Array.isArray(value["files"]) && value["files"].length >= 1 && value["files"].length <= 10) {
@@ -2415,7 +2543,8 @@ function messagingInteractionCard(
     return undefined;
   }
   if (buttons.length > 100 || (buttons.length < 1 && payload.kind !== "question")) return undefined;
-  const visibleButtons = channel === "discord" || channel === "dingtalk" ? buttons.slice(0, 25) : buttons;
+  const visibleButtons = channel === "wecom" ? buttons.slice(0, 9)
+    : channel === "discord" || channel === "dingtalk" ? buttons.slice(0, 25) : buttons;
   return {
     interactionId: interaction.id,
     interactionGeneration: interaction.generation,
@@ -2681,6 +2810,7 @@ function decodeSupportedConnection(connection: MessagingConnectionRecord): Suppo
   if (connection.channel === "discord") return decodeDiscordConnection(connection);
   if (connection.channel === "dingtalk") return decodeDingTalkConnection(connection);
   if (connection.channel === "feishu" || connection.channel === "lark") return decodeFeishuConnection(connection);
+  if (connection.channel === "wecom") return decodeWeComConnection(connection);
   throw unavailableChannel();
 }
 
@@ -2897,13 +3027,36 @@ export function decodeFeishuMessagingConfiguration(value: unknown): FeishuMessag
   return decodeFeishuConfiguration(value);
 }
 
+function decodeWeComConnection(connection: MessagingConnectionRecord): WeComMessagingConfiguration {
+  if (connection.channel !== "wecom") throw unavailableChannel();
+  if (connection.ownerProviderUserId !== undefined) {
+    weComProviderId(connection.ownerProviderUserId, "owner user", 512);
+  }
+  return decodeWeComConfiguration(connection.configuration);
+}
+
+function decodeWeComConfiguration(value: unknown): WeComMessagingConfiguration {
+  if (!isRecord(value) || value["format"] !== 1) throw invalid("WeCom configuration is invalid.");
+  const keys = Object.keys(value).sort();
+  const expected = ["botId", "format"].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw invalid("WeCom configuration contains unsupported fields.");
+  }
+  return { format: 1, botId: weComProviderId(value["botId"], "bot ID", 256) };
+}
+
+/** Strict current-v1 decoder shared by the authenticated contract projection. */
+export function decodeWeComMessagingConfiguration(value: unknown): WeComMessagingConfiguration {
+  return decodeWeComConfiguration(value);
+}
+
 async function verifiedAttachmentMime(
   channel: SupportedMessagingChannel,
   kind: "image" | "file",
   declared: string | null,
   downloaded: MessagingDownloadedAttachment
 ): Promise<string> {
-  const maximumBytes = channel === "discord" ? 50 * 1024 * 1024
+  const maximumBytes = channel === "discord" || channel === "wecom" ? 50 * 1024 * 1024
     : channel === "feishu" || channel === "lark" ? 30 * 1024 * 1024
       : 20 * 1024 * 1024;
   if (downloaded.bytes.byteLength === 0 || downloaded.bytes.byteLength > maximumBytes) {
@@ -2941,7 +3094,7 @@ function normalizedMime(value: string): string {
 }
 
 function runtimeFailure(error: unknown, channel: string): {
-  readonly status: "conflict" | "auth_loss" | "error";
+  readonly status: "offline" | "conflict" | "auth_loss" | "error";
   readonly code: string;
   readonly summary: string;
   readonly retryable: boolean;
@@ -2953,6 +3106,14 @@ function runtimeFailure(error: unknown, channel: string): {
     }
     if (error.code === "conflict") {
       return { status: "conflict", code: "polling_conflict", summary: `Another client is connected to this ${name} bot.`, retryable: true };
+    }
+    if (channel === "wecom" && error.code === "network" && error.options.retryable) {
+      return {
+        status: "offline",
+        code: "network",
+        summary: `${name} is temporarily unavailable for this connection.`,
+        retryable: true
+      };
     }
     return {
       status: "error",
@@ -3100,8 +3261,18 @@ function feishuProviderId(value: unknown, label: string, maximum: number): strin
   return normalized;
 }
 
+function weComProviderId(value: unknown, label: string, maximum: number): string {
+  if (typeof value !== "string") throw invalid(`WeCom ${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length < 1 || normalized.length > maximum || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw invalid(`WeCom ${label} is invalid.`);
+  }
+  return normalized;
+}
+
 function isSupportedMessagingChannel(value: string): value is SupportedMessagingChannel {
-  return value === "telegram" || value === "discord" || value === "dingtalk" || value === "feishu" || value === "lark";
+  return value === "telegram" || value === "discord" || value === "dingtalk" || value === "feishu" || value === "lark"
+    || value === "wecom";
 }
 
 function requiredSupportedMessagingChannel(value: string): SupportedMessagingChannel {
@@ -3115,12 +3286,14 @@ function channelDisplayName(value: string): string {
   if (value === "dingtalk") return "DingTalk";
   if (value === "feishu") return "Feishu";
   if (value === "lark") return "Lark";
+  if (value === "wecom") return "WeCom";
   return "Messaging provider";
 }
 
 function credentialDisplayName(channel: SupportedMessagingChannel): string {
   return channel === "dingtalk" ? "DingTalk App Secret"
     : channel === "feishu" || channel === "lark" ? `${channelDisplayName(channel)} App Secret`
+      : channel === "wecom" ? "WeCom Bot Secret"
       : `${channelDisplayName(channel)} bot token`;
 }
 
@@ -3166,7 +3339,7 @@ function isOneOf<const T extends readonly string[]>(value: unknown, options: T):
 
 function validAddress(value: unknown): value is MessagingAddress {
   if (!isRecord(value)) return false;
-  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark"] as const) && typeof value["connectionId"] === "string" &&
+  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom"] as const) && typeof value["connectionId"] === "string" &&
     typeof value["providerConversationId"] === "string" &&
     (value["providerThreadId"] === null || typeof value["providerThreadId"] === "string") &&
     isOneOf(value["conversationKind"], ["direct", "group", "channel"] as const);

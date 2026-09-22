@@ -433,6 +433,7 @@ export interface OrchestratorApplicationDependencies {
   readonly messagingDingTalkApiBaseUrl?: string;
   readonly messagingDingTalkOapiBaseUrl?: string;
   readonly messagingCreateFeishuTransport?: MessagingManagerOptions["createFeishuTransport"];
+  readonly messagingCreateWeComTransport?: MessagingManagerOptions["createWeComTransport"];
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -1319,6 +1320,9 @@ export async function createOrchestratorApplication(
     ...(dependencies.messagingCreateFeishuTransport === undefined
       ? {}
       : { createFeishuTransport: dependencies.messagingCreateFeishuTransport }),
+    ...(dependencies.messagingCreateWeComTransport === undefined
+      ? {}
+      : { createWeComTransport: dependencies.messagingCreateWeComTransport }),
     ...(dependencies.messagingPollTimeoutSeconds === undefined
       ? {}
       : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),

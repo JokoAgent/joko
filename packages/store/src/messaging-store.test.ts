@@ -18,6 +18,54 @@ afterEach(() => {
 });
 
 describe("OperationalStore messaging", () => {
+  it("persists an enabled connection offline with a bounded failure and clears it on recovery", () => {
+    const fixture = createFixture();
+    const initial = fixture.store.createMessagingConnection({
+      id: "wecom-offline",
+      channel: "wecom",
+      configuration: { format: 1, botId: "wecom-bot" },
+      createdAt: 10
+    });
+    const enabled = fixture.store.replaceMessagingCredential({
+      connectionId: initial.id,
+      expectedRevision: initial.revision,
+      expectedGeneration: initial.generation,
+      credentialReferenceId: "managed-wecom-secret",
+      credentialGeneration: "1".repeat(64),
+      enable: true,
+      updatedAt: 11
+    });
+
+    const offline = fixture.store.updateMessagingConnectionRuntime({
+      connectionId: enabled.id,
+      expectedRevision: enabled.revision,
+      expectedGeneration: enabled.generation,
+      runtimeStatus: "offline",
+      error: { code: "network", summary: "WeCom is temporarily unavailable." },
+      updatedAt: 12
+    });
+    expect(offline).toMatchObject({
+      enabled: true,
+      runtimeStatus: "offline",
+      errorCode: "network",
+      errorSummary: "WeCom is temporarily unavailable."
+    });
+
+    const connected = fixture.store.updateMessagingConnectionRuntime({
+      connectionId: offline.id,
+      expectedRevision: offline.revision,
+      expectedGeneration: offline.generation,
+      runtimeStatus: "connected",
+      providerAccountId: "wecom-bot",
+      error: null,
+      connectedAt: 13,
+      updatedAt: 13
+    });
+    expect(connected).toMatchObject({ runtimeStatus: "connected" });
+    expect(connected.errorCode).toBeUndefined();
+    expect(connected.errorSummary).toBeUndefined();
+  });
+
   it("separates credential replacement from offline state and snapshots routes only when a conversation binds", () => {
     const fixture = createFixture();
     const initial = fixture.store.createMessagingConnection({

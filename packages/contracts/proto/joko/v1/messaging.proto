@@ -160,6 +160,10 @@ message FeishuGroupActivationRule {
   FeishuGroupActivation activation = 2;
 }
 
+message WeComMessagingConfiguration {
+  string bot_id = 1;
+}
+
 message MessagingChannelCapability {
   MessagingChannel channel = 1;
   bool available = 2;
@@ -186,6 +190,7 @@ message MessagingConnection {
   optional DiscordMessagingConfiguration discord_configuration = 17;
   optional DingTalkMessagingConfiguration dingtalk_configuration = 18;
   optional FeishuMessagingConfiguration feishu_configuration = 19;
+  optional WeComMessagingConfiguration wecom_configuration = 20;
 }
 
 message MessagingRoute {
@@ -219,6 +224,7 @@ message CreateMessagingConnectionRequest {
   optional DiscordMessagingConfiguration discord_configuration = 4;
   optional DingTalkMessagingConfiguration dingtalk_configuration = 5;
   optional FeishuMessagingConfiguration feishu_configuration = 6;
+  optional WeComMessagingConfiguration wecom_configuration = 7;
 }
 
 message CreateMessagingConnectionResponse {
@@ -308,6 +314,17 @@ message UpdateFeishuMessagingConfigurationRequest {
 }
 
 message UpdateFeishuMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateWeComMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  WeComMessagingConfiguration configuration = 4;
+}
+
+message UpdateWeComMessagingConfigurationResponse {
   MessagingConnection connection = 1;
 }
 

@@ -112,6 +112,17 @@ describe("Messaging gateway", () => {
           id: "lark-one",
           channel: "lark",
           feishuConfiguration: expect.objectContaining({ appId: "cli_lark" })
+        }),
+        expect.objectContaining({
+          id: "wecom-one",
+          channel: "wecom",
+          generation: 7n,
+          revision: 11n,
+          runtimeStatus: "connected",
+          credentialConfigured: true,
+          ownerProviderUserId: "wecom-owner",
+          wecomConfiguration: { botId: "bot_wecom" },
+          lastConnectedAt: 8_500
         })
       ],
       routes: [expect.objectContaining({
@@ -127,7 +138,7 @@ describe("Messaging gateway", () => {
         { channel: "dingtalk", available: true },
         { channel: "feishu", available: true },
         { channel: "lark", available: true },
-        { channel: "wecom", available: false, reason: "not implemented" },
+        { channel: "wecom", available: true },
         { channel: "wechat", available: false, reason: "not implemented" },
         { channel: "slack", available: false, reason: "not implemented" }
       ]
@@ -163,6 +174,7 @@ describe("Messaging gateway", () => {
       groupPermissionMode: "ask" as const
     };
     await fixture.gateway.createFeishuMessagingConnection("lark", feishuConfiguration, signal);
+    await fixture.gateway.createWeComMessagingConnection({ botId: " bot_new " }, signal);
     await fixture.gateway.saveMessagingCredential("telegram-one", 7n, 3n, "telegram-test-token", true, signal);
     await fixture.gateway.clearMessagingCredential("telegram-one", 7n, 3n, signal);
     await fixture.gateway.setMessagingConnectionEnabled("telegram-one", 7n, 3n, false, signal);
@@ -187,6 +199,13 @@ describe("Messaging gateway", () => {
       10n,
       6n,
       feishuConfiguration,
+      signal
+    );
+    await fixture.gateway.updateWeComMessagingConfiguration(
+      "wecom-one",
+      11n,
+      7n,
+      { botId: "bot_updated" },
       signal
     );
     await expect(fixture.gateway.testMessagingConnection("telegram-one", signal)).resolves.toEqual({
@@ -281,6 +300,13 @@ describe("Messaging gateway", () => {
       }
     });
     expect(larkCreate.ownerProviderUserId).toBeUndefined();
+    const wecomCreate = fixture.requests.find((entry) => entry.method === "createMessagingConnection"
+      && entry.input.channel === MessagingChannel.WECOM)?.input;
+    expect(wecomCreate).toMatchObject({
+      channel: MessagingChannel.WECOM,
+      wecomConfiguration: { botId: "bot_new" }
+    });
+    expect(wecomCreate.ownerProviderUserId).toBeUndefined();
     expect(byMethod("beginMessagingCredentialUpload")).toEqual({
       connectionId: "telegram-one",
       expectedRevision: { value: 7n },
@@ -350,6 +376,15 @@ describe("Messaging gateway", () => {
         groupPermissionMode: PermissionMode.ASK
       }
     });
+    expect(byMethod("updateWeComMessagingConfiguration")).toEqual({
+      connectionId: "wecom-one",
+      expectedRevision: { value: 11n },
+      expectedGeneration: 7n,
+      configuration: {
+        $typeName: "joko.v1.WeComMessagingConfiguration",
+        botId: "bot_updated"
+      }
+    });
     expect(byMethod("putMessagingRoute")).toEqual({
       connectionId: "telegram-one",
       expectedRevision: { value: 5n },
@@ -375,6 +410,17 @@ describe("Messaging gateway", () => {
     await expect(fixture.gateway.testMessagingConnection("telegram-one")).rejects.toThrow(/incomplete Messaging connection test result/iu);
     fixture.gateway.disconnect();
   });
+
+  it("fails closed on invalid or cross-channel WeCom configuration", async () => {
+    const fixture = await mount();
+    fixture.invalidWeComBotId = true;
+    await expect(fixture.gateway.getMessagingSettings()).rejects.toThrow(/invalid WeCom configuration/iu);
+    fixture.invalidWeComBotId = false;
+    fixture.crossChannelWeComConfiguration = true;
+    await expect(fixture.gateway.getMessagingSettings()).rejects.toThrow(/WeCom configuration for another Messaging channel/iu);
+    await expect(fixture.gateway.createWeComMessagingConnection({ botId: "\n" })).rejects.toThrow(/WeCom Bot ID is required/iu);
+    fixture.gateway.disconnect();
+  });
 });
 
 async function mount() {
@@ -384,6 +430,8 @@ async function mount() {
     requests,
     duplicateCapabilities: false,
     incompleteTest: false,
+    invalidWeComBotId: false,
+    crossChannelWeComConfiguration: false,
     testCalls: 0
   };
   const transport = {
@@ -396,11 +444,12 @@ async function mount() {
           const channels = channelCapabilities();
           value = {
             connections: [
-              connection(),
+              connection(fixture.crossChannelWeComConfiguration),
               discordConnection(),
               dingTalkConnection(),
               feishuConnection(),
-              feishuConnection(MessagingChannel.LARK)
+              feishuConnection(MessagingChannel.LARK),
+              wecomConnection(fixture.invalidWeComBotId)
             ],
             routes: [route()],
             channels: fixture.duplicateCapabilities ? [...channels, channels[0]] : channels
@@ -429,6 +478,7 @@ async function mount() {
             : input.channel === MessagingChannel.DINGTALK ? dingTalkConnection()
               : input.channel === MessagingChannel.FEISHU ? feishuConnection()
                 : input.channel === MessagingChannel.LARK ? feishuConnection(MessagingChannel.LARK)
+                  : input.channel === MessagingChannel.WECOM ? wecomConnection()
                   : connection()
         }; break;
         case "commitMessagingCredential":
@@ -438,6 +488,7 @@ async function mount() {
         case "updateDiscordMessagingConfiguration": value = { connection: discordConnection() }; break;
         case "updateDingTalkMessagingConfiguration": value = { connection: dingTalkConnection() }; break;
         case "updateFeishuMessagingConfiguration": value = { connection: feishuConnection() }; break;
+        case "updateWeComMessagingConfiguration": value = { connection: wecomConnection() }; break;
         default: throw new Error(`Unexpected RPC ${method.localName}`);
       }
       return response(method, create(method.output, value));
@@ -454,7 +505,7 @@ async function mount() {
   return fixture;
 }
 
-function connection() {
+function connection(crossChannelWeComConfiguration = false) {
   return {
     connectionId: "telegram-one",
     channel: MessagingChannel.TELEGRAM,
@@ -474,6 +525,7 @@ function connection() {
         { chatId: "-200", activation: TelegramGroupActivation.ALWAYS }
       ]
     },
+    ...(crossChannelWeComConfiguration ? { wecomConfiguration: { botId: "bot_cross_channel" } } : {}),
     lastConnectedAt: timestamp(4n, 500_000_000),
     createdAt: timestamp(1n),
     updatedAt: timestamp(5n),
@@ -571,6 +623,24 @@ function feishuConnection(channel = MessagingChannel.FEISHU) {
   };
 }
 
+function wecomConnection(invalidBotId = false) {
+  return {
+    connectionId: "wecom-one",
+    channel: MessagingChannel.WECOM,
+    generation: 7n,
+    enabled: true,
+    runtimeStatus: MessagingConnectionRuntimeStatus.CONNECTED,
+    credentialConfigured: true,
+    ownerProviderUserId: "wecom-owner",
+    providerAccountId: "bot_wecom",
+    wecomConfiguration: { botId: invalidBotId ? "" : "bot_wecom" },
+    lastConnectedAt: timestamp(8n, 500_000_000),
+    createdAt: timestamp(5n),
+    updatedAt: timestamp(9n),
+    revision: { value: 11n }
+  };
+}
+
 function route(overrides: Record<string, unknown> = {}) {
   return {
     scopeKey: "global",
@@ -596,7 +666,7 @@ function channelCapabilities() {
     { channel: MessagingChannel.DINGTALK, available: true },
     { channel: MessagingChannel.FEISHU, available: true },
     { channel: MessagingChannel.LARK, available: true },
-    { channel: MessagingChannel.WECOM, available: false, reason: "not implemented" },
+    { channel: MessagingChannel.WECOM, available: true },
     { channel: MessagingChannel.WECHAT, available: false, reason: "not implemented" },
     { channel: MessagingChannel.SLACK, available: false, reason: "not implemented" }
   ];

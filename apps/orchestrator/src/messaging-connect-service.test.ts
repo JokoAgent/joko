@@ -50,7 +50,9 @@ describe("MessagingService", () => {
       .toMatchObject({ available: true, reason: "" });
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.LARK))
       .toMatchObject({ available: true, reason: "" });
-    expect(channels.filter((channel) => channel.available)).toHaveLength(5);
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.WECOM))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.filter((channel) => channel.available)).toHaveLength(6);
 
     const created = await service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
@@ -530,6 +532,125 @@ describe("MessagingService", () => {
     expect(changedApp.connection?.ownerProviderUserId).toBeUndefined();
   });
 
+  it("projects strict WeCom bot configuration with first-DM ownership and revision-fenced updates", async () => {
+    const fixture = await createFixture();
+    const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
+    const context = {} as HandlerContext;
+
+    const created = await service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      {
+        channel: contract.MessagingChannel.WECOM,
+        wecomConfiguration: create(contract.WeComMessagingConfigurationSchema, {
+          botId: "wecom-bot"
+        })
+      }
+    ), context);
+    expect(created.connection).toMatchObject({
+      channel: contract.MessagingChannel.WECOM,
+      generation: 1n,
+      credentialConfigured: false,
+      runtimeStatus: contract.MessagingConnectionRuntimeStatus.IDLE,
+      wecomConfiguration: { botId: "wecom-bot" }
+    });
+    expect(created.connection?.ownerProviderUserId).toBeUndefined();
+    expect(created.connection).not.toHaveProperty("telegramConfiguration");
+    expect(created.connection).not.toHaveProperty("feishuConfiguration");
+
+    for (const request of [
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.WECOM
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.WECOM,
+        ownerProviderUserId: "forbidden-owner",
+        wecomConfiguration: create(contract.WeComMessagingConfigurationSchema, { botId: "wecom-bot" })
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.WECOM,
+        telegramConfiguration: create(contract.TelegramMessagingConfigurationSchema),
+        wecomConfiguration: create(contract.WeComMessagingConfigurationSchema, { botId: "wecom-bot" })
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.TELEGRAM,
+        ownerProviderUserId: "42",
+        wecomConfiguration: create(contract.WeComMessagingConfigurationSchema, { botId: "wecom-bot" })
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.WECOM,
+        wecomConfiguration: create(contract.WeComMessagingConfigurationSchema, { botId: "" })
+      })
+    ]) {
+      await expect(service.createMessagingConnection(request, context)).rejects.toSatisfy(
+        (error: unknown) => error instanceof ConnectError && error.code === Code.InvalidArgument
+      );
+    }
+
+    if (created.connection === undefined) throw new Error("Missing created WeCom connection.");
+    const updated = await service.updateWeComMessagingConfiguration(create(
+      contract.UpdateWeComMessagingConfigurationRequestSchema,
+      {
+        connectionId: created.connection.connectionId,
+        expectedRevision: created.connection.revision,
+        expectedGeneration: created.connection.generation,
+        configuration: create(contract.WeComMessagingConfigurationSchema, {
+          botId: "replacement-bot"
+        })
+      }
+    ), context);
+    expect(updated.connection).toMatchObject({
+      generation: 2n,
+      wecomConfiguration: { botId: "replacement-bot" }
+    });
+    expect(updated.connection?.ownerProviderUserId).toBeUndefined();
+
+    await expect(service.updateWeComMessagingConfiguration(create(
+      contract.UpdateWeComMessagingConfigurationRequestSchema,
+      {
+        connectionId: updated.connection!.connectionId,
+        expectedRevision: updated.connection!.revision,
+        expectedGeneration: updated.connection!.generation
+      }
+    ), context)).rejects.toSatisfy(
+      (error: unknown) => error instanceof ConnectError && error.code === Code.InvalidArgument
+    );
+
+    await expect(service.updateWeComMessagingConfiguration(create(
+      contract.UpdateWeComMessagingConfigurationRequestSchema,
+      {
+        connectionId: created.connection.connectionId,
+        expectedRevision: created.connection.revision,
+        expectedGeneration: created.connection.generation,
+        configuration: create(contract.WeComMessagingConfigurationSchema, {
+          botId: "stale-bot"
+        })
+      }
+    ), context)).rejects.toSatisfy(
+      (error: unknown) => error instanceof ConnectError && error.code === Code.Aborted
+    );
+
+    const telegram = await service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      {
+        channel: contract.MessagingChannel.TELEGRAM,
+        ownerProviderUserId: "42"
+      }
+    ), context);
+    await expect(service.updateWeComMessagingConfiguration(create(
+      contract.UpdateWeComMessagingConfigurationRequestSchema,
+      {
+        connectionId: telegram.connection!.connectionId,
+        expectedRevision: telegram.connection!.revision,
+        expectedGeneration: telegram.connection!.generation,
+        configuration: create(contract.WeComMessagingConfigurationSchema, {
+          botId: "cross-channel-bot"
+        })
+      }
+    ), context)).rejects.toSatisfy(
+      (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
+    );
+  });
+
   it("reports unavailable channels and nodes explicitly", async () => {
     const context = {} as HandlerContext;
     const unavailable = createMessagingConnectService(undefined, () => ({ connectionId: "desktop" }));
@@ -542,12 +663,14 @@ describe("MessagingService", () => {
 
     const fixture = await createFixture();
     const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
-    await expect(service.createMessagingConnection(create(
-      contract.CreateMessagingConnectionRequestSchema,
-      { channel: contract.MessagingChannel.WECOM }
-    ), context)).rejects.toSatisfy(
-      (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
-    );
+    for (const channel of [contract.MessagingChannel.UNSPECIFIED, contract.MessagingChannel.WECHAT]) {
+      await expect(service.createMessagingConnection(create(
+        contract.CreateMessagingConnectionRequestSchema,
+        { channel }
+      ), context)).rejects.toSatisfy(
+        (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
+      );
+    }
   });
 });
 

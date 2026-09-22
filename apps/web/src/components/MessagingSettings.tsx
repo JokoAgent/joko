@@ -25,7 +25,8 @@ import type {
   MessagingRouteView,
   MessagingSettingsView,
   PermissionMode,
-  TelegramMessagingConfigurationView
+  TelegramMessagingConfigurationView,
+  WeComMessagingConfigurationView
 } from "../model.js";
 import type { Translator } from "./types.js";
 import {
@@ -65,8 +66,10 @@ const DEFAULT_FEISHU_CONFIGURATION = Object.freeze({
   groupPermissionMode: "ask"
 } as const satisfies Omit<FeishuMessagingConfigurationView, "appId">);
 
+type MessagingCreateChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom";
+
 type MessagingDialog =
-  | { readonly kind: "create"; readonly channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark" }
+  | { readonly kind: "create"; readonly channel: MessagingCreateChannel }
   | { readonly kind: "credential"; readonly connectionId: string }
   | { readonly kind: "configuration"; readonly connectionId: string }
   | { readonly kind: "clear"; readonly connectionId: string }
@@ -189,9 +192,11 @@ export function MessagingSettings({ controller, snapshot, t }: {
     capability.channel === "feishu" && capability.available) === true;
   const larkAvailable = settings?.channels.some((capability) =>
     capability.channel === "lark" && capability.available) === true;
+  const wecomAvailable = settings?.channels.some((capability) =>
+    capability.channel === "wecom" && capability.available) === true;
 
   const createConnection = async (
-    channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark",
+    channel: MessagingCreateChannel,
     identity: string
   ): Promise<void> => {
     const connection = await run(`create:${channel}`, () => channel === "telegram"
@@ -200,10 +205,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
         ? controller.createDiscordMessagingConnection(identity, DEFAULT_DISCORD_CONFIGURATION)
         : channel === "dingtalk"
           ? controller.createDingTalkMessagingConnection({ appKey: identity, groupActivation: {} })
-          : controller.createFeishuMessagingConnection(channel, {
-              appId: identity,
-              ...DEFAULT_FEISHU_CONFIGURATION
-            }));
+          : channel === "wecom"
+            ? controller.createWeComMessagingConnection({ botId: identity })
+            : controller.createFeishuMessagingConnection(channel, {
+                appId: identity,
+                ...DEFAULT_FEISHU_CONFIGURATION
+              }));
     if (connection === undefined) return;
     replaceConnection(connection);
     setDialog({ kind: "credential", connectionId: connection.id });
@@ -411,6 +418,38 @@ export function MessagingSettings({ controller, snapshot, t }: {
     setDialog(undefined);
   };
 
+  const updateWeComConfiguration = async (
+    connection: MessagingConnectionView,
+    configuration: WeComMessagingConfigurationView
+  ): Promise<void> => {
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.updateWeComMessagingConfiguration(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        configuration
+      );
+      let candidate = await refreshConnection(connection);
+      if (wecomConfigurationEqual(candidate.wecomConfiguration, configuration)) return candidate;
+      if (candidate.generation !== connection.generation
+        || !wecomConfigurationEqual(candidate.wecomConfiguration, connection.wecomConfiguration)) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (wecomConfigurationEqual(candidate.wecomConfiguration, configuration)) return candidate;
+        if (candidate.generation !== connection.generation
+          || !wecomConfigurationEqual(candidate.wecomConfiguration, connection.wecomConfiguration)) throw reason;
+        return save(candidate);
+      }
+    });
+    if (updated === undefined) return;
+    replaceConnection(updated);
+    setDialog(undefined);
+  };
+
   const clearCredential = async (connection: MessagingConnectionView): Promise<void> => {
     const updated = await run(`clear:${connection.id}`, async () => {
       const clear = (candidate: MessagingConnectionView) => controller.clearMessagingCredential(
@@ -479,6 +518,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
         {larkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "lark" })}>
           <Plus aria-hidden="true" />{t("messaging.addLark")}
         </Button>}
+        {wecomAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "wecom" })}>
+          <Plus aria-hidden="true" />{t("messaging.addWeCom")}
+        </Button>}
       </div>
     </header>
 
@@ -528,6 +570,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
           {larkAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "lark" })}>
             <Plus aria-hidden="true" />{t("messaging.addLark")}
           </Button>}
+          {wecomAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "wecom" })}>
+            <Plus aria-hidden="true" />{t("messaging.addWeCom")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -542,10 +587,11 @@ export function MessagingSettings({ controller, snapshot, t }: {
                       <h4>{channelLabel(connection.channel)}</h4>
                       <ConnectionStatus status={connection.runtimeStatus} channel={connection.channel} t={t} />
                     </div>
-                    <p>{connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark"
+                    <p>{connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom"
                       ? connection.ownerProviderUserId === undefined
                         ? t(connection.channel === "dingtalk"
-                          ? "messaging.dingtalkAwaitingOwner" : "messaging.feishuAwaitingOwner")
+                          ? "messaging.dingtalkAwaitingOwner"
+                          : connection.channel === "wecom" ? "messaging.wecomAwaitingOwner" : "messaging.feishuAwaitingOwner")
                         : t("messaging.ownerIdentity", { id: connection.ownerProviderUserId })
                       : connection.providerUsername === undefined
                         ? t("messaging.ownerIdentity", { id: connection.ownerProviderUserId ?? "—" })
@@ -573,10 +619,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <span><strong>{t(connection.channel === "discord" ? "messaging.discordOwnerId"
                   : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId"
                     : connection.channel === "feishu" || connection.channel === "lark"
-                      ? "messaging.feishuOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId
+                      ? "messaging.feishuOwnerId"
+                      : connection.channel === "wecom" ? "messaging.wecomOwnerId" : "messaging.ownerId")}</strong>{connection.ownerProviderUserId
                     ?? (connection.channel === "dingtalk" ? t("messaging.dingtalkAwaitingOwner")
                       : connection.channel === "feishu" || connection.channel === "lark"
-                        ? t("messaging.feishuAwaitingOwner") : "—")}</span>
+                        ? t("messaging.feishuAwaitingOwner")
+                        : connection.channel === "wecom" ? t("messaging.wecomAwaitingOwner") : "—")}</span>
+                {connection.channel === "wecom" && connection.wecomConfiguration !== undefined && <span>
+                  <strong>{t("messaging.wecomBotId")}</strong>{connection.wecomConfiguration.botId}
+                </span>}
               </div>
 
               {(connection.runtimeStatus === "conflict" || connection.runtimeStatus === "authLoss" || connection.runtimeStatus === "error") &&
@@ -609,6 +660,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                     ? "messaging.dingtalkClearCredential"
                     : connection.channel === "feishu" || connection.channel === "lark"
                       ? "messaging.appSecretClearCredential"
+                      : connection.channel === "wecom" ? "messaging.wecomClearCredential"
                       : "messaging.clearCredential")}
                 </Button>}
               </footer>
@@ -664,6 +716,14 @@ export function MessagingSettings({ controller, snapshot, t }: {
       onClose={() => setDialog(undefined)}
       onSubmit={(configuration) => { void updateFeishuConfiguration(connectionForDialog, configuration); }}
     />}
+    {connectionForDialog !== undefined && connectionForDialog.wecomConfiguration !== undefined && <WeComConfigurationDialog
+      open={dialog?.kind === "configuration"}
+      connection={connectionForDialog}
+      busy={busy === `configuration:${connectionForDialog.id}`}
+      t={t}
+      onClose={() => setDialog(undefined)}
+      onSubmit={(configuration) => { void updateWeComConfiguration(connectionForDialog, configuration); }}
+    />}
     {connectionForDialog !== undefined && <ClearCredentialDialog
       open={dialog?.kind === "clear"}
       connection={connectionForDialog}
@@ -700,6 +760,8 @@ function ConnectionStatus({ status, channel, t }: {
   return <span className={cx("messaging-status", `messaging-status--${status}`)}>
     <span aria-hidden="true" />{t(status === "idle" && channel === "dingtalk"
       ? "messaging.status.dingtalkIdle"
+      : status === "idle" && channel === "wecom"
+        ? "messaging.status.wecomIdle"
       : status === "idle" && (channel === "feishu" || channel === "lark")
         ? "messaging.status.appSecretIdle"
       : `messaging.status.${status}`)}
@@ -730,11 +792,11 @@ function RouteSummary({ route, fallback, snapshot, t, compact = false }: {
 
 function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
   readonly open: boolean;
-  readonly channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark";
+  readonly channel: MessagingCreateChannel;
   readonly busy: boolean;
   readonly t: Translator;
   readonly onClose: () => void;
-  readonly onSubmit: (channel: "telegram" | "discord" | "dingtalk" | "feishu" | "lark", identity: string) => void;
+  readonly onSubmit: (channel: MessagingCreateChannel, identity: string) => void;
 }): JSX.Element {
   const [identity, setIdentity] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -745,16 +807,20 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
       ? validDingTalkProviderId(identity, 256)
       : channel === "feishu" || channel === "lark"
         ? validFeishuProviderId(identity, 256)
+        : channel === "wecom"
+          ? validWeComBotId(identity)
         : /^[1-9][0-9]{0,15}$/u.test(identity.trim());
   return <Modal
     open={open}
     title={channel === "discord" ? t("messaging.discordCreateTitle")
       : channel === "dingtalk" ? t("messaging.dingtalkCreateTitle")
         : channel === "feishu" ? t("messaging.feishuCreateTitle")
-          : channel === "lark" ? t("messaging.larkCreateTitle") : t("messaging.createTitle")}
+          : channel === "lark" ? t("messaging.larkCreateTitle")
+            : channel === "wecom" ? t("messaging.wecomCreateTitle") : t("messaging.createTitle")}
     description={channel === "discord" ? t("messaging.discordCreateBody")
       : channel === "dingtalk" ? t("messaging.dingtalkCreateBody")
-        : channel === "feishu" || channel === "lark" ? t("messaging.feishuCreateBody") : t("messaging.createBody")}
+        : channel === "feishu" || channel === "lark" ? t("messaging.feishuCreateBody")
+          : channel === "wecom" ? t("messaging.wecomCreateBody") : t("messaging.createBody")}
     closeLabel={t("common.close")}
     onClose={onClose}
     initialFocus={() => inputRef.current}
@@ -764,10 +830,12 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
       <label><span>{channel === "discord" ? t("messaging.discordOwnerId")
         : channel === "dingtalk" ? t("messaging.dingtalkAppKey")
           : channel === "feishu" || channel === "lark" ? t("messaging.feishuAppId")
-            : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "telegram" || channel === "discord" ? "numeric" : "text"} autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : channel === "feishu" || channel === "lark" ? "cli_xxxxxxxx" : "123456789"} /></label>
+            : channel === "wecom" ? t("messaging.wecomBotId")
+            : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "telegram" || channel === "discord" ? "numeric" : "text"} autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : channel === "feishu" || channel === "lark" ? "cli_xxxxxxxx" : channel === "wecom" ? "bot_xxxxxxxx" : "123456789"} /></label>
       <p className="messaging-form__hint">{channel === "discord" ? t("messaging.discordOwnerIdBody")
         : channel === "dingtalk" ? t("messaging.dingtalkAppKeyBody")
           : channel === "feishu" || channel === "lark" ? t("messaging.feishuAppIdBody")
+            : channel === "wecom" ? t("messaging.wecomBotIdBody")
             : t("messaging.ownerIdBody")}</p>
       {channel === "discord" && <p className="messaging-form__hint"><a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">{t("messaging.discordDeveloperPortal")}</a></p>}
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.continue")}</Button></div>
@@ -786,16 +854,18 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
   const [secret, setSecret] = useState("");
   const [enable, setEnable] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
-  const appSecret = connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark";
+  const appSecret = connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom";
   const credentialLabel = connection.channel === "dingtalk"
     ? "messaging.dingtalkAppSecret"
-    : appSecret ? "messaging.appSecret" : "messaging.botToken";
+    : connection.channel === "wecom" ? "messaging.wecomBotSecret"
+      : appSecret ? "messaging.appSecret" : "messaging.botToken";
   const secretSafety = connection.channel === "dingtalk"
     ? "messaging.dingtalkSecretSafety"
-    : appSecret ? "messaging.appSecretSafety" : "messaging.secretSafety";
+    : connection.channel === "wecom" ? "messaging.wecomSecretSafety"
+      : appSecret ? "messaging.appSecretSafety" : "messaging.secretSafety";
   useEffect(() => { if (open) { setSecret(""); setEnable(true); } }, [open, connection.id]);
-  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
-    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (secret.trim() !== "") onSubmit(secret, enable); }}>
+  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : connection.channel === "wecom" ? "messaging.wecomCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
+    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); const value = secret; if (value.trim() !== "") { setSecret(""); onSubmit(value, enable); } }}>
       <label><span>{t(credentialLabel)}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
       <label className="messaging-choice-row"><CheckboxControl checked={enable} onChange={(event) => setEnable(event.target.checked)} aria-label={t("messaging.enableAfterSave")} /><span>{t("messaging.enableAfterSave")}</span></label>
       <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t(secretSafety)}</p>
@@ -997,6 +1067,32 @@ function FeishuConfigurationDialog({ open, connection, busy, t, onClose, onSubmi
   </Modal>;
 }
 
+function WeComConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
+  readonly open: boolean;
+  readonly connection: MessagingConnectionView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onSubmit: (configuration: WeComMessagingConfigurationView) => void;
+}): JSX.Element {
+  const [botId, setBotId] = useState(connection.wecomConfiguration!.botId);
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (open) setBotId(connection.wecomConfiguration!.botId);
+  }, [connection, open]);
+  const valid = validWeComBotId(botId);
+  return <Modal open={open} title={t("messaging.wecomConfigureTitle")} description={t("messaging.wecomConfigureBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
+    <form className="messaging-form" onSubmit={(event) => {
+      event.preventDefault();
+      if (valid) onSubmit({ botId: botId.trim() });
+    }}>
+      <label><span>{t("messaging.wecomBotId")}</span><input ref={inputRef} value={botId} onChange={(event) => setBotId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+      <p className="messaging-form__hint">{t("messaging.wecomBotIdChangeBody")}</p>
+      <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
+    </form>
+  </Modal>;
+}
+
 function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }: {
   readonly open: boolean;
   readonly connection: MessagingConnectionView;
@@ -1006,11 +1102,13 @@ function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }
   readonly onConfirm: () => void;
 }): JSX.Element {
   const dingtalk = connection.channel === "dingtalk";
-  const appSecret = connection.channel === "feishu" || connection.channel === "lark";
+  const appSecret = connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom";
   const title = dingtalk ? "messaging.dingtalkClearTitle"
-    : appSecret ? "messaging.appSecretClearTitle" : "messaging.clearTitle";
+    : connection.channel === "wecom" ? "messaging.wecomClearTitle"
+      : appSecret ? "messaging.appSecretClearTitle" : "messaging.clearTitle";
   const action = dingtalk ? "messaging.dingtalkClearCredential"
-    : appSecret ? "messaging.appSecretClearCredential" : "messaging.clearCredential";
+    : connection.channel === "wecom" ? "messaging.wecomClearCredential"
+      : appSecret ? "messaging.appSecretClearCredential" : "messaging.clearCredential";
   return <Modal open={open} title={t(title)} description={t("messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
     <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(action)}</Button></div>
   </Modal>;
@@ -1181,6 +1279,13 @@ function validFeishuProviderId(value: string, maximum: number): boolean {
   return normalized.length >= 1 && normalized.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(normalized);
 }
 
+function validWeComBotId(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length >= 1
+    && normalized.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(normalized);
+}
+
 function telegramConfigurationEqual(
   left: TelegramMessagingConfigurationView | undefined,
   right: TelegramMessagingConfigurationView | undefined
@@ -1226,12 +1331,23 @@ function feishuConfigurationEqual(
     && activationRulesEqual(left.groupActivation, right.groupActivation);
 }
 
+function wecomConfigurationEqual(
+  left: WeComMessagingConfigurationView | undefined,
+  right: WeComMessagingConfigurationView | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.botId === right.botId;
+}
+
 function messagingCredentialActionLabel(connection: MessagingConnectionView, t: Translator): string {
   if (connection.channel === "dingtalk") {
     return t(connection.credentialConfigured ? "messaging.dingtalkReplaceCredential" : "messaging.dingtalkAddCredential");
   }
   if (connection.channel === "feishu" || connection.channel === "lark") {
     return t(connection.credentialConfigured ? "messaging.feishuReplaceCredential" : "messaging.feishuAddCredential");
+  }
+  if (connection.channel === "wecom") {
+    return t(connection.credentialConfigured ? "messaging.wecomReplaceCredential" : "messaging.wecomAddCredential");
   }
   return t(connection.credentialConfigured ? "messaging.replaceCredential" : "messaging.addCredential");
 }

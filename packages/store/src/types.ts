@@ -785,7 +785,7 @@ export interface UpdateMessagingConnectionRuntimeInput {
   readonly connectionId: string;
   readonly expectedRevision: bigint;
   readonly expectedGeneration: number;
-  readonly runtimeStatus: Exclude<MessagingConnectionRuntimeStatus, "idle" | "offline">;
+  readonly runtimeStatus: Exclude<MessagingConnectionRuntimeStatus, "idle">;
   readonly cursor?: string | null;
   readonly providerAccountId?: string | null;
   readonly providerUsername?: string | null;

@@ -178,6 +178,26 @@ test("voice input remains an ephemeral capability surface", () => {
   assert.equal(fieldNames(contract.SnapshotSchema).has("voice_input"), false);
 });
 
+test("WeCom messaging exposes one strict non-secret bot configuration and revision-fenced update", () => {
+  assert.equal(field(contract.WeComMessagingConfigurationSchema, "bot_id").number, 1);
+  assert.equal(field(contract.MessagingConnectionSchema, "wecom_configuration").number, 20);
+  assert.equal(field(contract.CreateMessagingConnectionRequestSchema, "wecom_configuration").number, 7);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "connection_id").number, 1);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "expected_revision").number, 2);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "expected_generation").number, 3);
+  assert.equal(field(contract.UpdateWeComMessagingConfigurationRequestSchema, "configuration").number, 4);
+  assert.equal(methodNames(contract.MessagingService).has("updateWeComMessagingConfiguration"), true);
+  assertNoFields([
+    contract.WeComMessagingConfigurationSchema,
+    contract.MessagingConnectionSchema,
+    contract.CreateMessagingConnectionRequestSchema,
+    contract.UpdateWeComMessagingConfigurationRequestSchema
+  ], ["secret", "token", "credential", "credential_reference_id", "authorization"]);
+
+  const value = roundTrip(contract.WeComMessagingConfigurationSchema, { botId: "wecom-bot" });
+  assert.equal(value.botId, "wecom-bot");
+});
+
 test("Contacts exposes revision-fenced local and explicit device-sync authority without secret transport fields", () => {
   assert.deepEqual([...methodNames(contract.ContactService)], [
     "getContactDirectory",

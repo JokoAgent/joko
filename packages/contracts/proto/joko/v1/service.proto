@@ -207,6 +207,7 @@ service MessagingService {
   rpc UpdateDiscordMessagingConfiguration(UpdateDiscordMessagingConfigurationRequest) returns (UpdateDiscordMessagingConfigurationResponse);
   rpc UpdateDingTalkMessagingConfiguration(UpdateDingTalkMessagingConfigurationRequest) returns (UpdateDingTalkMessagingConfigurationResponse);
   rpc UpdateFeishuMessagingConfiguration(UpdateFeishuMessagingConfigurationRequest) returns (UpdateFeishuMessagingConfigurationResponse);
+  rpc UpdateWeComMessagingConfiguration(UpdateWeComMessagingConfigurationRequest) returns (UpdateWeComMessagingConfigurationResponse);
   rpc TestMessagingConnection(TestMessagingConnectionRequest) returns (TestMessagingConnectionResponse);
   rpc PutMessagingRoute(PutMessagingRouteRequest) returns (PutMessagingRouteResponse);
 }

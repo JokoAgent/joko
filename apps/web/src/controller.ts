@@ -2402,6 +2402,8 @@ export function useAppController(): AppController {
       gateway().createDingTalkMessagingConnection(configuration, signal),
     createFeishuMessagingConnection: (channel, configuration, signal) =>
       gateway().createFeishuMessagingConnection(channel, configuration, signal),
+    createWeComMessagingConnection: (configuration, signal) =>
+      gateway().createWeComMessagingConnection(configuration, signal),
     saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
       gateway().saveMessagingCredential(
         connectionId,
@@ -2471,6 +2473,19 @@ export function useAppController(): AppController {
       configuration,
       signal
     ) => gateway().updateFeishuMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ),
+    updateWeComMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      configuration,
+      signal
+    ) => gateway().updateWeComMessagingConfiguration(
       connectionId,
       expectedRevision,
       expectedGeneration,

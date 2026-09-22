@@ -4277,6 +4277,10 @@ export interface FeishuMessagingConfigurationView {
   readonly groupPermissionMode: "ask" | "bypassPermissions";
 }
 
+export interface WeComMessagingConfigurationView {
+  readonly botId: string;
+}
+
 export interface MessagingConnectionView {
   readonly id: string;
   readonly channel: MessagingChannelView;
@@ -4292,6 +4296,7 @@ export interface MessagingConnectionView {
   readonly discordConfiguration?: DiscordMessagingConfigurationView;
   readonly dingtalkConfiguration?: DingTalkMessagingConfigurationView;
   readonly feishuConfiguration?: FeishuMessagingConfigurationView;
+  readonly wecomConfiguration?: WeComMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -5541,6 +5546,10 @@ export interface OperationApi {
     configuration: FeishuMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  createWeComMessagingConnection(
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
   saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -5590,6 +5599,13 @@ export interface OperationApi {
     expectedRevision: bigint,
     expectedGeneration: bigint,
     configuration: FeishuMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateWeComMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: WeComMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
   testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;

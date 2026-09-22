@@ -4759,7 +4759,7 @@ export class OperationalStore {
         );
       }
       const status = messagingRuntimeStatus(input.runtimeStatus);
-      const needsError = status === "conflict" || status === "auth_loss" || status === "error";
+      const needsError = status === "offline" || status === "conflict" || status === "auth_loss" || status === "error";
       if (needsError !== (input.error !== null && input.error !== undefined)) {
         throw new StoreError("Messaging failure states require one bounded error and healthy states forbid it.");
       }

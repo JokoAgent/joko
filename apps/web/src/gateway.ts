@@ -408,6 +408,7 @@ import {
   type DiscordMessagingConfiguration as ProtoDiscordMessagingConfiguration,
   type FeishuMessagingConfiguration as ProtoFeishuMessagingConfiguration,
   type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
+  type WeComMessagingConfiguration as ProtoWeComMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
   type ModelDescriptor,
@@ -620,6 +621,7 @@ import type {
   DingTalkMessagingConfigurationView,
   DiscordMessagingConfigurationView,
   FeishuMessagingConfigurationView,
+  WeComMessagingConfigurationView,
   OperationApi,
   PartnerCapabilitiesView,
   PartnerActivityView,
@@ -5943,6 +5945,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapMessagingConnection(response.connection);
   }
 
+  async createWeComMessagingConnection(
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.WECOM,
+      wecomConfiguration: protoWeComMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
   async saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,
@@ -6078,6 +6093,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         expectedRevision: { value: expectedRevision },
         expectedGeneration,
         configuration: protoFeishuMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateWeComMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateWeComMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        configuration: protoWeComMessagingConfiguration(configuration)
       }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
@@ -18378,6 +18412,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const feishuConfiguration = channel === "feishu" || channel === "lark"
     ? mapFeishuMessagingConfiguration(value.feishuConfiguration)
     : undefined;
+  const wecomConfiguration = channel === "wecom"
+    ? mapWeComMessagingConfiguration(value.wecomConfiguration)
+    : undefined;
   if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
   }
@@ -18389,6 +18426,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   }
   if (channel !== "feishu" && channel !== "lark" && value.feishuConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Feishu/Lark configuration for another Messaging channel.");
+  }
+  if (channel !== "wecom" && value.wecomConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned WeCom configuration for another Messaging channel.");
   }
   return {
     id: value.connectionId,
@@ -18405,6 +18445,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(discordConfiguration === undefined ? {} : { discordConfiguration }),
     ...(dingtalkConfiguration === undefined ? {} : { dingtalkConfiguration }),
     ...(feishuConfiguration === undefined ? {} : { feishuConfiguration }),
+    ...(wecomConfiguration === undefined ? {} : { wecomConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -18719,6 +18760,33 @@ function protoFeishuMessagingConfiguration(
       ? ProtoPermissionMode.ASK
       : ProtoPermissionMode.BYPASS_PERMISSIONS
   };
+}
+
+function mapWeComMessagingConfiguration(
+  value: ProtoWeComMessagingConfiguration | undefined
+): WeComMessagingConfigurationView {
+  if (value === undefined || !validWeComBotId(value.botId)) {
+    throw new GatewayError("Orchestrator returned an invalid WeCom configuration.");
+  }
+  return { botId: value.botId };
+}
+
+function protoWeComMessagingConfiguration(
+  value: WeComMessagingConfigurationView
+): ProtoWeComMessagingConfiguration {
+  const botId = value.botId.trim();
+  if (!validWeComBotId(botId)) throw new GatewayError("WeCom Bot ID is required.");
+  return {
+    $typeName: "joko.v1.WeComMessagingConfiguration",
+    botId
+  };
+}
+
+function validWeComBotId(value: string): boolean {
+  const normalized = value.trim();
+  return normalized.length >= 1
+    && normalized.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(normalized);
 }
 
 function mapMessagingTestFailure(

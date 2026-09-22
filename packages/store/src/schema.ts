@@ -1483,7 +1483,7 @@ CREATE TABLE messaging_channels (
           OR (enabled = 0 AND runtime_status = 'idle' AND cursor IS NULL)
         ),
         CHECK (runtime_status <> 'idle' OR credential_reference_id IS NULL),
-        CHECK (runtime_status <> 'offline' OR (enabled = 0 AND credential_reference_id IS NOT NULL)),
+        CHECK (runtime_status <> 'offline' OR credential_reference_id IS NOT NULL),
         CHECK ((error_code IS NULL) = (error_summary IS NULL))
       ) STRICT;
 

@@ -43,6 +43,11 @@ import {
   TELEGRAM_SYSTEM_TOKEN,
   TelegramSystemFixture
 } from "./telegram-system-fixture.js";
+import {
+  WECOM_SYSTEM_BOT_ID,
+  WECOM_SYSTEM_BOT_SECRET,
+  WeComSystemFixture
+} from "./wecom-system-fixture.js";
 
 const MOUNTED_CHAIN_ENABLED = nonBlankEnvironment("JOKO_BROWSER_EXECUTABLE") !== undefined
   && nonBlankEnvironment("JOKO_MOUNTED_WEB_DIR") !== undefined;
@@ -54,6 +59,7 @@ describe("mounted Messaging Settings product chain", () => {
   let discord: DiscordSystemFixture | undefined;
   let dingtalk: DingTalkSystemFixture | undefined;
   let feishu: FeishuSystemFixture | undefined;
+  let wecom: WeComSystemFixture | undefined;
   let browser: Browser | undefined;
 
   afterEach(async () => {
@@ -68,15 +74,17 @@ describe("mounted Messaging Settings product chain", () => {
     await dingtalk?.close();
     dingtalk = undefined;
     feishu = undefined;
+    wecom = undefined;
   });
 
-  mountedIt("configures the complete Telegram, Discord, DingTalk, Feishu, and Lark matrix through wide and narrow production Web", { timeout: 180_000 }, async () => {
+  mountedIt("configures the complete Telegram, Discord, DingTalk, Feishu, Lark, and WeCom matrix through wide and narrow production Web", { timeout: 180_000 }, async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
     telegram = await TelegramSystemFixture.start();
     discord = await DiscordSystemFixture.start();
     dingtalk = await DingTalkSystemFixture.start();
     feishu = new FeishuSystemFixture();
+    wecom = new WeComSystemFixture();
     fixture = await RealPiSystemFixture.start({
       webDirectory,
       telegramApiBaseUrl: telegram.baseUrl,
@@ -84,6 +92,7 @@ describe("mounted Messaging Settings product chain", () => {
       dingTalkApiBaseUrl: dingtalk.baseUrl,
       dingTalkOapiBaseUrl: dingtalk.baseUrl,
       createFeishuTransport: feishu.createTransport,
+      createWeComTransport: wecom.createTransport,
       messagingPollTimeoutSeconds: 1,
       messagingRetryDelayMs: 250
     });
@@ -111,12 +120,13 @@ describe("mounted Messaging Settings product chain", () => {
     });
     browserErrors.splice(0);
     expect(await settings.locator(".messaging-channel").count()).toBe(8);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(5);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(6);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Discord", { exact: true }).waitFor({ state: "visible" });
     await settings.getByText("DingTalk", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Feishu", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Lark", { exact: true }).first().waitFor({ state: "visible" });
+    await settings.getByText("WeCom", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Slack", { exact: true }).waitFor({ state: "visible" });
 
     await settings.getByRole("button", { name: "Set route", exact: true }).click();
@@ -232,6 +242,54 @@ describe("mounted Messaging Settings product chain", () => {
       15_000
     );
 
+    await settings.getByRole("button", { name: "Add WeCom", exact: true }).first().click();
+    const wecomCreateDialog = page.getByRole("dialog", { name: "Add WeCom" });
+    await wecomCreateDialog.getByLabel("WeCom Bot ID").fill(WECOM_SYSTEM_BOT_ID);
+    await wecomCreateDialog.getByRole("button", { name: "Continue", exact: true }).click();
+    const wecomCredentialDialog = page.getByRole("dialog", { name: "Add Bot Secret" });
+    await wecomCredentialDialog.getByLabel("WeCom Bot Secret").fill(WECOM_SYSTEM_BOT_SECRET);
+    await wecomCredentialDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await wecomCredentialDialog.waitFor({ state: "hidden" });
+    expect(await page.locator("body").innerText()).not.toContain(WECOM_SYSTEM_BOT_SECRET);
+
+    const wecomCard = settings.locator(".messaging-connection-card").filter({
+      has: page.getByRole("heading", { name: "WeCom", exact: true })
+    });
+    await wecomCard.getByText("Connected", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    const wecomBotIdFact = wecomCard.locator(".messaging-connection-card__facts span")
+      .filter({ hasText: WECOM_SYSTEM_BOT_ID });
+    await wecomBotIdFact.waitFor({ state: "visible" });
+    expect(await wecomBotIdFact.textContent()).toContain(WECOM_SYSTEM_BOT_ID);
+    await wecomCard.getByText("Waiting for first direct message", { exact: true }).first().waitFor({ state: "visible" });
+    await wecomCard.getByRole("button", { name: "Test", exact: true }).click();
+    await wecomCard.getByText("Connected as Joko WeCom system bot.", { exact: true }).waitFor({
+      state: "visible",
+      timeout: 15_000
+    });
+
+    await wecomCard.getByRole("button", { name: "Configure", exact: true }).click();
+    let wecomConfigurationDialog = page.getByRole("dialog", { name: "WeCom identity" });
+    expect(await wecomConfigurationDialog.getByLabel("WeCom Bot ID").inputValue()).toBe(WECOM_SYSTEM_BOT_ID);
+    await wecomConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await wecomConfigurationDialog.waitFor({ state: "hidden" });
+    await wecomCard.getByRole("button", { name: "Configure", exact: true }).click();
+    wecomConfigurationDialog = page.getByRole("dialog", { name: "WeCom identity" });
+    expect(await wecomConfigurationDialog.getByLabel("WeCom Bot ID").inputValue()).toBe(WECOM_SYSTEM_BOT_ID);
+    await page.keyboard.press("Escape");
+    await wecomConfigurationDialog.waitFor({ state: "hidden" });
+
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.channel === MessagingChannel.WECOM
+        && connection.wecomConfiguration?.botId === WECOM_SYSTEM_BOT_ID
+        && connection.ownerProviderUserId === undefined
+        && connection.credentialConfigured
+        && connection.enabled),
+      "the mounted WeCom identity and provisional owner state",
+      15_000
+    );
+
     await discordCard.getByRole("button", { name: "Configure", exact: true }).click();
     discordConfigurationDialog = page.getByRole("dialog", { name: "Discord behavior" });
     expect(await discordConfigurationDialog.getByLabel("Lifecycle announcements").isChecked()).toBe(false);
@@ -284,6 +342,27 @@ describe("mounted Messaging Settings product chain", () => {
           rule.conversationId === "cid-ding-muted"
           && rule.activation === DingTalkGroupActivation.DISABLED)),
       "the mounted DingTalk behavior matrix",
+      15_000
+    );
+
+    await wecomCard.getByRole("button", { name: "Clear Bot Secret", exact: true }).click();
+    const wecomClearDialog = page.getByRole("alertdialog", { name: "Clear WeCom Bot Secret?" });
+    await wecomClearDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await wecomClearDialog.waitFor({ state: "hidden" });
+    await wecomCard.getByText("Connected", { exact: true }).waitFor({ state: "visible" });
+    await wecomCard.getByRole("button", { name: "Clear Bot Secret", exact: true }).click();
+    const confirmedWeComClearDialog = page.getByRole("alertdialog", { name: "Clear WeCom Bot Secret?" });
+    await confirmedWeComClearDialog.getByRole("button", { name: "Clear Bot Secret", exact: true }).click();
+    await confirmedWeComClearDialog.waitFor({ state: "hidden" });
+    await wecomCard.getByText("Needs Bot Secret", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    await waitFor(
+      () => inspector.clients.messaging.getMessagingSettings({}),
+      (value) => value.connections.some((connection) =>
+        connection.channel === MessagingChannel.WECOM
+        && connection.ownerProviderUserId === undefined
+        && !connection.credentialConfigured
+        && !connection.enabled),
+      "the mounted WeCom credential and provisional owner clear",
       15_000
     );
 
@@ -469,12 +548,14 @@ describe("mounted Messaging Settings product chain", () => {
     await dingtalkCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     await feishuCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     await larkCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
+    await wecomCard.getByRole("button", { name: "Configure", exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(await card.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await discordCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await dingtalkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await feishuCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await larkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    expect(await wecomCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
 
     const durableProjection = JSON.stringify({
@@ -487,6 +568,7 @@ describe("mounted Messaging Settings product chain", () => {
     expect(durableProjection).not.toContain(DINGTALK_SYSTEM_APP_SECRET);
     expect(durableProjection).not.toContain(FEISHU_SYSTEM_APP_SECRET);
     expect(durableProjection).not.toContain(LARK_SYSTEM_APP_SECRET);
+    expect(durableProjection).not.toContain(WECOM_SYSTEM_BOT_SECRET);
   });
 });
 

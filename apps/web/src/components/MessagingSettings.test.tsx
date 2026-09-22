@@ -45,7 +45,7 @@ describe("Messaging settings", () => {
     const container = await renderSettings(controller, snapshot());
 
     expect(container.querySelectorAll(".messaging-channel")).toHaveLength(8);
-    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(5);
+    expect(container.querySelectorAll(".messaging-channel.is-available")).toHaveLength(6);
     expect(container.textContent).toContain("Conflict");
     expect(container.textContent).toContain("Another poller owns this bot token.");
 
@@ -236,6 +236,149 @@ describe("Messaging settings", () => {
     expect(container.textContent).toContain("Replace App Secret");
   });
 
+  it("creates WeCom with Bot ID and clears each one-shot Bot Secret immediately", async () => {
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(390);
+    const created = wecomConnection({
+      enabled: false,
+      runtimeStatus: "idle",
+      credentialConfigured: false,
+      ownerProviderUserId: undefined
+    });
+    const saved = wecomConnection({
+      enabled: true,
+      runtimeStatus: "connecting",
+      credentialConfigured: true,
+      ownerProviderUserId: undefined,
+      revision: 12n
+    });
+    const replaced = wecomConnection({ ...saved, revision: 13n });
+    let finishFirstSave: ((connection: MessagingConnectionView) => void) | undefined;
+    const create = vi.fn(async () => created);
+    const save = vi.fn()
+      .mockImplementationOnce(() => new Promise<MessagingConnectionView>((resolve) => { finishFirstSave = resolve; }))
+      .mockResolvedValueOnce(replaced);
+    const controller = controllerFixture(messagingSettings([]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([]))
+        .mockResolvedValueOnce(messagingSettings([created]))
+        .mockResolvedValue(messagingSettings([saved])),
+      createWeComMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add WeCom")[0]!.click());
+    const botId = required(document.querySelector<HTMLInputElement>('input[placeholder="bot_xxxxxxxx"]'));
+    expect(document.activeElement).toBe(botId);
+    await change(botId, "bot_new");
+    await act(async () => button(document.body, "Continue").click());
+    expect(create).toHaveBeenCalledWith({ botId: "bot_new" });
+
+    const credentialDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(credentialDialog.textContent).toContain("WeCom Bot Secret");
+    const secret = required(credentialDialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    await change(secret, "wecom-secret");
+    await act(async () => {
+      button(credentialDialog, "Save").click();
+      await Promise.resolve();
+    });
+    expect(save).toHaveBeenCalledWith("wecom-one", 11n, 7n, "wecom-secret", true);
+    expect(secret.value).toBe("");
+    expect(document.body.textContent).not.toContain("wecom-secret");
+    await act(async () => finishFirstSave?.(saved));
+
+    expect(container.textContent).toContain("Waiting for first direct message");
+    await act(async () => button(container, "Replace Bot Secret").click());
+    const replacement = required(document.querySelector<HTMLInputElement>('input[type="password"]'));
+    expect(replacement.value).toBe("");
+    await change(replacement, "wecom-replacement");
+    await act(async () => button(document.body, "Save").click());
+    expect(save).toHaveBeenLastCalledWith("wecom-one", 12n, 7n, "wecom-replacement", true);
+    expect(document.body.textContent).not.toContain("wecom-replacement");
+
+    const replace = button(container, "Replace Bot Secret");
+    await act(async () => { replace.focus(); replace.click(); });
+    expect(document.activeElement).toBe(document.querySelector('input[type="password"]'));
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(replace);
+  });
+
+  it("updates WeCom Bot ID and exposes test, enable, disable, and clear actions", async () => {
+    const original = wecomConnection();
+    const configured = wecomConnection({
+      generation: 8n,
+      revision: 12n,
+      ownerProviderUserId: undefined,
+      wecomConfiguration: { botId: "bot_replacement" }
+    });
+    const disabled = wecomConnection({ ...configured, enabled: false });
+    const cleared = wecomConnection({ ...disabled, credentialConfigured: false, runtimeStatus: "idle", revision: 13n });
+    const update = vi.fn(async () => configured);
+    const test = vi.fn(async () => ({ ok: true as const, providerAccountId: "bot_wecom", displayName: "WeCom bot" }));
+    const setEnabled = vi.fn(async () => disabled);
+    const clear = vi.fn(async () => cleared);
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([original]))
+        .mockResolvedValueOnce(messagingSettings([original]))
+        .mockResolvedValueOnce(messagingSettings([configured]))
+        .mockResolvedValue(messagingSettings([disabled])),
+      updateWeComMessagingConfiguration: update,
+      testMessagingConnection: test,
+      setMessagingConnectionEnabled: setEnabled,
+      clearMessagingCredential: clear
+    });
+    const container = await renderSettings(controller, snapshot());
+    expect(container.textContent).toContain("bot_wecom");
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("WeCom identity");
+    const botId = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    expect(document.activeElement).toBe(botId);
+    await change(botId, "bot_replacement");
+    await act(async () => button(dialog, "Save").click());
+    expect(update).toHaveBeenCalledWith("wecom-one", 11n, 7n, { botId: "bot_replacement" });
+    expect(container.textContent).toContain("Waiting for first direct message");
+
+    await act(async () => button(container, "Test").click());
+    expect(test).toHaveBeenCalledWith("wecom-one");
+    expect(container.textContent).toContain("Connected as WeCom bot");
+
+    const toggle = required(container.querySelector<HTMLInputElement>('.messaging-switch-label input[type="checkbox"]'));
+    await act(async () => toggle.click());
+    expect(setEnabled).toHaveBeenCalledWith("wecom-one", 12n, 8n, false);
+
+    await act(async () => button(container, "Clear Bot Secret").click());
+    const clearDialog = required(document.querySelector<HTMLElement>('[role="alertdialog"]'));
+    await act(async () => button(clearDialog, "Clear Bot Secret").click());
+    expect(clear).toHaveBeenCalledWith("wecom-one", 12n, 8n);
+    expect(container.textContent).toContain("Needs Bot Secret");
+  });
+
+  it("fails closed when WeCom configuration drifts while its editor is open", async () => {
+    const original = wecomConnection();
+    const drifted = wecomConnection({ revision: 12n, wecomConfiguration: { botId: "bot_external" } });
+    const update = vi.fn(async () => drifted);
+    const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([original]))
+        .mockResolvedValue(messagingSettings([drifted])),
+      updateWeComMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    await change(required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]')), "bot_local");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("The Messaging connection changed");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+  });
+
   it("saves Discord lifecycle, reply, reaction, and approved server-channel policy together", async () => {
     const original = discordConnection();
     const refreshed = discordConnection({ revision: 9n });
@@ -403,6 +546,7 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     createDiscordMessagingConnection: vi.fn(async () => discordConnection()),
     createDingTalkMessagingConnection: vi.fn(async () => dingTalkConnection()),
     createFeishuMessagingConnection: vi.fn(async () => feishuConnection()),
+    createWeComMessagingConnection: vi.fn(async () => wecomConnection()),
     saveMessagingCredential: vi.fn(unchanged),
     clearMessagingCredential: vi.fn(unchanged),
     setMessagingConnectionEnabled: vi.fn(unchanged),
@@ -410,6 +554,7 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     updateDiscordMessagingConfiguration: vi.fn(async () => discordConnection()),
     updateDingTalkMessagingConfiguration: vi.fn(async () => dingTalkConnection()),
     updateFeishuMessagingConfiguration: vi.fn(async () => feishuConnection()),
+    updateWeComMessagingConfiguration: vi.fn(async () => wecomConnection()),
     testMessagingConnection: vi.fn(async () => ({ ok: true as const, providerAccountId: "9001", displayName: "Joko Bot" })),
     putMessagingRoute: vi.fn(async () => messagingRoute()),
     ...overrides
@@ -426,7 +571,7 @@ function messagingSettings(connections: readonly MessagingConnectionView[]): Mes
       { channel: "dingtalk", available: true },
       { channel: "feishu", available: true },
       { channel: "lark", available: true },
-      { channel: "wecom", available: false, reason: "not implemented" },
+      { channel: "wecom", available: true },
       { channel: "wechat", available: false, reason: "not implemented" },
       { channel: "slack", available: false, reason: "not implemented" }
     ]
@@ -526,6 +671,25 @@ function feishuConnection(overrides: Partial<MessagingConnectionView> = {}): Mes
       groupActivation: { oc_primary: "mention" },
       groupPermissionMode: "ask"
     },
+    lastConnectedAt: Date.now() - 1_000,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function wecomConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "wecom-one",
+    channel: "wecom",
+    generation: 7n,
+    revision: 11n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "wecom-owner",
+    providerAccountId: "bot_wecom",
+    wecomConfiguration: { botId: "bot_wecom" },
     lastConnectedAt: Date.now() - 1_000,
     createdAt: 1_000,
     updatedAt: 2_000,

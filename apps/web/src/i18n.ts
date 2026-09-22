@@ -4788,6 +4788,7 @@ const en = {
   ,"messaging.addDingTalk": "Add DingTalk"
   ,"messaging.addFeishu": "Add Feishu"
   ,"messaging.addLark": "Add Lark"
+  ,"messaging.addWeCom": "Add WeCom"
   ,"messaging.loadFailed": "Could not load Messaging settings."
   ,"messaging.actionFailed": "Could not complete the Messaging action."
   ,"messaging.connectionChanged": "The Messaging connection changed. Review the refreshed settings and try again."
@@ -4802,7 +4803,7 @@ const en = {
   ,"messaging.connections": "Connections"
   ,"messaging.connectionsBody": "Each external account has an independent credential, transport generation, and conversation-to-task mapping."
   ,"messaging.emptyTitle": "No messaging connections"
-  ,"messaging.emptyBody": "Add Telegram, Discord, DingTalk, Feishu, or Lark to receive direct messages and group conversations in Joko tasks."
+  ,"messaging.emptyBody": "Add Telegram, Discord, DingTalk, Feishu, Lark, or WeCom to receive direct messages and group conversations in Joko tasks."
   ,"messaging.ownerIdentity": "Owner ID {id}"
   ,"messaging.toggleConnection": "Enable or disable this Messaging connection"
   ,"messaging.credential": "Credential"
@@ -4837,6 +4838,12 @@ const en = {
   ,"messaging.feishuAppIdBody": "Use the App ID from the Feishu or Lark developer console. The App Secret is added separately through the protected credential form."
   ,"messaging.feishuOwnerId": "Feishu/Lark owner user ID"
   ,"messaging.feishuAwaitingOwner": "Waiting for first direct message"
+  ,"messaging.wecomCreateTitle": "Add WeCom"
+  ,"messaging.wecomCreateBody": "Enter the bot identity now. The first direct-message sender claims the owner identity; messages from other users are rejected."
+  ,"messaging.wecomBotId": "WeCom Bot ID"
+  ,"messaging.wecomBotIdBody": "Use the Bot ID from the WeCom bot settings. The Bot Secret is added separately through the protected credential form."
+  ,"messaging.wecomOwnerId": "WeCom owner user ID"
+  ,"messaging.wecomAwaitingOwner": "Waiting for first direct message"
   ,"messaging.botToken": "Bot token"
   ,"messaging.appSecret": "App Secret"
   ,"messaging.credentialBody": "Replacing the token retires the previous transport generation and its pending work."
@@ -4853,6 +4860,12 @@ const en = {
   ,"messaging.feishuAddCredential": "Add App Secret"
   ,"messaging.feishuReplaceCredential": "Replace App Secret"
   ,"messaging.feishuCredentialBody": "Replacing the App Secret retires the previous WebSocket transport generation and its pending work."
+  ,"messaging.wecomBotSecret": "WeCom Bot Secret"
+  ,"messaging.wecomAddCredential": "Add Bot Secret"
+  ,"messaging.wecomReplaceCredential": "Replace Bot Secret"
+  ,"messaging.wecomClearCredential": "Clear Bot Secret"
+  ,"messaging.wecomCredentialBody": "Replacing the Bot Secret retires the previous WebSocket transport generation and its pending work."
+  ,"messaging.wecomSecretSafety": "The Bot Secret uses a one-shot managed credential channel and is cleared from this form immediately after submission."
   ,"messaging.configureTitle": "Telegram behavior"
   ,"messaging.configureBody": "Configure replies, reactions, and the activation policy for each group."
   ,"messaging.discordConfigureTitle": "Discord behavior"
@@ -4871,6 +4884,9 @@ const en = {
   ,"messaging.feishuGroupActivationInvalid": "Use one unique, non-empty chat ID per line with mention, always, or disabled."
   ,"messaging.feishuGroupPermission": "Group execution permission"
   ,"messaging.feishuGroupSafety": "Group history is untrusted. Keep Ask unless you explicitly accept bypassing execution permission for approved group chats."
+  ,"messaging.wecomConfigureTitle": "WeCom identity"
+  ,"messaging.wecomConfigureBody": "Configure the bot identity used for this WebSocket connection."
+  ,"messaging.wecomBotIdChangeBody": "Changing the Bot ID retires the active transport and clears the claimed owner. The next direct-message sender claims ownership again."
   ,"messaging.lifecycleAnnouncements": "Lifecycle announcements"
   ,"messaging.lifecycleAnnouncementsBody": "Post online, offline, and recovery notices to the owner conversation when a route is available."
   ,"messaging.emojiReactions": "Acknowledgement reactions"
@@ -4889,6 +4905,7 @@ const en = {
   ,"messaging.clearTitle": "Clear bot token?"
   ,"messaging.dingtalkClearTitle": "Clear DingTalk AppSecret?"
   ,"messaging.appSecretClearTitle": "Clear App Secret?"
+  ,"messaging.wecomClearTitle": "Clear WeCom Bot Secret?"
   ,"messaging.clearBody": "The connection goes offline immediately. Existing tasks remain visible, but this transport and its pending work are retired."
   ,"messaging.target": "Workspace"
   ,"messaging.model": "Model"
@@ -4910,6 +4927,7 @@ const en = {
   ,"messaging.status.idle": "Needs token"
   ,"messaging.status.dingtalkIdle": "Needs AppSecret"
   ,"messaging.status.appSecretIdle": "Needs App Secret"
+  ,"messaging.status.wecomIdle": "Needs Bot Secret"
   ,"messaging.status.connecting": "Connecting"
   ,"messaging.status.connected": "Connected"
   ,"messaging.status.offline": "Offline"
@@ -7785,6 +7803,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.addDingTalk": "添加钉钉",
     "messaging.addFeishu": "添加飞书",
     "messaging.addLark": "添加 Lark",
+    "messaging.addWeCom": "添加企业微信",
     "messaging.loadFailed": "无法加载消息渠道设置。",
     "messaging.actionFailed": "无法完成消息渠道操作。",
     "messaging.connectionChanged": "消息连接已发生变化。请检查刷新的设置后重试。",
@@ -7799,7 +7818,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.connections": "连接",
     "messaging.connectionsBody": "每个外部账号都有独立凭证、传输代际和会话到任务的映射。",
     "messaging.emptyTitle": "没有消息连接",
-    "messaging.emptyBody": "添加 Telegram、Discord、钉钉、飞书或 Lark，将私聊与群组会话接入 Joko 任务。",
+    "messaging.emptyBody": "添加 Telegram、Discord、钉钉、飞书、Lark 或企业微信，将私聊与群组会话接入 Joko 任务。",
     "messaging.ownerIdentity": "所有者 ID {id}",
     "messaging.toggleConnection": "启用或停用此消息连接",
     "messaging.credential": "凭证",
@@ -7834,6 +7853,12 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.feishuAppIdBody": "请使用飞书或 Lark 开发者后台中的 App ID。App Secret 会通过受保护的凭证表单单独添加。",
     "messaging.feishuOwnerId": "飞书/Lark 所有者用户 ID",
     "messaging.feishuAwaitingOwner": "等待首位私聊用户认领",
+    "messaging.wecomCreateTitle": "添加企业微信",
+    "messaging.wecomCreateBody": "先填写机器人身份。第一位发送私聊的用户会认领所有者身份；其他用户的消息会被拒绝。",
+    "messaging.wecomBotId": "企业微信机器人 ID",
+    "messaging.wecomBotIdBody": "请使用企业微信机器人设置中的机器人 ID。机器人密钥会通过受保护的凭证表单单独添加。",
+    "messaging.wecomOwnerId": "企业微信所有者用户 ID",
+    "messaging.wecomAwaitingOwner": "等待首位私聊用户认领",
     "messaging.botToken": "机器人令牌",
     "messaging.appSecret": "App Secret",
     "messaging.credentialBody": "替换令牌会退休旧传输代际及其待处理工作。",
@@ -7850,6 +7875,12 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.feishuAddCredential": "添加 App Secret",
     "messaging.feishuReplaceCredential": "替换 App Secret",
     "messaging.feishuCredentialBody": "替换 App Secret 会退休旧的 WebSocket 传输代际及其待处理工作。",
+    "messaging.wecomBotSecret": "企业微信机器人密钥",
+    "messaging.wecomAddCredential": "添加机器人密钥",
+    "messaging.wecomReplaceCredential": "替换机器人密钥",
+    "messaging.wecomClearCredential": "清除机器人密钥",
+    "messaging.wecomCredentialBody": "替换机器人密钥会退休旧的 WebSocket 传输代际及其待处理工作。",
+    "messaging.wecomSecretSafety": "机器人密钥仅通过一次性受管凭证通道传输，并会在提交后立即从此表单清除。",
     "messaging.configureTitle": "Telegram 行为",
     "messaging.configureBody": "配置回复、反应及每个群组的激活策略。",
     "messaging.discordConfigureTitle": "Discord 行为",
@@ -7868,6 +7899,9 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.feishuGroupActivationInvalid": "每行使用一个唯一且非空的聊天 ID，并选择 mention、always 或 disabled。",
     "messaging.feishuGroupPermission": "群聊执行权限",
     "messaging.feishuGroupSafety": "群聊历史是不可信输入。除非你明确接受为已批准群聊绕过执行权限，否则请保持“询问”。",
+    "messaging.wecomConfigureTitle": "企业微信机器人身份",
+    "messaging.wecomConfigureBody": "配置此 WebSocket 连接所使用的机器人身份。",
+    "messaging.wecomBotIdChangeBody": "修改机器人 ID 会退休当前传输并清除已认领的所有者；下一位发送私聊的用户会重新认领。",
     "messaging.lifecycleAnnouncements": "生命周期通知",
     "messaging.lifecycleAnnouncementsBody": "存在可用路由时，在所有者会话中发布上线、离线和恢复通知。",
     "messaging.emojiReactions": "确认反应",
@@ -7886,6 +7920,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.clearTitle": "清除机器人令牌？",
     "messaging.dingtalkClearTitle": "清除钉钉 AppSecret？",
     "messaging.appSecretClearTitle": "清除 App Secret？",
+    "messaging.wecomClearTitle": "清除企业微信机器人密钥？",
     "messaging.clearBody": "连接会立即离线。现有任务仍可见，但当前传输及其待处理工作会被退休。",
     "messaging.target": "工作区",
     "messaging.model": "模型",
@@ -7907,6 +7942,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.status.idle": "需要令牌",
     "messaging.status.dingtalkIdle": "需要 AppSecret",
     "messaging.status.appSecretIdle": "需要 App Secret",
+    "messaging.status.wecomIdle": "需要机器人密钥",
     "messaging.status.connecting": "正在连接",
     "messaging.status.connected": "已连接",
     "messaging.status.offline": "离线",

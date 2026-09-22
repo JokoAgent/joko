@@ -24,7 +24,11 @@ import {
   type TelegramNormalizationResult,
   type TelegramPollResult,
   type TelegramTransportOptions,
-  type TelegramUpdate
+  type TelegramUpdate,
+  type WeComCallbackUpdate,
+  type WeComNormalizationResult,
+  type WeComPollResult,
+  type WeComTransportOptions
 } from "@joko/messaging";
 import type { AdapterContext, InteractionDecision, MessageBlock, PromptInput } from "@joko/core";
 import { OperationalStore } from "@joko/store";
@@ -42,7 +46,8 @@ import {
   MessagingManager,
   type DingTalkMessagingConfiguration,
   type FeishuMessagingConfiguration,
-  type MessagingManagerOptions
+  type MessagingManagerOptions,
+  type WeComMessagingConfiguration
 } from "./messaging-manager.js";
 import { SessionHost } from "./session-host.js";
 import { mkdtempSync } from "./test-paths.js";
@@ -625,6 +630,193 @@ describe("MessagingManager", () => {
     expect(disabled.enabled).toBe(false);
     expect(transport.sentText.some((entry) => entry.text === "Joko's Feishu connection is being disabled.")).toBe(true);
   });
+
+  it("claims a WeCom owner, starts callback replies after admission, and keeps media effects single-part", async () => {
+    const transport = new FakeWeComTransport(weComInitialBatch(true));
+    const adapter = new AttachmentFakeAdapter(true);
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, () => transport);
+    const outboundImage = await fixture.artifacts.ingestBytes(pngBytes(), {
+      fileName: "result.png",
+      mimeType: "image/png"
+    });
+    adapter.blocks = [
+      { kind: "text", text: "x".repeat(18 * 1024 + 7) },
+      { kind: "image", blob: outboundImage, alt: "Result image" }
+    ];
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createWeComConnection({ configuration: weComConfiguration() });
+    const enabled = await replaceCredential(fixture, created, "wecom", true);
+
+    await vi.waitFor(() => {
+      const runtime = fixture.store.getMessagingConnection(enabled.id);
+      if (runtime.runtimeStatus === "error") {
+        throw new Error(`${runtime.errorCode ?? "unknown"}: ${runtime.errorSummary ?? "unknown"}`);
+      }
+      expect(runtime).toMatchObject({
+        channel: "wecom",
+        runtimeStatus: "connected",
+        ownerProviderUserId: "wecom-owner",
+        cursor: "wecom-cursor-1"
+      });
+      expect(fixture.store.listMessagingInboundRequests()).toHaveLength(2);
+      expect(transport.beginReplies).toEqual(expect.arrayContaining(["wecom-direct", "wecom-group"]));
+      expect(transport.sentText.length).toBeGreaterThanOrEqual(4);
+      expect(transport.sentAttachments.length).toBeGreaterThanOrEqual(2);
+    }, { timeout: 5_000 });
+    expect(transport.sentText.every((entry) => Buffer.byteLength(entry.text, "utf8") <= 18 * 1024)).toBe(true);
+    expect(transport.sentText
+      .flatMap((entry) => entry.callbackMessageId === undefined ? [] : [entry.callbackMessageId])
+      .sort()).toEqual(["wecom-direct", "wecom-group"]);
+    expect(transport.sentAttachments.every((entry) => entry.fileNames.length === 1)).toBe(true);
+    expect(transport.downloadedKinds).toEqual(["image", "file"]);
+    expect(transport.operations.indexOf("begin:wecom-direct")).toBeLessThan(
+      transport.operations.indexOf("download:wecom-image-coordinate")
+    );
+    expect(fixture.store.listMessagingConversations().map((value) => value.conversationKind).sort())
+      .toEqual(["direct", "group"]);
+
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    const cleared = await fixture.manager.clearCredential({
+      connectionId: current.id,
+      expectedRevision: current.revision,
+      expectedGeneration: current.generation
+    });
+    expect(cleared.ownerProviderUserId).toBeUndefined();
+  });
+
+  it("finalizes an empty WeCom assistant output with a visible callback placeholder", async () => {
+    const transport = new FakeWeComTransport();
+    const adapter = new AttachmentFakeAdapter();
+    adapter.blocks = [];
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, () => transport);
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createWeComConnection({ configuration: weComConfiguration() });
+    await replaceCredential(fixture, created, "wecom-empty", true);
+
+    await vi.waitFor(() => expect(transport.sentText).toContainEqual(expect.objectContaining({
+      text: "_(Empty reply)_",
+      callbackMessageId: "wecom-direct"
+    })), { timeout: 5_000 });
+  });
+
+  it("projects a retryable WeCom network disconnect offline before recovering", async () => {
+    const transport = new RecoveringWeComTransport();
+    const fixture = await createFixture(undefined, undefined, undefined, undefined, undefined, () => transport);
+    const created = fixture.manager.createWeComConnection({ configuration: weComConfiguration() });
+    const enabled = await replaceCredential(fixture, created, "wecom-recovery", true);
+
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(enabled.id)).toMatchObject({
+      runtimeStatus: "offline",
+      errorCode: "network",
+      errorSummary: "WeCom is temporarily unavailable for this connection."
+    }));
+    expect(transport.polls).toBe(1);
+
+    transport.resumeRecovery();
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(enabled.id).runtimeStatus).toBe("connected"));
+    const recovered = fixture.store.getMessagingConnection(enabled.id);
+    expect(recovered.errorCode).toBeUndefined();
+    expect(recovered.errorSummary).toBeUndefined();
+    expect(transport.probes).toBeGreaterThanOrEqual(2);
+  });
+
+  it("retires a WeCom callback reservation when its connection generation is aborted", async () => {
+    const transport = new BlockingWeComReplyTransport();
+    const fixture = await createFixture(undefined, undefined, undefined, undefined, undefined, () => transport);
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createWeComConnection({ configuration: weComConfiguration() });
+    const enabled = await replaceCredential(fixture, created, "wecom-generation", true);
+
+    await vi.waitFor(() => expect(transport.beginReplies).toEqual(["wecom-direct"]));
+    expect(fixture.store.listSessions({ includeArchived: true, includeDeleted: true })).toEqual([]);
+
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    await fixture.manager.clearCredential({
+      connectionId: current.id,
+      expectedRevision: current.revision,
+      expectedGeneration: current.generation
+    });
+
+    await vi.waitFor(() => expect(transport.cancelledReplies).toEqual(["wecom-direct"]));
+    expect(fixture.store.listSessions({ includeArchived: true, includeDeleted: true })).toEqual([]);
+    const conversations = fixture.store.listMessagingConversations();
+    expect(conversations).toEqual([
+      expect.objectContaining({ status: "retired", channelGeneration: enabled.generation })
+    ]);
+    expect(conversations[0]).not.toHaveProperty("sessionId");
+    expect(fixture.store.listMessagingInboundRequests()).toEqual([
+      expect.objectContaining({ status: "cancelled", channelGeneration: enabled.generation })
+    ]);
+  });
+
+  it("preserves a WeCom owner for the same Bot ID and retires it when the Bot ID changes", async () => {
+    const fixture = await createFixture();
+    const created = fixture.manager.createWeComConnection({ configuration: weComConfiguration() });
+    const claimed = fixture.store.claimMessagingConnectionOwner({
+      connectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation,
+      ownerProviderUserId: "wecom-owner",
+      updatedAt: Date.now()
+    });
+    const sameIdentity = await fixture.manager.replaceWeComConfiguration({
+      connectionId: claimed.id,
+      expectedRevision: claimed.revision,
+      expectedGeneration: claimed.generation,
+      configuration: weComConfiguration()
+    });
+    expect(sameIdentity.ownerProviderUserId).toBe("wecom-owner");
+
+    const changedIdentity = await fixture.manager.replaceWeComConfiguration({
+      connectionId: sameIdentity.id,
+      expectedRevision: sameIdentity.revision,
+      expectedGeneration: sameIdentity.generation,
+      configuration: { format: 1, botId: "wecom-bot-replaced" }
+    });
+    expect(changedIdentity.ownerProviderUserId).toBeUndefined();
+  });
+
+  it("resolves WeCom permission and question interactions from owner text without opening another task", async () => {
+    const transport = new InteractiveWeComTransport();
+    const adapter = new DingTalkInteractionAdapter();
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, () => transport);
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createWeComConnection({ configuration: weComConfiguration() });
+    await replaceCredential(fixture, created, "wecom-interaction", true);
+
+    await vi.waitFor(() => expect(adapter.decisions).toEqual([
+      { kind: "selected", value: "allow_once" },
+      {
+        kind: "question",
+        answers: {
+          name: { kind: "text", value: "Alice" },
+          confirm: { kind: "boolean", value: true }
+        }
+      }
+    ]), { timeout: 5_000 });
+    expect(transport.sentInteractionCards).toHaveLength(2);
+    expect(fixture.store.listMessagingInboundRequests()).toHaveLength(1);
+  });
 });
 
 class FakeTelegramTransport {
@@ -1052,6 +1244,169 @@ class FakeDingTalkTransport {
   async close(): Promise<void> {}
 }
 
+class FakeWeComTransport {
+  readonly channel = "wecom" as const;
+  readonly sentText: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+    readonly callbackMessageId?: string;
+  }> = [];
+  readonly sentAttachments: Array<{ readonly address: MessagingAddress; readonly fileNames: readonly string[] }> = [];
+  readonly sentInteractionCards: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }> = [];
+  readonly downloadedKinds: Array<"image" | "file"> = [];
+  readonly beginReplies: string[] = [];
+  readonly operations: string[] = [];
+  #boundConnectionId = "";
+  #boundGeneration = 0;
+  #ownerUserId: string | null = null;
+  #delivered = false;
+
+  constructor(readonly batch: WeComNormalizationResult = weComInitialBatch()) {}
+
+  get connectionId(): string { return this.#boundConnectionId; }
+  get generation(): number { return this.#boundGeneration; }
+
+  bind(options: WeComTransportOptions): this {
+    this.#boundConnectionId = options.connectionId;
+    this.#boundGeneration = options.generation;
+    this.#ownerUserId = options.ownerUserId;
+    return this;
+  }
+
+  async probe() {
+    return {
+      channel: "wecom" as const,
+      connectionId: this.#boundConnectionId,
+      generation: this.#boundGeneration,
+      providerAccountId: "wecom-bot",
+      displayName: "Joko WeCom test bot",
+      username: null
+    };
+  }
+
+  async poll(input: { readonly cursor: string | null; readonly signal?: AbortSignal }): Promise<WeComPollResult> {
+    if (!this.#delivered && input.cursor === null) {
+      this.#delivered = true;
+      return {
+        updates: [{ callbackId: "wecom-initial", receivedAt: Date.now(), frame: {} as never }],
+        nextCursor: "wecom-cursor-1"
+      };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  normalize(_updates: readonly WeComCallbackUpdate[]): WeComNormalizationResult {
+    if (this.batch.ownerClaimProviderUserId !== null) this.#ownerUserId = this.batch.ownerClaimProviderUserId;
+    const bindAddress = (address: MessagingAddress): MessagingAddress => ({
+      ...address,
+      connectionId: this.#boundConnectionId
+    });
+    return {
+      ...this.batch,
+      events: this.batch.events.map((event) => ({ ...event, address: bindAddress(event.address) })),
+      interactionReplyCandidates: this.batch.interactionReplyCandidates.map((event) => ({
+        ...event,
+        address: bindAddress(event.address)
+      })),
+      groupObservations: this.batch.groupObservations.map((observation) => ({
+        ...observation,
+        address: bindAddress(observation.address)
+      }))
+    };
+  }
+
+  async beginReply(input: { readonly messageId: string }): Promise<void> {
+    this.beginReplies.push(input.messageId);
+    this.operations.push(`begin:${input.messageId}`);
+  }
+
+  async downloadAttachment(attachment: MessagingInboundAttachment): Promise<MessagingDownloadedAttachment> {
+    this.downloadedKinds.push(attachment.kind);
+    this.operations.push(`download:${attachment.providerFileId}`);
+    return attachment.kind === "image"
+      ? { bytes: pngBytes(), fileName: attachment.fileName, mimeType: "image/png" }
+      : { bytes: new TextEncoder().encode("inbound evidence"), fileName: attachment.fileName, mimeType: "text/plain" };
+  }
+
+  async sendTextPart(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly replyToMessageId?: string;
+    readonly callbackMessageId?: string;
+  }) {
+    this.sentText.push({
+      address: input.address,
+      text: input.text,
+      ...(input.replyToMessageId === undefined ? {} : { replyToMessageId: input.replyToMessageId }),
+      ...(input.callbackMessageId === undefined ? {} : { callbackMessageId: input.callbackMessageId })
+    });
+    return { providerMessageId: `wecom-text-${this.sentText.length}`, address: input.address };
+  }
+
+  async sendAttachments(input: {
+    readonly address: MessagingAddress;
+    readonly attachments: readonly { readonly fileName: string }[];
+  }) {
+    this.sentAttachments.push({ address: input.address, fileNames: input.attachments.map((value) => value.fileName) });
+    return { providerMessageId: `wecom-file-${this.sentAttachments.length}`, address: input.address };
+  }
+
+  async sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }) {
+    this.sentInteractionCards.push(input);
+    return { providerMessageId: `wecom-card-${this.sentInteractionCards.length}`, address: input.address };
+  }
+
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+
+  async sendTyping(): Promise<void> {}
+  async setReaction(): Promise<void> {}
+  async answerInteraction(): Promise<void> {}
+
+  ownerAddress(): MessagingAddress {
+    if (this.#ownerUserId === null) throw new Error("WeCom owner is not bound.");
+    return {
+      channel: "wecom",
+      connectionId: this.#boundConnectionId,
+      providerConversationId: this.#ownerUserId,
+      providerThreadId: null,
+      conversationKind: "direct"
+    };
+  }
+
+  async close(): Promise<void> {}
+}
+
+class BlockingWeComReplyTransport extends FakeWeComTransport {
+  readonly cancelledReplies: string[] = [];
+
+  override async beginReply(input: { readonly messageId: string; readonly signal?: AbortSignal }): Promise<void> {
+    this.beginReplies.push(input.messageId);
+    this.operations.push(`begin:${input.messageId}`);
+    return new Promise<void>((_resolve, reject) => {
+      const abort = () => {
+        this.cancelledReplies.push(input.messageId);
+        reject(new MessagingTransportError("cancelled", "test callback reservation cancelled", {
+          retryable: false,
+          effect: "none"
+        }));
+      };
+      if (input.signal?.aborted === true) abort();
+      else input.signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+}
+
 class FakeFeishuTransport {
   readonly channel = "feishu" as const;
   readonly sentText: Array<{
@@ -1262,6 +1617,119 @@ class InteractiveDingTalkTransport extends FakeDingTalkTransport {
     this.#releasePoll?.();
     this.#releasePoll = undefined;
     return receipt;
+  }
+}
+
+class InteractiveWeComTransport extends FakeWeComTransport {
+  #releasePoll: (() => void) | undefined;
+
+  constructor() {
+    super(weComInitialBatch());
+  }
+
+  override async poll(input: {
+    readonly cursor: string | null;
+    readonly signal?: AbortSignal;
+  }): Promise<WeComPollResult> {
+    if (input.cursor === null) return super.poll(input);
+    const expectedCards = input.cursor === "wecom-cursor-1" ? 1 : input.cursor === "wecom-cursor-2" ? 2 : 0;
+    if (expectedCards > 0) {
+      if (this.sentInteractionCards.length < expectedCards) {
+        await new Promise<void>((resolve, reject) => {
+          this.#releasePoll = resolve;
+          const abort = () => reject(new MessagingTransportError("cancelled", "test poll cancelled", {
+            retryable: false,
+            effect: "none"
+          }));
+          if (input.signal?.aborted) abort();
+          else input.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return {
+        updates: [{
+          callbackId: expectedCards === 1 ? "wecom-permission-reply" : "wecom-question-reply",
+          receivedAt: Date.now(),
+          frame: {} as never
+        }],
+        nextCursor: expectedCards === 1 ? "wecom-cursor-2" : "wecom-cursor-3"
+      };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  override normalize(updates: readonly WeComCallbackUpdate[]): WeComNormalizationResult {
+    const reply = updates[0]?.callbackId;
+    if (reply !== "wecom-permission-reply" && reply !== "wecom-question-reply") return super.normalize(updates);
+    const event = weComMessage({
+      messageId: reply === "wecom-permission-reply" ? "wecom-reply-permission" : "wecom-reply-question",
+      text: reply === "wecom-permission-reply" ? "1" : "name: Alice\nconfirm: yes"
+    });
+    return {
+      events: [],
+      interactionReplyCandidates: [{
+        ...event,
+        address: { ...event.address, connectionId: this.connectionId }
+      }],
+      groupObservations: [],
+      ignored: [],
+      ownerClaimProviderUserId: null
+    };
+  }
+
+  override async sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }) {
+    const receipt = await super.sendInteractionCard(input);
+    this.#releasePoll?.();
+    this.#releasePoll = undefined;
+    return receipt;
+  }
+}
+
+class RecoveringWeComTransport extends FakeWeComTransport {
+  probes = 0;
+  polls = 0;
+  #resumeRecovery: (() => void) | undefined;
+
+  override async probe(signal?: AbortSignal) {
+    this.probes += 1;
+    if (this.probes > 1) {
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => {
+          signal?.removeEventListener("abort", abort);
+          resolve();
+        };
+        const abort = () => reject(new MessagingTransportError("cancelled", "fixture recovery cancelled", {
+          retryable: false,
+          effect: "none"
+        }));
+        this.#resumeRecovery = finish;
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    return super.probe();
+  }
+
+  override async poll(input: {
+    readonly cursor: string | null;
+    readonly signal?: AbortSignal;
+  }): Promise<WeComPollResult> {
+    this.polls += 1;
+    if (this.polls === 1) {
+      throw new MessagingTransportError("network", "fixture WeCom disconnected", {
+        retryable: true,
+        effect: "none"
+      });
+    }
+    return waitForAbort(input.signal);
+  }
+
+  resumeRecovery(): void {
+    this.#resumeRecovery?.();
+    this.#resumeRecovery = undefined;
   }
 }
 
@@ -1686,7 +2154,8 @@ async function createFixture(
   adapterFactory?: () => FakeBackendAdapter,
   discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport,
   dingTalkTransportFactory?: (options: DingTalkTransportOptions) => FakeDingTalkTransport,
-  feishuTransportFactory?: (options: FeishuTransportOptions) => FakeFeishuTransport
+  feishuTransportFactory?: (options: FeishuTransportOptions) => FakeFeishuTransport,
+  weComTransportFactory?: (options: WeComTransportOptions) => FakeWeComTransport
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -1736,6 +2205,9 @@ async function createFixture(
     }),
     ...(feishuTransportFactory === undefined ? {} : {
       createFeishuTransport: (input) => feishuTransportFactory(input).bind(input)
+    }),
+    ...(weComTransportFactory === undefined ? {} : {
+      createWeComTransport: (input) => weComTransportFactory(input).bind(input)
     })
   };
   manager = new MessagingManager(options);
@@ -1822,6 +2294,89 @@ function feishuConfiguration(
     appId: "cli_app",
     groupActivation: { oc_group: "mention" },
     ...overrides
+  };
+}
+
+function weComConfiguration(): WeComMessagingConfiguration {
+  return { format: 1, botId: "wecom-bot" };
+}
+
+function weComInitialBatch(withMedia = false): WeComNormalizationResult {
+  const direct = weComMessage({
+    messageId: "wecom-direct",
+    text: "Hello from WeCom",
+    ...(withMedia ? {
+      attachments: [{
+        providerFileId: "wecom-image-coordinate",
+        providerUniqueFileId: null,
+        kind: "image" as const,
+        fileName: "inbound.png",
+        mimeType: "image/png",
+        byteLength: pngBytes().byteLength
+      }, {
+        providerFileId: "wecom-file-coordinate",
+        providerUniqueFileId: null,
+        kind: "file" as const,
+        fileName: "inbound.txt",
+        mimeType: "text/plain",
+        byteLength: new TextEncoder().encode("inbound evidence").byteLength
+      }]
+    } : {})
+  });
+  const group = weComMessage({
+    messageId: "wecom-group",
+    text: "Help from the owner group",
+    conversationId: "wecom-chat",
+    conversationKind: "group"
+  });
+  return {
+    events: withMedia ? [direct, group] : [direct],
+    interactionReplyCandidates: [],
+    groupObservations: withMedia ? [{
+      address: group.address,
+      messageId: group.messageId,
+      speaker: group.speaker,
+      occurredAt: group.occurredAt,
+      text: group.text,
+      attachmentNames: []
+    }] : [],
+    ignored: [],
+    ownerClaimProviderUserId: "wecom-owner"
+  };
+}
+
+function weComMessage(input: {
+  readonly messageId: string;
+  readonly text: string;
+  readonly conversationId?: string;
+  readonly conversationKind?: "direct" | "group";
+  readonly attachments?: readonly MessagingInboundAttachment[];
+}) {
+  return {
+    kind: "message" as const,
+    providerRequestIds: [`wecom:callback:${input.messageId}`],
+    messageId: input.messageId,
+    address: {
+      channel: "wecom" as const,
+      connectionId: "placeholder",
+      providerConversationId: input.conversationId ?? "wecom-owner",
+      providerThreadId: null,
+      conversationKind: input.conversationKind ?? "direct"
+    },
+    speaker: {
+      providerUserId: "wecom-owner",
+      displayName: "WeCom owner",
+      username: null,
+      isBot: false,
+      isOwner: true
+    },
+    occurredAt: Date.now(),
+    text: input.text,
+    ambient: false,
+    protectedContent: false,
+    attachments: input.attachments ?? [],
+    unsupported: [],
+    replyContext: null
   };
 }
 

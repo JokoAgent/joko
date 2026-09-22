@@ -15,11 +15,13 @@ import {
   decodeDiscordMessagingConfiguration,
   decodeFeishuMessagingConfiguration,
   decodeTelegramMessagingConfiguration,
+  decodeWeComMessagingConfiguration,
   type DingTalkMessagingConfiguration,
   type DiscordMessagingConfiguration,
   type FeishuMessagingConfiguration,
   type MessagingManager,
-  type TelegramMessagingConfiguration
+  type TelegramMessagingConfiguration,
+  type WeComMessagingConfiguration
 } from "./messaging-manager.js";
 import { fromProtoRevision, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
 
@@ -66,6 +68,7 @@ export function createMessagingConnectService(
               request.discordConfiguration !== undefined
               || request.dingtalkConfiguration !== undefined
               || request.feishuConfiguration !== undefined
+              || request.wecomConfiguration !== undefined
             ) {
               throw new ConnectError("Another channel configuration does not belong to a Telegram connection.", Code.InvalidArgument);
             }
@@ -82,6 +85,7 @@ export function createMessagingConnectService(
                 request.telegramConfiguration !== undefined
                 || request.dingtalkConfiguration !== undefined
                 || request.feishuConfiguration !== undefined
+                || request.wecomConfiguration !== undefined
               ) {
                 throw new ConnectError("Another channel configuration does not belong to a Discord connection.", Code.InvalidArgument);
               }
@@ -98,6 +102,7 @@ export function createMessagingConnectService(
                   request.telegramConfiguration !== undefined
                   || request.discordConfiguration !== undefined
                   || request.feishuConfiguration !== undefined
+                  || request.wecomConfiguration !== undefined
                 ) {
                   throw new ConnectError("Another channel configuration does not belong to a DingTalk connection.", Code.InvalidArgument);
                 }
@@ -118,6 +123,7 @@ export function createMessagingConnectService(
                     request.telegramConfiguration !== undefined
                     || request.discordConfiguration !== undefined
                     || request.dingtalkConfiguration !== undefined
+                    || request.wecomConfiguration !== undefined
                   ) {
                     throw new ConnectError(
                       "Another channel configuration does not belong to a Feishu/Lark connection.",
@@ -138,7 +144,33 @@ export function createMessagingConnectService(
                     configuration: fromProtoFeishuConfiguration(request.feishuConfiguration)
                   });
                 })()
-              : undefined;
+              : request.channel === contract.MessagingChannel.WECOM
+                ? (() => {
+                    if (
+                      request.telegramConfiguration !== undefined
+                      || request.discordConfiguration !== undefined
+                      || request.dingtalkConfiguration !== undefined
+                      || request.feishuConfiguration !== undefined
+                    ) {
+                      throw new ConnectError(
+                        "Another channel configuration does not belong to a WeCom connection.",
+                        Code.InvalidArgument
+                      );
+                    }
+                    if (request.ownerProviderUserId !== "") {
+                      throw new ConnectError(
+                        "WeCom ownership is claimed by the first direct message.",
+                        Code.InvalidArgument
+                      );
+                    }
+                    if (request.wecomConfiguration === undefined) {
+                      throw new ConnectError("WeCom configuration is required.", Code.InvalidArgument);
+                    }
+                    return owner.createWeComConnection({
+                      configuration: fromProtoWeComConfiguration(request.wecomConfiguration)
+                    });
+                  })()
+                : undefined;
       if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
       }
@@ -264,6 +296,22 @@ export function createMessagingConnectService(
         configuration: fromProtoFeishuConfiguration(request.configuration)
       });
       return create(contract.UpdateFeishuMessagingConfigurationResponseSchema, {
+        connection: toProtoConnection(connection)
+      });
+    }),
+
+    updateWeComMessagingConfiguration: async (request, context) => messagingRpc(async () => {
+      authenticate(context);
+      if (request.configuration === undefined) {
+        throw new ConnectError("configuration is required.", Code.InvalidArgument);
+      }
+      const connection = await requireManager(manager).replaceWeComConfiguration({
+        connectionId: request.connectionId,
+        expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration),
+        configuration: fromProtoWeComConfiguration(request.configuration)
+      });
+      return create(contract.UpdateWeComMessagingConfigurationResponseSchema, {
         connection: toProtoConnection(connection)
       });
     }),
@@ -583,6 +631,23 @@ function toProtoFeishuConfiguration(
   });
 }
 
+function fromProtoWeComConfiguration(
+  value: contract.WeComMessagingConfiguration
+): WeComMessagingConfiguration {
+  return decodeWeComMessagingConfiguration({
+    format: 1,
+    botId: value.botId
+  });
+}
+
+function toProtoWeComConfiguration(
+  value: WeComMessagingConfiguration
+): contract.WeComMessagingConfiguration {
+  return create(contract.WeComMessagingConfigurationSchema, {
+    botId: value.botId
+  });
+}
+
 function toProtoConnection(value: MessagingConnectionRecord): contract.MessagingConnection {
   return create(contract.MessagingConnectionSchema, {
     connectionId: value.id,
@@ -612,6 +677,11 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
     ...(value.channel !== "feishu" && value.channel !== "lark" ? {} : {
       feishuConfiguration: toProtoFeishuConfiguration(
         decodeFeishuMessagingConfiguration(value.configuration)
+      )
+    }),
+    ...(value.channel !== "wecom" ? {} : {
+      wecomConfiguration: toProtoWeComConfiguration(
+        decodeWeComMessagingConfiguration(value.configuration)
       )
     }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
@@ -656,7 +726,7 @@ function toProtoChannel(value: NativeMessagingChannel): contract.MessagingChanne
 
 function isAvailableChannel(value: NativeMessagingChannel): boolean {
   return value === "telegram" || value === "discord" || value === "dingtalk"
-    || value === "feishu" || value === "lark";
+    || value === "feishu" || value === "lark" || value === "wecom";
 }
 
 function toProtoRuntimeStatus(

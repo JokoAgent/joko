@@ -69,6 +69,7 @@ export interface RealPiSystemFixtureOptions {
   readonly dingTalkApiBaseUrl?: string;
   readonly dingTalkOapiBaseUrl?: string;
   readonly createFeishuTransport?: OrchestratorApplicationDependencies["messagingCreateFeishuTransport"];
+  readonly createWeComTransport?: OrchestratorApplicationDependencies["messagingCreateWeComTransport"];
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -214,6 +215,9 @@ export class RealPiSystemFixture {
         ...(options.createFeishuTransport === undefined
           ? {}
           : { messagingCreateFeishuTransport: options.createFeishuTransport }),
+        ...(options.createWeComTransport === undefined
+          ? {}
+          : { messagingCreateWeComTransport: options.createWeComTransport }),
         ...(options.messagingPollTimeoutSeconds === undefined
           ? {}
           : { messagingPollTimeoutSeconds: options.messagingPollTimeoutSeconds }),
