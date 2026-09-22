@@ -2404,6 +2404,13 @@ export function useAppController(): AppController {
       gateway().createFeishuMessagingConnection(channel, configuration, signal),
     createWeComMessagingConnection: (configuration, signal) =>
       gateway().createWeComMessagingConnection(configuration, signal),
+    createWeChatMessagingConnection: (signal) => gateway().createWeChatMessagingConnection(signal),
+    beginWeChatAuthorization: (connectionId, expectedRevision, expectedGeneration, signal) =>
+      gateway().beginWeChatAuthorization(connectionId, expectedRevision, expectedGeneration, signal),
+    getWeChatAuthorization: (attempt, signal) => gateway().getWeChatAuthorization(attempt, signal),
+    submitWeChatVerificationCode: (attempt, code, signal) =>
+      gateway().submitWeChatVerificationCode(attempt, code, signal),
+    cancelWeChatAuthorization: (attempt, signal) => gateway().cancelWeChatAuthorization(attempt, signal),
     saveMessagingCredential: (connectionId, expectedRevision, expectedGeneration, secret, enable, signal) =>
       gateway().saveMessagingCredential(
         connectionId,

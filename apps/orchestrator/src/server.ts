@@ -25,7 +25,8 @@ export const ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY = [
   // Inline and remote scripts remain forbidden.
   "script-src 'self' 'unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' blob: data:",
+  // The QR authorization flow accepts only validated HTTPS weixin.qq.com URLs.
+  "img-src 'self' blob: data: https://weixin.qq.com https://*.weixin.qq.com",
   "media-src 'self' blob: data:",
   "font-src 'self' data:",
   "connect-src 'self' blob: https: http: ws: wss:"

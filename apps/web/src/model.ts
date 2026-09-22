@@ -4281,6 +4281,35 @@ export interface WeComMessagingConfigurationView {
   readonly botId: string;
 }
 
+export interface WeChatMessagingConfigurationView {
+  readonly format: 1;
+}
+
+export type WeChatAuthorizationStatusView =
+  | "waiting"
+  | "scanned"
+  | "verificationRequired"
+  | "qrRefreshed"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "expired";
+
+export interface WeChatAuthorizationAttemptView {
+  readonly attemptId: string;
+  readonly connectionId: string;
+  readonly generation: bigint;
+  readonly revision: bigint;
+  readonly status: WeChatAuthorizationStatusView;
+  readonly qrCodeUrl?: string;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly verificationRetry: boolean;
+  readonly errorCode?: string;
+  readonly errorSummary?: string;
+  readonly connection?: MessagingConnectionView;
+}
+
 export interface MessagingConnectionView {
   readonly id: string;
   readonly channel: MessagingChannelView;
@@ -4297,6 +4326,7 @@ export interface MessagingConnectionView {
   readonly dingtalkConfiguration?: DingTalkMessagingConfigurationView;
   readonly feishuConfiguration?: FeishuMessagingConfigurationView;
   readonly wecomConfiguration?: WeComMessagingConfigurationView;
+  readonly wechatConfiguration?: WeChatMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -5550,6 +5580,26 @@ export interface OperationApi {
     configuration: WeComMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  createWeChatMessagingConnection(signal?: AbortSignal): Promise<MessagingConnectionView>;
+  beginWeChatAuthorization(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  getWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  submitWeChatVerificationCode(
+    attempt: WeChatAuthorizationAttemptView,
+    code: string,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
+  cancelWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView>;
   saveMessagingCredential(
     connectionId: string,
     expectedRevision: bigint,

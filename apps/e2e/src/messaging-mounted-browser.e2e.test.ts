@@ -120,7 +120,7 @@ describe("mounted Messaging Settings product chain", () => {
     });
     browserErrors.splice(0);
     expect(await settings.locator(".messaging-channel").count()).toBe(8);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(6);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(7);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Discord", { exact: true }).waitFor({ state: "visible" });
     await settings.getByText("DingTalk", { exact: true }).first().waitFor({ state: "visible" });

@@ -1,6 +1,8 @@
 import { create } from "@bufbuild/protobuf";
+import { reflect } from "@bufbuild/protobuf/reflect";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import type { CredentialManager } from "./credential-manager.js";
 import type {
   MessagingChannel as NativeMessagingChannel,
   MessagingConnectionRecord,
@@ -16,17 +18,31 @@ import {
   decodeFeishuMessagingConfiguration,
   decodeTelegramMessagingConfiguration,
   decodeWeComMessagingConfiguration,
+  decodeWeChatMessagingConfiguration,
   type DingTalkMessagingConfiguration,
   type DiscordMessagingConfiguration,
   type FeishuMessagingConfiguration,
   type MessagingManager,
   type TelegramMessagingConfiguration,
-  type WeComMessagingConfiguration
+  type WeComMessagingConfiguration,
+  type WeChatMessagingConfiguration
 } from "./messaging-manager.js";
 import { fromProtoRevision, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
+import {
+  WeChatAuthorizationManager,
+  type WeChatAuthorizationPort,
+  type WeChatAuthorizationSnapshot
+} from "./wechat-authorization-manager.js";
 
 export interface MessagingRpcOwner {
   readonly connectionId: string;
+}
+
+export interface MessagingConnectServiceOptions {
+  readonly credentials?: CredentialManager;
+  readonly createWeChatAuthorization?: () => WeChatAuthorizationPort;
+  readonly onClientRevoked?: (connectionId: string, listener: () => void) => () => void;
+  readonly registerCleanup?: (cleanup: () => void) => void;
 }
 
 const CHANNELS: readonly NativeMessagingChannel[] = Object.freeze([
@@ -42,8 +58,20 @@ const CHANNELS: readonly NativeMessagingChannel[] = Object.freeze([
 
 export function createMessagingConnectService(
   manager: MessagingManager | undefined,
-  authenticate: (context: HandlerContext) => MessagingRpcOwner
+  authenticate: (context: HandlerContext) => MessagingRpcOwner,
+  options: MessagingConnectServiceOptions = {}
 ): ServiceImpl<typeof contract.MessagingService> {
+  const weChatAuthorization = manager === undefined || options.credentials === undefined
+    ? undefined
+    : new WeChatAuthorizationManager({
+        messaging: manager,
+        credentials: options.credentials,
+        ...(options.createWeChatAuthorization === undefined
+          ? {}
+          : { createAuthorization: options.createWeChatAuthorization }),
+        ...(options.onClientRevoked === undefined ? {} : { onClientRevoked: options.onClientRevoked })
+      });
+  if (weChatAuthorization !== undefined) options.registerCleanup?.(() => weChatAuthorization.close());
   return {
     getMessagingSettings: async (_request, context) => messagingRpc(async () => {
       authenticate(context);
@@ -53,8 +81,8 @@ export function createMessagingConnectService(
         routes: owner.listRoutes().map(toProtoRoute),
         channels: CHANNELS.map((channel) => create(contract.MessagingChannelCapabilitySchema, {
           channel: toProtoChannel(channel),
-          available: isAvailableChannel(channel),
-          reason: isAvailableChannel(channel) ? "" : "not_implemented"
+          available: isAvailableChannel(channel, weChatAuthorization !== undefined),
+          reason: isAvailableChannel(channel, weChatAuthorization !== undefined) ? "" : "not_implemented"
         }))
       });
     }),
@@ -69,6 +97,7 @@ export function createMessagingConnectService(
               || request.dingtalkConfiguration !== undefined
               || request.feishuConfiguration !== undefined
               || request.wecomConfiguration !== undefined
+              || request.wechatConfiguration !== undefined
             ) {
               throw new ConnectError("Another channel configuration does not belong to a Telegram connection.", Code.InvalidArgument);
             }
@@ -86,6 +115,7 @@ export function createMessagingConnectService(
                 || request.dingtalkConfiguration !== undefined
                 || request.feishuConfiguration !== undefined
                 || request.wecomConfiguration !== undefined
+                || request.wechatConfiguration !== undefined
               ) {
                 throw new ConnectError("Another channel configuration does not belong to a Discord connection.", Code.InvalidArgument);
               }
@@ -103,6 +133,7 @@ export function createMessagingConnectService(
                   || request.discordConfiguration !== undefined
                   || request.feishuConfiguration !== undefined
                   || request.wecomConfiguration !== undefined
+                  || request.wechatConfiguration !== undefined
                 ) {
                   throw new ConnectError("Another channel configuration does not belong to a DingTalk connection.", Code.InvalidArgument);
                 }
@@ -124,6 +155,7 @@ export function createMessagingConnectService(
                     || request.discordConfiguration !== undefined
                     || request.dingtalkConfiguration !== undefined
                     || request.wecomConfiguration !== undefined
+                    || request.wechatConfiguration !== undefined
                   ) {
                     throw new ConnectError(
                       "Another channel configuration does not belong to a Feishu/Lark connection.",
@@ -151,6 +183,7 @@ export function createMessagingConnectService(
                       || request.discordConfiguration !== undefined
                       || request.dingtalkConfiguration !== undefined
                       || request.feishuConfiguration !== undefined
+                      || request.wechatConfiguration !== undefined
                     ) {
                       throw new ConnectError(
                         "Another channel configuration does not belong to a WeCom connection.",
@@ -170,7 +203,29 @@ export function createMessagingConnectService(
                       configuration: fromProtoWeComConfiguration(request.wecomConfiguration)
                     });
                   })()
-                : undefined;
+                : request.channel === contract.MessagingChannel.WECHAT && weChatAuthorization !== undefined
+                  ? (() => {
+                      if (request.telegramConfiguration !== undefined
+                        || request.discordConfiguration !== undefined
+                        || request.dingtalkConfiguration !== undefined
+                        || request.feishuConfiguration !== undefined
+                        || request.wecomConfiguration !== undefined) {
+                        throw new ConnectError(
+                          "Another channel configuration does not belong to a WeChat connection.",
+                          Code.InvalidArgument
+                        );
+                      }
+                      if (request.ownerProviderUserId !== "") {
+                        throw new ConnectError("WeChat identity is established by QR authorization.", Code.InvalidArgument);
+                      }
+                      if (request.wechatConfiguration === undefined) {
+                        throw new ConnectError("WeChat configuration is required.", Code.InvalidArgument);
+                      }
+                      return owner.createWeChatConnection({
+                        configuration: fromProtoWeChatConfiguration(request.wechatConfiguration)
+                      });
+                    })()
+                  : undefined;
       if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
       }
@@ -316,6 +371,69 @@ export function createMessagingConnectService(
       });
     }),
 
+    beginWeChatAuthorization: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context);
+      const attempt = await requireWeChatAuthorization(weChatAuthorization).begin({
+        clientConnectionId: client.connectionId,
+        connectionId: request.connectionId,
+        expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration)
+      });
+      return create(contract.BeginWeChatAuthorizationResponseSchema, { attempt: toProtoWeChatAttempt(attempt) });
+    }),
+
+    getWeChatAuthorization: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context);
+      const attempt = await requireWeChatAuthorization(weChatAuthorization).get({
+        clientConnectionId: client.connectionId,
+        connectionId: request.connectionId,
+        attemptId: request.attemptId,
+        expectedGeneration: generationNumber(request.expectedGeneration)
+      });
+      return create(contract.GetWeChatAuthorizationResponseSchema, { attempt: toProtoWeChatAttempt(attempt) });
+    }),
+
+    beginWeChatVerificationInput: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context);
+      const ticket = requireWeChatAuthorization(weChatAuthorization).beginVerificationInput({
+        clientConnectionId: client.connectionId,
+        connectionId: request.connectionId,
+        attemptId: request.attemptId,
+        expectedGeneration: generationNumber(request.expectedGeneration)
+      });
+      return create(contract.BeginWeChatVerificationInputResponseSchema, {
+        ticket: create(contract.CredentialUploadTicketSchema, {
+          ticketId: ticket.credentialUploadTicketId,
+          relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}`,
+          expiresAt: toProtoTimestamp(ticket.expiresAt),
+          maximumBytes: BigInt(ticket.maximumBytes)
+        })
+      });
+    }),
+
+    submitWeChatVerificationCode: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context);
+      const attempt = await requireWeChatAuthorization(weChatAuthorization).submitVerificationCode({
+        clientConnectionId: client.connectionId,
+        connectionId: request.connectionId,
+        attemptId: request.attemptId,
+        expectedGeneration: generationNumber(request.expectedGeneration),
+        credentialInputTicketId: request.credentialInputTicketId
+      });
+      return create(contract.SubmitWeChatVerificationCodeResponseSchema, { attempt: toProtoWeChatAttempt(attempt) });
+    }),
+
+    cancelWeChatAuthorization: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context);
+      const attempt = await requireWeChatAuthorization(weChatAuthorization).cancel({
+        clientConnectionId: client.connectionId,
+        connectionId: request.connectionId,
+        attemptId: request.attemptId,
+        expectedGeneration: generationNumber(request.expectedGeneration)
+      });
+      return create(contract.CancelWeChatAuthorizationResponseSchema, { attempt: toProtoWeChatAttempt(attempt) });
+    }),
+
     testMessagingConnection: async (request, context) => messagingRpc(async () => {
       authenticate(context);
       const result = await requireManager(manager).testConnection(request.connectionId);
@@ -358,6 +476,11 @@ function requireManager(manager: MessagingManager | undefined): MessagingManager
     throw new ConnectError("Messaging is not available on this node.", Code.Unimplemented);
   }
   return manager;
+}
+
+function requireWeChatAuthorization(value: WeChatAuthorizationManager | undefined): WeChatAuthorizationManager {
+  if (value === undefined) throw new ConnectError("WeChat authorization is not available on this node.", Code.Unimplemented);
+  return value;
 }
 
 async function messagingRpc<T>(action: () => T | Promise<T>): Promise<T> {
@@ -648,6 +771,54 @@ function toProtoWeComConfiguration(
   });
 }
 
+function fromProtoWeChatConfiguration(
+  value: contract.WeChatMessagingConfiguration
+): WeChatMessagingConfiguration {
+  if (reflect(contract.WeChatMessagingConfigurationSchema, value).getUnknown()?.length) {
+    throw new ConnectError("WeChat configuration contains unsupported fields.", Code.InvalidArgument);
+  }
+  return decodeWeChatMessagingConfiguration({ format: 1 });
+}
+
+function toProtoWeChatConfiguration(
+  value: WeChatMessagingConfiguration
+): contract.WeChatMessagingConfiguration {
+  decodeWeChatMessagingConfiguration(value);
+  return create(contract.WeChatMessagingConfigurationSchema);
+}
+
+function toProtoWeChatAttempt(value: WeChatAuthorizationSnapshot): contract.WeChatAuthorizationAttempt {
+  const status: contract.WeChatAuthorizationStatus = value.status === "waiting"
+    ? contract.WeChatAuthorizationStatus.WAITING
+    : value.status === "scanned"
+      ? contract.WeChatAuthorizationStatus.SCANNED
+      : value.status === "verification_required"
+        ? contract.WeChatAuthorizationStatus.VERIFICATION_REQUIRED
+        : value.status === "qr_refreshed"
+          ? contract.WeChatAuthorizationStatus.QR_REFRESHED
+          : value.status === "succeeded"
+            ? contract.WeChatAuthorizationStatus.SUCCEEDED
+            : value.status === "failed"
+              ? contract.WeChatAuthorizationStatus.FAILED
+              : value.status === "cancelled"
+                ? contract.WeChatAuthorizationStatus.CANCELLED
+                : contract.WeChatAuthorizationStatus.EXPIRED;
+  return create(contract.WeChatAuthorizationAttemptSchema, {
+    attemptId: value.attemptId,
+    connectionId: value.connectionId,
+    generation: BigInt(value.generation),
+    revision: BigInt(value.revision),
+    status,
+    ...(value.qrCodeUrl === undefined ? {} : { qrCodeUrl: value.qrCodeUrl }),
+    createdAt: toProtoTimestamp(value.createdAt),
+    expiresAt: toProtoTimestamp(value.expiresAt),
+    verificationRetry: value.verificationRetry,
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
+    ...(value.connection === undefined ? {} : { connection: toProtoConnection(value.connection) })
+  });
+}
+
 function toProtoConnection(value: MessagingConnectionRecord): contract.MessagingConnection {
   return create(contract.MessagingConnectionSchema, {
     connectionId: value.id,
@@ -682,6 +853,11 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
     ...(value.channel !== "wecom" ? {} : {
       wecomConfiguration: toProtoWeComConfiguration(
         decodeWeComMessagingConfiguration(value.configuration)
+      )
+    }),
+    ...(value.channel !== "wechat" ? {} : {
+      wechatConfiguration: toProtoWeChatConfiguration(
+        decodeWeChatMessagingConfiguration(value.configuration)
       )
     }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
@@ -724,9 +900,10 @@ function toProtoChannel(value: NativeMessagingChannel): contract.MessagingChanne
   }
 }
 
-function isAvailableChannel(value: NativeMessagingChannel): boolean {
+function isAvailableChannel(value: NativeMessagingChannel, weChatAuthorizationAvailable: boolean): boolean {
   return value === "telegram" || value === "discord" || value === "dingtalk"
-    || value === "feishu" || value === "lark" || value === "wecom";
+    || value === "feishu" || value === "lark" || value === "wecom"
+    || value === "wechat" && weChatAuthorizationAvailable;
 }
 
 function toProtoRuntimeStatus(

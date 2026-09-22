@@ -136,6 +136,7 @@ import {
 } from "./lsp-tool-bridge.js";
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
 import { MessagingManager, type MessagingManagerOptions } from "./messaging-manager.js";
+import type { WeChatAuthorizationPort } from "./wechat-authorization-manager.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
 import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
@@ -353,6 +354,8 @@ export interface OrchestratorApplication {
   readonly skillPublication?: SkillPublicationManager;
   /** Direct third-party Messaging transport, durable admission and delivery owner. */
   readonly messaging?: MessagingManager;
+  /** Test-only, process-local third-party authorization fixture seam. */
+  readonly messagingCreateWeChatAuthorization?: () => WeChatAuthorizationPort;
   readonly collaboration?: CollaborationManager;
   /** Durable Goal/lead/worker scheduling authority. */
   readonly collaborationGoals?: CollaborationGoalManager;
@@ -434,6 +437,8 @@ export interface OrchestratorApplicationDependencies {
   readonly messagingDingTalkOapiBaseUrl?: string;
   readonly messagingCreateFeishuTransport?: MessagingManagerOptions["createFeishuTransport"];
   readonly messagingCreateWeComTransport?: MessagingManagerOptions["createWeComTransport"];
+  readonly messagingCreateWeChatTransport?: MessagingManagerOptions["createWeChatTransport"];
+  readonly messagingCreateWeChatAuthorization?: () => WeChatAuthorizationPort;
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -1303,6 +1308,7 @@ export async function createOrchestratorApplication(
   messaging = new MessagingManager({
     store,
     credentials,
+    contextVault: credentialVault,
     sessionHost,
     artifacts,
     ...(dependencies.messagingTelegramApiBaseUrl === undefined
@@ -1323,6 +1329,9 @@ export async function createOrchestratorApplication(
     ...(dependencies.messagingCreateWeComTransport === undefined
       ? {}
       : { createWeComTransport: dependencies.messagingCreateWeComTransport }),
+    ...(dependencies.messagingCreateWeChatTransport === undefined
+      ? {}
+      : { createWeChatTransport: dependencies.messagingCreateWeChatTransport }),
     ...(dependencies.messagingPollTimeoutSeconds === undefined
       ? {}
       : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),
@@ -2210,6 +2219,9 @@ export async function createOrchestratorApplication(
     skillMarketSync,
     skillPublication,
     messaging,
+    ...(dependencies.messagingCreateWeChatAuthorization === undefined
+      ? {}
+      : { messagingCreateWeChatAuthorization: dependencies.messagingCreateWeChatAuthorization }),
     collaboration,
     collaborationGoals,
     contacts,

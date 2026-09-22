@@ -1624,6 +1624,44 @@ CREATE TABLE messaging_request_artifacts (
         UNIQUE(request_id, artifact_id)
       ) STRICT;
 
+CREATE TABLE messaging_conversation_contexts (
+        conversation_id TEXT PRIMARY KEY
+          REFERENCES messaging_conversations(id) ON DELETE CASCADE,
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        material_generation TEXT NOT NULL CHECK (
+          length(material_generation) = 64
+          AND material_generation NOT GLOB '*[^0-9a-f]*'
+        ),
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('request', 'interaction')),
+        source_id TEXT NOT NULL CHECK (
+          length(trim(source_id)) BETWEEN 1 AND 256 AND instr(source_id, char(0)) = 0
+        ),
+        algorithm TEXT NOT NULL CHECK (algorithm = 'aes-256-gcm'),
+        nonce TEXT NOT NULL CHECK (length(nonce) = 16),
+        ciphertext TEXT NOT NULL CHECK (length(ciphertext) BETWEEN 4 AND 21848),
+        tag TEXT NOT NULL CHECK (length(tag) = 24),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1)
+      ) STRICT;
+
+CREATE TABLE messaging_conversation_context_sources (
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('request', 'interaction')),
+        source_id TEXT NOT NULL CHECK (
+          length(trim(source_id)) BETWEEN 1 AND 256 AND instr(source_id, char(0)) = 0
+        ),
+        connection_id TEXT NOT NULL REFERENCES messaging_channels(id) ON DELETE RESTRICT,
+        material_generation TEXT NOT NULL CHECK (
+          length(material_generation) = 64
+          AND material_generation NOT GLOB '*[^0-9a-f]*'
+        ),
+        conversation_id TEXT NOT NULL
+          REFERENCES messaging_conversations(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY(source_kind, source_id)
+      ) STRICT;
+
 CREATE TABLE messaging_group_observations (
         conversation_id TEXT NOT NULL REFERENCES messaging_conversations(id) ON DELETE CASCADE,
         provider_message_id TEXT NOT NULL CHECK (
@@ -2217,6 +2255,12 @@ CREATE INDEX messaging_conversations_connection_idx
 CREATE INDEX messaging_inbound_requests_recovery_idx
         ON messaging_inbound_requests(status, updated_at, id)
         WHERE status IN ('preparing', 'queued', 'dispatch_unknown');
+
+CREATE INDEX messaging_conversation_contexts_connection_idx
+        ON messaging_conversation_contexts(connection_id, material_generation, updated_at);
+
+CREATE INDEX messaging_conversation_context_sources_connection_idx
+        ON messaging_conversation_context_sources(connection_id, material_generation, conversation_id);
 
 CREATE INDEX messaging_group_observations_history_idx
         ON messaging_group_observations(conversation_id, occurred_at DESC, provider_message_id DESC);

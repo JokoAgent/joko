@@ -4,3 +4,4 @@ export * from "./dingtalk/index.js";
 export * from "./feishu/index.js";
 export * from "./telegram/index.js";
 export * from "./wecom/index.js";
+export * from "./wechat/index.js";

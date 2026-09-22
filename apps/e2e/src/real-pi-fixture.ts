@@ -70,6 +70,8 @@ export interface RealPiSystemFixtureOptions {
   readonly dingTalkOapiBaseUrl?: string;
   readonly createFeishuTransport?: OrchestratorApplicationDependencies["messagingCreateFeishuTransport"];
   readonly createWeComTransport?: OrchestratorApplicationDependencies["messagingCreateWeComTransport"];
+  readonly createWeChatTransport?: OrchestratorApplicationDependencies["messagingCreateWeChatTransport"];
+  readonly createWeChatAuthorization?: OrchestratorApplicationDependencies["messagingCreateWeChatAuthorization"];
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
 }
@@ -218,6 +220,12 @@ export class RealPiSystemFixture {
         ...(options.createWeComTransport === undefined
           ? {}
           : { messagingCreateWeComTransport: options.createWeComTransport }),
+        ...(options.createWeChatTransport === undefined
+          ? {}
+          : { messagingCreateWeChatTransport: options.createWeChatTransport }),
+        ...(options.createWeChatAuthorization === undefined
+          ? {}
+          : { messagingCreateWeChatAuthorization: options.createWeChatAuthorization }),
         ...(options.messagingPollTimeoutSeconds === undefined
           ? {}
           : { messagingPollTimeoutSeconds: options.messagingPollTimeoutSeconds }),

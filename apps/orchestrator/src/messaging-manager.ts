@@ -7,11 +7,13 @@ import {
   MessagingTransportError,
   TelegramTransport,
   WeComTransport,
+  WeChatTransport,
   splitDingTalkText,
   splitDiscordText,
   splitFeishuText,
   splitTelegramText,
   splitWeComText,
+  splitWeChatText,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
   type DingTalkPollResult,
@@ -39,14 +41,20 @@ import {
   type WeComCallbackUpdate,
   type WeComNormalizationResult,
   type WeComPollResult,
-  type WeComTransportOptions
+  type WeComTransportOptions,
+  type WeChatNormalizationResult,
+  type WeChatPollResult,
+  type WeChatRawMessage,
+  type WeChatTransportOptions
 } from "@joko/messaging";
 import type { BlobRef, InteractionQuestionField, PromptInput, TurnExecutionOverrides } from "@joko/core";
 import {
+  messagingConversationContextAad,
   operationBodyHash,
   type MessagingConnectionRecord,
   type MessagingConversationRecord,
   type MessagingDeliveryRecord,
+  type MessagingInboundRequestRecord,
   type InteractionRecord,
   type MessagingRouteRecord,
   type OperationalStore,
@@ -54,6 +62,7 @@ import {
 } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
+import type { CredentialVault } from "./credential-vault.js";
 import type { EnqueueResult, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
 
 const CREDENTIAL_JOURNAL_SCOPE_TYPE = "service";
@@ -65,12 +74,17 @@ const GROUP_CONTEXT_MAXIMUM_CHARACTERS = 4_000;
 const MAXIMUM_OUTBOUND_CHARACTERS = 64 * 1_024;
 const MAXIMUM_OUTBOUND_ATTACHMENTS = 100;
 const DEFAULT_RETRY_DELAY_MS = 2_000;
+const WECHAT_TYPING_REFRESH_MS = 5_000;
+const WECHAT_FIRST_PROGRESS_MS = 60_000;
+const WECHAT_REPEAT_PROGRESS_MS = 120_000;
 const TELEGRAM_ALBUM_SETTLE_POLL_SECONDS = 1;
 const TELEGRAM_ALBUM_MAXIMUM_MEMBERS = 10;
 const TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS = 10;
 const LIFECYCLE_DRAIN_TIMEOUT_MS = 1_500;
 const WECOM_EMPTY_REPLY_TEXT = "_(Empty reply)_";
 const WECOM_ATTACHMENT_REPLY_TEXT = "Attachments follow.";
+const WECHAT_EMPTY_REPLY_TEXT = "(No text response.)";
+const WECHAT_ATTACHMENT_REPLY_TEXT = "Attachments follow.";
 
 export interface TelegramMessagingConfiguration {
   readonly format: 1;
@@ -143,13 +157,18 @@ export interface WeComMessagingConfiguration {
   readonly botId: string;
 }
 
-type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom";
+export interface WeChatMessagingConfiguration {
+  readonly format: 1;
+}
+
+type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat";
 type SupportedMessagingConfiguration =
   | TelegramMessagingConfiguration
   | DiscordMessagingConfiguration
   | DingTalkMessagingConfiguration
   | FeishuMessagingConfiguration
-  | WeComMessagingConfiguration;
+  | WeComMessagingConfiguration
+  | WeChatMessagingConfiguration;
 
 export type MessagingConnectionTestResult =
   | {
@@ -186,6 +205,8 @@ interface MessagingTransportEffectsPort {
   sendTextPart(input: {
     readonly address: MessagingAddress;
     readonly text: string;
+    /** Transient provider reply capability, never serialized into a delivery. */
+    readonly context?: { readonly contextToken: string; readonly clientId: string };
     readonly replyToMessageId?: string;
     /** Exact inbound callback identity; used only by callback-capable transports. */
     readonly callbackMessageId?: string;
@@ -193,6 +214,7 @@ interface MessagingTransportEffectsPort {
   }): Promise<MessagingSendReceipt>;
   sendAttachments(input: {
     readonly address: MessagingAddress;
+    readonly context?: { readonly contextToken: string; readonly clientId: string };
     readonly attachments: readonly {
       readonly kind: "image" | "file";
       readonly bytes: Uint8Array;
@@ -206,6 +228,7 @@ interface MessagingTransportEffectsPort {
     readonly address: MessagingAddress;
     readonly text: string;
     readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+    readonly context?: { readonly contextToken: string; readonly clientId: string };
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   clearInteractionCard(input: {
@@ -213,7 +236,8 @@ interface MessagingTransportEffectsPort {
     readonly messageId: string;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
-  sendTyping(address: MessagingAddress, signal?: AbortSignal): Promise<void>;
+  sendTyping(address: MessagingAddress, signal?: AbortSignal, contextToken?: string): Promise<void>;
+  stopTyping?(address: MessagingAddress, signal?: AbortSignal, contextToken?: string): Promise<void>;
   setReaction(input: {
     readonly address: MessagingAddress;
     readonly messageId: string;
@@ -289,13 +313,24 @@ interface WeComTransportPort extends MessagingTransportEffectsPort {
   ownerAddress(): MessagingAddress;
 }
 
-type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort;
+interface WeChatTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "wechat";
+  poll(input: {
+    readonly cursor: string | null;
+    readonly timeoutSeconds?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<WeChatPollResult>;
+  normalize(updates: readonly WeChatRawMessage[]): WeChatNormalizationResult;
+}
+
+type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort | WeChatTransportPort;
 type MessagingNormalizationResult =
   | TelegramNormalizationResult
   | DiscordNormalizationResult
   | DingTalkNormalizationResult
   | FeishuNormalizationResult
-  | WeComNormalizationResult;
+  | WeComNormalizationResult
+  | WeChatNormalizationResult;
 
 interface CredentialTicketBinding {
   readonly clientConnectionId: string;
@@ -346,13 +381,18 @@ type MessagingInteractionDeliveryPayload =
 export interface MessagingManagerOptions {
   readonly store: OperationalStore;
   readonly credentials: CredentialManager;
-  readonly sessionHost: Pick<SessionHost, "createServiceSession" | "enqueueServiceInput" | "resolveInteraction">;
+  /** Node-only sealing key; required when using protected channel reply context. */
+  readonly contextVault?: Pick<CredentialVault, "seal" | "open">;
+  readonly sessionHost: Pick<SessionHost,
+    "createServiceSession" | "enqueueServiceInput" | "resolveInteraction" | "dismissInteraction"
+    | "abort" | "applySessionSettings">;
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
   readonly createDiscordTransport?: (options: DiscordTransportOptions) => DiscordTransportPort;
   readonly createDingTalkTransport?: (options: DingTalkTransportOptions) => DingTalkTransportPort;
   readonly createFeishuTransport?: (options: FeishuTransportOptions) => FeishuTransportPort;
   readonly createWeComTransport?: (options: WeComTransportOptions) => WeComTransportPort;
+  readonly createWeChatTransport?: (options: WeChatTransportOptions) => WeChatTransportPort;
   /** Test-only transport seams. Production always uses the providers' official direct endpoints. */
   readonly telegramFetch?: typeof fetch;
   readonly telegramApiBaseUrl?: string;
@@ -363,6 +403,12 @@ export interface MessagingManagerOptions {
   readonly dingTalkOapiBaseUrl?: string;
   readonly pollTimeoutSeconds?: number;
   readonly retryDelayMs?: number;
+  /** Test-only clock acceleration; production uses the fixed WeChat presence cadence. */
+  readonly weChatPresenceTiming?: {
+    readonly tickMs: number;
+    readonly firstProgressMs: number;
+    readonly repeatProgressMs: number;
+  };
   readonly now?: () => number;
   readonly idFactory?: () => string;
 }
@@ -375,6 +421,7 @@ export interface MessagingManagerOptions {
 export class MessagingManager {
   readonly #store: OperationalStore;
   readonly #credentials: CredentialManager;
+  readonly #contextVault: MessagingManagerOptions["contextVault"];
   readonly #sessionHost: MessagingManagerOptions["sessionHost"];
   readonly #artifacts: MessagingManagerOptions["artifacts"];
   readonly #createTelegramTransport: NonNullable<MessagingManagerOptions["createTelegramTransport"]>;
@@ -382,13 +429,24 @@ export class MessagingManager {
   readonly #createDingTalkTransport: NonNullable<MessagingManagerOptions["createDingTalkTransport"]>;
   readonly #createFeishuTransport: NonNullable<MessagingManagerOptions["createFeishuTransport"]>;
   readonly #createWeComTransport: NonNullable<MessagingManagerOptions["createWeComTransport"]>;
+  readonly #createWeChatTransport: NonNullable<MessagingManagerOptions["createWeChatTransport"]>;
   readonly #pollTimeoutSeconds: number;
   readonly #retryDelayMs: number;
+  readonly #weChatPresenceTiming: { readonly tickMs: number; readonly firstProgressMs: number; readonly repeatProgressMs: number };
   readonly #now: () => number;
   readonly #idFactory: () => string;
   readonly #tickets = new Map<string, CredentialTicketBinding>();
   readonly #workers = new Map<string, ActiveWorker>();
+  readonly #workerRetirements = new Map<string, Promise<void>>();
   readonly #deliveryFlights = new Map<string, Promise<void>>();
+  readonly #weChatPresence = new Map<string, {
+    readonly connectionId: string;
+    readonly generation: number;
+    readonly conversationId: string;
+    nextProgressAt: number;
+    progressIndex: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
   #mutationTail: Promise<void> = Promise.resolve();
   #initialized = false;
   #closed = false;
@@ -396,12 +454,18 @@ export class MessagingManager {
   constructor(options: MessagingManagerOptions) {
     this.#store = options.store;
     this.#credentials = options.credentials;
+    this.#contextVault = options.contextVault;
     this.#sessionHost = options.sessionHost;
     this.#artifacts = options.artifacts;
     this.#now = options.now ?? Date.now;
     this.#idFactory = options.idFactory ?? randomUUID;
     this.#pollTimeoutSeconds = boundedInteger(options.pollTimeoutSeconds ?? 50, 0, 50, "poll timeout");
     this.#retryDelayMs = boundedInteger(options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS, 1, 60_000, "retry delay");
+    this.#weChatPresenceTiming = options.weChatPresenceTiming ?? {
+      tickMs: WECHAT_TYPING_REFRESH_MS,
+      firstProgressMs: WECHAT_FIRST_PROGRESS_MS,
+      repeatProgressMs: WECHAT_REPEAT_PROGRESS_MS
+    };
     const telegramFetch = options.telegramFetch;
     const telegramApiBaseUrl = options.telegramApiBaseUrl;
     this.#createTelegramTransport = options.createTelegramTransport ?? ((input) => new TelegramTransport({
@@ -427,6 +491,7 @@ export class MessagingManager {
     }));
     this.#createFeishuTransport = options.createFeishuTransport ?? ((input) => new FeishuTransport(input));
     this.#createWeComTransport = options.createWeComTransport ?? ((input) => new WeComTransport(input));
+    this.#createWeChatTransport = options.createWeChatTransport ?? ((input) => new WeChatTransport(input));
   }
 
   async initialize(): Promise<void> {
@@ -441,6 +506,11 @@ export class MessagingManager {
     await this.#cleanupCredentials();
     for (const connection of this.#store.listMessagingConnections()) {
       if (connection.enabled) this.#startWorker(connection.id);
+      if (connection.enabled && connection.channel === "wechat") {
+        for (const request of this.#store.listMessagingInboundRequests({
+          connectionId: connection.id, statuses: ["queued"], limit: 500
+        })) this.#startWeChatPresence(request);
+      }
     }
   }
 
@@ -527,6 +597,87 @@ export class MessagingManager {
     });
   }
 
+  createWeChatConnection(input: {
+    readonly configuration?: WeChatMessagingConfiguration;
+  } = {}): MessagingConnectionRecord {
+    this.#assertReady();
+    return this.#store.createMessagingConnection({
+      channel: "wechat",
+      configuration: decodeWeChatConfiguration(input.configuration ?? { format: 1 })
+    });
+  }
+
+  /** Consumes a confirmed provider authorization only inside the service. */
+  commitWeChatAuthorization(input: {
+    readonly clientConnectionId: string;
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly expectedCredentialReferenceId: string | null;
+    readonly expectedCredentialGeneration: string | null;
+    readonly expectedEnabled: boolean;
+    readonly credentials: {
+      readonly token: string;
+      readonly botId: string;
+      readonly userId: string;
+      readonly baseUrl: string;
+    };
+    readonly enable: boolean;
+  }): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const clientConnectionId = requiredIdentifier(input.clientConnectionId, "client connection");
+      const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
+      assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      decodeWeChatConnection(current);
+      if ((current.credentialReferenceId ?? null) !== input.expectedCredentialReferenceId
+        || (current.credentialGeneration ?? null) !== input.expectedCredentialGeneration
+        || current.enabled !== input.expectedEnabled) {
+        throw new MessagingManagerError("conflict", "WeChat connection material changed during authorization.");
+      }
+      const credentials = validatedWeChatCredentials(input.credentials);
+      const ticket = this.#credentials.createUploadTicket({
+        maximumBytes: CREDENTIAL_MAXIMUM_BYTES,
+        kind: "api_key",
+        connectionId: clientConnectionId,
+        servicePurpose: credentialPurpose(current)
+      });
+      this.#credentials.upload(ticket.credentialUploadTicketId, JSON.stringify(credentials), clientConnectionId);
+
+      let reservedReference: string | undefined;
+      try {
+        const credential = await this.#credentials.commitNewManagedUpload({
+          credentialUploadTicketId: ticket.credentialUploadTicketId,
+          displayName: credentialDisplayName("wechat"),
+          kind: "api_key",
+          connectionId: clientConnectionId,
+          servicePurpose: credentialPurpose(current),
+          onReserved: (reference) => {
+            reservedReference = reference;
+            this.#appendCredentialJournal(reference);
+          }
+        });
+        const latest = this.#store.getMessagingConnection(current.id);
+        assertConnectionFence(latest, input.expectedRevision, input.expectedGeneration);
+        const updated = this.#store.replaceMessagingCredential({
+          connectionId: latest.id,
+          expectedRevision: latest.revision,
+          expectedGeneration: latest.generation,
+          credentialReferenceId: credential.credentialReferenceId,
+          credentialGeneration: credential.generation,
+          ownerProviderUserId: credentials.userId,
+          enable: input.enable,
+          updatedAt: this.#now()
+        });
+        this.#restartWorker(updated.id);
+        await this.#cleanupCredentials();
+        return updated;
+      } catch (error) {
+        if (reservedReference !== undefined) await this.#cleanupCredentials();
+        throw error;
+      }
+    });
+  }
+
   beginCredentialUpload(input: {
     readonly clientConnectionId: string;
     readonly messagingConnectionId: string;
@@ -540,6 +691,7 @@ export class MessagingManager {
     );
     assertConnectionFence(connection, input.expectedRevision, input.expectedGeneration);
     if (!isSupportedMessagingChannel(connection.channel)) throw unavailableChannel();
+    if (connection.channel === "wechat") throw invalid("WeChat credentials require the connection authorization flow.");
     decodeSupportedConnection(connection);
     const ticket = this.#credentials.createUploadTicket({
       maximumBytes: CREDENTIAL_MAXIMUM_BYTES,
@@ -626,7 +778,7 @@ export class MessagingManager {
         expectedRevision: current.revision,
         expectedGeneration: current.generation,
         clearOwner: current.channel === "dingtalk" || current.channel === "feishu" || current.channel === "lark"
-          || current.channel === "wecom",
+          || current.channel === "wecom" || current.channel === "wechat",
         updatedAt: this.#now()
       });
       this.#restartWorker(updated.id);
@@ -869,6 +1021,7 @@ export class MessagingManager {
   }): Promise<void> {
     if (!this.#initialized || this.#closed) return;
     const request = this.#store.findMessagingInboundRequestByRunId(input.runId);
+    if (request !== undefined) this.#stopWeChatPresence(request);
     if (request === undefined || request.status !== "queued") return;
     const conversation = request.conversationId === undefined
       ? undefined
@@ -886,11 +1039,13 @@ export class MessagingManager {
       if (input.outcome === "completed") {
         const output = this.#latestAssistantOutput(input.sessionId, input.runId);
         const text = boundedOutboundText(output.text, channel);
-        const deliveryText = channel === "wecom" && text.trim() === ""
-          ? output.attachments.length > 0 ? WECOM_ATTACHMENT_REPLY_TEXT : WECOM_EMPTY_REPLY_TEXT
+        const deliveryText = text.trim() === "" && (channel === "wecom" || channel === "wechat")
+          ? channel === "wecom"
+            ? output.attachments.length > 0 ? WECOM_ATTACHMENT_REPLY_TEXT : WECOM_EMPTY_REPLY_TEXT
+            : output.attachments.length > 0 ? WECHAT_ATTACHMENT_REPLY_TEXT : WECHAT_EMPTY_REPLY_TEXT
           : text;
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
-        if (text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom")) {
+        if (text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom" || channel === "wechat")) {
           const parts = channel === "discord"
             ? splitDiscordText(text)
             : channel === "dingtalk"
@@ -899,6 +1054,8 @@ export class MessagingManager {
                 ? splitFeishuText(text)
                 : channel === "wecom"
                   ? splitWeComText(deliveryText)
+                  : channel === "wechat"
+                    ? splitWeChatText(deliveryText)
                   : splitTelegramText(text);
           for (const part of parts) {
             const partIndex = deliveries.length;
@@ -921,7 +1078,7 @@ export class MessagingManager {
         const images = output.attachments.filter((attachment) => attachment.kind === "image");
         const files = output.attachments.filter((attachment) => attachment.kind === "file");
         const imageBatchSize = channel === "dingtalk" || channel === "feishu" || channel === "lark"
-          || channel === "wecom" ? 1 : 10;
+          || channel === "wecom" || channel === "wechat" ? 1 : 10;
         for (let index = 0; index < images.length; index += imageBatchSize) {
           const partIndex = deliveries.length;
           deliveries.push({
@@ -1021,6 +1178,8 @@ export class MessagingManager {
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    for (const state of this.#weChatPresence.values()) clearTimeout(state.timer);
+    this.#weChatPresence.clear();
     await Promise.allSettled([...this.#workers.entries()].map(async ([connectionId, worker]) => {
       const connection = this.#store.findMessagingConnection(connectionId);
       if (
@@ -1038,6 +1197,7 @@ export class MessagingManager {
       worker.controller.abort();
       return worker.task;
     });
+    tasks.push(...this.#workerRetirements.values());
     this.#workers.clear();
     await Promise.allSettled(tasks);
     await this.#mutationTail.catch(() => undefined);
@@ -1064,9 +1224,27 @@ export class MessagingManager {
   }
 
   #restartWorker(connectionId: string): void {
-    this.#workers.get(connectionId)?.controller.abort();
+    const previous = this.#workers.get(connectionId);
+    previous?.controller.abort();
     this.#workers.delete(connectionId);
     const connection = this.#store.getMessagingConnection(connectionId);
+    if (connection.channel === "wechat") {
+      // The provider's best-effort stop call belongs to the old transport.
+      // Do not let its late close stop a newly authenticated generation.
+      const priorRetirement = this.#workerRetirements.get(connectionId);
+      const retirement = (priorRetirement ?? Promise.resolve())
+        .then(async () => { await previous?.task; })
+        .catch(() => undefined);
+      this.#workerRetirements.set(connectionId, retirement);
+      void retirement.then(() => {
+        if (this.#workerRetirements.get(connectionId) !== retirement) return;
+        this.#workerRetirements.delete(connectionId);
+        if (this.#closed || this.#workers.has(connectionId)) return;
+        const latest = this.#store.findMessagingConnection(connectionId);
+        if (latest?.enabled) this.#startWorker(connectionId);
+      });
+      return;
+    }
     if (connection.enabled) this.#startWorker(connection.id);
   }
 
@@ -1145,6 +1323,14 @@ export class MessagingManager {
         const result = await transport.poll({
           cursor: connection.cursor ?? null,
           timeoutSeconds: this.#pollTimeoutSeconds,
+          signal
+        });
+        nextCursor = result.nextCursor;
+        normalized = transport.normalize(result.updates);
+      } else if (transport.channel === "wechat") {
+        const result = await transport.poll({
+          cursor: connection.cursor ?? null,
+          timeoutSeconds: Math.min(this.#pollTimeoutSeconds, 35),
           signal
         });
         nextCursor = result.nextCursor;
@@ -1260,8 +1446,15 @@ export class MessagingManager {
     for (const event of batch.events) {
       signal.throwIfAborted();
       if (event.kind === "message") {
-        if (!await this.#settleTextInteraction(activeConnection, event)) {
-          await this.#admitMessage(activeConnection, transport, event, signal);
+        const contextToken = activeConnection.channel === "wechat"
+          ? weChatPrivateContextForEvent(batch, event)
+          : undefined;
+        if (activeConnection.channel === "wechat" && contextToken !== undefined
+          && await this.#processWeChatCommand(activeConnection, event, contextToken)) {
+          continue;
+        }
+        if (!await this.#settleTextInteraction(activeConnection, event, undefined, contextToken)) {
+          await this.#admitMessage(activeConnection, transport, event, signal, contextToken);
         }
       }
       else await this.#settleInteraction(activeConnection, transport, event, signal);
@@ -1287,7 +1480,8 @@ export class MessagingManager {
       });
       if (exact !== undefined) return exact;
     }
-    if ((connection.channel !== "dingtalk" && connection.channel !== "wecom") || !event.speaker.isOwner) return undefined;
+    if ((connection.channel !== "dingtalk" && connection.channel !== "wecom" && connection.channel !== "wechat")
+      || (connection.channel !== "wechat" && !event.speaker.isOwner)) return undefined;
     const open = this.#store.listMessagingDeliveries({
       connectionId: connection.id,
       statuses: ["sent"],
@@ -1310,7 +1504,8 @@ export class MessagingManager {
   async #settleTextInteraction(
     connection: MessagingConnectionRecord,
     event: MessagingInboundMessage,
-    knownDelivery?: MessagingDeliveryRecord
+    knownDelivery?: MessagingDeliveryRecord,
+    contextToken?: string
   ): Promise<boolean> {
     const delivery = knownDelivery ?? this.#findTextInteractionDelivery(connection, event);
     if (delivery === undefined) return false;
@@ -1330,6 +1525,10 @@ export class MessagingManager {
       createdAt: this.#now()
     });
     if (interaction.status !== "pending") return true;
+    if (connection.channel === "wechat") {
+      if (contextToken === undefined) throw invalid("WeChat interaction reply context is missing.");
+      this.#putWeChatConversationContext(connection, conversation, { sourceInteractionId: interaction.id }, contextToken);
+    }
     const claimToken = this.#idFactory();
     const claimed = this.#store.claimMessagingInteraction({
       interactionId: interaction.id,
@@ -1345,7 +1544,7 @@ export class MessagingManager {
     try {
       const card = interactionDeliveryPayload(delivery.payload);
       const pending = this.#store.getInteraction(card.interactionId);
-      if (!event.speaker.isOwner) {
+      if (!event.speaker.isOwner && connection.channel !== "wechat") {
         outcomeCode = "unauthorized";
         notice = "Only the connection owner can answer this request.";
       } else if (
@@ -1407,11 +1606,217 @@ export class MessagingManager {
     return true;
   }
 
+  async #processWeChatCommand(
+    connection: MessagingConnectionRecord,
+    event: MessagingInboundMessage,
+    contextToken: string
+  ): Promise<boolean> {
+    const command = event.text.trim().normalize("NFC");
+    if (!command.startsWith("/")) return false;
+    let conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
+    conversation = await this.#activateConversation(conversation, event);
+    const payload = { format: 1, command };
+    const interaction = this.#store.createMessagingInteraction({
+      connectionId: connection.id,
+      expectedChannelGeneration: connection.generation,
+      conversationId: conversation.id,
+      providerRequestId: event.providerRequestIds[0]!,
+      providerInteractionId: `command:${event.messageId}`,
+      providerMessageId: event.messageId,
+      actionHash: operationBodyHash(payload),
+      payload,
+      expiresAt: this.#now() + 30 * 60_000,
+      createdAt: this.#now()
+    });
+    if (interaction.status !== "pending") return true;
+    this.#putWeChatConversationContext(connection, conversation, { sourceInteractionId: interaction.id }, contextToken);
+    const claimToken = this.#idFactory();
+    const claimed = this.#store.claimMessagingInteraction({
+      interactionId: interaction.id,
+      expectedRevision: interaction.revision,
+      claimToken,
+      claimedAt: this.#now()
+    });
+    if (claimed === undefined) return true;
+
+    let notice: string;
+    let outcomeCode: string | undefined;
+    try {
+      notice = await this.#runWeChatCommand(connection, conversation, event, command, claimed.id);
+    } catch {
+      outcomeCode = "command_effect_unknown";
+      notice = "The command result could not be confirmed. Check the task before retrying.";
+    }
+    const now = this.#now();
+    this.#store.transaction((store) => {
+      const noticePayload = { format: 1, address: event.address, text: notice };
+      store.enqueueMessagingDelivery({
+        connectionId: connection.id,
+        expectedChannelGeneration: connection.generation,
+        conversationId: conversation.id,
+        dedupeKey: `command:${claimed.id}:notice`,
+        kind: "notice",
+        partIndex: 0,
+        partCount: 1,
+        payloadHash: operationBodyHash(noticePayload),
+        payload: noticePayload,
+        availableAt: now,
+        createdAt: now
+      });
+      store.settleMessagingInteraction({
+        interactionId: claimed.id,
+        expectedRevision: claimed.revision,
+        claimToken,
+        status: outcomeCode === undefined ? "completed" : "unknown",
+        ...(outcomeCode === undefined ? {} : { outcomeCode }),
+        settledAt: now
+      });
+    });
+    this.#scheduleDeliveryDrain(connection.id);
+    return true;
+  }
+
+  async #runWeChatCommand(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    event: MessagingInboundMessage,
+    command: string,
+    interactionId: string
+  ): Promise<string> {
+    const sessionId = conversation.sessionId;
+    if (sessionId === undefined) throw invalid("WeChat command task binding is missing.");
+    if (command === "/help") {
+      return "Commands: /new, /stop, /stop all (account owner), /status, /permission, /help.";
+    }
+    if (command === "/status") {
+      const pending = this.#store.listQueueItems({
+        sessionId,
+        states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"],
+        limit: 1_000
+      }).length;
+      return `WeChat connection: ${connection.runtimeStatus}. This conversation has ${pending} pending task${pending === 1 ? "" : "s"}.`;
+    }
+    if (command === "/stop" || command === "/stop all") {
+      if (command === "/stop all" && !event.speaker.isOwner) {
+        return "Only the connected account can stop every WeChat conversation. Use /stop for this conversation.";
+      }
+      const conversations = command === "/stop all"
+        ? this.#store.listMessagingConversations({ connectionId: connection.id, statuses: ["active"] })
+        : [conversation];
+      let stopped = 0;
+      for (const candidate of conversations) {
+        if (candidate.sessionId === undefined) continue;
+        stopped += await this.#stopWeChatSession(candidate.sessionId, interactionId);
+      }
+      return stopped === 0 ? "No active task needed stopping." : `Stopped ${stopped} active task${stopped === 1 ? "" : "s"}.`;
+    }
+    if (command === "/new") {
+      await this.#startNewWeChatSession(connection, conversation, event, interactionId);
+      return "A new conversation is ready. Previous task history remains available.";
+    }
+    if (command === "/permission" || command.startsWith("/permission ")) {
+      return this.#changeWeChatPermission(conversation, command);
+    }
+    return "Unknown command. Send /help to see available commands.";
+  }
+
+  async #stopWeChatSession(sessionId: string, interactionId: string): Promise<number> {
+    let stopped = 0;
+    for (const interaction of this.#store.listInteractions({ sessionId, status: "open", limit: 1_000 })) {
+      this.#sessionHost.dismissInteraction(
+        interaction.id,
+        interaction.generation,
+        "Stopped from this Messaging conversation.",
+        `messaging-stop:${interactionId}:${interaction.id}`
+      );
+      stopped += 1;
+    }
+    for (const run of this.#store.listRuns({ sessionId, activeOnly: true, limit: 1_000 })) {
+      await this.#sessionHost.abort(sessionId, run.descriptor.id);
+      stopped += 1;
+    }
+    for (const item of this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1_000 })) {
+      this.#store.cancelQueueItem({
+        queueItemId: item.id,
+        expectedRevision: item.revision,
+        traceId: `messaging-stop:${interactionId}:${item.id}`,
+        at: this.#now()
+      });
+      stopped += 1;
+    }
+    return stopped;
+  }
+
+  async #startNewWeChatSession(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    event: MessagingInboundMessage,
+    interactionId: string
+  ): Promise<void> {
+    if (conversation.sessionId === undefined) throw invalid("WeChat conversation has no task.");
+    if (this.#store.listRuns({ sessionId: conversation.sessionId, activeOnly: true, limit: 1 }).length > 0
+      || this.#store.listQueueItems({
+        sessionId: conversation.sessionId,
+        states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"],
+        limit: 1
+      }).length > 0
+      || this.#store.listInteractions({ sessionId: conversation.sessionId, status: "open", limit: 1 }).length > 0) {
+      throw invalid("Stop or finish the active task before starting a new WeChat conversation.");
+    }
+    const route = this.#store.resolveMessagingRoute(connection.id);
+    const created = await this.#sessionHost.createServiceSession({
+      operationId: `messaging-new-session-${interactionId}`,
+      serviceKind: "messaging",
+      targetId: route.targetId,
+      title: `WeChat · ${safeExternalText(event.speaker.displayName, 128)}`,
+      providerId: route.providerId,
+      modelId: route.modelId,
+      effort: route.effort,
+      fastMode: route.fastMode,
+      permissionMode: route.permissionMode,
+      planMode: route.planMode
+    });
+    const session = this.#store.getSession(created.value.sessionId);
+    this.#store.rebindMessagingConversationSession({
+      conversationId: conversation.id,
+      expectedRevision: conversation.revision,
+      expectedChannelGeneration: connection.generation,
+      expectedSessionId: conversation.sessionId,
+      sessionId: session.descriptor.id,
+      expectedSessionGeneration: session.descriptor.binding.generation,
+      routeScopeKey: route.scopeKey,
+      updatedAt: this.#now()
+    });
+  }
+
+  async #changeWeChatPermission(
+    conversation: MessagingConversationRecord,
+    command: string
+  ): Promise<string> {
+    if (conversation.sessionId === undefined) throw invalid("WeChat conversation has no task.");
+    const session = this.#store.getSession(conversation.sessionId);
+    const available = this.#store.getBackend(session.descriptor.backendId).descriptor.capabilities
+      .get("permission.modes")?.options ?? [];
+    const choice = /^\/permission(?:\s+(ask|auto|bypassPermissions)(?:\s+(confirm))?)?$/iu.exec(command);
+    const picker = `Current permission: ${session.descriptor.permissionMode}. Available: ${available.join(", ") || "none"}. Use /permission <mode>; bypassPermissions requires /permission bypassPermissions confirm.`;
+    if (choice === null || choice[1] === undefined) return picker;
+    const mode = choice[1].toLowerCase() === "bypasspermissions"
+      ? "bypassPermissions"
+      : choice[1].toLowerCase() as "ask" | "auto";
+    if (!available.includes(mode)) return picker;
+    if (mode === "bypassPermissions" && choice[2]?.toLowerCase() !== "confirm") return picker;
+    if (session.descriptor.permissionMode === mode) return `Permission is already ${mode}.`;
+    await this.#sessionHost.applySessionSettings(session.descriptor.id, { permissionMode: mode });
+    this.#store.updateSession(session.descriptor.id, { permissionMode: mode }, session.revision, this.#now());
+    return `Permission changed to ${mode}.`;
+  }
+
   async #admitMessage(
     connection: MessagingConnectionRecord,
     transport: MessagingTransportEffectsPort,
     event: MessagingInboundMessage,
-    signal: AbortSignal
+    signal: AbortSignal,
+    contextToken?: string
   ): Promise<void> {
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
     const creation = this.#store.createMessagingInboundRequest({
@@ -1445,6 +1850,10 @@ export class MessagingManager {
     this.#requireWorkerConnection(connection.id, connection.generation);
 
     let activeConversation = await this.#activateConversation(conversation, event);
+    if (connection.channel === "wechat") {
+      if (contextToken === undefined) throw invalid("WeChat inbound reply context is missing.");
+      this.#putWeChatConversationContext(connection, activeConversation, { sourceRequestId: request.id }, contextToken);
+    }
 
     if (activeConversation.conversationKind !== "direct" && transport.loadGroupHistory !== undefined) {
       try {
@@ -1529,6 +1938,9 @@ export class MessagingManager {
       }
     });
     if (execution.value.queueItemId === "") throw new Error("Messaging Queue admission failed.");
+    if (connection.channel === "wechat") {
+      this.#startWeChatPresence(this.#store.getMessagingInboundRequest(request.id));
+    }
 
     if (reactionMode(configuration) !== "off") {
       this.#store.transaction((store) => enqueueReaction(store, connection, activeConversation, {
@@ -1538,7 +1950,10 @@ export class MessagingManager {
         availableAt: this.#now()
       }));
     }
-    await transport.sendTyping(event.address, signal).catch(() => undefined);
+    const typingContext = transport.channel === "wechat"
+      ? this.#openWeChatConversationContext(connection, activeConversation)
+      : undefined;
+    await transport.sendTyping(event.address, signal, typingContext).catch(() => undefined);
   }
 
   async #settleInteraction(
@@ -1851,6 +2266,16 @@ export class MessagingManager {
         now: this.#now
       });
     }
+    if (connection.channel === "wechat") {
+      decodeWeChatConnection(connection);
+      return this.#createWeChatTransport({
+        credentials: decodeStoredWeChatCredentials(token),
+        connectionId: connection.id,
+        generation: connection.generation,
+        initialCursor: connection.cursor ?? null,
+        now: this.#now
+      });
+    }
     if (connection.channel !== "feishu" && connection.channel !== "lark") {
       throw unavailableChannel();
     }
@@ -1896,6 +2321,181 @@ export class MessagingManager {
       });
     }
     return current;
+  }
+
+  #openWeChatConversationContext(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord
+  ): string {
+    const record = this.#store.findMessagingConversationContext(conversation.id);
+    if (connection.channel !== "wechat" || this.#contextVault === undefined
+      || connection.credentialGeneration === undefined || record === undefined
+      || record.connectionId !== connection.id
+      || record.materialGeneration !== connection.credentialGeneration
+      || record.conversationId !== conversation.id
+      || conversation.connectionId !== connection.id
+      || conversation.channelGeneration !== connection.generation
+      || conversation.status !== "active") {
+      throw new MessagingTransportError("invalid_input", "A protected reply context is unavailable.", {
+        retryable: false,
+        effect: "none"
+      });
+    }
+    try {
+      return this.#contextVault.open(record.sealed, messagingConversationContextAad(record));
+    } catch {
+      throw new MessagingTransportError("invalid_input", "A protected reply context is invalid.", {
+        retryable: false,
+        effect: "none"
+      });
+    }
+  }
+
+  #putWeChatConversationContext(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    source: { readonly sourceRequestId: string } | { readonly sourceInteractionId: string },
+    contextToken: string
+  ): void {
+    if (connection.channel !== "wechat" || this.#contextVault === undefined
+      || connection.credentialGeneration === undefined
+      || typeof contextToken !== "string" || contextToken.length < 1 || contextToken.length > 4_096) {
+      throw new MessagingTransportError("invalid_input", "A protected reply context is unavailable.", {
+        retryable: false,
+        effect: "none"
+      });
+    }
+    const aad = messagingConversationContextAad({
+      connectionId: connection.id,
+      materialGeneration: connection.credentialGeneration,
+      conversationId: conversation.id
+    });
+    const sealed = this.#contextVault.seal(contextToken, aad);
+    const latest = this.#store.findMessagingConversationContext(conversation.id);
+    this.#store.putMessagingConversationContext({
+      connectionId: connection.id,
+      expectedChannelGeneration: connection.generation,
+      expectedMaterialGeneration: connection.credentialGeneration,
+      conversationId: conversation.id,
+      expectedRevision: latest?.revision ?? null,
+      sealed,
+      ...source,
+      updatedAt: this.#now()
+    });
+  }
+
+  #weChatSendContext(
+    connection: MessagingConnectionRecord,
+    delivery: MessagingDeliveryRecord
+  ): { readonly contextToken: string; readonly clientId: string } {
+    if (delivery.connectionId !== connection.id || delivery.channelGeneration !== connection.generation) {
+      throw new MessagingTransportError("cancelled", "Messaging delivery generation changed.", {
+        retryable: false,
+        effect: "none"
+      });
+    }
+    const conversation = this.#store.getMessagingConversation(delivery.conversationId);
+    return {
+      contextToken: this.#openWeChatConversationContext(connection, conversation),
+      clientId: delivery.id
+    };
+  }
+
+  #startWeChatPresence(request: MessagingInboundRequestRecord): void {
+    if (this.#closed || request.status !== "queued" || request.conversationId === undefined
+      || this.#weChatPresence.has(request.id)) return;
+    const connection = this.#store.findMessagingConnection(request.connectionId);
+    if (connection?.channel !== "wechat" || !connection.enabled
+      || connection.generation !== request.channelGeneration) return;
+    const state = {
+      connectionId: connection.id,
+      generation: connection.generation,
+      conversationId: request.conversationId,
+      nextProgressAt: request.updatedAt + this.#weChatPresenceTiming.firstProgressMs,
+      progressIndex: 0,
+      timer: undefined as ReturnType<typeof setTimeout> | undefined
+    };
+    state.timer = setTimeout(() => void this.#tickWeChatPresence(request.id, state), this.#weChatPresenceTiming.tickMs);
+    state.timer.unref?.();
+    this.#weChatPresence.set(request.id, state);
+  }
+
+  #stopWeChatPresence(request: MessagingInboundRequestRecord): void {
+    const state = this.#weChatPresence.get(request.id);
+    if (state === undefined) return;
+    clearTimeout(state.timer);
+    this.#weChatPresence.delete(request.id);
+    const worker = this.#workers.get(state.connectionId);
+    const transport = worker?.transport;
+    if (worker?.generation !== state.generation || transport?.channel !== "wechat") return;
+    const connection = this.#store.findMessagingConnection(state.connectionId);
+    const conversation = this.#store.findMessagingConversation(state.conversationId);
+    if (connection?.generation !== state.generation || conversation?.status !== "active") return;
+    try {
+      const contextToken = this.#openWeChatConversationContext(connection, conversation);
+      void transport.stopTyping?.(addressFor(connection, conversation), worker.controller.signal, contextToken)
+        .catch(() => undefined);
+    } catch { /* Presence is best effort and carries no task authority. */ }
+  }
+
+  async #tickWeChatPresence(
+    requestId: string,
+    state: {
+      readonly connectionId: string;
+      readonly generation: number;
+      readonly conversationId: string;
+      nextProgressAt: number;
+      progressIndex: number;
+      timer?: ReturnType<typeof setTimeout>;
+    }
+  ): Promise<void> {
+    if (this.#closed || this.#weChatPresence.get(requestId) !== state) return;
+    try {
+      const request = this.#store.findMessagingInboundRequest(requestId);
+      if (request?.status !== "queued") {
+        if (request !== undefined) this.#stopWeChatPresence(request);
+        return;
+      }
+      const worker = this.#workers.get(state.connectionId);
+      const transport = worker?.transport;
+      const connection = this.#store.findMessagingConnection(state.connectionId);
+      const conversation = this.#store.findMessagingConversation(state.conversationId);
+      if (worker?.generation !== state.generation || transport?.channel !== "wechat"
+        || connection?.generation !== state.generation || !connection.enabled
+        || conversation?.status !== "active" || conversation.sessionId === undefined) return;
+      const address = addressFor(connection, conversation);
+      const contextToken = this.#openWeChatConversationContext(connection, conversation);
+      await transport.sendTyping(address, worker.controller.signal, contextToken);
+      if (this.#now() >= state.nextProgressAt && this.#weChatPresence.get(requestId) === state) {
+        const now = this.#now();
+        const payload = { format: 1, address, text: "Task is still in progress…" };
+        this.#store.transaction((store) => {
+          if (store.getMessagingInboundRequest(requestId).status !== "queued") return;
+          store.enqueueMessagingDelivery({
+            connectionId: connection.id,
+            expectedChannelGeneration: state.generation,
+            conversationId: conversation.id,
+            dedupeKey: `request:${requestId}:progress:${state.progressIndex}`,
+            kind: "notice",
+            partIndex: 0,
+            partCount: 1,
+            payloadHash: operationBodyHash(payload),
+            payload,
+            availableAt: now,
+            createdAt: now
+          });
+        });
+        state.progressIndex += 1;
+        state.nextProgressAt = now + this.#weChatPresenceTiming.repeatProgressMs;
+        this.#scheduleDeliveryDrain(connection.id);
+      }
+    } catch { /* Network presence must never fail the admitted task. */ }
+    finally {
+      if (!this.#closed && this.#weChatPresence.get(requestId) === state) {
+        state.timer = setTimeout(() => void this.#tickWeChatPresence(requestId, state), this.#weChatPresenceTiming.tickMs);
+        state.timer.unref?.();
+      }
+    }
   }
 
   #scheduleDeliveryDrain(connectionId: string): void {
@@ -2018,7 +2618,8 @@ export class MessagingManager {
           });
           continue;
         }
-        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, signal);
+        const context = transport.channel === "wechat" ? this.#weChatSendContext(connection, delivery) : undefined;
+        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, signal, context);
         const settled = this.#store.settleMessagingDelivery({
           deliveryId: delivery.id,
           expectedRevision: delivery.revision,
@@ -2074,6 +2675,7 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     delivery: MessagingDeliveryRecord
   ): void {
+    if (connection.channel === "wechat") return;
     if (delivery.providerMessageId === undefined) return;
     const payload = interactionDeliveryPayload(delivery.payload);
     if (payload.action !== "open") return;
@@ -2251,7 +2853,8 @@ async function dispatchMessagingDelivery(
   transport: MessagingTransportEffectsPort,
   delivery: MessagingDeliveryRecord,
   artifacts: Pick<ArtifactStore, "readBlob">,
-  signal: AbortSignal
+  signal: AbortSignal,
+  context?: { readonly contextToken: string; readonly clientId: string }
 ): Promise<string> {
   if (delivery.kind === "interaction") {
     const interaction = interactionDeliveryPayload(delivery.payload);
@@ -2267,6 +2870,7 @@ async function dispatchMessagingDelivery(
       address: interaction.address,
       text: interaction.text,
       buttons: interaction.buttons.map((button) => ({ label: button.label, actionValue: button.actionId })),
+      ...(context === undefined ? {} : { context }),
       signal
     });
     return receipt.providerMessageId;
@@ -2277,6 +2881,7 @@ async function dispatchMessagingDelivery(
     const receipt = await transport.sendTextPart({
       address: payload.address,
       text: payload.text,
+      ...(context === undefined ? {} : { context }),
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
       ...(payload.callbackMessageId === undefined ? {} : { callbackMessageId: payload.callbackMessageId }),
       signal
@@ -2309,6 +2914,7 @@ async function dispatchMessagingDelivery(
     const receipt = await transport.sendAttachments({
       address: payload.address,
       attachments,
+      ...(context === undefined ? {} : { context }),
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
       signal
     });
@@ -2543,7 +3149,7 @@ function messagingInteractionCard(
     return undefined;
   }
   if (buttons.length > 100 || (buttons.length < 1 && payload.kind !== "question")) return undefined;
-  const visibleButtons = channel === "wecom" ? buttons.slice(0, 9)
+  const visibleButtons = channel === "wecom" || channel === "wechat" ? buttons.slice(0, 9)
     : channel === "discord" || channel === "dingtalk" ? buttons.slice(0, 25) : buttons;
   return {
     interactionId: interaction.id,
@@ -2811,6 +3417,7 @@ function decodeSupportedConnection(connection: MessagingConnectionRecord): Suppo
   if (connection.channel === "dingtalk") return decodeDingTalkConnection(connection);
   if (connection.channel === "feishu" || connection.channel === "lark") return decodeFeishuConnection(connection);
   if (connection.channel === "wecom") return decodeWeComConnection(connection);
+  if (connection.channel === "wechat") return decodeWeChatConnection(connection);
   throw unavailableChannel();
 }
 
@@ -3050,13 +3657,36 @@ export function decodeWeComMessagingConfiguration(value: unknown): WeComMessagin
   return decodeWeComConfiguration(value);
 }
 
+function decodeWeChatConnection(connection: MessagingConnectionRecord): WeChatMessagingConfiguration {
+  if (connection.channel !== "wechat") throw unavailableChannel();
+  return decodeWeChatConfiguration(connection.configuration);
+}
+
+function decodeWeChatConfiguration(value: unknown): WeChatMessagingConfiguration {
+  if (!isRecord(value) || value["format"] !== 1 || Object.keys(value).length !== 1) {
+    throw invalid("WeChat configuration contains unsupported fields.");
+  }
+  return { format: 1 };
+}
+
+/** Strict current-v1 decoder shared by the authenticated contract projection. */
+export function decodeWeChatMessagingConfiguration(value: unknown): WeChatMessagingConfiguration {
+  return decodeWeChatConfiguration(value);
+}
+
 async function verifiedAttachmentMime(
   channel: SupportedMessagingChannel,
   kind: "image" | "file",
   declared: string | null,
   downloaded: MessagingDownloadedAttachment
 ): Promise<string> {
-  const maximumBytes = channel === "discord" || channel === "wecom" ? 50 * 1024 * 1024
+  const expandedWeChatVoice = channel === "wechat" && kind === "file"
+    && declared === "audio/wav" && downloaded.mimeType === "audio/wav"
+    && downloaded.bytes.byteLength >= 12
+    && Buffer.from(downloaded.bytes.subarray(0, 4)).toString("ascii") === "RIFF"
+    && Buffer.from(downloaded.bytes.subarray(8, 12)).toString("ascii") === "WAVE";
+  const maximumBytes = channel === "wechat" ? (expandedWeChatVoice ? 20 : 5) * 1024 * 1024
+    : channel === "discord" || channel === "wecom" ? 50 * 1024 * 1024
     : channel === "feishu" || channel === "lark" ? 30 * 1024 * 1024
       : 20 * 1024 * 1024;
   if (downloaded.bytes.byteLength === 0 || downloaded.bytes.byteLength > maximumBytes) {
@@ -3107,7 +3737,9 @@ function runtimeFailure(error: unknown, channel: string): {
     if (error.code === "conflict") {
       return { status: "conflict", code: "polling_conflict", summary: `Another client is connected to this ${name} bot.`, retryable: true };
     }
-    if (channel === "wecom" && error.code === "network" && error.options.retryable) {
+    if ((channel === "wecom" || channel === "wechat")
+      && (error.code === "network" || error.code === "provider_unavailable" || error.code === "rate_limited")
+      && error.options.retryable) {
       return {
         status: "offline",
         code: "network",
@@ -3178,6 +3810,24 @@ function safeExternalText(value: string, maximum: number): string {
     .replace(/[\r\n]+/gu, " ")
     .trim()
     .slice(0, maximum);
+}
+
+function weChatPrivateContextForEvent(
+  batch: MessagingNormalizationResult,
+  event: MessagingInboundMessage
+): string {
+  if (!isRecord(batch) || !Array.isArray(batch["privateContexts"])) {
+    throw invalid("WeChat normalized reply contexts are unavailable.");
+  }
+  const matches = batch["privateContexts"].filter((candidate: unknown) =>
+    isRecord(candidate)
+    && candidate["messageId"] === event.messageId
+    && candidate["providerConversationId"] === event.address.providerConversationId);
+  if (matches.length !== 1 || !isRecord(matches[0])
+    || typeof matches[0]["contextToken"] !== "string") {
+    throw invalid("WeChat inbound reply context is ambiguous or missing.");
+  }
+  return matches[0]["contextToken"];
 }
 
 function looksLikeGroupPromptInjection(value: string): boolean {
@@ -3270,9 +3920,83 @@ function weComProviderId(value: unknown, label: string, maximum: number): string
   return normalized;
 }
 
+function validatedWeChatCredentials(value: unknown): {
+  readonly format: 1;
+  readonly token: string;
+  readonly botId: string;
+  readonly userId: string;
+  readonly baseUrl: string;
+} {
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "baseUrl,botId,token,userId") {
+    throw invalid("WeChat authorization result is invalid.");
+  }
+  const botId = weChatProviderId(value["botId"], "bot ID");
+  const userId = weChatProviderId(value["userId"], "user ID");
+  const token = value["token"];
+  if (typeof token !== "string" || token.length < 1 || token.length > 2_048 || /[\u0000-\u001f\u007f]/u.test(token)) {
+    throw invalid("WeChat authorization token is invalid.");
+  }
+  const rawBaseUrl = value["baseUrl"];
+  if (typeof rawBaseUrl !== "string" || rawBaseUrl.length > 2_048) throw invalid("WeChat API origin is invalid.");
+  let parsed: URL;
+  try { parsed = new URL(rawBaseUrl); }
+  catch { throw invalid("WeChat API origin is invalid."); }
+  const host = parsed.hostname.toLowerCase();
+  if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== ""
+    || (parsed.port !== "" && parsed.port !== "443") || parsed.search !== "" || parsed.hash !== ""
+    || (host !== "weixin.qq.com" && !host.endsWith(".weixin.qq.com"))) {
+    throw invalid("WeChat API origin is invalid.");
+  }
+  const result = { format: 1, token, botId, userId, baseUrl: parsed.href } as const;
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") > CREDENTIAL_MAXIMUM_BYTES) {
+    throw invalid("WeChat authorization result exceeds the managed credential limit.");
+  }
+  return result;
+}
+
+function decodeStoredWeChatCredentials(value: string): {
+  readonly token: string;
+  readonly botId: string;
+  readonly userId: string;
+  readonly baseUrl: string;
+} {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { throw credentialUnavailable(); }
+  if (!isRecord(parsed) || parsed["format"] !== 1
+    || Object.keys(parsed).sort().join(",") !== "baseUrl,botId,format,token,userId") {
+    throw credentialUnavailable();
+  }
+  try {
+    const validated = validatedWeChatCredentials({
+      token: parsed["token"],
+      botId: parsed["botId"],
+      userId: parsed["userId"],
+      baseUrl: parsed["baseUrl"]
+    });
+    return {
+      token: validated.token,
+      botId: validated.botId,
+      userId: validated.userId,
+      baseUrl: validated.baseUrl
+    };
+  } catch {
+    throw credentialUnavailable();
+  }
+}
+
+function weChatProviderId(value: unknown, label: string): string {
+  if (typeof value !== "string") throw invalid(`WeChat ${label} is invalid.`);
+  const normalized = value.trim();
+  if (normalized.length < 1 || normalized.length > 512 || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw invalid(`WeChat ${label} is invalid.`);
+  }
+  return normalized;
+}
+
 function isSupportedMessagingChannel(value: string): value is SupportedMessagingChannel {
   return value === "telegram" || value === "discord" || value === "dingtalk" || value === "feishu" || value === "lark"
-    || value === "wecom";
+    || value === "wecom" || value === "wechat";
 }
 
 function requiredSupportedMessagingChannel(value: string): SupportedMessagingChannel {
@@ -3287,6 +4011,7 @@ function channelDisplayName(value: string): string {
   if (value === "feishu") return "Feishu";
   if (value === "lark") return "Lark";
   if (value === "wecom") return "WeCom";
+  if (value === "wechat") return "WeChat";
   return "Messaging provider";
 }
 
@@ -3294,6 +4019,7 @@ function credentialDisplayName(channel: SupportedMessagingChannel): string {
   return channel === "dingtalk" ? "DingTalk App Secret"
     : channel === "feishu" || channel === "lark" ? `${channelDisplayName(channel)} App Secret`
       : channel === "wecom" ? "WeCom Bot Secret"
+      : channel === "wechat" ? "WeChat authorization token"
       : `${channelDisplayName(channel)} bot token`;
 }
 
@@ -3339,7 +4065,7 @@ function isOneOf<const T extends readonly string[]>(value: unknown, options: T):
 
 function validAddress(value: unknown): value is MessagingAddress {
   if (!isRecord(value)) return false;
-  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom"] as const) && typeof value["connectionId"] === "string" &&
+  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat"] as const) && typeof value["connectionId"] === "string" &&
     typeof value["providerConversationId"] === "string" &&
     (value["providerThreadId"] === null || typeof value["providerThreadId"] === "string") &&
     isOneOf(value["conversationKind"], ["direct", "group", "channel"] as const);

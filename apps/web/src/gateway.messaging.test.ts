@@ -14,7 +14,8 @@ import {
   PermissionMode,
   TelegramEmojiReactions,
   TelegramGroupActivation,
-  TelegramReplyQuoteMode
+  TelegramReplyQuoteMode,
+  WeChatAuthorizationStatus
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -421,6 +422,65 @@ describe("Messaging gateway", () => {
     await expect(fixture.gateway.createWeComMessagingConnection({ botId: "\n" })).rejects.toThrow(/WeCom Bot ID is required/iu);
     fixture.gateway.disconnect();
   });
+
+  it("maps fenced WeChat QR authorization and sends verification code only through a zeroed one-shot upload", async () => {
+    const fixture = await mount();
+    fixture.includeWeChat = true;
+    const settings = await fixture.gateway.getMessagingSettings();
+    expect(settings.connections.find((value) => value.channel === "wechat")).toMatchObject({
+      id: "wechat-one",
+      generation: 8n,
+      credentialConfigured: false,
+      wechatConfiguration: { format: 1 }
+    });
+    const created = await fixture.gateway.createWeChatMessagingConnection();
+    expect(created.channel).toBe("wechat");
+    expect(fixture.requests.find((entry) => entry.method === "createMessagingConnection"
+      && entry.input.channel === MessagingChannel.WECHAT)?.input).toEqual({
+      channel: MessagingChannel.WECHAT,
+      wechatConfiguration: { $typeName: "joko.v1.WeChatMessagingConfiguration" }
+    });
+    const attempt = await fixture.gateway.beginWeChatAuthorization(created.id, created.revision, created.generation);
+    expect(attempt).toMatchObject({
+      attemptId: "wechat-attempt",
+      connectionId: "wechat-one",
+      generation: 8n,
+      status: "waiting",
+      qrCodeUrl: "https://ilinkai.weixin.qq.com/qr/test"
+    });
+    fixture.wechatAttemptStatus = WeChatAuthorizationStatus.VERIFICATION_REQUIRED;
+    const verification = await fixture.gateway.getWeChatAuthorization(attempt);
+    expect(verification.status).toBe("verificationRequired");
+    await expect(fixture.gateway.submitWeChatVerificationCode(verification, "A12")).rejects.toThrow(/1–12 digits/u);
+    const buffers: Uint8Array[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init: RequestInit) => {
+      buffers.push(init.body as Uint8Array);
+      return new Response(undefined, { status: 204 });
+    }));
+    const done = await fixture.gateway.submitWeChatVerificationCode(verification, "123456");
+    expect(done).toMatchObject({
+      status: "succeeded",
+      connection: { id: "wechat-one", generation: 9n, credentialConfigured: true }
+    });
+    expect(buffers).toHaveLength(1);
+    expect(buffers[0]!.every((byte) => byte === 0)).toBe(true);
+    expect(fixture.requests.find((entry) => entry.method === "submitWeChatVerificationCode")?.input)
+      .toMatchObject({ credentialInputTicketId: "wechat-input-ticket", expectedGeneration: 8n });
+    const serialized = JSON.stringify(fixture.requests, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+    expect(serialized).not.toContain("123456");
+    fixture.gateway.disconnect();
+  });
+
+  it("rejects untrusted QR URLs and mismatched WeChat authorization generations", async () => {
+    const fixture = await mount();
+    fixture.includeWeChat = true;
+    fixture.invalidWeChatQr = true;
+    await expect(fixture.gateway.beginWeChatAuthorization("wechat-one", 12n, 8n)).rejects.toThrow(/untrusted WeChat QR URL/u);
+    fixture.invalidWeChatQr = false;
+    fixture.wechatWrongGeneration = true;
+    await expect(fixture.gateway.beginWeChatAuthorization("wechat-one", 12n, 8n)).rejects.toThrow(/invalid WeChat authorization attempt/u);
+    fixture.gateway.disconnect();
+  });
 });
 
 async function mount() {
@@ -432,6 +492,10 @@ async function mount() {
     incompleteTest: false,
     invalidWeComBotId: false,
     crossChannelWeComConfiguration: false,
+    includeWeChat: false,
+    invalidWeChatQr: false,
+    wechatWrongGeneration: false,
+    wechatAttemptStatus: WeChatAuthorizationStatus.WAITING,
     testCalls: 0
   };
   const transport = {
@@ -449,7 +513,8 @@ async function mount() {
               dingTalkConnection(),
               feishuConnection(),
               feishuConnection(MessagingChannel.LARK),
-              wecomConnection(fixture.invalidWeComBotId)
+              wecomConnection(fixture.invalidWeComBotId),
+              ...(fixture.includeWeChat ? [wechatConnection()] : [])
             ],
             routes: [route()],
             channels: fixture.duplicateCapabilities ? [...channels, channels[0]] : channels
@@ -462,6 +527,27 @@ async function mount() {
             relativeEndpoint: "/v1/credential-uploads/messaging-ticket",
             maximumBytes: 1024n
           }
+        }; break;
+        case "beginWeChatAuthorization":
+        case "getWeChatAuthorization": value = {
+          attempt: wechatAttempt(
+            fixture.wechatAttemptStatus,
+            fixture.invalidWeChatQr,
+            fixture.wechatWrongGeneration
+          )
+        }; break;
+        case "beginWeChatVerificationInput": value = {
+          ticket: {
+            ticketId: "wechat-input-ticket",
+            relativeEndpoint: "/v1/credential-uploads/wechat-input-ticket",
+            maximumBytes: 64n
+          }
+        }; break;
+        case "submitWeChatVerificationCode": value = {
+          attempt: wechatAttempt(WeChatAuthorizationStatus.SUCCEEDED)
+        }; break;
+        case "cancelWeChatAuthorization": value = {
+          attempt: wechatAttempt(WeChatAuthorizationStatus.CANCELLED)
         }; break;
         case "testMessagingConnection": {
           fixture.testCalls += 1;
@@ -479,6 +565,7 @@ async function mount() {
               : input.channel === MessagingChannel.FEISHU ? feishuConnection()
                 : input.channel === MessagingChannel.LARK ? feishuConnection(MessagingChannel.LARK)
                   : input.channel === MessagingChannel.WECOM ? wecomConnection()
+                  : input.channel === MessagingChannel.WECHAT ? wechatConnection()
                   : connection()
         }; break;
         case "commitMessagingCredential":
@@ -638,6 +725,37 @@ function wecomConnection(invalidBotId = false) {
     createdAt: timestamp(5n),
     updatedAt: timestamp(9n),
     revision: { value: 11n }
+  };
+}
+
+function wechatConnection(authorized = false) {
+  return {
+    connectionId: "wechat-one",
+    channel: MessagingChannel.WECHAT,
+    generation: authorized ? 9n : 8n,
+    enabled: authorized,
+    runtimeStatus: authorized ? MessagingConnectionRuntimeStatus.CONNECTING : MessagingConnectionRuntimeStatus.IDLE,
+    credentialConfigured: authorized,
+    ...(authorized ? { ownerProviderUserId: "wx-user", providerAccountId: "wx-bot" } : {}),
+    wechatConfiguration: {},
+    createdAt: timestamp(6n),
+    updatedAt: timestamp(10n),
+    revision: { value: authorized ? 13n : 12n }
+  };
+}
+
+function wechatAttempt(status: WeChatAuthorizationStatus, invalidQr = false, wrongGeneration = false) {
+  return {
+    attemptId: "wechat-attempt",
+    connectionId: "wechat-one",
+    generation: wrongGeneration ? 11n : 8n,
+    revision: 12n,
+    status,
+    qrCodeUrl: invalidQr ? "https://elsewhere.example/qr" : "https://ilinkai.weixin.qq.com/qr/test",
+    createdAt: timestamp(100n),
+    expiresAt: timestamp(400n),
+    verificationRetry: false,
+    ...(status === WeChatAuthorizationStatus.SUCCEEDED ? { connection: wechatConnection(true) } : {})
   };
 }
 

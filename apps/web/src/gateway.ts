@@ -156,6 +156,7 @@ import {
   MessagingConnectionRuntimeStatus as ProtoMessagingConnectionRuntimeStatus,
   MessagingConnectionTestFailure as ProtoMessagingConnectionTestFailure,
   MessagingService,
+  WeChatAuthorizationStatus as ProtoWeChatAuthorizationStatus,
   ModelInputModality,
   ModelOutputModality,
   ModelPriceCurrency,
@@ -409,6 +410,8 @@ import {
   type FeishuMessagingConfiguration as ProtoFeishuMessagingConfiguration,
   type TelegramMessagingConfiguration as ProtoTelegramMessagingConfiguration,
   type WeComMessagingConfiguration as ProtoWeComMessagingConfiguration,
+  type WeChatAuthorizationAttempt as ProtoWeChatAuthorizationAttempt,
+  type WeChatMessagingConfiguration as ProtoWeChatMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
   type ModelDescriptor,
@@ -622,6 +625,8 @@ import type {
   DiscordMessagingConfigurationView,
   FeishuMessagingConfigurationView,
   WeComMessagingConfigurationView,
+  WeChatAuthorizationAttemptView,
+  WeChatMessagingConfigurationView,
   OperationApi,
   PartnerCapabilitiesView,
   PartnerActivityView,
@@ -5956,6 +5961,85 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
+  }
+
+  async createWeChatMessagingConnection(signal?: AbortSignal): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.WECHAT,
+      wechatConfiguration: protoWeChatMessagingConfiguration({ format: 1 })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async beginWeChatAuthorization(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).beginWeChatAuthorization({
+      connectionId,
+      expectedRevision: { value: expectedRevision },
+      expectedGeneration
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, connectionId, expectedGeneration);
+  }
+
+  async getWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).getWeChatAuthorization({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, attempt.connectionId, attempt.generation, attempt.attemptId);
+  }
+
+  async submitWeChatVerificationCode(
+    attempt: WeChatAuthorizationAttemptView,
+    code: string,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    if (!/^\d{1,12}$/u.test(code)) throw new GatewayError("A WeChat verification code must contain 1–12 digits.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(MessagingService, scope.transport);
+    const begun = await client.beginWeChatVerificationInput({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation
+    }, { signal: scope.signal });
+    const ticketId = await this.uploadCredentialTicket(code, begun.ticket, scope);
+    scope.signal.throwIfAborted();
+    const response = await client.submitWeChatVerificationCode({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation,
+      credentialInputTicketId: ticketId
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, attempt.connectionId, attempt.generation, attempt.attemptId);
+  }
+
+  async cancelWeChatAuthorization(
+    attempt: WeChatAuthorizationAttemptView,
+    signal?: AbortSignal
+  ): Promise<WeChatAuthorizationAttemptView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).cancelWeChatAuthorization({
+      connectionId: attempt.connectionId,
+      attemptId: attempt.attemptId,
+      expectedGeneration: attempt.generation
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapWeChatAuthorizationAttempt(response.attempt, attempt.connectionId, attempt.generation, attempt.attemptId);
   }
 
   async saveMessagingCredential(
@@ -18415,6 +18499,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const wecomConfiguration = channel === "wecom"
     ? mapWeComMessagingConfiguration(value.wecomConfiguration)
     : undefined;
+  const wechatConfiguration = channel === "wechat"
+    ? mapWeChatMessagingConfiguration(value.wechatConfiguration)
+    : undefined;
   if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
   }
@@ -18429,6 +18516,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   }
   if (channel !== "wecom" && value.wecomConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned WeCom configuration for another Messaging channel.");
+  }
+  if (channel !== "wechat" && value.wechatConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned WeChat configuration for another Messaging channel.");
   }
   return {
     id: value.connectionId,
@@ -18446,6 +18536,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(dingtalkConfiguration === undefined ? {} : { dingtalkConfiguration }),
     ...(feishuConfiguration === undefined ? {} : { feishuConfiguration }),
     ...(wecomConfiguration === undefined ? {} : { wecomConfiguration }),
+    ...(wechatConfiguration === undefined ? {} : { wechatConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -18769,6 +18860,96 @@ function mapWeComMessagingConfiguration(
     throw new GatewayError("Orchestrator returned an invalid WeCom configuration.");
   }
   return { botId: value.botId };
+}
+
+function mapWeChatMessagingConfiguration(
+  value: ProtoWeChatMessagingConfiguration | undefined
+): WeChatMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator returned no WeChat configuration.");
+  return { format: 1 };
+}
+
+function protoWeChatMessagingConfiguration(
+  value: WeChatMessagingConfigurationView
+): ProtoWeChatMessagingConfiguration {
+  if (value.format !== 1) throw new GatewayError("WeChat configuration format must be 1.");
+  return { $typeName: "joko.v1.WeChatMessagingConfiguration" };
+}
+
+function mapWeChatAuthorizationAttempt(
+  value: ProtoWeChatAuthorizationAttempt | undefined,
+  connectionId: string,
+  generation: bigint,
+  attemptId?: string
+): WeChatAuthorizationAttemptView {
+  if (value === undefined || value.attemptId.trim() === "" || value.connectionId !== connectionId
+    || value.generation !== generation || value.generation < 1n || value.revision < 1n
+    || (attemptId !== undefined && value.attemptId !== attemptId)) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization attempt.");
+  }
+  const createdAt = requiredMessagingTimestamp(value.createdAt, "wechat_authorization.created_at");
+  const expiresAt = requiredMessagingTimestamp(value.expiresAt, "wechat_authorization.expires_at");
+  if (expiresAt <= createdAt || expiresAt > createdAt + 5 * 60_000 + 1_000) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization expiration.");
+  }
+  const status = mapWeChatAuthorizationStatus(value.status);
+  const qrCodeUrl = value.qrCodeUrl === undefined ? undefined : trustedWeChatQrUrl(value.qrCodeUrl);
+  if ((status === "waiting" || status === "scanned" || status === "verificationRequired" || status === "qrRefreshed")
+    && qrCodeUrl === undefined) {
+    throw new GatewayError("Orchestrator returned an active WeChat authorization without a QR code.");
+  }
+  const connection = value.connection === undefined ? undefined : mapMessagingConnection(value.connection);
+  if (connection !== undefined && (status !== "succeeded" || connection.id !== connectionId
+    || connection.channel !== "wechat" || connection.generation <= generation || !connection.credentialConfigured)) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization connection.");
+  }
+  if (status === "succeeded" && connection === undefined) {
+    throw new GatewayError("Orchestrator returned WeChat authorization success without a connection.");
+  }
+  if (value.errorCode !== undefined && (value.errorCode.length > 128 || /[\u0000-\u001f\u007f]/u.test(value.errorCode))) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization error code.");
+  }
+  if (value.errorSummary !== undefined && (value.errorSummary.length > 1024 || /[\u0000-\u0008\u000b-\u001f\u007f]/u.test(value.errorSummary))) {
+    throw new GatewayError("Orchestrator returned an invalid WeChat authorization error summary.");
+  }
+  return {
+    attemptId: value.attemptId,
+    connectionId,
+    generation,
+    revision: value.revision,
+    status,
+    ...(qrCodeUrl === undefined ? {} : { qrCodeUrl }),
+    createdAt,
+    expiresAt,
+    verificationRetry: value.verificationRetry,
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
+    ...(connection === undefined ? {} : { connection })
+  };
+}
+
+function mapWeChatAuthorizationStatus(value: ProtoWeChatAuthorizationStatus): WeChatAuthorizationAttemptView["status"] {
+  switch (value) {
+    case ProtoWeChatAuthorizationStatus.WAITING: return "waiting";
+    case ProtoWeChatAuthorizationStatus.SCANNED: return "scanned";
+    case ProtoWeChatAuthorizationStatus.VERIFICATION_REQUIRED: return "verificationRequired";
+    case ProtoWeChatAuthorizationStatus.QR_REFRESHED: return "qrRefreshed";
+    case ProtoWeChatAuthorizationStatus.SUCCEEDED: return "succeeded";
+    case ProtoWeChatAuthorizationStatus.FAILED: return "failed";
+    case ProtoWeChatAuthorizationStatus.CANCELLED: return "cancelled";
+    case ProtoWeChatAuthorizationStatus.EXPIRED: return "expired";
+    default: throw new GatewayError("Orchestrator returned an unknown WeChat authorization status.");
+  }
+}
+
+function trustedWeChatQrUrl(value: string): string {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new GatewayError("Orchestrator returned an invalid WeChat QR URL."); }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.port !== ""
+    || !(url.hostname === "weixin.qq.com" || url.hostname.endsWith(".weixin.qq.com"))) {
+    throw new GatewayError("Orchestrator returned an untrusted WeChat QR URL.");
+  }
+  return url.toString();
 }
 
 function protoWeComMessagingConfiguration(

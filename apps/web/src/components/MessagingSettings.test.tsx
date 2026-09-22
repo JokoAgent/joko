@@ -12,7 +12,8 @@ import {
   type AppSnapshot,
   type MessagingConnectionView,
   type MessagingRouteView,
-  type MessagingSettingsView
+  type MessagingSettingsView,
+  type WeChatAuthorizationAttemptView
 } from "../model.js";
 import { MessagingSettings } from "./MessagingSettings.js";
 
@@ -519,6 +520,81 @@ describe("Messaging settings", () => {
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(container.textContent).toContain("Waiting for first direct message");
   });
+
+  it("creates WeChat without a token form, presents the QR, and cancels its exact attempt", async () => {
+    const created = wechatConnection();
+    const waiting = wechatAttempt();
+    const create = vi.fn(async () => created);
+    const begin = vi.fn(async () => waiting);
+    const cancel = vi.fn(async () => ({ ...waiting, status: "cancelled" as const }));
+    const controller = controllerFixture(messagingSettings([], true), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([], true))
+        .mockResolvedValue(messagingSettings([created], true)),
+      createWeChatMessagingConnection: create,
+      beginWeChatAuthorization: begin,
+      cancelWeChatAuthorization: cancel
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Add WeChat").click());
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(begin).toHaveBeenCalledWith("wechat-one", 12n, 8n, expect.any(AbortSignal));
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("Waiting for a scan");
+    expect(dialog.querySelector('img[alt="WeChat authorization QR code"]')?.getAttribute("src"))
+      .toBe("https://ilinkai.weixin.qq.com/qr/test");
+    expect(dialog.querySelector('input[type="password"]')).toBeNull();
+    expect(container.textContent).toContain("Scan a QR code to connect WeChat");
+
+    await act(async () => button(dialog, "Cancel").click());
+    expect(cancel).toHaveBeenCalledWith(waiting);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("keeps a prior WeChat connection active through reauthorization and clears verification UI before success", async () => {
+    const previous = wechatConnection({
+      credentialConfigured: true,
+      enabled: true,
+      runtimeStatus: "connected",
+      ownerProviderUserId: "wx-user",
+      providerAccountId: "wx-bot"
+    });
+    const verification = wechatAttempt({ status: "verificationRequired", verificationRetry: true });
+    const succeeded = wechatAttempt({
+      status: "succeeded",
+      connection: wechatConnection({
+        generation: 9n,
+        revision: 13n,
+        credentialConfigured: true,
+        enabled: true,
+        runtimeStatus: "connecting",
+        ownerProviderUserId: "wx-new-user",
+        providerAccountId: "wx-new-bot"
+      })
+    });
+    const submit = vi.fn(async () => succeeded);
+    const controller = controllerFixture(messagingSettings([previous], true), {
+      beginWeChatAuthorization: vi.fn(async () => verification),
+      submitWeChatVerificationCode: submit
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Reauthorize WeChat").click());
+    expect(container.textContent).toContain("Connected WeChat bot wx-bot");
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(dialog.textContent).toContain("existing connection stays active");
+    const code = required(dialog.querySelector<HTMLInputElement>('input[type="password"]'));
+    expect(document.activeElement).toBe(code);
+    await change(code, "654321");
+    await act(async () => button(dialog, "Submit code").click());
+    expect(submit).toHaveBeenCalledWith(verification, "654321", expect.any(AbortSignal));
+    expect(document.body.textContent).not.toContain("654321");
+    expect(container.textContent).toContain("Connected WeChat bot wx-new-bot");
+    expect(dialog.textContent).toContain("WeChat connected");
+    await act(async () => button(dialog, "Close").click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
 });
 
 async function renderSettings(controller: AppController, currentSnapshot: AppSnapshot): Promise<HTMLElement> {
@@ -547,6 +623,11 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     createDingTalkMessagingConnection: vi.fn(async () => dingTalkConnection()),
     createFeishuMessagingConnection: vi.fn(async () => feishuConnection()),
     createWeComMessagingConnection: vi.fn(async () => wecomConnection()),
+    createWeChatMessagingConnection: vi.fn(async () => wechatConnection()),
+    beginWeChatAuthorization: vi.fn(async () => wechatAttempt()),
+    getWeChatAuthorization: vi.fn(async () => wechatAttempt()),
+    submitWeChatVerificationCode: vi.fn(async () => wechatAttempt()),
+    cancelWeChatAuthorization: vi.fn(async () => wechatAttempt({ status: "cancelled" })),
     saveMessagingCredential: vi.fn(unchanged),
     clearMessagingCredential: vi.fn(unchanged),
     setMessagingConnectionEnabled: vi.fn(unchanged),
@@ -561,7 +642,7 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
   } as unknown as AppController;
 }
 
-function messagingSettings(connections: readonly MessagingConnectionView[]): MessagingSettingsView {
+function messagingSettings(connections: readonly MessagingConnectionView[], wechatAvailable = false): MessagingSettingsView {
   return {
     connections,
     routes: [],
@@ -572,7 +653,7 @@ function messagingSettings(connections: readonly MessagingConnectionView[]): Mes
       { channel: "feishu", available: true },
       { channel: "lark", available: true },
       { channel: "wecom", available: true },
-      { channel: "wechat", available: false, reason: "not implemented" },
+      { channel: "wechat", available: wechatAvailable, ...(wechatAvailable ? {} : { reason: "not implemented" }) },
       { channel: "slack", available: false, reason: "not implemented" }
     ]
   };
@@ -693,6 +774,37 @@ function wecomConnection(overrides: Partial<MessagingConnectionView> = {}): Mess
     lastConnectedAt: Date.now() - 1_000,
     createdAt: 1_000,
     updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function wechatConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "wechat-one",
+    channel: "wechat",
+    generation: 8n,
+    revision: 12n,
+    enabled: false,
+    runtimeStatus: "idle",
+    credentialConfigured: false,
+    wechatConfiguration: { format: 1 },
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function wechatAttempt(overrides: Partial<WeChatAuthorizationAttemptView> = {}): WeChatAuthorizationAttemptView {
+  return {
+    attemptId: "wechat-attempt",
+    connectionId: "wechat-one",
+    generation: 8n,
+    revision: 12n,
+    status: "waiting",
+    qrCodeUrl: "https://ilinkai.weixin.qq.com/qr/test",
+    createdAt: 100_000,
+    expiresAt: 400_000,
+    verificationRetry: false,
     ...overrides
   };
 }

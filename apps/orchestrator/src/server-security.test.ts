@@ -34,6 +34,8 @@ describe("Orchestrator Web content security policy", () => {
   it("permits the bundled fonts, authenticated media URLs, and self-hosted diagram runtime", () => {
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("font-src 'self' data:");
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("media-src 'self' blob: data:");
+    expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY)
+      .toContain("img-src 'self' blob: data: https://weixin.qq.com https://*.weixin.qq.com");
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("connect-src 'self' blob:");
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("script-src 'self' 'unsafe-eval'");
     expect(ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY).toContain("frame-src 'self'");

@@ -4789,6 +4789,7 @@ const en = {
   ,"messaging.addFeishu": "Add Feishu"
   ,"messaging.addLark": "Add Lark"
   ,"messaging.addWeCom": "Add WeCom"
+  ,"messaging.addWeChat": "Add WeChat"
   ,"messaging.loadFailed": "Could not load Messaging settings."
   ,"messaging.actionFailed": "Could not complete the Messaging action."
   ,"messaging.connectionChanged": "The Messaging connection changed. Review the refreshed settings and try again."
@@ -4803,7 +4804,7 @@ const en = {
   ,"messaging.connections": "Connections"
   ,"messaging.connectionsBody": "Each external account has an independent credential, transport generation, and conversation-to-task mapping."
   ,"messaging.emptyTitle": "No messaging connections"
-  ,"messaging.emptyBody": "Add Telegram, Discord, DingTalk, Feishu, Lark, or WeCom to receive direct messages and group conversations in Joko tasks."
+  ,"messaging.emptyBody": "Add a channel to receive conversations in Joko tasks. WeChat uses QR authorization and supports direct messages."
   ,"messaging.ownerIdentity": "Owner ID {id}"
   ,"messaging.toggleConnection": "Enable or disable this Messaging connection"
   ,"messaging.credential": "Credential"
@@ -4844,6 +4845,38 @@ const en = {
   ,"messaging.wecomBotIdBody": "Use the Bot ID from the WeCom bot settings. The Bot Secret is added separately through the protected credential form."
   ,"messaging.wecomOwnerId": "WeCom owner user ID"
   ,"messaging.wecomAwaitingOwner": "Waiting for first direct message"
+  ,"messaging.wechatAccountId": "Connected WeChat user ID"
+  ,"messaging.wechatAwaitingAuthorization": "Scan a QR code to connect WeChat"
+  ,"messaging.wechatConnectedAccount": "Connected WeChat bot {id}"
+  ,"messaging.wechatAuthorize": "Authorize with WeChat"
+  ,"messaging.wechatReauthorize": "Reauthorize WeChat"
+  ,"messaging.wechatAuthorizeBody": "Scan the QR code with WeChat to connect this channel. Each direct-message peer will have its own Joko task."
+  ,"messaging.wechatRebindBody": "Scan the QR code to replace the current authorization. The existing connection stays active until the new authorization succeeds."
+  ,"messaging.wechatRestoreBody": "Scan the QR code to restore this connection after authorization was lost."
+  ,"messaging.wechatPreparing": "Preparing a secure WeChat QR code…"
+  ,"messaging.wechatQrAlt": "WeChat authorization QR code"
+  ,"messaging.wechatOpenQr": "Open QR code in a new tab"
+  ,"messaging.wechatExpiresAt": "Authorization expires at {time}"
+  ,"messaging.wechatStatus.waiting": "Waiting for a scan"
+  ,"messaging.wechatStatus.scanned": "Scanned — confirm in WeChat"
+  ,"messaging.wechatStatus.qrRefreshed": "QR code refreshed — scan the new code"
+  ,"messaging.wechatStatus.verificationRequired": "Verification code required"
+  ,"messaging.wechatStatus.succeeded": "WeChat connected"
+  ,"messaging.wechatStatus.failed": "Authorization failed"
+  ,"messaging.wechatStatus.cancelled": "Authorization cancelled"
+  ,"messaging.wechatStatus.expired": "Authorization expired"
+  ,"messaging.wechatVerificationCode": "WeChat verification code"
+  ,"messaging.wechatVerificationRetry": "The previous code was not accepted. Check the code and try again."
+  ,"messaging.wechatVerificationSafety": "The code is sent through a one-shot protected channel and is cleared from this form immediately."
+  ,"messaging.wechatSubmitCode": "Submit code"
+  ,"messaging.wechatRetry": "Try authorization again"
+  ,"messaging.wechatAuthorizationFailed": "Could not start WeChat authorization."
+  ,"messaging.wechatPollFailed": "Could not check WeChat authorization."
+  ,"messaging.wechatVerificationFailed": "Could not submit the verification code."
+  ,"messaging.wechatCancelFailed": "Could not cancel WeChat authorization. Try again."
+  ,"messaging.wechatClearCredential": "Disconnect WeChat"
+  ,"messaging.wechatClearTitle": "Disconnect WeChat?"
+  ,"messaging.wechatClearBody": "This removes the stored WeChat authorization and stops the connection. Existing tasks remain visible."
   ,"messaging.botToken": "Bot token"
   ,"messaging.appSecret": "App Secret"
   ,"messaging.credentialBody": "Replacing the token retires the previous transport generation and its pending work."
@@ -4928,6 +4961,7 @@ const en = {
   ,"messaging.status.dingtalkIdle": "Needs AppSecret"
   ,"messaging.status.appSecretIdle": "Needs App Secret"
   ,"messaging.status.wecomIdle": "Needs Bot Secret"
+  ,"messaging.status.wechatIdle": "Needs QR authorization"
   ,"messaging.status.connecting": "Connecting"
   ,"messaging.status.connected": "Connected"
   ,"messaging.status.offline": "Offline"
@@ -7804,6 +7838,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.addFeishu": "添加飞书",
     "messaging.addLark": "添加 Lark",
     "messaging.addWeCom": "添加企业微信",
+    "messaging.addWeChat": "添加微信",
     "messaging.loadFailed": "无法加载消息渠道设置。",
     "messaging.actionFailed": "无法完成消息渠道操作。",
     "messaging.connectionChanged": "消息连接已发生变化。请检查刷新的设置后重试。",
@@ -7818,7 +7853,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.connections": "连接",
     "messaging.connectionsBody": "每个外部账号都有独立凭证、传输代际和会话到任务的映射。",
     "messaging.emptyTitle": "没有消息连接",
-    "messaging.emptyBody": "添加 Telegram、Discord、钉钉、飞书、Lark 或企业微信，将私聊与群组会话接入 Joko 任务。",
+    "messaging.emptyBody": "添加消息渠道，将会话接入 Joko 任务。微信通过二维码授权，支持私聊。",
     "messaging.ownerIdentity": "所有者 ID {id}",
     "messaging.toggleConnection": "启用或停用此消息连接",
     "messaging.credential": "凭证",
@@ -7859,6 +7894,38 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.wecomBotIdBody": "请使用企业微信机器人设置中的机器人 ID。机器人密钥会通过受保护的凭证表单单独添加。",
     "messaging.wecomOwnerId": "企业微信所有者用户 ID",
     "messaging.wecomAwaitingOwner": "等待首位私聊用户认领",
+    "messaging.wechatAccountId": "已连接的微信用户 ID",
+    "messaging.wechatAwaitingAuthorization": "扫描二维码以连接微信",
+    "messaging.wechatConnectedAccount": "已连接微信机器人 {id}",
+    "messaging.wechatAuthorize": "授权微信",
+    "messaging.wechatReauthorize": "重新授权微信",
+    "messaging.wechatAuthorizeBody": "使用微信扫描二维码以连接此渠道。每位私聊用户都有独立的 Joko 任务。",
+    "messaging.wechatRebindBody": "扫描二维码以替换当前授权。新授权成功前，现有连接保持工作。",
+    "messaging.wechatRestoreBody": "授权失效后，扫描二维码以恢复此连接。",
+    "messaging.wechatPreparing": "正在准备安全的微信二维码…",
+    "messaging.wechatQrAlt": "微信授权二维码",
+    "messaging.wechatOpenQr": "在新标签页打开二维码",
+    "messaging.wechatExpiresAt": "授权将于 {time} 过期",
+    "messaging.wechatStatus.waiting": "等待扫码",
+    "messaging.wechatStatus.scanned": "已扫码，请在微信中确认",
+    "messaging.wechatStatus.qrRefreshed": "二维码已刷新，请扫描新二维码",
+    "messaging.wechatStatus.verificationRequired": "需要验证码",
+    "messaging.wechatStatus.succeeded": "微信已连接",
+    "messaging.wechatStatus.failed": "授权失败",
+    "messaging.wechatStatus.cancelled": "授权已取消",
+    "messaging.wechatStatus.expired": "授权已过期",
+    "messaging.wechatVerificationCode": "微信验证码",
+    "messaging.wechatVerificationRetry": "上次验证码未被接受。请核对后重试。",
+    "messaging.wechatVerificationSafety": "验证码通过一次性受保护通道发送，并会立即从此表单清除。",
+    "messaging.wechatSubmitCode": "提交验证码",
+    "messaging.wechatRetry": "重新尝试授权",
+    "messaging.wechatAuthorizationFailed": "无法开始微信授权。",
+    "messaging.wechatPollFailed": "无法查询微信授权状态。",
+    "messaging.wechatVerificationFailed": "无法提交验证码。",
+    "messaging.wechatCancelFailed": "无法取消微信授权。请重试。",
+    "messaging.wechatClearCredential": "断开微信",
+    "messaging.wechatClearTitle": "要断开微信吗？",
+    "messaging.wechatClearBody": "这会移除已保存的微信授权并停止连接。现有任务仍然可见。",
     "messaging.botToken": "机器人令牌",
     "messaging.appSecret": "App Secret",
     "messaging.credentialBody": "替换令牌会退休旧传输代际及其待处理工作。",
@@ -7943,6 +8010,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.status.dingtalkIdle": "需要 AppSecret",
     "messaging.status.appSecretIdle": "需要 App Secret",
     "messaging.status.wecomIdle": "需要机器人密钥",
+    "messaging.status.wechatIdle": "需要二维码授权",
     "messaging.status.connecting": "正在连接",
     "messaging.status.connected": "已连接",
     "messaging.status.offline": "离线",

@@ -316,6 +316,40 @@
 .messaging-form__warning { color: var(--red); }
 .messaging-choice-row { cursor: pointer; color: var(--text); font-size: 13px; }
 
+.messaging-wechat-authorization {
+  display: grid;
+  gap: 16px;
+}
+
+.messaging-wechat-authorization__status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.messaging-wechat-authorization__qr {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.messaging-wechat-authorization__qr img {
+  display: block;
+  width: min(100%, 248px);
+  height: auto;
+  aspect-ratio: 1;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: white;
+}
+
 @media (max-width: 900px) {
   .messaging-channel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .messaging-connection-card__facts { grid-template-columns: 1fr; }

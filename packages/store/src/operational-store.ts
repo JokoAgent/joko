@@ -147,6 +147,8 @@ import type {
   MessagingConnectionRecord,
   MessagingConnectionRuntimeStatus,
   MessagingConversationKind,
+  MessagingConversationContextAadInput,
+  MessagingConversationContextRecord,
   MessagingConversationRecord,
   MessagingDeliveryRecord,
   MessagingDeliveryStatus,
@@ -190,6 +192,7 @@ import type {
   PutObjectiveInput,
   PutMakerMemoryEntryInput,
   PutMessagingRouteInput,
+  PutMessagingConversationContextInput,
   PutMobilePushRegistrationInput,
   PutLocalModelPullCheckpointInput,
   PutLocalRuntimeProviderBindingInput,
@@ -390,6 +393,19 @@ const MESSAGE_SEARCH_VECTOR_DIMENSIONS = 1024;
 const MESSAGE_SEARCH_VECTOR_POOL = 150;
 const MESSAGE_SEARCH_VECTOR_POOL_MAX = 1_000;
 const MAX_MESSAGE_SEARCH_FILTER_VALUES = 1_000;
+
+/** Exact AES-GCM associated reference shared with the Orchestrator vault. */
+export function messagingConversationContextAad(
+  input: MessagingConversationContextAadInput
+): string {
+  return JSON.stringify([
+    "joko.messaging.conversation-context",
+    1,
+    input.connectionId,
+    input.materialGeneration,
+    input.conversationId
+  ]);
+}
 const MESSAGE_SEARCH_RRF_K = 60;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
@@ -4540,6 +4556,7 @@ export class OperationalStore {
       const nextGeneration = current.generation + 1;
       if (!Number.isSafeInteger(nextGeneration)) throw new StoreError("Messaging generation is exhausted.");
       this.retireMessagingGeneration(current.id, current.generation, at);
+      this.retireMessagingConversationContextsForConnection(current.id);
       this.retireMessagingConversationsForConnection(current.id, at);
       const result = this.database.prepare(`
         UPDATE messaging_channels
@@ -4584,6 +4601,7 @@ export class OperationalStore {
       ));
       const nextGeneration = current.generation + 1;
       this.retireMessagingGeneration(current.id, current.generation, at);
+      this.retireMessagingConversationContextsForConnection(current.id);
       this.retireMessagingConversationsForConnection(current.id, at);
       const result = this.database.prepare(`
         UPDATE messaging_channels
@@ -5101,6 +5119,87 @@ export class OperationalStore {
     });
   }
 
+  /** Starts a fresh visible task for one direct peer without erasing the prior task history. */
+  rebindMessagingConversationSession(input: {
+    readonly conversationId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedChannelGeneration: number;
+    readonly expectedSessionId: string;
+    readonly sessionId: string;
+    readonly expectedSessionGeneration: number;
+    readonly routeScopeKey: string;
+    readonly expectedPermissionMode?: "ask" | "auto" | "bypassPermissions";
+    readonly updatedAt?: number;
+  }): MessagingConversationRecord {
+    return this.write(() => {
+      const current = this.getMessagingConversation(input.conversationId);
+      assertMessagingRevision("Messaging conversation", current.id, current.revision, input.expectedRevision);
+      const connection = this.getMessagingConnection(current.connectionId);
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (current.status !== "active" || current.conversationKind !== "direct"
+        || current.channelGeneration !== connection.generation
+        || current.sessionId !== input.expectedSessionId || current.sessionId === input.sessionId) {
+        throw new StoreError("Messaging direct conversation cannot switch a stale task binding.");
+      }
+      if (this.listRuns({ sessionId: current.sessionId, activeOnly: true, limit: 1 }).length > 0
+        || this.listQueueItems({
+          sessionId: current.sessionId,
+          states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"],
+          limit: 1
+        }).length > 0
+        || this.listInteractions({ sessionId: current.sessionId, status: "open", limit: 1 }).length > 0) {
+        throw new StoreError("Messaging cannot start a new conversation while the prior task is active.");
+      }
+      const route = this.getMessagingRoute(input.routeScopeKey);
+      if (route.connectionId !== undefined && route.connectionId !== current.connectionId) {
+        throw new StoreError("Messaging route belongs to another connection.");
+      }
+      const session = this.getSession(input.sessionId);
+      if (session.descriptor.archived || session.descriptor.deletedAt !== undefined
+        || session.descriptor.binding.generation !== input.expectedSessionGeneration) {
+        throw new StoreError("Messaging replacement task is stale or inactive.");
+      }
+      const permissionMode = input.expectedPermissionMode ?? route.permissionMode;
+      assertMessagingSessionMatchesRoute(session, route, permissionMode);
+      const at = Math.max(current.createdAt, messagingTimestamp(
+        input.updatedAt ?? this.now(), "conversation new task time"
+      ));
+      const result = this.database.prepare(`
+        UPDATE messaging_conversations
+        SET session_id = ?, session_generation = ?, route_scope_key = ?,
+            target_id = ?, backend_id = ?, provider_id = ?, model_id = ?, effort = ?,
+            fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ? AND status = 'active' AND session_id = ?
+      `).run(
+        session.descriptor.id,
+        session.descriptor.binding.generation,
+        route.scopeKey,
+        session.descriptor.targetId,
+        session.descriptor.backendId,
+        session.descriptor.providerId ?? null,
+        session.descriptor.modelId ?? null,
+        session.descriptor.effort ?? null,
+        session.descriptor.fastMode ? 1 : 0,
+        permissionMode,
+        session.descriptor.planMode ? 1 : 0,
+        at,
+        asSqlInteger(this.requireActiveRevision()),
+        current.id,
+        asSqlInteger(current.revision),
+        input.expectedSessionId
+      );
+      if (result.changes !== 1) {
+        throw new RevisionConflictError(
+          "Messaging conversation",
+          current.id,
+          current.revision,
+          this.getMessagingConversation(current.id).revision
+        );
+      }
+      return this.getMessagingConversation(current.id);
+    });
+  }
+
   retireMessagingConversation(input: {
     readonly conversationId: string;
     readonly expectedRevision: bigint;
@@ -5114,6 +5213,12 @@ export class OperationalStore {
         input.retiredAt ?? this.now(),
         "conversation retirement time"
       ));
+      this.database.prepare(
+        "DELETE FROM messaging_conversation_context_sources WHERE conversation_id = ?"
+      ).run(current.id);
+      this.database.prepare(
+        "DELETE FROM messaging_conversation_contexts WHERE conversation_id = ?"
+      ).run(current.id);
       this.database.prepare(`
         UPDATE messaging_conversations
         SET status = 'retired', retired_at = ?, updated_at = ?, revision = ?
@@ -5129,12 +5234,204 @@ export class OperationalStore {
     });
   }
 
+  findMessagingConversationContext(
+    conversationId: string
+  ): MessagingConversationContextRecord | undefined {
+    this.assertOpen();
+    const id = messagingIdentity(conversationId, "conversation ID");
+    const row = this.database.prepare(
+      "SELECT * FROM messaging_conversation_contexts WHERE conversation_id = ?"
+    ).get(id) as Row | undefined;
+    return row === undefined ? undefined : messagingConversationContextFromRow(row);
+  }
+
+  getMessagingConversationContext(conversationId: string): MessagingConversationContextRecord {
+    const context = this.findMessagingConversationContext(conversationId);
+    if (context === undefined) {
+      throw new NotFoundError("Messaging conversation context", conversationId);
+    }
+    return context;
+  }
+
+  /** Persists only a vault-sealed latest provider context. Callers may compose
+   * this write with inbound request/Interaction creation and the final cursor
+   * CAS through `transaction`; otherwise they must commit this context before
+   * advancing the cursor or scheduling any outbound delivery drain. */
+  putMessagingConversationContext(
+    input: PutMessagingConversationContextInput
+  ): MessagingConversationContextRecord {
+    return this.write(() => {
+      const connection = this.getMessagingConnection(
+        messagingIdentity(input.connectionId, "connection ID")
+      );
+      assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      if (!connection.enabled || connection.credentialGeneration === undefined) {
+        throw new StoreError("A Messaging conversation context requires an enabled managed credential.");
+      }
+      const materialGeneration = messagingCredentialGeneration(input.expectedMaterialGeneration);
+      if (connection.credentialGeneration !== materialGeneration) {
+        throw new StoreError("Messaging conversation context credential material is stale.");
+      }
+      const conversation = this.getMessagingConversation(
+        messagingIdentity(input.conversationId, "conversation ID")
+      );
+      if (
+        conversation.connectionId !== connection.id ||
+        conversation.channelGeneration !== connection.generation ||
+        conversation.status === "retired"
+      ) {
+        throw new StoreError("Messaging conversation context authority is stale.");
+      }
+
+      const hasRequest = input.sourceRequestId !== undefined;
+      const hasInteraction = input.sourceInteractionId !== undefined;
+      if (hasRequest === hasInteraction) {
+        throw new StoreError("Messaging conversation context requires exactly one durable source.");
+      }
+      const sourceKind = hasRequest ? "request" : "interaction";
+      const sourceId = messagingIdentity(
+        hasRequest ? input.sourceRequestId! : input.sourceInteractionId!,
+        `context source ${sourceKind} ID`
+      );
+      if (sourceKind === "request") {
+        const request = this.getMessagingInboundRequest(sourceId);
+        if (
+          request.connectionId !== connection.id ||
+          request.channelGeneration !== connection.generation ||
+          request.conversationId !== conversation.id
+        ) {
+          throw new StoreError("Messaging conversation context request authority is stale.");
+        }
+      } else {
+        const interaction = this.getMessagingInteraction(sourceId);
+        if (
+          interaction.connectionId !== connection.id ||
+          interaction.channelGeneration !== connection.generation ||
+          interaction.conversationId !== conversation.id
+        ) {
+          throw new StoreError("Messaging conversation context Interaction authority is stale.");
+        }
+      }
+
+      const sealed = messagingSealedConversationContext(input.sealed);
+      const priorSource = this.database.prepare(`
+        SELECT * FROM messaging_conversation_context_sources
+        WHERE source_kind = ? AND source_id = ?
+      `).get(sourceKind, sourceId) as Row | undefined;
+      if (priorSource !== undefined) {
+        if (
+          stringValue(priorSource["connection_id"]) !== connection.id ||
+          stringValue(priorSource["material_generation"]) !== materialGeneration ||
+          stringValue(priorSource["conversation_id"]) !== conversation.id
+        ) {
+          throw new StoreError("Messaging conversation context source identity conflicts with durable history.");
+        }
+        const current = this.findMessagingConversationContext(conversation.id);
+        if (current === undefined) {
+          throw new StoreError("Messaging conversation context source has no current sealed authority.");
+        }
+        return current;
+      }
+
+      const current = this.findMessagingConversationContext(conversation.id);
+      const at = Math.max(current?.createdAt ?? 0, messagingTimestamp(
+        input.updatedAt ?? this.now(),
+        "conversation context update time"
+      ));
+      const revision = asSqlInteger(this.requireActiveRevision());
+      if (current === undefined) {
+        if (input.expectedRevision !== null) {
+          throw new StoreError("Messaging conversation context expected an existing revision.");
+        }
+        this.database.prepare(`
+          INSERT INTO messaging_conversation_contexts(
+            conversation_id, connection_id, material_generation, source_kind, source_id,
+            algorithm, nonce, ciphertext, tag, created_at, updated_at, revision
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          conversation.id,
+          connection.id,
+          materialGeneration,
+          sourceKind,
+          sourceId,
+          sealed.algorithm,
+          sealed.nonce,
+          sealed.ciphertext,
+          sealed.tag,
+          at,
+          at,
+          revision
+        );
+      } else {
+        if (input.expectedRevision === null) {
+          throw new StoreError("Messaging conversation context already exists.");
+        }
+        assertMessagingRevision(
+          "Messaging conversation context",
+          conversation.id,
+          current.revision,
+          input.expectedRevision
+        );
+        const result = this.database.prepare(`
+          UPDATE messaging_conversation_contexts
+          SET material_generation = ?, source_kind = ?, source_id = ?,
+              algorithm = ?, nonce = ?, ciphertext = ?, tag = ?, updated_at = ?, revision = ?
+          WHERE conversation_id = ? AND revision = ?
+        `).run(
+          materialGeneration,
+          sourceKind,
+          sourceId,
+          sealed.algorithm,
+          sealed.nonce,
+          sealed.ciphertext,
+          sealed.tag,
+          at,
+          revision,
+          conversation.id,
+          asSqlInteger(current.revision)
+        );
+        if (result.changes !== 1) {
+          throw new RevisionConflictError(
+            "Messaging conversation context",
+            conversation.id,
+            current.revision,
+            this.getMessagingConversationContext(conversation.id).revision
+          );
+        }
+      }
+      this.database.prepare(`
+        INSERT INTO messaging_conversation_context_sources(
+          source_kind, source_id, connection_id, material_generation,
+          conversation_id, created_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        sourceKind,
+        sourceId,
+        connection.id,
+        materialGeneration,
+        conversation.id,
+        at,
+        revision
+      );
+      return this.getMessagingConversationContext(conversation.id);
+    });
+  }
+
   private retireMessagingConversationsForConnection(connectionId: string, at: number): void {
     this.database.prepare(`
       UPDATE messaging_conversations
       SET status = 'retired', retired_at = ?, updated_at = ?, revision = ?
       WHERE connection_id = ? AND status <> 'retired'
     `).run(at, at, asSqlInteger(this.requireActiveRevision()), connectionId);
+  }
+
+  private retireMessagingConversationContextsForConnection(connectionId: string): void {
+    this.database.prepare(
+      "DELETE FROM messaging_conversation_context_sources WHERE connection_id = ?"
+    ).run(connectionId);
+    this.database.prepare(
+      "DELETE FROM messaging_conversation_contexts WHERE connection_id = ?"
+    ).run(connectionId);
   }
 
   /** A user-owned generation change retires late callbacks and queued external
@@ -16943,6 +17240,28 @@ function messagingConversationFromRow(row: Row): MessagingConversationRecord {
   };
 }
 
+function messagingConversationContextFromRow(row: Row): MessagingConversationContextRecord {
+  const sourceKind = enumValue(row["source_kind"], ["request", "interaction"] as const);
+  const sourceId = stringValue(row["source_id"]);
+  return {
+    connectionId: stringValue(row["connection_id"]),
+    materialGeneration: stringValue(row["material_generation"]),
+    conversationId: stringValue(row["conversation_id"]),
+    ...(sourceKind === "request"
+      ? { sourceRequestId: sourceId }
+      : { sourceInteractionId: sourceId }),
+    sealed: {
+      algorithm: "aes-256-gcm",
+      nonce: stringValue(row["nonce"]),
+      ciphertext: stringValue(row["ciphertext"]),
+      tag: stringValue(row["tag"])
+    },
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
 function messagingInboundRequestFromRow(
   row: Row,
   providerRequestIds: readonly string[],
@@ -19065,6 +19384,40 @@ function messagingHash(value: string, label: string): string {
 function messagingCredentialGeneration(value: string): string {
   if (!/^[0-9a-f]{64}$/u.test(value)) {
     throw new StoreError("Messaging credential generation is invalid.");
+  }
+  return value;
+}
+
+function messagingSealedConversationContext(
+  value: PutMessagingConversationContextInput["sealed"]
+): PutMessagingConversationContextInput["sealed"] {
+  if (value === null || typeof value !== "object" || value.algorithm !== "aes-256-gcm") {
+    throw new StoreError("Messaging conversation context envelope is invalid.");
+  }
+  return {
+    algorithm: "aes-256-gcm",
+    nonce: canonicalMessagingContextBase64(value.nonce, "nonce", 12, 12),
+    ciphertext: canonicalMessagingContextBase64(value.ciphertext, "ciphertext", 1, 16_384),
+    tag: canonicalMessagingContextBase64(value.tag, "authentication tag", 16, 16)
+  };
+}
+
+function canonicalMessagingContextBase64(
+  value: unknown,
+  label: string,
+  minimumBytes: number,
+  maximumBytes: number
+): string {
+  if (typeof value !== "string" || value.length < 4 || value.length > 21_848) {
+    throw new StoreError(`Messaging conversation context ${label} is invalid.`);
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (
+    decoded.byteLength < minimumBytes ||
+    decoded.byteLength > maximumBytes ||
+    decoded.toString("base64") !== value
+  ) {
+    throw new StoreError(`Messaging conversation context ${label} is invalid.`);
   }
   return value;
 }

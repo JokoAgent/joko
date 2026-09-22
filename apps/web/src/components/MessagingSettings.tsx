@@ -26,7 +26,8 @@ import type {
   MessagingSettingsView,
   PermissionMode,
   TelegramMessagingConfigurationView,
-  WeComMessagingConfigurationView
+  WeComMessagingConfigurationView,
+  WeChatAuthorizationAttemptView
 } from "../model.js";
 import type { Translator } from "./types.js";
 import {
@@ -73,6 +74,7 @@ type MessagingDialog =
   | { readonly kind: "credential"; readonly connectionId: string }
   | { readonly kind: "configuration"; readonly connectionId: string }
   | { readonly kind: "clear"; readonly connectionId: string }
+  | { readonly kind: "wechatAuthorization"; readonly connectionId: string }
   | { readonly kind: "route"; readonly connectionId?: string };
 
 interface MessagingTestMessage {
@@ -194,6 +196,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
     capability.channel === "lark" && capability.available) === true;
   const wecomAvailable = settings?.channels.some((capability) =>
     capability.channel === "wecom" && capability.available) === true;
+  const wechatAvailable = settings?.channels.some((capability) =>
+    capability.channel === "wechat" && capability.available) === true;
+
+  const createWeChatConnection = async (): Promise<void> => {
+    const connection = await run("create:wechat", () => controller.createWeChatMessagingConnection());
+    if (connection === undefined) return;
+    replaceConnection(connection);
+    setDialog({ kind: "wechatAuthorization", connectionId: connection.id });
+  };
 
   const createConnection = async (
     channel: MessagingCreateChannel,
@@ -521,6 +532,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
         {wecomAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "wecom" })}>
           <Plus aria-hidden="true" />{t("messaging.addWeCom")}
         </Button>}
+        {wechatAvailable && <Button tone="primary" disabled={busy === "create:wechat"} onClick={() => { void createWeChatConnection(); }}>
+          {busy === "create:wechat" ? <Spinner /> : <Plus aria-hidden="true" />}{t("messaging.addWeChat")}
+        </Button>}
       </div>
     </header>
 
@@ -573,6 +587,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
           {wecomAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "wecom" })}>
             <Plus aria-hidden="true" />{t("messaging.addWeCom")}
           </Button>}
+          {wechatAvailable && <Button tone="primary" disabled={busy === "create:wechat"} onClick={() => { void createWeChatConnection(); }}>
+            {busy === "create:wechat" ? <Spinner /> : <Plus aria-hidden="true" />}{t("messaging.addWeChat")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -587,7 +604,11 @@ export function MessagingSettings({ controller, snapshot, t }: {
                       <h4>{channelLabel(connection.channel)}</h4>
                       <ConnectionStatus status={connection.runtimeStatus} channel={connection.channel} t={t} />
                     </div>
-                    <p>{connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom"
+                    <p>{connection.channel === "wechat"
+                      ? connection.providerAccountId === undefined
+                        ? t("messaging.wechatAwaitingAuthorization")
+                        : t("messaging.wechatConnectedAccount", { id: connection.providerAccountId })
+                      : connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom"
                       ? connection.ownerProviderUserId === undefined
                         ? t(connection.channel === "dingtalk"
                           ? "messaging.dingtalkAwaitingOwner"
@@ -616,7 +637,8 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <span><strong>{t("messaging.lastConnected")}</strong>{connection.lastConnectedAt === undefined
                   ? t("common.none")
                   : formatRelativeTime(connection.lastConnectedAt, controller.state.preferences.locale)}</span>
-                <span><strong>{t(connection.channel === "discord" ? "messaging.discordOwnerId"
+                <span><strong>{t(connection.channel === "wechat" ? "messaging.wechatAccountId"
+                  : connection.channel === "discord" ? "messaging.discordOwnerId"
                   : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId"
                     : connection.channel === "feishu" || connection.channel === "lark"
                       ? "messaging.feishuOwnerId"
@@ -649,18 +671,23 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <Button tone="secondary" disabled={pending || !connection.credentialConfigured} onClick={() => { void testConnection(connection); }}>
                   {busy === `test:${connection.id}` ? <Spinner /> : <RefreshCw aria-hidden="true" />}{t("messaging.test")}
                 </Button>
-                <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "configuration", connectionId: connection.id })}>
+                {connection.channel !== "wechat" && <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "configuration", connectionId: connection.id })}>
                   <Settings2 aria-hidden="true" />{t("messaging.configure")}
-                </Button>
-                <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "credential", connectionId: connection.id })}>
-                  <KeyRound aria-hidden="true" />{messagingCredentialActionLabel(connection, t)}
-                </Button>
+                </Button>}
+                {connection.channel === "wechat"
+                  ? <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "wechatAuthorization", connectionId: connection.id })}>
+                      <KeyRound aria-hidden="true" />{t(connection.credentialConfigured ? "messaging.wechatReauthorize" : "messaging.wechatAuthorize")}
+                    </Button>
+                  : <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "credential", connectionId: connection.id })}>
+                      <KeyRound aria-hidden="true" />{messagingCredentialActionLabel(connection, t)}
+                    </Button>}
                 {connection.credentialConfigured && <Button tone="ghost" disabled={pending} onClick={() => setDialog({ kind: "clear", connectionId: connection.id })}>
                   <Trash2 aria-hidden="true" />{t(connection.channel === "dingtalk"
                     ? "messaging.dingtalkClearCredential"
                     : connection.channel === "feishu" || connection.channel === "lark"
                       ? "messaging.appSecretClearCredential"
                       : connection.channel === "wecom" ? "messaging.wecomClearCredential"
+                      : connection.channel === "wechat" ? "messaging.wechatClearCredential"
                       : "messaging.clearCredential")}
                 </Button>}
               </footer>
@@ -676,7 +703,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
       onClose={() => setDialog(undefined)}
       onSubmit={(channel, ownerId) => { void createConnection(channel, ownerId); }}
     />
-    {connectionForDialog !== undefined && <CredentialDialog
+    {connectionForDialog !== undefined && connectionForDialog.channel === "wechat" && dialog?.kind === "wechatAuthorization" && <WeChatAuthorizationDialog
+      key={`${ownerKey}:${connectionForDialog.id}`}
+      connection={connectionForDialog}
+      controller={controller}
+      t={t}
+      onConnection={replaceConnection}
+      onClose={() => setDialog(undefined)}
+    />}
+    {connectionForDialog !== undefined && connectionForDialog.channel !== "wechat" && <CredentialDialog
       open={dialog?.kind === "credential"}
       connection={connectionForDialog}
       busy={busy === `credential:${connectionForDialog.id}`}
@@ -760,6 +795,8 @@ function ConnectionStatus({ status, channel, t }: {
   return <span className={cx("messaging-status", `messaging-status--${status}`)}>
     <span aria-hidden="true" />{t(status === "idle" && channel === "dingtalk"
       ? "messaging.status.dingtalkIdle"
+      : status === "idle" && channel === "wechat"
+        ? "messaging.status.wechatIdle"
       : status === "idle" && channel === "wecom"
         ? "messaging.status.wecomIdle"
       : status === "idle" && (channel === "feishu" || channel === "lark")
@@ -872,6 +909,176 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={secret.trim() === "" || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
     </form>
   </Modal>;
+}
+
+function WeChatAuthorizationDialog({ connection, controller, t, onConnection, onClose }: {
+  readonly connection: MessagingConnectionView;
+  readonly controller: AppController;
+  readonly t: Translator;
+  readonly onConnection: (connection: MessagingConnectionView) => void;
+  readonly onClose: () => void;
+}): JSX.Element {
+  const originalGeneration = useRef(connection.generation);
+  const originalCredentialConfigured = useRef(connection.credentialConfigured);
+  const started = useRef(false);
+  const cancelling = useRef(false);
+  const actionAbort = useRef<AbortController | undefined>(undefined);
+  const [attempt, setAttempt] = useState<WeChatAuthorizationAttemptView>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const [pollRetry, setPollRetry] = useState(0);
+  const [verificationCode, setVerificationCode] = useState("");
+  const initialFocus = useRef<HTMLButtonElement>(null);
+  const codeFocus = useRef<HTMLInputElement>(null);
+
+  const begin = async (signal: AbortSignal): Promise<void> => {
+    setBusy(true);
+    setError(undefined);
+    setAttempt(undefined);
+    try {
+      const settings = await controller.getMessagingSettings(signal);
+      const latest = settings.connections.find((value) => value.id === connection.id);
+      if (latest === undefined || latest.channel !== "wechat" || latest.generation !== originalGeneration.current
+        || latest.credentialConfigured !== originalCredentialConfigured.current) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      const next = await controller.beginWeChatAuthorization(latest.id, latest.revision, latest.generation, signal);
+      if (signal.aborted) return;
+      setAttempt(next);
+      if (next.connection !== undefined) onConnection(next.connection);
+    } catch (reason) {
+      if (!signal.aborted) setError(errorMessage(reason, t("messaging.wechatAuthorizationFailed")));
+    } finally {
+      if (!signal.aborted) setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    const abort = new AbortController();
+    actionAbort.current = abort;
+    void begin(abort.signal);
+    return () => abort.abort();
+  }, []);
+
+  useEffect(() => {
+    if (attempt === undefined || attempt.status === "verificationRequired" || isWeChatAuthorizationTerminal(attempt.status)
+      || busy || error !== undefined) return;
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => { void (async () => {
+      try {
+        const next = await controller.getWeChatAuthorization(attempt, abort.signal);
+        if (abort.signal.aborted) return;
+        setAttempt(next);
+        if (next.connection !== undefined) onConnection(next.connection);
+      } catch (reason) {
+        if (!abort.signal.aborted) setError(errorMessage(reason, t("messaging.wechatPollFailed")));
+      }
+    })(); }, 1_500);
+    return () => { window.clearTimeout(timer); abort.abort(); };
+  }, [attempt, busy, controller, error, pollRetry]);
+
+  useEffect(() => {
+    if (attempt?.status === "verificationRequired") codeFocus.current?.focus();
+  }, [attempt?.status]);
+
+  const retryBegin = (): void => {
+    actionAbort.current?.abort();
+    const abort = new AbortController();
+    actionAbort.current = abort;
+    void begin(abort.signal);
+  };
+
+  const submitCode = async (): Promise<void> => {
+    if (attempt?.status !== "verificationRequired" || !/^\d{1,12}$/u.test(verificationCode)) return;
+    const code = verificationCode;
+    setVerificationCode("");
+    setBusy(true);
+    setError(undefined);
+    const abort = new AbortController();
+    actionAbort.current = abort;
+    try {
+      const next = await controller.submitWeChatVerificationCode(attempt, code, abort.signal);
+      if (abort.signal.aborted) return;
+      setAttempt(next);
+      if (next.connection !== undefined) onConnection(next.connection);
+    } catch (reason) {
+      if (!abort.signal.aborted) setError(errorMessage(reason, t("messaging.wechatVerificationFailed")));
+    } finally {
+      if (!abort.signal.aborted) setBusy(false);
+    }
+  };
+
+  const close = async (): Promise<void> => {
+    if (cancelling.current) return;
+    setVerificationCode("");
+    actionAbort.current?.abort();
+    if (attempt === undefined || isWeChatAuthorizationTerminal(attempt.status)) {
+      onClose();
+      return;
+    }
+    cancelling.current = true;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await controller.cancelWeChatAuthorization(attempt);
+      onClose();
+    } catch (reason) {
+      setError(errorMessage(reason, t("messaging.wechatCancelFailed")));
+      setBusy(false);
+      cancelling.current = false;
+    }
+  };
+
+  const terminal = attempt !== undefined && isWeChatAuthorizationTerminal(attempt.status);
+  return <Modal
+    open
+    title={t(originalCredentialConfigured.current ? "messaging.wechatReauthorize" : "messaging.wechatAuthorize")}
+    description={t(connection.runtimeStatus === "authLoss" ? "messaging.wechatRestoreBody"
+      : originalCredentialConfigured.current ? "messaging.wechatRebindBody" : "messaging.wechatAuthorizeBody")}
+    closeLabel={t("common.close")}
+    onClose={() => { void close(); }}
+    initialFocus={() => attempt?.status === "verificationRequired" ? codeFocus.current : initialFocus.current}
+    showClose
+  >
+    <div className="messaging-wechat-authorization">
+      {error !== undefined && <ErrorBanner message={error} onClose={() => setError(undefined)} onRetry={() => {
+        if (attempt === undefined || terminal) retryBegin();
+        else { setError(undefined); setPollRetry((value) => value + 1); }
+      }} />}
+      {attempt === undefined && <p className="messaging-wechat-authorization__status" role="status">{busy ? <Spinner /> : null}{t("messaging.wechatPreparing")}</p>}
+      {attempt !== undefined && <>
+        <p className="messaging-wechat-authorization__status" role="status" aria-live="polite">
+          {t(`messaging.wechatStatus.${attempt.status}`)}
+        </p>
+        {attempt.errorSummary !== undefined && <p className="messaging-form__warning">{attempt.errorSummary}</p>}
+        {!terminal && attempt.qrCodeUrl !== undefined && <div className="messaging-wechat-authorization__qr">
+          <img src={attempt.qrCodeUrl} referrerPolicy="no-referrer" alt={t("messaging.wechatQrAlt")} />
+          <a href={attempt.qrCodeUrl} target="_blank" rel="noreferrer">{t("messaging.wechatOpenQr")}</a>
+          <span>{t("messaging.wechatExpiresAt", { time: new Date(attempt.expiresAt).toLocaleTimeString() })}</span>
+        </div>}
+        {attempt.status === "verificationRequired" && <form className="messaging-form" onSubmit={(event) => {
+          event.preventDefault();
+          void submitCode();
+        }}>
+          <label><span>{t("messaging.wechatVerificationCode")}</span><input ref={codeFocus} type="password" inputMode="numeric" autoComplete="one-time-code" value={verificationCode} onChange={(event) => setVerificationCode(event.target.value)} maxLength={12} /></label>
+          {attempt.verificationRetry && <p className="messaging-form__warning">{t("messaging.wechatVerificationRetry")}</p>}
+          <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t("messaging.wechatVerificationSafety")}</p>
+          <Button tone="primary" type="submit" disabled={busy || !/^\d{1,12}$/u.test(verificationCode)}>{busy ? <Spinner /> : null}{t("messaging.wechatSubmitCode")}</Button>
+        </form>}
+      </>}
+      <div className="modal__actions">
+        <button ref={initialFocus} type="button" className="button button--secondary" onClick={() => { void close(); }} disabled={cancelling.current}>{terminal ? t("common.close") : t("common.cancel")}</button>
+        {(attempt === undefined && !busy || attempt?.status === "failed" || attempt?.status === "expired" || attempt?.status === "cancelled")
+          && <Button tone="primary" onClick={retryBegin} disabled={busy}>{t("messaging.wechatRetry")}</Button>}
+      </div>
+    </div>
+  </Modal>;
+}
+
+function isWeChatAuthorizationTerminal(status: WeChatAuthorizationAttemptView["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled" || status === "expired";
 }
 
 function TelegramConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
@@ -1104,12 +1311,14 @@ function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }
   const dingtalk = connection.channel === "dingtalk";
   const appSecret = connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom";
   const title = dingtalk ? "messaging.dingtalkClearTitle"
+    : connection.channel === "wechat" ? "messaging.wechatClearTitle"
     : connection.channel === "wecom" ? "messaging.wecomClearTitle"
       : appSecret ? "messaging.appSecretClearTitle" : "messaging.clearTitle";
   const action = dingtalk ? "messaging.dingtalkClearCredential"
+    : connection.channel === "wechat" ? "messaging.wechatClearCredential"
     : connection.channel === "wecom" ? "messaging.wecomClearCredential"
       : appSecret ? "messaging.appSecretClearCredential" : "messaging.clearCredential";
-  return <Modal open={open} title={t(title)} description={t("messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
+  return <Modal open={open} title={t(title)} description={t(connection.channel === "wechat" ? "messaging.wechatClearBody" : "messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
     <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(action)}</Button></div>
   </Modal>;
 }

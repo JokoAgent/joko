@@ -37,6 +37,14 @@ describe("translate", () => {
     expect(translate("en-XA", "messaging.wecomConfigureTitle")).toMatch(/^［.*··］$/u);
   });
 
+  it("localizes WeChat QR authorization, verification, and recovery across three locales", () => {
+    expect(translate("en", "messaging.addWeChat")).toBe("Add WeChat");
+    expect(translate("en", "messaging.wechatVerificationSafety")).toContain("one-shot protected channel");
+    expect(translate("zh-CN", "messaging.wechatRebindBody")).toContain("现有连接保持工作");
+    expect(translate("zh-CN", "messaging.wechatStatus.verificationRequired")).toBe("需要验证码");
+    expect(translate("en-XA", "messaging.wechatStatus.expired")).toMatch(/^［.*··］$/u);
+  });
+
   it("keeps every shared Backend surface neutral while retaining Pi-owned feature names", () => {
     const sharedKeys = [
       "session.deleteWarning",

@@ -9,7 +9,8 @@
     "./discord": "./src/discord/index.ts",
     "./feishu": "./src/feishu/index.ts",
     "./telegram": "./src/telegram/index.ts",
-    "./wecom": "./src/wecom/index.ts"
+    "./wecom": "./src/wecom/index.ts",
+    "./wechat": "./src/wechat/index.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -19,6 +20,7 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.71.1",
     "@wecom/aibot-node-sdk": "1.0.7",
+    "silk-wasm": "3.7.1",
     "ws": "8.21.3"
   },
   "devDependencies": {

@@ -198,6 +198,48 @@ test("WeCom messaging exposes one strict non-secret bot configuration and revisi
   assert.equal(value.botId, "wecom-bot");
 });
 
+test("WeChat messaging exposes only an empty configuration and a fenced QR authorization flow", () => {
+  assert.deepEqual([...fieldNames(contract.WeChatMessagingConfigurationSchema)], []);
+  assert.equal(field(contract.MessagingConnectionSchema, "wechat_configuration").number, 21);
+  assert.equal(field(contract.CreateMessagingConnectionRequestSchema, "wechat_configuration").number, 8);
+  for (const name of [
+    "beginWeChatAuthorization", "getWeChatAuthorization", "beginWeChatVerificationInput",
+    "submitWeChatVerificationCode", "cancelWeChatAuthorization"
+  ]) assert.equal(methodNames(contract.MessagingService).has(name), true, name);
+  for (const schema of [
+    contract.BeginWeChatAuthorizationRequestSchema,
+    contract.GetWeChatAuthorizationRequestSchema,
+    contract.BeginWeChatVerificationInputRequestSchema,
+    contract.SubmitWeChatVerificationCodeRequestSchema,
+    contract.CancelWeChatAuthorizationRequestSchema
+  ]) {
+    assert.equal(fieldNames(schema).has("expected_generation"), true, schema.typeName);
+  }
+  assert.equal(fieldNames(contract.WeChatAuthorizationAttemptSchema).has("qr_code_url"), true);
+  assert.equal(fieldNames(contract.WeChatAuthorizationAttemptSchema).has("verification_retry"), true);
+  assertNoFields([
+    contract.WeChatMessagingConfigurationSchema,
+    contract.WeChatAuthorizationAttemptSchema,
+    contract.BeginWeChatAuthorizationRequestSchema,
+    contract.GetWeChatAuthorizationResponseSchema,
+    contract.SubmitWeChatVerificationCodeRequestSchema
+  ], [
+    "token", "bot_token", "context_token", "qrcode", "poll_token", "verification_code",
+    "base_url", "aes_key", "credential_value"
+  ]);
+  const input = roundTrip(contract.WeChatAuthorizationAttemptSchema, {
+    attemptId: "attempt-id",
+    connectionId: "connection-id",
+    generation: 1n,
+    revision: 2n,
+    status: contract.WeChatAuthorizationStatus.VERIFICATION_REQUIRED,
+    qrCodeUrl: "https://ilinkai.weixin.qq.com/qr/example",
+    verificationRetry: true
+  });
+  assert.equal(input.status, contract.WeChatAuthorizationStatus.VERIFICATION_REQUIRED);
+  assert.equal(input.qrCodeUrl, "https://ilinkai.weixin.qq.com/qr/example");
+});
+
 test("Contacts exposes revision-fenced local and explicit device-sync authority without secret transport fields", () => {
   assert.deepEqual([...methodNames(contract.ContactService)], [
     "getContactDirectory",

@@ -851,6 +851,58 @@ export interface MessagingConversationRecord {
   readonly revision: bigint;
 }
 
+/** Ciphertext-only latest send capability for one Messaging conversation.
+ * The Orchestrator credential vault owns encryption and the raw provider
+ * context. Store only persists this strict AES-GCM envelope. */
+export interface SealedMessagingConversationContext {
+  readonly algorithm: "aes-256-gcm";
+  readonly nonce: string;
+  readonly ciphertext: string;
+  readonly tag: string;
+}
+
+interface MessagingConversationContextRecordBase {
+  readonly connectionId: string;
+  /** Exact managed credential material generation used in the AES-GCM AAD. */
+  readonly materialGeneration: string;
+  readonly conversationId: string;
+  readonly sealed: SealedMessagingConversationContext;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+/** Durable request or text-interaction reply that supplied this latest
+ * provider context. Exactly one source identity is present. */
+export type MessagingConversationContextRecord = MessagingConversationContextRecordBase & (
+  | { readonly sourceRequestId: string; readonly sourceInteractionId?: never }
+  | { readonly sourceRequestId?: never; readonly sourceInteractionId: string }
+);
+
+interface PutMessagingConversationContextInputBase {
+  readonly connectionId: string;
+  readonly expectedChannelGeneration: number;
+  readonly expectedMaterialGeneration: string;
+  readonly conversationId: string;
+  /** `null` requires that no context exists; otherwise this is an exact CAS.
+   * A replay of the same durable source is idempotent even when AES-GCM
+   * produced a different envelope or a newer source is already current. */
+  readonly expectedRevision: bigint | null;
+  readonly sealed: SealedMessagingConversationContext;
+  readonly updatedAt?: UnixMillis;
+}
+
+export type PutMessagingConversationContextInput = PutMessagingConversationContextInputBase & (
+  | { readonly sourceRequestId: string; readonly sourceInteractionId?: never }
+  | { readonly sourceRequestId?: never; readonly sourceInteractionId: string }
+);
+
+export interface MessagingConversationContextAadInput {
+  readonly connectionId: string;
+  readonly materialGeneration: string;
+  readonly conversationId: string;
+}
+
 export interface EnsureMessagingConversationInput {
   readonly id?: string;
   readonly connectionId: string;

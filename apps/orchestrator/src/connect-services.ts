@@ -1215,7 +1215,15 @@ export function createConnectServices(application: OrchestratorApplication): Con
   );
   const messaging = createMessagingConnectService(
     application.messaging,
-    (context) => ({ connectionId: authenticate(context).id })
+    (context) => ({ connectionId: authenticate(context).id }),
+    {
+      ...(dependencies.credentials === undefined ? {} : { credentials: dependencies.credentials }),
+      ...(application.messagingCreateWeChatAuthorization === undefined
+        ? {}
+        : { createWeChatAuthorization: application.messagingCreateWeChatAuthorization }),
+      onClientRevoked: (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
+      registerCleanup: (cleanup) => { application.registerServiceCleanup?.(cleanup); }
+    }
   );
   const contact = createContactConnectService(
     application.contacts,

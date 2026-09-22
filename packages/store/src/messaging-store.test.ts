@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { createCipheriv } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,6 +9,7 @@ import {
   OperationalStore,
   StaleGenerationError,
   StoreError,
+  messagingConversationContextAad,
   operationBodyHash
 } from "./index.js";
 
@@ -736,6 +738,278 @@ describe("OperationalStore messaging", () => {
       statuses: ["unknown"]
     })).toEqual([expect.objectContaining({ id: interaction.id })]);
   });
+
+  it("persists only sealed latest conversation context with source idempotency, exact CAS, and material retirement", () => {
+    const fixture = createActiveFixture({ channel: "wechat" });
+    const materialGeneration = "1".repeat(64);
+    const aad = messagingConversationContextAad({
+      connectionId: fixture.connectionId,
+      materialGeneration,
+      conversationId: fixture.conversationId
+    });
+    const rawContextA = "private-wechat-context-a";
+    const sealedA = sealMessagingContext(rawContextA, aad, 1);
+
+    expect(() => fixture.store.transaction((store) => {
+      const request = store.createMessagingInboundRequest({
+        id: "context-request-a",
+        connectionId: fixture.connectionId,
+        expectedChannelGeneration: fixture.generation,
+        conversationId: fixture.conversationId,
+        providerRequestIds: ["wechat:update:a"],
+        providerMessageId: "wechat-message-a",
+        bodyHash: operationBodyHash({ text: "first" }),
+        protectedContent: false,
+        occurredAt: 20,
+        receivedAt: 20
+      }).request;
+      store.putMessagingConversationContext({
+        connectionId: fixture.connectionId,
+        expectedChannelGeneration: fixture.generation,
+        expectedMaterialGeneration: materialGeneration,
+        conversationId: fixture.conversationId,
+        sourceRequestId: request.id,
+        expectedRevision: null,
+        sealed: sealedA,
+        updatedAt: 20
+      });
+      const connection = store.getMessagingConnection(fixture.connectionId);
+      store.updateMessagingConnectionRuntime({
+        connectionId: connection.id,
+        expectedRevision: connection.revision,
+        expectedGeneration: connection.generation,
+        runtimeStatus: "connected",
+        cursor: "cursor-rolled-back",
+        updatedAt: 20
+      });
+      throw new Error("rollback context batch");
+    })).toThrow("rollback context batch");
+    expect(fixture.store.findMessagingInboundRequest("context-request-a")).toBeUndefined();
+    expect(fixture.store.findMessagingConversationContext(fixture.conversationId)).toBeUndefined();
+    expect(fixture.store.getMessagingConnection(fixture.connectionId).cursor).toBeUndefined();
+
+    const first = fixture.store.transaction((store) => {
+      const request = store.createMessagingInboundRequest({
+        id: "context-request-a",
+        connectionId: fixture.connectionId,
+        expectedChannelGeneration: fixture.generation,
+        conversationId: fixture.conversationId,
+        providerRequestIds: ["wechat:update:a"],
+        providerMessageId: "wechat-message-a",
+        bodyHash: operationBodyHash({ text: "first" }),
+        protectedContent: false,
+        occurredAt: 20,
+        receivedAt: 20
+      }).request;
+      const context = store.putMessagingConversationContext({
+        connectionId: fixture.connectionId,
+        expectedChannelGeneration: fixture.generation,
+        expectedMaterialGeneration: materialGeneration,
+        conversationId: fixture.conversationId,
+        sourceRequestId: request.id,
+        expectedRevision: null,
+        sealed: sealedA,
+        updatedAt: 20
+      });
+      const connection = store.getMessagingConnection(fixture.connectionId);
+      store.updateMessagingConnectionRuntime({
+        connectionId: connection.id,
+        expectedRevision: connection.revision,
+        expectedGeneration: connection.generation,
+        runtimeStatus: "connected",
+        cursor: "cursor-a",
+        updatedAt: 20
+      });
+      return context;
+    });
+    expect(first).toMatchObject({
+      connectionId: fixture.connectionId,
+      materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceRequestId: "context-request-a",
+      sealed: sealedA
+    });
+
+    fixture.reopen();
+    expect(fixture.store.getMessagingConnection(fixture.connectionId).cursor).toBe("cursor-a");
+    expect(fixture.store.getMessagingConversationContext(fixture.conversationId)).toEqual(first);
+    expect(readFileSync(fixture.filePath).includes(Buffer.from(rawContextA, "utf8"))).toBe(false);
+
+    const replay = fixture.store.putMessagingConversationContext({
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      expectedMaterialGeneration: materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceRequestId: "context-request-a",
+      expectedRevision: null,
+      sealed: sealMessagingContext(rawContextA, aad, 2),
+      updatedAt: 21
+    });
+    expect(replay).toEqual(first);
+
+    const interaction = fixture.store.createMessagingInteraction({
+      id: "context-interaction-b",
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      conversationId: fixture.conversationId,
+      providerRequestId: "wechat:update:b",
+      providerInteractionId: "wechat:text-reply:b",
+      providerMessageId: "wechat-message-b",
+      actionHash: operationBodyHash({ text: "approve" }),
+      payload: { text: "approve" },
+      expiresAt: 1_000,
+      createdAt: 22
+    });
+    const sealedB = sealMessagingContext("private-wechat-context-b", aad, 3);
+    const second = fixture.store.putMessagingConversationContext({
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      expectedMaterialGeneration: materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceInteractionId: interaction.id,
+      expectedRevision: first.revision,
+      sealed: sealedB,
+      updatedAt: 22
+    });
+    expect(second).toMatchObject({ sourceInteractionId: interaction.id, sealed: sealedB });
+    expect(second.revision).not.toBe(first.revision);
+
+    const oldReplay = fixture.store.putMessagingConversationContext({
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      expectedMaterialGeneration: materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceRequestId: "context-request-a",
+      expectedRevision: second.revision,
+      sealed: sealMessagingContext(rawContextA, aad, 4),
+      updatedAt: 23
+    });
+    expect(oldReplay).toEqual(second);
+
+    const requestC = fixture.store.createMessagingInboundRequest({
+      id: "context-request-c",
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      conversationId: fixture.conversationId,
+      providerRequestIds: ["wechat:update:c"],
+      providerMessageId: "wechat-message-c",
+      bodyHash: operationBodyHash({ text: "third" }),
+      protectedContent: false,
+      occurredAt: 24,
+      receivedAt: 24
+    }).request;
+    expect(() => fixture.store.putMessagingConversationContext({
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      expectedMaterialGeneration: materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceRequestId: requestC.id,
+      expectedRevision: second.revision,
+      sealed: { ...sealedB, ciphertext: rawContextA },
+      updatedAt: 24
+    })).toThrow(/envelope|ciphertext/u);
+    expect(() => fixture.store.putMessagingConversationContext({
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      expectedMaterialGeneration: materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceRequestId: requestC.id,
+      expectedRevision: first.revision,
+      sealed: sealMessagingContext("private-wechat-context-c", aad, 5),
+      updatedAt: 24
+    })).toThrow(/revision/u);
+    expect(fixture.store.getMessagingConversationContext(fixture.conversationId)).toEqual(second);
+    expect(readFileSync(fixture.filePath).includes(Buffer.from("private-wechat-context-b", "utf8"))).toBe(false);
+
+    const otherConversation = fixture.store.ensureMessagingConversation({
+      id: "another-wechat-peer",
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      providerConversationId: "other-wechat-peer",
+      conversationKind: "direct",
+      observedAt: 24
+    });
+    const wrongSource = fixture.store.createMessagingInboundRequest({
+      id: "other-peer-request",
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      conversationId: otherConversation.id,
+      providerRequestIds: ["wechat:update:other-peer"],
+      providerMessageId: "wechat-message-other-peer",
+      bodyHash: operationBodyHash({ text: "wrong peer" }),
+      protectedContent: false,
+      occurredAt: 24,
+      receivedAt: 24
+    }).request;
+    expect(() => fixture.store.putMessagingConversationContext({
+      connectionId: fixture.connectionId,
+      expectedChannelGeneration: fixture.generation,
+      expectedMaterialGeneration: materialGeneration,
+      conversationId: fixture.conversationId,
+      sourceRequestId: wrongSource.id,
+      expectedRevision: second.revision,
+      sealed: sealMessagingContext("wrong-peer-context", aad, 7),
+      updatedAt: 24
+    })).toThrow(/request authority/u);
+    expect(fixture.store.getMessagingConversationContext(fixture.conversationId)).toEqual(second);
+
+    const current = fixture.store.getMessagingConnection(fixture.connectionId);
+    const rebound = fixture.store.replaceMessagingCredential({
+      connectionId: current.id,
+      expectedRevision: current.revision,
+      expectedGeneration: current.generation,
+      credentialReferenceId: "managed-credential-ref-2",
+      credentialGeneration: "2".repeat(64),
+      enable: true,
+      updatedAt: 25
+    });
+    expect(fixture.store.findMessagingConversationContext(fixture.conversationId)).toBeUndefined();
+
+    const nextConversation = fixture.store.ensureMessagingConversation({
+      id: "active-conversation-after-rebind",
+      connectionId: rebound.id,
+      expectedChannelGeneration: rebound.generation,
+      providerConversationId: "wechat-peer",
+      conversationKind: "direct",
+      observedAt: 26
+    });
+    const requestAfterRebind = fixture.store.createMessagingInboundRequest({
+      id: "context-request-after-rebind",
+      connectionId: rebound.id,
+      expectedChannelGeneration: rebound.generation,
+      conversationId: nextConversation.id,
+      providerRequestIds: ["wechat:update:after-rebind"],
+      providerMessageId: "wechat-message-after-rebind",
+      bodyHash: operationBodyHash({ text: "after rebind" }),
+      protectedContent: false,
+      occurredAt: 26,
+      receivedAt: 26
+    }).request;
+    const nextMaterialGeneration = "2".repeat(64);
+    fixture.store.putMessagingConversationContext({
+      connectionId: rebound.id,
+      expectedChannelGeneration: rebound.generation,
+      expectedMaterialGeneration: nextMaterialGeneration,
+      conversationId: nextConversation.id,
+      sourceRequestId: requestAfterRebind.id,
+      expectedRevision: null,
+      sealed: sealMessagingContext("private-wechat-context-after-rebind", messagingConversationContextAad({
+        connectionId: rebound.id,
+        materialGeneration: nextMaterialGeneration,
+        conversationId: nextConversation.id
+      }), 6),
+      updatedAt: 26
+    });
+    const latest = fixture.store.getMessagingConnection(rebound.id);
+    fixture.store.clearMessagingCredential({
+      connectionId: latest.id,
+      expectedRevision: latest.revision,
+      expectedGeneration: latest.generation,
+      clearOwner: true,
+      updatedAt: 27
+    });
+    expect(fixture.store.findMessagingConversationContext(nextConversation.id)).toBeUndefined();
+  });
 });
 
 function createFixture(): {
@@ -766,7 +1040,10 @@ function createFixture(): {
   return fixture;
 }
 
-function createActiveFixture(options: { readonly kind?: "direct" | "group" } = {}): {
+function createActiveFixture(options: {
+  readonly kind?: "direct" | "group";
+  readonly channel?: "telegram" | "wechat";
+} = {}): {
   readonly filePath: string;
   readonly store: OperationalStore;
   readonly connectionId: string;
@@ -778,9 +1055,9 @@ function createActiveFixture(options: { readonly kind?: "direct" | "group" } = {
   const fixture = createFixture();
   const initial = fixture.store.createMessagingConnection({
     id: "telegram-active",
-    channel: "telegram",
+    channel: options.channel ?? "telegram",
     ownerProviderUserId: "42",
-    configuration: {},
+    configuration: options.channel === "wechat" ? { format: 1 } : {},
     createdAt: 10
   });
   fixture.store.putMessagingRoute({
@@ -848,6 +1125,19 @@ function createActiveFixture(options: { readonly kind?: "direct" | "group" } = {
     conversationId: conversation.id,
     sessionId: "active-messaging-session",
     generation: connected.generation
+  };
+}
+
+function sealMessagingContext(value: string, aad: string, nonceByte: number) {
+  const nonce = Buffer.alloc(12, nonceByte);
+  const cipher = createCipheriv("aes-256-gcm", Buffer.alloc(32, 7), nonce);
+  cipher.setAAD(Buffer.from(aad, "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return {
+    algorithm: "aes-256-gcm" as const,
+    nonce: nonce.toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64")
   };
 }
 

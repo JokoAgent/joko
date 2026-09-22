@@ -208,6 +208,11 @@ service MessagingService {
   rpc UpdateDingTalkMessagingConfiguration(UpdateDingTalkMessagingConfigurationRequest) returns (UpdateDingTalkMessagingConfigurationResponse);
   rpc UpdateFeishuMessagingConfiguration(UpdateFeishuMessagingConfigurationRequest) returns (UpdateFeishuMessagingConfigurationResponse);
   rpc UpdateWeComMessagingConfiguration(UpdateWeComMessagingConfigurationRequest) returns (UpdateWeComMessagingConfigurationResponse);
+  rpc BeginWeChatAuthorization(BeginWeChatAuthorizationRequest) returns (BeginWeChatAuthorizationResponse);
+  rpc GetWeChatAuthorization(GetWeChatAuthorizationRequest) returns (GetWeChatAuthorizationResponse);
+  rpc BeginWeChatVerificationInput(BeginWeChatVerificationInputRequest) returns (BeginWeChatVerificationInputResponse);
+  rpc SubmitWeChatVerificationCode(SubmitWeChatVerificationCodeRequest) returns (SubmitWeChatVerificationCodeResponse);
+  rpc CancelWeChatAuthorization(CancelWeChatAuthorizationRequest) returns (CancelWeChatAuthorizationResponse);
   rpc TestMessagingConnection(TestMessagingConnectionRequest) returns (TestMessagingConnectionResponse);
   rpc PutMessagingRoute(PutMessagingRouteRequest) returns (PutMessagingRouteResponse);
 }

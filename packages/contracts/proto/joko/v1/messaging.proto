@@ -109,6 +109,18 @@ enum MessagingConnectionTestFailure {
   MESSAGING_CONNECTION_TEST_FAILURE_CONNECTION_FAILED = 5;
 }
 
+enum WeChatAuthorizationStatus {
+  WE_CHAT_AUTHORIZATION_STATUS_UNSPECIFIED = 0;
+  WE_CHAT_AUTHORIZATION_STATUS_WAITING = 1;
+  WE_CHAT_AUTHORIZATION_STATUS_SCANNED = 2;
+  WE_CHAT_AUTHORIZATION_STATUS_VERIFICATION_REQUIRED = 3;
+  WE_CHAT_AUTHORIZATION_STATUS_QR_REFRESHED = 4;
+  WE_CHAT_AUTHORIZATION_STATUS_SUCCEEDED = 5;
+  WE_CHAT_AUTHORIZATION_STATUS_FAILED = 6;
+  WE_CHAT_AUTHORIZATION_STATUS_CANCELLED = 7;
+  WE_CHAT_AUTHORIZATION_STATUS_EXPIRED = 8;
+}
+
 message TelegramMessagingConfiguration {
   TelegramEmojiReactions emoji_reactions = 1;
   TelegramReplyQuoteMode reply_quote_dm = 2;
@@ -164,6 +176,9 @@ message WeComMessagingConfiguration {
   string bot_id = 1;
 }
 
+// Presence selects the only supported strict current-v1 shape: { format: 1 }.
+message WeChatMessagingConfiguration {}
+
 message MessagingChannelCapability {
   MessagingChannel channel = 1;
   bool available = 2;
@@ -191,6 +206,7 @@ message MessagingConnection {
   optional DingTalkMessagingConfiguration dingtalk_configuration = 18;
   optional FeishuMessagingConfiguration feishu_configuration = 19;
   optional WeComMessagingConfiguration wecom_configuration = 20;
+  optional WeChatMessagingConfiguration wechat_configuration = 21;
 }
 
 message MessagingRoute {
@@ -225,6 +241,7 @@ message CreateMessagingConnectionRequest {
   optional DingTalkMessagingConfiguration dingtalk_configuration = 5;
   optional FeishuMessagingConfiguration feishu_configuration = 6;
   optional WeComMessagingConfiguration wecom_configuration = 7;
+  optional WeChatMessagingConfiguration wechat_configuration = 8;
 }
 
 message CreateMessagingConnectionResponse {
@@ -326,6 +343,72 @@ message UpdateWeComMessagingConfigurationRequest {
 
 message UpdateWeComMessagingConfigurationResponse {
   MessagingConnection connection = 1;
+}
+
+message WeChatAuthorizationAttempt {
+  string attempt_id = 1;
+  string connection_id = 2;
+  uint64 generation = 3;
+  uint64 revision = 4;
+  WeChatAuthorizationStatus status = 5;
+  optional string qr_code_url = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  bool verification_retry = 9;
+  optional string error_code = 10;
+  optional string error_summary = 11;
+  optional MessagingConnection connection = 12;
+}
+
+message BeginWeChatAuthorizationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+}
+
+message BeginWeChatAuthorizationResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message GetWeChatAuthorizationRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+}
+
+message GetWeChatAuthorizationResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message BeginWeChatVerificationInputRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+}
+
+message BeginWeChatVerificationInputResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message SubmitWeChatVerificationCodeRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+  string credential_input_ticket_id = 4;
+}
+
+message SubmitWeChatVerificationCodeResponse {
+  WeChatAuthorizationAttempt attempt = 1;
+}
+
+message CancelWeChatAuthorizationRequest {
+  string connection_id = 1;
+  string attempt_id = 2;
+  uint64 expected_generation = 3;
+}
+
+message CancelWeChatAuthorizationResponse {
+  WeChatAuthorizationAttempt attempt = 1;
 }
 
 message TestMessagingConnectionRequest {

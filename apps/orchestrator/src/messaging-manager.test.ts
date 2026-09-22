@@ -28,7 +28,11 @@ import {
   type WeComCallbackUpdate,
   type WeComNormalizationResult,
   type WeComPollResult,
-  type WeComTransportOptions
+  type WeComTransportOptions,
+  type WeChatNormalizationResult,
+  type WeChatPollResult,
+  type WeChatRawMessage,
+  type WeChatTransportOptions
 } from "@joko/messaging";
 import type { AdapterContext, InteractionDecision, MessageBlock, PromptInput } from "@joko/core";
 import { OperationalStore } from "@joko/store";
@@ -59,6 +63,272 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it("seals confirmed WeChat authorization without exposing token or accepting generic credential upload", async () => {
+    const fixture = await createFixture();
+    const created = fixture.manager.createWeChatConnection();
+    expect(created.configuration).toEqual({ format: 1 });
+    expect(() => fixture.manager.beginCredentialUpload({
+      clientConnectionId: "desktop-one",
+      messagingConnectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation
+    })).toThrow(/WeChat/u);
+
+    const credentials = {
+      token: "private-provider-token",
+      botId: "bot-123",
+      userId: "account-456",
+      baseUrl: "https://ilinkai.weixin.qq.com"
+    };
+    const confirmed = await fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one",
+      connectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation,
+      expectedCredentialReferenceId: null,
+      expectedCredentialGeneration: null,
+      expectedEnabled: false,
+      credentials,
+      enable: false
+    });
+    expect(confirmed.generation).toBe(created.generation + 1);
+    expect(confirmed.ownerProviderUserId).toBe(credentials.userId);
+    expect(JSON.stringify(confirmed, (_key, value) => typeof value === "bigint" ? value.toString() : value))
+      .not.toContain(credentials.token);
+    expect(JSON.parse(fixture.credentials.resolve(confirmed.credentialReferenceId!))).toEqual({
+      format: 1,
+      ...credentials,
+      baseUrl: "https://ilinkai.weixin.qq.com/"
+    });
+    await expect(fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one",
+      connectionId: created.id,
+      expectedRevision: confirmed.revision,
+      expectedGeneration: confirmed.generation,
+      expectedCredentialReferenceId: null,
+      expectedCredentialGeneration: null,
+      expectedEnabled: false,
+      credentials,
+      enable: false
+    })).rejects.toMatchObject({ code: "conflict" });
+
+    const cleared = await fixture.manager.clearCredential({
+      connectionId: confirmed.id,
+      expectedRevision: confirmed.revision,
+      expectedGeneration: confirmed.generation
+    });
+    expect(cleared.ownerProviderUserId).toBeUndefined();
+    expect(fixture.credentials.find(confirmed.credentialReferenceId!)).toBeUndefined();
+  });
+
+  it("keeps WeChat peers in exact Sessions and decrypts only each durable delivery's current reply context", async () => {
+    const transport = new FakeWeChatTransport(weChatDirectBatch());
+    const adapter = new CaptureFakeAdapter();
+    const fixture = await createFixture(
+      undefined, () => adapter, undefined, undefined, undefined, undefined, () => transport
+    );
+    fixture.manager.putRoute({
+      targetId: "target-one",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    });
+    const created = fixture.manager.createWeChatConnection();
+    const enabled = await fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one",
+      connectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation,
+      expectedCredentialReferenceId: null,
+      expectedCredentialGeneration: null,
+      expectedEnabled: false,
+      credentials: {
+        token: "weChat-private-token",
+        botId: "wx-bot",
+        userId: "wx-account",
+        baseUrl: "https://ilinkai.weixin.qq.com"
+      },
+      enable: true
+    });
+    await vi.waitFor(() => {
+      const runtime = fixture.store.getMessagingConnection(enabled.id);
+      if (runtime.runtimeStatus === "error") throw new Error(runtime.errorSummary ?? "WeChat failed");
+      expect(runtime.cursor).toBe("wechat-cursor-1");
+      expect(adapter.inputs).toHaveLength(2);
+      expect(transport.sentText).toHaveLength(2);
+    }, { timeout: 5_000 });
+    const conversations = fixture.store.listMessagingConversations({ connectionId: enabled.id });
+    expect(conversations.map((value) => value.providerConversationId).sort()).toEqual(["wx-peer-a", "wx-peer-b"]);
+    expect(new Set(conversations.map((value) => value.sessionId)).size).toBe(2);
+    expect(transport.sentText.map((entry) => [entry.address.providerConversationId, entry.context?.contextToken]).sort())
+      .toEqual([["wx-peer-a", "private-context-a"], ["wx-peer-b", "private-context-b"]]);
+    const deliveries = fixture.store.listMessagingDeliveries({ connectionId: enabled.id, limit: 20 });
+    expect(transport.sentText.map((entry) => entry.context?.clientId).sort())
+      .toEqual(deliveries.filter((entry) => entry.kind === "text").map((entry) => entry.id).sort());
+    expect(JSON.stringify(deliveries, (_key, value) => typeof value === "bigint" ? value.toString() : value))
+      .not.toContain("private-context-");
+    for (const conversation of conversations) {
+      const sealed = fixture.store.getMessagingConversationContext(conversation.id);
+      expect(JSON.stringify(sealed, (_key, value) => typeof value === "bigint" ? value.toString() : value))
+        .not.toContain("private-context-");
+    }
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    await fixture.manager.clearCredential({
+      connectionId: current.id,
+      expectedRevision: current.revision,
+      expectedGeneration: current.generation
+    });
+    for (const conversation of conversations) {
+      expect(fixture.store.findMessagingConversationContext(conversation.id)).toBeUndefined();
+    }
+  });
+
+  it("runs WeChat commands through one peer's durable task and keeps the previous task on /new", async () => {
+    const commands = ["/new", "/permission auto", "/status", "/stop all"];
+    const batch = weChatDirectBatch();
+    const transport = new FakeWeChatTransport({
+      ...batch,
+      events: commands.map((command, index) => ({
+        ...batch.events[0]!,
+        providerRequestIds: [`wechat:command-${index}`],
+        messageId: `command-${index}`,
+        text: command
+      })),
+      privateContexts: commands.map((_, index) => ({
+        messageId: `command-${index}`,
+        providerConversationId: "wx-peer-a",
+        contextToken: `private-command-${index}`
+      }))
+    });
+    const adapter = new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [
+        ...PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "permission.modes"
+          ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] }
+          : capability),
+        { key: "permission.change", supported: true }
+      ]
+    });
+    const fixture = await createFixture(
+      undefined, () => adapter, undefined, undefined, undefined, undefined, () => transport
+    );
+    fixture.manager.putRoute({
+      targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
+    });
+    const created = fixture.manager.createWeChatConnection();
+    const enabled = await fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one",
+      connectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation,
+      expectedCredentialReferenceId: null,
+      expectedCredentialGeneration: null,
+      expectedEnabled: false,
+      credentials: {
+        token: "weChat-private-token", botId: "wx-bot", userId: "wx-account",
+        baseUrl: "https://ilinkai.weixin.qq.com"
+      },
+      enable: true
+    });
+    await vi.waitFor(() => {
+      expect(fixture.store.getMessagingConnection(enabled.id).cursor).toBe("wechat-cursor-1");
+      expect(transport.sentText).toHaveLength(commands.length);
+    }, { timeout: 5_000 });
+    const conversation = fixture.store.listMessagingConversations({ connectionId: enabled.id })[0]!;
+    const taskIds = fixture.store.listSessions().map((session) => session.descriptor.id);
+    expect(taskIds).toContain(conversation.sessionId);
+    expect(taskIds).toHaveLength(2);
+    expect(transport.sentText.map((entry) => entry.text)).toEqual([
+      expect.stringContaining("new conversation is ready"),
+      expect.stringContaining("Permission changed to auto"),
+      expect.stringContaining("pending task"),
+      expect.stringContaining("Only the connected account")
+    ]);
+    expect(transport.sentText.every((entry) => entry.context?.contextToken.startsWith("private-command-")))
+      .toBe(true);
+    expect(fixture.store.listMessagingInteractions({ connectionId: enabled.id, limit: 20 })
+      .map((interaction) => interaction.status)).toEqual(["completed", "completed", "completed", "completed"]);
+  });
+
+  it("refreshes WeChat typing and persists bounded progress notices until the run settles", async () => {
+    const batch = weChatDirectBatch();
+    const transport = new FakeWeChatTransport({
+      ...batch,
+      events: batch.events.slice(0, 1),
+      privateContexts: batch.privateContexts.slice(0, 1)
+    });
+    const adapter = new SlowFakeAdapter();
+    const fixture = await createFixture(
+      undefined, () => adapter, undefined, undefined, undefined, undefined,
+      () => transport, { tickMs: 10, firstProgressMs: 30, repeatProgressMs: 40 }
+    );
+    fixture.manager.putRoute({
+      targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
+    });
+    const created = fixture.manager.createWeChatConnection();
+    const enabled = await fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation,
+      expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false,
+      credentials: {
+        token: "weChat-private-token", botId: "wx-bot", userId: "wx-account",
+        baseUrl: "https://ilinkai.weixin.qq.com"
+      },
+      enable: true
+    });
+    await vi.waitFor(() => {
+      expect(transport.sentText.filter((entry) => entry.text === "Task is still in progress…"))
+        .toHaveLength(2);
+    }, { timeout: 5_000 });
+    expect(transport.typingStarts).toBeGreaterThan(2);
+    expect(fixture.store.listMessagingDeliveries({ connectionId: enabled.id, limit: 20 })
+      .filter((delivery) => delivery.kind === "notice")).toHaveLength(2);
+    await adapter.finish();
+    await vi.waitFor(() => {
+      expect(transport.sentText.some((entry) => entry.text === "Finished." )).toBe(true);
+      expect(transport.typingStops).toBe(1);
+    }, { timeout: 5_000 });
+    const startsAtSettlement = transport.typingStarts;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(transport.typingStarts).toBe(startsAtSettlement);
+  });
+
+  it("resolves a non-owner WeChat peer's exact text permission without admitting a second task", async () => {
+    const transport = new InteractiveWeChatTransport();
+    const adapter = new PermissionFakeAdapter();
+    const fixture = await createFixture(
+      undefined, () => adapter, undefined, undefined, undefined, undefined, () => transport
+    );
+    fixture.manager.putRoute({
+      targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
+    });
+    const created = fixture.manager.createWeChatConnection();
+    const enabled = await fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation,
+      expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false,
+      credentials: {
+        token: "weChat-private-token", botId: "wx-bot", userId: "wx-account",
+        baseUrl: "https://ilinkai.weixin.qq.com"
+      },
+      enable: true
+    });
+    await vi.waitFor(() => {
+      expect(adapter.decision).toEqual({ kind: "selected", value: "allow_once" });
+      expect(transport.interactionCards).toBe(1);
+    }, { timeout: 5_000 });
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: enabled.id })).toHaveLength(1);
+    expect(fixture.store.listMessagingInteractions({ connectionId: enabled.id })).toMatchObject([
+      { status: "completed", providerMessageId: "wechat-permission-reply" }
+    ]);
+    const conversation = fixture.store.listMessagingConversations({ connectionId: enabled.id })[0]!;
+    expect(fixture.store.getInteraction("permission-one")).toMatchObject({
+      sessionId: conversation.sessionId, status: "resolved"
+    });
+  });
+
   it("binds one-shot credential tickets to the exact client, channel revision and generation, then retires replaced secrets", async () => {
     const fixture = await createFixture();
     const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42" });
@@ -1244,6 +1514,147 @@ class FakeDingTalkTransport {
   async close(): Promise<void> {}
 }
 
+class FakeWeChatTransport {
+  readonly channel = "wechat" as const;
+  typingStarts = 0;
+  typingStops = 0;
+  readonly sentText: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly context?: { readonly contextToken: string; readonly clientId: string };
+  }> = [];
+  #connectionId = "";
+  #generation = 0;
+  #polled = false;
+
+  constructor(readonly batch: WeChatNormalizationResult) {}
+
+  get connectionId(): string { return this.#connectionId; }
+  get generation(): number { return this.#generation; }
+
+  bind(options: WeChatTransportOptions): this {
+    this.#connectionId = options.connectionId;
+    this.#generation = options.generation;
+    return this;
+  }
+
+  async probe() {
+    return {
+      channel: "wechat" as const,
+      connectionId: this.#connectionId,
+      generation: this.#generation,
+      providerAccountId: "wx-bot",
+      displayName: "Joko WeChat test bot",
+      username: null
+    };
+  }
+
+  async poll(input: { readonly cursor: string | null; readonly signal?: AbortSignal }): Promise<WeChatPollResult> {
+    if (!this.#polled && input.cursor === null) {
+      this.#polled = true;
+      return { updates: [{} as WeChatRawMessage], nextCursor: "wechat-cursor-1" };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  normalize(_updates: readonly WeChatRawMessage[]): WeChatNormalizationResult {
+    return {
+      ...this.batch,
+      events: this.batch.events.map((event) => ({
+        ...event,
+        address: { ...event.address, connectionId: this.#connectionId }
+      }))
+    };
+  }
+
+  async downloadAttachment(): Promise<MessagingDownloadedAttachment> {
+    throw new Error("The direct peer fixture has no attachment.");
+  }
+
+  async sendTextPart(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly context?: { readonly contextToken: string; readonly clientId: string };
+  }) {
+    this.sentText.push(input);
+    return { providerMessageId: `wx-out-${this.sentText.length}`, address: input.address };
+  }
+
+  async sendAttachments(input: { readonly address: MessagingAddress }) {
+    return { providerMessageId: "wx-file", address: input.address };
+  }
+
+  async sendInteractionCard(input: { readonly address: MessagingAddress }) {
+    return { providerMessageId: "wx-interaction", address: input.address };
+  }
+
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+
+  async sendTyping(): Promise<void> { this.typingStarts += 1; }
+  async stopTyping(): Promise<void> { this.typingStops += 1; }
+  async setReaction(): Promise<void> {}
+  async answerInteraction(): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+class InteractiveWeChatTransport extends FakeWeChatTransport {
+  interactionCards = 0;
+  #releasePoll: (() => void) | undefined;
+
+  constructor() {
+    const batch = weChatDirectBatch();
+    super({ ...batch, events: batch.events.slice(0, 1), privateContexts: batch.privateContexts.slice(0, 1) });
+  }
+
+  override async poll(input: { readonly cursor: string | null; readonly signal?: AbortSignal }): Promise<WeChatPollResult> {
+    if (input.cursor === null) return super.poll(input);
+    if (input.cursor === "wechat-cursor-1") {
+      if (this.interactionCards === 0) {
+        await new Promise<void>((resolve, reject) => {
+          this.#releasePoll = resolve;
+          const abort = () => reject(new MessagingTransportError("cancelled", "test poll cancelled", {
+            retryable: false, effect: "none"
+          }));
+          if (input.signal?.aborted) abort();
+          else input.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return { updates: [{ client_id: "wechat-permission-reply" }], nextCursor: "wechat-cursor-2" };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  override normalize(updates: readonly WeChatRawMessage[]): WeChatNormalizationResult {
+    if (updates[0]?.client_id !== "wechat-permission-reply") return super.normalize(updates);
+    const base = this.batch.events[0]!;
+    if (base.kind !== "message") throw new Error("WeChat fixture expected a message.");
+    return {
+      events: [{
+        ...base,
+        providerRequestIds: ["wechat:permission-reply"],
+        messageId: "wechat-permission-reply",
+        address: { ...base.address, connectionId: this.connectionId },
+        text: "1"
+      }],
+      interactionReplyCandidates: [], groupObservations: [], ignored: [],
+      privateContexts: [{
+        messageId: "wechat-permission-reply", providerConversationId: "wx-peer-a",
+        contextToken: "private-permission-reply"
+      }]
+    };
+  }
+
+  override async sendInteractionCard(input: { readonly address: MessagingAddress }) {
+    const receipt = await super.sendInteractionCard(input);
+    this.interactionCards += 1;
+    this.#releasePoll?.();
+    this.#releasePoll = undefined;
+    return receipt;
+  }
+}
+
 class FakeWeComTransport {
   readonly channel = "wecom" as const;
   readonly sentText: Array<{
@@ -2019,6 +2430,23 @@ class CaptureFakeAdapter extends FakeBackendAdapter {
   }
 }
 
+class SlowFakeAdapter extends FakeBackendAdapter {
+  #context: AdapterContext | undefined;
+
+  constructor() { super(PI_LIKE_PROFILE); }
+
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    this.#context = context;
+  }
+
+  async finish(): Promise<void> {
+    const context = this.#context;
+    if (context === undefined) throw new Error("Slow fake task was not dispatched.");
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Finished." }] });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
+
 class PermissionFakeAdapter extends FakeBackendAdapter {
   decision: InteractionDecision | undefined;
 
@@ -2155,7 +2583,9 @@ async function createFixture(
   discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport,
   dingTalkTransportFactory?: (options: DingTalkTransportOptions) => FakeDingTalkTransport,
   feishuTransportFactory?: (options: FeishuTransportOptions) => FakeFeishuTransport,
-  weComTransportFactory?: (options: WeComTransportOptions) => FakeWeComTransport
+  weComTransportFactory?: (options: WeComTransportOptions) => FakeWeComTransport,
+  weChatTransportFactory?: (options: WeChatTransportOptions) => FakeWeChatTransport,
+  weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"]
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -2190,9 +2620,11 @@ async function createFixture(
   const options: MessagingManagerOptions = {
     store,
     credentials,
+    contextVault: vault,
     sessionHost: host,
     artifacts,
     retryDelayMs: 5,
+    ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),
     pollTimeoutSeconds: 0,
     ...(transportFactory === undefined ? {} : {
       createTelegramTransport: (input) => transportFactory(input).bind(input)
@@ -2208,6 +2640,9 @@ async function createFixture(
     }),
     ...(weComTransportFactory === undefined ? {} : {
       createWeComTransport: (input) => weComTransportFactory(input).bind(input)
+    }),
+    ...(weChatTransportFactory === undefined ? {} : {
+      createWeChatTransport: (input) => weChatTransportFactory(input).bind(input)
     })
   };
   manager = new MessagingManager(options);
@@ -2243,6 +2678,45 @@ async function replaceCredential(
 
 function token(suffix: string): string {
   return `123456:${suffix.padEnd(32, "x")}`;
+}
+
+function weChatDirectBatch(): WeChatNormalizationResult {
+  const message = (peerId: string) => ({
+    kind: "message" as const,
+    providerRequestIds: [`wechat:${peerId}-incoming`],
+    messageId: `${peerId}-incoming`,
+    address: {
+      channel: "wechat" as const,
+      connectionId: "placeholder",
+      providerConversationId: peerId,
+      providerThreadId: null,
+      conversationKind: "direct" as const
+    },
+    speaker: {
+      providerUserId: peerId,
+      displayName: peerId,
+      username: null,
+      isBot: false,
+      isOwner: false
+    },
+    occurredAt: Date.now(),
+    text: `Hello from ${peerId}`,
+    ambient: false,
+    protectedContent: false,
+    attachments: [],
+    unsupported: [],
+    replyContext: null
+  });
+  return {
+    events: [message("wx-peer-a"), message("wx-peer-b")],
+    interactionReplyCandidates: [],
+    groupObservations: [],
+    ignored: [],
+    privateContexts: [
+      { messageId: "wx-peer-a-incoming", providerConversationId: "wx-peer-a", contextToken: "private-context-a" },
+      { messageId: "wx-peer-b-incoming", providerConversationId: "wx-peer-b", contextToken: "private-context-b" }
+    ]
+  };
 }
 
 function directMessageBatch(): TelegramNormalizationResult {
