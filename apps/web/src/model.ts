@@ -4285,6 +4285,13 @@ export interface WeChatMessagingConfigurationView {
   readonly format: 1;
 }
 
+export interface SlackMessagingConfigurationView {
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  /** Keys are exact approved Slack channel IDs. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
 export type WeChatAuthorizationStatusView =
   | "waiting"
   | "scanned"
@@ -4327,6 +4334,7 @@ export interface MessagingConnectionView {
   readonly feishuConfiguration?: FeishuMessagingConfigurationView;
   readonly wecomConfiguration?: WeComMessagingConfigurationView;
   readonly wechatConfiguration?: WeChatMessagingConfigurationView;
+  readonly slackConfiguration?: SlackMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -5581,6 +5589,11 @@ export interface OperationApi {
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
   createWeChatMessagingConnection(signal?: AbortSignal): Promise<MessagingConnectionView>;
+  createSlackMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
   beginWeChatAuthorization(
     connectionId: string,
     expectedRevision: bigint,
@@ -5656,6 +5669,14 @@ export interface OperationApi {
     expectedRevision: bigint,
     expectedGeneration: bigint,
     configuration: WeComMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView>;
+  updateSlackMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: SlackMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
   testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;

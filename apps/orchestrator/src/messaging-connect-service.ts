@@ -11,11 +11,13 @@ import type {
 
 import {
   DEFAULT_DISCORD_MESSAGING_CONFIGURATION,
+  DEFAULT_SLACK_MESSAGING_CONFIGURATION,
   DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION,
   MessagingManagerError,
   decodeDingTalkMessagingConfiguration,
   decodeDiscordMessagingConfiguration,
   decodeFeishuMessagingConfiguration,
+  decodeSlackMessagingConfiguration,
   decodeTelegramMessagingConfiguration,
   decodeWeComMessagingConfiguration,
   decodeWeChatMessagingConfiguration,
@@ -23,6 +25,7 @@ import {
   type DiscordMessagingConfiguration,
   type FeishuMessagingConfiguration,
   type MessagingManager,
+  type SlackMessagingConfiguration,
   type TelegramMessagingConfiguration,
   type WeComMessagingConfiguration,
   type WeChatMessagingConfiguration
@@ -98,6 +101,7 @@ export function createMessagingConnectService(
               || request.feishuConfiguration !== undefined
               || request.wecomConfiguration !== undefined
               || request.wechatConfiguration !== undefined
+              || request.slackConfiguration !== undefined
             ) {
               throw new ConnectError("Another channel configuration does not belong to a Telegram connection.", Code.InvalidArgument);
             }
@@ -116,6 +120,7 @@ export function createMessagingConnectService(
                 || request.feishuConfiguration !== undefined
                 || request.wecomConfiguration !== undefined
                 || request.wechatConfiguration !== undefined
+                || request.slackConfiguration !== undefined
               ) {
                 throw new ConnectError("Another channel configuration does not belong to a Discord connection.", Code.InvalidArgument);
               }
@@ -134,6 +139,7 @@ export function createMessagingConnectService(
                   || request.feishuConfiguration !== undefined
                   || request.wecomConfiguration !== undefined
                   || request.wechatConfiguration !== undefined
+                  || request.slackConfiguration !== undefined
                 ) {
                   throw new ConnectError("Another channel configuration does not belong to a DingTalk connection.", Code.InvalidArgument);
                 }
@@ -156,6 +162,7 @@ export function createMessagingConnectService(
                     || request.dingtalkConfiguration !== undefined
                     || request.wecomConfiguration !== undefined
                     || request.wechatConfiguration !== undefined
+                    || request.slackConfiguration !== undefined
                   ) {
                     throw new ConnectError(
                       "Another channel configuration does not belong to a Feishu/Lark connection.",
@@ -184,6 +191,7 @@ export function createMessagingConnectService(
                       || request.dingtalkConfiguration !== undefined
                       || request.feishuConfiguration !== undefined
                       || request.wechatConfiguration !== undefined
+                      || request.slackConfiguration !== undefined
                     ) {
                       throw new ConnectError(
                         "Another channel configuration does not belong to a WeCom connection.",
@@ -209,7 +217,8 @@ export function createMessagingConnectService(
                         || request.discordConfiguration !== undefined
                         || request.dingtalkConfiguration !== undefined
                         || request.feishuConfiguration !== undefined
-                        || request.wecomConfiguration !== undefined) {
+                        || request.wecomConfiguration !== undefined
+                        || request.slackConfiguration !== undefined) {
                         throw new ConnectError(
                           "Another channel configuration does not belong to a WeChat connection.",
                           Code.InvalidArgument
@@ -225,6 +234,26 @@ export function createMessagingConnectService(
                         configuration: fromProtoWeChatConfiguration(request.wechatConfiguration)
                       });
                     })()
+                  : request.channel === contract.MessagingChannel.SLACK
+                    ? (() => {
+                        if (request.telegramConfiguration !== undefined
+                          || request.discordConfiguration !== undefined
+                          || request.dingtalkConfiguration !== undefined
+                          || request.feishuConfiguration !== undefined
+                          || request.wecomConfiguration !== undefined
+                          || request.wechatConfiguration !== undefined) {
+                          throw new ConnectError(
+                            "Another channel configuration does not belong to a Slack connection.",
+                            Code.InvalidArgument
+                          );
+                        }
+                        return owner.createSlackConnection({
+                          ownerProviderUserId: request.ownerProviderUserId,
+                          configuration: request.slackConfiguration === undefined
+                            ? DEFAULT_SLACK_MESSAGING_CONFIGURATION
+                            : fromProtoSlackConfiguration(request.slackConfiguration)
+                        });
+                      })()
                   : undefined;
       if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
@@ -367,6 +396,23 @@ export function createMessagingConnectService(
         configuration: fromProtoWeComConfiguration(request.configuration)
       });
       return create(contract.UpdateWeComMessagingConfigurationResponseSchema, {
+        connection: toProtoConnection(connection)
+      });
+    }),
+
+    updateSlackMessagingConfiguration: async (request, context) => messagingRpc(async () => {
+      authenticate(context);
+      if (request.configuration === undefined) {
+        throw new ConnectError("configuration is required.", Code.InvalidArgument);
+      }
+      const connection = await requireManager(manager).replaceSlackConfiguration({
+        connectionId: request.connectionId,
+        expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration),
+        ownerProviderUserId: request.ownerProviderUserId,
+        configuration: fromProtoSlackConfiguration(request.configuration)
+      });
+      return create(contract.UpdateSlackMessagingConfigurationResponseSchema, {
         connection: toProtoConnection(connection)
       });
     }),
@@ -771,6 +817,61 @@ function toProtoWeComConfiguration(
   });
 }
 
+function fromProtoSlackConfiguration(
+  value: contract.SlackMessagingConfiguration
+): SlackMessagingConfiguration {
+  if (reflect(contract.SlackMessagingConfigurationSchema, value).getUnknown()?.length) {
+    throw new ConnectError("Slack configuration contains unsupported fields.", Code.InvalidArgument);
+  }
+  const emojiReactions = value.emojiReactions === contract.SlackEmojiReactions.OFF ? "off"
+    : value.emojiReactions === contract.SlackEmojiReactions.MINIMAL ? "minimal"
+      : value.emojiReactions === contract.SlackEmojiReactions.EXPRESSIVE ? "expressive"
+        : undefined;
+  if (emojiReactions === undefined) {
+    throw new ConnectError("Slack configuration is invalid.", Code.InvalidArgument);
+  }
+  const groupActivation = Object.create(null) as Record<string, "mention" | "always" | "disabled">;
+  for (const rule of value.groupActivationRules) {
+    if (reflect(contract.SlackGroupActivationRuleSchema, rule).getUnknown()?.length) {
+      throw new ConnectError("Slack group activation contains unsupported fields.", Code.InvalidArgument);
+    }
+    const mapped = rule.activation === contract.SlackGroupActivation.MENTION ? "mention"
+      : rule.activation === contract.SlackGroupActivation.ALWAYS ? "always"
+        : rule.activation === contract.SlackGroupActivation.DISABLED ? "disabled"
+          : undefined;
+    if (mapped === undefined || Object.hasOwn(groupActivation, rule.channelId)) {
+      throw new ConnectError("Slack group activation is invalid.", Code.InvalidArgument);
+    }
+    groupActivation[rule.channelId] = mapped;
+  }
+  return decodeSlackMessagingConfiguration({
+    format: 1,
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    groupActivation
+  });
+}
+
+function toProtoSlackConfiguration(
+  value: SlackMessagingConfiguration
+): contract.SlackMessagingConfiguration {
+  return create(contract.SlackMessagingConfigurationSchema, {
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? contract.SlackEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? contract.SlackEmojiReactions.MINIMAL
+        : contract.SlackEmojiReactions.EXPRESSIVE,
+    groupActivationRules: Object.entries(value.groupActivation).map(([channelId, activation]) => create(
+      contract.SlackGroupActivationRuleSchema,
+      {
+        channelId,
+        activation: activation === "mention" ? contract.SlackGroupActivation.MENTION
+          : activation === "always" ? contract.SlackGroupActivation.ALWAYS
+            : contract.SlackGroupActivation.DISABLED
+      }
+    ))
+  });
+}
+
 function fromProtoWeChatConfiguration(
   value: contract.WeChatMessagingConfiguration
 ): WeChatMessagingConfiguration {
@@ -860,6 +961,11 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
         decodeWeChatMessagingConfiguration(value.configuration)
       )
     }),
+    ...(value.channel !== "slack" ? {} : {
+      slackConfiguration: toProtoSlackConfiguration(
+        decodeSlackMessagingConfiguration(value.configuration)
+      )
+    }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined ? {} : { lastConnectedAt: toProtoTimestamp(value.lastConnectedAt) }),
@@ -903,7 +1009,7 @@ function toProtoChannel(value: NativeMessagingChannel): contract.MessagingChanne
 function isAvailableChannel(value: NativeMessagingChannel, weChatAuthorizationAvailable: boolean): boolean {
   return value === "telegram" || value === "discord" || value === "dingtalk"
     || value === "feishu" || value === "lark" || value === "wecom"
-    || value === "wechat" && weChatAuthorizationAvailable;
+    || value === "slack" || (value === "wechat" && weChatAuthorizationAvailable);
 }
 
 function toProtoRuntimeStatus(

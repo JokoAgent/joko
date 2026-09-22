@@ -323,6 +323,9 @@ import {
   FeishuGroupActivation as ProtoFeishuGroupActivation,
   FeishuGroupActivationRuleSchema as ProtoFeishuGroupActivationRuleSchema,
   FeishuReplyQuoteMode as ProtoFeishuReplyQuoteMode,
+  SlackEmojiReactions as ProtoSlackEmojiReactions,
+  SlackGroupActivation as ProtoSlackGroupActivation,
+  SlackGroupActivationRuleSchema as ProtoSlackGroupActivationRuleSchema,
   TelegramEmojiReactions as ProtoTelegramEmojiReactions,
   TelegramGroupActivation as ProtoTelegramGroupActivation,
   TelegramGroupActivationRuleSchema as ProtoTelegramGroupActivationRuleSchema,
@@ -412,6 +415,7 @@ import {
   type WeComMessagingConfiguration as ProtoWeComMessagingConfiguration,
   type WeChatAuthorizationAttempt as ProtoWeChatAuthorizationAttempt,
   type WeChatMessagingConfiguration as ProtoWeChatMessagingConfiguration,
+  type SlackMessagingConfiguration as ProtoSlackMessagingConfiguration,
   type MessageBlock as ProtoMessageBlock,
   type MessageCompletedEvent as ProtoMessageCompletedEvent,
   type ModelDescriptor,
@@ -627,6 +631,7 @@ import type {
   WeComMessagingConfigurationView,
   WeChatAuthorizationAttemptView,
   WeChatMessagingConfigurationView,
+  SlackMessagingConfigurationView,
   OperationApi,
   PartnerCapabilitiesView,
   PartnerActivityView,
@@ -5973,6 +5978,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapMessagingConnection(response.connection);
   }
 
+  async createSlackMessagingConnection(
+    ownerProviderUserId: string,
+    configuration?: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    if (!validSlackOwnerId(ownerProviderUserId)) throw new GatewayError("Slack owner user ID is invalid.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.SLACK,
+      ownerProviderUserId,
+      ...(configuration === undefined ? {} : { slackConfiguration: protoSlackMessagingConfiguration(configuration) })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
   async beginWeChatAuthorization(
     connectionId: string,
     expectedRevision: bigint,
@@ -6196,6 +6217,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         expectedRevision: { value: expectedRevision },
         expectedGeneration,
         configuration: protoWeComMessagingConfiguration(configuration)
+      }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateSlackMessagingConfiguration(
+    connectionId: string,
+    expectedRevision: bigint,
+    expectedGeneration: bigint,
+    ownerProviderUserId: string,
+    configuration: SlackMessagingConfigurationView,
+    signal?: AbortSignal
+  ): Promise<MessagingConnectionView> {
+    if (!validSlackOwnerId(ownerProviderUserId)) throw new GatewayError("Slack owner user ID is invalid.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport)
+      .updateSlackMessagingConfiguration({
+        connectionId,
+        expectedRevision: { value: expectedRevision },
+        expectedGeneration,
+        ownerProviderUserId,
+        configuration: protoSlackMessagingConfiguration(configuration)
       }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
@@ -18502,6 +18545,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const wechatConfiguration = channel === "wechat"
     ? mapWeChatMessagingConfiguration(value.wechatConfiguration)
     : undefined;
+  const slackConfiguration = channel === "slack"
+    ? mapSlackMessagingConfiguration(value.slackConfiguration)
+    : undefined;
   if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
   }
@@ -18520,6 +18566,12 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   if (channel !== "wechat" && value.wechatConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned WeChat configuration for another Messaging channel.");
   }
+  if (channel !== "slack" && value.slackConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned Slack configuration for another Messaging channel.");
+  }
+  if (channel === "slack" && !validSlackOwnerId(value.ownerProviderUserId ?? "")) {
+    throw new GatewayError("Orchestrator returned an invalid Slack owner user ID.");
+  }
   return {
     id: value.connectionId,
     channel,
@@ -18537,6 +18589,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(feishuConfiguration === undefined ? {} : { feishuConfiguration }),
     ...(wecomConfiguration === undefined ? {} : { wecomConfiguration }),
     ...(wechatConfiguration === undefined ? {} : { wechatConfiguration }),
+    ...(slackConfiguration === undefined ? {} : { slackConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -18724,6 +18777,69 @@ function protoDiscordMessagingConfiguration(
       });
     })
   };
+}
+
+function mapSlackMessagingConfiguration(
+  value: ProtoSlackMessagingConfiguration | undefined
+): SlackMessagingConfigurationView {
+  if (value === undefined) throw new GatewayError("Orchestrator omitted Slack configuration.");
+  const emojiReactions = value.emojiReactions === ProtoSlackEmojiReactions.OFF ? "off" as const
+    : value.emojiReactions === ProtoSlackEmojiReactions.MINIMAL ? "minimal" as const
+      : value.emojiReactions === ProtoSlackEmojiReactions.EXPRESSIVE ? "expressive" as const
+        : undefined;
+  if (emojiReactions === undefined) {
+    throw new GatewayError("Orchestrator returned an invalid Slack configuration.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rule of value.groupActivationRules) {
+    const mapped = rule.activation === ProtoSlackGroupActivation.MENTION ? "mention" as const
+      : rule.activation === ProtoSlackGroupActivation.ALWAYS ? "always" as const
+        : rule.activation === ProtoSlackGroupActivation.DISABLED ? "disabled" as const
+          : undefined;
+    if (mapped === undefined || !validSlackChannelId(rule.channelId)
+      || Object.hasOwn(groupActivation, rule.channelId)) {
+      throw new GatewayError("Orchestrator returned an invalid Slack channel activation.");
+    }
+    groupActivation[rule.channelId] = mapped;
+  }
+  return {
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions,
+    groupActivation
+  };
+}
+
+function protoSlackMessagingConfiguration(
+  value: SlackMessagingConfigurationView
+): ProtoSlackMessagingConfiguration {
+  if (!["off", "minimal", "expressive"].includes(value.emojiReactions)) {
+    throw new GatewayError("Slack reaction configuration is invalid.");
+  }
+  return {
+    $typeName: "joko.v1.SlackMessagingConfiguration",
+    lifecycleAnnouncements: value.lifecycleAnnouncements,
+    emojiReactions: value.emojiReactions === "off" ? ProtoSlackEmojiReactions.OFF
+      : value.emojiReactions === "minimal" ? ProtoSlackEmojiReactions.MINIMAL
+        : ProtoSlackEmojiReactions.EXPRESSIVE,
+    groupActivationRules: Object.entries(value.groupActivation).map(([channelId, activation]) => {
+      if (!validSlackChannelId(channelId) || !["mention", "always", "disabled"].includes(activation)) {
+        throw new GatewayError("Slack channel activation is invalid.");
+      }
+      return create(ProtoSlackGroupActivationRuleSchema, {
+        channelId,
+        activation: activation === "mention" ? ProtoSlackGroupActivation.MENTION
+          : activation === "always" ? ProtoSlackGroupActivation.ALWAYS : ProtoSlackGroupActivation.DISABLED
+      });
+    })
+  };
+}
+
+function validSlackOwnerId(value: string): boolean {
+  return /^[UW][A-Z0-9]{8,63}$/u.test(value);
+}
+
+function validSlackChannelId(value: string): boolean {
+  return /^[CG][A-Z0-9]{8,63}$/u.test(value);
 }
 
 function mapDingTalkMessagingConfiguration(

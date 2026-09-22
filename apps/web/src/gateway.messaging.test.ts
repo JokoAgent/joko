@@ -12,6 +12,8 @@ import {
   MessagingConnectionRuntimeStatus,
   MessagingConnectionTestFailure,
   PermissionMode,
+  SlackEmojiReactions,
+  SlackGroupActivation,
   TelegramEmojiReactions,
   TelegramGroupActivation,
   TelegramReplyQuoteMode,
@@ -423,6 +425,76 @@ describe("Messaging gateway", () => {
     fixture.gateway.disconnect();
   });
 
+  it("maps Slack configuration and sends the paired credential only through a zeroed upload ticket", async () => {
+    const fixture = await mount();
+    fixture.includeSlack = true;
+    const settings = await fixture.gateway.getMessagingSettings();
+    expect(settings.connections.find((value) => value.channel === "slack")).toMatchObject({
+      id: "slack-one",
+      ownerProviderUserId: "U12345678",
+      slackConfiguration: {
+        lifecycleAnnouncements: true,
+        emojiReactions: "minimal",
+        groupActivation: { C12345678: "mention", G12345678: "disabled" }
+      }
+    });
+    const configuration = {
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive" as const,
+      groupActivation: { C87654321: "always" as const }
+    };
+    await fixture.gateway.createSlackMessagingConnection("W12345678", configuration);
+    await fixture.gateway.updateSlackMessagingConfiguration("slack-one", 13n, 9n, "U87654321", configuration);
+    const created = fixture.requests.find((entry) => entry.method === "createMessagingConnection"
+      && entry.input.channel === MessagingChannel.SLACK)?.input;
+    expect(created).toMatchObject({
+      channel: MessagingChannel.SLACK,
+      ownerProviderUserId: "W12345678",
+      slackConfiguration: {
+        lifecycleAnnouncements: false,
+        emojiReactions: SlackEmojiReactions.EXPRESSIVE,
+        groupActivationRules: [{ channelId: "C87654321", activation: SlackGroupActivation.ALWAYS }]
+      }
+    });
+    expect(fixture.requests.find((entry) => entry.method === "updateSlackMessagingConfiguration")?.input)
+      .toMatchObject({ connectionId: "slack-one", expectedRevision: { value: 13n }, expectedGeneration: 9n,
+        ownerProviderUserId: "U87654321", configuration: created.slackConfiguration });
+
+    let uploaded = "";
+    let buffer: Uint8Array | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init: RequestInit) => {
+      buffer = init.body as Uint8Array;
+      uploaded = new TextDecoder().decode(buffer);
+      return new Response(undefined, { status: 204 });
+    }));
+    const secret = JSON.stringify({ format: 1, appToken: "xapp-secret", botToken: "xoxb-secret" });
+    await fixture.gateway.saveMessagingCredential("slack-one", 13n, 9n, secret, true);
+    expect(uploaded).toBe(secret);
+    expect(buffer?.every((byte) => byte === 0)).toBe(true);
+    const rpcText = JSON.stringify(fixture.requests, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+    expect(rpcText).not.toContain("xapp-secret");
+    expect(rpcText).not.toContain("xoxb-secret");
+    fixture.gateway.disconnect();
+  });
+
+  it("fails closed on malformed Slack owner, channel, enum, or cross-channel projection", async () => {
+    const fixture = await mount();
+    fixture.includeSlack = true;
+    fixture.invalidSlackConfiguration = true;
+    await expect(fixture.gateway.getMessagingSettings()).rejects.toThrow(/invalid Slack configuration/iu);
+    fixture.invalidSlackConfiguration = false;
+    fixture.crossChannelSlackConfiguration = true;
+    await expect(fixture.gateway.getMessagingSettings()).rejects.toThrow(/Slack configuration for another Messaging channel/iu);
+    fixture.crossChannelSlackConfiguration = false;
+    await expect(fixture.gateway.createSlackMessagingConnection("bad-user-id")).rejects.toThrow(/Slack owner user ID/iu);
+    await expect(fixture.gateway.createSlackMessagingConnection("U12345678", {
+      lifecycleAnnouncements: false,
+      emojiReactions: "minimal",
+      groupActivation: { "bad-channel": "mention" }
+    })).rejects.toThrow(/Slack channel activation/iu);
+    fixture.gateway.disconnect();
+  });
+
   it("maps fenced WeChat QR authorization and sends verification code only through a zeroed one-shot upload", async () => {
     const fixture = await mount();
     fixture.includeWeChat = true;
@@ -493,6 +565,9 @@ async function mount() {
     invalidWeComBotId: false,
     crossChannelWeComConfiguration: false,
     includeWeChat: false,
+    includeSlack: false,
+    crossChannelSlackConfiguration: false,
+    invalidSlackConfiguration: false,
     invalidWeChatQr: false,
     wechatWrongGeneration: false,
     wechatAttemptStatus: WeChatAuthorizationStatus.WAITING,
@@ -508,13 +583,14 @@ async function mount() {
           const channels = channelCapabilities();
           value = {
             connections: [
-              connection(fixture.crossChannelWeComConfiguration),
+              connection(fixture.crossChannelWeComConfiguration, fixture.crossChannelSlackConfiguration),
               discordConnection(),
               dingTalkConnection(),
               feishuConnection(),
               feishuConnection(MessagingChannel.LARK),
               wecomConnection(fixture.invalidWeComBotId),
-              ...(fixture.includeWeChat ? [wechatConnection()] : [])
+              ...(fixture.includeWeChat ? [wechatConnection()] : []),
+              ...(fixture.includeSlack ? [slackConnection(fixture.invalidSlackConfiguration)] : [])
             ],
             routes: [route()],
             channels: fixture.duplicateCapabilities ? [...channels, channels[0]] : channels
@@ -566,6 +642,7 @@ async function mount() {
                 : input.channel === MessagingChannel.LARK ? feishuConnection(MessagingChannel.LARK)
                   : input.channel === MessagingChannel.WECOM ? wecomConnection()
                   : input.channel === MessagingChannel.WECHAT ? wechatConnection()
+                  : input.channel === MessagingChannel.SLACK ? slackConnection()
                   : connection()
         }; break;
         case "commitMessagingCredential":
@@ -576,6 +653,7 @@ async function mount() {
         case "updateDingTalkMessagingConfiguration": value = { connection: dingTalkConnection() }; break;
         case "updateFeishuMessagingConfiguration": value = { connection: feishuConnection() }; break;
         case "updateWeComMessagingConfiguration": value = { connection: wecomConnection() }; break;
+        case "updateSlackMessagingConfiguration": value = { connection: slackConnection() }; break;
         default: throw new Error(`Unexpected RPC ${method.localName}`);
       }
       return response(method, create(method.output, value));
@@ -592,7 +670,7 @@ async function mount() {
   return fixture;
 }
 
-function connection(crossChannelWeComConfiguration = false) {
+function connection(crossChannelWeComConfiguration = false, crossChannelSlackConfiguration = false) {
   return {
     connectionId: "telegram-one",
     channel: MessagingChannel.TELEGRAM,
@@ -613,6 +691,7 @@ function connection(crossChannelWeComConfiguration = false) {
       ]
     },
     ...(crossChannelWeComConfiguration ? { wecomConfiguration: { botId: "bot_cross_channel" } } : {}),
+    ...(crossChannelSlackConfiguration ? { slackConfiguration: slackConnection().slackConfiguration } : {}),
     lastConnectedAt: timestamp(4n, 500_000_000),
     createdAt: timestamp(1n),
     updatedAt: timestamp(5n),
@@ -741,6 +820,32 @@ function wechatConnection(authorized = false) {
     createdAt: timestamp(6n),
     updatedAt: timestamp(10n),
     revision: { value: authorized ? 13n : 12n }
+  };
+}
+
+function slackConnection(invalidConfiguration = false) {
+  return {
+    connectionId: "slack-one",
+    channel: MessagingChannel.SLACK,
+    generation: 9n,
+    enabled: true,
+    runtimeStatus: MessagingConnectionRuntimeStatus.CONNECTED,
+    credentialConfigured: true,
+    ownerProviderUserId: "U12345678",
+    providerAccountId: "T12345678",
+    providerUsername: "joko-slack",
+    slackConfiguration: {
+      lifecycleAnnouncements: true,
+      emojiReactions: invalidConfiguration ? 99 : SlackEmojiReactions.MINIMAL,
+      groupActivationRules: [
+        { channelId: "C12345678", activation: SlackGroupActivation.MENTION },
+        { channelId: "G12345678", activation: SlackGroupActivation.DISABLED }
+      ]
+    },
+    lastConnectedAt: timestamp(9n, 500_000_000),
+    createdAt: timestamp(7n),
+    updatedAt: timestamp(11n),
+    revision: { value: 13n }
   };
 }
 

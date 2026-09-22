@@ -2405,6 +2405,8 @@ export function useAppController(): AppController {
     createWeComMessagingConnection: (configuration, signal) =>
       gateway().createWeComMessagingConnection(configuration, signal),
     createWeChatMessagingConnection: (signal) => gateway().createWeChatMessagingConnection(signal),
+    createSlackMessagingConnection: (ownerProviderUserId, configuration, signal) =>
+      gateway().createSlackMessagingConnection(ownerProviderUserId, configuration, signal),
     beginWeChatAuthorization: (connectionId, expectedRevision, expectedGeneration, signal) =>
       gateway().beginWeChatAuthorization(connectionId, expectedRevision, expectedGeneration, signal),
     getWeChatAuthorization: (attempt, signal) => gateway().getWeChatAuthorization(attempt, signal),
@@ -2496,6 +2498,21 @@ export function useAppController(): AppController {
       connectionId,
       expectedRevision,
       expectedGeneration,
+      configuration,
+      signal
+    ),
+    updateSlackMessagingConfiguration: (
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
+      configuration,
+      signal
+    ) => gateway().updateSlackMessagingConfiguration(
+      connectionId,
+      expectedRevision,
+      expectedGeneration,
+      ownerProviderUserId,
       configuration,
       signal
     ),

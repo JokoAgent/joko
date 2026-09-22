@@ -100,6 +100,20 @@ enum FeishuGroupActivation {
   FEISHU_GROUP_ACTIVATION_DISABLED = 3;
 }
 
+enum SlackEmojiReactions {
+  SLACK_EMOJI_REACTIONS_UNSPECIFIED = 0;
+  SLACK_EMOJI_REACTIONS_OFF = 1;
+  SLACK_EMOJI_REACTIONS_MINIMAL = 2;
+  SLACK_EMOJI_REACTIONS_EXPRESSIVE = 3;
+}
+
+enum SlackGroupActivation {
+  SLACK_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  SLACK_GROUP_ACTIVATION_MENTION = 1;
+  SLACK_GROUP_ACTIVATION_ALWAYS = 2;
+  SLACK_GROUP_ACTIVATION_DISABLED = 3;
+}
+
 enum MessagingConnectionTestFailure {
   MESSAGING_CONNECTION_TEST_FAILURE_UNSPECIFIED = 0;
   MESSAGING_CONNECTION_TEST_FAILURE_INVALID = 1;
@@ -179,6 +193,17 @@ message WeComMessagingConfiguration {
 // Presence selects the only supported strict current-v1 shape: { format: 1 }.
 message WeChatMessagingConfiguration {}
 
+message SlackMessagingConfiguration {
+  bool lifecycle_announcements = 1;
+  SlackEmojiReactions emoji_reactions = 2;
+  repeated SlackGroupActivationRule group_activation_rules = 3;
+}
+
+message SlackGroupActivationRule {
+  string channel_id = 1;
+  SlackGroupActivation activation = 2;
+}
+
 message MessagingChannelCapability {
   MessagingChannel channel = 1;
   bool available = 2;
@@ -207,6 +232,7 @@ message MessagingConnection {
   optional FeishuMessagingConfiguration feishu_configuration = 19;
   optional WeComMessagingConfiguration wecom_configuration = 20;
   optional WeChatMessagingConfiguration wechat_configuration = 21;
+  optional SlackMessagingConfiguration slack_configuration = 22;
 }
 
 message MessagingRoute {
@@ -242,6 +268,7 @@ message CreateMessagingConnectionRequest {
   optional FeishuMessagingConfiguration feishu_configuration = 6;
   optional WeComMessagingConfiguration wecom_configuration = 7;
   optional WeChatMessagingConfiguration wechat_configuration = 8;
+  optional SlackMessagingConfiguration slack_configuration = 9;
 }
 
 message CreateMessagingConnectionResponse {
@@ -342,6 +369,18 @@ message UpdateWeComMessagingConfigurationRequest {
 }
 
 message UpdateWeComMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateSlackMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  SlackMessagingConfiguration configuration = 5;
+}
+
+message UpdateSlackMessagingConfigurationResponse {
   MessagingConnection connection = 1;
 }
 

@@ -151,6 +151,142 @@ describe("Messaging settings", () => {
     expect(container.textContent).toContain("Connecting");
   });
 
+  it("creates Slack with an explicit owner and uploads both tokens atomically without retaining either field", async () => {
+    const created = slackConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
+    const saved = slackConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 14n });
+    const create = vi.fn(async () => created);
+    const save = vi.fn(async () => saved);
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([], false, true))
+      .mockResolvedValueOnce(messagingSettings([created], false, true))
+      .mockResolvedValue(messagingSettings([saved], false, true));
+    const controller = controllerFixture(messagingSettings([], false, true), {
+      getMessagingSettings,
+      createSlackMessagingConnection: create,
+      saveMessagingCredential: save
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => buttons(container, "Add Slack")[0]!.click());
+    const createDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const owner = required(createDialog.querySelector<HTMLInputElement>("input"));
+    expect(document.activeElement).toBe(owner);
+    await change(owner, "U1");
+    expect(button(createDialog, "Continue").disabled).toBe(true);
+    await change(owner, "U12345678");
+    await act(async () => button(createDialog, "Continue").click());
+    expect(create).toHaveBeenCalledWith("U12345678", {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      groupActivation: {}
+    });
+
+    const tokenDialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const fields = [...tokenDialog.querySelectorAll<HTMLInputElement>('input[type="password"]')];
+    expect(fields).toHaveLength(2);
+    expect(document.activeElement).toBe(fields[0]);
+    await change(fields[0]!, "wrong-app-token");
+    await change(fields[1]!, "xoxb-secret-bot");
+    expect(button(tokenDialog, "Save").disabled).toBe(true);
+    await change(fields[0]!, "xapp-secret-app");
+    await act(async () => button(tokenDialog, "Save").click());
+    expect(save).toHaveBeenCalledWith("slack-one", 13n, 9n,
+      JSON.stringify({ format: 1, appToken: "xapp-secret-app", botToken: "xoxb-secret-bot" }), true);
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("xapp-secret-app");
+    expect(document.body.textContent).not.toContain("xoxb-secret-bot");
+    expect(container.textContent).toContain("Connecting");
+
+    const replace = button(container, "Replace Slack tokens");
+    await act(async () => { replace.focus(); replace.click(); });
+    const replacementFields = [...document.querySelectorAll<HTMLInputElement>('input[type="password"]')];
+    expect(replacementFields).toHaveLength(2);
+    await change(replacementFields[0]!, "xapp-replacement");
+    await change(replacementFields[1]!, "xoxb-replacement");
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.activeElement).toBe(replace);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it("edits Slack behavior, rejects duplicate channels, and retries revision-only drift", async () => {
+    const original = slackConnection();
+    const refreshed = slackConnection({ revision: 14n });
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original], false, true))
+      .mockResolvedValueOnce(messagingSettings([original], false, true))
+      .mockResolvedValue(messagingSettings([refreshed], false, true));
+    const update = vi.fn()
+      .mockRejectedValueOnce(new ConnectError("runtime projection changed", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, ownerProviderUserId, configuration) =>
+        slackConnection({ ownerProviderUserId, slackConfiguration: configuration }));
+    const controller = controllerFixture(messagingSettings([original], false, true), {
+      getMessagingSettings,
+      updateSlackMessagingConfiguration: update
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const owner = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
+    await change(owner, "W12345678");
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    await act(async () => lifecycle.click());
+    const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
+    expect(selects).toHaveLength(1);
+    await change(required(selects[0]), "expressive");
+    const groups = required(dialog.querySelector<HTMLTextAreaElement>("textarea"));
+    await change(groups, "C12345678=always\nC12345678=disabled");
+    expect(button(dialog, "Save").disabled).toBe(true);
+    await change(groups, "C12345678=always\nG12345678=disabled");
+    await act(async () => button(dialog, "Save").click());
+
+    expect(update).toHaveBeenNthCalledWith(1, "slack-one", 13n, 9n, "W12345678", {
+      lifecycleAnnouncements: false,
+      emojiReactions: "expressive",
+      groupActivation: { C12345678: "always", G12345678: "disabled" }
+    });
+    expect(update).toHaveBeenNthCalledWith(2, "slack-one", 14n, 9n, "W12345678", expect.any(Object));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("exposes Slack test, enable, and confirmed two-token clear without mutating on cancel", async () => {
+    const original = slackConnection();
+    const disabled = slackConnection({ enabled: false, revision: 14n });
+    const cleared = slackConnection({ enabled: false, credentialConfigured: false, runtimeStatus: "idle", revision: 15n });
+    const test = vi.fn(async () => ({ ok: true as const, providerAccountId: "T12345678", displayName: "Slack bot" }));
+    const setEnabled = vi.fn(async () => disabled);
+    const clear = vi.fn(async () => cleared);
+    const controller = controllerFixture(messagingSettings([original], false, true), {
+      getMessagingSettings: vi.fn()
+        .mockResolvedValueOnce(messagingSettings([original], false, true))
+        .mockResolvedValueOnce(messagingSettings([original], false, true))
+        .mockResolvedValue(messagingSettings([disabled], false, true)),
+      testMessagingConnection: test,
+      setMessagingConnectionEnabled: setEnabled,
+      clearMessagingCredential: clear
+    });
+    const container = await renderSettings(controller, snapshot());
+
+    await act(async () => button(container, "Test").click());
+    expect(test).toHaveBeenCalledWith("slack-one");
+    expect(container.textContent).toContain("Connected as Slack bot");
+    const toggle = required(container.querySelector<HTMLInputElement>('.messaging-switch-label input[type="checkbox"]'));
+    await act(async () => toggle.click());
+    expect(setEnabled).toHaveBeenCalledWith("slack-one", 13n, 9n, false);
+
+    await act(async () => button(container, "Clear Slack tokens").click());
+    let dialog = required(document.querySelector<HTMLElement>('[role="alertdialog"]'));
+    expect(dialog.textContent).toContain("removes both tokens");
+    await act(async () => button(dialog, "Cancel").click());
+    expect(clear).not.toHaveBeenCalled();
+    await act(async () => button(container, "Clear Slack tokens").click());
+    dialog = required(document.querySelector<HTMLElement>('[role="alertdialog"]'));
+    await act(async () => button(dialog, "Clear Slack tokens").click());
+    expect(clear).toHaveBeenCalledWith("slack-one", 14n, 9n);
+    expect(container.textContent).toContain("Needs both tokens");
+  });
+
   it("creates DingTalk with AppKey and AppSecret while leaving ownership for the first direct message", async () => {
     const created = dingTalkConnection({ enabled: false, runtimeStatus: "idle", credentialConfigured: false });
     const saved = dingTalkConnection({ enabled: true, runtimeStatus: "connecting", credentialConfigured: true, revision: 10n });
@@ -624,6 +760,7 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     createFeishuMessagingConnection: vi.fn(async () => feishuConnection()),
     createWeComMessagingConnection: vi.fn(async () => wecomConnection()),
     createWeChatMessagingConnection: vi.fn(async () => wechatConnection()),
+    createSlackMessagingConnection: vi.fn(async () => slackConnection()),
     beginWeChatAuthorization: vi.fn(async () => wechatAttempt()),
     getWeChatAuthorization: vi.fn(async () => wechatAttempt()),
     submitWeChatVerificationCode: vi.fn(async () => wechatAttempt()),
@@ -636,13 +773,14 @@ function controllerFixture(settings: MessagingSettingsView, overrides: Partial<A
     updateDingTalkMessagingConfiguration: vi.fn(async () => dingTalkConnection()),
     updateFeishuMessagingConfiguration: vi.fn(async () => feishuConnection()),
     updateWeComMessagingConfiguration: vi.fn(async () => wecomConnection()),
+    updateSlackMessagingConfiguration: vi.fn(async () => slackConnection()),
     testMessagingConnection: vi.fn(async () => ({ ok: true as const, providerAccountId: "9001", displayName: "Joko Bot" })),
     putMessagingRoute: vi.fn(async () => messagingRoute()),
     ...overrides
   } as unknown as AppController;
 }
 
-function messagingSettings(connections: readonly MessagingConnectionView[], wechatAvailable = false): MessagingSettingsView {
+function messagingSettings(connections: readonly MessagingConnectionView[], wechatAvailable = false, slackAvailable = false): MessagingSettingsView {
   return {
     connections,
     routes: [],
@@ -654,7 +792,7 @@ function messagingSettings(connections: readonly MessagingConnectionView[], wech
       { channel: "lark", available: true },
       { channel: "wecom", available: true },
       { channel: "wechat", available: wechatAvailable, ...(wechatAvailable ? {} : { reason: "not implemented" }) },
-      { channel: "slack", available: false, reason: "not implemented" }
+      { channel: "slack", available: slackAvailable, ...(slackAvailable ? {} : { reason: "not implemented" }) }
     ]
   };
 }
@@ -788,6 +926,30 @@ function wechatConnection(overrides: Partial<MessagingConnectionView> = {}): Mes
     runtimeStatus: "idle",
     credentialConfigured: false,
     wechatConfiguration: { format: 1 },
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    ...overrides
+  };
+}
+
+function slackConnection(overrides: Partial<MessagingConnectionView> = {}): MessagingConnectionView {
+  return {
+    id: "slack-one",
+    channel: "slack",
+    generation: 9n,
+    revision: 13n,
+    enabled: true,
+    runtimeStatus: "connected",
+    credentialConfigured: true,
+    ownerProviderUserId: "U12345678",
+    providerAccountId: "T12345678",
+    providerUsername: "joko-slack",
+    slackConfiguration: {
+      lifecycleAnnouncements: true,
+      emojiReactions: "minimal",
+      groupActivation: { C12345678: "mention" }
+    },
+    lastConnectedAt: Date.now() - 1_000,
     createdAt: 1_000,
     updatedAt: 2_000,
     ...overrides

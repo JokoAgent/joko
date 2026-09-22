@@ -5,12 +5,14 @@ import {
   DiscordTransport,
   FeishuTransport,
   MessagingTransportError,
+  SlackTransport,
   TelegramTransport,
   WeComTransport,
   WeChatTransport,
   splitDingTalkText,
   splitDiscordText,
   splitFeishuText,
+  splitSlackText,
   splitTelegramText,
   splitWeComText,
   splitWeChatText,
@@ -30,6 +32,10 @@ import {
   type MessagingInboundInteraction,
   type MessagingInboundMessage,
   type MessagingSendReceipt,
+  type SlackNormalizationResult,
+  type SlackPollResult,
+  type SlackSocketUpdate,
+  type SlackTransportOptions,
   type DiscordGatewayUpdate,
   type DiscordNormalizationResult,
   type DiscordPollResult,
@@ -77,6 +83,9 @@ const DEFAULT_RETRY_DELAY_MS = 2_000;
 const WECHAT_TYPING_REFRESH_MS = 5_000;
 const WECHAT_FIRST_PROGRESS_MS = 60_000;
 const WECHAT_REPEAT_PROGRESS_MS = 120_000;
+const SLACK_PROGRESS_TICK_MS = 15_000;
+const SLACK_FIRST_PROGRESS_MS = 60_000;
+const SLACK_REPEAT_PROGRESS_MS = 120_000;
 const TELEGRAM_ALBUM_SETTLE_POLL_SECONDS = 1;
 const TELEGRAM_ALBUM_MAXIMUM_MEMBERS = 10;
 const TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS = 10;
@@ -161,14 +170,30 @@ export interface WeChatMessagingConfiguration {
   readonly format: 1;
 }
 
-type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat";
+export interface SlackMessagingConfiguration {
+  readonly format: 1;
+  readonly lifecycleAnnouncements: boolean;
+  readonly emojiReactions: "off" | "minimal" | "expressive";
+  /** Only explicitly authorized channels may start a thread. */
+  readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
+}
+
+export const DEFAULT_SLACK_MESSAGING_CONFIGURATION: SlackMessagingConfiguration = Object.freeze({
+  format: 1,
+  lifecycleAnnouncements: true,
+  emojiReactions: "minimal",
+  groupActivation: Object.freeze({})
+});
+
+type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat" | "slack";
 type SupportedMessagingConfiguration =
   | TelegramMessagingConfiguration
   | DiscordMessagingConfiguration
   | DingTalkMessagingConfiguration
   | FeishuMessagingConfiguration
   | WeComMessagingConfiguration
-  | WeChatMessagingConfiguration;
+  | WeChatMessagingConfiguration
+  | SlackMessagingConfiguration;
 
 export type MessagingConnectionTestResult =
   | {
@@ -210,6 +235,12 @@ interface MessagingTransportEffectsPort {
     readonly replyToMessageId?: string;
     /** Exact inbound callback identity; used only by callback-capable transports. */
     readonly callbackMessageId?: string;
+    readonly signal?: AbortSignal;
+  }): Promise<MessagingSendReceipt>;
+  editTextPart?(input: {
+    readonly address: MessagingAddress;
+    readonly messageId: string;
+    readonly text: string;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   sendAttachments(input: {
@@ -323,14 +354,27 @@ interface WeChatTransportPort extends MessagingTransportEffectsPort {
   normalize(updates: readonly WeChatRawMessage[]): WeChatNormalizationResult;
 }
 
-type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort | WeChatTransportPort;
+interface SlackTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "slack";
+  poll(input: {
+    readonly cursor: string | null;
+    readonly timeoutSeconds?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<SlackPollResult>;
+  normalize(updates: readonly SlackSocketUpdate[]): SlackNormalizationResult;
+  acknowledge(envelopeId: string, signal?: AbortSignal): Promise<void>;
+  ownerAddress(): MessagingAddress;
+}
+
+type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort | WeChatTransportPort | SlackTransportPort;
 type MessagingNormalizationResult =
   | TelegramNormalizationResult
   | DiscordNormalizationResult
   | DingTalkNormalizationResult
   | FeishuNormalizationResult
   | WeComNormalizationResult
-  | WeChatNormalizationResult;
+  | WeChatNormalizationResult
+  | SlackNormalizationResult;
 
 interface CredentialTicketBinding {
   readonly clientConnectionId: string;
@@ -393,6 +437,7 @@ export interface MessagingManagerOptions {
   readonly createFeishuTransport?: (options: FeishuTransportOptions) => FeishuTransportPort;
   readonly createWeComTransport?: (options: WeComTransportOptions) => WeComTransportPort;
   readonly createWeChatTransport?: (options: WeChatTransportOptions) => WeChatTransportPort;
+  readonly createSlackTransport?: (options: SlackTransportOptions) => SlackTransportPort;
   /** Test-only transport seams. Production always uses the providers' official direct endpoints. */
   readonly telegramFetch?: typeof fetch;
   readonly telegramApiBaseUrl?: string;
@@ -405,6 +450,12 @@ export interface MessagingManagerOptions {
   readonly retryDelayMs?: number;
   /** Test-only clock acceleration; production uses the fixed WeChat presence cadence. */
   readonly weChatPresenceTiming?: {
+    readonly tickMs: number;
+    readonly firstProgressMs: number;
+    readonly repeatProgressMs: number;
+  };
+  /** Test-only clock acceleration; production uses the fixed Slack progress cadence. */
+  readonly slackProgressTiming?: {
     readonly tickMs: number;
     readonly firstProgressMs: number;
     readonly repeatProgressMs: number;
@@ -430,9 +481,11 @@ export class MessagingManager {
   readonly #createFeishuTransport: NonNullable<MessagingManagerOptions["createFeishuTransport"]>;
   readonly #createWeComTransport: NonNullable<MessagingManagerOptions["createWeComTransport"]>;
   readonly #createWeChatTransport: NonNullable<MessagingManagerOptions["createWeChatTransport"]>;
+  readonly #createSlackTransport: NonNullable<MessagingManagerOptions["createSlackTransport"]>;
   readonly #pollTimeoutSeconds: number;
   readonly #retryDelayMs: number;
   readonly #weChatPresenceTiming: { readonly tickMs: number; readonly firstProgressMs: number; readonly repeatProgressMs: number };
+  readonly #slackProgressTiming: { readonly tickMs: number; readonly firstProgressMs: number; readonly repeatProgressMs: number };
   readonly #now: () => number;
   readonly #idFactory: () => string;
   readonly #tickets = new Map<string, CredentialTicketBinding>();
@@ -443,6 +496,13 @@ export class MessagingManager {
     readonly connectionId: string;
     readonly generation: number;
     readonly conversationId: string;
+    nextProgressAt: number;
+    progressIndex: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
+  readonly #slackPresence = new Map<string, {
+    readonly connectionId: string;
+    readonly generation: number;
     nextProgressAt: number;
     progressIndex: number;
     timer?: ReturnType<typeof setTimeout>;
@@ -465,6 +525,11 @@ export class MessagingManager {
       tickMs: WECHAT_TYPING_REFRESH_MS,
       firstProgressMs: WECHAT_FIRST_PROGRESS_MS,
       repeatProgressMs: WECHAT_REPEAT_PROGRESS_MS
+    };
+    this.#slackProgressTiming = options.slackProgressTiming ?? {
+      tickMs: SLACK_PROGRESS_TICK_MS,
+      firstProgressMs: SLACK_FIRST_PROGRESS_MS,
+      repeatProgressMs: SLACK_REPEAT_PROGRESS_MS
     };
     const telegramFetch = options.telegramFetch;
     const telegramApiBaseUrl = options.telegramApiBaseUrl;
@@ -492,6 +557,7 @@ export class MessagingManager {
     this.#createFeishuTransport = options.createFeishuTransport ?? ((input) => new FeishuTransport(input));
     this.#createWeComTransport = options.createWeComTransport ?? ((input) => new WeComTransport(input));
     this.#createWeChatTransport = options.createWeChatTransport ?? ((input) => new WeChatTransport(input));
+    this.#createSlackTransport = options.createSlackTransport ?? ((input) => new SlackTransport(input));
   }
 
   async initialize(): Promise<void> {
@@ -510,6 +576,19 @@ export class MessagingManager {
         for (const request of this.#store.listMessagingInboundRequests({
           connectionId: connection.id, statuses: ["queued"], limit: 500
         })) this.#startWeChatPresence(request);
+      }
+      if (connection.enabled && connection.channel === "slack") {
+        for (const request of this.#store.listMessagingInboundRequests({
+          connectionId: connection.id, statuses: ["queued"], limit: 500
+        })) {
+          if (request.conversationId !== undefined) {
+            this.#enqueueSlackProgressStart(connection, this.#store.getMessagingConversation(request.conversationId), request);
+          }
+          this.#startSlackPresence(request);
+        }
+        for (const request of this.#store.listMessagingInboundRequests({
+          connectionId: connection.id, statuses: ["completed", "failed", "cancelled"], limit: 500
+        })) this.#finishSlackProgress(request);
       }
     }
   }
@@ -563,6 +642,21 @@ export class MessagingManager {
       channel: "discord",
       configuration,
       ownerProviderUserId: discordUserId(input.ownerProviderUserId)
+    });
+  }
+
+  createSlackConnection(input: {
+    readonly configuration?: SlackMessagingConfiguration;
+    readonly ownerProviderUserId: string;
+  }): MessagingConnectionRecord {
+    this.#assertReady();
+    const configuration = decodeSlackConfiguration(
+      input.configuration ?? DEFAULT_SLACK_MESSAGING_CONFIGURATION
+    );
+    return this.#store.createMessagingConnection({
+      channel: "slack",
+      configuration,
+      ownerProviderUserId: slackUserId(input.ownerProviderUserId)
     });
   }
 
@@ -656,6 +750,9 @@ export class MessagingManager {
             this.#appendCredentialJournal(reference);
           }
         });
+        if (current.channel === "slack") {
+          parseSlackCredentialUpload(this.#credentials.resolve(credential.credentialReferenceId));
+        }
         const latest = this.#store.getMessagingConnection(current.id);
         assertConnectionFence(latest, input.expectedRevision, input.expectedGeneration);
         const updated = this.#store.replaceMessagingCredential({
@@ -858,6 +955,30 @@ export class MessagingManager {
     });
   }
 
+  replaceSlackConfiguration(input: {
+    readonly connectionId: string;
+    readonly expectedRevision: bigint;
+    readonly expectedGeneration: number;
+    readonly configuration: SlackMessagingConfiguration;
+    readonly ownerProviderUserId: string;
+  }): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
+      assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      if (current.channel !== "slack") throw unavailableChannel();
+      const updated = this.#store.replaceMessagingConfiguration({
+        connectionId: current.id,
+        expectedRevision: current.revision,
+        expectedGeneration: current.generation,
+        configuration: decodeSlackConfiguration(input.configuration),
+        ownerProviderUserId: slackUserId(input.ownerProviderUserId),
+        updatedAt: this.#now()
+      });
+      this.#restartWorker(updated.id);
+      return updated;
+    });
+  }
+
   replaceDingTalkConfiguration(input: {
     readonly connectionId: string;
     readonly expectedRevision: bigint;
@@ -1022,6 +1143,7 @@ export class MessagingManager {
     if (!this.#initialized || this.#closed) return;
     const request = this.#store.findMessagingInboundRequestByRunId(input.runId);
     if (request !== undefined) this.#stopWeChatPresence(request);
+    if (request !== undefined) this.#stopSlackPresence(request);
     if (request === undefined || request.status !== "queued") return;
     const conversation = request.conversationId === undefined
       ? undefined
@@ -1046,7 +1168,9 @@ export class MessagingManager {
           : text;
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
         if (text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom" || channel === "wechat")) {
-          const parts = channel === "discord"
+          const parts = channel === "slack"
+            ? splitSlackText(text)
+            : channel === "discord"
             ? splitDiscordText(text)
             : channel === "dingtalk"
               ? splitDingTalkText(text)
@@ -1078,7 +1202,7 @@ export class MessagingManager {
         const images = output.attachments.filter((attachment) => attachment.kind === "image");
         const files = output.attachments.filter((attachment) => attachment.kind === "file");
         const imageBatchSize = channel === "dingtalk" || channel === "feishu" || channel === "lark"
-          || channel === "wecom" || channel === "wechat" ? 1 : 10;
+          || channel === "wecom" || channel === "wechat" || channel === "slack" ? 1 : 10;
         for (let index = 0; index < images.length; index += imageBatchSize) {
           const partIndex = deliveries.length;
           deliveries.push({
@@ -1123,19 +1247,19 @@ export class MessagingManager {
           });
         });
         if (reactionMode(configuration) !== "off" && current.providerMessageId !== undefined) {
-          if (connection.channel === "discord") {
+          if (connection.channel === "discord" || connection.channel === "slack") {
             enqueueReaction(store, connection, conversation, {
               dedupeKey: `run:${input.runId}:ack-clear`,
               messageId: current.providerMessageId,
               emoji: null,
-              availableAt: now
+              availableAt: connection.channel === "slack" ? now + 1 : now
             });
           }
           enqueueReaction(store, connection, conversation, {
             dedupeKey: `run:${input.runId}:settled`,
             messageId: current.providerMessageId,
-            emoji: "✅",
-            availableAt: connection.channel === "discord" ? now + 1 : now
+            emoji: connection.channel === "slack" ? "👍" : "✅",
+            availableAt: connection.channel === "slack" ? now + 2 : connection.channel === "discord" ? now + 1 : now
           });
         }
         current = store.updateMessagingInboundRequestStatus({
@@ -1154,39 +1278,52 @@ export class MessagingManager {
           updatedAt: now
         });
         if (reactionMode(configuration) !== "off" && current.providerMessageId !== undefined) {
-          if (connection.channel === "discord") {
+          if (connection.channel === "discord" || connection.channel === "slack") {
             enqueueReaction(store, connection, conversation, {
               dedupeKey: `run:${input.runId}:ack-clear`,
               messageId: current.providerMessageId,
               emoji: null,
-              availableAt: now
+              availableAt: connection.channel === "slack" ? now + 1 : now
             });
           }
           if (connection.channel !== "discord" || input.outcome !== "aborted") {
             enqueueReaction(store, connection, conversation, {
               dedupeKey: `run:${input.runId}:settled`,
               messageId: current.providerMessageId,
-              emoji: input.outcome === "aborted" ? null : "❌",
-              availableAt: connection.channel === "discord" ? now + 1 : now
+              emoji: connection.channel === "slack" ? "👎" : input.outcome === "aborted" ? null : "❌",
+              availableAt: connection.channel === "slack" ? now + 2 : connection.channel === "discord" ? now + 1 : now
             });
           }
         }
       }
     });
+    if (connection.channel === "slack") {
+      this.#finishSlackProgress(this.#store.getMessagingInboundRequest(request.id));
+    }
     this.#scheduleDeliveryDrain(connection.id);
+    if (connection.channel === "slack") {
+      // Terminal reactions are ordered after the accepted reaction even when
+      // admission and settlement share one millisecond. Wake the outbox once
+      // they become due instead of waiting for the next Socket poll.
+      const wake = setTimeout(() => this.#scheduleDeliveryDrain(connection.id), 10);
+      wake.unref?.();
+    }
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     for (const state of this.#weChatPresence.values()) clearTimeout(state.timer);
     this.#weChatPresence.clear();
+    for (const state of this.#slackPresence.values()) clearTimeout(state.timer);
+    this.#slackPresence.clear();
     await Promise.allSettled([...this.#workers.entries()].map(async ([connectionId, worker]) => {
       const connection = this.#store.findMessagingConnection(connectionId);
       if (
         connection === undefined
         || (worker.transport?.channel !== "discord"
           && worker.transport?.channel !== "feishu"
-          && worker.transport?.channel !== "lark")
+          && worker.transport?.channel !== "lark"
+          && worker.transport?.channel !== "slack")
       ) return;
       await this.#enqueueLifecycleNotice(connection, worker.transport, "shutdown");
       await this.#drainDeliveries(worker.transport, AbortSignal.timeout(LIFECYCLE_DRAIN_TIMEOUT_MS));
@@ -1228,6 +1365,11 @@ export class MessagingManager {
     previous?.controller.abort();
     this.#workers.delete(connectionId);
     const connection = this.#store.getMessagingConnection(connectionId);
+    for (const [requestId, state] of this.#slackPresence) {
+      if (state.connectionId !== connectionId || (connection.enabled && state.generation === connection.generation)) continue;
+      clearTimeout(state.timer);
+      this.#slackPresence.delete(requestId);
+    }
     if (connection.channel === "wechat") {
       // The provider's best-effort stop call belongs to the old transport.
       // Do not let its late close stop a newly authenticated generation.
@@ -1271,7 +1413,8 @@ export class MessagingManager {
         });
         const worker = this.#workers.get(connectionId);
         if (worker?.generation === generation) worker.transport = transport;
-        if (transport.channel === "discord" || transport.channel === "feishu" || transport.channel === "lark") {
+        if (transport.channel === "discord" || transport.channel === "feishu" || transport.channel === "lark"
+          || transport.channel === "slack") {
           const connected = this.#requireWorkerConnection(connectionId, generation);
           await this.#enqueueLifecycleNotice(connected, transport, "connected");
         }
@@ -1299,6 +1442,7 @@ export class MessagingManager {
       await this.#drainDeliveries(transport, signal);
       let nextCursor: string;
       let normalized: MessagingNormalizationResult;
+      let acknowledge: (() => Promise<void>) | undefined;
       if (transport.channel === "telegram") {
         const result = await this.#pollTelegramBatch(transport, connection.cursor ?? null, signal);
         nextCursor = result.nextCursor;
@@ -1335,6 +1479,23 @@ export class MessagingManager {
         });
         nextCursor = result.nextCursor;
         normalized = transport.normalize(result.updates);
+      } else if (transport.channel === "slack") {
+        const result = await transport.poll({
+          cursor: connection.cursor ?? null,
+          timeoutSeconds: this.#pollTimeoutSeconds,
+          signal
+        });
+        nextCursor = result.nextCursor;
+        normalized = transport.normalize(result.updates);
+        if (result.envelopeId !== null) {
+          const envelopeId = result.envelopeId;
+          let acknowledged = false;
+          acknowledge = async () => {
+            if (acknowledged) return;
+            await transport.acknowledge(envelopeId, signal);
+            acknowledged = true;
+          };
+        }
       } else {
         const result = await transport.poll({
           cursor: connection.cursor ?? null,
@@ -1349,7 +1510,7 @@ export class MessagingManager {
       // committing its receipt. Fence that flight before matching inbound
       // replies so the durable sent interaction is visible.
       await this.#deliveryFlights.get(connection.id);
-      await this.#processMessagingBatch(connection, transport, normalized, signal);
+      await this.#processMessagingBatch(connection, transport, normalized, signal, acknowledge);
       const latest = this.#requireWorkerConnection(transport.connectionId, transport.generation);
       if (
         latest.runtimeStatus !== "connected" || latest.cursor !== nextCursor
@@ -1407,7 +1568,8 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     transport: MessagingTransportEffectsPort,
     batch: MessagingNormalizationResult,
-    signal: AbortSignal
+    signal: AbortSignal,
+    acknowledge?: () => Promise<void>
   ): Promise<void> {
     let activeConnection = connection;
     if ("ownerClaimProviderUserId" in batch && batch.ownerClaimProviderUserId !== null) {
@@ -1423,11 +1585,15 @@ export class MessagingManager {
         updatedAt: this.#now()
       });
     }
+    const events = batch.events.filter((event) =>
+      event.kind !== "message" || this.#slackMessageMayEnter(activeConnection, event));
+    const admittedAddresses = new Set(events.filter((event) => event.kind === "message")
+      .map((event) => messagingAddressKey(event.address)));
     const replyCandidates = "interactionReplyCandidates" in batch
       ? batch.interactionReplyCandidates
       : [];
     const interactionReplyMessageIds = new Set<string>();
-    for (const event of batch.events) {
+    for (const event of events) {
       if (event.kind === "message" && this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
         interactionReplyMessageIds.add(event.messageId);
       }
@@ -1440,10 +1606,19 @@ export class MessagingManager {
     for (const observation of batch.groupObservations) {
       signal.throwIfAborted();
       if (interactionReplyMessageIds.has(observation.messageId)) continue;
+      if (activeConnection.channel === "slack"
+        && !admittedAddresses.has(messagingAddressKey(observation.address))
+        && this.#store.findMessagingConversationByAddress({
+          connectionId: activeConnection.id,
+          channelGeneration: activeConnection.generation,
+          providerConversationId: observation.address.providerConversationId,
+          ...(observation.address.providerThreadId === null
+            ? {} : { providerThreadId: observation.address.providerThreadId })
+        })?.sessionId === undefined) continue;
       const conversation = this.#ensureConversation(activeConnection, observation.address, observation.occurredAt);
       this.#appendGroupObservation(conversation, observation);
     }
-    for (const event of batch.events) {
+    for (const event of events) {
       signal.throwIfAborted();
       if (event.kind === "message") {
         const contextToken = activeConnection.channel === "wechat"
@@ -1453,17 +1628,40 @@ export class MessagingManager {
           && await this.#processWeChatCommand(activeConnection, event, contextToken)) {
           continue;
         }
-        if (!await this.#settleTextInteraction(activeConnection, event, undefined, contextToken)) {
-          await this.#admitMessage(activeConnection, transport, event, signal, contextToken);
+        if (activeConnection.channel === "slack"
+          && await this.#processSlackCommand(activeConnection, event, acknowledge)) {
+          continue;
+        }
+        if (!await this.#settleTextInteraction(activeConnection, event, undefined, contextToken, acknowledge)) {
+          await this.#admitMessage(activeConnection, transport, event, signal, contextToken, acknowledge);
         }
       }
-      else await this.#settleInteraction(activeConnection, transport, event, signal);
+      else await this.#settleInteraction(activeConnection, transport, event, signal, acknowledge);
     }
     for (const event of replyCandidates) {
       signal.throwIfAborted();
       const delivery = this.#findTextInteractionDelivery(activeConnection, event);
-      if (delivery !== undefined) await this.#settleTextInteraction(activeConnection, event, delivery);
+      if (delivery !== undefined) await this.#settleTextInteraction(activeConnection, event, delivery, undefined, acknowledge);
     }
+    await acknowledge?.();
+  }
+
+  #slackMessageMayEnter(connection: MessagingConnectionRecord, event: MessagingInboundMessage): boolean {
+    if (connection.channel !== "slack" || event.address.conversationKind === "direct" || !event.ambient) {
+      return true;
+    }
+    const channelId = event.address.providerConversationId.split("/")[1];
+    if (channelId === undefined) return false;
+    const activation = decodeSlackConnection(connection).groupActivation[channelId];
+    if (activation === "always") return true;
+    if (activation !== "mention") return false;
+    const existing = this.#store.findMessagingConversationByAddress({
+      connectionId: connection.id,
+      channelGeneration: connection.generation,
+      providerConversationId: event.address.providerConversationId,
+      ...(event.address.providerThreadId === null ? {} : { providerThreadId: event.address.providerThreadId })
+    });
+    return existing?.status === "active" && existing.sessionId !== undefined;
   }
 
   #findTextInteractionDelivery(
@@ -1480,7 +1678,8 @@ export class MessagingManager {
       });
       if (exact !== undefined) return exact;
     }
-    if ((connection.channel !== "dingtalk" && connection.channel !== "wecom" && connection.channel !== "wechat")
+    if ((connection.channel !== "dingtalk" && connection.channel !== "wecom" && connection.channel !== "wechat"
+      && connection.channel !== "slack")
       || (connection.channel !== "wechat" && !event.speaker.isOwner)) return undefined;
     const open = this.#store.listMessagingDeliveries({
       connectionId: connection.id,
@@ -1505,7 +1704,8 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     event: MessagingInboundMessage,
     knownDelivery?: MessagingDeliveryRecord,
-    contextToken?: string
+    contextToken?: string,
+    acknowledge?: () => Promise<void>
   ): Promise<boolean> {
     const delivery = knownDelivery ?? this.#findTextInteractionDelivery(connection, event);
     if (delivery === undefined) return false;
@@ -1524,7 +1724,10 @@ export class MessagingManager {
       expiresAt: this.#now() + 30 * 60_000,
       createdAt: this.#now()
     });
-    if (interaction.status !== "pending") return true;
+    if (interaction.status !== "pending") {
+      await acknowledge?.();
+      return true;
+    }
     if (connection.channel === "wechat") {
       if (contextToken === undefined) throw invalid("WeChat interaction reply context is missing.");
       this.#putWeChatConversationContext(connection, conversation, { sourceInteractionId: interaction.id }, contextToken);
@@ -1536,7 +1739,11 @@ export class MessagingManager {
       claimToken,
       claimedAt: this.#now()
     });
-    if (claimed === undefined) return true;
+    if (claimed === undefined) {
+      await acknowledge?.();
+      return true;
+    }
+    await acknowledge?.();
 
     let completed = false;
     let outcomeCode = "stale_action";
@@ -1676,6 +1883,174 @@ export class MessagingManager {
     return true;
   }
 
+  async #processSlackCommand(
+    connection: MessagingConnectionRecord,
+    event: MessagingInboundMessage,
+    acknowledge?: () => Promise<void>
+  ): Promise<boolean> {
+    const source = event.text.trim().normalize("NFC");
+    const slash = event.providerRequestIds[0]?.startsWith("slack:command:") === true;
+    if (slash && event.address.conversationKind !== "direct") return false;
+    if (!slash && (event.address.conversationKind === "direct" || !source.startsWith("!"))) return false;
+    const command = slash ? source : `/${source.slice(1)}`;
+    if (!command.startsWith("/")) return false;
+    if (!event.speaker.isOwner) {
+      await acknowledge?.();
+      return true;
+    }
+    let conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
+    conversation = await this.#activateConversation(conversation, event);
+    const interaction = this.#store.createMessagingInteraction({
+      connectionId: connection.id,
+      expectedChannelGeneration: connection.generation,
+      conversationId: conversation.id,
+      providerRequestId: event.providerRequestIds[0]!,
+      providerInteractionId: `slack:command:${event.address.providerConversationId}:${event.messageId}`,
+      providerMessageId: event.messageId,
+      actionHash: operationBodyHash({ format: 1, command }),
+      payload: { format: 1, command },
+      expiresAt: this.#now() + 30 * 60_000,
+      createdAt: this.#now()
+    });
+    if (interaction.status !== "pending") {
+      await acknowledge?.();
+      return true;
+    }
+    const claimToken = this.#idFactory();
+    const claimed = this.#store.claimMessagingInteraction({
+      interactionId: interaction.id,
+      expectedRevision: interaction.revision,
+      claimToken,
+      claimedAt: this.#now()
+    });
+    if (claimed === undefined) {
+      await acknowledge?.();
+      return true;
+    }
+    await acknowledge?.();
+    let notice: string;
+    let outcomeCode: string | undefined;
+    try {
+      notice = await this.#runSlackCommand(connection, conversation, event, command, claimed.id);
+    } catch (error) {
+      if (error instanceof MessagingManagerError && error.code === "invalid") {
+        outcomeCode = "invalid_command";
+        notice = error.message;
+      } else {
+        outcomeCode = "command_effect_unknown";
+        notice = "The command result could not be confirmed. Check the task before retrying.";
+      }
+    }
+    const now = this.#now();
+    this.#store.transaction((store) => {
+      const payload = { format: 1, address: event.address, text: notice, replyToMessageId: event.messageId };
+      store.enqueueMessagingDelivery({
+        connectionId: connection.id,
+        expectedChannelGeneration: connection.generation,
+        conversationId: conversation.id,
+        dedupeKey: `command:${claimed.id}:notice`,
+        kind: "notice",
+        partIndex: 0,
+        partCount: 1,
+        payloadHash: operationBodyHash(payload),
+        payload,
+        availableAt: now,
+        createdAt: now
+      });
+      store.settleMessagingInteraction({
+        interactionId: claimed.id,
+        expectedRevision: claimed.revision,
+        claimToken,
+        status: outcomeCode === undefined ? "completed" : outcomeCode === "invalid_command" ? "failed" : "unknown",
+        ...(outcomeCode === undefined ? {} : { outcomeCode }),
+        settledAt: now
+      });
+    });
+    this.#scheduleDeliveryDrain(connection.id);
+    return true;
+  }
+
+  async #runSlackCommand(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    event: MessagingInboundMessage,
+    command: string,
+    interactionId: string
+  ): Promise<string> {
+    if (!event.speaker.isOwner) return "Only the connection owner can run commands in this thread.";
+    const sessionId = conversation.sessionId;
+    if (sessionId === undefined) throw invalid("Slack command task binding is missing.");
+    if (command === "/help") return "In a thread, use !new, !stop, !status, !model, !effort, !permission or !help. In a DM, use /joko followed by a command.";
+    if (command === "/status") {
+      const pending = this.#store.listQueueItems({
+        sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1_000
+      }).length;
+      return `Slack connection: ${connection.runtimeStatus}. This thread has ${pending} pending task${pending === 1 ? "" : "s"}.`;
+    }
+    if (command === "/stop") {
+      const stopped = await this.#stopMessagingSession(sessionId, interactionId);
+      return stopped === 0 ? "No active task needed stopping." : `Stopped ${stopped} active task${stopped === 1 ? "" : "s"}.`;
+    }
+    if (command === "/new") {
+      await this.#startNewSlackSession(connection, conversation, event, interactionId);
+      return "A new task is ready in this thread. Previous task history was archived.";
+    }
+    const session = this.#store.getSession(sessionId);
+    if (command === "/model") {
+      return `Current model: ${session.descriptor.modelId ?? "Backend default"}. Change it in Messaging Settings for new threads.`;
+    }
+    if (command === "/effort") {
+      return `Current effort: ${session.descriptor.effort ?? "Backend default"}. Change it in Messaging Settings for new threads.`;
+    }
+    if (command === "/permission") return `Current permission: ${session.descriptor.permissionMode}.`;
+    return "Unknown command. Send /help to see available commands.";
+  }
+
+  async #startNewSlackSession(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    event: MessagingInboundMessage,
+    interactionId: string
+  ): Promise<void> {
+    if (conversation.sessionId === undefined) throw invalid("Slack conversation has no task.");
+    const oldSession = this.#store.getSession(conversation.sessionId);
+    if (this.#store.listRuns({ sessionId: conversation.sessionId, activeOnly: true, limit: 1 }).length > 0
+      || this.#store.listQueueItems({
+        sessionId: conversation.sessionId,
+        states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1
+      }).length > 0
+      || this.#store.listInteractions({ sessionId: conversation.sessionId, status: "open", limit: 1 }).length > 0) {
+      throw invalid("Stop or finish the active task before starting a new Slack conversation.");
+    }
+    const route = this.#store.resolveMessagingRoute(connection.id);
+    const created = await this.#sessionHost.createServiceSession({
+      operationId: `messaging-new-session-${interactionId}`,
+      serviceKind: "messaging",
+      targetId: route.targetId,
+      title: `Slack · ${safeExternalText(event.speaker.displayName, 128)}`,
+      providerId: route.providerId,
+      modelId: route.modelId,
+      effort: route.effort,
+      fastMode: route.fastMode,
+      permissionMode: route.permissionMode,
+      planMode: route.planMode
+    });
+    const session = this.#store.getSession(created.value.sessionId);
+    this.#store.transaction((store) => {
+      store.rebindMessagingConversationSession({
+        conversationId: conversation.id,
+        expectedRevision: conversation.revision,
+        expectedChannelGeneration: connection.generation,
+        expectedSessionId: conversation.sessionId!,
+        sessionId: session.descriptor.id,
+        expectedSessionGeneration: session.descriptor.binding.generation,
+        routeScopeKey: route.scopeKey,
+        updatedAt: this.#now()
+      });
+      store.updateSession(oldSession.descriptor.id, { archived: true }, oldSession.revision, this.#now());
+    });
+  }
+
   async #runWeChatCommand(
     connection: MessagingConnectionRecord,
     conversation: MessagingConversationRecord,
@@ -1706,7 +2081,7 @@ export class MessagingManager {
       let stopped = 0;
       for (const candidate of conversations) {
         if (candidate.sessionId === undefined) continue;
-        stopped += await this.#stopWeChatSession(candidate.sessionId, interactionId);
+        stopped += await this.#stopMessagingSession(candidate.sessionId, interactionId);
       }
       return stopped === 0 ? "No active task needed stopping." : `Stopped ${stopped} active task${stopped === 1 ? "" : "s"}.`;
     }
@@ -1720,7 +2095,7 @@ export class MessagingManager {
     return "Unknown command. Send /help to see available commands.";
   }
 
-  async #stopWeChatSession(sessionId: string, interactionId: string): Promise<number> {
+  async #stopMessagingSession(sessionId: string, interactionId: string): Promise<number> {
     let stopped = 0;
     for (const interaction of this.#store.listInteractions({ sessionId, status: "open", limit: 1_000 })) {
       this.#sessionHost.dismissInteraction(
@@ -1816,7 +2191,8 @@ export class MessagingManager {
     transport: MessagingTransportEffectsPort,
     event: MessagingInboundMessage,
     signal: AbortSignal,
-    contextToken?: string
+    contextToken?: string,
+    acknowledge?: () => Promise<void>
   ): Promise<void> {
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
     const creation = this.#store.createMessagingInboundRequest({
@@ -1830,7 +2206,16 @@ export class MessagingManager {
       occurredAt: event.occurredAt,
       receivedAt: this.#now()
     });
-    if (!creation.created && creation.request.status !== "preparing") return;
+    if (!creation.created && creation.request.status !== "preparing") {
+      if (connection.channel === "slack" && creation.request.status === "queued"
+        && creation.request.conversationId !== undefined) {
+        const resumed = this.#store.getMessagingConversation(creation.request.conversationId);
+        this.#enqueueSlackProgressStart(connection, resumed, creation.request);
+        this.#startSlackPresence(creation.request);
+      }
+      await acknowledge?.();
+      return;
+    }
     let request = creation.request;
 
     // WeCom callback frames are transient provider capabilities. Reserve the
@@ -1934,15 +2319,50 @@ export class MessagingManager {
           queueItemId: admitted.queueItemId,
           updatedAt: this.#now()
         });
+        if (connection.channel === "slack") {
+          const progressPayload = {
+            format: 1,
+            address: addressFor(connection, activeConversation),
+            text: "Working on this task…"
+          };
+          const now = this.#now();
+          store.enqueueMessagingDelivery({
+            connectionId: connection.id,
+            expectedChannelGeneration: connection.generation,
+            conversationId: activeConversation.id,
+            dedupeKey: `request:${request.id}:progress:start`,
+            kind: "notice",
+            partIndex: 0,
+            partCount: 1,
+            payloadHash: operationBodyHash(progressPayload),
+            payload: progressPayload,
+            availableAt: now,
+            createdAt: now
+          });
+        }
+        if (connection.channel === "slack" && reactionMode(configuration) !== "off") {
+          enqueueReaction(store, connection, activeConversation, {
+            dedupeKey: `request:${request.id}:ack`,
+            messageId: event.messageId,
+            emoji: "👀",
+            availableAt: this.#now()
+          });
+        }
         void admittedRequest;
       }
     });
     if (execution.value.queueItemId === "") throw new Error("Messaging Queue admission failed.");
+    if (connection.channel === "slack") {
+      const queued = this.#store.getMessagingInboundRequest(request.id);
+      this.#startSlackPresence(queued);
+      this.#scheduleDeliveryDrain(connection.id);
+    }
+    await acknowledge?.();
     if (connection.channel === "wechat") {
       this.#startWeChatPresence(this.#store.getMessagingInboundRequest(request.id));
     }
 
-    if (reactionMode(configuration) !== "off") {
+    if (connection.channel !== "slack" && reactionMode(configuration) !== "off") {
       this.#store.transaction((store) => enqueueReaction(store, connection, activeConversation, {
         dedupeKey: `request:${request.id}:ack`,
         messageId: event.messageId,
@@ -1960,9 +2380,21 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     transport: MessagingTransportEffectsPort,
     event: MessagingInboundInteraction,
-    signal: AbortSignal
+    signal: AbortSignal,
+    acknowledge?: () => Promise<void>
   ): Promise<void> {
-    const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
+    const conversation = connection.channel === "slack"
+      ? this.#store.findMessagingConversationByAddress({
+        connectionId: connection.id,
+        channelGeneration: connection.generation,
+        providerConversationId: event.address.providerConversationId,
+        ...(event.address.providerThreadId === null ? {} : { providerThreadId: event.address.providerThreadId })
+      })
+      : this.#ensureConversation(connection, event.address, event.occurredAt);
+    if (conversation === undefined || conversation.status !== "active") {
+      await acknowledge?.();
+      return;
+    }
     const payload = { format: 1, actionValue: event.actionValue };
     const interaction = this.#store.createMessagingInteraction({
       connectionId: connection.id,
@@ -1976,7 +2408,10 @@ export class MessagingManager {
       expiresAt: this.#now() + 30 * 60_000,
       createdAt: this.#now()
     });
-    if (interaction.status !== "pending") return;
+    if (interaction.status !== "pending") {
+      await acknowledge?.();
+      return;
+    }
     const claimToken = this.#idFactory();
     const claimed = this.#store.claimMessagingInteraction({
       interactionId: interaction.id,
@@ -1984,7 +2419,11 @@ export class MessagingManager {
       claimToken,
       claimedAt: this.#now()
     });
-    if (claimed === undefined) return;
+    if (claimed === undefined) {
+      await acknowledge?.();
+      return;
+    }
+    await acknowledge?.();
     let completed = false;
     let outcomeCode = "unsupported_action";
     if (conversation.status === "active" && conversation.sessionId !== undefined) {
@@ -2236,6 +2675,21 @@ export class MessagingManager {
         connectionId: connection.id,
         generation: connection.generation,
         ownerUserId: discordUserId(connection.ownerProviderUserId),
+        groupActivation: configuration.groupActivation,
+        initialCursor: connection.cursor ?? null,
+        now: this.#now
+      });
+    }
+    if (connection.channel === "slack") {
+      const configuration = decodeSlackConnection(connection);
+      if (connection.ownerProviderUserId === undefined) throw credentialUnavailable();
+      const { appToken, botToken } = decodeStoredSlackCredentials(token);
+      return this.#createSlackTransport({
+        appToken,
+        botToken,
+        connectionId: connection.id,
+        generation: connection.generation,
+        ownerUserId: slackUserId(connection.ownerProviderUserId),
         groupActivation: configuration.groupActivation,
         initialCursor: connection.cursor ?? null,
         now: this.#now
@@ -2498,6 +2952,143 @@ export class MessagingManager {
     }
   }
 
+  #enqueueSlackProgressStart(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    request: MessagingInboundRequestRecord
+  ): void {
+    if (connection.channel !== "slack" || request.status !== "queued"
+      || request.channelGeneration !== connection.generation
+      || request.conversationId !== conversation.id) return;
+    const payload = { format: 1, address: addressFor(connection, conversation), text: "Working on this task…" };
+    this.#store.enqueueMessagingDelivery({
+      connectionId: connection.id,
+      expectedChannelGeneration: connection.generation,
+      conversationId: conversation.id,
+      dedupeKey: `request:${request.id}:progress:start`,
+      kind: "notice",
+      partIndex: 0,
+      partCount: 1,
+      payloadHash: operationBodyHash(payload),
+      payload,
+      availableAt: this.#now(),
+      createdAt: this.#now()
+    });
+    this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  #startSlackPresence(request: MessagingInboundRequestRecord): void {
+    if (request.status !== "queued" || request.conversationId === undefined
+      || this.#slackPresence.has(request.id)) return;
+    const connection = this.#store.findMessagingConnection(request.connectionId);
+    if (connection?.channel !== "slack" || !connection.enabled
+      || connection.generation !== request.channelGeneration) return;
+    const state = {
+      connectionId: connection.id,
+      generation: connection.generation,
+      nextProgressAt: request.updatedAt + this.#slackProgressTiming.firstProgressMs,
+      progressIndex: 0,
+      timer: undefined as ReturnType<typeof setTimeout> | undefined
+    };
+    state.timer = setTimeout(() => void this.#tickSlackPresence(request.id, state), this.#slackProgressTiming.tickMs);
+    state.timer.unref?.();
+    this.#slackPresence.set(request.id, state);
+  }
+
+  #stopSlackPresence(request: MessagingInboundRequestRecord): void {
+    const state = this.#slackPresence.get(request.id);
+    if (state === undefined) return;
+    clearTimeout(state.timer);
+    this.#slackPresence.delete(request.id);
+  }
+
+  async #tickSlackPresence(
+    requestId: string,
+    state: {
+      readonly connectionId: string;
+      readonly generation: number;
+      nextProgressAt: number;
+      progressIndex: number;
+      timer?: ReturnType<typeof setTimeout>;
+    }
+  ): Promise<void> {
+    if (this.#closed || this.#slackPresence.get(requestId) !== state) return;
+    try {
+      const request = this.#store.findMessagingInboundRequest(requestId);
+      if (request?.status !== "queued") {
+        if (request !== undefined) {
+          this.#stopSlackPresence(request);
+          this.#finishSlackProgress(request);
+        }
+        return;
+      }
+      if (this.#now() < state.nextProgressAt || request.conversationId === undefined) return;
+      const connection = this.#store.findMessagingConnection(state.connectionId);
+      const conversation = this.#store.findMessagingConversation(request.conversationId);
+      if (connection?.channel !== "slack" || !connection.enabled
+        || connection.generation !== state.generation || conversation?.status !== "active") return;
+      const start = this.#store.findMessagingDeliveryByDedupe({
+        connectionId: connection.id,
+        channelGeneration: state.generation,
+        dedupeKey: `request:${request.id}:progress:start`
+      });
+      if (start?.status !== "sent" || start.providerMessageId === undefined) return;
+      this.#enqueueSlackProgressEdit(connection, conversation, request, start.providerMessageId,
+        `tick:${state.progressIndex}`, "Still working on this task…");
+      state.progressIndex += 1;
+      state.nextProgressAt = this.#now() + this.#slackProgressTiming.repeatProgressMs;
+    } catch { /* Progress is best effort and cannot change task authority. */ }
+    finally {
+      if (!this.#closed && this.#slackPresence.get(requestId) === state) {
+        state.timer = setTimeout(() => void this.#tickSlackPresence(requestId, state), this.#slackProgressTiming.tickMs);
+        state.timer.unref?.();
+      }
+    }
+  }
+
+  #finishSlackProgress(request: MessagingInboundRequestRecord): void {
+    if (request.status !== "completed" && request.status !== "failed" && request.status !== "cancelled") return;
+    if (request.conversationId === undefined) return;
+    const connection = this.#store.findMessagingConnection(request.connectionId);
+    const conversation = this.#store.findMessagingConversation(request.conversationId);
+    if (connection?.channel !== "slack" || !connection.enabled
+      || connection.generation !== request.channelGeneration || conversation?.status !== "active") return;
+    const start = this.#store.findMessagingDeliveryByDedupe({
+      connectionId: connection.id,
+      channelGeneration: connection.generation,
+      dedupeKey: `request:${request.id}:progress:start`
+    });
+    if (start?.status !== "sent" || start.providerMessageId === undefined) return;
+    const text = request.status === "completed" ? "Task completed."
+      : request.status === "cancelled" ? "Task stopped." : "Task failed.";
+    this.#enqueueSlackProgressEdit(connection, conversation, request, start.providerMessageId, "final", text);
+  }
+
+  #enqueueSlackProgressEdit(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    request: MessagingInboundRequestRecord,
+    messageId: string,
+    phase: string,
+    text: string
+  ): void {
+    const payload = { format: 1, address: addressFor(connection, conversation), text, editMessageId: messageId };
+    this.#store.enqueueMessagingDelivery({
+      connectionId: connection.id,
+      expectedChannelGeneration: connection.generation,
+      conversationId: conversation.id,
+      dedupeKey: `request:${request.id}:progress:${phase}`,
+      kind: "notice",
+      partIndex: 0,
+      partCount: 1,
+      payloadHash: operationBodyHash(payload),
+      payload,
+      availableAt: this.#now(),
+      createdAt: this.#now()
+    });
+    this.#scheduleDeliveryDrain(connection.id);
+  }
+
   #scheduleDeliveryDrain(connectionId: string): void {
     if (this.#deliveryFlights.has(connectionId)) return;
     const worker = this.#workers.get(connectionId);
@@ -2518,7 +3109,8 @@ export class MessagingManager {
   ): Promise<void> {
     if (
       !connection.enabled
-      || (connection.channel !== "discord" && connection.channel !== "feishu" && connection.channel !== "lark")
+      || (connection.channel !== "discord" && connection.channel !== "feishu" && connection.channel !== "lark"
+        && connection.channel !== "slack")
     ) return;
     const worker = this.#workers.get(connection.id);
     const transport = worker?.transport;
@@ -2526,6 +3118,7 @@ export class MessagingManager {
       transport?.channel !== "discord"
       && transport?.channel !== "feishu"
       && transport?.channel !== "lark"
+      && transport?.channel !== "slack"
     ) return;
     await this.#enqueueLifecycleNotice(connection, transport, phase);
     await this.#drainDeliveries(transport, AbortSignal.timeout(LIFECYCLE_DRAIN_TIMEOUT_MS)).catch(() => undefined);
@@ -2533,19 +3126,22 @@ export class MessagingManager {
 
   async #enqueueLifecycleNotice(
     connection: MessagingConnectionRecord,
-    transport: DiscordTransportPort | FeishuTransportPort,
+    transport: DiscordTransportPort | FeishuTransportPort | SlackTransportPort,
     phase: "connected" | "credential-cleared" | "disabled" | "shutdown"
   ): Promise<void> {
     if (transport.channel !== connection.channel) return;
     const configuration = connection.channel === "discord"
       ? decodeDiscordConnection(connection)
-      : decodeFeishuConnection(connection);
+      : connection.channel === "slack"
+        ? decodeSlackConnection(connection)
+        : decodeFeishuConnection(connection);
     if (!configuration.lifecycleAnnouncements) return;
-    if (connection.channel !== "discord" && connection.ownerProviderUserId === undefined) return;
+    if (connection.ownerProviderUserId === undefined) return;
     const address = transport.ownerAddress();
     const providerName = connection.channel === "discord"
       ? "Discord"
-      : connection.channel === "feishu" ? "Feishu" : "Lark";
+      : connection.channel === "slack" ? "Slack"
+        : connection.channel === "feishu" ? "Feishu" : "Lark";
     let conversation = this.#ensureConversation(connection, address, this.#now());
     if (conversation.status !== "active") {
       const route = this.#store.findMessagingRoute(`connection:${connection.id}`)
@@ -2629,6 +3225,13 @@ export class MessagingManager {
           settledAt: this.#now()
         });
         if (settled.kind === "interaction") this.#retireSentInteractionIfSettled(connection, settled);
+        if (connection.channel === "slack" && settled.kind === "notice"
+          && settled.dedupeKey.startsWith("request:")
+          && settled.dedupeKey.endsWith(":progress:start")) {
+          const requestId = settled.dedupeKey.slice("request:".length, -":progress:start".length);
+          const request = this.#store.findMessagingInboundRequest(requestId);
+          if (request !== undefined) this.#finishSlackProgress(request);
+        }
       } catch (error) {
         const unknown = externalEffectUnknown(error);
         const settled = this.#store.settleMessagingDelivery({
@@ -2878,6 +3481,18 @@ async function dispatchMessagingDelivery(
   const payload = deliveryPayload(delivery.payload);
   if (delivery.kind === "text" || delivery.kind === "notice") {
     if (typeof payload.text !== "string") throw invalid("Messaging text delivery payload is invalid.");
+    if (payload.editMessageId !== undefined) {
+      if (transport.channel !== "slack" || transport.editTextPart === undefined) {
+        throw invalid("Messaging edit delivery is unavailable for this channel.");
+      }
+      const receipt = await transport.editTextPart({
+        address: payload.address,
+        messageId: payload.editMessageId,
+        text: payload.text,
+        signal
+      });
+      return receipt.providerMessageId;
+    }
     const receipt = await transport.sendTextPart({
       address: payload.address,
       text: payload.text,
@@ -2945,6 +3560,7 @@ function deliveryPayload(value: unknown):
       readonly text: string;
       readonly replyToMessageId?: string;
       readonly callbackMessageId?: string;
+      readonly editMessageId?: string;
       readonly messageId?: never;
       readonly emoji?: never;
       readonly files?: never;
@@ -2957,6 +3573,7 @@ function deliveryPayload(value: unknown):
       readonly text?: never;
       readonly replyToMessageId?: never;
       readonly callbackMessageId?: never;
+      readonly editMessageId?: never;
       readonly files?: never;
     }
   | {
@@ -2965,6 +3582,7 @@ function deliveryPayload(value: unknown):
       readonly files: readonly MessagingOutboundFile[];
       readonly replyToMessageId?: string;
       readonly callbackMessageId?: never;
+      readonly editMessageId?: never;
       readonly text?: never;
       readonly messageId?: never;
       readonly emoji?: never;
@@ -2975,16 +3593,25 @@ function deliveryPayload(value: unknown):
   if (typeof value["text"] === "string" && value["text"].length > 0) {
     const reply = value["replyToMessageId"];
     const callback = value["callbackMessageId"];
+    const edit = value["editMessageId"];
     if (reply !== undefined && typeof reply !== "string") throw invalid("Messaging reply identity is invalid.");
     if (callback !== undefined && (typeof callback !== "string" || callback.trim() === "" || callback.length > 512)) {
       throw invalid("Messaging callback identity is invalid.");
+    }
+    if (edit !== undefined && (value["address"] as MessagingAddress).channel !== "slack") {
+      throw invalid("Messaging edit delivery belongs to another channel.");
+    }
+    if (edit !== undefined && (typeof edit !== "string" || !/^\d{1,16}\.\d{1,16}$/u.test(edit)
+      || reply !== undefined || callback !== undefined)) {
+      throw invalid("Messaging edit identity is invalid.");
     }
     return {
       format: 1,
       address: value["address"],
       text: value["text"],
       ...(reply === undefined ? {} : { replyToMessageId: reply }),
-      ...(callback === undefined ? {} : { callbackMessageId: callback })
+      ...(callback === undefined ? {} : { callbackMessageId: callback }),
+      ...(edit === undefined ? {} : { editMessageId: edit })
     };
   }
   if (Array.isArray(value["files"]) && value["files"].length >= 1 && value["files"].length <= 10) {
@@ -3149,7 +3776,8 @@ function messagingInteractionCard(
     return undefined;
   }
   if (buttons.length > 100 || (buttons.length < 1 && payload.kind !== "question")) return undefined;
-  const visibleButtons = channel === "wecom" || channel === "wechat" ? buttons.slice(0, 9)
+  const visibleButtons = channel === "slack" ? buttons.slice(0, 6)
+    : channel === "wecom" || channel === "wechat" ? buttons.slice(0, 9)
     : channel === "discord" || channel === "dingtalk" ? buttons.slice(0, 25) : buttons;
   return {
     interactionId: interaction.id,
@@ -3418,6 +4046,7 @@ function decodeSupportedConnection(connection: MessagingConnectionRecord): Suppo
   if (connection.channel === "feishu" || connection.channel === "lark") return decodeFeishuConnection(connection);
   if (connection.channel === "wecom") return decodeWeComConnection(connection);
   if (connection.channel === "wechat") return decodeWeChatConnection(connection);
+  if (connection.channel === "slack") return decodeSlackConnection(connection);
   throw unavailableChannel();
 }
 
@@ -3527,6 +4156,47 @@ function decodeDiscordConfiguration(value: unknown): DiscordMessagingConfigurati
 /** Strict current-v1 decoder shared by the authenticated contract projection. */
 export function decodeDiscordMessagingConfiguration(value: unknown): DiscordMessagingConfiguration {
   return decodeDiscordConfiguration(value);
+}
+
+function decodeSlackConnection(connection: MessagingConnectionRecord): SlackMessagingConfiguration {
+  if (connection.channel !== "slack") throw unavailableChannel();
+  if (connection.ownerProviderUserId === undefined) throw invalid("Slack owner identity is required.");
+  slackUserId(connection.ownerProviderUserId);
+  return decodeSlackConfiguration(connection.configuration);
+}
+
+function decodeSlackConfiguration(value: unknown): SlackMessagingConfiguration {
+  if (!isRecord(value) || value["format"] !== 1) throw invalid("Slack configuration is invalid.");
+  const keys = Object.keys(value).sort();
+  const expected = [
+    "emojiReactions", "format", "groupActivation", "lifecycleAnnouncements"
+  ].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw invalid("Slack configuration contains unsupported fields.");
+  }
+  const lifecycleAnnouncements = value["lifecycleAnnouncements"];
+  const emojiReactions = value["emojiReactions"];
+  if (typeof lifecycleAnnouncements !== "boolean") throw invalid("Slack lifecycle mode is invalid.");
+  if (!isOneOf(emojiReactions, ["off", "minimal", "expressive"] as const)) {
+    throw invalid("Slack reaction mode is invalid.");
+  }
+  const rawActivation = value["groupActivation"];
+  if (!isRecord(rawActivation) || Object.keys(rawActivation).length > 1_000) {
+    throw invalid("Slack group activation map is invalid.");
+  }
+  const groupActivation: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const [channelId, activation] of Object.entries(rawActivation)) {
+    slackChannelId(channelId);
+    if (!isOneOf(activation, ["mention", "always", "disabled"] as const)) {
+      throw invalid("Slack group activation mode is invalid.");
+    }
+    groupActivation[channelId] = activation;
+  }
+  return { format: 1, lifecycleAnnouncements, emojiReactions, groupActivation };
+}
+
+export function decodeSlackMessagingConfiguration(value: unknown): SlackMessagingConfiguration {
+  return decodeSlackConfiguration(value);
 }
 
 function decodeDingTalkConnection(connection: MessagingConnectionRecord): DingTalkMessagingConfiguration {
@@ -3686,7 +4356,7 @@ async function verifiedAttachmentMime(
     && Buffer.from(downloaded.bytes.subarray(0, 4)).toString("ascii") === "RIFF"
     && Buffer.from(downloaded.bytes.subarray(8, 12)).toString("ascii") === "WAVE";
   const maximumBytes = channel === "wechat" ? (expandedWeChatVoice ? 20 : 5) * 1024 * 1024
-    : channel === "discord" || channel === "wecom" ? 50 * 1024 * 1024
+    : channel === "discord" || channel === "wecom" || channel === "slack" ? 50 * 1024 * 1024
     : channel === "feishu" || channel === "lark" ? 30 * 1024 * 1024
       : 20 * 1024 * 1024;
   if (downloaded.bytes.byteLength === 0 || downloaded.bytes.byteLength > maximumBytes) {
@@ -3737,7 +4407,7 @@ function runtimeFailure(error: unknown, channel: string): {
     if (error.code === "conflict") {
       return { status: "conflict", code: "polling_conflict", summary: `Another client is connected to this ${name} bot.`, retryable: true };
     }
-    if ((channel === "wecom" || channel === "wechat")
+    if ((channel === "wecom" || channel === "wechat" || channel === "slack")
       && (error.code === "network" || error.code === "provider_unavailable" || error.code === "rate_limited")
       && error.options.retryable) {
       return {
@@ -3848,6 +4518,16 @@ function sameMessagingAddress(left: MessagingAddress, right: MessagingAddress): 
     && left.conversationKind === right.conversationKind;
 }
 
+function messagingAddressKey(address: MessagingAddress): string {
+  return JSON.stringify([
+    address.channel,
+    address.connectionId,
+    address.providerConversationId,
+    address.providerThreadId,
+    address.conversationKind
+  ]);
+}
+
 function outboundFileName(value: string | undefined, index: number): string {
   const normalized = (value ?? "")
     .replace(/[\\/]/gu, "_")
@@ -3893,6 +4573,17 @@ function discordUserId(value: string): string {
   return normalized;
 }
 
+function slackUserId(value: string): string {
+  const normalized = value.trim();
+  if (!/^[UW][A-Z0-9]{8,63}$/u.test(normalized)) throw invalid("Slack owner identity is invalid.");
+  return normalized;
+}
+
+function slackChannelId(value: string): string {
+  if (!/^[CG][A-Z0-9]{8,63}$/u.test(value)) throw invalid("Slack channel identity is invalid.");
+  return value;
+}
+
 function dingTalkProviderId(value: unknown, label: string, maximum: number): string {
   if (typeof value !== "string") throw invalid(`DingTalk ${label} is invalid.`);
   const normalized = value.trim();
@@ -3918,6 +4609,28 @@ function weComProviderId(value: unknown, label: string, maximum: number): string
     throw invalid(`WeCom ${label} is invalid.`);
   }
   return normalized;
+}
+
+function parseSlackCredentialUpload(value: string): { readonly appToken: string; readonly botToken: string } {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); }
+  catch { throw invalid("Slack credential bundle is invalid."); }
+  if (!isRecord(parsed) || parsed["format"] !== 1
+    || Object.keys(parsed).sort().join(",") !== "appToken,botToken,format") {
+    throw invalid("Slack credential bundle is invalid.");
+  }
+  const appToken = parsed["appToken"];
+  const botToken = parsed["botToken"];
+  if (typeof appToken !== "string" || !/^xapp-[A-Za-z0-9._-]{11,507}$/u.test(appToken)
+    || typeof botToken !== "string" || !/^xoxb-[A-Za-z0-9._-]{11,507}$/u.test(botToken)) {
+    throw invalid("Slack app or bot credential is invalid.");
+  }
+  return { appToken, botToken };
+}
+
+function decodeStoredSlackCredentials(value: string): { readonly appToken: string; readonly botToken: string } {
+  try { return parseSlackCredentialUpload(value); }
+  catch { throw credentialUnavailable(); }
 }
 
 function validatedWeChatCredentials(value: unknown): {
@@ -3996,7 +4709,7 @@ function weChatProviderId(value: unknown, label: string): string {
 
 function isSupportedMessagingChannel(value: string): value is SupportedMessagingChannel {
   return value === "telegram" || value === "discord" || value === "dingtalk" || value === "feishu" || value === "lark"
-    || value === "wecom" || value === "wechat";
+    || value === "wecom" || value === "wechat" || value === "slack";
 }
 
 function requiredSupportedMessagingChannel(value: string): SupportedMessagingChannel {
@@ -4012,6 +4725,7 @@ function channelDisplayName(value: string): string {
   if (value === "lark") return "Lark";
   if (value === "wecom") return "WeCom";
   if (value === "wechat") return "WeChat";
+  if (value === "slack") return "Slack";
   return "Messaging provider";
 }
 
@@ -4020,6 +4734,7 @@ function credentialDisplayName(channel: SupportedMessagingChannel): string {
     : channel === "feishu" || channel === "lark" ? `${channelDisplayName(channel)} App Secret`
       : channel === "wecom" ? "WeCom Bot Secret"
       : channel === "wechat" ? "WeChat authorization token"
+      : channel === "slack" ? "Slack app and bot tokens"
       : `${channelDisplayName(channel)} bot token`;
 }
 
@@ -4065,7 +4780,7 @@ function isOneOf<const T extends readonly string[]>(value: unknown, options: T):
 
 function validAddress(value: unknown): value is MessagingAddress {
   if (!isRecord(value)) return false;
-  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat"] as const) && typeof value["connectionId"] === "string" &&
+  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat", "slack"] as const) && typeof value["connectionId"] === "string" &&
     typeof value["providerConversationId"] === "string" &&
     (value["providerThreadId"] === null || typeof value["providerThreadId"] === "string") &&
     isOneOf(value["conversationKind"], ["direct", "group", "channel"] as const);

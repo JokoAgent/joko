@@ -52,7 +52,9 @@ describe("MessagingService", () => {
       .toMatchObject({ available: true, reason: "" });
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.WECOM))
       .toMatchObject({ available: true, reason: "" });
-    expect(channels.filter((channel) => channel.available)).toHaveLength(6);
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.SLACK))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.filter((channel) => channel.available)).toHaveLength(7);
 
     const created = await service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,
@@ -649,6 +651,147 @@ describe("MessagingService", () => {
     ), context)).rejects.toSatisfy(
       (error: unknown) => error instanceof ConnectError && error.code === Code.Unimplemented
     );
+  });
+
+  it("projects Slack owner and channel rules with strict configuration and revision-fenced updates", async () => {
+    const fixture = await createFixture();
+    const service = createMessagingConnectService(fixture.manager, () => ({ connectionId: "desktop" }));
+    const context = {} as HandlerContext;
+    const configuration = create(contract.SlackMessagingConfigurationSchema, {
+      lifecycleAnnouncements: true,
+      emojiReactions: contract.SlackEmojiReactions.MINIMAL,
+      groupActivationRules: [create(contract.SlackGroupActivationRuleSchema, {
+        channelId: "C0123456789",
+        activation: contract.SlackGroupActivation.MENTION
+      })]
+    });
+    const created = await service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      {
+        channel: contract.MessagingChannel.SLACK,
+        ownerProviderUserId: "U0123456789",
+        slackConfiguration: configuration
+      }
+    ), context);
+    expect(created.connection).toMatchObject({
+      channel: contract.MessagingChannel.SLACK,
+      generation: 1n,
+      ownerProviderUserId: "U0123456789",
+      credentialConfigured: false,
+      runtimeStatus: contract.MessagingConnectionRuntimeStatus.IDLE,
+      slackConfiguration: {
+        lifecycleAnnouncements: true,
+        emojiReactions: contract.SlackEmojiReactions.MINIMAL,
+        groupActivationRules: [{
+          channelId: "C0123456789",
+          activation: contract.SlackGroupActivation.MENTION
+        }]
+      }
+    });
+    expect(created.connection).not.toHaveProperty("telegramConfiguration");
+    if (created.connection === undefined) throw new Error("Missing created Slack connection.");
+
+    const defaulted = await service.createMessagingConnection(create(
+      contract.CreateMessagingConnectionRequestSchema,
+      { channel: contract.MessagingChannel.SLACK, ownerProviderUserId: "U2123456789" }
+    ), context);
+    expect(defaulted.connection?.slackConfiguration).toMatchObject({
+      lifecycleAnnouncements: true,
+      emojiReactions: contract.SlackEmojiReactions.MINIMAL,
+      groupActivationRules: []
+    });
+
+    const updated = await service.updateSlackMessagingConfiguration(create(
+      contract.UpdateSlackMessagingConfigurationRequestSchema,
+      {
+        connectionId: created.connection.connectionId,
+        expectedRevision: created.connection.revision,
+        expectedGeneration: created.connection.generation,
+        ownerProviderUserId: "U1123456789",
+        configuration: create(contract.SlackMessagingConfigurationSchema, {
+          lifecycleAnnouncements: false,
+          emojiReactions: contract.SlackEmojiReactions.EXPRESSIVE,
+          groupActivationRules: [create(contract.SlackGroupActivationRuleSchema, {
+            channelId: "C1123456789",
+            activation: contract.SlackGroupActivation.ALWAYS
+          })]
+        })
+      }
+    ), context);
+    expect(updated.connection).toMatchObject({
+      generation: 2n,
+      ownerProviderUserId: "U1123456789",
+      slackConfiguration: {
+        lifecycleAnnouncements: false,
+        emojiReactions: contract.SlackEmojiReactions.EXPRESSIVE,
+        groupActivationRules: [{
+          channelId: "C1123456789",
+          activation: contract.SlackGroupActivation.ALWAYS
+        }]
+      }
+    });
+
+    await expect(service.updateSlackMessagingConfiguration(create(
+      contract.UpdateSlackMessagingConfigurationRequestSchema,
+      {
+        connectionId: created.connection.connectionId,
+        expectedRevision: created.connection.revision,
+        expectedGeneration: created.connection.generation,
+        ownerProviderUserId: "U0123456789",
+        configuration
+      }
+    ), context)).rejects.toSatisfy(
+      (error: unknown) => error instanceof ConnectError && error.code === Code.Aborted
+    );
+    await expect(service.updateSlackMessagingConfiguration(create(
+      contract.UpdateSlackMessagingConfigurationRequestSchema,
+      {
+        connectionId: updated.connection!.connectionId,
+        expectedRevision: updated.connection!.revision,
+        expectedGeneration: updated.connection!.generation,
+        ownerProviderUserId: "U1123456789"
+      }
+    ), context)).rejects.toSatisfy(
+      (error: unknown) => error instanceof ConnectError && error.code === Code.InvalidArgument
+    );
+    for (const request of [
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.SLACK,
+        ownerProviderUserId: "U0123456789",
+        discordConfiguration: create(contract.DiscordMessagingConfigurationSchema)
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.TELEGRAM,
+        ownerProviderUserId: "42",
+        slackConfiguration: configuration
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.SLACK,
+        ownerProviderUserId: "U0123456789",
+        slackConfiguration: create(contract.SlackMessagingConfigurationSchema, {
+          emojiReactions: contract.SlackEmojiReactions.UNSPECIFIED
+        })
+      }),
+      create(contract.CreateMessagingConnectionRequestSchema, {
+        channel: contract.MessagingChannel.SLACK,
+        ownerProviderUserId: "U0123456789",
+        slackConfiguration: create(contract.SlackMessagingConfigurationSchema, {
+          emojiReactions: contract.SlackEmojiReactions.MINIMAL,
+          groupActivationRules: [
+            create(contract.SlackGroupActivationRuleSchema, {
+              channelId: "C0123456789", activation: contract.SlackGroupActivation.MENTION
+            }),
+            create(contract.SlackGroupActivationRuleSchema, {
+              channelId: "C0123456789", activation: contract.SlackGroupActivation.ALWAYS
+            })
+          ]
+        })
+      })
+    ]) {
+      await expect(service.createMessagingConnection(request, context)).rejects.toSatisfy(
+        (error: unknown) => error instanceof ConnectError && error.code === Code.InvalidArgument
+      );
+    }
   });
 
   it("reports unavailable channels and nodes explicitly", async () => {

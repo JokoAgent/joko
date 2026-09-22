@@ -4790,6 +4790,7 @@ const en = {
   ,"messaging.addLark": "Add Lark"
   ,"messaging.addWeCom": "Add WeCom"
   ,"messaging.addWeChat": "Add WeChat"
+  ,"messaging.addSlack": "Add Slack"
   ,"messaging.loadFailed": "Could not load Messaging settings."
   ,"messaging.actionFailed": "Could not complete the Messaging action."
   ,"messaging.connectionChanged": "The Messaging connection changed. Review the refreshed settings and try again."
@@ -4826,6 +4827,11 @@ const en = {
   ,"messaging.discordOwnerId": "Discord owner user ID"
   ,"messaging.discordOwnerIdBody": "Use the 17–20 digit Discord user ID, not a display name or username."
   ,"messaging.discordDeveloperPortal": "Open the Discord Developer Portal"
+  ,"messaging.slackCreateTitle": "Add Slack"
+  ,"messaging.slackCreateBody": "Enter the Slack user ID allowed to start direct-message tasks. Approved channels can create or continue threaded tasks."
+  ,"messaging.slackOwnerId": "Slack owner user ID"
+  ,"messaging.slackOwnerIdBody": "Use a Slack user ID beginning with U or W, not a display name."
+  ,"messaging.slackDeveloperPortal": "Open Slack app settings"
   ,"messaging.dingtalkCreateTitle": "Add DingTalk"
   ,"messaging.dingtalkCreateBody": "Enter the application identity now. The first direct-message sender claims the owner identity; only explicitly approved group conversations are admitted."
   ,"messaging.dingtalkAppKey": "DingTalk AppKey"
@@ -4899,6 +4905,14 @@ const en = {
   ,"messaging.wecomClearCredential": "Clear Bot Secret"
   ,"messaging.wecomCredentialBody": "Replacing the Bot Secret retires the previous WebSocket transport generation and its pending work."
   ,"messaging.wecomSecretSafety": "The Bot Secret uses a one-shot managed credential channel and is cleared from this form immediately after submission."
+  ,"messaging.slackAppToken": "Slack app-level token (xapp-)"
+  ,"messaging.slackBotToken": "Slack bot token (xoxb-)"
+  ,"messaging.slackAddCredential": "Add Slack tokens"
+  ,"messaging.slackReplaceCredential": "Replace Slack tokens"
+  ,"messaging.slackClearCredential": "Clear Slack tokens"
+  ,"messaging.slackCredentialBody": "Both tokens are replaced together. The prior Socket Mode connection and its pending work retire only after the new credential is saved."
+  ,"messaging.slackSecretSafety": "Both tokens use one protected upload and are cleared from this form immediately after submission. They are never stored in settings or task history."
+  ,"messaging.slackScopes": "Configure Socket Mode with an app token granting connections:write, and a bot token granting chat:write, im:history, im:write, app_mentions:read, reactions:write, files:read and files:write. Approved public/private channels also need channels:history or groups:history; enable commands and interactivity if you use those controls."
   ,"messaging.configureTitle": "Telegram behavior"
   ,"messaging.configureBody": "Configure replies, reactions, and the activation policy for each group."
   ,"messaging.discordConfigureTitle": "Discord behavior"
@@ -4920,6 +4934,12 @@ const en = {
   ,"messaging.wecomConfigureTitle": "WeCom identity"
   ,"messaging.wecomConfigureBody": "Configure the bot identity used for this WebSocket connection."
   ,"messaging.wecomBotIdChangeBody": "Changing the Bot ID retires the active transport and clears the claimed owner. The next direct-message sender claims ownership again."
+  ,"messaging.slackConfigureTitle": "Slack behavior"
+  ,"messaging.slackConfigureBody": "Configure owner access, lifecycle notices, reactions, threaded replies, and explicitly approved channels."
+  ,"messaging.slackGroupActivation": "Channel activation rules"
+  ,"messaging.slackGroupActivationBody": "Enter one approved channel ID per line as channelId=mention, =always, or =disabled. Unlisted channels are rejected."
+  ,"messaging.slackGroupActivationInvalid": "Use one unique Slack channel ID beginning with C or G per line, with mention, always, or disabled."
+  ,"messaging.slackGroupSafety": "Channel history and files are untrusted. Only approve channels whose members may start Joko tasks."
   ,"messaging.lifecycleAnnouncements": "Lifecycle announcements"
   ,"messaging.lifecycleAnnouncementsBody": "Post online, offline, and recovery notices to the owner conversation when a route is available."
   ,"messaging.emojiReactions": "Acknowledgement reactions"
@@ -4939,6 +4959,8 @@ const en = {
   ,"messaging.dingtalkClearTitle": "Clear DingTalk AppSecret?"
   ,"messaging.appSecretClearTitle": "Clear App Secret?"
   ,"messaging.wecomClearTitle": "Clear WeCom Bot Secret?"
+  ,"messaging.slackClearTitle": "Clear Slack tokens?"
+  ,"messaging.slackClearBody": "This disconnects Socket Mode and removes both tokens. Existing Joko tasks remain visible."
   ,"messaging.clearBody": "The connection goes offline immediately. Existing tasks remain visible, but this transport and its pending work are retired."
   ,"messaging.target": "Workspace"
   ,"messaging.model": "Model"
@@ -4958,6 +4980,7 @@ const en = {
   ,"messaging.testFailure.channelUnavailable": "This channel is not available on the node."
   ,"messaging.testFailure.connectionFailed": "The provider could not be reached or rejected the token."
   ,"messaging.status.idle": "Needs token"
+  ,"messaging.status.slackIdle": "Needs both tokens"
   ,"messaging.status.dingtalkIdle": "Needs AppSecret"
   ,"messaging.status.appSecretIdle": "Needs App Secret"
   ,"messaging.status.wecomIdle": "Needs Bot Secret"
@@ -7839,6 +7862,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.addLark": "添加 Lark",
     "messaging.addWeCom": "添加企业微信",
     "messaging.addWeChat": "添加微信",
+    "messaging.addSlack": "添加 Slack",
     "messaging.loadFailed": "无法加载消息渠道设置。",
     "messaging.actionFailed": "无法完成消息渠道操作。",
     "messaging.connectionChanged": "消息连接已发生变化。请检查刷新的设置后重试。",
@@ -7875,6 +7899,11 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.discordOwnerId": "Discord 所有者用户 ID",
     "messaging.discordOwnerIdBody": "请使用 17–20 位 Discord 用户 ID，不要使用显示名或用户名。",
     "messaging.discordDeveloperPortal": "打开 Discord Developer Portal",
+    "messaging.slackCreateTitle": "添加 Slack",
+    "messaging.slackCreateBody": "填写可从私聊发起任务的 Slack 用户 ID。已批准的频道可创建或继续线程任务。",
+    "messaging.slackOwnerId": "Slack 所有者用户 ID",
+    "messaging.slackOwnerIdBody": "请使用以 U 或 W 开头的 Slack 用户 ID，不要使用显示名。",
+    "messaging.slackDeveloperPortal": "打开 Slack 应用设置",
     "messaging.dingtalkCreateTitle": "添加钉钉",
     "messaging.dingtalkCreateBody": "先填写应用身份。第一位发送私聊的用户会认领所有者身份；只有明确批准的群会话才能接入。",
     "messaging.dingtalkAppKey": "钉钉 AppKey",
@@ -7948,6 +7977,14 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.wecomClearCredential": "清除机器人密钥",
     "messaging.wecomCredentialBody": "替换机器人密钥会退休旧的 WebSocket 传输代际及其待处理工作。",
     "messaging.wecomSecretSafety": "机器人密钥仅通过一次性受管凭证通道传输，并会在提交后立即从此表单清除。",
+    "messaging.slackAppToken": "Slack 应用级令牌（xapp-）",
+    "messaging.slackBotToken": "Slack 机器人令牌（xoxb-）",
+    "messaging.slackAddCredential": "添加 Slack 令牌",
+    "messaging.slackReplaceCredential": "替换 Slack 令牌",
+    "messaging.slackClearCredential": "清除 Slack 令牌",
+    "messaging.slackCredentialBody": "两个令牌会一并替换。只有新凭证保存成功后，旧 Socket Mode 连接及其待处理工作才会退休。",
+    "messaging.slackSecretSafety": "两个令牌通过一次受保护上传传输，提交后立即从表单清除，不会写入设置或任务历史。",
+    "messaging.slackScopes": "启用 Socket Mode：应用令牌需有 connections:write；机器人令牌需有 chat:write、im:history、im:write、app_mentions:read、reactions:write、files:read、files:write。已批准的公开或私有频道还需 channels:history 或 groups:history；使用命令和按钮时请启用命令及交互功能。",
     "messaging.configureTitle": "Telegram 行为",
     "messaging.configureBody": "配置回复、反应及每个群组的激活策略。",
     "messaging.discordConfigureTitle": "Discord 行为",
@@ -7969,6 +8006,12 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.wecomConfigureTitle": "企业微信机器人身份",
     "messaging.wecomConfigureBody": "配置此 WebSocket 连接所使用的机器人身份。",
     "messaging.wecomBotIdChangeBody": "修改机器人 ID 会退休当前传输并清除已认领的所有者；下一位发送私聊的用户会重新认领。",
+    "messaging.slackConfigureTitle": "Slack 行为",
+    "messaging.slackConfigureBody": "配置所有者准入、生命周期通知、反应、线程回复及明确批准的频道。",
+    "messaging.slackGroupActivation": "频道激活规则",
+    "messaging.slackGroupActivationBody": "每行输入一个已批准的频道 ID，格式为 channelId=mention、=always 或 =disabled。未列出的频道会被拒绝。",
+    "messaging.slackGroupActivationInvalid": "每行使用一个以 C 或 G 开头的唯一 Slack 频道 ID，并选择 mention、always 或 disabled。",
+    "messaging.slackGroupSafety": "频道历史和文件是不可信输入。只批准其成员可以发起 Joko 任务的频道。",
     "messaging.lifecycleAnnouncements": "生命周期通知",
     "messaging.lifecycleAnnouncementsBody": "存在可用路由时，在所有者会话中发布上线、离线和恢复通知。",
     "messaging.emojiReactions": "确认反应",
@@ -7988,6 +8031,8 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.dingtalkClearTitle": "清除钉钉 AppSecret？",
     "messaging.appSecretClearTitle": "清除 App Secret？",
     "messaging.wecomClearTitle": "清除企业微信机器人密钥？",
+    "messaging.slackClearTitle": "清除 Slack 令牌？",
+    "messaging.slackClearBody": "这会断开 Socket Mode 并移除两个令牌。现有 Joko 任务仍然可见。",
     "messaging.clearBody": "连接会立即离线。现有任务仍可见，但当前传输及其待处理工作会被退休。",
     "messaging.target": "工作区",
     "messaging.model": "模型",
@@ -8007,6 +8052,7 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.testFailure.channelUnavailable": "此节点尚不支持该渠道。",
     "messaging.testFailure.connectionFailed": "无法访问提供方，或令牌被拒绝。",
     "messaging.status.idle": "需要令牌",
+    "messaging.status.slackIdle": "需要两个令牌",
     "messaging.status.dingtalkIdle": "需要 AppSecret",
     "messaging.status.appSecretIdle": "需要 App Secret",
     "messaging.status.wecomIdle": "需要机器人密钥",

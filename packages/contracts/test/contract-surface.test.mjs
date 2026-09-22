@@ -240,6 +240,38 @@ test("WeChat messaging exposes only an empty configuration and a fenced QR autho
   assert.equal(input.qrCodeUrl, "https://ilinkai.weixin.qq.com/qr/example");
 });
 
+test("Slack messaging exposes one non-secret channel configuration and fenced update", () => {
+  assert.deepEqual([...fieldNames(contract.SlackMessagingConfigurationSchema)], [
+    "lifecycle_announcements", "emoji_reactions", "group_activation_rules"
+  ]);
+  assert.equal(field(contract.SlackMessagingConfigurationSchema, "group_activation_rules").number, 3);
+  assert.equal(field(contract.SlackGroupActivationRuleSchema, "channel_id").number, 1);
+  assert.equal(field(contract.SlackGroupActivationRuleSchema, "activation").number, 2);
+  assert.equal(field(contract.MessagingConnectionSchema, "slack_configuration").number, 22);
+  assert.equal(field(contract.CreateMessagingConnectionRequestSchema, "slack_configuration").number, 9);
+  for (const [name, number] of [
+    ["connection_id", 1], ["expected_revision", 2], ["expected_generation", 3],
+    ["owner_provider_user_id", 4], ["configuration", 5]
+  ]) {
+    assert.equal(field(contract.UpdateSlackMessagingConfigurationRequestSchema, name).number, number);
+  }
+  assert.equal(methodNames(contract.MessagingService).has("updateSlackMessagingConfiguration"), true);
+  assertNoFields([
+    contract.SlackMessagingConfigurationSchema,
+    contract.SlackGroupActivationRuleSchema,
+    contract.UpdateSlackMessagingConfigurationRequestSchema
+  ], ["secret", "token", "credential", "authorization"]);
+  const value = roundTrip(contract.SlackMessagingConfigurationSchema, {
+    lifecycleAnnouncements: true,
+    emojiReactions: contract.SlackEmojiReactions.MINIMAL,
+    groupActivationRules: [{
+      channelId: "C0123456789",
+      activation: contract.SlackGroupActivation.MENTION
+    }]
+  });
+  assert.equal(value.groupActivationRules[0].channelId, "C0123456789");
+});
+
 test("Contacts exposes revision-fenced local and explicit device-sync authority without secret transport fields", () => {
   assert.deepEqual([...methodNames(contract.ContactService)], [
     "getContactDirectory",

@@ -438,6 +438,7 @@ export interface OrchestratorApplicationDependencies {
   readonly messagingCreateFeishuTransport?: MessagingManagerOptions["createFeishuTransport"];
   readonly messagingCreateWeComTransport?: MessagingManagerOptions["createWeComTransport"];
   readonly messagingCreateWeChatTransport?: MessagingManagerOptions["createWeChatTransport"];
+  readonly messagingCreateSlackTransport?: MessagingManagerOptions["createSlackTransport"];
   readonly messagingCreateWeChatAuthorization?: () => WeChatAuthorizationPort;
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
@@ -1332,6 +1333,9 @@ export async function createOrchestratorApplication(
     ...(dependencies.messagingCreateWeChatTransport === undefined
       ? {}
       : { createWeChatTransport: dependencies.messagingCreateWeChatTransport }),
+    ...(dependencies.messagingCreateSlackTransport === undefined
+      ? {}
+      : { createSlackTransport: dependencies.messagingCreateSlackTransport }),
     ...(dependencies.messagingPollTimeoutSeconds === undefined
       ? {}
       : { pollTimeoutSeconds: dependencies.messagingPollTimeoutSeconds }),

@@ -25,6 +25,7 @@ import type {
   MessagingRouteView,
   MessagingSettingsView,
   PermissionMode,
+  SlackMessagingConfigurationView,
   TelegramMessagingConfigurationView,
   WeComMessagingConfigurationView,
   WeChatAuthorizationAttemptView
@@ -58,6 +59,12 @@ const DEFAULT_DISCORD_CONFIGURATION: DiscordMessagingConfigurationView = Object.
   groupActivation: Object.freeze({})
 });
 
+const DEFAULT_SLACK_CONFIGURATION: SlackMessagingConfigurationView = Object.freeze({
+  lifecycleAnnouncements: true,
+  emojiReactions: "minimal",
+  groupActivation: Object.freeze({})
+});
+
 const DEFAULT_FEISHU_CONFIGURATION = Object.freeze({
   lifecycleAnnouncements: true,
   emojiReactions: "minimal",
@@ -67,7 +74,7 @@ const DEFAULT_FEISHU_CONFIGURATION = Object.freeze({
   groupPermissionMode: "ask"
 } as const satisfies Omit<FeishuMessagingConfigurationView, "appId">);
 
-type MessagingCreateChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom";
+type MessagingCreateChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "slack";
 
 type MessagingDialog =
   | { readonly kind: "create"; readonly channel: MessagingCreateChannel }
@@ -198,6 +205,8 @@ export function MessagingSettings({ controller, snapshot, t }: {
     capability.channel === "wecom" && capability.available) === true;
   const wechatAvailable = settings?.channels.some((capability) =>
     capability.channel === "wechat" && capability.available) === true;
+  const slackAvailable = settings?.channels.some((capability) =>
+    capability.channel === "slack" && capability.available) === true;
 
   const createWeChatConnection = async (): Promise<void> => {
     const connection = await run("create:wechat", () => controller.createWeChatMessagingConnection());
@@ -214,6 +223,8 @@ export function MessagingSettings({ controller, snapshot, t }: {
       ? controller.createTelegramMessagingConnection(identity, DEFAULT_TELEGRAM_CONFIGURATION)
       : channel === "discord"
         ? controller.createDiscordMessagingConnection(identity, DEFAULT_DISCORD_CONFIGURATION)
+        : channel === "slack"
+          ? controller.createSlackMessagingConnection(identity, DEFAULT_SLACK_CONFIGURATION)
         : channel === "dingtalk"
           ? controller.createDingTalkMessagingConnection({ appKey: identity, groupActivation: {} })
           : channel === "wecom"
@@ -357,6 +368,44 @@ export function MessagingSettings({ controller, snapshot, t }: {
         if (candidate.generation !== connection.generation
           || candidate.ownerProviderUserId !== connection.ownerProviderUserId
           || !discordConfigurationEqual(candidate.discordConfiguration, connection.discordConfiguration)) throw reason;
+        return save(candidate);
+      }
+    });
+    if (updated === undefined) return;
+    replaceConnection(updated);
+    setDialog(undefined);
+  };
+
+  const updateSlackConfiguration = async (
+    connection: MessagingConnectionView,
+    ownerProviderUserId: string,
+    configuration: SlackMessagingConfigurationView
+  ): Promise<void> => {
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => controller.updateSlackMessagingConfiguration(
+        candidate.id,
+        candidate.revision,
+        candidate.generation,
+        ownerProviderUserId,
+        configuration
+      );
+      let candidate = await refreshConnection(connection);
+      if (candidate.ownerProviderUserId === ownerProviderUserId
+        && slackConfigurationEqual(candidate.slackConfiguration, configuration)) return candidate;
+      if (candidate.generation !== connection.generation
+        || candidate.ownerProviderUserId !== connection.ownerProviderUserId
+        || !slackConfigurationEqual(candidate.slackConfiguration, connection.slackConfiguration)) {
+        throw new Error(t("messaging.connectionChanged"));
+      }
+      try {
+        return await save(candidate);
+      } catch (reason) {
+        candidate = await refreshAfterRevisionConflict(reason, connection);
+        if (candidate.ownerProviderUserId === ownerProviderUserId
+          && slackConfigurationEqual(candidate.slackConfiguration, configuration)) return candidate;
+        if (candidate.generation !== connection.generation
+          || candidate.ownerProviderUserId !== connection.ownerProviderUserId
+          || !slackConfigurationEqual(candidate.slackConfiguration, connection.slackConfiguration)) throw reason;
         return save(candidate);
       }
     });
@@ -535,6 +584,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
         {wechatAvailable && <Button tone="primary" disabled={busy === "create:wechat"} onClick={() => { void createWeChatConnection(); }}>
           {busy === "create:wechat" ? <Spinner /> : <Plus aria-hidden="true" />}{t("messaging.addWeChat")}
         </Button>}
+        {slackAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "slack" })}>
+          <Plus aria-hidden="true" />{t("messaging.addSlack")}
+        </Button>}
       </div>
     </header>
 
@@ -590,6 +642,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
           {wechatAvailable && <Button tone="primary" disabled={busy === "create:wechat"} onClick={() => { void createWeChatConnection(); }}>
             {busy === "create:wechat" ? <Spinner /> : <Plus aria-hidden="true" />}{t("messaging.addWeChat")}
           </Button>}
+          {slackAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "slack" })}>
+            <Plus aria-hidden="true" />{t("messaging.addSlack")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -639,6 +694,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                   : formatRelativeTime(connection.lastConnectedAt, controller.state.preferences.locale)}</span>
                 <span><strong>{t(connection.channel === "wechat" ? "messaging.wechatAccountId"
                   : connection.channel === "discord" ? "messaging.discordOwnerId"
+                  : connection.channel === "slack" ? "messaging.slackOwnerId"
                   : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId"
                     : connection.channel === "feishu" || connection.channel === "lark"
                       ? "messaging.feishuOwnerId"
@@ -687,6 +743,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                     : connection.channel === "feishu" || connection.channel === "lark"
                       ? "messaging.appSecretClearCredential"
                       : connection.channel === "wecom" ? "messaging.wecomClearCredential"
+                      : connection.channel === "slack" ? "messaging.slackClearCredential"
                       : connection.channel === "wechat" ? "messaging.wechatClearCredential"
                       : "messaging.clearCredential")}
                 </Button>}
@@ -734,6 +791,14 @@ export function MessagingSettings({ controller, snapshot, t }: {
       t={t}
       onClose={() => setDialog(undefined)}
       onSubmit={(ownerId, configuration) => { void updateDiscordConfiguration(connectionForDialog, ownerId, configuration); }}
+    />}
+    {connectionForDialog !== undefined && connectionForDialog.slackConfiguration !== undefined && <SlackConfigurationDialog
+      open={dialog?.kind === "configuration"}
+      connection={connectionForDialog}
+      busy={busy === `configuration:${connectionForDialog.id}`}
+      t={t}
+      onClose={() => setDialog(undefined)}
+      onSubmit={(ownerId, configuration) => { void updateSlackConfiguration(connectionForDialog, ownerId, configuration); }}
     />}
     {connectionForDialog !== undefined && connectionForDialog.dingtalkConfiguration !== undefined && <DingTalkConfigurationDialog
       open={dialog?.kind === "configuration"}
@@ -799,6 +864,8 @@ function ConnectionStatus({ status, channel, t }: {
         ? "messaging.status.wechatIdle"
       : status === "idle" && channel === "wecom"
         ? "messaging.status.wecomIdle"
+      : status === "idle" && channel === "slack"
+        ? "messaging.status.slackIdle"
       : status === "idle" && (channel === "feishu" || channel === "lark")
         ? "messaging.status.appSecretIdle"
       : `messaging.status.${status}`)}
@@ -838,7 +905,9 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
   const [identity, setIdentity] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (open) setIdentity(""); }, [channel, open]);
-  const valid = channel === "discord"
+  const valid = channel === "slack"
+    ? validSlackOwnerId(identity.trim())
+    : channel === "discord"
     ? /^[1-9][0-9]{16,19}$/u.test(identity.trim())
     : channel === "dingtalk"
       ? validDingTalkProviderId(identity, 256)
@@ -849,12 +918,14 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
         : /^[1-9][0-9]{0,15}$/u.test(identity.trim());
   return <Modal
     open={open}
-    title={channel === "discord" ? t("messaging.discordCreateTitle")
+    title={channel === "slack" ? t("messaging.slackCreateTitle")
+      : channel === "discord" ? t("messaging.discordCreateTitle")
       : channel === "dingtalk" ? t("messaging.dingtalkCreateTitle")
         : channel === "feishu" ? t("messaging.feishuCreateTitle")
           : channel === "lark" ? t("messaging.larkCreateTitle")
             : channel === "wecom" ? t("messaging.wecomCreateTitle") : t("messaging.createTitle")}
-    description={channel === "discord" ? t("messaging.discordCreateBody")
+    description={channel === "slack" ? t("messaging.slackCreateBody")
+      : channel === "discord" ? t("messaging.discordCreateBody")
       : channel === "dingtalk" ? t("messaging.dingtalkCreateBody")
         : channel === "feishu" || channel === "lark" ? t("messaging.feishuCreateBody")
           : channel === "wecom" ? t("messaging.wecomCreateBody") : t("messaging.createBody")}
@@ -864,17 +935,20 @@ function CreateConnectionDialog({ open, channel, busy, t, onClose, onSubmit }: {
     showClose
   >
     <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSubmit(channel, identity.trim()); }}>
-      <label><span>{channel === "discord" ? t("messaging.discordOwnerId")
+      <label><span>{channel === "slack" ? t("messaging.slackOwnerId")
+        : channel === "discord" ? t("messaging.discordOwnerId")
         : channel === "dingtalk" ? t("messaging.dingtalkAppKey")
           : channel === "feishu" || channel === "lark" ? t("messaging.feishuAppId")
             : channel === "wecom" ? t("messaging.wecomBotId")
-            : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "telegram" || channel === "discord" ? "numeric" : "text"} autoComplete="off" placeholder={channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : channel === "feishu" || channel === "lark" ? "cli_xxxxxxxx" : channel === "wecom" ? "bot_xxxxxxxx" : "123456789"} /></label>
-      <p className="messaging-form__hint">{channel === "discord" ? t("messaging.discordOwnerIdBody")
+            : t("messaging.ownerId")}</span><input ref={inputRef} value={identity} onChange={(event) => setIdentity(event.target.value)} inputMode={channel === "telegram" || channel === "discord" ? "numeric" : "text"} autoComplete="off" placeholder={channel === "slack" ? "U12345678" : channel === "discord" ? "123456789012345678" : channel === "dingtalk" ? "dingxxxxxxxx" : channel === "feishu" || channel === "lark" ? "cli_xxxxxxxx" : channel === "wecom" ? "bot_xxxxxxxx" : "123456789"} /></label>
+      <p className="messaging-form__hint">{channel === "slack" ? t("messaging.slackOwnerIdBody")
+        : channel === "discord" ? t("messaging.discordOwnerIdBody")
         : channel === "dingtalk" ? t("messaging.dingtalkAppKeyBody")
           : channel === "feishu" || channel === "lark" ? t("messaging.feishuAppIdBody")
             : channel === "wecom" ? t("messaging.wecomBotIdBody")
             : t("messaging.ownerIdBody")}</p>
       {channel === "discord" && <p className="messaging-form__hint"><a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">{t("messaging.discordDeveloperPortal")}</a></p>}
+      {channel === "slack" && <p className="messaging-form__hint"><a href="https://api.slack.com/apps" target="_blank" rel="noreferrer">{t("messaging.slackDeveloperPortal")}</a></p>}
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.continue")}</Button></div>
     </form>
   </Modal>;
@@ -889,8 +963,11 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
   readonly onSubmit: (secret: string, enable: boolean) => void;
 }): JSX.Element {
   const [secret, setSecret] = useState("");
+  const [slackAppToken, setSlackAppToken] = useState("");
+  const [slackBotToken, setSlackBotToken] = useState("");
   const [enable, setEnable] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
+  const slack = connection.channel === "slack";
   const appSecret = connection.channel === "dingtalk" || connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom";
   const credentialLabel = connection.channel === "dingtalk"
     ? "messaging.dingtalkAppSecret"
@@ -900,13 +977,26 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
     ? "messaging.dingtalkSecretSafety"
     : connection.channel === "wecom" ? "messaging.wecomSecretSafety"
       : appSecret ? "messaging.appSecretSafety" : "messaging.secretSafety";
-  useEffect(() => { if (open) { setSecret(""); setEnable(true); } }, [open, connection.id]);
-  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : connection.channel === "wecom" ? "messaging.wecomCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose>
-    <form className="messaging-form" onSubmit={(event) => { event.preventDefault(); const value = secret; if (value.trim() !== "") { setSecret(""); onSubmit(value, enable); } }}>
-      <label><span>{t(credentialLabel)}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
+  useEffect(() => { if (open) { setSecret(""); setSlackAppToken(""); setSlackBotToken(""); setEnable(true); } }, [open, connection.id]);
+  const close = (): void => { setSecret(""); setSlackAppToken(""); setSlackBotToken(""); onClose(); };
+  const valid = slack ? validSlackToken(slackAppToken, "xapp-") && validSlackToken(slackBotToken, "xoxb-")
+    : secret.trim() !== "";
+  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(slack ? "messaging.slackCredentialBody" : connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : connection.channel === "wecom" ? "messaging.wecomCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={close} initialFocus={() => inputRef.current} showClose>
+    <form className="messaging-form" onSubmit={(event) => {
+      event.preventDefault();
+      if (!valid) return;
+      const value = slack ? JSON.stringify({ format: 1, appToken: slackAppToken, botToken: slackBotToken }) : secret;
+      setSecret(""); setSlackAppToken(""); setSlackBotToken("");
+      onSubmit(value, enable);
+    }}>
+      {slack ? <>
+        <label><span>{t("messaging.slackAppToken")}</span><input ref={inputRef} type="password" value={slackAppToken} onChange={(event) => setSlackAppToken(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
+        <label><span>{t("messaging.slackBotToken")}</span><input type="password" value={slackBotToken} onChange={(event) => setSlackBotToken(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>
+        <p className="messaging-form__hint">{t("messaging.slackScopes")}</p>
+      </> : <label><span>{t(credentialLabel)}</span><input ref={inputRef} type="password" value={secret} onChange={(event) => setSecret(event.target.value)} autoComplete="new-password" spellCheck={false} /></label>}
       <label className="messaging-choice-row"><CheckboxControl checked={enable} onChange={(event) => setEnable(event.target.checked)} aria-label={t("messaging.enableAfterSave")} /><span>{t("messaging.enableAfterSave")}</span></label>
-      <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t(secretSafety)}</p>
-      <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={secret.trim() === "" || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
+      <p className="messaging-form__secure"><KeyRound aria-hidden="true" />{t(slack ? "messaging.slackSecretSafety" : secretSafety)}</p>
+      <div className="modal__actions"><Button onClick={close}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
     </form>
   </Modal>;
 }
@@ -1180,6 +1270,51 @@ function DiscordConfigurationDialog({ open, connection, busy, t, onClose, onSubm
   </Modal>;
 }
 
+function SlackConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
+  readonly open: boolean;
+  readonly connection: MessagingConnectionView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onSubmit: (ownerId: string, configuration: SlackMessagingConfigurationView) => void;
+}): JSX.Element {
+  const initial = connection.slackConfiguration ?? DEFAULT_SLACK_CONFIGURATION;
+  const [ownerId, setOwnerId] = useState(connection.ownerProviderUserId ?? "");
+  const [lifecycleAnnouncements, setLifecycleAnnouncements] = useState(initial.lifecycleAnnouncements);
+  const [emoji, setEmoji] = useState(initial.emojiReactions);
+  const [groups, setGroups] = useState(groupActivationText(initial.groupActivation));
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const current = connection.slackConfiguration ?? DEFAULT_SLACK_CONFIGURATION;
+    setOwnerId(connection.ownerProviderUserId ?? "");
+    setLifecycleAnnouncements(current.lifecycleAnnouncements);
+    setEmoji(current.emojiReactions);
+    setGroups(groupActivationText(current.groupActivation));
+  }, [connection, open]);
+  const parsedGroups = parseSlackGroupActivation(groups);
+  const valid = validSlackOwnerId(ownerId.trim()) && parsedGroups !== undefined;
+  return <Modal open={open} title={t("messaging.slackConfigureTitle")} description={t("messaging.slackConfigureBody")} closeLabel={t("common.close")} onClose={onClose} initialFocus={() => inputRef.current} showClose size="large">
+    <form className="messaging-form messaging-form--grid" onSubmit={(event) => {
+      event.preventDefault();
+      if (valid && parsedGroups !== undefined) onSubmit(ownerId.trim(), {
+        lifecycleAnnouncements,
+        emojiReactions: emoji,
+        groupActivation: parsedGroups
+      });
+    }}>
+      <label className="messaging-form__wide"><span>{t("messaging.slackOwnerId")}</span><input ref={inputRef} value={ownerId} onChange={(event) => setOwnerId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+      <label><span>{t("messaging.emojiReactions")}</span><SelectControl value={emoji} onChange={(event) => setEmoji(event.target.value as typeof emoji)}><option value="off">{t("common.off")}</option><option value="minimal">{t("messaging.reactionsMinimal")}</option><option value="expressive">{t("messaging.reactionsExpressive")}</option></SelectControl></label>
+      <label className="messaging-choice-row"><CheckboxControl checked={lifecycleAnnouncements} onChange={(event) => setLifecycleAnnouncements(event.target.checked)} aria-label={t("messaging.lifecycleAnnouncements")} /><span>{t("messaging.lifecycleAnnouncements")}</span></label>
+      <p className="messaging-form__hint">{t("messaging.lifecycleAnnouncementsBody")}</p>
+      <label className="messaging-form__wide"><span>{t("messaging.slackGroupActivation")}</span><textarea value={groups} onChange={(event) => setGroups(event.target.value)} rows={5} placeholder={"C12345678=mention\nG12345678=always"} aria-invalid={parsedGroups === undefined} /></label>
+      <p className="messaging-form__hint messaging-form__wide">{parsedGroups === undefined ? t("messaging.slackGroupActivationInvalid") : t("messaging.slackGroupActivationBody")}</p>
+      <p className="messaging-form__warning messaging-form__wide">{t("messaging.slackGroupSafety")}</p>
+      <div className="modal__actions messaging-form__wide"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={!valid || busy}>{busy ? <Spinner /> : null}{t("common.save")}</Button></div>
+    </form>
+  </Modal>;
+}
+
 function DingTalkConfigurationDialog({ open, connection, busy, t, onClose, onSubmit }: {
   readonly open: boolean;
   readonly connection: MessagingConnectionView;
@@ -1312,13 +1447,15 @@ function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }
   const appSecret = connection.channel === "feishu" || connection.channel === "lark" || connection.channel === "wecom";
   const title = dingtalk ? "messaging.dingtalkClearTitle"
     : connection.channel === "wechat" ? "messaging.wechatClearTitle"
+    : connection.channel === "slack" ? "messaging.slackClearTitle"
     : connection.channel === "wecom" ? "messaging.wecomClearTitle"
       : appSecret ? "messaging.appSecretClearTitle" : "messaging.clearTitle";
   const action = dingtalk ? "messaging.dingtalkClearCredential"
     : connection.channel === "wechat" ? "messaging.wechatClearCredential"
+    : connection.channel === "slack" ? "messaging.slackClearCredential"
     : connection.channel === "wecom" ? "messaging.wecomClearCredential"
       : appSecret ? "messaging.appSecretClearCredential" : "messaging.clearCredential";
-  return <Modal open={open} title={t(title)} description={t(connection.channel === "wechat" ? "messaging.wechatClearBody" : "messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
+  return <Modal open={open} title={t(title)} description={t(connection.channel === "wechat" ? "messaging.wechatClearBody" : connection.channel === "slack" ? "messaging.slackClearBody" : "messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
     <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(action)}</Button></div>
   </Modal>;
 }
@@ -1450,6 +1587,18 @@ function parseDiscordGroupActivation(value: string): Record<string, "mention" | 
   return result;
 }
 
+function parseSlackGroupActivation(value: string): Record<string, "mention" | "always" | "disabled"> | undefined {
+  const result: Record<string, "mention" | "always" | "disabled"> = {};
+  for (const rawLine of value.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    const match = /^([CG][A-Z0-9]{8,63})\s*=\s*(mention|always|disabled)$/u.exec(line);
+    if (match === null || Object.hasOwn(result, match[1]!)) return undefined;
+    result[match[1]!] = match[2]! as "mention" | "always" | "disabled";
+  }
+  return result;
+}
+
 function parseDingTalkGroupActivation(value: string): Record<string, "mention" | "always" | "disabled"> | undefined {
   const result: Record<string, "mention" | "always" | "disabled"> = {};
   for (const rawLine of value.split(/\r?\n/u)) {
@@ -1495,6 +1644,15 @@ function validWeComBotId(value: string): boolean {
     && !/[\u0000-\u001f\u007f]/u.test(normalized);
 }
 
+function validSlackOwnerId(value: string): boolean {
+  return /^[UW][A-Z0-9]{8,63}$/u.test(value);
+}
+
+function validSlackToken(value: string, prefix: "xapp-" | "xoxb-"): boolean {
+  return value.startsWith(prefix) && value.length > prefix.length && value.length <= 8_192
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
 function telegramConfigurationEqual(
   left: TelegramMessagingConfigurationView | undefined,
   right: TelegramMessagingConfigurationView | undefined
@@ -1515,6 +1673,16 @@ function discordConfigurationEqual(
     && left.emojiReactions === right.emojiReactions
     && left.replyQuoteDm === right.replyQuoteDm
     && left.replyQuoteGroup === right.replyQuoteGroup
+    && activationRulesEqual(left.groupActivation, right.groupActivation);
+}
+
+function slackConfigurationEqual(
+  left: SlackMessagingConfigurationView | undefined,
+  right: SlackMessagingConfigurationView | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.lifecycleAnnouncements === right.lifecycleAnnouncements
+    && left.emojiReactions === right.emojiReactions
     && activationRulesEqual(left.groupActivation, right.groupActivation);
 }
 
@@ -1549,6 +1717,9 @@ function wecomConfigurationEqual(
 }
 
 function messagingCredentialActionLabel(connection: MessagingConnectionView, t: Translator): string {
+  if (connection.channel === "slack") {
+    return t(connection.credentialConfigured ? "messaging.slackReplaceCredential" : "messaging.slackAddCredential");
+  }
   if (connection.channel === "dingtalk") {
     return t(connection.credentialConfigured ? "messaging.dingtalkReplaceCredential" : "messaging.dingtalkAddCredential");
   }

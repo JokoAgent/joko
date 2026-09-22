@@ -45,6 +45,15 @@ describe("translate", () => {
     expect(translate("en-XA", "messaging.wechatStatus.expired")).toMatch(/^［.*··］$/u);
   });
 
+  it("localizes Slack owner, paired-token, channel policy, and recovery across three locales", () => {
+    expect(translate("en", "messaging.addSlack")).toBe("Add Slack");
+    expect(translate("en", "messaging.slackSecretSafety")).toContain("one protected upload");
+    expect(translate("en", "messaging.slackScopes")).toContain("connections:write");
+    expect(translate("zh-CN", "messaging.slackOwnerIdBody")).toContain("U 或 W");
+    expect(translate("zh-CN", "messaging.slackClearBody")).toContain("两个令牌");
+    expect(translate("en-XA", "messaging.slackGroupSafety")).toMatch(/^［.*··］$/u);
+  });
+
   it("keeps every shared Backend surface neutral while retaining Pi-owned feature names", () => {
     const sharedKeys = [
       "session.deleteWarning",

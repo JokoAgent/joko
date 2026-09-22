@@ -21,6 +21,10 @@ import {
   type MessagingDownloadedAttachment,
   type MessagingGroupObservation,
   type MessagingInboundAttachment,
+  type SlackNormalizationResult,
+  type SlackPollResult,
+  type SlackSocketUpdate,
+  type SlackTransportOptions,
   type TelegramNormalizationResult,
   type TelegramPollResult,
   type TelegramTransportOptions,
@@ -46,6 +50,7 @@ import { CredentialVault } from "./credential-vault.js";
 import {
   DEFAULT_DISCORD_MESSAGING_CONFIGURATION,
   DEFAULT_FEISHU_MESSAGING_CONFIGURATION,
+  DEFAULT_SLACK_MESSAGING_CONFIGURATION,
   DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION,
   MessagingManager,
   type DingTalkMessagingConfiguration,
@@ -63,6 +68,176 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it("orders a fast failed Slack run's accepted and terminal reactions after durable ACK", async () => {
+    const transport = new FastFailureSlackTransport();
+    const fixture = await createFixture(
+      undefined, () => new FastFailureAdapter(), undefined, undefined, undefined, undefined,
+      undefined, undefined, () => transport
+    );
+    fixture.manager.putRoute({
+      targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
+    });
+    const created = fixture.manager.createSlackConnection({ ownerProviderUserId: "U12345678" });
+    const ticket = fixture.manager.beginCredentialUpload({
+      clientConnectionId: "desktop-one",
+      messagingConnectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation
+    });
+    fixture.credentials.upload(ticket.credentialUploadTicketId, JSON.stringify({
+      format: 1, appToken: "xapp-12345678901", botToken: "xoxb-12345678901"
+    }), "desktop-one");
+    const enabled = await fixture.manager.commitCredential({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      clientConnectionId: "desktop-one",
+      enable: true
+    });
+    await vi.waitFor(() => {
+      expect(transport.acknowledged).toBe(true);
+      expect(fixture.store.listMessagingInboundRequests({ connectionId: enabled.id }))
+        .toContainEqual(expect.objectContaining({ status: "failed" }));
+      expect(transport.reactions).toEqual(["👀", null, "👎"]);
+    }, { timeout: 5_000 });
+  });
+
+  it("acknowledges a stale Slack action without creating a new conversation or task", async () => {
+    const transport = new StaleActionSlackTransport();
+    const fixture = await createFixture(
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, () => transport
+    );
+    const created = fixture.manager.createSlackConnection({
+      ownerProviderUserId: "U12345678",
+      configuration: { ...DEFAULT_SLACK_MESSAGING_CONFIGURATION, lifecycleAnnouncements: false }
+    });
+    const ticket = fixture.manager.beginCredentialUpload({
+      clientConnectionId: "desktop-one", messagingConnectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation
+    });
+    fixture.credentials.upload(ticket.credentialUploadTicketId, JSON.stringify({
+      format: 1, appToken: "xapp-12345678901", botToken: "xoxb-12345678901"
+    }), "desktop-one");
+    await fixture.manager.commitCredential({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      clientConnectionId: "desktop-one", enable: true
+    });
+    await vi.waitFor(() => expect(transport.acknowledged).toBe(true), { timeout: 5_000 });
+    expect(fixture.store.listMessagingConversations()).toEqual([]);
+    expect(fixture.store.listSessions()).toEqual([]);
+  });
+
+  it("claims Slack button and exact text replies before Socket ACK without admitting another task", async () => {
+    const transport = new InteractiveSlackTransport();
+    const adapter = new SequentialInteractionAdapter();
+    const fixture = await createFixture(
+      undefined, () => adapter, undefined, undefined, undefined, undefined,
+      undefined, undefined, () => transport
+    );
+    transport.captureAck = () => ({
+      inboundStatuses: fixture.store.listMessagingInboundRequests().map((request) => request.status),
+      interactions: fixture.store.listMessagingInteractions().map((interaction) => ({
+        providerMessageId: interaction.providerMessageId,
+        status: interaction.status
+      })),
+      sessionCount: fixture.store.listSessions().length
+    });
+    fixture.manager.putRoute({
+      targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
+    });
+    const created = fixture.manager.createSlackConnection({ ownerProviderUserId: "U12345678" });
+    const ticket = fixture.manager.beginCredentialUpload({
+      clientConnectionId: "desktop-one", messagingConnectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation
+    });
+    fixture.credentials.upload(ticket.credentialUploadTicketId, JSON.stringify({
+      format: 1, appToken: "xapp-12345678901", botToken: "xoxb-12345678901"
+    }), "desktop-one");
+    const enabled = await fixture.manager.commitCredential({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      clientConnectionId: "desktop-one", enable: true
+    });
+
+    await vi.waitFor(() => expect(adapter.decisions).toEqual([
+      { kind: "selected", value: "allow_once" },
+      {
+        kind: "question",
+        answers: {
+          name: { kind: "text", value: "Alice" },
+          confirm: { kind: "boolean", value: true }
+        }
+      }
+    ]), { timeout: 5_000 });
+    expect(transport.sentInteractionCards).toHaveLength(2);
+    expect(transport.sentInteractionCards[0]?.buttons).toEqual([
+      { label: "allow_once", actionValue: expect.any(String) },
+      { label: "deny_once", actionValue: expect.any(String) }
+    ]);
+    expect(transport.sentInteractionCards[1]?.buttons).toEqual([]);
+    expect(transport.interactionAnswers).toEqual(["Response recorded."]);
+    expect(transport.ackSnapshots).toHaveLength(3);
+    expect(transport.ackSnapshots[0]).toMatchObject({
+      inboundStatuses: ["queued"], interactions: [], sessionCount: 1
+    });
+    expect(transport.ackSnapshots[1]).toMatchObject({
+      interactions: [{ providerMessageId: "1234567890.999991", status: "claimed" }], sessionCount: 1
+    });
+    expect(transport.ackSnapshots[2]?.interactions).toEqual(expect.arrayContaining([
+      { providerMessageId: "1234567890.999991", status: "completed" },
+      { providerMessageId: "1234567890.543210", status: "claimed" }
+    ]));
+    expect(fixture.store.getInteraction("interaction-permission-one")).toMatchObject({ status: "resolved" });
+    expect(fixture.store.getInteraction("interaction-question-one")).toMatchObject({ status: "resolved" });
+    expect(fixture.store.listMessagingInteractions({ connectionId: enabled.id })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ providerMessageId: "1234567890.999991", status: "completed" }),
+      expect.objectContaining({ providerMessageId: "1234567890.543210", status: "completed" })
+    ]));
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: enabled.id })).toHaveLength(1);
+    expect(fixture.store.listSessions()).toHaveLength(1);
+  });
+
+  it("keeps a strict Slack workspace configuration and atomic dual-token credential private", async () => {
+    const fixture = await createFixture();
+    expect(() => fixture.manager.createSlackConnection({ ownerProviderUserId: "not-a-user" }))
+      .toThrow(/Slack owner/u);
+    const created = fixture.manager.createSlackConnection({ ownerProviderUserId: "U12345678" });
+    expect(created.configuration).toEqual(DEFAULT_SLACK_MESSAGING_CONFIGURATION);
+    await expect(fixture.manager.replaceSlackConfiguration({
+      connectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation,
+      ownerProviderUserId: "U12345678",
+      configuration: {
+        ...DEFAULT_SLACK_MESSAGING_CONFIGURATION,
+        groupActivation: { invalid: "always" }
+      }
+    })).rejects.toMatchObject({ code: "invalid" });
+    const ticket = fixture.manager.beginCredentialUpload({
+      clientConnectionId: "desktop-one",
+      messagingConnectionId: created.id,
+      expectedRevision: created.revision,
+      expectedGeneration: created.generation
+    });
+    const bundle = { format: 1, appToken: "xapp-12345678901", botToken: "xoxb-12345678901" };
+    fixture.credentials.upload(ticket.credentialUploadTicketId, JSON.stringify(bundle), "desktop-one");
+    const configured = await fixture.manager.commitCredential({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      clientConnectionId: "desktop-one",
+      enable: false
+    });
+    expect(configured.generation).toBe(created.generation + 1);
+    expect(configured.ownerProviderUserId).toBe("U12345678");
+    expect(JSON.stringify(configured, (_key, value) => typeof value === "bigint" ? value.toString() : value))
+      .not.toContain(bundle.appToken);
+    expect(fixture.credentials.resolve(configured.credentialReferenceId!)).toBe(JSON.stringify(bundle));
+    const cleared = await fixture.manager.clearCredential({
+      connectionId: configured.id,
+      expectedRevision: configured.revision,
+      expectedGeneration: configured.generation
+    });
+    expect(cleared.ownerProviderUserId).toBe("U12345678");
+    expect(fixture.credentials.find(configured.credentialReferenceId!)).toBeUndefined();
+  });
+
   it("seals confirmed WeChat authorization without exposing token or accepting generic credential upload", async () => {
     const fixture = await createFixture();
     const created = fixture.manager.createWeChatConnection();
@@ -780,7 +955,7 @@ describe("MessagingManager", () => {
 
   it("resolves DingTalk permission and question interactions from lane-scoped text without a second Queue turn", async () => {
     const transport = new InteractiveDingTalkTransport();
-    const adapter = new DingTalkInteractionAdapter();
+    const adapter = new SequentialInteractionAdapter();
     const fixture = await createFixture(undefined, () => adapter, undefined, () => transport);
     fixture.manager.putRoute({
       targetId: "target-one",
@@ -1063,7 +1238,7 @@ describe("MessagingManager", () => {
 
   it("resolves WeCom permission and question interactions from owner text without opening another task", async () => {
     const transport = new InteractiveWeComTransport();
-    const adapter = new DingTalkInteractionAdapter();
+    const adapter = new SequentialInteractionAdapter();
     const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, () => transport);
     fixture.manager.putRoute({
       targetId: "target-one",
@@ -1233,6 +1408,214 @@ class StableEmptyTelegramTransport extends FakeTelegramTransport {
     await new Promise((resolve) => setTimeout(resolve, 1));
     input.signal?.throwIfAborted();
     return { updates: [], nextCursor: input.cursor ?? "1" };
+  }
+}
+
+class FastFailureSlackTransport {
+  readonly channel = "slack" as const;
+  readonly reactions: Array<string | null> = [];
+  acknowledged = false;
+  #connectionId = "";
+  #generation = 0;
+  #delivered = false;
+
+  get connectionId(): string { return this.#connectionId; }
+  get generation(): number { return this.#generation; }
+
+  bind(options: SlackTransportOptions): this {
+    this.#connectionId = options.connectionId;
+    this.#generation = options.generation;
+    return this;
+  }
+
+  async probe() {
+    return {
+      channel: "slack" as const,
+      connectionId: this.#connectionId,
+      generation: this.#generation,
+      providerAccountId: "T12345678",
+      displayName: "Joko Slack test bot",
+      username: "joko_test_bot",
+      teamId: "T12345678",
+      botUserId: "U87654321",
+      ownerConversationId: "T12345678/D12345678"
+    };
+  }
+
+  async poll(input: { readonly signal?: AbortSignal }): Promise<SlackPollResult> {
+    if (!this.#delivered) {
+      this.#delivered = true;
+      return { updates: [{} as SlackSocketUpdate], nextCursor: "slack-cursor-1", envelopeId: "slack-envelope-1" };
+    }
+    return waitForAbort(input.signal);
+  }
+
+  normalize(_updates: readonly SlackSocketUpdate[]): SlackNormalizationResult {
+    return {
+      events: [{
+        kind: "message",
+        providerRequestIds: ["slack:event:one", "slack:message:one"],
+        messageId: "1234567890.123456",
+        address: this.ownerAddress(),
+        speaker: {
+          providerUserId: "U12345678", displayName: "Owner", username: "owner", isBot: false, isOwner: true
+        },
+        occurredAt: Date.now(),
+        text: "Fail this task promptly.",
+        ambient: false,
+        protectedContent: false,
+        attachments: [],
+        unsupported: [],
+        replyContext: null
+      }],
+      groupObservations: [],
+      ignored: []
+    };
+  }
+
+  async acknowledge(): Promise<void> { this.acknowledged = true; }
+
+  ownerAddress(): MessagingAddress {
+    return {
+      channel: "slack",
+      connectionId: this.#connectionId,
+      providerConversationId: "T12345678/D12345678",
+      providerThreadId: null,
+      conversationKind: "direct"
+    };
+  }
+
+  async downloadAttachment(): Promise<MessagingDownloadedAttachment> {
+    throw new Error("No Slack attachment was expected.");
+  }
+  async sendTextPart(input: { readonly address: MessagingAddress }) {
+    return { providerMessageId: "1234567890.999999", address: input.address };
+  }
+  async sendAttachments(input: { readonly address: MessagingAddress }) {
+    return { providerMessageId: "1234567890.999998", address: input.address };
+  }
+  async sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }) {
+    return { providerMessageId: "1234567890.999997", address: input.address };
+  }
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+  async sendTyping(): Promise<void> {}
+  async setReaction(input: { readonly emoji: string | null }): Promise<void> { this.reactions.push(input.emoji); }
+  async answerInteraction(_input: { readonly text?: string }): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+class StaleActionSlackTransport extends FastFailureSlackTransport {
+  override normalize(_updates: readonly SlackSocketUpdate[]): SlackNormalizationResult {
+    return {
+      events: [{
+        kind: "interaction",
+        providerRequestIds: ["slack:interaction:stale"],
+        interactionId: "slack:action:stale",
+        messageId: "1234567890.123456",
+        address: this.ownerAddress(),
+        speaker: {
+          providerUserId: "U12345678", displayName: "Owner", username: "owner", isBot: false, isOwner: true
+        },
+        actionValue: "stale-choice",
+        occurredAt: Date.now()
+      }],
+      groupObservations: [],
+      ignored: []
+    };
+  }
+}
+
+class InteractiveSlackTransport extends FastFailureSlackTransport {
+  readonly sentInteractionCards: Array<{
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }> = [];
+  readonly interactionAnswers: string[] = [];
+  readonly ackSnapshots: Array<{
+    readonly inboundStatuses: readonly string[];
+    readonly interactions: readonly { readonly providerMessageId: string | null; readonly status: string }[];
+    readonly sessionCount: number;
+  }> = [];
+  captureAck?: () => (typeof this.ackSnapshots)[number];
+  #nextStage = 0;
+
+  override async poll(input: { readonly signal?: AbortSignal }): Promise<SlackPollResult> {
+    const stage = this.#nextStage;
+    if (stage >= 3) return waitForAbort(input.signal);
+    while (stage > 0 && this.sentInteractionCards.length < stage) {
+      input.signal?.throwIfAborted();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    this.#nextStage += 1;
+    return {
+      updates: [{} as SlackSocketUpdate],
+      nextCursor: `slack-cursor-${this.#nextStage}`,
+      envelopeId: `slack-envelope-${this.#nextStage}`
+    };
+  }
+
+  override normalize(_updates: readonly SlackSocketUpdate[]): SlackNormalizationResult {
+    if (this.#nextStage === 1) return super.normalize(_updates);
+    if (this.#nextStage === 2) {
+      const card = this.sentInteractionCards[0];
+      if (card?.buttons[0] === undefined) throw new Error("Slack permission card is missing its action.");
+      return {
+        events: [{
+          kind: "interaction",
+          providerRequestIds: ["slack:interaction:permission"],
+          interactionId: "slack:action:permission",
+          messageId: "1234567890.999991",
+          address: this.ownerAddress(),
+          speaker: {
+            providerUserId: "U12345678", displayName: "Owner", username: "owner", isBot: false, isOwner: true
+          },
+          actionValue: card.buttons[0].actionValue,
+          occurredAt: Date.now()
+        }],
+        groupObservations: [], ignored: []
+      };
+    }
+    return {
+      events: [{
+        kind: "message",
+        providerRequestIds: ["slack:event:question-reply"],
+        messageId: "1234567890.543210",
+        address: this.ownerAddress(),
+        speaker: {
+          providerUserId: "U12345678", displayName: "Owner", username: "owner", isBot: false, isOwner: true
+        },
+        occurredAt: Date.now(),
+        text: "name: Alice\nconfirm: yes",
+        ambient: false, protectedContent: false, attachments: [], unsupported: [], replyContext: null
+      }],
+      groupObservations: [], ignored: []
+    };
+  }
+
+  override async acknowledge(): Promise<void> {
+    const snapshot = this.captureAck?.();
+    if (snapshot !== undefined) this.ackSnapshots.push(snapshot);
+    await super.acknowledge();
+  }
+
+  override async sendInteractionCard(input: {
+    readonly address: MessagingAddress;
+    readonly text: string;
+    readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
+  }) {
+    this.sentInteractionCards.push(input);
+    return { providerMessageId: `1234567890.99999${this.sentInteractionCards.length}`, address: input.address };
+  }
+
+  override async answerInteraction(input: { readonly text?: string }): Promise<void> {
+    this.interactionAnswers.push(input.text ?? "");
   }
 }
 
@@ -2447,6 +2830,14 @@ class SlowFakeAdapter extends FakeBackendAdapter {
   }
 }
 
+class FastFailureAdapter extends FakeBackendAdapter {
+  constructor() { super(PI_LIKE_PROFILE); }
+
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    queueMicrotask(() => void context.emit({ type: "done", outcome: "failed" }));
+  }
+}
+
 class PermissionFakeAdapter extends FakeBackendAdapter {
   decision: InteractionDecision | undefined;
 
@@ -2530,7 +2921,7 @@ class QuestionFakeAdapter extends FakeBackendAdapter {
   }
 }
 
-class DingTalkInteractionAdapter extends FakeBackendAdapter {
+class SequentialInteractionAdapter extends FakeBackendAdapter {
   readonly decisions: InteractionDecision[] = [];
 
   constructor() {
@@ -2540,7 +2931,7 @@ class DingTalkInteractionAdapter extends FakeBackendAdapter {
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
     queueMicrotask(() => void (async () => {
       this.decisions.push(await context.requestInteraction({
-        id: "ding-permission-one",
+        id: "interaction-permission-one",
         kind: "permission",
         title: "Run command",
         toolName: "shell",
@@ -2549,7 +2940,7 @@ class DingTalkInteractionAdapter extends FakeBackendAdapter {
         choices: ["allow_once", "deny_once"]
       }));
       this.decisions.push(await context.requestInteraction({
-        id: "ding-question-one",
+        id: "interaction-question-one",
         kind: "question",
         title: "Configure the run",
         prompt: "Answer every required field.",
@@ -2570,7 +2961,7 @@ class DingTalkInteractionAdapter extends FakeBackendAdapter {
       await context.emit({
         type: "message_complete",
         role: "assistant",
-        blocks: [{ kind: "text", text: "DingTalk interactions resolved." }]
+        blocks: [{ kind: "text", text: "Interactions resolved." }]
       });
       await context.emit({ type: "done", outcome: "completed" });
     })());
@@ -2585,7 +2976,8 @@ async function createFixture(
   feishuTransportFactory?: (options: FeishuTransportOptions) => FakeFeishuTransport,
   weComTransportFactory?: (options: WeComTransportOptions) => FakeWeComTransport,
   weChatTransportFactory?: (options: WeChatTransportOptions) => FakeWeChatTransport,
-  weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"]
+  weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"],
+  slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -2643,6 +3035,9 @@ async function createFixture(
     }),
     ...(weChatTransportFactory === undefined ? {} : {
       createWeChatTransport: (input) => weChatTransportFactory(input).bind(input)
+    }),
+    ...(slackTransportFactory === undefined ? {} : {
+      createSlackTransport: (input) => slackTransportFactory(input).bind(input)
     })
   };
   manager = new MessagingManager(options);

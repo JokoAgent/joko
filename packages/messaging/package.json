@@ -10,7 +10,8 @@
     "./feishu": "./src/feishu/index.ts",
     "./telegram": "./src/telegram/index.ts",
     "./wecom": "./src/wecom/index.ts",
-    "./wechat": "./src/wechat/index.ts"
+    "./wechat": "./src/wechat/index.ts",
+    "./slack": "./src/slack/index.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
