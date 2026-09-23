@@ -1069,7 +1069,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       const request: GamepadInspectorRequest = {
         requestId: ++inspectorGamepadRequestIdRef.current, action, sessionId: owner.id,
         sessionGeneration: owner.generation, connectionGeneration: state.snapshot.generation,
-        profileId: state.activeProfile.id
+        profileId: state.activeProfile.id,
+        navigationRevision: (state.navigationRevision ?? 0) + Number(activeSession?.id !== owner.id)
       };
       if (activeSession?.id === owner.id) setInspectorGamepadRequest(request);
       else void navigateFromApplicationMenu({ kind: "session", sessionId: owner.id }).then((allowed) => {

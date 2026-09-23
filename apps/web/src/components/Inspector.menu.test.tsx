@@ -46,6 +46,7 @@ afterEach(async () => {
   document.documentElement.style.removeProperty("--inspector-width");
   sortableMock.MockSortable.instances.length = 0;
   sortableMock.MockSortable.active = null;
+  vi.restoreAllMocks();
 });
 
 describe("Inspector menus", () => {
@@ -276,6 +277,12 @@ describe("Inspector menus", () => {
 
   it("binds gamepad terminal, browser and changes commands to the exact current task", async () => {
     const colors = vi.spyOn(window, "getComputedStyle").mockReturnValue({ getPropertyValue: () => "#123456" } as unknown as CSSStyleDeclaration);
+    const focused = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const pane = document.body.appendChild(document.createElement("main"));
+    pane.className = "session-pane";
+    pane.dataset.gamepadSessionId = "session-one";
+    const taskButton = pane.appendChild(document.createElement("button"));
+    taskButton.focus();
     const host = document.body.appendChild(document.createElement("div"));
     const root = createRoot(host); roots.push(root);
     const base = emptySnapshot();
@@ -289,13 +296,14 @@ describe("Inspector menus", () => {
     const setInspectorOpen = vi.fn(async () => undefined);
     const consumed = vi.fn();
     const errors: unknown[] = [];
-    const controller = { state: { connectionState: "connected", activeProfile: { id: "profile", serverId: "server" }, snapshot, preferences: DEFAULT_UI_PREFERENCES },
+    const state = { connectionState: "connected", activeProfile: { id: "profile", serverId: "server" }, snapshot, preferences: DEFAULT_UI_PREFERENCES, navigationRevision: 0 };
+    const controller = { state,
       getTerminalCapabilities: vi.fn(async () => ({ support: "supported", shells: [{ id: "auto", label: "Shell" }], defaultShellId: "auto", maximumTerminals: 16,
         maximumInputBytes: 65536, maximumColumns: 500, maximumRows: 200 })),
       listTerminals: vi.fn(async () => []), createTerminal, openBrowserPage, setInspectorOpen, releaseArtifactUrl: vi.fn()
     } as unknown as AppController;
     const request = (requestId: number, action: GamepadInspectorRequest["action"], sessionGeneration = 1n): GamepadInspectorRequest => ({
-      requestId, action, sessionId: "session-one", sessionGeneration, connectionGeneration: snapshot.generation, profileId: "profile"
+      requestId, action, sessionId: "session-one", sessionGeneration, connectionGeneration: snapshot.generation, profileId: "profile", navigationRevision: 0
     });
     const render = async (gamepadRequest?: GamepadInspectorRequest): Promise<void> => act(async () => root.render(<Inspector
       controller={controller} snapshot={snapshot} session={session()} timeline={[]} open t={t} gamepadRequest={gamepadRequest}
@@ -304,16 +312,26 @@ describe("Inspector menus", () => {
     await render(); await settle();
     await render(request(1, "open-terminal", 2n));
     expect(createTerminal).not.toHaveBeenCalled();
+    taskButton.focus();
     await render(request(2, "open-terminal")); await settle();
     expect(createTerminal).toHaveBeenCalledExactlyOnceWith("session-one", expect.any(String), "auto", 80, 24, expect.anything());
+    taskButton.focus();
     await render(request(3, "open-browser-tab")); await settle();
     expect(openBrowserPage).toHaveBeenCalledExactlyOnceWith("browser-one", "session-one", "about:blank");
     expect(host.querySelector('[data-tab-kind="browser"]:not([hidden])')).not.toBeNull();
+    taskButton.focus();
     await render(request(4, "toggle-review-tab")); await settle();
     expect(host.querySelector('[data-tab-kind="changes"]:not([hidden])')).not.toBeNull();
+    taskButton.focus();
     await render(request(5, "toggle-review-tab")); await settle();
     expect(host.querySelector('[data-tab-kind="changes"]')).toBeNull();
-    expect(consumed.mock.calls.map(([id]) => id)).toEqual([1, 2, 3, 4, 5]);
+    focused.mockReturnValue(false);
+    await render(request(6, "open-browser-tab")); await settle();
+    focused.mockReturnValue(true);
+    state.navigationRevision = 1;
+    await render(request(7, "open-browser-tab")); await settle();
+    expect(openBrowserPage).toHaveBeenCalledTimes(1);
+    expect(consumed.mock.calls.map(([id]) => id)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(errors).toEqual([]);
     colors.mockRestore();
   });

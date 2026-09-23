@@ -84,7 +84,7 @@ import { AuthenticatedImage, Button, IconButton, Modal, Pill, Spinner, StatusDot
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { GAMEPAD_PANEL_EVENT } from "../gamepad-client.js";
-import type { GamepadInspectorRequest } from "../gamepad-actions.js";
+import { gamepadInspectorRequestOwned, type GamepadInspectorRequest } from "../gamepad-actions.js";
 import { isSessionApplicationWindow } from "../session-window-navigation.js";
 import { CLIENT_LAYOUT_RESET_EVENT } from "../client-layout-reset.js";
 import { installCurrentWindowActivationClickGuard } from "../window-activation-click.js";
@@ -758,13 +758,20 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     lastGamepadRequestRef.current = request.requestId;
     onGamepadRequestConsumed?.(request.requestId);
     if (controller.state.connectionState !== "connected" || controller.state.activeProfile?.id !== request.profileId
+      || (controller.state.navigationRevision ?? 0) !== request.navigationRevision
       || snapshot.generation !== request.connectionGeneration || session.generation !== request.sessionGeneration
-      || session.archived) return;
+      || session.archived || !gamepadInspectorRequestOwned(document, request)) return;
     if (request.action === "open-terminal") {
       if (!canTerminal && !bucket.tabs.some((tab) => tab.kind === "terminal")) {
         runAction(`gamepad-terminal:${session.id}`, () => controller.setInspectorOpen(true));
         return;
       }
+      if (!bucket.tabs.some((tab) => tab.kind === "terminal")
+        && bucket.tabs.filter((tab) => tab.kind === "terminal").length >= (terminalCapabilities?.maximumTerminals ?? 0)) {
+        runAction(`gamepad-terminal:${session.id}`, async () => { throw new Error(t("settings.gamepad.terminalLimit")); });
+        return;
+      }
+      runAction(`gamepad-terminal:${session.id}`, () => controller.setInspectorOpen(true));
       openTerminal(true);
       return;
     }
@@ -788,6 +795,8 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     runAction(`gamepad-browser:${session.id}`, async () => {
       const pageId = await controller.openBrowserPage(browser.id, session.id, "about:blank");
       if (terminalOwnerRef.current !== terminalOwner || inspectorControllerRef.current.state.connectionState !== "connected"
+        || (inspectorControllerRef.current.state.navigationRevision ?? 0) !== request.navigationRevision
+        || !gamepadInspectorRequestOwned(document, request)
         || inspectorControllerRef.current.state.snapshot.generation !== request.connectionGeneration
         || inspectorControllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === request.sessionId)?.generation !== request.sessionGeneration) return;
       setGamepadBrowserFocusRequest({ sessionId: session.id, browserId: browser.id, pageId, requestId: request.requestId });

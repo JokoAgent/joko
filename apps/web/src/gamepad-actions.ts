@@ -10,9 +10,17 @@ export interface GamepadInspectorRequest {
   readonly sessionGeneration: bigint;
   readonly connectionGeneration: bigint;
   readonly profileId: string;
+  readonly navigationRevision: number;
 }
 export function isGamepadInspectorAction(action: GamepadAction): action is GamepadInspectorAction {
   return (GAMEPAD_INSPECTOR_ACTIONS as readonly string[]).includes(action);
+}
+
+export function gamepadInspectorRequestOwned(doc: Document, request: GamepadInspectorRequest): boolean {
+  return doc.visibilityState === "visible" && doc.hasFocus()
+    && !doc.body.classList.contains("modal-open") && doc.body.dataset.appShortcutRecording !== "1"
+    && doc.querySelector("[data-gamepad-preview]") === null
+    && currentGamepadTaskRoot(doc)?.dataset.gamepadSessionId === request.sessionId;
 }
 
 export const GAMEPAD_OWNED_ACTIONS = [
