@@ -1,4 +1,4 @@
-import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, type DocsThemeName } from "@joko/tool-document";
+import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, type DocsThemeName } from "@joko/tool-document";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
@@ -127,6 +127,25 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
     additionalProperties: false
   },
   requiresPermission: false
+}, {
+  serverId: DOCUMENT_TOOL_PROVIDER_ID,
+  name: "inspect_pdf",
+  runtimeName: "inspect_pdf",
+  description: "Read structural evidence from a task-local PDF: page count, paper size, rotation, text preview, paint and image operations, and structurally blank pages. Inspect at most 50 pages per call. Continue with nextPages, inspectedThrough, previousVerdict and previousPdfSha256 until all pages are covered. Structural inspection does not confirm visual layout.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .pdf path." },
+      pages: { type: "array", maxItems: 50, items: { type: "integer", minimum: 1 }, description: "One-based pages to inspect; defaults to the first maxPages pages." },
+      inspectedThrough: { type: "integer", minimum: 0, default: 0, description: "Previous contiguous coverage cursor." },
+      previousVerdict: { type: "string", enum: ["ok", "blank", "partial-blank", "warning", "incomplete"], description: "Verdict returned by the previous batch." },
+      previousPdfSha256: { type: "string", pattern: "^[a-f0-9]{64}$", description: "SHA-256 returned by the previous batch." },
+      maxPages: { type: "integer", minimum: 1, maximum: 50, default: 10 }
+    },
+    required: ["path"],
+    additionalProperties: false
+  },
+  requiresPermission: false
 }]);
 
 export interface DocumentToolPublisher {
@@ -168,11 +187,12 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   async callTool(name: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx" && name !== "read_sheet") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
+      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx" && name !== "read_sheet" && name !== "inspect_pdf") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
       const root = this.#requireRoot(context);
       if (name === "make_pptx") return await this.#makePptx(args, root, signal, context);
       if (name === "make_xlsx") return await this.#makeXlsx(args, root, signal, context);
       if (name === "read_sheet") return await this.#readSheet(args, root, signal, context);
+      if (name === "inspect_pdf") return await this.#inspectPdf(args, root, signal, context);
       onlyKeys(args, ["markdown", "outPath", "title", "subtitle", "cover", "theme", "overwrite"]);
       const markdown = boundedString(args["markdown"], 4 * 1024 * 1024, false, "markdown");
       const outPath = boundedString(args["outPath"], 4_096, false, "outPath");
@@ -206,7 +226,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       }, false);
     } catch (error) {
       if (signal?.aborted) throw error;
-      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof DocumentToolError) {
+      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof DocumentToolError) {
         return response({ errorCode: error.code, message: error.message,
           ...(error instanceof SheetReadError && error.available ? { available: error.available } : {}) }, true);
       }
@@ -266,6 +286,14 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   async #readSheet(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     onlyKeys(args, ["path", "sheet", "startRow", "maxRows", "startColumn", "maxColumns"]);
     const result = await readSheet(args, root, signal);
+    signal?.throwIfAborted();
+    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    return response({ ...result }, false);
+  }
+
+  async #inspectPdf(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
+    onlyKeys(args, ["path", "pages", "inspectedThrough", "previousVerdict", "previousPdfSha256", "maxPages"]);
+    const result = await inspectPdf(args, root, signal);
     signal?.throwIfAborted();
     if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
     return response({ ...result }, false);

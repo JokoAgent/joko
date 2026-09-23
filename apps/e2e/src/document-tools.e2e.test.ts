@@ -1,11 +1,30 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CredentialManager, CredentialVault, DocumentToolBridgeProvider, McpRouter, createInternalServer, createOrchestratorApplication, type OrchestratorConfig } from "@joko/orchestrator";
 import { expect, it } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+
+function visiblePdf(): Buffer {
+  const stream = "BT /F1 24 Tf 72 760 Td (Visible report) Tj ET";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [5 0 R] /Count 1 >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>"
+  ];
+  let output = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  objects.forEach((body, index) => { offsets.push(output.length); output += `${index + 1} 0 obj\n${body}\nendobj\n`; });
+  const xref = output.length;
+  output += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) output += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  output += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(output, "latin1");
+}
 
 it("creates and reads back a Word document through an authenticated task Tool bridge", async () => {
   let fixture: OrchestratorE2eFixture | undefined;
@@ -29,7 +48,7 @@ it("creates and reads back a Word document through an authenticated task Tool br
     const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
     const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
     const bridge = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${internalUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
     const call = async (markdown: string, overwrite = false) => {
       const response = await fetch(`${internalUrl}/internal/mcp`, {
         method: "POST",
@@ -98,7 +117,7 @@ it("advertises the document tool from the production application composition", a
       targetId: target.id,
       expectedPiGeneration: 1
     });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
     const response = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -172,6 +191,25 @@ it("advertises the document tool from the production application composition", a
     expect(readResponse.ok).toBe(true);
     expect(await readResponse.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
       format: "xlsx", sheet: "Results", rows: [["Total", 0.98]], totalRows: 3, truncated: false
+    } } });
+    await writeFile(join(workspace, "documents", "actual.pdf"), visiblePdf());
+    const inspectResponse = await fetch(`${url}/internal/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridge.mcpBridge.token}`,
+        "content-type": "application/json",
+        "x-joko-pi-generation": "1"
+      },
+      body: JSON.stringify({
+        requestId: randomUUID(), sessionId: "document-task", targetId: target.id, generation: 1,
+        serverId: "joko-document-tools", toolName: "inspect_pdf",
+        arguments: { path: "documents/actual.pdf" }
+      })
+    });
+    expect(inspectResponse.ok).toBe(true);
+    expect(await inspectResponse.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      numPages: 1, pagesInspected: 1, inspectedThrough: 1, verdict: "ok", blankPages: [],
+      pages: [{ page: 1, paper: "A4", textPreview: "Visible report", blank: false }]
     } } });
     bridge.revoke();
   } finally {

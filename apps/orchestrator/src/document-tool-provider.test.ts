@@ -27,7 +27,7 @@ it("binds editable document creation to the current trusted local task and stric
     }
   });
   const context = { sessionId: "session", targetId: "target", generation: 3 };
-  expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true], ["make_xlsx", true], ["read_sheet", false]]);
+  expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true], ["make_xlsx", true], ["read_sheet", false], ["inspect_pdf", false]]);
   expect(provider.includeForTarget("target")).toBe(true);
   const result = await provider.callTool("make_docx", {
     markdown: "# Heading\n\n| A | B |\n|---|---|\n| 1 | 2 |",
@@ -79,6 +79,18 @@ it("binds editable document creation to the current trusted local task and stric
       .toMatchObject({ isError: false, structuredContent: { rows: [["East", "42"]], totalRows: 3, truncated: true, nextStartRow: 3 } });
     expect((await provider.callTool("read_sheet", { path: "values.csv", unknown: true }, undefined, context)).structuredContent)
       .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+    await writeFile(join(directory, "empty.pdf"), Buffer.alloc(0));
+    expect((await provider.callTool("inspect_pdf", { path: "empty.pdf" }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "EMPTY_FILE" });
+    expect((await provider.callTool("inspect_pdf", { path: "empty.pdf", unknown: true }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+    generation = 4;
+    expect((await provider.callTool("inspect_pdf", { path: "empty.pdf" }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "STALE_SCOPE" });
+    generation = 3;
+    remote = true;
+    expect((await provider.callTool("inspect_pdf", { path: "empty.pdf" }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "STALE_SCOPE" });
     expect(published).toHaveLength(3);
   } finally {
     await rm(directory, { recursive: true, force: true });

@@ -5,3 +5,4 @@ export { readDocumentInput, DocumentInputError } from "./input.js";
 export { createPptxBuffer, PptxDocumentError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE } from "./pptx.js";
 export { createXlsxBuffer, XlsxDocumentError, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, MAX_XLSX_TOTAL_CELLS, MAX_XLSX_TOTAL_TEXT_BYTES } from "./xlsx.js";
 export { readSheet, SheetReadError, type ReadSheetResult } from "./readSheet.js";
+export { inspectPdf, PdfInspectError, type InspectPdfResult } from "./inspectPdf.js";
