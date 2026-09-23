@@ -28,6 +28,7 @@
     { "path": "../../packages/tool-android" },
     { "path": "../../packages/tool-browser" },
     { "path": "../../packages/tool-computer" },
+    { "path": "../../packages/tool-document" },
     { "path": "../../packages/tool-lsp" },
     { "path": "../../packages/tool-terminal" },
     { "path": "../../packages/voice-input" },

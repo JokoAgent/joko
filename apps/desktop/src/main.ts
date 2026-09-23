@@ -5789,7 +5789,9 @@ async function launchManagedOrchestratorBootstrap(
       platform: process.platform,
       publicPort: ports.publicPort,
       internalPort: ports.internalPort,
-      environment: { ...process.env, ...outboundProxySnapshotEnvironment },
+      environment: { ...process.env, ...outboundProxySnapshotEnvironment,
+        JOKO_DOCUMENT_PDF_ELECTRON_EXECUTABLE: process.execPath,
+        ...(!app.isPackaged ? { JOKO_DOCUMENT_PDF_ELECTRON_APP: resolve(sourceDirectory, "..") } : {}) },
       // The Desktop process remains alive while its window is in the tray,
       // and owns the managed service lease until explicit complete exit.
       ephemeral: true,
