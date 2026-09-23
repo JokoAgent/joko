@@ -18,6 +18,8 @@ import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
   && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   && process.env.JOKO_PDF_ELECTRON_TEST_EXECUTABLE?.trim() ? it : it.skip;
+const officeIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
+  && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 const DOCUMENT_FILES_PROFILE = {
   ...PI_LIKE_PROFILE,
   id: "fake-document-files",
@@ -194,6 +196,120 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   await page.locator(".workspace-files-route").waitFor({ state: "visible" });
   await page.locator(".workspace-file-body__state.is-error").waitFor({ state: "visible" });
   expect(await page.locator(".workspace-file-body__pdf-pages canvas").count()).toBe(0);
+  expect(await page.locator(".workspace-file-body__download:not([disabled])").count()).toBe(0);
+  expect(pageErrors).toEqual([]);
+  bridge.revoke();
+}, 90_000);
+
+officeIt("shows generated Office files as bounded binary previews with exact downloads", async () => {
+  fixture = await OrchestratorE2eFixture.start({
+    webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
+    profiles: [DOCUMENT_FILES_PROFILE],
+    createAuxiliaryServices: async (store, directory, artifacts) => {
+      const vault = await CredentialVault.open(join(directory, "document-vault.key"));
+      const credentials = new CredentialManager({ vault, storagePath: join(directory, "document-credentials.json") });
+      await credentials.initialize();
+      const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
+      await mcpRouter.initialize();
+      mcpRouter.registerBridgeToolProvider(new DocumentToolBridgeProvider({ store }));
+      return { mcpRouter };
+    }
+  });
+  internal = await createInternalServer(fixture.application);
+  const internalUrl = await internal.listen({ host: "127.0.0.1", port: 0 });
+  const manager = await fixture.pair("Office document manager");
+  const [backendId, targetId] = [...fixture.targets][0]!;
+  const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+    createSessionMutation({ backendId, targetId, displayName: "Office report" })));
+  const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
+  const bridge = fixture.application.mcpRouter!.createPiBridgeSnapshot({
+    endpoint: `${internalUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation
+  });
+  const outputs = [
+    { name: "report.docx", tool: "make_docx", args: { markdown: "# Office report\n\nA real document.", outPath: "documents/report.docx" } },
+    { name: "slides.pptx", tool: "make_pptx", args: { slides: [
+      { layout: "cover", title: "Office report" },
+      { layout: "metrics", title: "Results", metrics: [{ value: "98%", label: "Uptime" }, { value: 12, label: "Regions" }] }
+    ], outPath: "documents/slides.pptx" } },
+    { name: "metrics.xlsx", tool: "make_xlsx", args: { sheets: [{ name: "Results", header: ["Metric", "Value"], rows: [["Uptime", 0.98]] }], outPath: "documents/metrics.xlsx" } }
+  ] as const;
+  await mkdir(join(fixture.workspaceDirectory, "documents"));
+  const bytesByName = new Map<string, Buffer>();
+  for (const output of outputs) {
+    const response = await fetch(`${internalUrl}/internal/mcp`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${bridge.mcpBridge.token}`, "content-type": "application/json", "x-joko-pi-generation": String(generation) },
+      body: JSON.stringify({ requestId: randomUUID(), sessionId, targetId, generation,
+        serverId: "joko-document-tools", toolName: output.tool, arguments: output.args })
+    });
+    expect(response.ok).toBe(true);
+    expect(await response.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      relativePath: join("documents", output.name)
+    } } });
+    const bytes = await readFile(join(fixture.workspaceDirectory, "documents", output.name));
+    expect(bytes.subarray(0, 2).toString()).toBe("PK");
+    bytesByName.set(output.name, bytes);
+  }
+
+  const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted Office Web" });
+  if (!challenge.challenge) throw new Error("Mounted Web pairing returned no challenge.");
+  browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, acceptDownloads: true });
+  const pageErrors: string[] = [];
+  page.on("pageerror", error => pageErrors.push(error.message));
+  const hash = (name: string) => `#/files/${encodeURIComponent(sessionId)}?file=${encodeURIComponent(`documents/${name}`)}`;
+  await page.goto(`${fixture.baseUrl}/${hash(outputs[0]!.name)}`, { waitUntil: "domcontentloaded" });
+  await page.locator(".connection-tabs > button").nth(2).click();
+  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
+  await page.getByLabel("Device name").fill("Mounted Office Web");
+  await page.locator("form.pair-form button[type=submit]").click();
+  await page.goto(`${fixture.baseUrl}/${hash(outputs[0]!.name)}`, { waitUntil: "domcontentloaded" });
+
+  for (const output of outputs) {
+    if (output !== outputs[0]) await page.evaluate((nextHash) => { window.location.hash = nextHash; }, hash(output.name));
+    await page.locator(".workspace-file-body--unsupported").waitFor({ state: "visible" });
+    const selected = page.locator(`[role="treeitem"][data-relative-path="documents/${output.name}"]`);
+    await selected.waitFor({ state: "visible" });
+    expect(await selected.getAttribute("aria-selected")).toBe("true");
+    expect(await page.locator(".workspace-file-body--unsupported").getAttribute("data-file-kind")).toBe("blob");
+    expect(await page.locator(".workspace-file-body--unsupported strong").innerText()).toBe(output.name);
+    const bytes = bytesByName.get(output.name)!;
+    const size = bytes.length < 1_024 ? `${bytes.length} B` : `${(bytes.length / 1_024).toFixed(1)} KB`;
+    expect(await page.locator(".workspace-file-body__meta").innerText()).toContain(size);
+    const downloadPromise = page.waitForEvent("download");
+    await page.locator(".workspace-file-body__download").click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe(output.name);
+    expect(await readFile(await download.path())).toEqual(bytes);
+  }
+  const captureDirectory = process.env.JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR?.trim();
+  if (captureDirectory) {
+    await mkdir(captureDirectory, { recursive: true });
+    await page.screenshot({ path: join(captureDirectory, "office-wide.png") });
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForFunction(() => {
+    const rail = document.querySelector(".workspace-files-route__chat");
+    return rail?.getAttribute("aria-hidden") === "true" && rail.getBoundingClientRect().width < 1;
+  });
+  const closeNavigation = page.locator(".sidebar__mobile-close");
+  if (await closeNavigation.isVisible()) await closeNavigation.click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+  if (captureDirectory) await page.screenshot({ path: join(captureDirectory, "office-compact.png") });
+  const narrowDownload = page.waitForEvent("download");
+  await page.locator(".workspace-file-body__download").click();
+  expect(await readFile(await (await narrowDownload).path())).toEqual(bytesByName.get("metrics.xlsx"));
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await page.locator(".workspace-file-body--unsupported").waitFor({ state: "visible" });
+  expect(await page.locator('[role="treeitem"][data-relative-path="documents/metrics.xlsx"]').getAttribute("aria-selected")).toBe("true");
+  await rm(join(fixture.workspaceDirectory, "documents", "metrics.xlsx"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await page.locator(".workspace-file-body__state.is-error").waitFor({ state: "visible" });
   expect(await page.locator(".workspace-file-body__download:not([disabled])").count()).toBe(0);
   expect(pageErrors).toEqual([]);
   bridge.revoke();
