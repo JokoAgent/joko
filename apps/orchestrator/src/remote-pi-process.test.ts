@@ -104,7 +104,8 @@ describe("RemotePiProcessFactory", () => {
     };
     const scopes: Array<readonly [string, string]> = [];
     const registry = {
-      list: () => [{ id: "host-a" }],
+      list: () => [{ targetId: "target-a", id: "host-a" }],
+      boundHost: () => ({ targetId: "target-a", id: "host-a" }),
       transports: async (targetId: string, hostId: string) => {
         scopes.push([targetId, hostId]);
         return { host: {}, lease };
@@ -116,7 +117,7 @@ describe("RemotePiProcessFactory", () => {
     const nativeAuthReservationToken = "r".repeat(43);
     const productSessionId = "11111111-1111-4111-8111-111111111111";
     const recoveryIdentity = createHash("sha256")
-      .update([productSessionId, "target-a", "host-a"].join("\0"))
+      .update([productSessionId, "target-a", "target-a", "host-a"].join("\0"))
       .digest("hex");
     const spec: PiProcessSpec = {
       command: process.execPath,
@@ -137,7 +138,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_NATIVE_AUTH_RESERVATION_TOKEN: nativeAuthReservationToken,
         PROVIDER_RUNTIME_KEY: secret
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     };
 
     let factoryResolved = false;
@@ -415,7 +416,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as Record<string, any>;
     const sessionIndex = bootstrap.args.indexOf("--session");
@@ -502,7 +503,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_MCP_DESCRIPTOR_FILE: descriptor,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
     const output: string[] = [];
@@ -634,7 +635,7 @@ describe("RemotePiProcessFactory", () => {
         PI_CODING_AGENT_DIR: agentHomeOne,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     const firstOutput = once(first.stdout, "data");
     firstBridge.stdout.write(testFrame(2, 1, Buffer.from('{"phase":"consumed"}\n')));
@@ -661,7 +662,7 @@ describe("RemotePiProcessFactory", () => {
         PI_CODING_AGENT_DIR: agentHomeTwo,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     };
     const [authorityFile] = await readdir(authorityRoot);
     const authorityLink = join(fixture, "linked-authority.json");
@@ -808,7 +809,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: controlOne,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
     const second = await new RemotePiProcessFactory({ registry, authorityRoot }).create({
@@ -824,7 +825,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: controlTwo,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     expect(bridgeIndex).toBe(3);
     expect(requests.filter((request) => request.args[1] === "kill")).toHaveLength(0);
@@ -915,7 +916,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
     const first = await new RemotePiProcessFactory({ registry, authorityRoot })
@@ -995,7 +996,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     expect(mapped.kill("SIGKILL")).toBe(true);
     await waitUntil(() => requests.length === 2);
@@ -1073,7 +1074,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
       mapped.once("exit", (code, signal) => resolveExit([code, signal]));

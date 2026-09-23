@@ -610,6 +610,8 @@ export interface TargetDescriptor {
 }
 
 export interface RemoteWorkspaceBinding {
+  /** Target that owns the single SSH Host record and transport authority. */
+  readonly hostTargetId: string;
   readonly hostId: string;
   readonly workspaceRoot: string;
 }

@@ -87,6 +87,7 @@ interface RemoteAuthorityScope {
 }
 
 interface RemoteManagedStoreScope extends RemoteAuthorityScope {
+  readonly hostTargetId: string;
   readonly sessionId: string;
   readonly identity: string;
 }
@@ -192,18 +193,25 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     nonnegativeSafeInteger(input.generation, "managed runtime generation");
     const key = managedStoreKey(sessionId, targetId);
     let scope = this.#managedStoreScopes.get(key);
+    const boundHost = this.#registry.boundHost(targetId);
+    if (scope !== undefined && (boundHost === undefined || scope.hostTargetId !== boundHost.targetId
+      || scope.hostId !== boundHost.id)) {
+      this.#managedStoreScopes.delete(key);
+      this.#managedStores.delete(key);
+      scope = undefined;
+    }
     if (scope === undefined) {
       const candidates: RemoteManagedStoreScope[] = [];
-      for (const host of this.#registry.list(targetId)) {
-        const recoveryIdentity = remoteRecoveryIdentity(sessionId, targetId, host.id);
-        const identity = stableIdentity(targetId, host.id, recoveryIdentity);
+      for (const host of boundHost === undefined ? this.#registry.list(targetId) : [boundHost]) {
+        const recoveryIdentity = remoteRecoveryIdentity(sessionId, targetId, host.targetId, host.id);
+        const identity = stableIdentity(targetId, host.targetId, host.id, recoveryIdentity);
         const authority = await this.#authorityStore.read(identity, {
           targetId,
           hostId: host.id,
           recoveryIdentity
         });
         if (authority === undefined || authority.authority.trustedRunnerScriptSha256 === "0".repeat(64)) continue;
-        candidates.push({ sessionId, targetId, hostId: host.id, recoveryIdentity, identity });
+        candidates.push({ sessionId, targetId, hostTargetId: host.targetId, hostId: host.id, recoveryIdentity, identity });
       }
       if (candidates.length === 0) return undefined;
       if (candidates.length !== 1) {
@@ -242,7 +250,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
   async #createRemote(spec: PiProcessSpec): Promise<PiProcessHandle> {
     const binding = spec.remoteWorkspace!;
     const targetId = requiredEnvironment(spec.env, "JOKO_PI_TARGET_ID");
-    const { lease } = await this.#registry.transports(targetId, binding.hostId);
+    const { lease } = await this.#registry.transports(binding.hostTargetId, binding.hostId);
     const files = requireFiles(lease);
     const canonicalWorkspace = await files.realpath(binding.workspaceRoot);
     if (canonicalWorkspace !== binding.workspaceRoot) throw new Error("Remote workspace root is not canonical.");
@@ -257,7 +265,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     const currentNativeAuthReservationToken = optionalNativeAuthReservationToken(
       spec.env[NATIVE_AUTH_RESERVATION_TOKEN_ENV]
     );
-    const identity = stableIdentity(targetId, binding.hostId, recoveryIdentity);
+    const identity = stableIdentity(targetId, binding.hostTargetId, binding.hostId, recoveryIdentity);
     const authorityScope: RemoteAuthorityScope = { targetId, hostId: binding.hostId, recoveryIdentity };
     let existingAuthority = await this.#authorityStore.read(identity, authorityScope);
     if (existingAuthority?.deletion !== undefined) {
@@ -269,7 +277,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     }
     const managedRoot = remotePath.join(home, ".joko", "pi-broker");
     const remoteRuntime = remotePath.join(home, ".joko", "runtime", identity);
-    const remoteSessions = remotePath.join(home, ".joko", "sessions", stableIdentity(targetId, binding.hostId));
+    const remoteSessions = remotePath.join(home, ".joko", "sessions", stableIdentity(targetId, binding.hostTargetId, binding.hostId));
     const localManagedRunRoot = spec.env["JOKO_PI_SUBAGENT_RUN_ROOT"];
     const remoteManagedRunRoot = localManagedRunRoot === undefined
       ? undefined
@@ -280,12 +288,13 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     if (remoteManagedRunRoot !== undefined) await ensureRemotePrivateDirectory(files, remoteManagedRunRoot);
     if (localManagedRunRoot !== undefined) {
       const productSessionId = requiredEnvironment(spec.env, MANAGED_SUBAGENT_PRODUCT_SESSION_ENV);
-      if (remoteRecoveryIdentity(productSessionId, targetId, binding.hostId) !== recoveryIdentity) {
+      if (remoteRecoveryIdentity(productSessionId, targetId, binding.hostTargetId, binding.hostId) !== recoveryIdentity) {
         throw new Error("Remote managed durable store crossed its recovery identity fence.");
       }
       this.#managedStoreScopes.set(managedStoreKey(productSessionId, targetId), {
         sessionId: productSessionId,
         targetId,
+        hostTargetId: binding.hostTargetId,
         hostId: binding.hostId,
         recoveryIdentity,
         identity
@@ -537,7 +546,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     return new MappedRemotePiProcess({
       initialAttachment,
       reattach: async () => {
-        const next = await this.#registry.transports(targetId, binding.hostId);
+        const next = await this.#registry.transports(binding.hostTargetId, binding.hostId);
         return openAttachment(next.lease);
       },
       localSessionRoot: resolve(localSessionRoot),
@@ -812,7 +821,7 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
   }
 
   async #request(operation: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> {
-    const { lease } = await this.#registry.transports(this.#scope.targetId, this.#scope.hostId);
+    const { lease } = await this.#registry.transports(this.#scope.hostTargetId, this.#scope.hostId);
     const files = requireFiles(lease);
     const processes = requireProcesses(lease);
     const home = await files.realpath(".");
@@ -1801,8 +1810,8 @@ function managedSessionKey(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 40);
 }
 
-function remoteRecoveryIdentity(sessionId: string, targetId: string, hostId: string): string {
-  return createHash("sha256").update([sessionId, targetId, hostId].join("\0")).digest("hex");
+function remoteRecoveryIdentity(sessionId: string, targetId: string, hostTargetId: string, hostId: string): string {
+  return createHash("sha256").update([sessionId, targetId, hostTargetId, hostId].join("\0")).digest("hex");
 }
 
 function assertStableLocalFile(left: Stats, right: Stats): void {

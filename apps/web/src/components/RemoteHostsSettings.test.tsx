@@ -44,6 +44,19 @@ it("uses one authoritative catalog stream and keeps an edited root through snaps
   expect(root.value).toBe("/home/joko/unsaved");
 });
 
+it("keeps a source Host undeletable while another project is bound to it", async () => {
+  const fixture = await mountSettings();
+  const ready = { ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
+    status: { state: "ready" as const, changedAt: 2 } };
+  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map((target) => target.id === "target-two"
+    ? { ...target, remoteWorkspace: { hostTargetId: "target-one", hostId: "build-box", workspaceRoot: "/srv/other" } }
+    : target) };
+  await fixture.render(fixture.controller);
+  await fixture.publish([ready]);
+  expect(document.querySelector<HTMLButtonElement>('button[aria-label="Delete"]')?.disabled).toBe(true);
+  expect(fixture.controller.deleteRemoteHost).not.toHaveBeenCalled();
+});
+
 it("browses the selected SSH Host home and child, then only prefills the binding draft", async () => {
   const fixture = await mountSettings();
   const ready = { ...host(), revision: 4n, trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready" as const, changedAt: 2 } };
@@ -124,7 +137,7 @@ it("preserves a binding draft on concurrent project change until explicitly relo
   const fixture = await mountSettings();
   await fixture.publish([{ ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready", changedAt: 2 } }]);
   await change(input("Remote workspace path"), "/home/joko/local-edit");
-  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map(target => ({ ...target, revision: 2n, remoteWorkspace: { hostId: "build-box", workspaceRoot: "/home/joko/other-window" } })) };
+  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map(target => ({ ...target, revision: 2n, remoteWorkspace: { hostTargetId: target.id, hostId: "build-box", workspaceRoot: "/home/joko/other-window" } })) };
   await fixture.render(fixture.controller);
   expect(input("Remote workspace path").value).toBe("/home/joko/local-edit");
   expect(button("Use remote workspace").disabled).toBe(true);

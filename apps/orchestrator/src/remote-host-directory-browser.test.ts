@@ -2,7 +2,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import type { RemoteFileTransportPort } from "@joko/remote-ssh";
 import { expect, it, vi } from "vitest";
 
-import { listRemoteHostDirectories, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
+import { inspectRemoteHostDirectory, listRemoteHostDirectories, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 
 const signal = new AbortController().signal;
 const stat = { kind: "directory" as const, size: 0, modifiedAt: 0, mode: 0o755 };
@@ -63,4 +63,27 @@ it("checks the captured authority after delayed transport work", async () => {
   finish("/home/maker");
   await expect(pending).rejects.toMatchObject({ code: Code.Aborted });
   expect(files.stat).not.toHaveBeenCalled();
+});
+
+it("classifies only an absent SSH entry as missing and keeps existing directories canonical", async () => {
+  const list = vi.fn(async (path: string) => ({
+    "/": [{ name: "home", kind: "directory" }],
+    "/home": [{ name: "maker", kind: "directory" }],
+    "/home/maker": [{ name: "link", kind: "symbolic_link" }, { name: "file", kind: "file" }]
+  } as Record<string, readonly { name: string; kind: "directory" | "symbolic_link" | "file" }[]>)[path] ?? []);
+  const files = {
+    realpath: vi.fn(async (path: string) => path === "/home/maker/link" ? "/srv/shared" : path),
+    stat: vi.fn(async () => stat),
+    list
+  } as unknown as RemoteFileTransportPort;
+  await expect(inspectRemoteHostDirectory(files, "/home/maker/link", signal, () => undefined))
+    .resolves.toEqual({ exists: true, path: "/srv/shared" });
+  await expect(inspectRemoteHostDirectory(files, "/home/maker/new/sub", signal, () => undefined))
+    .resolves.toEqual({ exists: false, path: "/home/maker/new/sub" });
+  await expect(inspectRemoteHostDirectory(files, "/home/maker/file", signal, () => undefined))
+    .rejects.toMatchObject({ code: Code.FailedPrecondition });
+  list.mockRejectedValueOnce(new Error("Permission denied"));
+  await expect(inspectRemoteHostDirectory(files, "/home/maker/new", signal, () => undefined))
+    .rejects.toThrow("Permission denied");
+  expect(files.realpath).not.toHaveBeenCalledWith("/home/maker/new", signal);
 });

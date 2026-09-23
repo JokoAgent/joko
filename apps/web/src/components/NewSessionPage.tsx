@@ -49,7 +49,7 @@ import type {
   WorktreeSourceView,
   WorkspaceEntryView
 } from "../model.js";
-import type { TargetDraft } from "../model.js";
+import type { RemoteTargetDraft, TargetDraft } from "../model.js";
 import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
 import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
@@ -81,6 +81,7 @@ import {
 import { nativeSessionDiscoveryAvailability } from "./session-discovery.js";
 import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
 import { ProjectEditor, localProjectPickerOwner, sameProjectPickerOwner } from "./ProjectEditor.js";
+import { RemoteProjectEditor } from "./RemoteProjectEditor.js";
 import { NewTaskProjectPicker } from "./NewTaskProjectPicker.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
@@ -193,6 +194,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [projectEditorInitialDirectory, setProjectEditorInitialDirectory] = useState<string>();
   const [projectCreatePending, setProjectCreatePending] = useState(false);
   const [projectCreateError, setProjectCreateError] = useState<string>();
+  const [remoteProjectEditorOpen, setRemoteProjectEditorOpen] = useState(false);
+  const [remoteProjectCreatePending, setRemoteProjectCreatePending] = useState(false);
+  const [remoteProjectCreateError, setRemoteProjectCreateError] = useState<string>();
   const [projectBrowsePending, setProjectBrowsePending] = useState(false);
   const [projectBrowseError, setProjectBrowseError] = useState<string>();
   const [openPickerRequestId, setOpenPickerRequestId] = useState<number>();
@@ -203,6 +207,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const pageRef = useRef<HTMLElement>(null);
   const consumedPickerRequestIdRef = useRef<number | undefined>(undefined);
   const projectCreateEpochRef = useRef(0);
+  const remoteProjectCreateEpochRef = useRef(0);
   const projectBrowseEpochRef = useRef(0);
   const [startKind, setStartKind] = useState<"fresh" | "attach">("fresh");
   const [nativeSessions, setNativeSessions] = useState<readonly NativeSessionCandidateView[]>([]);
@@ -348,11 +353,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [controller, hydrated, hydratedProfileScope, onProjectPickerRequestConsumed, profileScope, projectPickerRequest, snapshot.generation]);
   useEffect(() => {
     projectCreateEpochRef.current += 1;
+    remoteProjectCreateEpochRef.current += 1;
     projectBrowseEpochRef.current += 1;
     setProjectEditorOpen(false);
     setProjectEditorInitialDirectory(undefined);
     setProjectCreatePending(false);
     setProjectCreateError(undefined);
+    setRemoteProjectEditorOpen(false);
+    setRemoteProjectCreatePending(false);
+    setRemoteProjectCreateError(undefined);
     setProjectBrowsePending(false);
     setProjectBrowseError(undefined);
   }, [profileScope, snapshot.generation]);
@@ -481,6 +490,38 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (ownsResult()) setProjectCreateError(cause instanceof Error ? cause.message : t("error.unexpected"));
     }).finally(() => {
       if (ownsResult()) setProjectCreatePending(false);
+    });
+  };
+  const createRemoteProject = (draft: RemoteTargetDraft): void => {
+    if (remoteProjectCreatePending || controller.state.connectionState !== "connected"
+      || controller.state.activeProfile === undefined || controller.state.route.kind !== "newSession") return;
+    const epoch = ++remoteProjectCreateEpochRef.current;
+    const owner = {
+      profileId: controller.state.activeProfile.id,
+      serverId: controller.state.activeProfile.serverId,
+      generation: controller.state.snapshot.generation,
+      navigationRevision: controller.state.navigationRevision ?? 0
+    };
+    const ownsResult = (): boolean => {
+      const current = controllerRef.current.state;
+      return mountedRef.current && remoteProjectCreateEpochRef.current === epoch
+        && current.connectionState === "connected" && current.activeProfile?.id === owner.profileId
+        && current.activeProfile.serverId === owner.serverId && current.snapshot.generation === owner.generation
+        && current.route.kind === "newSession" && (current.navigationRevision ?? 0) === owner.navigationRevision;
+    };
+    setRemoteProjectCreatePending(true);
+    setRemoteProjectCreateError(undefined);
+    void controller.createRemoteTarget(draft).then((targetId) => {
+      if (!ownsResult()) return;
+      setSelection({ kind: "target", targetId });
+      setStartKind("fresh");
+      setNativeReference("");
+      setNativeSelectionWarning(undefined);
+      setRemoteProjectEditorOpen(false);
+    }).catch((cause: unknown) => {
+      if (ownsResult()) setRemoteProjectCreateError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    }).finally(() => {
+      if (ownsResult()) setRemoteProjectCreatePending(false);
     });
   };
   const selected = selection?.kind === "target" ? snapshot.targets.find((target) => target.id === selection.targetId) : undefined;
@@ -1920,9 +1961,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const recentlyShownTargets = new Set(recentOptions.filter((option) => option.available).map((option) => option.entry.targetId));
   const projectPickerOptions = projectTargets.filter((target) => !recentlyShownTargets.has(target.id)).map((target) => {
     const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
+    const hostSource = target.remoteWorkspace === undefined ? undefined
+      : snapshot.targets.find((candidate) => candidate.id === target.remoteWorkspace?.hostTargetId);
     const location = target.remoteWorkspace === undefined
       ? targetWorkspace?.serverPath || target.workspaceName
-      : `${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
+      : `${hostSource?.name ?? target.remoteWorkspace.hostTargetId} / ${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
     const available = activeTargets.some((candidate) => candidate.id === target.id)
       && target.error === undefined && targetWorkspace !== undefined && targetWorkspace.targetId === target.id;
     return { value: newSessionSelectionValue({ kind: "target" as const, targetId: target.id }),
@@ -1974,7 +2017,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             setProjectEditorInitialDirectory(undefined);
             setProjectCreateError(undefined);
             setProjectEditorOpen(true);
-          }} t={t} />
+          }} onAddRemote={() => { setRemoteProjectCreateError(undefined); setRemoteProjectEditorOpen(true); }} t={t} />
         {canDiscover && <label className="new-task-context__control new-task-context__control--native">
           <span className="sr-only">{t("session.startMode")}</span>
           <SelectControl value={startKind} disabled={submitting} onChange={(event) => { const next = event.target.value as "fresh" | "attach"; setStartKind(next); setNativeSelectionWarning(undefined); if (next === "fresh") setNativeReference(""); }}>
@@ -1987,6 +2030,22 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     </header>
 
     <ProjectEditor open={projectEditorOpen} initialDirectory={projectEditorInitialDirectory} controller={controller} snapshot={snapshot} t={t} saving={projectCreatePending} error={projectCreateError} onClose={() => { projectCreateEpochRef.current += 1; setProjectEditorOpen(false); setProjectEditorInitialDirectory(undefined); setProjectCreatePending(false); setProjectCreateError(undefined); }} onSave={createProject} />
+    <RemoteProjectEditor open={remoteProjectEditorOpen} controller={controller} snapshot={snapshot}
+      restoreFocusFallback={() => pageRef.current?.querySelector<HTMLElement>(".new-task-project-picker__trigger") ?? null}
+      initialBackendId={backend?.id} eligibleTargetIds={new Set(activeTargets.map((target) => target.id))}
+      saving={remoteProjectCreatePending} error={remoteProjectCreateError} t={t}
+      onClose={() => { remoteProjectCreateEpochRef.current += 1; setRemoteProjectEditorOpen(false); setRemoteProjectCreatePending(false); setRemoteProjectCreateError(undefined); }}
+      onSave={createRemoteProject} onChooseExisting={(targetId) => {
+        const current = controllerRef.current.state;
+        const target = current.snapshot.targets.find((candidate) => candidate.id === targetId);
+        if (current.connectionState !== "connected" || current.route.kind !== "newSession" || target === undefined
+          || !newSessionTargets([target], current.snapshot.settings.backendSettings).some((candidate) => candidate.id === target.id)) return;
+        setSelection({ kind: "target", targetId });
+        setStartKind("fresh");
+        setNativeReference("");
+        setNativeSelectionWarning(undefined);
+        setRemoteProjectEditorOpen(false);
+      }} />
 
     <div className="new-task-page__scroll">
       <section className="new-task-page__content" aria-labelledby="new-task-title">

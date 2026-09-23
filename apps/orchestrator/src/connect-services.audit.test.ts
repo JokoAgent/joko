@@ -2720,6 +2720,99 @@ describe("Connect security and protocol audit", () => {
     expect(register).not.toHaveBeenCalled();
   });
 
+  it("creates a cross-project SSH Target only after explicit missing-directory consent and exact Host authority", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-remote-project-audit-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const sourceDescriptor = { id: "source-target", backendId: "pi", displayName: "Source",
+      workspaceRoot: directory, managed: false, trusted: true };
+    const source = { descriptor: sourceDescriptor, metadata: { workspaceId: "source-workspace" },
+      revision: 7n, createdAt: 1, updatedAt: 1 };
+    let created: { descriptor: Parameters<OperationalStore["upsertTarget"]>[0]; metadata: unknown;
+      revision: bigint; createdAt: number; updatedAt: number } | undefined;
+    const upsertTarget = vi.fn((descriptor: Parameters<OperationalStore["upsertTarget"]>[0], metadata: unknown) => {
+      created = { descriptor, metadata, revision: 1n, createdAt: 1, updatedAt: 1 };
+    });
+    const store = {
+      findOperation: () => undefined,
+      getTarget: (id: string) => id === sourceDescriptor.id ? source : created?.descriptor.id === id ? created : (() => { throw new Error("Target missing"); })(),
+      getBackend: () => ({ descriptor: { id: "pi" } }), upsertTarget
+    };
+    let directoryCreated = false;
+    const files = {
+      realpath: vi.fn(async (path: string) => path),
+      stat: vi.fn(async () => ({ kind: "directory" as const, size: 0, modifiedAt: 0, mode: 0o755 })),
+      list: vi.fn(async (path: string) => path === "/" ? [{ name: "srv", kind: "directory" as const }]
+        : path === "/srv" && directoryCreated ? [{ name: "new", kind: "directory" as const }] : []),
+      mkdir: vi.fn(async () => { directoryCreated = true; })
+    };
+    const hostRecord = { targetId: sourceDescriptor.id, id: "build-box", revision: 9n,
+      status: { state: "ready" }, trust: { sha256Fingerprint: "sha256:test" } };
+    const remoteHosts = {
+      get: vi.fn(() => hostRecord),
+      captureTransportAuthority: vi.fn(async () => ({ hostRevision: hostRecord.revision,
+        lease: { files }, assertCurrent: () => undefined }))
+    };
+    const register = vi.fn(async (registration) => registration);
+    const unregister = vi.fn();
+    const validateTarget = vi.fn(async () => undefined);
+    const mutate = vi.fn(async (input: {
+      precondition: (value: typeof store) => void;
+      effect: () => Promise<void>;
+      commit: (value: typeof store) => unknown;
+    }) => {
+      input.precondition(store);
+      await input.effect();
+      input.precondition(store);
+      return { replayed: false, value: input.commit(store), operation: {
+        id: "created", connectionId: "connection", kind: "createRemoteTarget", body: {}, bodyHash: "hash",
+        completionMode: "synchronous", status: "completed", createdAt: 1, updatedAt: 2, revision: 1n
+      } };
+    });
+    const services = createConnectServices(stubApplication({
+      config: { publicOrigin: "https://orchestrator.example.test", dataDirectory: directory },
+      store, remoteHosts, workspaces: { register, unregister }, sessionHost: { mutate, validateTarget },
+      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+    }));
+    const submit = (createIfMissing: boolean, hostRevision = 9n, suffix = "") => invoke(services.operation.submitOperation, {
+      operationId: `operation-remote-${createIfMissing}-${hostRevision}${suffix}`,
+      connectionId: "connection",
+      mutation: create(contract.OperationMutationSchema, {
+        preconditions: [{ entity: { kind: contract.EntityKind.TARGET, id: sourceDescriptor.id },
+          expectedRevision: { value: source.revision } }],
+        payload: { case: "createRemoteTarget", value: create(contract.CreateRemoteTargetMutationSchema, {
+          backendId: "pi", displayName: "New remote project", hostTargetId: sourceDescriptor.id,
+          hostId: "build-box", expectedHostRevision: { value: hostRevision },
+          workspacePath: "/srv/new", createIfMissing
+        }) }
+      })
+    }, context());
+
+    await expect(submit(false)).rejects.toMatchObject({ code: Code.NotFound });
+    expect(files.mkdir).not.toHaveBeenCalled();
+    expect(upsertTarget).not.toHaveBeenCalled();
+    await expect(submit(true, 8n)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(files.mkdir).not.toHaveBeenCalled();
+    await submit(true);
+    expect(files.mkdir).toHaveBeenCalledOnce();
+    expect(validateTarget).toHaveBeenCalledWith(expect.objectContaining({ remoteWorkspace: {
+      hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new"
+    } }));
+    expect(upsertTarget).toHaveBeenCalledOnce();
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ root: "/srv/new", remote: {
+      targetId: created?.descriptor.id, hostTargetId: sourceDescriptor.id,
+      hostId: "build-box", workspaceRoot: "/srv/new"
+    } }));
+
+    upsertTarget.mockClear();
+    register.mockImplementationOnce(async (registration) => {
+      hostRecord.revision = 10n;
+      return registration;
+    });
+    await expect(submit(true, 9n, "-commit-fence")).rejects.toMatchObject({ code: Code.Aborted });
+    expect(upsertTarget).not.toHaveBeenCalled();
+    expect(unregister).toHaveBeenCalledOnce();
+  });
+
   it.each([
     {
       name: "service-node",
@@ -2747,14 +2840,14 @@ describe("Connect security and protocol audit", () => {
         workspaceRoot: "D:\\service-copy",
         managed: false,
         trusted: false,
-        remoteWorkspace: { hostId: "build-host", workspaceRoot: "/srv/project" }
+        remoteWorkspace: { hostTargetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
       },
       expected: {
         id: "workspace-remote",
         root: "/srv/project",
         displayName: "Remote project",
         trusted: false,
-        remote: { targetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
+        remote: { targetId: "target-remote", hostTargetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
       }
     }
   ])("prepares the exact durable $name Target workspace binding and revision", async ({ descriptor, expected }) => {

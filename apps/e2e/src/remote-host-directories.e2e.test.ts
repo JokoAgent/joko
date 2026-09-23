@@ -1,27 +1,38 @@
+import { create } from "@bufbuild/protobuf";
 import { Code, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { RemoteHostService } from "@joko/contracts";
+import { EntityKind, OperationMutationSchema, OperationState, RemoteHostService } from "@joko/contracts";
 import { RemoteHostRegistry } from "@joko/orchestrator";
-import type { RemoteFileTransportPort } from "@joko/remote-ssh";
+import type { RemoteFileTransportPort, RemoteProcessTransportPort } from "@joko/remote-ssh";
 import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture } from "./fixture.js";
+import { submit } from "./operations.js";
 
-it("browses an authenticated current SSH Host over HTTP/SQLite without using the service-node filesystem", async () => {
+it("browses and creates a revision-fenced SSH project through the production HTTP and SQLite chain", async () => {
+  let createdRemoteDirectory = false;
   const files: RemoteFileTransportPort = {
     realpath: vi.fn(async path => path === "." ? "/home/fixture" : path),
     stat: vi.fn(async () => ({ kind: "directory" as const, size: 0, modifiedAt: 0, mode: 0o755 })),
-    list: vi.fn(async path => path === "/home/fixture" ? [
-      { name: "work", kind: "directory" as const }, { name: "readme.txt", kind: "file" as const }
-    ] : []),
+    list: vi.fn(async path => {
+      if (path === "/") return [{ name: "home", kind: "directory" as const }, { name: "srv", kind: "directory" as const }];
+      if (path === "/home") return [{ name: "fixture", kind: "directory" as const }];
+      if (path === "/home/fixture") return [
+        { name: "work", kind: "directory" as const }, { name: "readme.txt", kind: "file" as const }
+      ];
+      if (path === "/srv" && createdRemoteDirectory) return [{ name: "new-project", kind: "directory" as const }];
+      return [];
+    }),
     read: async () => new Uint8Array(), write: async () => undefined,
-    mkdir: async () => undefined, rename: async () => undefined, remove: async () => undefined
+    mkdir: vi.fn(async path => { if (path === "/srv/new-project") createdRemoteDirectory = true; }),
+    rename: async () => undefined, remove: async () => undefined
   };
-  const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+  const processes: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused process transport"); }) };
+  const capabilities = { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
   const connect = vi.fn(async (request: Parameters<NonNullable<ConstructorParameters<typeof RemoteHostRegistry>[0]["connector"]>["connect"]>[0]) => {
     request.onAuthenticating();
     await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 2, 3) });
-    return { capabilities, files, close: async () => undefined };
+    return { capabilities, files, processes, close: async () => undefined };
   });
   const fixture = await OrchestratorE2eFixture.start({ createAuxiliaryServices: async store => ({
     remoteHosts: new RemoteHostRegistry({ store, ownerId: "remote-directory-e2e", connector: { capabilities, connect } })
@@ -50,6 +61,54 @@ it("browses an authenticated current SSH Host over HTTP/SQLite without using the
       .rejects.toMatchObject({ code: Code.Aborted });
     await expect(client(paired.authKey).listRemoteHostDirectories({ ...request, path: "D:/service-node" }))
       .rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    const inspection = await client(paired.authKey).inspectRemoteHostDirectory({
+      ...request, path: "/srv/new-project"
+    });
+    expect(inspection).toMatchObject({
+      targetId, hostId: host.id, targetRevision: { value: targetRevision }, hostRevision: { value: host.revision },
+      exists: false, path: "/srv/new-project"
+    });
+    const createRemoteProject = (createIfMissing: boolean) => create(OperationMutationSchema, {
+      preconditions: [{
+        entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: targetRevision }
+      }],
+      payload: { case: "createRemoteTarget", value: {
+        backendId: fixture.adapter().id,
+        displayName: "Remote E2E project",
+        hostTargetId: targetId,
+        hostId: host.id,
+        expectedHostRevision: { value: host.revision },
+        workspacePath: "/srv/new-project",
+        createIfMissing
+      } }
+    });
+    const refused = await submit(
+      paired.clients.operation, paired.connectionId, createRemoteProject(false)
+    );
+    expect(refused).toMatchObject({
+      state: OperationState.FAILED,
+      error: { code: "EFFECT_FAILED", message: expect.stringContaining("The SSH project directory does not exist.") }
+    });
+    expect(createdRemoteDirectory).toBe(false);
+    const createdOperation = await submit(
+      paired.clients.operation, paired.connectionId, createRemoteProject(true)
+    );
+    expect(createdOperation.state).toBe(OperationState.SUCCEEDED);
+    if (createdOperation.result?.payload.case !== "target") throw new Error("Remote project creation returned no Target.");
+    const createdTarget = createdOperation.result.payload.value;
+    expect(createdTarget.remoteWorkspace).toMatchObject({
+      hostTargetId: targetId, hostId: host.id, workspaceRootDisplay: "/srv/new-project"
+    });
+    expect(fixture.application.store.getTarget(createdTarget.targetId).descriptor.remoteWorkspace).toEqual({
+      hostTargetId: targetId, hostId: host.id, workspaceRoot: "/srv/new-project"
+    });
+    expect(fixture.application.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
+      id: createdTarget.workspaceId,
+      root: "/srv/new-project",
+      remote: { targetId: createdTarget.targetId, hostTargetId: targetId, hostId: host.id, workspaceRoot: "/srv/new-project" }
+    }));
+    expect(files.mkdir).toHaveBeenCalledWith("/srv/new-project", expect.objectContaining({ recursive: true, mode: 0o700 }));
     expect(connect).toHaveBeenCalledOnce();
   } finally {
     await fixture.close();

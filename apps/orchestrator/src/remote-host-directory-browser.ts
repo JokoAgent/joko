@@ -5,6 +5,48 @@ import type { RemoteFileTransportPort } from "@joko/remote-ssh";
 const MAX_PATH_LENGTH = 16_384;
 const MAX_SCANNED_ENTRIES = 4_096;
 const MAX_DIRECTORIES = 200;
+const MAX_PATH_COMPONENTS = 256;
+
+export type RemoteHostDirectoryInspection =
+  | { readonly exists: true; readonly path: string }
+  | { readonly exists: false; readonly path: string };
+
+/** Distinguishes a missing path from an inaccessible/broken one without trusting SFTP error text. */
+export async function inspectRemoteHostDirectory(
+  files: RemoteFileTransportPort,
+  requestedPath: string,
+  signal: AbortSignal,
+  assertCurrent: () => void
+): Promise<RemoteHostDirectoryInspection> {
+  if (requestedPath === "") throw new ConnectError("A remote project directory is required.", Code.InvalidArgument);
+  validateRemoteHostDirectoryPath(requestedPath);
+  const components = requestedPath.split("/").filter(Boolean);
+  if (components.length > MAX_PATH_COMPONENTS) throw new ConnectError("The SSH Host path is too deep.", Code.InvalidArgument);
+  signal.throwIfAborted(); assertCurrent();
+  let parent = await files.realpath("/", signal);
+  signal.throwIfAborted(); assertCurrent();
+  if (!validRemotePath(parent) || (await files.stat(parent, signal)).kind !== "directory") {
+    throw new ConnectError("The SSH Host root is unavailable.", Code.FailedPrecondition);
+  }
+  for (const name of components) {
+    signal.throwIfAborted(); assertCurrent();
+    const entries = await files.list(parent, signal);
+    signal.throwIfAborted(); assertCurrent();
+    const entry = entries.find((candidate) => candidate.name === name);
+    if (entry === undefined) return { exists: false, path: requestedPath };
+    if (entry.kind !== "directory" && entry.kind !== "symbolic_link") {
+      throw new ConnectError("The SSH Host path contains a non-directory entry.", Code.FailedPrecondition);
+    }
+    const resolved = await files.realpath(posix.join(parent, name), signal);
+    signal.throwIfAborted(); assertCurrent();
+    if (!validRemotePath(resolved) || (await files.stat(resolved, signal)).kind !== "directory") {
+      throw new ConnectError("The SSH Host path is not an available directory.", Code.FailedPrecondition);
+    }
+    parent = resolved;
+  }
+  signal.throwIfAborted(); assertCurrent();
+  return { exists: true, path: parent };
+}
 
 export interface RemoteHostDirectoryListing {
   readonly path: string;

@@ -89,7 +89,7 @@ describe("Claude MCP durable Session and Queue", () => {
     await host.registerTarget({
       id: targetId, backendId: "claude-code", displayName: location, workspaceRoot: root,
       managed: !remote, trusted: true,
-      ...(remote ? { remoteWorkspace: { hostId: "host-a", workspaceRoot: nativeRoot } } : {})
+      ...(remote ? { remoteWorkspace: { hostTargetId: targetId, hostId: "host-a", workspaceRoot: nativeRoot } } : {})
     });
     const connection = store.createConnection({ id: "connection-local", name: "Local", authKeyDigest: "digest" });
     const create = await host.createSession({

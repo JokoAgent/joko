@@ -4,6 +4,8 @@ export interface TerminalScope {
   readonly workspaceRoot: string;
   /** A remote scope uses POSIX paths owned by this host, never the service filesystem. */
   readonly remoteHostId?: string;
+  /** Host catalog owner; a remote Target may use a Host owned by another Target. */
+  readonly remoteHostTargetId?: string;
 }
 
 export interface TerminalReference extends TerminalScope {

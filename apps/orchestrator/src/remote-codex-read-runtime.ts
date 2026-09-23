@@ -117,7 +117,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     signal?: AbortSignal
   ): Promise<CodexRemoteRuntime> {
     const binding = requireRemoteBinding(target);
-    const authority = await this.#registry.captureProcessAuthority(target.id, binding.hostId, signal);
+    const authority = await this.#registry.captureProcessAuthority(binding.hostTargetId, binding.hostId, signal);
     const processes = requireProcesses(authority.lease);
     authority.assertCurrent();
     const installation = await probeRemoteCodexInstallation(processes, binding.workspaceRoot, authority.assertCurrent, signal);

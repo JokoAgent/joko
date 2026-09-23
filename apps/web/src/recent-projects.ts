@@ -6,6 +6,7 @@ export interface RecentProject {
   readonly workspaceId: string;
   readonly name: string;
   readonly serverPath: string;
+  readonly remoteHostTargetId?: string;
   readonly remoteHostId?: string;
   readonly remoteWorkspaceRoot?: string;
   readonly lastUsedAt: number;
@@ -42,6 +43,7 @@ export function recentProjectForTarget(snapshot: AppSnapshot, targetId: string, 
   const entry: RecentProject = {
     targetId, workspaceId: workspace.id, name: target.name, serverPath: workspace.serverPath,
     ...(target.remoteWorkspace === undefined ? {} : {
+      remoteHostTargetId: target.remoteWorkspace.hostTargetId,
       remoteHostId: target.remoteWorkspace.hostId,
       remoteWorkspaceRoot: target.remoteWorkspace.workspaceRoot
     }),
@@ -56,13 +58,14 @@ export function resolveRecentProject(entry: RecentProject, snapshot: AppSnapshot
   const workspace = snapshot.workspaces.find((candidate) => candidate.id === entry.workspaceId
     && candidate.targetId === entry.targetId && candidate.kind === "userProject");
   if (target === undefined || workspace === undefined || normalizePath(workspace.serverPath) !== normalizePath(entry.serverPath)) return undefined;
-  if (target.remoteWorkspace?.hostId !== entry.remoteHostId
+  if (target.remoteWorkspace?.hostTargetId !== entry.remoteHostTargetId
+    || target.remoteWorkspace?.hostId !== entry.remoteHostId
     || target.remoteWorkspace?.workspaceRoot !== entry.remoteWorkspaceRoot) return undefined;
   return target;
 }
 
 export function recentProjectKey(entry: RecentProject): string {
-  return `${entry.remoteHostId ?? ""}\u0000${normalizePath(entry.remoteWorkspaceRoot ?? entry.serverPath)}`;
+  return `${entry.remoteHostTargetId ?? ""}\u0000${entry.remoteHostId ?? ""}\u0000${normalizePath(entry.remoteWorkspaceRoot ?? entry.serverPath)}`;
 }
 
 export function withRecentProject(current: readonly RecentProject[], entry: RecentProject): readonly RecentProject[] {
@@ -84,7 +87,8 @@ export function normalizeRecentProjects(value: unknown): readonly RecentProject[
   const entries = value.filter(validRecentProject).map((entry) => ({
     targetId: entry.targetId, workspaceId: entry.workspaceId, name: entry.name,
     serverPath: entry.serverPath,
-    ...(entry.remoteHostId === undefined ? {} : { remoteHostId: entry.remoteHostId, remoteWorkspaceRoot: entry.remoteWorkspaceRoot }),
+    ...(entry.remoteHostId === undefined ? {} : { remoteHostTargetId: entry.remoteHostTargetId,
+      remoteHostId: entry.remoteHostId, remoteWorkspaceRoot: entry.remoteWorkspaceRoot }),
     lastUsedAt: entry.lastUsedAt
   })).sort((left, right) => right.lastUsedAt - left.lastUsedAt);
   const seen = new Set<string>();
@@ -103,10 +107,11 @@ function validRecentProject(value: unknown): value is RecentProject {
     || !validText(entry["name"], 120) || !validText(entry["serverPath"], 4096)
     || typeof entry["lastUsedAt"] !== "number" || !Number.isSafeInteger(entry["lastUsedAt"])
     || entry["lastUsedAt"] < 0) return false;
+  const remoteHostTarget = entry["remoteHostTargetId"];
   const remoteHost = entry["remoteHostId"];
   const remoteRoot = entry["remoteWorkspaceRoot"];
-  return remoteHost === undefined && remoteRoot === undefined
-    || validText(remoteHost, 256) && validText(remoteRoot, 4096);
+  return remoteHostTarget === undefined && remoteHost === undefined && remoteRoot === undefined
+    || validText(remoteHostTarget, 256) && validText(remoteHost, 256) && validText(remoteRoot, 4096);
 }
 
 function validText(value: unknown, maximum: number): value is string {

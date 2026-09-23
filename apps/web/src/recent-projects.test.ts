@@ -9,8 +9,8 @@ it("keeps ten most recently used directory identities and does not merge matchin
   entries = withRecentProject(entries, { ...sample, targetId: "other", workspaceId: "other-workspace", serverPath: "C:/work/project/" });
   expect(entries).toHaveLength(1);
   expect(entries[0]?.targetId).toBe("other");
-  entries = withRecentProject(entries, { ...sample, targetId: "remote-a", remoteHostId: "host-a", remoteWorkspaceRoot: "/work/project", serverPath: "/work/project" });
-  entries = withRecentProject(entries, { ...sample, targetId: "remote-b", remoteHostId: "host-b", remoteWorkspaceRoot: "/work/project", serverPath: "/work/project" });
+  entries = withRecentProject(entries, { ...sample, targetId: "remote-a", remoteHostTargetId: "source", remoteHostId: "host-a", remoteWorkspaceRoot: "/work/project", serverPath: "/work/project" });
+  entries = withRecentProject(entries, { ...sample, targetId: "remote-b", remoteHostTargetId: "source", remoteHostId: "host-b", remoteWorkspaceRoot: "/work/project", serverPath: "/work/project" });
   expect(entries.map((entry) => entry.targetId)).toEqual(["remote-b", "remote-a", "other"]);
   for (let index = 0; index < 12; index += 1) entries = withRecentProject(entries, { ...sample, targetId: `t-${index}`, serverPath: `/work/${index}` });
   expect(entries).toHaveLength(MAX_RECENT_PROJECTS);
@@ -32,11 +32,11 @@ it("uses current Target and Workspace identity, availability and path rather tha
   expect(resolveRecentProject(entry!, { ...snapshot, workspaces: [{ ...snapshot.workspaces[0]!, serverPath: "C:/other" }] })).toBeUndefined();
   expect(resolveRecentProject(entry!, { ...snapshot, targets: [] })).toBeUndefined();
   expect(recentProjectForTarget({ ...snapshot, workspaces: [{ ...snapshot.workspaces[0]!, kind: "managedDialogue" }] }, "target")).toBeUndefined();
-  const remoteSnapshot = { ...snapshot, targets: [{ ...snapshot.targets[0]!, remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" } }],
+  const remoteSnapshot = { ...snapshot, targets: [{ ...snapshot.targets[0]!, remoteWorkspace: { hostTargetId: "target", hostId: "host-a", workspaceRoot: "/srv/project" } }],
     workspaces: [{ ...snapshot.workspaces[0]!, serverPath: "/srv/project" }] };
   const remoteEntry = recentProjectForTarget(remoteSnapshot, "target");
   expect(resolveRecentProject(remoteEntry!, { ...remoteSnapshot,
-    targets: [{ ...remoteSnapshot.targets[0]!, remoteWorkspace: { hostId: "host-b", workspaceRoot: "/srv/project" } }] })).toBeUndefined();
+    targets: [{ ...remoteSnapshot.targets[0]!, remoteWorkspace: { hostTargetId: "target", hostId: "host-b", workspaceRoot: "/srv/project" } }] })).toBeUndefined();
 });
 
 it("discards malformed local history and removes only the exact remembered identity", () => {

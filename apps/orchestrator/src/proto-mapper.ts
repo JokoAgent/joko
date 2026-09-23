@@ -2162,6 +2162,7 @@ export function toProtoRemoteWorkspace(
 ): contract.RemoteWorkspaceBinding | undefined {
   if (value === undefined) return undefined;
   return message<contract.RemoteWorkspaceBinding>("joko.v1.RemoteWorkspaceBinding", {
+    hostTargetId: value.hostTargetId,
     hostId: value.hostId,
     workspaceRootDisplay: value.workspaceRoot
   });
@@ -2170,6 +2171,7 @@ export function toProtoRemoteWorkspace(
 export function fromProtoRemoteWorkspace(
   value: contract.RemoteWorkspaceBinding
 ): NonNullable<TargetDescriptor["remoteWorkspace"]> {
+  requireText(value.hostTargetId, "remote_workspace.host_target_id");
   requireText(value.hostId, "remote_workspace.host_id");
   requireText(value.workspaceRootDisplay, "remote_workspace.workspace_root_display");
   if (!value.workspaceRootDisplay.startsWith("/") || value.workspaceRootDisplay.includes("\0")) {
@@ -2179,7 +2181,7 @@ export function fromProtoRemoteWorkspace(
       "Remote workspace root must be an absolute POSIX path."
     );
   }
-  return { hostId: value.hostId, workspaceRoot: value.workspaceRootDisplay };
+  return { hostTargetId: value.hostTargetId, hostId: value.hostId, workspaceRoot: value.workspaceRootDisplay };
 }
 
 function toProtoWorkspaceChangeSetProjection(value: WorkspaceChangeSetProjection): WorkspaceChangeSet {

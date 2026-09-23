@@ -422,7 +422,7 @@ function createFixture(options: FixtureOptions = {}) {
     workspaceRoot: "D:\\service-owned-placeholder",
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+    remoteWorkspace: { hostTargetId: "target-claude", hostId: "host-a", workspaceRoot: "/srv/project" }
   };
   const host: RemoteHostRecord = {
     ownerId: "owner-a",

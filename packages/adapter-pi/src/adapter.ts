@@ -4137,6 +4137,7 @@ export class PiBackendAdapter implements BackendAdapter {
         JOKO_PI_REMOTE_RECOVERY_IDENTITY: stableRemoteRecoveryIdentity(
           context.sessionId,
           context.target.id,
+          context.target.remoteWorkspace.hostTargetId,
           context.target.remoteWorkspace.hostId
         )
       }),
@@ -6352,9 +6353,9 @@ function stableSpawnIdentity(agentHome: string, sessionsRoot: string, sessionKey
     .digest("hex");
 }
 
-function stableRemoteRecoveryIdentity(sessionId: string, targetId: string, hostId: string): string {
+function stableRemoteRecoveryIdentity(sessionId: string, targetId: string, hostTargetId: string, hostId: string): string {
   return createHash("sha256")
-    .update([sessionId, targetId, hostId].join("\0"))
+    .update([sessionId, targetId, hostTargetId, hostId].join("\0"))
     .digest("hex");
 }
 

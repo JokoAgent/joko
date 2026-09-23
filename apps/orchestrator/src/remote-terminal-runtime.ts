@@ -19,7 +19,7 @@ export class RemoteTerminalRuntimeResolver {
     if (scope.remoteHostId === undefined) throw unavailable();
     try {
       signal?.throwIfAborted();
-      const { lease } = await this.registry.transports(scope.targetId, scope.remoteHostId, signal);
+      const { lease } = await this.registry.transports(scope.remoteHostTargetId ?? scope.targetId, scope.remoteHostId, signal);
       if (!lease.capabilities.interactiveTerminal || !lease.capabilities.fileTransfer || !lease.capabilities.processStreaming
         || lease.terminals === undefined || lease.files === undefined || lease.processes === undefined) throw unavailable();
       const { terminals, files, processes } = lease;

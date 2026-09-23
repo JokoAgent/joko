@@ -1817,7 +1817,7 @@ describe("SessionHost", () => {
         backendId: "pi",
         displayName: "Remote target",
         workspaceRoot: "/workspace",
-        remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" },
+        remoteWorkspace: { hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
         managed: true,
         trusted: true
       } as const;
@@ -1980,7 +1980,7 @@ describe("SessionHost", () => {
         backendId: "pi",
         displayName: "Remote target",
         workspaceRoot: "/workspace",
-        remoteWorkspace: { hostId: "host-a", workspaceRoot: "/workspace" },
+        remoteWorkspace: { hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
         managed: true,
         trusted: true
       } as const;
@@ -10463,7 +10463,7 @@ describe("SessionHost", () => {
       workspaceRoot: directory,
       managed: false,
       trusted: true,
-      remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+      remoteWorkspace: { hostTargetId: "codex-remote-target", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
     } as const;
     await host.registerTarget(target);
     const nativeSessionId = remoteFake.seedThread(target.remoteWorkspace.workspaceRoot);

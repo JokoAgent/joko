@@ -177,7 +177,7 @@ async function fixture(options: FixtureOptions = {}) {
     workspaceRoot: "D:/remote-placeholder",
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/workspace" }
+    remoteWorkspace: { hostTargetId: "target-remote", hostId: "remote-host", workspaceRoot: "/srv/workspace" }
   });
   for (const generation of [0, 1, 2, 7, 8, 99]) {
     store.createSession({
@@ -201,7 +201,7 @@ async function fixture(options: FixtureOptions = {}) {
     targetId: "target-remote",
     title: "Remote Session",
     binding: { opaqueRef: "remote-session.jsonl", generation: 1 },
-    remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/workspace" },
+    remoteWorkspace: { hostTargetId: "target-remote", hostId: "remote-host", workspaceRoot: "/srv/workspace" },
     pinned: false,
     archived: false,
     permissionMode: "ask",

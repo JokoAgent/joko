@@ -56,6 +56,7 @@ message OperationMutation {
     LogoutConnectionMutation logout_connection = 11;
     RestartBackendMutation restart_backend = 12;
     CreateTargetMutation create_target = 13;
+    CreateRemoteTargetMutation create_remote_target = 215;
     UpdateTargetMutation update_target = 14;
     ArchiveTargetMutation archive_target = 15;
     DeleteTargetMutation delete_target = 16;
@@ -481,6 +482,19 @@ message CreateTargetMutation {
   string backend_id = 1;
   string display_name = 2;
   TargetWorkspaceInput workspace = 3;
+}
+
+// Creates a project on one already trusted SSH Host. The source Target's
+// exact revision is supplied as an Operation precondition.
+message CreateRemoteTargetMutation {
+  string backend_id = 1;
+  string display_name = 2;
+  string host_target_id = 3;
+  string host_id = 4;
+  Revision expected_host_revision = 5;
+  string workspace_path = 6;
+  // True only after the user explicitly confirms creating an absent directory.
+  bool create_if_missing = 7;
 }
 
 message TargetWorkspaceInput {

@@ -3,6 +3,7 @@ import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { listProjectDirectories } from "./project-directory-browser.js";
+import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import {
@@ -8006,6 +8007,7 @@ function targetWorkspaceRegistration(target: StoredTarget): WorkspaceRegistratio
     ...(binding === undefined ? {} : {
       remote: {
         targetId: target.descriptor.id,
+        hostTargetId: binding.hostTargetId,
         hostId: binding.hostId,
         workspaceRoot: binding.workspaceRoot
       }
@@ -15061,6 +15063,98 @@ async function dispatchMutation(
       });
       return presented(execution);
     }
+    case "createRemoteTarget": {
+      const remoteHosts = dependencies.remoteHosts;
+      if (remoteHosts === undefined || dependencies.managedWorkspaceRoot === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case,
+          "Remote project creation is unavailable on this service node.");
+      }
+      const input = payload.value;
+      const sourceTargetId = input.hostTargetId;
+      const hostId = input.hostId;
+      const expectedHostRevision = fromProtoRevision(input.expectedHostRevision, "expected_host_revision");
+      requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, sourceTargetId, "create_remote_target");
+      if (sourceTargetId.trim() === "" || hostId.trim() === "" || input.backendId.trim() === ""
+        || input.displayName.trim() === "" || input.displayName.length > 120) {
+        throw invalidArgument("A Backend, project name and exact SSH Host are required.");
+      }
+      if (input.workspacePath === "") throw invalidArgument("A remote project directory is required.");
+      validateRemoteHostDirectoryPath(input.workspacePath);
+      const id = stableId("target", operationId);
+      const workspaceId = stableId("workspace", operationId);
+      const fallbackRoot = resolve(dependencies.managedWorkspaceRoot, id);
+      let descriptor: import("@joko/core").TargetDescriptor | undefined;
+      let workspaceRegistered = false;
+      let fallbackCreated = false;
+      const assertSourceCurrent = (store: OperationalStore): void => {
+        const host = remoteHosts.get(sourceTargetId, hostId);
+        if (host.revision !== expectedHostRevision) {
+          throw new ConnectError("The selected SSH Host changed. Reload it and retry.", Code.Aborted);
+        }
+        if (host.status.state !== "ready" || host.trust === undefined) {
+          throw new ConnectError("The selected SSH Host is not ready and trusted.", Code.FailedPrecondition);
+        }
+        store.getBackend(input.backendId);
+      };
+      let execution: OperationExecution<OperationOutcome>;
+      try {
+        execution = await host.mutate({
+          operationId, connection, kind: payload.case, body: mutation,
+          precondition: assertSourceCurrent,
+          effect: async () => {
+            const authority = await remoteHosts.captureTransportAuthority(sourceTargetId, hostId);
+            if (authority.hostRevision !== expectedHostRevision || authority.lease.files === undefined) {
+              throw new ConnectError("The selected SSH Host file transport changed.", Code.Aborted);
+            }
+            const signal = new AbortController().signal;
+            const inspection = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, authority.assertCurrent);
+            let canonical = inspection.path;
+            if (!inspection.exists) {
+              if (!input.createIfMissing) throw new ConnectError("The SSH project directory does not exist.", Code.NotFound);
+              await authority.lease.files.mkdir(input.workspacePath, { recursive: true, mode: 0o700, signal });
+              authority.assertCurrent();
+              const created = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, authority.assertCurrent);
+              if (!created.exists) throw new ConnectError("The SSH project directory could not be verified after creation.", Code.FailedPrecondition);
+              canonical = created.path;
+            }
+            authority.assertCurrent();
+            const fallbackExisted = await pathExists(fallbackRoot);
+            await mkdir(fallbackRoot, { recursive: true, mode: 0o700 });
+            fallbackCreated = !fallbackExisted;
+            const localRoot = await requireExistingDirectory(fallbackRoot, "remote project fallback");
+            if (localRoot !== fallbackRoot) throw new ConnectError("The service-owned project directory changed.", Code.FailedPrecondition);
+            descriptor = {
+              id, backendId: input.backendId, displayName: input.displayName.trim(),
+              workspaceRoot: localRoot, managed: false, trusted: false,
+              remoteWorkspace: { hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
+            };
+            await host.validateTarget(descriptor);
+            authority.assertCurrent();
+            await dependencies.workspaceService.register({
+              id: workspaceId, root: canonical, displayName: descriptor.displayName, trusted: false,
+              remote: { targetId: id, hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
+            });
+            workspaceRegistered = true;
+            authority.assertCurrent();
+          },
+          commit: (store) => {
+            if (descriptor === undefined) throw new Error("Remote project preparation completed without a Target.");
+            store.upsertTarget(descriptor, { workspaceId });
+            return { accepted: true, resultCase: "target", entityId: id } satisfies OperationOutcome;
+          }
+        });
+      } catch (error) {
+        if (workspaceRegistered) dependencies.workspaceService.unregister(workspaceId);
+        if (fallbackCreated) {
+          await moveManagedWorkspaceToTrash({
+            managedRoot: resolve(dependencies.managedWorkspaceRoot), workspaceRoot: fallbackRoot,
+            targetId: id, operationId
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
+      return presented(execution);
+    }
     case "updateTarget": {
       return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
         requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, payload.value.targetId, "update_target");
@@ -15074,7 +15168,7 @@ async function dispatchMutation(
               throw new ConnectError("Remote workspace binding is unavailable.", Code.Unimplemented);
             }
             const remoteWorkspace = fromProtoRemoteWorkspace(payload.value.workspaceLocationUpdate.value);
-            const remoteHost = dependencies.remoteHosts.get(existing.descriptor.id, remoteWorkspace.hostId);
+            const remoteHost = dependencies.remoteHosts.get(remoteWorkspace.hostTargetId, remoteWorkspace.hostId);
             if (remoteHost.status.state !== "ready" || remoteHost.trust === undefined) {
               throw new ConnectError(
                 "Test and trust the Remote Host before binding this target.",

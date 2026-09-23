@@ -107,6 +107,7 @@ service RemoteHostService {
   rpc ListRemoteHosts(ListRemoteHostsRequest) returns (ListRemoteHostsResponse);
   rpc GetRemoteHost(GetRemoteHostRequest) returns (GetRemoteHostResponse);
   rpc ListRemoteHostDirectories(ListRemoteHostDirectoriesRequest) returns (ListRemoteHostDirectoriesResponse);
+  rpc InspectRemoteHostDirectory(InspectRemoteHostDirectoryRequest) returns (InspectRemoteHostDirectoryResponse);
   // Emits one authoritative initial catalog snapshot, then ordered changes for
   // this authenticated owner and exact target until the stream ends.
   rpc WatchRemoteHosts(WatchRemoteHostsRequest) returns (stream WatchRemoteHostsResponse);
@@ -285,6 +286,24 @@ message ListRemoteHostDirectoriesResponse {
   string parent_path = 6;
   repeated RemoteHostDirectoryEntry directories = 7;
   bool truncated = 8;
+}
+
+message InspectRemoteHostDirectoryRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_target_revision = 3;
+  Revision expected_host_revision = 4;
+  string path = 5;
+}
+
+message InspectRemoteHostDirectoryResponse {
+  string target_id = 1;
+  string host_id = 2;
+  Revision target_revision = 3;
+  Revision host_revision = 4;
+  bool exists = 5;
+  // Canonical when existing, the validated requested path when absent.
+  string path = 6;
 }
 
 message WatchRemoteHostsRequest {

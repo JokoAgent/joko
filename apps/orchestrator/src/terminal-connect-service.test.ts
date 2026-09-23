@@ -21,7 +21,7 @@ describe("TerminalService authority and volatile transport", () => {
     const f = await fixture({ resolveRemoteRuntime: async () => ({
       discoverShells: async () => [{ id: "/bin/sh", label: "sh", executable: "/bin/sh", args: ["-i"], isDefault: true }], canonicalDirectory: directory, spawn
     }) });
-    const remoteWorkspace = { hostId: "host-one", workspaceRoot: "/work/project" };
+    const remoteWorkspace = { hostTargetId: "remote-target", hostId: "host-one", workspaceRoot: "/work/project" };
     f.store.upsertTarget({ ...f.store.getTarget("target").descriptor, id: "remote-target", remoteWorkspace });
     f.store.createSession({ ...f.store.getSession("task").descriptor, id: "remote-task", targetId: "remote-target", remoteWorkspace,
       binding: { opaqueRef: "remote-native", generation: 0 } });
@@ -49,7 +49,7 @@ describe("TerminalService authority and volatile transport", () => {
         canonicalDirectory: async (root) => root, spawn };
     });
     const f = await fixture({ resolveRemoteRuntime });
-    const remoteWorkspace = { hostId: "host-one", workspaceRoot: "/work/project" };
+    const remoteWorkspace = { hostTargetId: "remote-target", hostId: "host-one", workspaceRoot: "/work/project" };
     f.store.upsertTarget({ ...f.store.getTarget("target").descriptor, id: "remote-target", remoteWorkspace });
     f.store.createSession({ ...f.store.getSession("task").descriptor, id: "remote-task", targetId: "remote-target", remoteWorkspace,
       binding: { opaqueRef: "remote-native", generation: 0 } });
@@ -57,7 +57,7 @@ describe("TerminalService authority and volatile transport", () => {
     expect(capabilities).toMatchObject({ support: contract.CapabilitySupport.SUPPORTED, defaultShellId: "/bin/sh" });
     const created = await f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { sessionId: "remote-task", requestId: "remote-start", initialPalette: palette }), f.context);
     expect(created.terminal).toMatchObject({ cwd: "/work/project", exitConfirmed: false, status: contract.TerminalStatus.RUNNING });
-    expect(resolveRemoteRuntime.mock.calls[0]?.[0]).toEqual({ sessionId: "remote-task", targetId: "remote-target", remoteHostId: "host-one", workspaceRoot: "/work/project" });
+    expect(resolveRemoteRuntime.mock.calls[0]?.[0]).toEqual({ sessionId: "remote-task", targetId: "remote-target", remoteHostTargetId: "remote-target", remoteHostId: "host-one", workspaceRoot: "/work/project" });
     expect(f.spawn).not.toHaveBeenCalled();
     const reference = { sessionId: "remote-task", terminalId: created.terminal!.id, generation: created.terminal!.generation };
     pty.output("Remote process screen");
@@ -320,7 +320,7 @@ describe("TerminalService authority and volatile transport", () => {
     await expect(f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "task", requestId: "archived" }), f.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     f.store.updateSession("task", { archived: false });
     const existing = f.store.getSession("task").descriptor;
-    const remoteWorkspace = { hostId: "remote-host", workspaceRoot: "/remote/workspace" };
+    const remoteWorkspace = { hostTargetId: "remote-target", hostId: "remote-host", workspaceRoot: "/remote/workspace" };
     f.store.upsertTarget({ ...f.store.getTarget("target").descriptor, id: "remote-target", remoteWorkspace });
     f.store.createSession({ ...existing, id: "remote-task", targetId: "remote-target", remoteWorkspace, binding: { opaqueRef: "remote-native", generation: 0 } });
     await expect(f.service.createTerminal(create(contract.CreateTerminalRequestSchema, { initialPalette: palette, sessionId: "remote-task", requestId: "remote" }), f.context)).rejects.toMatchObject({ code: Code.Unimplemented });

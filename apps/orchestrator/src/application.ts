@@ -937,7 +937,7 @@ export async function createOrchestratorApplication(
     validateRemoteWorkspace: async (target, signal) => {
       const binding = target.remoteWorkspace;
       if (binding === undefined) throw new Error("Remote workspace binding is missing.");
-      await remotePiProcesses.validate(target.id, binding.hostId, binding.workspaceRoot, signal);
+      await remotePiProcesses.validate(binding.hostTargetId, binding.hostId, binding.workspaceRoot, signal);
     },
     providers: providerSnapshot.providers,
     nativeModels: providerAuth.listNativeModels().filter((model) =>
@@ -1865,7 +1865,7 @@ export async function createOrchestratorApplication(
       displayName: configuredTarget.descriptor.displayName,
       trusted: configuredTarget.descriptor.trusted,
       ...(configuredBinding === undefined ? {} : {
-        remote: { targetId: configuredTarget.descriptor.id, hostId: configuredBinding.hostId, workspaceRoot: configuredBinding.workspaceRoot }
+        remote: { targetId: configuredTarget.descriptor.id, hostTargetId: configuredBinding.hostTargetId, hostId: configuredBinding.hostId, workspaceRoot: configuredBinding.workspaceRoot }
       })
     });
     for (const storedTarget of store.listTargets()) {
@@ -1882,6 +1882,7 @@ export async function createOrchestratorApplication(
           ...(binding === undefined ? {} : {
             remote: {
               targetId: storedTarget.descriptor.id,
+              hostTargetId: binding.hostTargetId,
               hostId: binding.hostId,
               workspaceRoot: binding.workspaceRoot
             }

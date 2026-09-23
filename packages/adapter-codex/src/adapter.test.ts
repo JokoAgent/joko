@@ -4194,7 +4194,7 @@ async function createRemoteSetup(options: {
     workspaceRoot: serviceRoot,
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+    remoteWorkspace: { hostTargetId: "target-codex", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
   };
   cleanups.push(async () => {
     await adapter.dispose();

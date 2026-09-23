@@ -70,6 +70,26 @@ describe("owner-scoped Remote Host persistence", () => {
     expect(() => createHost(fixture.store, { credentialReferenceId: "../private-key" })).toThrow(StoreError);
   });
 
+  it("retains a shared Host's source identity and blocks deletion while another Target or Session uses it", () => {
+    const fixture = createFixture();
+    const source = createHost(fixture.store, { targetId: "target-a", id: "shared" });
+    const other = createHost(fixture.store, { targetId: "target-b", id: "shared" });
+    const binding = { hostTargetId: source.targetId, hostId: source.id, workspaceRoot: "/srv/second-project" };
+    const second = fixture.store.getTarget("target-b").descriptor;
+    fixture.store.upsertTarget({ ...second, remoteWorkspace: binding });
+    fixture.store.createSession(sessionDescriptor({ id: "shared-remote-session", targetId: "target-b", remoteWorkspace: binding }));
+
+    const restarted = fixture.reopen();
+    expect(restarted.getTarget("target-b").descriptor.remoteWorkspace).toEqual(binding);
+    expect(restarted.getSession("shared-remote-session").descriptor.remoteWorkspace).toEqual(binding);
+    expect(restarted.deleteRemoteHost({ ownerId: other.ownerId, targetId: other.targetId,
+      id: other.id, expectedRevision: other.revision }).id).toBe("shared");
+    expect(() => restarted.deleteRemoteHost({ ownerId: source.ownerId, targetId: source.targetId,
+      id: source.id, expectedRevision: source.revision })).toThrow(/bound remote host/u);
+    expect(() => restarted.upsertTarget({ ...second,
+      remoteWorkspace: { ...binding, hostTargetId: "missing-target" } })).toThrow(NotFoundError);
+  });
+
   it("applies revision checks and protects active or pinned routing metadata", () => {
     const fixture = createFixture();
     const created = createHost(fixture.store, { credentialReferenceId: "agent:key-old" });
@@ -373,26 +393,28 @@ describe("owner-scoped Remote Host persistence", () => {
       workspaceRoot: "D:/workspace/target-a",
       managed: false,
       trusted: true,
-      remoteWorkspace: { hostId: host.id, workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: host.targetId, hostId: host.id, workspaceRoot: "/srv/project" }
     });
     expect(target.descriptor.remoteWorkspace).toEqual({
+      hostTargetId: "target-a",
       hostId: "build",
       workspaceRoot: "/srv/project"
     });
     expect(() => fixture.store.createSession(sessionDescriptor({
       id: "mismatched-session",
-      remoteWorkspace: { hostId: host.id, workspaceRoot: "/srv/other" }
+      remoteWorkspace: { hostTargetId: host.targetId, hostId: host.id, workspaceRoot: "/srv/other" }
     }))).toThrow(/must match its target/u);
 
     const session = fixture.store.createSession(sessionDescriptor({
       id: "remote-session",
-      remoteWorkspace: { hostId: host.id, workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: host.targetId, hostId: host.id, workspaceRoot: "/srv/project" }
     }));
     fixture.store.upsertTarget({
       ...target.descriptor,
-      remoteWorkspace: { hostId: host.id, workspaceRoot: "/srv/next" }
+      remoteWorkspace: { hostTargetId: host.targetId, hostId: host.id, workspaceRoot: "/srv/next" }
     });
     expect(fixture.store.getSession(session.descriptor.id).descriptor.remoteWorkspace).toEqual({
+      hostTargetId: "target-a",
       hostId: "build",
       workspaceRoot: "/srv/project"
     });
@@ -405,6 +427,7 @@ describe("owner-scoped Remote Host persistence", () => {
 
     const restarted = fixture.reopen();
     expect(restarted.getTarget("target-a").descriptor.remoteWorkspace).toEqual({
+      hostTargetId: "target-a",
       hostId: "build",
       workspaceRoot: "/srv/next"
     });
@@ -412,6 +435,7 @@ describe("owner-scoped Remote Host persistence", () => {
     const cleared = restarted.updateRemoteHost({ ownerId: selected.ownerId, targetId: selected.targetId, id: selected.id, expectedRevision: selected.revision, authenticationMode: "system_agent", nodeKey: null });
     expect(cleared.nodeKey).toBeUndefined();
     expect(restarted.getSession("remote-session").descriptor.remoteWorkspace).toEqual({
+      hostTargetId: "target-a",
       hostId: "build",
       workspaceRoot: "/srv/project"
     });
@@ -567,12 +591,13 @@ function jsonText(value: unknown): string {
 
 function sessionDescriptor(overrides: {
   readonly id: string;
-  readonly remoteWorkspace?: { readonly hostId: string; readonly workspaceRoot: string };
+  readonly targetId?: string;
+  readonly remoteWorkspace?: { readonly hostTargetId: string; readonly hostId: string; readonly workspaceRoot: string };
 }) {
   return {
     id: overrides.id,
     backendId: "pi",
-    targetId: "target-a",
+    targetId: overrides.targetId ?? "target-a",
     title: overrides.id,
     binding: { opaqueRef: `native:${overrides.id}`, generation: 0 },
     pinned: false,

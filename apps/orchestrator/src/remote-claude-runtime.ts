@@ -142,7 +142,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     signal?: AbortSignal
   ): Promise<ClaudeTargetRuntime> {
     const remote = requireRemoteBinding(target);
-    const authority = await this.#registry.captureProcessAuthority(target.id, remote.hostId, signal);
+    const authority = await this.#registry.captureProcessAuthority(remote.hostTargetId, remote.hostId, signal);
     const processes = requireProcesses(authority.lease);
     authority.assertCurrent();
     const installation = await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, authority.assertCurrent, signal);

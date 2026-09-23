@@ -91,6 +91,7 @@ export interface TargetView {
   readonly pinned: boolean;
   readonly archived: boolean;
   readonly remoteWorkspace?: {
+    readonly hostTargetId: string;
     readonly hostId: string;
     readonly workspaceRoot: string;
   };
@@ -230,6 +231,17 @@ export interface TargetDraft {
   readonly createIfMissing: boolean;
 }
 
+export interface RemoteTargetDraft {
+  readonly backendId: string;
+  readonly name: string;
+  readonly hostTargetId: string;
+  readonly hostId: string;
+  readonly expectedHostTargetRevision: bigint;
+  readonly expectedHostRevision: bigint;
+  readonly workspacePath: string;
+  readonly createIfMissing: boolean;
+}
+
 export interface ProjectDirectoryListingView {
   readonly path: string;
   readonly parentPath: string;
@@ -312,6 +324,15 @@ export interface RemoteHostDirectoryListingView {
   readonly parentPath: string;
   readonly directories: readonly { readonly name: string; readonly path: string }[];
   readonly truncated: boolean;
+}
+
+export interface RemoteHostDirectoryInspectionView {
+  readonly targetId: string;
+  readonly hostId: string;
+  readonly targetRevision: bigint;
+  readonly hostRevision: bigint;
+  readonly exists: boolean;
+  readonly path: string;
 }
 
 export interface SshKeyView {
@@ -5280,6 +5301,7 @@ export interface OperationApi {
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
   createTarget(draft: TargetDraft): Promise<string>;
+  createRemoteTarget(draft: RemoteTargetDraft): Promise<string>;
   listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
   prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {
@@ -5766,6 +5788,7 @@ export interface OperationApi {
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
   listRemoteHostDirectories(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, path: string, signal?: AbortSignal): Promise<RemoteHostDirectoryListingView>;
+  inspectRemoteHostDirectory(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, path: string, signal?: AbortSignal): Promise<RemoteHostDirectoryInspectionView>;
   watchRemoteHosts(targetId: string, signal?: AbortSignal): AsyncIterable<readonly RemoteHostView[]>;
   refreshRemoteHostCatalog(targetId: string): Promise<readonly RemoteHostView[]>;
   createRemoteHost(targetId: string, draft: RemoteHostDraft): Promise<RemoteHostView>;

@@ -96,7 +96,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     this.#assertOpen();
     const registration = this.#require(workspaceId);
     const remote = registration.remote!;
-    const authority = await this.#registry.captureTransportAuthority(remote.targetId, remote.hostId, signal);
+    const authority = await this.#registry.captureTransportAuthority(remote.hostTargetId, remote.hostId, signal);
     signal?.throwIfAborted();
     const assertCurrent = (): void => {
       signal?.throwIfAborted(); this.#assertOpen(); authority.assertCurrent();
@@ -665,7 +665,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
 
   async #transports(registration: WorkspaceRegistration): Promise<RemoteTransports> {
     const remote = registration.remote!;
-    const { lease } = await this.#registry.transports(remote.targetId, remote.hostId);
+    const { lease } = await this.#registry.transports(remote.hostTargetId, remote.hostId);
     if (lease.files === undefined || lease.processes === undefined || !lease.capabilities.fileTransfer || !lease.capabilities.processStreaming) {
       throw new Error("Remote workspace transports are unavailable.");
     }

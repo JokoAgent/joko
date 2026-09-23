@@ -9,6 +9,7 @@ import {
   InteractionState,
   GetRemoteHostCapabilitiesResponseSchema,
   GetSnapshotResponseSchema,
+  InspectRemoteHostDirectoryResponseSchema,
   ListRemoteHostsResponseSchema,
   ListRemoteHostDirectoriesResponseSchema,
   OperationState,
@@ -62,11 +63,78 @@ describe("Remote Host gateway", () => {
     gateway.disconnect();
   });
 
+  it("maps remote project inspection and creation to the exact source Target and Host revisions", async () => {
+    const requests: Array<{ readonly method: string; readonly input: any }> = [];
+    const gateway = createOrchestratorGateway(
+      { id: "remote-project", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => remoteTransport((method, input) => {
+        requests.push({ method, input });
+        if (method === "inspectRemoteHostDirectory") {
+          return create(InspectRemoteHostDirectoryResponseSchema, {
+            targetId: "source-target", hostId: "build-box",
+            targetRevision: { value: 9n }, hostRevision: { value: 4n },
+            exists: false, path: "/srv/new-project"
+          });
+        }
+        if (method === "submitOperation") {
+          return create(SubmitOperationResponseSchema, {
+            operation: {
+              operationId: input.operationId,
+              connectionId: input.connectionId,
+              state: OperationState.SUCCEEDED,
+              result: { payload: { case: "target", value: { targetId: "created-target" } } }
+            }
+          });
+        }
+        throw new Error(`Unexpected method: ${method}`);
+      })
+    );
+    await gateway.connect();
+
+    await expect(gateway.inspectRemoteHostDirectory(
+      "source-target", "build-box", 9n, 4n, "/srv/new-project"
+    )).resolves.toEqual({
+      targetId: "source-target", hostId: "build-box", targetRevision: 9n, hostRevision: 4n,
+      exists: false, path: "/srv/new-project"
+    });
+    await expect(gateway.createRemoteTarget({
+      name: "  New remote project  ", backendId: "pi", hostTargetId: "source-target",
+      hostId: "build-box", expectedHostTargetRevision: 9n, expectedHostRevision: 4n,
+      workspacePath: "/srv/new-project", createIfMissing: true
+    })).resolves.toBe("created-target");
+
+    expect(requests.find(({ method }) => method === "inspectRemoteHostDirectory")?.input).toEqual({
+      targetId: "source-target", hostId: "build-box",
+      expectedTargetRevision: { value: 9n }, expectedHostRevision: { value: 4n },
+      path: "/srv/new-project"
+    });
+    const submitted = requests.find(({ method }) => method === "submitOperation")?.input.mutation;
+    expect(submitted?.payload).toMatchObject({
+      case: "createRemoteTarget",
+      value: {
+        backendId: "pi", displayName: "New remote project", hostTargetId: "source-target",
+        hostId: "build-box", expectedHostRevision: { value: 4n },
+        workspacePath: "/srv/new-project", createIfMissing: true
+      }
+    });
+    expect(submitted?.preconditions).toMatchObject([{
+      entity: { kind: EntityKind.TARGET, id: "source-target" }, expectedRevision: { value: 9n }
+    }]);
+    gateway.disconnect();
+  });
+
   it.each([undefined, 0n])("rejects a Target projection without a usable revision (%s)", (revision) => {
     expect(() => mapSnapshot(create(SnapshotSchema, { targets: [{
       targetId: "target-one", backendId: "backend", workspaceId: "workspace-one",
       ...(revision === undefined ? {} : { version: { revision: { value: revision } } })
     }] }))).toThrow("Target without a current revision");
+  });
+  it("rejects the obsolete remote binding shape without a source Target", () => {
+    expect(() => mapSnapshot(create(SnapshotSchema, { targets: [{
+      targetId: "target-one", backendId: "backend", workspaceId: "workspace-one",
+      version: { revision: { value: 1n } },
+      remoteWorkspace: { hostId: "build-box", workspaceRootDisplay: "/srv/project" }
+    }] }))).toThrow("incomplete remote workspace binding");
   });
   it("uses generated contracts for capability, CRUD, status, TOFU, and remote workspace binding", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];
@@ -114,6 +182,7 @@ describe("Remote Host gateway", () => {
 
     expect(snapshot?.targets[0]?.revision).toBe(7n);
     expect(snapshot?.targets[0]?.remoteWorkspace).toEqual({
+      hostTargetId: "target-one",
       hostId: "build-box",
       workspaceRoot: "/srv/project"
     });
@@ -536,7 +605,7 @@ function remoteTransport(handler: (method: string, input: any) => unknown, snaps
               displayName: "Project",
               workspaceId: "workspace-one",
               version: { revision: { value: 7n } },
-              remoteWorkspace: { hostId: "build-box", workspaceRootDisplay: "/srv/project" }
+              remoteWorkspace: { hostTargetId: "target-one", hostId: "build-box", workspaceRootDisplay: "/srv/project" }
             }],
             ...snapshotFields
           })

@@ -133,7 +133,7 @@ export class VisualRemoteHostFixture {
   updateTarget: AppController["updateTarget"] = async (id, patch, revision) => {
     const target = this.#targets.get(id);
     if (target === undefined || target.revision !== revision) throw new Error("The project changed. Reload its current values.");
-    const next = { ...target, revision: revision + 1n, ...(patch.name === undefined ? {} : { name: patch.name }), ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }), ...(patch.workspaceLocation === undefined ? {} : { remoteWorkspace: patch.workspaceLocation.kind === "serviceNode" ? undefined : { hostId: patch.workspaceLocation.hostId, workspaceRoot: patch.workspaceLocation.workspaceRoot } }) };
+    const next = { ...target, revision: revision + 1n, ...(patch.name === undefined ? {} : { name: patch.name }), ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }), ...(patch.workspaceLocation === undefined ? {} : { remoteWorkspace: patch.workspaceLocation.kind === "serviceNode" ? undefined : { hostTargetId: id, hostId: patch.workspaceLocation.hostId, workspaceRoot: patch.workspaceLocation.workspaceRoot } }) };
     this.#targets.set(id, next); this.#onTarget(next);
   };
 

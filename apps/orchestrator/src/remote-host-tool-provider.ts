@@ -139,7 +139,7 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
       this.#requireCaller(context);
       if (name === "remote_host_list_hosts") {
         requireOnlyKeys(arguments_, []);
-        return success({ hosts: this.#registry.list(context.targetId).map(publicHost) });
+        return success({ hosts: targetHosts(this.#registry, context.targetId).map(publicHost) });
       }
       if (name === "remote_host_status") {
         requireOnlyKeys(arguments_, ["host"]);
@@ -162,7 +162,7 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
         const input = optionalText(arguments_["input"], "input", INPUT_BYTE_LIMIT, true);
         const timeoutMs = optionalInteger(arguments_["timeoutMs"], "timeoutMs", 1, MAXIMUM_TIMEOUT_MS)
           ?? DEFAULT_TIMEOUT_MS;
-        const outcome = await this.#registry.execute(context.targetId, host.id, {
+        const outcome = await this.#registry.execute(host.targetId, host.id, {
           command,
           ...(cwd === undefined ? {} : { cwd }),
           ...(input === undefined ? {} : { input }),
@@ -188,6 +188,9 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
     if (
       session.targetId !== context.targetId ||
       session.backendId !== target.backendId ||
+      session.remoteWorkspace?.hostTargetId !== target.remoteWorkspace?.hostTargetId ||
+      session.remoteWorkspace?.hostId !== target.remoteWorkspace?.hostId ||
+      session.remoteWorkspace?.workspaceRoot !== target.remoteWorkspace?.workspaceRoot ||
       session.binding.generation !== context.generation ||
       session.deletedAt !== undefined ||
       session.archived
@@ -199,7 +202,7 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
 }
 
 function resolveHost(registry: RemoteHostRegistry, targetId: string, value: string): RemoteHostRecord {
-  const hosts = registry.list(targetId);
+  const hosts = targetHosts(registry, targetId);
   const alias = hosts.find((host) => host.id === value);
   if (alias !== undefined) return alias;
   const endpoints = hosts.filter((host) => host.hostname === value);
@@ -211,6 +214,11 @@ function resolveHost(registry: RemoteHostRegistry, targetId: string, value: stri
     );
   }
   throw new RemoteHostToolError("HOST_NOT_FOUND", "Remote Host is not configured for this target.");
+}
+
+function targetHosts(registry: RemoteHostRegistry, targetId: string): readonly RemoteHostRecord[] {
+  const bound = registry.boundHost(targetId);
+  return bound === undefined ? registry.list(targetId) : [bound];
 }
 
 function publicHost(host: RemoteHostRecord): Readonly<Record<string, unknown>> {

@@ -194,7 +194,7 @@ export class TerminalProvider {
     }
     const requestedShell = input.shellId === undefined || input.shellId === "" ? "auto" : input.shellId;
     identity(requestedShell, "Shell identity");
-    const key = JSON.stringify([input.sessionId, input.targetId, input.remoteHostId ?? null, paths.resolve(input.workspaceRoot), paths.resolve(input.workspaceRoot, cwd), requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette]);
+    const key = JSON.stringify([input.sessionId, input.targetId, input.remoteHostTargetId ?? null, input.remoteHostId ?? null, paths.resolve(input.workspaceRoot), paths.resolve(input.workspaceRoot, cwd), requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette]);
     const existing = this.#records.get(input.id);
     if (existing !== undefined) {
       this.#assertScope(existing, input);
@@ -216,7 +216,7 @@ export class TerminalProvider {
     const abort = new AbortController();
     const combined = signal === undefined ? abort.signal : AbortSignal.any([signal, abort.signal]);
     const scope: TerminalScope = { sessionId: input.sessionId, targetId: input.targetId, workspaceRoot: paths.resolve(input.workspaceRoot),
-      ...(input.remoteHostId === undefined ? {} : { remoteHostId: input.remoteHostId }) };
+      ...(input.remoteHostId === undefined ? {} : { remoteHostId: input.remoteHostId, remoteHostTargetId: input.remoteHostTargetId }) };
     const result = this.#create(scope, input.id, key, cwd, requestedShell, input.fallbackToDefaultShell === true, cols, rows, initialPalette, combined, beforeSpawn);
     this.#creating.set(input.id, { key, scope, abort, result });
     this.#activity();
@@ -800,11 +800,14 @@ function validateScope(scope: TerminalScope): void {
   identity(scope.sessionId, "Session identity");
   identity(scope.targetId, "Target identity");
   if (scope.remoteHostId !== undefined) identity(scope.remoteHostId, "Remote host identity");
+  if (scope.remoteHostTargetId !== undefined) identity(scope.remoteHostTargetId, "Remote host Target identity");
+  if (scope.remoteHostId === undefined && scope.remoteHostTargetId !== undefined) throw new TerminalError("INVALID_ARGUMENT", "Remote Host Target requires a Remote Host.");
   if (typeof scope.workspaceRoot !== "string" || !scopePaths(scope).isAbsolute(scope.workspaceRoot) || scope.workspaceRoot.includes("\0")) throw new TerminalError("WORKSPACE_PATH_DENIED", "A canonical workspace root is required.");
 }
 
 function sameScope(left: TerminalScope, right: TerminalScope): boolean {
-  return left.sessionId === right.sessionId && left.targetId === right.targetId && left.remoteHostId === right.remoteHostId
+  return left.sessionId === right.sessionId && left.targetId === right.targetId
+    && left.remoteHostTargetId === right.remoteHostTargetId && left.remoteHostId === right.remoteHostId
     && scopePaths(left).relative(left.workspaceRoot, right.workspaceRoot) === "";
 }
 

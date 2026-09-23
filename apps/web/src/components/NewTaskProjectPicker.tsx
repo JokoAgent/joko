@@ -20,7 +20,7 @@ export interface RecentProjectPickerOption {
 }
 
 export function NewTaskProjectPicker({ value, selectedName, projects, dialogues, recent, ownerKey, requestId, disabled,
-  canBrowse, error, onChoose, onChooseRecent, onRemoveRecent, onBrowse, onAdd, onOpen, t }: {
+  canBrowse, error, onChoose, onChooseRecent, onRemoveRecent, onBrowse, onAdd, onAddRemote, onOpen, t }: {
   readonly value: string;
   readonly selectedName: string;
   readonly projects: readonly ProjectPickerOption[];
@@ -36,6 +36,7 @@ export function NewTaskProjectPicker({ value, selectedName, projects, dialogues,
   readonly onRemoveRecent: (entry: RecentProject) => void;
   readonly onBrowse: () => void;
   readonly onAdd: () => void;
+  readonly onAddRemote: () => void;
   readonly onOpen: () => void;
   readonly t: Translator;
 }): JSX.Element {
@@ -57,6 +58,7 @@ export function NewTaskProjectPicker({ value, selectedName, projects, dialogues,
   const choose = (next: string): void => {
     setOpen(false);
     if (next === "__new_project__") onAdd();
+    else if (next === "__new_remote_project__") onAddRemote();
     else if (next === "__browse_local__") onBrowse();
     else onChoose(next);
   };
@@ -88,11 +90,12 @@ export function NewTaskProjectPicker({ value, selectedName, projects, dialogues,
         {error && <p role="alert" className="new-task-project-picker__error">{error}</p>}
         {recent.length > 0 && <section aria-label={t("newTask.recentProjects")}>
           <h3>{t("newTask.recentProjects")}</h3>
-          {recent.map(({ entry, available }) => <div className="new-task-project-picker__recent" key={`${entry.targetId}:${entry.workspaceId}:${entry.serverPath}:${entry.remoteHostId ?? ""}`}>
+          {recent.map(({ entry, available }) => <div className="new-task-project-picker__recent" key={`${entry.targetId}:${entry.workspaceId}:${entry.serverPath}:${entry.remoteHostTargetId ?? ""}:${entry.remoteHostId ?? ""}`}>
             <button type="button" data-project-picker-choice="" disabled={!available}
               className="new-task-project-picker__choice" onClick={() => { if (onChooseRecent(entry)) setOpen(false); }}>
               <span><strong>{entry.name}{available ? "" : ` · ${t("newTask.unavailable")}`}</strong>
-                <small>{entry.remoteHostId === undefined ? entry.serverPath : `${entry.remoteHostId} · ${entry.remoteWorkspaceRoot}`}</small></span>
+                <small>{entry.remoteHostId === undefined ? entry.serverPath
+                  : `${entry.remoteHostTargetId ?? ""} / ${entry.remoteHostId} · ${entry.remoteWorkspaceRoot}`}</small></span>
             </button>
             <button type="button" className="new-task-project-picker__remove"
               aria-label={`${t("newTask.removeRecentProject")}: ${entry.name}`} onClick={() => onRemoveRecent(entry)}><X aria-hidden="true" /></button>
@@ -103,6 +106,7 @@ export function NewTaskProjectPicker({ value, selectedName, projects, dialogues,
         <section aria-label={t("newTask.projectActions")}>
           {canBrowse && row({ value: "__browse_local__", name: t("newTask.browseLocalProject") })}
           {row({ value: "__new_project__", name: t("newTask.addProject") })}
+          {row({ value: "__new_remote_project__", name: t("newTask.addRemoteProject") })}
         </section>
       </div>
     </MorphPopover>
@@ -114,6 +118,7 @@ export function NewTaskProjectPicker({ value, selectedName, projects, dialogues,
       {dialogues.map((option) => <option value={option.value} disabled={option.disabled} key={option.value}>{option.name}{option.location ? ` · ${option.location}` : ""}</option>)}
       {canBrowse && <option value="__browse_local__">{t("newTask.browseLocalProject")}</option>}
       <option value="__new_project__">{t("newTask.addProject")}</option>
+      <option value="__new_remote_project__">{t("newTask.addRemoteProject")}</option>
     </select>
   </div>;
 }

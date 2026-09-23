@@ -693,6 +693,7 @@ import type {
   RemoteBackendRuntimeInstallEventView,
   RemoteBackendRuntimeView,
   RemoteHostCapabilitiesView,
+  RemoteHostDirectoryInspectionView,
   RemoteHostDirectoryListingView,
   RemoteHostDraft,
   RemoteHostView,
@@ -836,6 +837,7 @@ import type {
   TelegramMessagingConfigurationView,
   VoiceInputTranscriptionProtocolView,
   TargetDraft,
+  RemoteTargetDraft,
   ProjectDirectoryListingView,
   TargetWorktreeProbeView,
   WorktreeSourceView,
@@ -1876,6 +1878,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return payload.value.targetId;
   }
 
+  async createRemoteTarget(draft: RemoteTargetDraft): Promise<string> {
+    if (draft.name.trim() === "" || draft.backendId.trim() === "" || draft.hostTargetId.trim() === ""
+      || draft.hostId.trim() === "" || !draft.workspacePath.startsWith("/")
+      || draft.expectedHostTargetRevision < 1n || draft.expectedHostRevision < 1n) {
+      throw new GatewayError("A current Backend, SSH Host and absolute project directory are required.");
+    }
+    const operation = await this.submit({
+      case: "createRemoteTarget",
+      value: {
+        backendId: draft.backendId, displayName: draft.name.trim(),
+        hostTargetId: draft.hostTargetId, hostId: draft.hostId,
+        expectedHostRevision: { value: draft.expectedHostRevision },
+        workspacePath: draft.workspacePath, createIfMissing: draft.createIfMissing
+      }
+    }, true, [{ entity: { kind: EntityKind.TARGET, id: draft.hostTargetId },
+      expectedRevision: { value: draft.expectedHostTargetRevision } }]);
+    const payload = operation.result?.payload;
+    if (payload?.case !== "target" || payload.value.targetId.length === 0) {
+      throw new GatewayError("Orchestrator completed remote project creation without a typed project result.");
+    }
+    return payload.value.targetId;
+  }
+
   async listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView> {
     const scope = this.captureActionScope(signal);
     const listing = await createClient(TargetService, scope.transport).listProjectDirectories({ path }, { signal: scope.signal });
@@ -1934,6 +1959,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         : {
             case: "remoteWorkspace" as const,
             value: {
+              hostTargetId: targetId,
               hostId: patch.workspaceLocation.hostId,
               workspaceRootDisplay: remoteWorkspaceRoot!
             }
@@ -7547,6 +7573,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       truncated: response.truncated };
   }
 
+  async inspectRemoteHostDirectory(
+    targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint,
+    path: string, signal?: AbortSignal
+  ): Promise<RemoteHostDirectoryInspectionView> {
+    if (targetId.trim() === "" || hostId.trim() === "" || expectedTargetRevision < 1n || expectedHostRevision < 1n
+      || !path.startsWith("/")) {
+      throw new GatewayError("A current Target, SSH Host, and absolute project directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(RemoteHostService, scope.transport).inspectRemoteHostDirectory({
+      targetId, hostId, expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision }, path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.targetId !== targetId || response.hostId !== hostId
+      || response.targetRevision?.value !== expectedTargetRevision
+      || response.hostRevision?.value !== expectedHostRevision || !response.path.startsWith("/")) {
+      throw new GatewayError("Orchestrator inspected another SSH Host, path, or revision.");
+    }
+    return { targetId, hostId, targetRevision: expectedTargetRevision, hostRevision: expectedHostRevision,
+      exists: response.exists, path: response.path };
+  }
+
   async probeRemoteBackendRuntime(
     targetId: string,
     hostId: string,
@@ -9275,6 +9324,10 @@ function remapSessionProjection(raw: Snapshot, snapshot: AppSnapshot, sessionId:
 function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly WorkspaceDescriptor[]): AppSnapshot["targets"][number] {
   const revision = target.version?.revision?.value;
   if (revision === undefined || revision < 1n) throw new GatewayError("Orchestrator returned a Target without a current revision.");
+  if (target.remoteWorkspace !== undefined && (target.remoteWorkspace.hostTargetId.trim() === ""
+    || target.remoteWorkspace.hostId.trim() === "" || !target.remoteWorkspace.workspaceRootDisplay.startsWith("/"))) {
+    throw new GatewayError("Orchestrator returned a Target with an incomplete remote workspace binding.");
+  }
   const workspace = workspaces.find((candidate) => candidate.workspaceId === target.workspaceId);
   return {
     id: target.targetId,
@@ -9288,6 +9341,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     archived: target.state === 2,
     ...(target.remoteWorkspace === undefined ? {} : {
       remoteWorkspace: {
+        hostTargetId: target.remoteWorkspace.hostTargetId,
         hostId: target.remoteWorkspace.hostId,
         workspaceRoot: target.remoteWorkspace.workspaceRootDisplay
       }

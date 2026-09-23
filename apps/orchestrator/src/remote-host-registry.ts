@@ -171,6 +171,13 @@ export class RemoteHostRegistry {
     return this.#store.getRemoteHost(this.#ownerId, targetId, id);
   }
 
+  /** Resolves the one Host named by a Target's remote binding, without copying its authority. */
+  boundHost(targetId: string): RemoteHostRecord | undefined {
+    this.assertOpen();
+    const binding = this.#store.getTarget(targetId).descriptor.remoteWorkspace;
+    return binding === undefined ? undefined : this.get(binding.hostTargetId, binding.hostId);
+  }
+
   targetRevision(targetId: string): bigint {
     this.assertOpen();
     return this.#store.getTarget(targetId).revision;

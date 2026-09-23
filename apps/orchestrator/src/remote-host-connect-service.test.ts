@@ -87,6 +87,54 @@ describe("RemoteHostService", () => {
     expect(connect).toHaveBeenCalledOnce();
   });
 
+  it("inspects an SSH project path without treating inaccessible entries as missing or accepting a stale Host", async () => {
+    let releaseList: ((entries: readonly { name: string; kind: "directory" }[]) => void) | undefined;
+    let delayList = false;
+    const files = {
+      realpath: vi.fn(async (path: string) => path),
+      stat: vi.fn(async () => ({ kind: "directory" as const, size: 0, modifiedAt: 0, mode: 0o755 })),
+      list: vi.fn(async (path: string) => {
+        if (delayList && path === "/srv") return await new Promise<readonly { name: string; kind: "directory" }[]>((resolve) => { releaseList = resolve; });
+        return path === "/" ? [{ name: "srv", kind: "directory" as const }]
+          : path === "/srv" ? [{ name: "existing", kind: "directory" as const }, { name: "file", kind: "file" as const }]
+            : [];
+      }),
+      read: async () => new Uint8Array(), write: async () => undefined,
+      mkdir: async () => undefined, rename: async () => undefined, remove: async () => undefined
+    };
+    const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: true,
+      tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities,
+      connect: async (request) => {
+        request.onAuthenticating();
+        await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 2, 3) });
+        return { capabilities, files, close: async () => undefined };
+      }
+    } });
+    const service = createRemoteHostConnectService(fixture.registry, () => ({ connectionId: "connection-a" }));
+    const host = fixture.registry.create({ targetId: "target-a", id: "build-box", hostname: "host.test", user: "maker", source: "manual" });
+    await fixture.registry.connect("target-a", "build-box", host.revision);
+    const request = (path: string, revision = fixture.registry.get("target-a", "build-box").revision) => create(contract.InspectRemoteHostDirectoryRequestSchema, {
+      targetId: "target-a", hostId: "build-box", path,
+      expectedTargetRevision: toProtoRevision(fixture.registry.targetRevision("target-a")),
+      expectedHostRevision: toProtoRevision(revision)
+    });
+    await expect(service.inspectRemoteHostDirectory(request("/srv/existing"), context())).resolves.toMatchObject({
+      targetId: "target-a", hostId: "build-box", exists: true, path: "/srv/existing"
+    });
+    await expect(service.inspectRemoteHostDirectory(request("/srv/new"), context())).resolves.toMatchObject({
+      exists: false, path: "/srv/new"
+    });
+    await expect(service.inspectRemoteHostDirectory(request("/srv/file"), context())).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    await expect(service.inspectRemoteHostDirectory(request("/srv/new", host.revision), context())).rejects.toSatisfy(connectCode(Code.Aborted));
+    delayList = true;
+    const delayed = service.inspectRemoteHostDirectory(request("/srv/new"), context());
+    await vi.waitFor(() => expect(releaseList).toBeTypeOf("function"));
+    await fixture.registry.disconnect("target-a", "build-box", fixture.registry.get("target-a", "build-box").revision);
+    releaseList!([]);
+    await expect(delayed).rejects.toSatisfy(connectCode(Code.Aborted));
+  });
+
   it("authenticates an owner-private, target-scoped CRUD catalog and paginates canonical projections", async () => {
     const fixture = createFixture();
     const authenticate = vi.fn(() => ({ connectionId: "connection-a" }));

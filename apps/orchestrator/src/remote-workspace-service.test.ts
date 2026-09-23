@@ -85,7 +85,7 @@ describe("RemoteWorkspaceService", () => {
       root: "/workspace",
       displayName: "Remote project",
       trusted: true,
-      remote: { targetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remote: { targetId: "target-a", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
     const listing = await workspaces.list("workspace-a", "", { recursive: true });
@@ -173,7 +173,7 @@ describe("RemoteWorkspaceService", () => {
     const registry = { transports: async () => ({ lease }), captureTransportAuthority: capture } as unknown as RemoteHostRegistry;
     const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(registry) });
     const registration = { id: "workspace", root: "/workspace", displayName: "Remote", trusted: true,
-      remote: { targetId: "target", hostId: "host", workspaceRoot: "/workspace" } };
+      remote: { targetId: "target", hostTargetId: "target", hostId: "host", workspaceRoot: "/workspace" } };
     await workspaces.register(registration);
     const store = { getSession: () => ({ descriptor: { id: "session", targetId: "target", binding: { generation: 1, opaqueRef: "native" } } }),
       getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }), findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
@@ -256,7 +256,7 @@ describe("RemoteWorkspaceService", () => {
       root: "/canonical",
       displayName: "Remote",
       trusted: true,
-      remote: { targetId: "target-a", hostId: "host-a", workspaceRoot: "/canonical" }
+      remote: { targetId: "target-a", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/canonical" }
     })).rejects.toThrow("transports are unavailable");
     expect(workspaces.listRegistrations()).toEqual([]);
     await workspaces.close();

@@ -1713,6 +1713,7 @@ export function useAppController(): AppController {
       getRemoteHostCapabilities: async (...args: Parameters<OperationApi["getRemoteHostCapabilities"]>) => original().getRemoteHostCapabilities(...args),
       listRemoteHosts: async (...args: Parameters<OperationApi["listRemoteHosts"]>) => original().listRemoteHosts(...args),
       listRemoteHostDirectories: async (...args: Parameters<OperationApi["listRemoteHostDirectories"]>) => original().listRemoteHostDirectories(...args),
+      inspectRemoteHostDirectory: async (...args: Parameters<OperationApi["inspectRemoteHostDirectory"]>) => original().inspectRemoteHostDirectory(...args),
       watchRemoteHosts: (...args: Parameters<OperationApi["watchRemoteHosts"]>) => original().watchRemoteHosts(...args),
       refreshRemoteHostCatalog: async (...args: Parameters<OperationApi["refreshRemoteHostCatalog"]>) => original().refreshRemoteHostCatalog(...args),
       createRemoteHost: async (...args: Parameters<OperationApi["createRemoteHost"]>) => original().createRemoteHost(...args),
@@ -1750,6 +1751,7 @@ export function useAppController(): AppController {
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
+      createRemoteTarget: async (...args: Parameters<OperationApi["createRemoteTarget"]>) => original().createRemoteTarget(...args),
       listProjectDirectories: async (...args: Parameters<OperationApi["listProjectDirectories"]>) => original().listProjectDirectories(...args),
       prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
