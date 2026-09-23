@@ -27,7 +27,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import type { AppController } from "../controller.js";
+import type { AppController, ToolsTab } from "../controller.js";
 import { useLiveBrowserTakeover, withLiveBrowserTakeover } from "../browser-takeover-expiry.js";
 import { browserPageKey } from "../browser-page-key.js";
 import type { AppSnapshot, BrowserActivityView, BrowserCommentDraftItem, BrowserCommentInspectionInputView, BrowserCommentPlacementView, BrowserCommentStyleChangeView, BrowserCommentTargetView, BrowserPageView, BrowserSettingsView, BrowserTakeoverActionView, BrowserTakeoverKeyModifierView, BrowserTakeoverKeyView, BrowserTransferView, BrowserView, ExtensionCatalogEntryView, McpServerView, NewSessionLocalDraft, ResourceView, SessionView, TimelineItemView } from "../model.js";
@@ -62,35 +62,36 @@ import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 import { SkillTools } from "./SkillTools.js";
 
-type ToolsTab = "browser" | "extensions" | "skills" | "resources" | "mcp" | "activity";
-
-export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExtensionId, locale, t, runAction, onSelectExtension, onOpenNavigation }: {
+export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExtensionId, selectedTab, locale, t, runAction, onSelectExtension, onSelectTab, onOpenNavigation }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly runtimeSessionId?: string;
   readonly selectedExtensionId?: string;
+  readonly selectedTab?: ToolsTab;
   readonly locale: string;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onSelectExtension?: (extensionId: string | undefined) => void;
+  readonly onSelectTab?: (tab: ToolsTab) => void;
   readonly onOpenNavigation: () => void;
 }): JSX.Element {
-  const [tab, setTab] = useState<ToolsTab>(selectedExtensionId === undefined ? "browser" : "extensions");
+  const [tab, setTab] = useState<ToolsTab>(selectedExtensionId === undefined ? selectedTab ?? "browser" : "extensions");
   const [selectedExtension, setSelectedExtension] = useState(selectedExtensionId);
   const [removeResource, setRemoveResource] = useState<ResourceView>();
   const [newSessionDraft, setNewSessionDraft] = useState<NewSessionLocalDraft>();
   useEffect(() => {
-    if (selectedExtensionId === undefined) return;
-    setTab("extensions");
+    setTab(selectedExtensionId === undefined ? selectedTab ?? "browser" : "extensions");
     setSelectedExtension(selectedExtensionId);
-  }, [selectedExtensionId]);
+  }, [selectedExtensionId, selectedTab]);
   const selectExtension = (extensionId: string | undefined): void => {
     setSelectedExtension(extensionId);
     onSelectExtension?.(extensionId);
   };
   const selectTab = (next: ToolsTab): void => {
+    if (next === tab) return;
     setTab(next);
-    if (next !== "extensions" && selectedExtension !== undefined) selectExtension(undefined);
+    if (next !== "extensions") setSelectedExtension(undefined);
+    onSelectTab?.(next);
   };
   const activity = useMemo(() => [...snapshot.timelineBySession.values()].flat().filter((item) => item.tool !== undefined).sort((a, b) => b.createdAt - a.createdAt), [snapshot.timelineBySession]);
   const mcpBackends = snapshot.backends.filter((backend) => backend.capabilities.get("tool.mcp")?.supported === true);

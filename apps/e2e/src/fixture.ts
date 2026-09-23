@@ -18,6 +18,7 @@ import {
   OperationalArtifactRepository,
   DurableReviewEvidenceProvider,
   ReviewCoordinator,
+  RemoteWorkspaceService,
   ScheduleCoordinator,
   SessionHost,
   SessionWorktreeCoordinator,
@@ -208,7 +209,10 @@ export class OrchestratorE2eFixture {
     });
     await artifactMaintenance.initialize();
     const blobTransfers = new BlobTransferCoordinator(artifacts);
-    const workspaces = new WorkspaceService();
+    const auxiliaryServices = await options.createAuxiliaryServices?.(store, dataDirectory, artifacts);
+    const workspaces = new WorkspaceService(auxiliaryServices?.remoteHosts === undefined
+      ? undefined
+      : { remoteDelegate: new RemoteWorkspaceService(auxiliaryServices.remoteHosts) });
     await workspaces.register({
       id: "workspace-main",
       root: workspaceDirectory,
@@ -318,7 +322,6 @@ export class OrchestratorE2eFixture {
     const refreshBackendDescriptor = async (backendId: string): Promise<void> => {
       await backendInstances.refresh(backendId);
     };
-    const auxiliaryServices = await options.createAuxiliaryServices?.(store, dataDirectory, artifacts);
     const contactStore = new ContactStore(join(dataDirectory, "contacts.db"));
     const contacts = new ContactManager(contactStore);
     const application: OrchestratorApplication = {

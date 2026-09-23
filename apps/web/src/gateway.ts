@@ -270,6 +270,8 @@ import {
   SkillDiffChangeKind,
   SkillDraftKind,
   SkillFileKind,
+  SkillLearningSourceKind as ProtoSkillLearningSourceKind,
+  SkillLearningState as ProtoSkillLearningState,
   SkillMarketInstallAction as ProtoSkillMarketInstallAction,
   SkillMarketInstallConfirmationReason as ProtoSkillMarketInstallConfirmationReason,
   SkillMarketInstallStatusState as ProtoSkillMarketInstallStatusState,
@@ -452,6 +454,7 @@ import {
   type SkillDraft as ProtoSkillDraft,
   type SkillFileContent as ProtoSkillFileContent,
   type SkillFileEntry as ProtoSkillFileEntry,
+  type SkillLearningRun as ProtoSkillLearningRun,
   type SkillMarketArchiveEntry as ProtoSkillMarketArchiveEntry,
   type SkillAccessPolicy as ProtoSkillAccessPolicy,
   type SkillMarketEntry as ProtoSkillMarketEntry,
@@ -693,6 +696,8 @@ import type {
   RemoteBackendRuntimeInstallEventView,
   RemoteBackendRuntimeView,
   RemoteHostCapabilitiesView,
+  RemoteHostDirectoryInspectionView,
+  RemoteHostDirectoryListingView,
   RemoteHostDraft,
   RemoteHostView,
   ScheduleView,
@@ -727,6 +732,8 @@ import type {
   CollaborationWorkerStatusView,
   CollaborationWorkerView,
   SkillDescriptorView,
+  SkillLearningRunView,
+  StartSkillLearningDraft,
   SkillDiffChangeView,
   SkillDiffView,
   SkillDraftView,
@@ -835,6 +842,8 @@ import type {
   TelegramMessagingConfigurationView,
   VoiceInputTranscriptionProtocolView,
   TargetDraft,
+  RemoteTargetDraft,
+  ProjectDirectoryListingView,
   TargetWorktreeProbeView,
   WorktreeSourceView,
   WorkspaceView
@@ -1874,6 +1883,41 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return payload.value.targetId;
   }
 
+  async createRemoteTarget(draft: RemoteTargetDraft): Promise<string> {
+    if (draft.name.trim() === "" || draft.backendId.trim() === "" || draft.hostTargetId.trim() === ""
+      || draft.hostId.trim() === "" || !draft.workspacePath.startsWith("/")
+      || draft.expectedHostTargetRevision < 1n || draft.expectedHostRevision < 1n) {
+      throw new GatewayError("A current Backend, SSH Host and absolute project directory are required.");
+    }
+    const operation = await this.submit({
+      case: "createRemoteTarget",
+      value: {
+        backendId: draft.backendId, displayName: draft.name.trim(),
+        hostTargetId: draft.hostTargetId, hostId: draft.hostId,
+        expectedHostRevision: { value: draft.expectedHostRevision },
+        workspacePath: draft.workspacePath, createIfMissing: draft.createIfMissing
+      }
+    }, true, [{ entity: { kind: EntityKind.TARGET, id: draft.hostTargetId },
+      expectedRevision: { value: draft.expectedHostTargetRevision } }]);
+    const payload = operation.result?.payload;
+    if (payload?.case !== "target" || payload.value.targetId.length === 0) {
+      throw new GatewayError("Orchestrator completed remote project creation without a typed project result.");
+    }
+    return payload.value.targetId;
+  }
+
+  async listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView> {
+    const scope = this.captureActionScope(signal);
+    const listing = await createClient(TargetService, scope.transport).listProjectDirectories({ path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (listing.path === "" || listing.parentPath === "" || listing.directories.length > 200
+      || listing.directories.some((entry) => entry.name === "" || entry.path === "")) {
+      throw new GatewayError("Orchestrator returned an invalid project directory listing.");
+    }
+    return { path: listing.path, parentPath: listing.parentPath,
+      directories: listing.directories.map((entry) => ({ name: entry.name, path: entry.path })), truncated: listing.truncated };
+  }
+
   async prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {
     if (targetId.trim() === "" || typeof expectedRevision !== "bigint" || expectedRevision < 1n) {
       throw new GatewayError("A current Target identity and revision are required.");
@@ -1920,6 +1964,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         : {
             case: "remoteWorkspace" as const,
             value: {
+              hostTargetId: targetId,
               hostId: patch.workspaceLocation.hostId,
               workspaceRootDisplay: remoteWorkspaceRoot!
             }
@@ -3066,6 +3111,86 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async removeResource(resourceId: string): Promise<void> {
     await this.submit({ case: "removeResource", value: { resourceId } }, true);
+  }
+
+  async startSkillLearning(draft: StartSkillLearningDraft, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).startSkillLearning({
+      requestId: draft.requestId,
+      targetId: draft.targetId,
+      instruction: draft.instruction,
+      ...(draft.sourceSessionId === undefined ? {} : { sourceSessionId: draft.sourceSessionId }),
+      ...(draft.marketIdentity === undefined ? {} : { marketIdentity: protoSkillMarketIdentity(draft.marketIdentity) })
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async listSkillLearningRuns(signal?: AbortSignal): Promise<readonly SkillLearningRunView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const runs: SkillLearningRunView[] = [];
+    const ids = new Set<string>();
+    let pageToken = "";
+    const seenTokens = new Set<string>();
+    for (let page = 0; page < 100; page += 1) {
+      const response = await client.listSkillLearningRuns({ page: { pageSize: 100, pageToken } }, { signal: scope.signal });
+      for (const value of response.runs) {
+        const run = mapSkillLearningRun(value);
+        if (ids.has(run.id)) throw new GatewayError("The service returned duplicate learning runs.");
+        ids.add(run.id);
+        runs.push(run);
+      }
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") return runs;
+      if (next === pageToken || seenTokens.has(next)) throw new GatewayError("The service returned a cyclic learning page token.");
+      seenTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Learning run history exceeded the safe page limit.");
+  }
+
+  async getSkillLearningRun(runId: string, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillLearningRun({ runId }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async applySkillLearning(run: SkillLearningRunView, confirmReplace: boolean, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    if (run.proposal === undefined || run.state !== "awaitingReview") throw new GatewayError("Learning proposal is not ready for review.");
+    const scope = this.captureActionScope(signal);
+    const proposal = run.proposal;
+    const response = await createClient(SkillService, scope.transport).applySkillLearning({
+      operationId: `${run.id}_apply_${run.revision.toString(10)}_${confirmReplace ? "replace" : "new"}`,
+      runId: run.id,
+      expectedRunRevision: { value: run.revision },
+      expectedProposalRevision: proposal.revision,
+      expectedResourceId: proposal.resourceId,
+      ...(proposal.currentResourceId === undefined ? {} : { expectedCurrentResourceId: proposal.currentResourceId }),
+      ...(proposal.currentResourceRevision === undefined ? {} : { expectedCurrentResourceRevision: { value: proposal.currentResourceRevision } }),
+      ...(proposal.currentObservedRevision === undefined ? {} : { expectedCurrentObservedRevision: proposal.currentObservedRevision }),
+      confirmReplace
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async discardSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).discardSkillLearning({
+      operationId: `${run.id}_discard_${run.revision.toString(10)}`,
+      runId: run.id,
+      expectedRunRevision: { value: run.revision }
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async cancelSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).cancelSkillLearning({
+      operationId: `${run.id}_cancel_${run.revision.toString(10)}`,
+      runId: run.id,
+      expectedRunRevision: { value: run.revision }
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
   }
 
   async listSkills(options: {
@@ -5674,6 +5799,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
     if (provider.providerId.length === 0 || provider.displayName.length === 0) throw new GatewayError("Provider ID and name are required.");
     await this.submit({ case: "upsertProvider", value: { provider } }, true, [], scope.signal);
+    // A credential upload may have started a snapshot read before this commit.
+    // Let any such read settle, then project the committed Provider revision.
+    await this.#refreshPromise?.catch(() => undefined);
+    scope.signal.throwIfAborted();
+    await this.refresh();
   }
 
   async deleteProvider(providerId: string): Promise<void> {
@@ -7504,6 +7634,58 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return requireRemoteHost(response.host);
   }
 
+  async listRemoteHostDirectories(
+    targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint,
+    path: string, signal?: AbortSignal
+  ): Promise<RemoteHostDirectoryListingView> {
+    if (targetId.trim() === "" || hostId.trim() === "" || expectedTargetRevision < 1n || expectedHostRevision < 1n
+      || (path !== "" && !path.startsWith("/"))) {
+      throw new GatewayError("A current Target, SSH Host, and absolute directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(RemoteHostService, scope.transport).listRemoteHostDirectories({
+      targetId, hostId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision }, path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.targetId !== targetId || response.hostId !== hostId
+      || response.targetRevision?.value !== expectedTargetRevision
+      || response.hostRevision?.value !== expectedHostRevision
+      || !response.path.startsWith("/") || !response.parentPath.startsWith("/")
+      || response.directories.length > 200
+      || response.directories.some((entry) => entry.name === "" || !entry.path.startsWith("/"))) {
+      throw new GatewayError("Orchestrator returned a directory listing for another SSH Host or revision.");
+    }
+    return { targetId, hostId, targetRevision: expectedTargetRevision, hostRevision: expectedHostRevision,
+      path: response.path, parentPath: response.parentPath,
+      directories: response.directories.map((entry) => ({ name: entry.name, path: entry.path })),
+      truncated: response.truncated };
+  }
+
+  async inspectRemoteHostDirectory(
+    targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint,
+    path: string, signal?: AbortSignal
+  ): Promise<RemoteHostDirectoryInspectionView> {
+    if (targetId.trim() === "" || hostId.trim() === "" || expectedTargetRevision < 1n || expectedHostRevision < 1n
+      || !path.startsWith("/")) {
+      throw new GatewayError("A current Target, SSH Host, and absolute project directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(RemoteHostService, scope.transport).inspectRemoteHostDirectory({
+      targetId, hostId, expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision }, path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.targetId !== targetId || response.hostId !== hostId
+      || response.targetRevision?.value !== expectedTargetRevision
+      || response.hostRevision?.value !== expectedHostRevision || !response.path.startsWith("/")) {
+      throw new GatewayError("Orchestrator inspected another SSH Host, path, or revision.");
+    }
+    return { targetId, hostId, targetRevision: expectedTargetRevision, hostRevision: expectedHostRevision,
+      exists: response.exists, path: response.path };
+  }
+
   async probeRemoteBackendRuntime(
     targetId: string,
     hostId: string,
@@ -9232,6 +9414,10 @@ function remapSessionProjection(raw: Snapshot, snapshot: AppSnapshot, sessionId:
 function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly WorkspaceDescriptor[]): AppSnapshot["targets"][number] {
   const revision = target.version?.revision?.value;
   if (revision === undefined || revision < 1n) throw new GatewayError("Orchestrator returned a Target without a current revision.");
+  if (target.remoteWorkspace !== undefined && (target.remoteWorkspace.hostTargetId.trim() === ""
+    || target.remoteWorkspace.hostId.trim() === "" || !target.remoteWorkspace.workspaceRootDisplay.startsWith("/"))) {
+    throw new GatewayError("Orchestrator returned a Target with an incomplete remote workspace binding.");
+  }
   const workspace = workspaces.find((candidate) => candidate.workspaceId === target.workspaceId);
   return {
     id: target.targetId,
@@ -9245,6 +9431,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     archived: target.state === 2,
     ...(target.remoteWorkspace === undefined ? {} : {
       remoteWorkspace: {
+        hostTargetId: target.remoteWorkspace.hostTargetId,
         hostId: target.remoteWorkspace.hostId,
         workspaceRoot: target.remoteWorkspace.workspaceRootDisplay
       }
@@ -13192,6 +13379,77 @@ function mapSkillDescriptor(skill: ProtoSkillDescriptor): SkillDescriptorView {
   };
 }
 
+function mapSkillLearningRun(value: ProtoSkillLearningRun | undefined): SkillLearningRunView {
+  if (value === undefined) throw new GatewayError("The service returned an empty learning run.");
+  const states = new Map<ProtoSkillLearningState, SkillLearningRunView["state"]>([
+    [ProtoSkillLearningState.COLLECTING, "collecting"],
+    [ProtoSkillLearningState.DISTILLING, "distilling"],
+    [ProtoSkillLearningState.AWAITING_REVIEW, "awaitingReview"],
+    [ProtoSkillLearningState.APPLIED, "applied"],
+    [ProtoSkillLearningState.DISCARDED, "discarded"],
+    [ProtoSkillLearningState.FAILED, "failed"],
+    [ProtoSkillLearningState.CANCELLED, "cancelled"],
+    [ProtoSkillLearningState.EXPIRED, "expired"]
+  ]);
+  const sourceKinds = new Map<ProtoSkillLearningSourceKind, SkillLearningRunView["sourceKind"]>([
+    [ProtoSkillLearningSourceKind.TEXT, "text"],
+    [ProtoSkillLearningSourceKind.SESSION, "session"],
+    [ProtoSkillLearningSourceKind.MARKET, "market"]
+  ]);
+  const state = states.get(value.state);
+  const sourceKind = sourceKinds.get(value.sourceKind);
+  const revision = value.revision?.value;
+  if (!/^skill_learning_[a-f0-9]{32}$/u.test(value.runId) || revision === undefined || revision < 1n
+    || state === undefined || sourceKind === undefined || value.backendId.trim() === "" || value.targetId.trim() === ""
+    || value.summary.length > 160 || privatePathLikeLabel(value.summary)
+    || value.createdAt === undefined || value.updatedAt === undefined || value.expiresAt === undefined) {
+    throw new GatewayError("The service returned an invalid learning run.");
+  }
+  const proposal = value.proposal;
+  const currentResourceRevision = proposal?.currentResourceRevision?.value;
+  if (proposal !== undefined && (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(proposal.name)
+    || !/^sha256:[a-f0-9]{64}$/u.test(proposal.revision) || proposal.resourceId.trim() === ""
+    || (proposal.currentResourceId !== undefined && (currentResourceRevision === undefined || currentResourceRevision < 1n))
+    || proposal.files.length > 64 || proposal.files.some((file) => !portableSkillKey(file.key)))) {
+    throw new GatewayError("The service returned an invalid learning proposal.");
+  }
+  return {
+    id: value.runId,
+    revision,
+    state,
+    sourceKind,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    ...(value.sourceSessionId === undefined ? {} : { sourceSessionId: value.sourceSessionId }),
+    ...(value.distillationSessionId === undefined ? {} : { distillationSessionId: value.distillationSessionId }),
+    summary: value.summary,
+    ...(value.error === undefined ? {} : { error: value.error }),
+    ...(proposal === undefined ? {} : {
+      proposal: {
+        name: proposal.name,
+        description: proposal.description,
+        explanation: proposal.explanation,
+        revision: proposal.revision,
+        files: proposal.files.map((file) => ({ key: file.key, content: file.content })),
+        resourceId: proposal.resourceId,
+        ...(proposal.currentResourceId === undefined ? {} : { currentResourceId: proposal.currentResourceId }),
+        ...(currentResourceRevision === undefined ? {} : { currentResourceRevision }),
+        ...(proposal.currentObservedRevision === undefined ? {} : { currentObservedRevision: proposal.currentObservedRevision }),
+        diff: {
+          available: proposal.diffAvailable,
+          ...(proposal.diffReason === undefined ? {} : { reason: proposal.diffReason }),
+          changes: proposal.changes.map(mapSkillDiffChange),
+          truncated: proposal.diffTruncated
+        }
+      }
+    }),
+    ...(value.appliedResourceId === undefined ? {} : { appliedResourceId: value.appliedResourceId }),
+    createdAt: timestampMs(value.createdAt),
+    updatedAt: timestampMs(value.updatedAt),
+    expiresAt: timestampMs(value.expiresAt)
+  };
+}
+
 function mapSkillFileEntry(file: ProtoSkillFileEntry): SkillFileEntryView {
   const kind = file.kind === SkillFileKind.DIRECTORY
     ? "directory" as const
@@ -13726,6 +13984,8 @@ function mapSkillMarketCurrentResource(value: NonNullable<ProtoSkillMarketInstal
           ? "extensionSource" as const
           : value.sourceKind === ResourceAcquisitionKind.SKILL_MARKET
             ? "skillMarket" as const
+            : value.sourceKind === ResourceAcquisitionKind.LEARNED
+              ? "learned" as const
             : undefined;
   if (value.resourceId.trim() === "" || resourceRevision === undefined || resourceRevision < 1n || value.name.trim() === ""
     || sourceKind === undefined || value.sourceDisplay.trim() === "" || privatePathLikeLabel(value.sourceDisplay)

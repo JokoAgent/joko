@@ -40,8 +40,9 @@ describe("application shortcut settings", () => {
 
     expect(container.querySelector("h2")?.textContent).toBe("Keyboard shortcuts");
     expect(container.querySelector('[role="status"][aria-live="polite"]')).not.toBeNull();
-    expect(container.querySelectorAll('[aria-label^="Edit shortcut for "]')).toHaveLength(15);
+    expect(container.querySelectorAll('[aria-label^="Edit shortcut for "]')).toHaveLength(16);
     expect(container.querySelector('[aria-label="Edit shortcut for Open terminal"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Edit shortcut for Copy conversation as Markdown"]')).not.toBeNull();
     expect(container.textContent).toContain("Focus address bar");
     expect(container.textContent).toContain("Reload page");
     expect(container.textContent).not.toContain("Save file");
@@ -63,6 +64,8 @@ describe("application shortcut settings", () => {
       kind: "commit",
       combo: { code: "KeyG", ctrl: true }
     });
+    expect(appShortcutRecordingDecision("copy-conversation-markdown", key({ code: "KeyY", key: "y" }), {}, "win32"))
+      .toMatchObject({ kind: "commit", combo: { code: "KeyY", ctrl: true } });
     expect(appShortcutRecordingDecision("find-in-page", key({ code: "KeyM", key: "m" }), {}, "win32", {
       code: "KeyM", key: "m", meta: false, ctrl: true, alt: false, shift: false, fn: false
     })).toEqual({ kind: "reject", issue: { kind: "voice-conflict" } });

@@ -487,7 +487,7 @@ export interface CreateScheduledSessionInput {
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
   readonly operationId: string;
-  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging";
+  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging" | "learning";
   readonly targetId: string;
   readonly title: string;
   readonly providerId?: string;
@@ -8322,8 +8322,10 @@ export class SessionHost {
           ? "create_partner_session"
           : input.serviceKind === "collaboration"
             ? "create_collaboration_worker_session"
-            : input.serviceKind === "messaging"
+          : input.serviceKind === "messaging"
               ? "create_messaging_session"
+              : input.serviceKind === "learning"
+                ? "create_learning_session"
               : "create_session_handoff"
         : "create_scheduled_session";
     const claim = authorized

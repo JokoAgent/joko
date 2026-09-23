@@ -1,5 +1,6 @@
 import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, Locale, MachineCacheView, NewSessionLocalDraft, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
+import { normalizeRecentProjects, publishRecentProjectsChange, withRecentProject, withoutRecentProject, type RecentProject } from "./recent-projects.js";
 import { normalizeMachineCache, normalizeMachineSelection, type MachineSelection } from "./machine-federation.js";
 import {
   isNavigationMode,
@@ -31,6 +32,7 @@ const SECRET_STORE = "secrets";
 const KEY_STORE = "keys";
 const DRAFT_STORE = "drafts";
 const NEW_SESSION_DRAFT_PREFIX = "new-session\u0000";
+const RECENT_PROJECTS_PREFIX = "recent-projects\u0000";
 const PENDING_EXTENSION_USE_PREFIX = "pending-extension-use\u0000";
 const PREFERENCE_STORE = "preferences";
 const MACHINE_CACHE_STORE = "machine-caches";
@@ -604,6 +606,35 @@ export class LocalState {
     return normalizeNewSessionLocalDraft({ ...record, attachments, browserComments });
   }
 
+  async readRecentProjects(scope: string): Promise<readonly RecentProject[]> {
+    return normalizeRecentProjects(await this.get<unknown>(DRAFT_STORE, recentProjectsKey(scope)));
+  }
+
+  /** Read-modify-write under one transaction so separate windows cannot lose a recent selection. */
+  async recordRecentProject(scope: string, entry: RecentProject): Promise<readonly RecentProject[]> {
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const key = recentProjectsKey(scope);
+    const current = normalizeRecentProjects(await requestResult<unknown>(store.get(key)));
+    const next = withRecentProject(current, entry);
+    store.put(next, key);
+    await transactionDone(transaction);
+    publishRecentProjectsChange(scope);
+    return next;
+  }
+
+  async removeRecentProject(scope: string, entry: RecentProject): Promise<readonly RecentProject[]> {
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const key = recentProjectsKey(scope);
+    const current = normalizeRecentProjects(await requestResult<unknown>(store.get(key)));
+    const next = withoutRecentProject(current, entry);
+    store.put(next, key);
+    await transactionDone(transaction);
+    publishRecentProjectsChange(scope);
+    return next;
+  }
+
   async savePendingExtensionUse(scope: string, value: PendingExtensionUseView): Promise<void> {
     const normalized = normalizePendingExtensionUse(value);
     if (normalized === undefined) throw new Error("The Extension use handoff is invalid.");
@@ -1153,6 +1184,11 @@ function safeMediaType(value: unknown): string {
 function newSessionDraftKey(scope: string): string {
   if (scope.length === 0) throw new Error("A new-task draft scope is required.");
   return `${NEW_SESSION_DRAFT_PREFIX}${scope}`;
+}
+
+function recentProjectsKey(scope: string): string {
+  if (scope.length === 0) throw new Error("A recent-project owner scope is required.");
+  return `${RECENT_PROJECTS_PREFIX}${scope}`;
 }
 
 function pendingExtensionUseKey(scope: string): string {

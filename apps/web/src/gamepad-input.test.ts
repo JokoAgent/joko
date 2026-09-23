@@ -34,13 +34,34 @@ function sampler(engine = new GamepadInputEngine()) {
 const voice = (phase: "press" | "release" | "cancel") => ({ kind: "action", action: "voice", phase });
 
 describe("gamepad preference authority", () => {
+  it("accepts bounded skill identities and emits a single skill press after a neutral sample", () => {
+    const binding = { kind: "skill" as const, serverId: "server-one", resourceId: "resource-skill", name: "Review" };
+    const current = { ...preferences(), buttons: preferences().buttons.map((value, index) => index === 0 ? binding : value) };
+    expect(parseGamepadPreferences(current)).toEqual(current);
+    expect(parseGamepadPreferences({ ...current, buttons: current.buttons.map((value, index) => index === 0 ? { ...binding, name: "" } : value) })).toBeUndefined();
+    const { sample } = sampler();
+    expect(sample([pad({ down: [0] })], { preferences: current }).effects).toEqual([]);
+    sample([pad()], { preferences: current });
+    expect(sample([pad({ down: [0] })], { preferences: current }).effects).toEqual([{ kind: "skill", binding }]);
+    expect(sample([pad({ down: [0] })], { preferences: current }).effects).toEqual([]);
+    expect(sample([pad()], { preferences: current }).effects).toEqual([]);
+    const oversized = { ...current, buttons: Array(17).fill({ ...binding, name: "x".repeat(512) }) };
+    expect(() => saveGamepadPreferences(oversized)).toThrow("storage limit");
+    expect(window.localStorage.getItem(GAMEPAD_PREFERENCES_KEY)).toBeNull();
+  });
   it("accepts the complete current shape and rejects malformed settings without repairing persisted content", () => {
     const current = preferences();
     expect(parseGamepadPreferences(current)).toEqual(current);
+    const splitAttachments = {
+      ...current,
+      buttons: current.buttons.map((action, index) => index === 0 ? "add-photos" : index === 1 ? "add-files" : index === 2 ? "open-folder" : action)
+    };
+    expect(parseGamepadPreferences(splitAttachments)).toEqual(splitAttachments);
     const invalid = [
       { ...current, version: 2 }, { ...current, enabled: 1 }, { ...current, extra: true },
       { ...current, buttons: current.buttons.slice(1) }, { ...current, buttons: [...current.buttons, "none"] },
       { ...current, buttons: current.buttons.map((action, index) => index === 0 ? "arbitrary-command" : action) },
+      { ...current, buttons: current.buttons.map((action, index) => index === 0 ? "add-attachments" : action) },
       { ...current, buttons: Array(17) }, { ...current, rightStick: undefined },
       { ...current, leftStick: { ...current.leftStick, mode: "unknown" } },
       { ...current, leftStick: { ...current.leftStick, directions: { ...current.leftStick.directions, up: "voice" } } },
@@ -98,6 +119,37 @@ describe("gamepad preference authority", () => {
 });
 
 describe("gamepad input ownership", () => {
+  it("maps the standard View button to fullscreen after a neutral sample", () => {
+    expect(createDefaultGamepadPreferences().buttons[8]).toBe("toggle-fullscreen");
+    const { sample } = sampler();
+    expect(sample([pad({ down: [8] })]).effects).toEqual([]);
+    sample();
+    expect(sample([pad({ down: [8] })]).effects).toEqual([{ kind: "action", action: "toggle-fullscreen", phase: "press" }]);
+    expect(sample([pad({ down: [8] })]).effects).toEqual([]);
+  });
+  it("maps the default B button to history back and accepts a saved forward binding", () => {
+    const defaultLayout = createDefaultGamepadPreferences();
+    expect(defaultLayout.buttons[1]).toBe("navigate-back");
+    const layout = { ...defaultLayout, enabled: true, buttons: defaultLayout.buttons.map((binding, index) => index === 3 ? "navigate-forward" as const : binding) };
+    saveGamepadPreferences(layout);
+    expect(readGamepadPreferences().preferences.buttons[3]).toBe("navigate-forward");
+    const { sample } = sampler();
+    expect(sample([pad({ down: [1, 3] })], { preferences: layout }).effects).toEqual([]);
+    sample([pad()], { preferences: layout });
+    expect(sample([pad({ down: [1, 3] })], { preferences: layout }).effects).toEqual([
+      { kind: "action", action: "navigate-back", phase: "press" },
+      { kind: "action", action: "navigate-forward", phase: "press" }
+    ]);
+    expect(sample([pad({ down: [1, 3] })], { preferences: layout }).effects).toEqual([]);
+  });
+  it("maps the standard home button to schedule management after a neutral sample", () => {
+    expect(createDefaultGamepadPreferences().buttons[16]).toBe("open-schedules");
+    const { sample } = sampler();
+    expect(sample([pad({ down: [16] })]).effects).toEqual([]);
+    sample();
+    expect(sample([pad({ down: [16] })]).effects).toEqual([{ kind: "action", action: "open-schedules", phase: "press" }]);
+    expect(sample([pad({ down: [16] })]).effects).toEqual([]);
+  });
   it("requires neutral input after initial connection and dispatches each button edge once", () => {
     const { sample } = sampler();
     expect(sample([pad({ down: [0] })]).effects).toEqual([]);

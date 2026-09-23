@@ -16,6 +16,8 @@ message SessionStartTarget {}
 message RemoteWorkspaceBinding {
   string host_id = 1;
   string workspace_root_display = 2;
+  // The Target that owns the one Host record; may differ from this binding's Target.
+  string host_target_id = 3;
 }
 
 import "google/protobuf/duration.proto";

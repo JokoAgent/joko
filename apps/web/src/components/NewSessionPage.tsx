@@ -1,6 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, DragEvent, JSX } from "react";
+import type { DragEvent, JSX } from "react";
 import {
   AlertTriangle,
   AtSign,
@@ -49,8 +49,10 @@ import type {
   WorktreeSourceView,
   WorkspaceEntryView
 } from "../model.js";
+import type { RemoteTargetDraft, TargetDraft } from "../model.js";
 import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
+import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
 import {
   currentComposerPlatform,
   resolveComposerAttachmentPolicy,
@@ -78,6 +80,9 @@ import {
 } from "./new-session-options.js";
 import { nativeSessionDiscoveryAvailability } from "./session-discovery.js";
 import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
+import { ProjectEditor, localProjectPickerOwner, sameProjectPickerOwner } from "./ProjectEditor.js";
+import { RemoteProjectEditor } from "./RemoteProjectEditor.js";
+import { NewTaskProjectPicker } from "./NewTaskProjectPicker.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
@@ -90,6 +95,8 @@ import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./Com
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { useDraftVoiceInput } from "./use-draft-voice-input.js";
 import { useGamepadVoiceInput } from "../gamepad-client.js";
+import { useGamepadActions } from "../gamepad-actions.js";
+import { ComposerAttachmentPicker, type ComposerAttachmentPickerRequirement } from "../composer-attachment-picker.js";
 import { useHeldVoiceInput } from "./use-held-voice-input.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
@@ -123,11 +130,22 @@ interface NewSessionPageProps {
   readonly snapshot: AppSnapshot;
   readonly initialTargetId?: string;
   readonly initialDialogueBackendId?: string;
+  readonly projectPickerRequest?: NewSessionProjectPickerRequest;
+  readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
   readonly navigationOpen: boolean;
   readonly t: Translator;
   readonly onOpenNavigation: () => void;
   readonly onClose: () => void;
   readonly onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft, owner: NewSessionSubmissionOwner) => Promise<void>;
+}
+
+export interface NewSessionProjectPickerRequest {
+  readonly requestId: number;
+  readonly ownerDocument: Document;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly connectionGeneration: bigint;
+  readonly sourceNavigationRevision: number;
 }
 
 interface NewTaskWorkspaceMentionIndex {
@@ -155,7 +173,7 @@ const QUICK_STARTS = [
 ] as const;
 
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
   const projectTargets = snapshot.targets.filter((target) => !target.archived);
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
     const candidate = snapshot.backends.find((backend) => backend.id === target.backendId);
@@ -172,6 +190,25 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ? { kind: "dialogue", backendId: initialDialogueBackendId }
     : undefined);
   const [selection, setSelection] = useState<NewSessionDraftSelection | undefined>(() => requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
+  const [projectEditorOpen, setProjectEditorOpen] = useState(false);
+  const [projectEditorInitialDirectory, setProjectEditorInitialDirectory] = useState<string>();
+  const [projectCreatePending, setProjectCreatePending] = useState(false);
+  const [projectCreateError, setProjectCreateError] = useState<string>();
+  const [remoteProjectEditorOpen, setRemoteProjectEditorOpen] = useState(false);
+  const [remoteProjectCreatePending, setRemoteProjectCreatePending] = useState(false);
+  const [remoteProjectCreateError, setRemoteProjectCreateError] = useState<string>();
+  const [projectBrowsePending, setProjectBrowsePending] = useState(false);
+  const [projectBrowseError, setProjectBrowseError] = useState<string>();
+  const [openPickerRequestId, setOpenPickerRequestId] = useState<number>();
+  const pickerOpenSequenceRef = useRef(0);
+  const [recentProjects, setRecentProjects] = useState<{ readonly owner: string; readonly entries: readonly RecentProject[] }>();
+  const [recentProjectsError, setRecentProjectsError] = useState<string>();
+  const recentProjectsEpochRef = useRef(0);
+  const pageRef = useRef<HTMLElement>(null);
+  const consumedPickerRequestIdRef = useRef<number | undefined>(undefined);
+  const projectCreateEpochRef = useRef(0);
+  const remoteProjectCreateEpochRef = useRef(0);
+  const projectBrowseEpochRef = useRef(0);
   const [startKind, setStartKind] = useState<"fresh" | "attach">("fresh");
   const [nativeSessions, setNativeSessions] = useState<readonly NativeSessionCandidateView[]>([]);
   const [nativeReference, setNativeReference] = useState("");
@@ -230,6 +267,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const bindVoiceSend = useCallback((node: HTMLButtonElement | null) => setVoiceSendTarget(node ?? undefined), []);
   const voiceCaretRef = useRef<number | undefined>(undefined);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentPicker = useMemo(() => new ComposerAttachmentPicker(), []);
   const editorDocumentRef = useRef(editorDocument);
   const textRef = useRef(text);
   const mentionsRef = useRef(mentions);
@@ -291,6 +329,201 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  useLayoutEffect(() => {
+    const request = projectPickerRequest;
+    if (!hydrated || hydratedProfileScope !== profileScope || request === undefined
+      || consumedPickerRequestIdRef.current === request.requestId) return;
+    consumedPickerRequestIdRef.current = request.requestId;
+    onProjectPickerRequestConsumed?.(request.requestId);
+    const page = pageRef.current;
+    const ownerDocument = request.ownerDocument;
+    const ownerWindow = ownerDocument.defaultView;
+    const profile = controller.state.activeProfile;
+    const navigationRevision = controller.state.navigationRevision ?? 0;
+    if (page === null || !page.isConnected || page.ownerDocument !== ownerDocument
+      || ownerWindow === null || ownerWindow.closed || ownerDocument.visibilityState !== "visible" || !ownerDocument.hasFocus()
+      || ownerDocument.body.classList.contains("modal-open") || ownerDocument.body.dataset.appShortcutRecording === "1"
+      || ownerDocument.querySelector("[role='listbox'], [data-new-task-project-picker][data-state='open']") !== null
+      || ownerDocument.querySelector("[data-gamepad-preview]") !== null
+      || controller.state.route.kind !== "newSession" || controller.state.connectionState !== "connected"
+      || profile?.id !== request.profileId || profile.serverId !== request.serverId
+      || snapshot.generation !== request.connectionGeneration || controller.state.snapshot.generation !== request.connectionGeneration
+      || navigationRevision < request.sourceNavigationRevision || navigationRevision > request.sourceNavigationRevision + 1) return;
+    setOpenPickerRequestId(++pickerOpenSequenceRef.current);
+  }, [controller, hydrated, hydratedProfileScope, onProjectPickerRequestConsumed, profileScope, projectPickerRequest, snapshot.generation]);
+  useEffect(() => {
+    projectCreateEpochRef.current += 1;
+    remoteProjectCreateEpochRef.current += 1;
+    projectBrowseEpochRef.current += 1;
+    setProjectEditorOpen(false);
+    setProjectEditorInitialDirectory(undefined);
+    setProjectCreatePending(false);
+    setProjectCreateError(undefined);
+    setRemoteProjectEditorOpen(false);
+    setRemoteProjectCreatePending(false);
+    setRemoteProjectCreateError(undefined);
+    setProjectBrowsePending(false);
+    setProjectBrowseError(undefined);
+  }, [profileScope, snapshot.generation]);
+  useEffect(() => {
+    recentProjectsEpochRef.current += 1;
+    setRecentProjects(undefined);
+    setRecentProjectsError(undefined);
+  }, [profileScope, snapshot.generation]);
+  const loadRecentProjects = (): void => {
+    const current = controllerRef.current;
+    if (current.state.connectionState !== "connected" || current.state.activeProfile === undefined
+      || current.state.route.kind !== "newSession"
+      || `${current.state.activeProfile.serverId}\u0000${current.state.activeProfile.id}` !== profileScope) return;
+    const owner = profileScope;
+    const generation = current.state.snapshot.generation;
+    const epoch = ++recentProjectsEpochRef.current;
+    const read = current.readRecentProjects?.() ?? Promise.resolve([]);
+    void read.then((entries) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== owner
+        || state.snapshot.generation !== generation) return;
+      setRecentProjects({ owner, entries });
+      setRecentProjectsError(undefined);
+    }).catch((cause: unknown) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== owner
+        || state.snapshot.generation !== generation) return;
+      setRecentProjects({ owner, entries: [] });
+      setRecentProjectsError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    });
+  };
+  const loadRecentProjectsRef = useRef(loadRecentProjects);
+  loadRecentProjectsRef.current = loadRecentProjects;
+  useEffect(() => subscribeRecentProjectsChange(profileScope, () => loadRecentProjectsRef.current()), [profileScope]);
+  const removeRecentProject = (entry: RecentProject): void => {
+    const current = controllerRef.current;
+    if (current.state.connectionState !== "connected" || current.state.route.kind !== "newSession"
+      || current.state.activeProfile === undefined
+      || `${current.state.activeProfile.serverId}\u0000${current.state.activeProfile.id}` !== profileScope) return;
+    const epoch = ++recentProjectsEpochRef.current;
+    const generation = current.state.snapshot.generation;
+    void current.removeRecentProject(entry).then((entries) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== profileScope
+        || state.snapshot.generation !== generation) return;
+      setRecentProjects({ owner: profileScope, entries });
+      setRecentProjectsError(undefined);
+    }).catch((cause: unknown) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== profileScope
+        || state.snapshot.generation !== generation) return;
+      setRecentProjectsError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    });
+  };
+  const browseProjectDirectory = (): void => {
+    const picker = window.jokoDesktop?.projects?.pickDirectory;
+    const owner = localProjectPickerOwner(controller);
+    const ownerDocument = pageRef.current?.ownerDocument;
+    if (picker === undefined || owner === undefined || ownerDocument === undefined || projectBrowsePending
+      || controller.state.route.kind !== "newSession") return;
+    const epoch = ++projectBrowseEpochRef.current;
+    const generation = controller.state.snapshot.generation;
+    const navigationRevision = controller.state.navigationRevision ?? 0;
+    const ownsResult = (): boolean => {
+      const current = controllerRef.current;
+      const state = current.state;
+      return mountedRef.current && projectBrowseEpochRef.current === epoch
+        && pageRef.current?.isConnected === true && pageRef.current.ownerDocument === ownerDocument
+        && ownerDocument.defaultView !== null && !ownerDocument.defaultView.closed
+        && ownerDocument.visibilityState === "visible" && ownerDocument.hasFocus()
+        && !ownerDocument.body.classList.contains("modal-open")
+        && state.route.kind === "newSession" && state.snapshot.generation === generation
+        && (state.navigationRevision ?? 0) === navigationRevision
+        && sameProjectPickerOwner(localProjectPickerOwner(current), owner);
+    };
+    setProjectBrowsePending(true);
+    setProjectBrowseError(undefined);
+    void picker(owner).then((result) => {
+      if (!ownsResult()) return;
+      if (result.cancelled) {
+        setOpenPickerRequestId(++pickerOpenSequenceRef.current);
+      } else {
+        setProjectEditorInitialDirectory(result.path);
+        setProjectCreateError(undefined);
+        setProjectEditorOpen(true);
+      }
+    }).catch((cause: unknown) => {
+      if (!ownsResult()) return;
+      setProjectBrowseError(cause instanceof Error ? cause.message : t("error.unexpected"));
+      setOpenPickerRequestId(++pickerOpenSequenceRef.current);
+    }).finally(() => {
+      if (ownsResult()) setProjectBrowsePending(false);
+    });
+  };
+  const createProject = (draft: TargetDraft): void => {
+    if (projectCreatePending || controller.state.connectionState !== "connected"
+      || controller.state.activeProfile === undefined || controller.state.route.kind !== "newSession") return;
+    const epoch = ++projectCreateEpochRef.current;
+    const owner = {
+      profileId: controller.state.activeProfile?.id,
+      serverId: controller.state.activeProfile?.serverId,
+      generation: controller.state.snapshot.generation,
+      navigationRevision: controller.state.navigationRevision ?? 0
+    };
+    const ownsResult = (): boolean => {
+      const current = controllerRef.current.state;
+      return mountedRef.current && projectCreateEpochRef.current === epoch && current.connectionState === "connected"
+        && current.activeProfile?.id === owner.profileId && current.activeProfile?.serverId === owner.serverId
+        && current.snapshot.generation === owner.generation && current.route.kind === "newSession"
+        && (current.navigationRevision ?? 0) === owner.navigationRevision;
+    };
+    setProjectCreatePending(true);
+    setProjectCreateError(undefined);
+    void controller.createTarget(draft).then((targetId) => {
+      if (!ownsResult()) return;
+      setSelection({ kind: "target", targetId });
+      setStartKind("fresh");
+      setNativeReference("");
+      setNativeSelectionWarning(undefined);
+      setProjectEditorOpen(false);
+    }).catch((cause: unknown) => {
+      if (ownsResult()) setProjectCreateError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    }).finally(() => {
+      if (ownsResult()) setProjectCreatePending(false);
+    });
+  };
+  const createRemoteProject = (draft: RemoteTargetDraft): void => {
+    if (remoteProjectCreatePending || controller.state.connectionState !== "connected"
+      || controller.state.activeProfile === undefined || controller.state.route.kind !== "newSession") return;
+    const epoch = ++remoteProjectCreateEpochRef.current;
+    const owner = {
+      profileId: controller.state.activeProfile.id,
+      serverId: controller.state.activeProfile.serverId,
+      generation: controller.state.snapshot.generation,
+      navigationRevision: controller.state.navigationRevision ?? 0
+    };
+    const ownsResult = (): boolean => {
+      const current = controllerRef.current.state;
+      return mountedRef.current && remoteProjectCreateEpochRef.current === epoch
+        && current.connectionState === "connected" && current.activeProfile?.id === owner.profileId
+        && current.activeProfile.serverId === owner.serverId && current.snapshot.generation === owner.generation
+        && current.route.kind === "newSession" && (current.navigationRevision ?? 0) === owner.navigationRevision;
+    };
+    setRemoteProjectCreatePending(true);
+    setRemoteProjectCreateError(undefined);
+    void controller.createRemoteTarget(draft).then((targetId) => {
+      if (!ownsResult()) return;
+      setSelection({ kind: "target", targetId });
+      setStartKind("fresh");
+      setNativeReference("");
+      setNativeSelectionWarning(undefined);
+      setRemoteProjectEditorOpen(false);
+    }).catch((cause: unknown) => {
+      if (ownsResult()) setRemoteProjectCreateError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    }).finally(() => {
+      if (ownsResult()) setRemoteProjectCreatePending(false);
+    });
+  };
   const selected = selection?.kind === "target" ? snapshot.targets.find((target) => target.id === selection.targetId) : undefined;
   const backend = selection?.kind === "dialogue"
     ? eligibleDialogueBackends.find((candidate) => candidate.id === selection.backendId)
@@ -811,10 +1044,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [initialDialogueBackendId, initialTargetId, profileScope]);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || projectPickerRequest !== undefined || openPickerRequestId !== undefined) return;
     const frame = window.requestAnimationFrame(() => richEditorRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [hydrated, profileScope]);
+  }, [hydrated, profileScope, projectPickerRequest?.requestId, openPickerRequestId]);
 
   useEffect(() => {
     if (selection?.kind === "target") return;
@@ -1063,6 +1296,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
   }, [submissionScope, voiceRoot]);
+  useLayoutEffect(() => () => attachmentPicker.retire(), [attachmentPicker, submissionScope]);
   useLayoutEffect(() => {
     if (submissionOriginRef.current !== undefined && !submissionOriginRef.current.isCurrent()) submissionAbortRef.current?.abort();
   });
@@ -1464,6 +1698,29 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     if (next.length > 0) setAttachments((current) => [...current, ...next]);
   };
 
+  const attachmentPickerAdmission = () => ({
+    owner: submissionScope,
+    epoch: submissionEpochRef.current,
+    connected: controller.state.connectionState === "connected",
+    locked: !hydrated || submitting || voice.active,
+    images: attachmentPolicy.images,
+    files: attachmentPolicy.files
+  });
+  const openAttachmentPicker = (
+    requirement: ComposerAttachmentPickerRequirement = "either",
+    requireConnection = false
+  ): void => {
+    if (attachmentPicker.open(fileInputRef.current, attachmentPickerAdmission(), requirement, requireConnection)) closePalette();
+  };
+  const consumeAttachmentPicker = (input: HTMLInputElement): void => {
+    const files = attachmentPicker.consume(input, input.files, attachmentPickerAdmission());
+    if (files.length > 0) addFiles(files);
+  };
+  useGamepadActions(voiceRoot, submissionScope, "composer", {
+    "add-photos": () => openAttachmentPicker("images", true),
+    "add-files": () => openAttachmentPicker("files", true)
+  });
+
   const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
     const state = classifyComposerInternalDrop(dataTransfer, usableWorkspace?.id);
     if (state.kind === "none") {
@@ -1647,11 +1904,6 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     return true;
   };
 
-  const handleFiles = (event: ChangeEvent<HTMLInputElement>): void => {
-    if (event.target.files !== null) addFiles(event.target.files);
-    event.target.value = "";
-  };
-
   const preventDrag = (event: DragEvent): void => {
     event.preventDefault();
     event.stopPropagation();
@@ -1697,38 +1949,75 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const activeFullAccessConfirmation = fullAccessConfirmation?.scope === fullAccessConfirmationScope
     ? fullAccessConfirmation
     : undefined;
+  const visibleRecentProjects = controller.state.connectionState === "connected" && recentProjects?.owner === profileScope
+    ? recentProjects.entries : [];
+  const recentOptions = visibleRecentProjects.map((entry) => {
+    const target = resolveRecentProject(entry, snapshot);
+    return { entry, available: target !== undefined && target.error === undefined
+      && activeTargets.some((candidate) => candidate.id === target.id)
+      && snapshot.backends.some((candidate) => candidate.id === target.backendId
+        && candidate.health !== "unavailable" && candidate.capabilities.get("input.text")?.supported === true) };
+  });
+  const recentlyShownTargets = new Set(recentOptions.filter((option) => option.available).map((option) => option.entry.targetId));
+  const projectPickerOptions = projectTargets.filter((target) => !recentlyShownTargets.has(target.id)).map((target) => {
+    const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
+    const hostSource = target.remoteWorkspace === undefined ? undefined
+      : snapshot.targets.find((candidate) => candidate.id === target.remoteWorkspace?.hostTargetId);
+    const location = target.remoteWorkspace === undefined
+      ? targetWorkspace?.serverPath || target.workspaceName
+      : `${hostSource?.name ?? target.remoteWorkspace.hostTargetId} / ${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
+    const available = activeTargets.some((candidate) => candidate.id === target.id)
+      && target.error === undefined && targetWorkspace !== undefined && targetWorkspace.targetId === target.id;
+    return { value: newSessionSelectionValue({ kind: "target" as const, targetId: target.id }),
+      name: `${target.name}${available ? "" : ` · ${t("newTask.unavailable")}`}`, location, disabled: !available };
+  });
+  const dialoguePickerOptions = eligibleDialogueBackends.map((candidate) => ({
+    value: newSessionSelectionValue({ kind: "dialogue" as const, backendId: candidate.id }),
+    name: `${t("newTask.dialogue")} · ${candidate.name}`
+  }));
+  const selectProjectPickerValue = (value: string): void => {
+    const next = parseNewSessionSelection(value, projectTargets, eligibleDialogueBackends);
+    if (next === undefined) return;
+    setSelection(next);
+    setStartKind("fresh");
+    setNativeReference("");
+    setNativeSelectionWarning(undefined);
+  };
+  const selectRecentProject = (entry: RecentProject): boolean => {
+    const current = controllerRef.current.state;
+    if (current.connectionState !== "connected" || current.route.kind !== "newSession"
+      || current.activeProfile === undefined || `${current.activeProfile.serverId}\u0000${current.activeProfile.id}` !== profileScope
+      || current.snapshot.generation !== snapshot.generation) return false;
+    const target = resolveRecentProject(entry, current.snapshot);
+    if (target === undefined || target.error !== undefined
+      || !newSessionTargets([target], current.snapshot.settings.backendSettings).some((candidate) => candidate.id === target.id)
+      || !current.snapshot.backends.some((candidate) => candidate.id === target.backendId
+        && candidate.health !== "unavailable" && candidate.capabilities.get("input.text")?.supported === true)) {
+      setRecentProjectsError(t("newTask.projectUnavailable"));
+      return false;
+    }
+    selectProjectPickerValue(newSessionSelectionValue({ kind: "target", targetId: target.id }));
+    return true;
+  };
 
-  return <main className="new-task-page">
+  return <main ref={pageRef} className="new-task-page">
     <header className="new-task-page__header">
       {!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       <div className="new-task-context" aria-label={t("session.newDescription")}>
-        <label className="new-task-context__control new-task-context__control--target">
-          <FolderKanban aria-hidden="true" />
-          <span className="sr-only">{t("newTask.location")}</span>
-          <SelectControl value={selectionKey} disabled={submitting || (projectTargets.length === 0 && eligibleDialogueBackends.length === 0)} onChange={(event) => {
-            const next = parseNewSessionSelection(event.target.value, projectTargets, eligibleDialogueBackends);
-            if (next !== undefined) {
-              setSelection(next);
-              setStartKind("fresh");
-              setNativeReference("");
-              setNativeSelectionWarning(undefined);
-            }
-          }}>
-            {projectTargets.length === 0 && selected === undefined && eligibleDialogueBackends.length === 0 && <option value="">{t("session.noProjects")}</option>}
-            {(projectTargets.length > 0 || selection?.kind === "target" && !projectTargets.some((target) => target.id === selection.targetId)) && <optgroup label={t("nav.projects")}>
-              {selection?.kind === "target" && !projectTargets.some((target) => target.id === selection.targetId) && <option value={selectionKey} disabled>{selected?.name ?? selection.targetId} · {t("newTask.unavailable")}</option>}
-              {projectTargets.map((target) => {
-                const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
-                const location = target.remoteWorkspace === undefined
-                  ? targetWorkspace?.serverPath || target.workspaceName
-                  : `${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
-                const available = activeTargets.some((candidate) => candidate.id === target.id) && target.error === undefined && targetWorkspace !== undefined;
-                return <option value={newSessionSelectionValue({ kind: "target", targetId: target.id })} disabled={!available} key={target.id}>{target.name} · {location}{available ? "" : ` · ${t("newTask.unavailable")}`}</option>;
-              })}
-            </optgroup>}
-            {eligibleDialogueBackends.length > 0 && <optgroup label={t("newTask.dialogues")}>{eligibleDialogueBackends.map((candidate) => <option value={newSessionSelectionValue({ kind: "dialogue", backendId: candidate.id })} key={`dialogue:${candidate.id}`}>{t("newTask.dialogue")} · {candidate.name}</option>)}</optgroup>}
-          </SelectControl>
-        </label>
+        <NewTaskProjectPicker value={selectionKey}
+          selectedName={selected?.name ?? (selection?.kind === "dialogue" ? `${t("newTask.dialogue")} · ${backend?.name ?? ""}` : t("session.noProjects"))}
+          projects={projectPickerOptions} dialogues={dialoguePickerOptions} recent={recentOptions}
+          ownerKey={`${profileScope}\u0000${snapshot.generation}`}
+          requestId={hydrated && hydratedProfileScope === profileScope ? openPickerRequestId : undefined}
+          disabled={submitting || !hydrated || projectBrowsePending || controller.state.connectionState !== "connected"}
+          canBrowse={localProjectPickerOwner(controller) !== undefined}
+          error={recentProjectsError} onOpen={loadRecentProjects}
+          onChoose={selectProjectPickerValue} onChooseRecent={selectRecentProject} onRemoveRecent={removeRecentProject}
+          onBrowse={browseProjectDirectory} onAdd={() => {
+            setProjectEditorInitialDirectory(undefined);
+            setProjectCreateError(undefined);
+            setProjectEditorOpen(true);
+          }} onAddRemote={() => { setRemoteProjectCreateError(undefined); setRemoteProjectEditorOpen(true); }} t={t} />
         {canDiscover && <label className="new-task-context__control new-task-context__control--native">
           <span className="sr-only">{t("session.startMode")}</span>
           <SelectControl value={startKind} disabled={submitting} onChange={(event) => { const next = event.target.value as "fresh" | "attach"; setStartKind(next); setNativeSelectionWarning(undefined); if (next === "fresh") setNativeReference(""); }}>
@@ -1739,6 +2028,24 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       </div>
       <IconButton label={t("common.close")} disabled={submitting} onClick={onClose}><X aria-hidden="true" /></IconButton>
     </header>
+
+    <ProjectEditor open={projectEditorOpen} initialDirectory={projectEditorInitialDirectory} controller={controller} snapshot={snapshot} t={t} saving={projectCreatePending} error={projectCreateError} onClose={() => { projectCreateEpochRef.current += 1; setProjectEditorOpen(false); setProjectEditorInitialDirectory(undefined); setProjectCreatePending(false); setProjectCreateError(undefined); }} onSave={createProject} />
+    <RemoteProjectEditor open={remoteProjectEditorOpen} controller={controller} snapshot={snapshot}
+      restoreFocusFallback={() => pageRef.current?.querySelector<HTMLElement>(".new-task-project-picker__trigger") ?? null}
+      initialBackendId={backend?.id} eligibleTargetIds={new Set(activeTargets.map((target) => target.id))}
+      saving={remoteProjectCreatePending} error={remoteProjectCreateError} t={t}
+      onClose={() => { remoteProjectCreateEpochRef.current += 1; setRemoteProjectEditorOpen(false); setRemoteProjectCreatePending(false); setRemoteProjectCreateError(undefined); }}
+      onSave={createRemoteProject} onChooseExisting={(targetId) => {
+        const current = controllerRef.current.state;
+        const target = current.snapshot.targets.find((candidate) => candidate.id === targetId);
+        if (current.connectionState !== "connected" || current.route.kind !== "newSession" || target === undefined
+          || !newSessionTargets([target], current.snapshot.settings.backendSettings).some((candidate) => candidate.id === target.id)) return;
+        setSelection({ kind: "target", targetId });
+        setStartKind("fresh");
+        setNativeReference("");
+        setNativeSelectionWarning(undefined);
+        setRemoteProjectEditorOpen(false);
+      }} />
 
     <div className="new-task-page__scroll">
       <section className="new-task-page__content" aria-labelledby="new-task-title">
@@ -1751,6 +2058,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         {selection?.kind === "target" && !workspacePreparationLoading && (targetStaticUnavailableReason ?? currentWorkspacePreparationError) !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{targetStaticUnavailableReason ?? currentWorkspacePreparationError}</span>{targetStaticReady && currentWorkspacePreparationError !== undefined && <Button tone="ghost" disabled={submitting} onClick={() => setWorkspacePreparationRevision((value) => value + 1)}>{t("common.retry")}</Button>}</div>}
         {selected !== undefined && targetWorkspaceReady && !selected.trusted && <div className="new-task-warning" role="status"><AlertTriangle aria-hidden="true" /><span>{t("session.projectInert")}</span></div>}
         {draftError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{draftError}</span></div>}
+        {projectBrowseError !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{projectBrowseError}</span></div>}
         {showWorktreeControls && <section className="new-task-worktree" aria-labelledby="new-task-worktree-title">
           <header>
             <span><GitBranch aria-hidden="true" /><strong id="new-task-worktree-title">{t("worktree.title")}</strong></span>
@@ -1898,7 +2206,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             />}
             <div className="composer__toolbar new-task-composer__toolbar">
               <div className="composer__tools">
-                <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={submitting} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={handleFiles} />
+                <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={submitting} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={(event) => consumeAttachmentPicker(event.currentTarget)} />
                 {canUseAddMenu && <div className="palette-anchor">
                   <ComposerAddMenu
                     open={paletteInAddMenu}
@@ -1920,7 +2228,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     count={extraDirectoryIds.length}
                   >
                     {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
-                      {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { closePalette(); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
+                      {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => openAttachmentPicker()}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
                       {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => {
                         if (mentionPolicy.directories) {
                           openInlineMentionPalette();

@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
+import type { AppShortcutOverrides } from "../app-shortcuts.js";
 import { dispatchGamepadOwnedAction, type GamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type ModelView, type SessionView, type TimelineItemView } from "../model.js";
@@ -21,7 +22,7 @@ const roots: Root[] = [];
 beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.stubGlobal("requestAnimationFrame", () => 0); });
 afterEach(async () => {
   await act(async () => roots.splice(0).forEach((root) => root.unmount()));
-  document.body.replaceChildren(); document.body.className = ""; vi.unstubAllGlobals();
+  document.body.replaceChildren(); document.body.className = ""; Reflect.deleteProperty(window.navigator, "clipboard"); vi.unstubAllGlobals();
 });
 const model: ModelView = { backendId: "backend", providerId: "provider", providerName: "Provider", modelId: "model", name: "Model", available: true, supportsImages: false,
   supportsFast: true, efforts: ["low", "medium", "high"], inputModalities: ["text"], outputModalities: ["text"], contextWindow: 8192, maximumOutputTokens: 2048,
@@ -75,6 +76,74 @@ describe("session gamepad actions", () => {
     expect(view.api.forkSession.mock.calls[0]?.slice(0, 2)).toEqual(["task", "native-entry"]);
   });
 
+  it("copies the complete current task through the configured gamepad action and reports the result", async () => {
+    const view = await mount();
+    const writeText = vi.fn(async (_value: string) => undefined);
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+    view.api.loadSessionTimelinePage.mockResolvedValueOnce({ items: [
+      { ...message, id: "user", kind: "user", text: "Question", sequence: 1n },
+      { ...message, id: "answer", text: "Answer", sequence: 2n }
+    ] });
+    await view.action("copy-conversation-markdown");
+    await vi.waitFor(() => expect(writeText).toHaveBeenCalledExactlyOnceWith("## timeline.you\n\nQuestion\n\n## timeline.agent\n\nAnswer"));
+    expect(view.api.loadSessionTimelinePage).toHaveBeenCalledExactlyOnceWith("task", undefined, 500);
+    expect(view.host.textContent).toContain("session.conversationCopy.copied");
+  });
+
+  it("leaves the clipboard unchanged for empty or failed history and discards an old task response", async () => {
+    const view = await mount();
+    const writeText = vi.fn(async (_value: string) => undefined);
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+    view.api.loadSessionTimelinePage.mockResolvedValueOnce({ items: [] });
+    await view.action("copy-conversation-markdown");
+    await vi.waitFor(() => expect(view.host.textContent).toContain("session.conversationCopy.empty"));
+    expect(writeText).not.toHaveBeenCalled();
+    view.api.loadSessionTimelinePage.mockRejectedValueOnce(new Error("offline"));
+    await view.action("copy-conversation-markdown");
+    await vi.waitFor(() => expect(view.host.textContent).toContain("session.conversationCopy.read-failed"));
+    expect(writeText).not.toHaveBeenCalled();
+    let resolvePage!: (value: { items: TimelineItemView[] }) => void;
+    view.api.loadSessionTimelinePage.mockImplementationOnce(() => new Promise((resolve) => { resolvePage = resolve; }));
+    await view.action("copy-conversation-markdown");
+    await view.render({ ...session, id: "other-task" });
+    await act(async () => resolvePage({ items: [message] }));
+    expect(writeText).not.toHaveBeenCalled();
+    expect(view.host.textContent).not.toContain("session.conversationCopy.copied");
+  });
+
+  it("reports clipboard rejection without claiming that the conversation was copied", async () => {
+    const view = await mount();
+    const writeText = vi.fn(async (_value: string) => { throw new Error("denied"); });
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+    view.api.loadSessionTimelinePage.mockResolvedValueOnce({ items: [message] });
+    await view.action("copy-conversation-markdown");
+    await vi.waitFor(() => expect(view.host.textContent).toContain("session.conversationCopy.clipboard-failed"));
+    expect(writeText).toHaveBeenCalledOnce();
+    expect(view.host.textContent).not.toContain("session.conversationCopy.copied");
+  });
+
+  it("routes a saved keyboard binding only to the focused task pane", async () => {
+    const overrides: AppShortcutOverrides = { "copy-conversation-markdown": { code: "KeyY", key: "y", meta: false, ctrl: true, alt: false, shift: false } };
+    const first = await mount(overrides);
+    const second = await mount(overrides);
+    await second.render({ ...session, id: "other-task" });
+    const writeText = vi.fn(async (_value: string) => undefined);
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+    second.api.loadSessionTimelinePage.mockResolvedValueOnce({ items: [message] });
+    const keydown = new KeyboardEvent("keydown", { key: "y", code: "KeyY", ctrlKey: true, bubbles: true, cancelable: true });
+    second.host.querySelector<HTMLButtonElement>("button")!.focus();
+    await act(async () => { second.host.querySelector<HTMLButtonElement>("button")!.dispatchEvent(keydown); });
+    await vi.waitFor(() => expect(writeText).toHaveBeenCalledOnce());
+    expect(keydown.defaultPrevented).toBe(true);
+    expect(first.api.loadSessionTimelinePage).not.toHaveBeenCalled();
+    expect(second.api.loadSessionTimelinePage).toHaveBeenCalledExactlyOnceWith("other-task", undefined, 500);
+    document.body.classList.add("modal-open");
+    const blocked = new KeyboardEvent("keydown", { key: "y", code: "KeyY", ctrlKey: true, bubbles: true, cancelable: true });
+    await act(async () => { second.host.querySelector<HTMLButtonElement>("button")!.dispatchEvent(blocked); });
+    expect(blocked.defaultPrevented).toBe(false);
+    expect(second.api.loadSessionTimelinePage).toHaveBeenCalledOnce();
+  });
+
   it("exposes clone and message fork for an isolated workspace only when the backend can derive it", async () => {
     const view = await mount();
     const isolatedSession: SessionView = {
@@ -126,15 +195,16 @@ describe("session gamepad actions", () => {
   });
 });
 
-async function mount() {
+async function mount(overrides: AppShortcutOverrides = {}) {
   const api = { setModel: vi.fn<AppController["setModel"]>(async () => undefined), setPlanMode: vi.fn(async () => undefined),
     pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkSession: vi.fn<AppController["forkSession"]>(async () => "forked"),
+    loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
     cloneSession: vi.fn<AppController["cloneSession"]>(async () => "cloned"), navigate: vi.fn(), exportSession: vi.fn(), getArtifactUrl: vi.fn(), releaseArtifactUrl: vi.fn() };
   const archive = vi.fn(); const copy = vi.fn(); const pending: Promise<unknown>[] = [];
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
   const render = async (current = session, currentBackend = backend, readOnly = false) => {
     const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model], timelineBySession: new Map([[current.id, [message]]]) };
-    const controller = { ...api, state: { ready: true, connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES, snapshot, route: { kind: "session", sessionId: current.id } } } as unknown as AppController;
+    const controller = { ...api, state: { ready: true, connectionState: "connected", preferences: { ...DEFAULT_UI_PREFERENCES, appShortcutOverrides: overrides }, snapshot, route: { kind: "session", sessionId: current.id } } } as unknown as AppController;
     await act(async () => root.render(<SessionPane controller={controller} session={current} backend={currentBackend} reviewReadOnly={readOnly} models={[model]} timeline={[message]}
       timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined} extensionWidgets={[]} extensionStatuses={[]}
       queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]} remainingInteractions={0} navigationOpen inspectorOpen t={(key) => key}

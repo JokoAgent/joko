@@ -30,6 +30,7 @@ import {
 import { isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
 import { normalizeNavigationWidth, type NavigationLayout } from "./navigation-layout.js";
+import type { RecentProject } from "./recent-projects.js";
 import { parseWorkspaceFilesHash, workspaceFilesHash } from "./workspace-files-navigation.js";
 import { requestWorkspaceDocumentLeave, workspaceRouteLeaveRequest } from "./workspace-document-lifecycle.js";
 import type {
@@ -89,6 +90,9 @@ const DARK_APP_ICON_URL = darkAppIconUrl;
 const FAVICON_SIZE = 256;
 let faviconRequest = 0;
 
+export type ToolsTab = "browser" | "extensions" | "skills" | "resources" | "mcp" | "activity";
+const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "resources", "mcp", "activity"];
+
 export type AppRoute =
   | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly messageId?: string; readonly messageEventId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
@@ -96,7 +100,7 @@ export type AppRoute =
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "partners"; readonly partnerId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
-  | { readonly kind: "tools"; readonly extensionId?: string }
+  | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
@@ -207,6 +211,9 @@ export interface AppController extends OperationApi {
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
+  readRecentProjects(): Promise<readonly RecentProject[]>;
+  recordRecentProject(entry: RecentProject): Promise<readonly RecentProject[]>;
+  removeRecentProject(entry: RecentProject): Promise<readonly RecentProject[]>;
   readPendingExtensionUse(): Promise<PendingExtensionUseView | undefined>;
   savePendingExtensionUse(value: PendingExtensionUseView): Promise<void>;
   clearPendingExtensionUse(): Promise<void>;
@@ -1641,6 +1648,9 @@ export function useAppController(): AppController {
         const selectedScope = scope();
         return enqueue(selectedScope, () => requireLocal(draftStore).clearNewSessionDraft(selectedScope));
       },
+      readRecentProjects: (): Promise<readonly RecentProject[]> => requireLocal(draftStore).readRecentProjects(scope()),
+      recordRecentProject: (entry: RecentProject): Promise<readonly RecentProject[]> => requireLocal(draftStore).recordRecentProject(scope(), entry),
+      removeRecentProject: (entry: RecentProject): Promise<readonly RecentProject[]> => requireLocal(draftStore).removeRecentProject(scope(), entry),
       readPendingExtensionUse: (): Promise<PendingExtensionUseView | undefined> => requireLocal(draftStore).readPendingExtensionUse(scope()),
       savePendingExtensionUse: (value: PendingExtensionUseView): Promise<void> => requireLocal(draftStore).savePendingExtensionUse(scope(), value),
       clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope())
@@ -1702,6 +1712,8 @@ export function useAppController(): AppController {
       saveCredential: async (...args: Parameters<OperationApi["saveCredential"]>) => original().saveCredential(...args),
       getRemoteHostCapabilities: async (...args: Parameters<OperationApi["getRemoteHostCapabilities"]>) => original().getRemoteHostCapabilities(...args),
       listRemoteHosts: async (...args: Parameters<OperationApi["listRemoteHosts"]>) => original().listRemoteHosts(...args),
+      listRemoteHostDirectories: async (...args: Parameters<OperationApi["listRemoteHostDirectories"]>) => original().listRemoteHostDirectories(...args),
+      inspectRemoteHostDirectory: async (...args: Parameters<OperationApi["inspectRemoteHostDirectory"]>) => original().inspectRemoteHostDirectory(...args),
       watchRemoteHosts: (...args: Parameters<OperationApi["watchRemoteHosts"]>) => original().watchRemoteHosts(...args),
       refreshRemoteHostCatalog: async (...args: Parameters<OperationApi["refreshRemoteHostCatalog"]>) => original().refreshRemoteHostCatalog(...args),
       createRemoteHost: async (...args: Parameters<OperationApi["createRemoteHost"]>) => original().createRemoteHost(...args),
@@ -1739,6 +1751,8 @@ export function useAppController(): AppController {
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
+      createRemoteTarget: async (...args: Parameters<OperationApi["createRemoteTarget"]>) => original().createRemoteTarget(...args),
+      listProjectDirectories: async (...args: Parameters<OperationApi["listProjectDirectories"]>) => original().listProjectDirectories(...args),
       prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
         draft,
@@ -2097,6 +2111,12 @@ export function useAppController(): AppController {
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
     listSkills: (options) => gateway().listSkills(options),
+    startSkillLearning: (draft, signal) => gateway().startSkillLearning(draft, signal),
+    listSkillLearningRuns: (signal) => gateway().listSkillLearningRuns(signal),
+    getSkillLearningRun: (runId, signal) => gateway().getSkillLearningRun(runId, signal),
+    applySkillLearning: (run, confirmReplace, signal) => gateway().applySkillLearning(run, confirmReplace, signal),
+    discardSkillLearning: (run, signal) => gateway().discardSkillLearning(run, signal),
+    cancelSkillLearning: (run, signal) => gateway().cancelSkillLearning(run, signal),
     getSkillResourceUsageReport: (resourceId, timeZone, signal) =>
       gateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
     openSkill: (skillId, expectedRevision, signal) => gateway().openSkill(skillId, expectedRevision, signal),
@@ -3205,9 +3225,11 @@ export function routeFromHash(hash: string): AppRoute {
   if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
+    if (extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId)) return { kind: "tools", extensionId };
+    const tab = query.get("tab");
     return {
       kind: "tools",
-      ...(extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId) ? { extensionId } : {})
+      ...(tab !== null && tab !== "browser" && (TOOLS_TABS as readonly string[]).includes(tab) ? { tab: tab as ToolsTab } : {})
     };
   }
   if (parts[0] === "extensions" && parts[1] !== undefined && /^extension_[a-f0-9]{32}$/u.test(parts[1])) {
@@ -3271,6 +3293,7 @@ export function appRouteHash(route: AppRoute): string {
   if (route.kind === "tools") {
     const query = new URLSearchParams();
     if (route.extensionId !== undefined) query.set("extension", route.extensionId);
+    else if (route.tab !== undefined && route.tab !== "browser") query.set("tab", route.tab);
     return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "extensionMainView") return `#/extensions/${encodeURIComponent(route.extensionId)}`;

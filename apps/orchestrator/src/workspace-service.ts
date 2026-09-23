@@ -71,6 +71,7 @@ export interface WorkspaceRegistration {
   readonly trusted: boolean;
   readonly remote?: {
     readonly targetId: string;
+    readonly hostTargetId: string;
     readonly hostId: string;
     readonly workspaceRoot: string;
   };

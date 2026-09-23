@@ -45,7 +45,7 @@ it("composes remote terminals over authenticated HTTP and completes service shut
   const application = await createOrchestratorApplication(config, { remoteSshConnector: connector });
   let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
   try {
-    const remoteWorkspace = { hostId: "host-one", workspaceRoot: "/srv/project" };
+    const remoteWorkspace = { hostTargetId: "remote-target", hostId: "host-one", workspaceRoot: "/srv/project" };
     application.store.upsertTarget({ id: "remote-target", backendId: "pi", displayName: "Remote project", workspaceRoot: workspace,
       managed: false, trusted: true, remoteWorkspace });
     application.remoteHosts!.create({ id: "host-one", targetId: "remote-target", hostname: "terminal.invalid", user: "fixture", source: "manual" });

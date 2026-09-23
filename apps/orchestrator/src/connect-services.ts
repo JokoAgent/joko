@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { listProjectDirectories } from "./project-directory-browser.js";
+import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import {
@@ -301,6 +303,7 @@ import {
   type SkillRecoveryRecord as NativeSkillRecoveryRecord,
   type SkillSessionDetails as NativeSkillSessionDetails
 } from "./skill-manager.js";
+import type { SkillLearningManager, SkillLearningRun as NativeSkillLearningRun } from "./skill-learning-manager.js";
 import {
   SkillMarketError,
   type PreparedSkillMarketInstallation,
@@ -476,6 +479,7 @@ interface ConnectServiceDependencies {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
+  readonly skillLearning?: SkillLearningManager;
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
@@ -1073,6 +1077,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.skills === undefined ? {} : { skills: application.skills }),
+    ...(application.skillLearning === undefined ? {} : { skillLearning: application.skillLearning }),
     ...(application.skillMarket === undefined ? {} : { skillMarket: application.skillMarket }),
     ...(application.skillMarketSync === undefined ? {} : { skillMarketSync: application.skillMarketSync }),
     ...(application.skillPublication === undefined ? {} : { skillPublication: application.skillPublication }),
@@ -2062,6 +2067,13 @@ export function createConnectServices(application: OrchestratorApplication): Con
     getTarget: (request, context) => {
       authenticate(context);
       return { target: toProtoTarget(dependencies.store.getTarget(request.targetId)) };
+    },
+    listProjectDirectories: async (request, context) => {
+      const connection = authenticate(context);
+      const listing = await listProjectDirectories(request.path, context.signal);
+      context.signal.throwIfAborted();
+      dependencies.connections.fence(connection);
+      return { ...listing, directories: listing.directories.map((entry) => ({ name: entry.name, path: entry.path })) };
     },
     prepareTargetWorkspace: async (request, context) => {
       const connection = authenticate(context);
@@ -4169,6 +4181,75 @@ export function createConnectServices(application: OrchestratorApplication): Con
   } satisfies ServiceImpl<typeof contract.ExtensionService>;
 
   const skill = {
+    startSkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillLearningManager(dependencies);
+      const run = await skillEffect(() => manager.start({
+        requestId: nonBlankRequest(request.requestId, "request_id"),
+        connection: stableConnection(connection),
+        targetId: nonBlankRequest(request.targetId, "target_id"),
+        instruction: request.instruction,
+        ...(request.sourceSessionId === undefined ? {} : { sourceSessionId: nonBlankRequest(request.sourceSessionId, "source_session_id") }),
+        ...(request.marketIdentity === undefined ? {} : { marketIdentity: nativeSkillMarketIdentity(request.marketIdentity) })
+      }));
+      return { run: mapSkillLearningRun(run) };
+    },
+    listSkillLearningRuns: async (request, context) => {
+      authenticate(context);
+      if (dependencies.skillLearning === undefined) return { runs: [], page: emptyPage(request.page) };
+      const runs = await skillEffect(() => dependencies.skillLearning!.list());
+      const result = paginate(runs.map((run) => mapSkillLearningRun(run, false)), request.page);
+      return { runs: result.values, page: result.page };
+    },
+    getSkillLearningRun: async (request, context) => {
+      authenticate(context);
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).get(nonBlankRequest(request.runId, "run_id")));
+      return { run: mapSkillLearningRun(run) };
+    },
+    applySkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.expectedRunRevision === undefined) throw invalidArgument("expected_run_revision is required");
+      if (request.expectedCurrentResourceId !== undefined && request.expectedCurrentResourceRevision === undefined) {
+        throw invalidArgument("expected_current_resource_revision is required with expected_current_resource_id");
+      }
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).apply({
+        operationId: nonBlankRequest(request.operationId, "operation_id"),
+        connection: stableConnection(connection),
+        runId: nonBlankRequest(request.runId, "run_id"),
+        expectedRunRevision: fromProtoRevision(request.expectedRunRevision, "expected_run_revision"),
+        expectedProposalRevision: nonBlankRequest(request.expectedProposalRevision, "expected_proposal_revision"),
+        expectedResourceId: nonBlankRequest(request.expectedResourceId, "expected_resource_id"),
+        ...(request.expectedCurrentResourceId === undefined ? {} : { expectedCurrentResourceId: request.expectedCurrentResourceId }),
+        ...(request.expectedCurrentResourceRevision === undefined ? {} : {
+          expectedCurrentResourceVersion: fromProtoRevision(request.expectedCurrentResourceRevision, "expected_current_resource_revision")
+        }),
+        ...(request.expectedCurrentObservedRevision === undefined ? {} : { expectedCurrentObservedRevision: request.expectedCurrentObservedRevision }),
+        confirmReplace: request.confirmReplace
+      }));
+      return { run: mapSkillLearningRun(run) };
+    },
+    discardSkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.expectedRunRevision === undefined) throw invalidArgument("expected_run_revision is required");
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).discard(
+        stableConnection(connection),
+        nonBlankRequest(request.operationId, "operation_id"),
+        nonBlankRequest(request.runId, "run_id"),
+        fromProtoRevision(request.expectedRunRevision, "expected_run_revision")
+      ));
+      return { run: mapSkillLearningRun(run) };
+    },
+    cancelSkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.expectedRunRevision === undefined) throw invalidArgument("expected_run_revision is required");
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).cancel(
+        stableConnection(connection),
+        nonBlankRequest(request.operationId, "operation_id"),
+        nonBlankRequest(request.runId, "run_id"),
+        fromProtoRevision(request.expectedRunRevision, "expected_run_revision")
+      ));
+      return { run: mapSkillLearningRun(run) };
+    },
     listSkills: async (request, context) => {
       authenticate(context);
       if (dependencies.skills === undefined) {
@@ -7998,6 +8079,7 @@ function targetWorkspaceRegistration(target: StoredTarget): WorkspaceRegistratio
     ...(binding === undefined ? {} : {
       remote: {
         targetId: target.descriptor.id,
+        hostTargetId: binding.hostTargetId,
         hostId: binding.hostId,
         workspaceRoot: binding.workspaceRoot
       }
@@ -10234,6 +10316,11 @@ function requireSkillManager(dependencies: ConnectServiceDependencies): SkillMan
   return dependencies.skills;
 }
 
+function requireSkillLearningManager(dependencies: ConnectServiceDependencies): SkillLearningManager {
+  if (dependencies.skillLearning === undefined) throw new ConnectError("Skill learning is unavailable.", Code.Unimplemented);
+  return dependencies.skillLearning;
+}
+
 function requireSkillMarketManager(dependencies: ConnectServiceDependencies): SkillMarketManager {
   if (dependencies.skillMarket === undefined) throw new ConnectError("Skill market management is unavailable.", Code.Unimplemented);
   return dependencies.skillMarket;
@@ -10984,6 +11071,58 @@ function mapSkillDescriptor(item: NativeSkillCatalogEntry): contract.SkillDescri
     entityVersion: toProtoEntityVersion(item.resourceVersion, 0, item.updatedAt),
     approvedRevision: item.approvedRevision,
     updatedAt: toProtoTimestamp(item.updatedAt)
+  });
+}
+
+function mapSkillLearningRun(run: NativeSkillLearningRun, includeProposal = true): contract.SkillLearningRun {
+  const states: Record<NativeSkillLearningRun["state"], contract.SkillLearningState> = {
+    collecting: contract.SkillLearningState.COLLECTING,
+    distilling: contract.SkillLearningState.DISTILLING,
+    awaiting_review: contract.SkillLearningState.AWAITING_REVIEW,
+    applied: contract.SkillLearningState.APPLIED,
+    discarded: contract.SkillLearningState.DISCARDED,
+    failed: contract.SkillLearningState.FAILED,
+    cancelled: contract.SkillLearningState.CANCELLED,
+    expired: contract.SkillLearningState.EXPIRED
+  };
+  const sourceKinds: Record<NativeSkillLearningRun["sourceKind"], contract.SkillLearningSourceKind> = {
+    text: contract.SkillLearningSourceKind.TEXT,
+    session: contract.SkillLearningSourceKind.SESSION,
+    market: contract.SkillLearningSourceKind.MARKET
+  };
+  const proposal = includeProposal ? run.proposal : undefined;
+  return create(contract.SkillLearningRunSchema, {
+    runId: run.id,
+    revision: toProtoRevision(run.revision),
+    state: states[run.state],
+    sourceKind: sourceKinds[run.sourceKind],
+    backendId: run.backendId,
+    targetId: run.targetId,
+    ...(run.sourceSessionId === undefined ? {} : { sourceSessionId: run.sourceSessionId }),
+    ...(run.distillationSessionId === undefined ? {} : { distillationSessionId: run.distillationSessionId }),
+    summary: run.summary,
+    ...(run.error === undefined ? {} : { error: run.error }),
+    ...(proposal === undefined ? {} : {
+      proposal: create(contract.SkillLearningProposalSchema, {
+        name: proposal.name,
+        description: proposal.description,
+        explanation: proposal.explanation,
+        revision: proposal.revision,
+        files: proposal.files.map((file) => create(contract.SkillLearningFileSchema, file)),
+        resourceId: proposal.resourceId,
+        ...(proposal.currentResourceId === undefined ? {} : { currentResourceId: proposal.currentResourceId }),
+        ...(proposal.currentResourceVersion === undefined ? {} : { currentResourceRevision: toProtoRevision(proposal.currentResourceVersion) }),
+        ...(proposal.currentObservedRevision === undefined ? {} : { currentObservedRevision: proposal.currentObservedRevision }),
+        diffAvailable: proposal.diffAvailable,
+        ...(proposal.diffReason === undefined ? {} : { diffReason: proposal.diffReason }),
+        changes: proposal.changes.map(mapSkillDiffChange),
+        diffTruncated: proposal.diffTruncated
+      })
+    }),
+    ...(run.appliedResourceId === undefined ? {} : { appliedResourceId: run.appliedResourceId }),
+    createdAt: toProtoTimestamp(run.createdAt),
+    updatedAt: toProtoTimestamp(run.updatedAt),
+    expiresAt: toProtoTimestamp(run.expiresAt)
   });
 }
 
@@ -14627,6 +14766,7 @@ function protoResourceAcquisitionKind(value: NativePiResourceDescriptor["sourceK
     case "git": return contract.ResourceAcquisitionKind.GIT;
     case "extension_source": return contract.ResourceAcquisitionKind.EXTENSION_SOURCE;
     case "skill_market": return contract.ResourceAcquisitionKind.SKILL_MARKET;
+    case "learned": return contract.ResourceAcquisitionKind.LEARNED;
     default: return contract.ResourceAcquisitionKind.UNSPECIFIED;
   }
 }
@@ -15053,6 +15193,98 @@ async function dispatchMutation(
       });
       return presented(execution);
     }
+    case "createRemoteTarget": {
+      const remoteHosts = dependencies.remoteHosts;
+      if (remoteHosts === undefined || dependencies.managedWorkspaceRoot === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case,
+          "Remote project creation is unavailable on this service node.");
+      }
+      const input = payload.value;
+      const sourceTargetId = input.hostTargetId;
+      const hostId = input.hostId;
+      const expectedHostRevision = fromProtoRevision(input.expectedHostRevision, "expected_host_revision");
+      requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, sourceTargetId, "create_remote_target");
+      if (sourceTargetId.trim() === "" || hostId.trim() === "" || input.backendId.trim() === ""
+        || input.displayName.trim() === "" || input.displayName.length > 120) {
+        throw invalidArgument("A Backend, project name and exact SSH Host are required.");
+      }
+      if (input.workspacePath === "") throw invalidArgument("A remote project directory is required.");
+      validateRemoteHostDirectoryPath(input.workspacePath);
+      const id = stableId("target", operationId);
+      const workspaceId = stableId("workspace", operationId);
+      const fallbackRoot = resolve(dependencies.managedWorkspaceRoot, id);
+      let descriptor: import("@joko/core").TargetDescriptor | undefined;
+      let workspaceRegistered = false;
+      let fallbackCreated = false;
+      const assertSourceCurrent = (store: OperationalStore): void => {
+        const host = remoteHosts.get(sourceTargetId, hostId);
+        if (host.revision !== expectedHostRevision) {
+          throw new ConnectError("The selected SSH Host changed. Reload it and retry.", Code.Aborted);
+        }
+        if (host.status.state !== "ready" || host.trust === undefined) {
+          throw new ConnectError("The selected SSH Host is not ready and trusted.", Code.FailedPrecondition);
+        }
+        store.getBackend(input.backendId);
+      };
+      let execution: OperationExecution<OperationOutcome>;
+      try {
+        execution = await host.mutate({
+          operationId, connection, kind: payload.case, body: mutation,
+          precondition: assertSourceCurrent,
+          effect: async () => {
+            const authority = await remoteHosts.captureTransportAuthority(sourceTargetId, hostId);
+            if (authority.hostRevision !== expectedHostRevision || authority.lease.files === undefined) {
+              throw new ConnectError("The selected SSH Host file transport changed.", Code.Aborted);
+            }
+            const signal = new AbortController().signal;
+            const inspection = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, authority.assertCurrent);
+            let canonical = inspection.path;
+            if (!inspection.exists) {
+              if (!input.createIfMissing) throw new ConnectError("The SSH project directory does not exist.", Code.NotFound);
+              await authority.lease.files.mkdir(input.workspacePath, { recursive: true, mode: 0o700, signal });
+              authority.assertCurrent();
+              const created = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, authority.assertCurrent);
+              if (!created.exists) throw new ConnectError("The SSH project directory could not be verified after creation.", Code.FailedPrecondition);
+              canonical = created.path;
+            }
+            authority.assertCurrent();
+            const fallbackExisted = await pathExists(fallbackRoot);
+            await mkdir(fallbackRoot, { recursive: true, mode: 0o700 });
+            fallbackCreated = !fallbackExisted;
+            const localRoot = await requireExistingDirectory(fallbackRoot, "remote project fallback");
+            if (localRoot !== fallbackRoot) throw new ConnectError("The service-owned project directory changed.", Code.FailedPrecondition);
+            descriptor = {
+              id, backendId: input.backendId, displayName: input.displayName.trim(),
+              workspaceRoot: localRoot, managed: false, trusted: false,
+              remoteWorkspace: { hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
+            };
+            await host.validateTarget(descriptor);
+            authority.assertCurrent();
+            await dependencies.workspaceService.register({
+              id: workspaceId, root: canonical, displayName: descriptor.displayName, trusted: false,
+              remote: { targetId: id, hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
+            });
+            workspaceRegistered = true;
+            authority.assertCurrent();
+          },
+          commit: (store) => {
+            if (descriptor === undefined) throw new Error("Remote project preparation completed without a Target.");
+            store.upsertTarget(descriptor, { workspaceId });
+            return { accepted: true, resultCase: "target", entityId: id } satisfies OperationOutcome;
+          }
+        });
+      } catch (error) {
+        if (workspaceRegistered) dependencies.workspaceService.unregister(workspaceId);
+        if (fallbackCreated) {
+          await moveManagedWorkspaceToTrash({
+            managedRoot: resolve(dependencies.managedWorkspaceRoot), workspaceRoot: fallbackRoot,
+            targetId: id, operationId
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
+      return presented(execution);
+    }
     case "updateTarget": {
       return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
         requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, payload.value.targetId, "update_target");
@@ -15066,7 +15298,7 @@ async function dispatchMutation(
               throw new ConnectError("Remote workspace binding is unavailable.", Code.Unimplemented);
             }
             const remoteWorkspace = fromProtoRemoteWorkspace(payload.value.workspaceLocationUpdate.value);
-            const remoteHost = dependencies.remoteHosts.get(existing.descriptor.id, remoteWorkspace.hostId);
+            const remoteHost = dependencies.remoteHosts.get(remoteWorkspace.hostTargetId, remoteWorkspace.hostId);
             if (remoteHost.status.state !== "ready" || remoteHost.trust === undefined) {
               throw new ConnectError(
                 "Test and trust the Remote Host before binding this target.",

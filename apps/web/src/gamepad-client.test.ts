@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { GamepadClient, createGamepadDomInput, GAMEPAD_SCROLL_EVENT, GAMEPAD_VOICE_EVENT } from "./gamepad-client.js";
+import { GamepadClient, createGamepadDomInput, GAMEPAD_SCROLL_EVENT, GAMEPAD_SKILL_EVENT, GAMEPAD_VOICE_EVENT } from "./gamepad-client.js";
 import { createDefaultGamepadPreferences, saveGamepadPreferences, type GamepadInputEffect } from "./gamepad-input.js";
 
 let pads: Gamepad[];
@@ -75,6 +75,23 @@ describe("gamepad UI target ownership", () => {
     root.innerHTML = `<main class="session-pane"><div data-timeline-session-id="${id}"></div><div data-gamepad-voice><button>Input</button><div data-composer-editor="true" tabindex="0"></div></div></main>`;
     document.body.append(root); return root;
   }
+  it("routes a skill press only to the focused composer outside modal input", () => {
+    const first = task("one"); const second = task("two");
+    first.querySelector("[data-gamepad-voice]")?.setAttribute("data-gamepad-skill", "true");
+    second.querySelector("[data-gamepad-voice]")?.setAttribute("data-gamepad-skill", "true");
+    const firstSkill = vi.fn(); const secondSkill = vi.fn();
+    first.querySelector("[data-gamepad-skill]")!.addEventListener(GAMEPAD_SKILL_EVENT, firstSkill);
+    second.querySelector("[data-gamepad-skill]")!.addEventListener(GAMEPAD_SKILL_EVENT, secondSkill);
+    const input = createGamepadDomInput(document, vi.fn());
+    const effect = { kind: "skill" as const, binding: { kind: "skill" as const, serverId: "server-one", resourceId: "resource-skill", name: "Review" } };
+    first.querySelector("button")!.focus();
+    input(effect); expect(firstSkill).toHaveBeenCalledOnce(); expect(secondSkill).not.toHaveBeenCalled();
+    document.body.classList.add("modal-open");
+    input(effect); expect(firstSkill).toHaveBeenCalledOnce();
+    document.body.classList.remove("modal-open");
+    second.querySelector("button")!.focus();
+    input(effect); expect(secondSkill).toHaveBeenCalledOnce();
+  });
   it("holds continuous scrolling on its original task and never transfers held input to another split", () => {
     const first = task("one"); const second = task("two");
     first.querySelector("button")!.focus();
@@ -105,6 +122,95 @@ describe("gamepad UI target ownership", () => {
     input({ kind: "action", action: "activate", phase: "press" }); expect(clicked).toHaveBeenCalledOnce();
     input({ kind: "action", action: "back", phase: "press" }); expect(back.mock.calls[0]?.[0].key).toBe("Escape");
     root.setAttribute("inert", ""); input({ kind: "action", action: "activate", phase: "press" }); expect(clicked).toHaveBeenCalledOnce();
+  });
+  it("admits skill-library navigation only from the active host surface", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const pressSkills = (): void => input({ kind: "action", action: "open-skills", phase: "press" });
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    document.body.classList.add("modal-open"); pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    document.body.classList.remove("modal-open");
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus();
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    const preview = document.body.appendChild(document.createElement("button")); preview.dataset.messageRewindPreview = "true"; preview.focus();
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    preview.removeAttribute("data-message-rewind-preview");
+    document.body.dataset.appShortcutRecording = "1"; pressSkills(); expect(navigate).toHaveBeenCalledTimes(1);
+    delete document.body.dataset.appShortcutRecording;
+    pressSkills(); expect(navigate).toHaveBeenCalledTimes(2);
+  });
+  it("keeps schedule navigation in the same host boundary", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (): void => input({ kind: "action", action: "open-schedules", phase: "press" });
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus();
+    press(); expect(navigate).not.toHaveBeenCalled();
+    frame.remove(); document.body.focus();
+    document.body.dataset.appShortcutRecording = "1"; press(); expect(navigate).not.toHaveBeenCalled();
+    delete document.body.dataset.appShortcutRecording;
+    press(); expect(navigate).toHaveBeenCalledWith("open-schedules");
+  });
+  it("admits project picking only from the visible focused host outside an open selection popup", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (): void => input({ kind: "action", action: "open-folder", phase: "press" });
+    press(); expect(navigate).toHaveBeenCalledExactlyOnceWith("open-folder");
+    document.body.classList.add("modal-open"); press(); document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    press(); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; press(); delete document.body.dataset.appShortcutRecording;
+    const picker = document.body.appendChild(document.createElement("div")); picker.setAttribute("role", "listbox");
+    press(); picker.remove();
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press(); frame.remove();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); press();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+  it("admits page history only from the visible focused host outside modal, preview and shortcut recording", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (action: "navigate-back" | "navigate-forward"): void => input({ kind: "action", action, phase: "press" });
+    press("navigate-back"); press("navigate-forward");
+    expect(navigate.mock.calls.map(([action]) => action)).toEqual(["navigate-back", "navigate-forward"]);
+    document.body.classList.add("modal-open"); press("navigate-back");
+    document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    press("navigate-forward"); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; press("navigate-back");
+    delete document.body.dataset.appShortcutRecording;
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press("navigate-forward"); frame.remove();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); press("navigate-back");
+    expect(navigate).toHaveBeenCalledTimes(2);
+  });
+  it("routes fullscreen only from the active host input boundary", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (): void => input({ kind: "action", action: "toggle-fullscreen", phase: "press" });
+    press(); expect(navigate).toHaveBeenCalledExactlyOnceWith("toggle-fullscreen");
+    document.body.classList.add("modal-open"); press(); document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    press(); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; press(); delete document.body.dataset.appShortcutRecording;
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press(); frame.remove();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); press();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
+  it("routes inspector commands only while the focused task surface can act", () => {
+    const root = task("one"); root.querySelector("button")!.focus();
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    for (const action of ["open-terminal", "open-browser-tab", "toggle-review-tab"] as const) {
+      input({ kind: "action", action, phase: "press" });
+    }
+    expect(navigate.mock.calls.map(([action]) => action)).toEqual(["open-terminal", "open-browser-tab", "toggle-review-tab"]);
+    document.body.dataset.appShortcutRecording = "1";
+    input({ kind: "action", action: "open-terminal", phase: "press" });
+    delete document.body.dataset.appShortcutRecording;
+    document.body.classList.add("modal-open");
+    input({ kind: "action", action: "open-browser-tab", phase: "press" });
+    document.body.classList.remove("modal-open");
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus();
+    input({ kind: "action", action: "toggle-review-tab", phase: "press" });
+    expect(navigate).toHaveBeenCalledTimes(3);
   });
   it("focuses the real new-task composer without selecting another task", () => {
     document.body.innerHTML = '<main class="new-task-page"><div data-composer-editor="true" tabindex="0"></div></main>';

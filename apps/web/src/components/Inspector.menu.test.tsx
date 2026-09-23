@@ -23,6 +23,7 @@ const sortableMock = vi.hoisted(() => {
 vi.mock("sortablejs", () => ({ default: sortableMock.MockSortable }));
 
 import type { AppController } from "../controller.js";
+import type { GamepadInspectorRequest } from "../gamepad-actions.js";
 import { translate } from "../i18n.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { readTerminalShellPreference, writeTerminalShellPreference } from "../terminal-preferences.js";
@@ -45,6 +46,7 @@ afterEach(async () => {
   document.documentElement.style.removeProperty("--inspector-width");
   sortableMock.MockSortable.instances.length = 0;
   sortableMock.MockSortable.active = null;
+  vi.restoreAllMocks();
 });
 
 describe("Inspector menus", () => {
@@ -271,6 +273,67 @@ describe("Inspector menus", () => {
     await act(async () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("inspector.addTab")}"]`)?.click());
     expect([...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
       .some((candidate) => candidate.textContent?.includes(t("composer.shell")))).toBe(false);
+  });
+
+  it("binds gamepad terminal, browser and changes commands to the exact current task", async () => {
+    const colors = vi.spyOn(window, "getComputedStyle").mockReturnValue({ getPropertyValue: () => "#123456" } as unknown as CSSStyleDeclaration);
+    const focused = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const pane = document.body.appendChild(document.createElement("main"));
+    pane.className = "session-pane";
+    pane.dataset.gamepadSessionId = "session-one";
+    const taskButton = pane.appendChild(document.createElement("button"));
+    taskButton.focus();
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host); roots.push(root);
+    const base = emptySnapshot();
+    const snapshot = { ...base, sessions: [session()], browsers: [browser()], backends: [{ ...backend(false), capabilities: new Map([
+      ["workspace.diff.sources", { name: "workspace.diff.sources", supported: true, options: [] }]
+    ]) }] };
+    const record = { id: "terminal-one", sessionId: "session-one", targetId: "target-one", generation: 1n, status: "running" as const,
+      exitConfirmed: false, shellId: "auto", shellLabel: "Shell", cwd: "/workspace", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 };
+    const createTerminal = vi.fn(async () => record);
+    const openBrowserPage = vi.fn(async () => "page-one");
+    const setInspectorOpen = vi.fn(async () => undefined);
+    const consumed = vi.fn();
+    const errors: unknown[] = [];
+    const state = { connectionState: "connected", activeProfile: { id: "profile", serverId: "server" }, snapshot, preferences: DEFAULT_UI_PREFERENCES, navigationRevision: 0 };
+    const controller = { state,
+      getTerminalCapabilities: vi.fn(async () => ({ support: "supported", shells: [{ id: "auto", label: "Shell" }], defaultShellId: "auto", maximumTerminals: 16,
+        maximumInputBytes: 65536, maximumColumns: 500, maximumRows: 200 })),
+      listTerminals: vi.fn(async () => []), createTerminal, openBrowserPage, setInspectorOpen, releaseArtifactUrl: vi.fn()
+    } as unknown as AppController;
+    const request = (requestId: number, action: GamepadInspectorRequest["action"], sessionGeneration = 1n): GamepadInspectorRequest => ({
+      requestId, action, sessionId: "session-one", sessionGeneration, connectionGeneration: snapshot.generation, profileId: "profile", navigationRevision: 0
+    });
+    const render = async (gamepadRequest?: GamepadInspectorRequest): Promise<void> => act(async () => root.render(<Inspector
+      controller={controller} snapshot={snapshot} session={session()} timeline={[]} open t={t} gamepadRequest={gamepadRequest}
+      onGamepadRequestConsumed={consumed} runAction={(_key, action) => { void action().catch((error) => errors.push(error)); }}
+      onClose={vi.fn()} onSelectionQuote={vi.fn()} />));
+    await render(); await settle();
+    await render(request(1, "open-terminal", 2n));
+    expect(createTerminal).not.toHaveBeenCalled();
+    taskButton.focus();
+    await render(request(2, "open-terminal")); await settle();
+    expect(createTerminal).toHaveBeenCalledExactlyOnceWith("session-one", expect.any(String), "auto", 80, 24, expect.anything());
+    taskButton.focus();
+    await render(request(3, "open-browser-tab")); await settle();
+    expect(openBrowserPage).toHaveBeenCalledExactlyOnceWith("browser-one", "session-one", "about:blank");
+    expect(host.querySelector('[data-tab-kind="browser"]:not([hidden])')).not.toBeNull();
+    taskButton.focus();
+    await render(request(4, "toggle-review-tab")); await settle();
+    expect(host.querySelector('[data-tab-kind="changes"]:not([hidden])')).not.toBeNull();
+    taskButton.focus();
+    await render(request(5, "toggle-review-tab")); await settle();
+    expect(host.querySelector('[data-tab-kind="changes"]')).toBeNull();
+    focused.mockReturnValue(false);
+    await render(request(6, "open-browser-tab")); await settle();
+    focused.mockReturnValue(true);
+    state.navigationRevision = 1;
+    await render(request(7, "open-browser-tab")); await settle();
+    expect(openBrowserPage).toHaveBeenCalledTimes(1);
+    expect(consumed.mock.calls.map(([id]) => id)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(errors).toEqual([]);
+    colors.mockRestore();
   });
 });
 

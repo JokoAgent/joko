@@ -4,6 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { translate } from "../i18n.js";
+import type { AppController } from "../controller.js";
+import type { SkillDescriptorView } from "../model.js";
 import {
   createDefaultGamepadPreferences, GAMEPAD_PREFERENCES_KEY, readGamepadPreferences,
   type GamepadPreferences
@@ -28,11 +30,19 @@ afterEach(async () => {
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
 
-async function renderSettings(): Promise<HTMLElement> {
+const listedSkill: SkillDescriptorView = {
+  id: "resource-skill", backendId: "backend", scope: "global", name: "Review",
+  sourceLabel: "Local", state: "loaded", enabled: true, canToggle: true,
+  contentAvailable: true, canEdit: true, canDelete: true, revision: 1n,
+  approvedRevision: "1", updatedAt: 1
+};
+async function renderSettings(input: { readonly serverId?: string; readonly connected?: boolean; readonly listSkills?: AppController["listSkills"] } = {}): Promise<HTMLElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container); roots.push(root);
-  await act(async () => root.render(<GamepadSettings t={(key, values) => translate("en", key, values)} />));
+  await act(async () => root.render(<GamepadSettings t={(key, values) => translate("en", key, values)}
+    serverId={input.serverId} connected={input.connected ?? false}
+    listSkills={input.listSkills ?? (async () => ({ revision: 1n, skills: [] }))} />));
   return container;
 }
 function required<T>(value: T | null | undefined): T {
@@ -52,6 +62,19 @@ async function key(target: HTMLElement, value: string): Promise<void> {
 function store(value: unknown): void { window.localStorage.setItem(GAMEPAD_PREFERENCES_KEY, JSON.stringify(value)); }
 
 describe("gamepad settings", () => {
+  it("persists an enabled skill identity only after a successful save", async () => {
+    const listSkills = vi.fn(async () => ({ revision: 1n, skills: [listedSkill] }));
+    const container = await renderSettings({ serverId: "server-one", connected: true, listSkills });
+    await vi.waitFor(() => expect(listSkills).toHaveBeenCalledOnce());
+    const binding = control(container, "Action for South face button");
+    binding.focus();
+    await key(binding, "ArrowDown"); await key(binding, "End"); await key(binding, "Enter");
+    expect(readGamepadPreferences().preferences.buttons[0]).toEqual({
+      kind: "skill", serverId: "server-one", resourceId: "resource-skill", name: "Review"
+    });
+    expect(binding.textContent).toContain("Review");
+    expect(container.textContent).toContain("Gamepad settings saved.");
+  });
   it("starts off and adopts enabled input only after its device setting has been saved", async () => {
     const container = await renderSettings();
     const enabled = control(container, "Enable gamepad input");
@@ -71,6 +94,52 @@ describe("gamepad settings", () => {
     expect(readGamepadPreferences().preferences.enabled).toBe(true);
     expect(enabled.getAttribute("aria-checked")).toBe("true");
     expect(container.textContent).toContain("Gamepad settings saved.");
+  });
+  it("offers the skill library as a persistent standard gamepad action", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const option = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Open skills");
+    expect(option).toBeDefined();
+    await act(async () => option?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-skills");
+  });
+  it("offers the schedule manager as a persistent standard gamepad action", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const option = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Open schedules");
+    expect(option).toBeDefined();
+    await act(async () => option?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-schedules");
+  });
+  it("offers project folder registration as a persistent standard gamepad action", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const option = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Open folder");
+    expect(option).toBeDefined();
+    await act(async () => option?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-folder");
+  });
+
+  it("offers photos and files as independent persistent actions", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const options = [...document.querySelectorAll<HTMLElement>("[role='option']")];
+    const photos = options.find((candidate) => candidate.textContent === "Add photos");
+    const files = options.find((candidate) => candidate.textContent === "Add files");
+    expect(photos).toBeDefined();
+    expect(files).toBeDefined();
+    await act(async () => photos?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("add-photos");
+
+    await act(async () => binding.click());
+    const currentFiles = [...document.querySelectorAll<HTMLElement>("[role='option']")]
+      .find((candidate) => candidate.textContent === "Add files");
+    await act(async () => currentFiles?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("add-files");
   });
 
   it("retains the committed binding and keyboard focus on save failure, then allows a successful retry", async () => {
