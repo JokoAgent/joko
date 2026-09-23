@@ -1,4 +1,4 @@
-import { createPptxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, type DocsThemeName } from "@joko/tool-document";
+import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, type DocsThemeName } from "@joko/tool-document";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
@@ -73,6 +73,41 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
     additionalProperties: false
   },
   requiresPermission: true
+}, {
+  serverId: DOCUMENT_TOOL_PROVIDER_ID,
+  name: "make_xlsx",
+  runtimeName: "make_xlsx",
+  description: "Create an editable Excel workbook from one or more sheets in this task's working directory. Cells may contain text, numbers, booleans, blanks, or formulas with required cached results. Headers are styled, frozen and filterable; columns have readable widths and number formats. Existing files require overwrite: true.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      sheets: {
+        type: "array", minItems: 1, maxItems: MAX_XLSX_SHEETS,
+        items: { type: "object", properties: {
+          name: { type: "string", minLength: 1, maxLength: 31 },
+          header: { type: "array", maxItems: MAX_XLSX_COLUMNS, items: { type: "string", maxLength: MAX_XLSX_CELL_TEXT_CHARS } },
+          rows: { type: "array", maxItems: MAX_XLSX_ROWS_PER_SHEET, items: {
+            type: "array", maxItems: MAX_XLSX_COLUMNS,
+            items: { oneOf: [
+              { type: "string", maxLength: MAX_XLSX_CELL_TEXT_CHARS },
+              { type: "number" }, { type: "boolean" }, { type: "null" },
+              { type: "object", properties: {
+                formula: { type: "string", minLength: 1, maxLength: MAX_XLSX_FORMULA_CHARS },
+                result: { oneOf: [{ type: "string", maxLength: MAX_XLSX_CELL_TEXT_CHARS }, { type: "number" }, { type: "boolean" }] }
+              }, required: ["formula", "result"], additionalProperties: false }
+            ] }
+          } }
+        }, required: ["name", "rows"], additionalProperties: false }
+      },
+      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Workspace-relative or in-workspace absolute .xlsx output path." },
+      theme: { type: "string", enum: [...DOCS_THEME_NAMES], default: "light" },
+      zebra: { type: "boolean", default: true },
+      overwrite: { type: "boolean", default: false }
+    },
+    required: ["sheets", "outPath"],
+    additionalProperties: false
+  },
+  requiresPermission: true
 }]);
 
 export interface DocumentToolPublisher {
@@ -114,9 +149,10 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   async callTool(name: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      if (name !== "make_docx" && name !== "make_pptx") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
+      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
       const root = this.#requireRoot(context);
       if (name === "make_pptx") return await this.#makePptx(args, root, signal, context);
+      if (name === "make_xlsx") return await this.#makeXlsx(args, root, signal, context);
       onlyKeys(args, ["markdown", "outPath", "title", "subtitle", "cover", "theme", "overwrite"]);
       const markdown = boundedString(args["markdown"], 4 * 1024 * 1024, false, "markdown");
       const outPath = boundedString(args["outPath"], 4_096, false, "outPath");
@@ -150,7 +186,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       }, false);
     } catch (error) {
       if (signal?.aborted) throw error;
-      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof DocumentToolError) {
+      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof DocumentToolError) {
         return response({ errorCode: error.code, message: error.message }, true);
       }
       return response({ errorCode: "DOCUMENT_FAILED", message: "Document creation failed." }, true);
@@ -182,6 +218,27 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       path: output.path, relativePath: output.relativePath, bytes: output.bytes,
       format: "pptx", slides: result.slides, layouts: result.layouts,
       theme: result.theme, footer: result.footer
+    }, false);
+  }
+
+  async #makeXlsx(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
+    onlyKeys(args, ["sheets", "outPath", "theme", "zebra", "overwrite"]);
+    const outPath = boundedString(args["outPath"], 4_096, false, "outPath");
+    if (!outPath.toLowerCase().endsWith(".xlsx")) throw new DocumentToolError("INVALID_EXTENSION", "Output filename must end in .xlsx.");
+    const overwrite = optionalBoolean(args["overwrite"], "overwrite") ?? false;
+    const result = await createXlsxBuffer({
+      sheets: args["sheets"],
+      ...(args["theme"] === undefined ? {} : { theme: args["theme"] }),
+      ...(args["zebra"] === undefined ? {} : { zebra: args["zebra"] })
+    }, signal);
+    signal?.throwIfAborted();
+    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    const output = await this.#publish({ root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) });
+    signal?.throwIfAborted();
+    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    return response({
+      path: output.path, relativePath: output.relativePath, bytes: output.bytes,
+      format: "xlsx", sheets: result.sheets, theme: result.theme, zebra: result.zebra
     }, false);
   }
 

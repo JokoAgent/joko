@@ -24,7 +24,7 @@ it("binds editable document creation to the current trusted local task and stric
     }
   });
   const context = { sessionId: "session", targetId: "target", generation: 3 };
-  expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true]]);
+  expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true], ["make_xlsx", true]]);
   expect(provider.includeForTarget("target")).toBe(true);
   const result = await provider.callTool("make_docx", {
     markdown: "# Heading\n\n| A | B |\n|---|---|\n| 1 | 2 |",
@@ -43,6 +43,12 @@ it("binds editable document creation to the current trusted local task and stric
   expect(Buffer.from(published[1]!.bytes).subarray(0, 2).toString("ascii")).toBe("PK");
   expect((await provider.callTool("make_pptx", { slides: [{ title: "Invalid", extra: true }], outPath: "bad.pptx" }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await provider.callTool("make_xlsx", { sheets: [{ name: "Report", header: ["Count"], rows: [[42]] }], outPath: "documents/report.xlsx", theme: "navy" }, undefined, context))
+    .toMatchObject({ isError: false, structuredContent: { format: "xlsx", sheets: [{ name: "Report", rows: 1 }], theme: "navy" } });
+  expect(published[2]).toMatchObject({ root: "D:\\task", outPath: "documents/report.xlsx", overwrite: false });
+  expect(Buffer.from(published[2]!.bytes).subarray(0, 2).toString("ascii")).toBe("PK");
+  expect((await provider.callTool("make_xlsx", { sheets: [{ name: "Invalid", rows: [[{ formula: "SUM(A1:A2)" }]] }], outPath: "bad.xlsx" }, undefined, context)).structuredContent)
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect((await provider.callTool("make_docx", { markdown: "Hi", outPath: "report.docx", typo: true }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect((await provider.callTool("make_docx", { markdown: "Hi", outPath: "report.pdf" }, undefined, context)).structuredContent)
@@ -60,5 +66,5 @@ it("binds editable document creation to the current trusted local task and stric
   expect(provider.includeForTarget("target")).toBe(false);
   expect((await provider.callTool("make_docx", { markdown: "Hi", outPath: "report.docx" }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "STALE_SCOPE" });
-  expect(published).toHaveLength(2);
+  expect(published).toHaveLength(3);
 });
