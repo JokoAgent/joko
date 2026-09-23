@@ -4908,6 +4908,43 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-hub__tabs > button { min-height: 30px; border: 0; border-radius: 7px; padding: 5px 12px; background: transparent; color: var(--text-soft); font: inherit; font-size: var(--text-10); font-weight: 650; }
 .skill-hub__tabs > button:hover, .skill-hub__tabs > button:focus-visible { outline: 0; background: var(--surface-hover); color: var(--text); }
 .skill-hub__tabs > button.is-active { background: var(--surface-raised); color: var(--accent-strong); box-shadow: var(--shadow-sm); }
+.skill-learning { min-width: 0; display: grid; grid-template-columns: minmax(240px, 30%) minmax(0, 1fr); gap: 14px; align-items: start; }
+.skill-learning > section { min-width: 0; border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: var(--surface-raised); }
+.skill-learning__start { grid-column: 1; }
+.skill-learning__start h2, .skill-learning__history h3, .skill-learning__detail h3 { margin: 0; }
+.skill-learning__start p { color: var(--text-soft); }
+.skill-learning__start form { display: grid; gap: 12px; margin-top: 16px; }
+.skill-learning__start label { display: grid; gap: 5px; font-size: var(--text-10); font-weight: 650; }
+.skill-learning__start textarea { min-height: 108px; resize: vertical; border: 1px solid var(--line); border-radius: 9px; padding: 9px; background: var(--surface); color: var(--text); font: inherit; }
+.skill-learning__start textarea:focus-visible { outline: 2px solid var(--accent-edge); outline-offset: 2px; }
+.skill-learning__history { grid-column: 1; }
+.skill-learning__history > header, .skill-learning__detail > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.skill-learning__history > header .button { min-height: 36px; }
+.skill-learning__run-list { display: grid; gap: 4px; margin-top: 10px; max-height: 320px; overflow-y: auto; }
+.skill-learning__run-list > button { min-width: 0; min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid transparent; border-radius: 9px; padding: 8px; background: transparent; color: var(--text); text-align: left; }
+.skill-learning__run-list > button:hover, .skill-learning__run-list > button:focus-visible, .skill-learning__run-list > button.is-active { border-color: var(--accent-edge); background: var(--accent-soft); }
+.skill-learning__run-list > button > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-learning__detail { grid-column: 2; grid-row: 1 / span 2; }
+.skill-learning__detail > header > div { min-width: 0; display: flex; align-items: center; gap: 9px; }
+.skill-learning__detail > header h3 { min-width: 0; overflow-wrap: anywhere; }
+.skill-learning__progress { display: flex; align-items: center; gap: 8px; margin-top: 16px; color: var(--text-soft); }
+.skill-learning__explanation { margin-top: 18px; }
+.skill-learning__explanation h4, .skill-learning__diff h4 { margin: 0 0 7px; }
+.skill-learning__explanation p { margin: 4px 0; overflow-wrap: anywhere; }
+.skill-learning__review-grid { min-width: 0; display: grid; grid-template-columns: minmax(145px, 26%) minmax(0, 1fr); margin-top: 18px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.skill-learning__file-list { display: grid; align-content: start; gap: 2px; border-right: 1px solid var(--line); padding: 6px; }
+.skill-learning__file-list > button { min-width: 0; min-height: 36px; display: flex; align-items: center; gap: 6px; border: 0; border-radius: 7px; padding: 5px; background: transparent; color: var(--text); text-align: left; overflow-wrap: anywhere; }
+.skill-learning__file-list > button.is-active, .skill-learning__file-list > button:hover { background: var(--accent-soft); }
+.skill-learning__file-list svg { width: 15px; flex: none; }
+.skill-learning__file { min-width: 0; padding: 10px; }
+.skill-learning__file h4 { margin: 0 0 8px; overflow-wrap: anywhere; }
+.skill-learning__file pre, .skill-learning__diff pre { max-height: 360px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-9); }
+.skill-learning__diff { min-width: 0; margin-top: 18px; }
+.skill-learning__diff h4 { display: flex; align-items: center; gap: 6px; }
+.skill-learning__diff details { border-top: 1px solid var(--line); padding: 8px 0; }
+.skill-learning__diff summary { cursor: pointer; overflow-wrap: anywhere; }
+.skill-learning__actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.skill-learning__actions > label { width: 100%; display: flex; align-items: center; gap: 8px; }
 .skill-market-browser { min-height: min(720px, calc(100vh - 295px)); display: grid; grid-template-columns: minmax(310px, 38%) minmax(0, 1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--surface-raised); box-shadow: var(--shadow-sm); }
 .skill-market-catalog, .skill-market-detail-pane { min-width: 0; min-height: 0; }
 .skill-market-catalog { display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--line); background: var(--surface); }
@@ -5158,6 +5195,13 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
   .skill-catalog__toolbar { grid-template-columns: minmax(0, 1fr) 94px 32px; }
   .skill-hub__tabs { width: 100%; }
   .skill-hub__tabs > button { min-width: 0; flex: 1; }
+  .skill-hub__tabs { overflow-x: auto; }
+  .skill-hub__tabs > button { flex: 1 0 auto; min-height: 44px; }
+  .skill-learning { grid-template-columns: minmax(0, 1fr); }
+  .skill-learning__start, .skill-learning__history, .skill-learning__detail { grid-column: 1; grid-row: auto; }
+  .skill-learning__detail > header { align-items: flex-start; flex-direction: column; }
+  .skill-learning__review-grid { grid-template-columns: minmax(0, 1fr); }
+  .skill-learning__file-list { max-height: 180px; overflow-y: auto; border-right: 0; border-bottom: 1px solid var(--line); }
   .skill-market-browser { min-height: calc(100vh - 225px); grid-template-columns: minmax(0, 1fr); }
   .skill-market-browser--mobile-detail .skill-market-catalog { display: none; }
   .skill-market-browser:not(.skill-market-browser--mobile-detail) .skill-market-detail-pane { display: none; }

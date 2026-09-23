@@ -159,6 +159,7 @@ import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { PiResourceManager } from "./resource-manager.js";
 import { SkillManager } from "./skill-manager.js";
+import { SkillLearningManager } from "./skill-learning-manager.js";
 import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
@@ -349,6 +350,7 @@ export interface OrchestratorApplication {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
+  readonly skillLearning?: SkillLearningManager;
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
@@ -1306,6 +1308,16 @@ export async function createOrchestratorApplication(
     onServiceInteractionSettled: (input) => messaging?.onInteractionSettled(input),
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
+  let reconcileLearnedResourceRuntime: (backendId: string, resourceId: string, fence: symbol) => Promise<void> = async () => undefined;
+  const skillLearning = new SkillLearningManager({
+    store,
+    sessions: sessionHost,
+    resources: piResources,
+    mutations: skillMutations,
+    market: skillMarket,
+    rootDirectory: join(config.dataDirectory, "skill-learning"),
+    onResourceCommitted: (backendId, resourceId, fence) => reconcileLearnedResourceRuntime(backendId, resourceId, fence)
+  });
   messaging = new MessagingManager({
     store,
     credentials,
@@ -1755,6 +1767,23 @@ export async function createOrchestratorApplication(
     }));
   };
   refreshPiGenerationImpl = refreshPiGeneration;
+  reconcileLearnedResourceRuntime = async (backendId, resourceId, fence) => {
+    try {
+      const backend = store.getBackend(backendId).descriptor;
+      const retainsPreviousSnapshot = backendId === piBackendId || backend.adapterKind === "pi";
+      if (retainsPreviousSnapshot) await refreshPiGeneration();
+      else await restartBackend(backendId);
+      sessionHost.completeBackendResourceCatalogRefresh(backendId, fence, retainsPreviousSnapshot);
+    } catch {
+      store.appendDiagnostic({
+        severity: "warning",
+        component: "resource-runtime",
+        code: "LEARNED_SKILL_RUNTIME_REFRESH_FAILED",
+        message: "A learned Skill was saved, but its Backend runtime has not refreshed yet.",
+        details: { backendId, resourceId }
+      });
+    }
+  };
   reconcileSkillMarketResourceRuntime = async ({ resourceId, backendId }) => {
     const resourceCatalogFence = sessionHost.fenceBackendResourceCatalogs(backendId);
     try {
@@ -1902,6 +1931,7 @@ export async function createOrchestratorApplication(
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
     await sessionHost.initialize();
+    await skillLearning.initialize();
     for (const registration of backendTargets) {
       if (backendInstances.adapter(registration.backendId) === undefined) continue;
       const target: TargetDescriptor = {
@@ -2220,6 +2250,7 @@ export async function createOrchestratorApplication(
     mcpRouter,
     piResources,
     skills,
+    skillLearning,
     skillMarket,
     skillMarketSync,
     skillPublication,

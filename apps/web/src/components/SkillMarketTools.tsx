@@ -182,7 +182,7 @@ interface CatalogCursor {
   readonly revision?: bigint;
 }
 
-export function SkillMarketCatalogTools({ controller, backends, targets, locale, t, initialSelection, onOpenSources }: {
+export function SkillMarketCatalogTools({ controller, backends, targets, locale, t, initialSelection, onOpenSources, onLearn }: {
   readonly controller: AppController;
   readonly backends: readonly BackendView[];
   readonly targets: readonly TargetView[];
@@ -190,6 +190,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
   readonly t: Translator;
   readonly initialSelection?: SkillMarketEntryIdentityView;
   readonly onOpenSources: () => void;
+  readonly onLearn?: (identity: SkillMarketEntryIdentityView) => void;
 }): JSX.Element {
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("");
@@ -366,7 +367,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
           <div className="skill-market-tags">{readyDetail.entry.tags.map((tag) => <Pill key={tag}>{tag}</Pill>)}</div>
           <section className="skill-market-access"><div><h3>{t("skills.market.access.title")}</h3><p>{t("skills.market.access.summary", { publisher: t(`skills.publish.publisher.${readyDetail.entry.access.publisher.kind}`), visibility: t(`skills.publish.visibility.${readyDetail.entry.access.visibility}`) })}</p></div>{readyDetail.entry.canManage && <Button onClick={() => setAccessEntry(readyDetail.entry)}>{t("skills.market.access.manage")}</Button>}</section>
           <MarketInstallStatusDetails entry={readyDetail.entry} backends={backends} targets={targets} t={t} />
-          <div className="skill-market-detail__actions"><Button tone="primary" disabled={readyDetail.entry.sourceState !== "ready"} onClick={() => setInstallEntry(readyDetail.entry)}><Download aria-hidden="true" />{t("skills.market.install.open")}</Button><span>{t("skills.market.preview.summary", { files: readyDetail.preview.files, size: formatBytes(readyDetail.preview.bytes) })}</span></div>
+          <div className="skill-market-detail__actions"><Button tone="primary" disabled={readyDetail.entry.sourceState !== "ready"} onClick={() => setInstallEntry(readyDetail.entry)}><Download aria-hidden="true" />{t("skills.market.install.open")}</Button>{onLearn !== undefined && <Button disabled={readyDetail.entry.sourceState !== "ready"} onClick={() => onLearn(readyDetail.entry.identity)}><Sparkles aria-hidden="true" />{t("skills.learning.fromMarket")}</Button>}<span>{t("skills.market.preview.summary", { files: readyDetail.preview.files, size: formatBytes(readyDetail.preview.bytes) })}</span></div>
           <section className="skill-market-files" aria-label={t("skills.market.preview.files") }><div className="skill-market-file-list">{readyDetail.files.files.map((entry) => <button type="button" disabled={entry.kind === "directory"} className={cx(selectedFile === entry.key && "is-active")} key={entry.key} onClick={() => setSelectedFile(entry.key)}>{entry.kind === "directory" ? <Folder aria-hidden="true" /> : <File aria-hidden="true" />}<span>{entry.key}</span><small>{entry.kind === "file" ? formatBytes(entry.size) : t("skills.market.preview.folder")}</small></button>)}{readyDetail.files.nextPageToken !== undefined && <Button tone="ghost" onClick={loadMoreFiles}>{t("skills.market.preview.more")}</Button>}</div><div className="skill-market-file-preview">{selectedFile === undefined && <EmptyState icon={<File />} title={t("skills.market.preview.selectFile")} body={t("skills.market.preview.selectFileBody")} />}{file?.kind === "loading" && <LoadingState message={t("skills.market.preview.loadingFile")} />}{file?.kind === "error" && <ErrorState message={file.message} retry={() => { const key = selectedFile; setSelectedFile(undefined); window.setTimeout(() => setSelectedFile(key), 0); }} t={t} />}{file?.kind === "ready" && (file.value.previewable ? <pre>{file.value.content}</pre> : <EmptyState icon={<File />} title={t("skills.market.preview.unavailable")} body={t(`skills.market.preview.reason.${file.value.unavailableReason ?? "binary"}`)} />)}</div></section>
         </article>}
       </section>

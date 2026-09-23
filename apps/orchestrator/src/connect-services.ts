@@ -303,6 +303,7 @@ import {
   type SkillRecoveryRecord as NativeSkillRecoveryRecord,
   type SkillSessionDetails as NativeSkillSessionDetails
 } from "./skill-manager.js";
+import type { SkillLearningManager, SkillLearningRun as NativeSkillLearningRun } from "./skill-learning-manager.js";
 import {
   SkillMarketError,
   type PreparedSkillMarketInstallation,
@@ -478,6 +479,7 @@ interface ConnectServiceDependencies {
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
+  readonly skillLearning?: SkillLearningManager;
   readonly skillMarket?: SkillMarketManager;
   readonly skillMarketSync?: SkillMarketSyncManager;
   readonly skillPublication?: SkillPublicationManager;
@@ -1075,6 +1077,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.skills === undefined ? {} : { skills: application.skills }),
+    ...(application.skillLearning === undefined ? {} : { skillLearning: application.skillLearning }),
     ...(application.skillMarket === undefined ? {} : { skillMarket: application.skillMarket }),
     ...(application.skillMarketSync === undefined ? {} : { skillMarketSync: application.skillMarketSync }),
     ...(application.skillPublication === undefined ? {} : { skillPublication: application.skillPublication }),
@@ -4178,6 +4181,75 @@ export function createConnectServices(application: OrchestratorApplication): Con
   } satisfies ServiceImpl<typeof contract.ExtensionService>;
 
   const skill = {
+    startSkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      const manager = requireSkillLearningManager(dependencies);
+      const run = await skillEffect(() => manager.start({
+        requestId: nonBlankRequest(request.requestId, "request_id"),
+        connection: stableConnection(connection),
+        targetId: nonBlankRequest(request.targetId, "target_id"),
+        instruction: request.instruction,
+        ...(request.sourceSessionId === undefined ? {} : { sourceSessionId: nonBlankRequest(request.sourceSessionId, "source_session_id") }),
+        ...(request.marketIdentity === undefined ? {} : { marketIdentity: nativeSkillMarketIdentity(request.marketIdentity) })
+      }));
+      return { run: mapSkillLearningRun(run) };
+    },
+    listSkillLearningRuns: async (request, context) => {
+      authenticate(context);
+      if (dependencies.skillLearning === undefined) return { runs: [], page: emptyPage(request.page) };
+      const runs = await skillEffect(() => dependencies.skillLearning!.list());
+      const result = paginate(runs.map((run) => mapSkillLearningRun(run, false)), request.page);
+      return { runs: result.values, page: result.page };
+    },
+    getSkillLearningRun: async (request, context) => {
+      authenticate(context);
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).get(nonBlankRequest(request.runId, "run_id")));
+      return { run: mapSkillLearningRun(run) };
+    },
+    applySkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.expectedRunRevision === undefined) throw invalidArgument("expected_run_revision is required");
+      if (request.expectedCurrentResourceId !== undefined && request.expectedCurrentResourceRevision === undefined) {
+        throw invalidArgument("expected_current_resource_revision is required with expected_current_resource_id");
+      }
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).apply({
+        operationId: nonBlankRequest(request.operationId, "operation_id"),
+        connection: stableConnection(connection),
+        runId: nonBlankRequest(request.runId, "run_id"),
+        expectedRunRevision: fromProtoRevision(request.expectedRunRevision, "expected_run_revision"),
+        expectedProposalRevision: nonBlankRequest(request.expectedProposalRevision, "expected_proposal_revision"),
+        expectedResourceId: nonBlankRequest(request.expectedResourceId, "expected_resource_id"),
+        ...(request.expectedCurrentResourceId === undefined ? {} : { expectedCurrentResourceId: request.expectedCurrentResourceId }),
+        ...(request.expectedCurrentResourceRevision === undefined ? {} : {
+          expectedCurrentResourceVersion: fromProtoRevision(request.expectedCurrentResourceRevision, "expected_current_resource_revision")
+        }),
+        ...(request.expectedCurrentObservedRevision === undefined ? {} : { expectedCurrentObservedRevision: request.expectedCurrentObservedRevision }),
+        confirmReplace: request.confirmReplace
+      }));
+      return { run: mapSkillLearningRun(run) };
+    },
+    discardSkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.expectedRunRevision === undefined) throw invalidArgument("expected_run_revision is required");
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).discard(
+        stableConnection(connection),
+        nonBlankRequest(request.operationId, "operation_id"),
+        nonBlankRequest(request.runId, "run_id"),
+        fromProtoRevision(request.expectedRunRevision, "expected_run_revision")
+      ));
+      return { run: mapSkillLearningRun(run) };
+    },
+    cancelSkillLearning: async (request, context) => {
+      const connection = authenticate(context);
+      if (request.expectedRunRevision === undefined) throw invalidArgument("expected_run_revision is required");
+      const run = await skillEffect(() => requireSkillLearningManager(dependencies).cancel(
+        stableConnection(connection),
+        nonBlankRequest(request.operationId, "operation_id"),
+        nonBlankRequest(request.runId, "run_id"),
+        fromProtoRevision(request.expectedRunRevision, "expected_run_revision")
+      ));
+      return { run: mapSkillLearningRun(run) };
+    },
     listSkills: async (request, context) => {
       authenticate(context);
       if (dependencies.skills === undefined) {
@@ -10244,6 +10316,11 @@ function requireSkillManager(dependencies: ConnectServiceDependencies): SkillMan
   return dependencies.skills;
 }
 
+function requireSkillLearningManager(dependencies: ConnectServiceDependencies): SkillLearningManager {
+  if (dependencies.skillLearning === undefined) throw new ConnectError("Skill learning is unavailable.", Code.Unimplemented);
+  return dependencies.skillLearning;
+}
+
 function requireSkillMarketManager(dependencies: ConnectServiceDependencies): SkillMarketManager {
   if (dependencies.skillMarket === undefined) throw new ConnectError("Skill market management is unavailable.", Code.Unimplemented);
   return dependencies.skillMarket;
@@ -10994,6 +11071,58 @@ function mapSkillDescriptor(item: NativeSkillCatalogEntry): contract.SkillDescri
     entityVersion: toProtoEntityVersion(item.resourceVersion, 0, item.updatedAt),
     approvedRevision: item.approvedRevision,
     updatedAt: toProtoTimestamp(item.updatedAt)
+  });
+}
+
+function mapSkillLearningRun(run: NativeSkillLearningRun, includeProposal = true): contract.SkillLearningRun {
+  const states: Record<NativeSkillLearningRun["state"], contract.SkillLearningState> = {
+    collecting: contract.SkillLearningState.COLLECTING,
+    distilling: contract.SkillLearningState.DISTILLING,
+    awaiting_review: contract.SkillLearningState.AWAITING_REVIEW,
+    applied: contract.SkillLearningState.APPLIED,
+    discarded: contract.SkillLearningState.DISCARDED,
+    failed: contract.SkillLearningState.FAILED,
+    cancelled: contract.SkillLearningState.CANCELLED,
+    expired: contract.SkillLearningState.EXPIRED
+  };
+  const sourceKinds: Record<NativeSkillLearningRun["sourceKind"], contract.SkillLearningSourceKind> = {
+    text: contract.SkillLearningSourceKind.TEXT,
+    session: contract.SkillLearningSourceKind.SESSION,
+    market: contract.SkillLearningSourceKind.MARKET
+  };
+  const proposal = includeProposal ? run.proposal : undefined;
+  return create(contract.SkillLearningRunSchema, {
+    runId: run.id,
+    revision: toProtoRevision(run.revision),
+    state: states[run.state],
+    sourceKind: sourceKinds[run.sourceKind],
+    backendId: run.backendId,
+    targetId: run.targetId,
+    ...(run.sourceSessionId === undefined ? {} : { sourceSessionId: run.sourceSessionId }),
+    ...(run.distillationSessionId === undefined ? {} : { distillationSessionId: run.distillationSessionId }),
+    summary: run.summary,
+    ...(run.error === undefined ? {} : { error: run.error }),
+    ...(proposal === undefined ? {} : {
+      proposal: create(contract.SkillLearningProposalSchema, {
+        name: proposal.name,
+        description: proposal.description,
+        explanation: proposal.explanation,
+        revision: proposal.revision,
+        files: proposal.files.map((file) => create(contract.SkillLearningFileSchema, file)),
+        resourceId: proposal.resourceId,
+        ...(proposal.currentResourceId === undefined ? {} : { currentResourceId: proposal.currentResourceId }),
+        ...(proposal.currentResourceVersion === undefined ? {} : { currentResourceRevision: toProtoRevision(proposal.currentResourceVersion) }),
+        ...(proposal.currentObservedRevision === undefined ? {} : { currentObservedRevision: proposal.currentObservedRevision }),
+        diffAvailable: proposal.diffAvailable,
+        ...(proposal.diffReason === undefined ? {} : { diffReason: proposal.diffReason }),
+        changes: proposal.changes.map(mapSkillDiffChange),
+        diffTruncated: proposal.diffTruncated
+      })
+    }),
+    ...(run.appliedResourceId === undefined ? {} : { appliedResourceId: run.appliedResourceId }),
+    createdAt: toProtoTimestamp(run.createdAt),
+    updatedAt: toProtoTimestamp(run.updatedAt),
+    expiresAt: toProtoTimestamp(run.expiresAt)
   });
 }
 
@@ -14637,6 +14766,7 @@ function protoResourceAcquisitionKind(value: NativePiResourceDescriptor["sourceK
     case "git": return contract.ResourceAcquisitionKind.GIT;
     case "extension_source": return contract.ResourceAcquisitionKind.EXTENSION_SOURCE;
     case "skill_market": return contract.ResourceAcquisitionKind.SKILL_MARKET;
+    case "learned": return contract.ResourceAcquisitionKind.LEARNED;
     default: return contract.ResourceAcquisitionKind.UNSPECIFIED;
   }
 }

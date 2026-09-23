@@ -2111,6 +2111,12 @@ export function useAppController(): AppController {
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
     listSkills: (options) => gateway().listSkills(options),
+    startSkillLearning: (draft, signal) => gateway().startSkillLearning(draft, signal),
+    listSkillLearningRuns: (signal) => gateway().listSkillLearningRuns(signal),
+    getSkillLearningRun: (runId, signal) => gateway().getSkillLearningRun(runId, signal),
+    applySkillLearning: (run, confirmReplace, signal) => gateway().applySkillLearning(run, confirmReplace, signal),
+    discardSkillLearning: (run, signal) => gateway().discardSkillLearning(run, signal),
+    cancelSkillLearning: (run, signal) => gateway().cancelSkillLearning(run, signal),
     getSkillResourceUsageReport: (resourceId, timeZone, signal) =>
       gateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
     openSkill: (skillId, expectedRevision, signal) => gateway().openSkill(skillId, expectedRevision, signal),

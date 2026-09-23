@@ -1777,6 +1777,17 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
               );
               controller.navigate({ kind: "session", sessionId });
             }) : undefined}
+            onLearnFromSession={!reviewReadOnly && controller.state.connectionState === "connected" ? () => runAction(`learn:${session.id}`, async () => {
+              const run = await controller.startSkillLearning({
+                requestId: randomUuid(),
+                targetId: session.targetId,
+                sourceSessionId: session.id,
+                instruction: ""
+              });
+              controller.navigate(run.distillationSessionId === undefined
+                ? { kind: "tools", tab: "skills" }
+                : { kind: "session", sessionId: run.distillationSessionId });
+            }) : undefined}
             onSplitSession={onSplitSession}
             onOpenSessionWindow={onOpenSessionWindow}
             onOpenCodeHostPullRequest={(url) => runAction(

@@ -270,6 +270,8 @@ import {
   SkillDiffChangeKind,
   SkillDraftKind,
   SkillFileKind,
+  SkillLearningSourceKind as ProtoSkillLearningSourceKind,
+  SkillLearningState as ProtoSkillLearningState,
   SkillMarketInstallAction as ProtoSkillMarketInstallAction,
   SkillMarketInstallConfirmationReason as ProtoSkillMarketInstallConfirmationReason,
   SkillMarketInstallStatusState as ProtoSkillMarketInstallStatusState,
@@ -452,6 +454,7 @@ import {
   type SkillDraft as ProtoSkillDraft,
   type SkillFileContent as ProtoSkillFileContent,
   type SkillFileEntry as ProtoSkillFileEntry,
+  type SkillLearningRun as ProtoSkillLearningRun,
   type SkillMarketArchiveEntry as ProtoSkillMarketArchiveEntry,
   type SkillAccessPolicy as ProtoSkillAccessPolicy,
   type SkillMarketEntry as ProtoSkillMarketEntry,
@@ -729,6 +732,8 @@ import type {
   CollaborationWorkerStatusView,
   CollaborationWorkerView,
   SkillDescriptorView,
+  SkillLearningRunView,
+  StartSkillLearningDraft,
   SkillDiffChangeView,
   SkillDiffView,
   SkillDraftView,
@@ -3106,6 +3111,86 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async removeResource(resourceId: string): Promise<void> {
     await this.submit({ case: "removeResource", value: { resourceId } }, true);
+  }
+
+  async startSkillLearning(draft: StartSkillLearningDraft, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).startSkillLearning({
+      requestId: draft.requestId,
+      targetId: draft.targetId,
+      instruction: draft.instruction,
+      ...(draft.sourceSessionId === undefined ? {} : { sourceSessionId: draft.sourceSessionId }),
+      ...(draft.marketIdentity === undefined ? {} : { marketIdentity: protoSkillMarketIdentity(draft.marketIdentity) })
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async listSkillLearningRuns(signal?: AbortSignal): Promise<readonly SkillLearningRunView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(SkillService, scope.transport);
+    const runs: SkillLearningRunView[] = [];
+    const ids = new Set<string>();
+    let pageToken = "";
+    const seenTokens = new Set<string>();
+    for (let page = 0; page < 100; page += 1) {
+      const response = await client.listSkillLearningRuns({ page: { pageSize: 100, pageToken } }, { signal: scope.signal });
+      for (const value of response.runs) {
+        const run = mapSkillLearningRun(value);
+        if (ids.has(run.id)) throw new GatewayError("The service returned duplicate learning runs.");
+        ids.add(run.id);
+        runs.push(run);
+      }
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") return runs;
+      if (next === pageToken || seenTokens.has(next)) throw new GatewayError("The service returned a cyclic learning page token.");
+      seenTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Learning run history exceeded the safe page limit.");
+  }
+
+  async getSkillLearningRun(runId: string, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).getSkillLearningRun({ runId }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async applySkillLearning(run: SkillLearningRunView, confirmReplace: boolean, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    if (run.proposal === undefined || run.state !== "awaitingReview") throw new GatewayError("Learning proposal is not ready for review.");
+    const scope = this.captureActionScope(signal);
+    const proposal = run.proposal;
+    const response = await createClient(SkillService, scope.transport).applySkillLearning({
+      operationId: `${run.id}_apply_${run.revision.toString(10)}_${confirmReplace ? "replace" : "new"}`,
+      runId: run.id,
+      expectedRunRevision: { value: run.revision },
+      expectedProposalRevision: proposal.revision,
+      expectedResourceId: proposal.resourceId,
+      ...(proposal.currentResourceId === undefined ? {} : { expectedCurrentResourceId: proposal.currentResourceId }),
+      ...(proposal.currentResourceRevision === undefined ? {} : { expectedCurrentResourceRevision: { value: proposal.currentResourceRevision } }),
+      ...(proposal.currentObservedRevision === undefined ? {} : { expectedCurrentObservedRevision: proposal.currentObservedRevision }),
+      confirmReplace
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async discardSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).discardSkillLearning({
+      operationId: `${run.id}_discard_${run.revision.toString(10)}`,
+      runId: run.id,
+      expectedRunRevision: { value: run.revision }
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
+  }
+
+  async cancelSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(SkillService, scope.transport).cancelSkillLearning({
+      operationId: `${run.id}_cancel_${run.revision.toString(10)}`,
+      runId: run.id,
+      expectedRunRevision: { value: run.revision }
+    }, { signal: scope.signal });
+    return mapSkillLearningRun(response.run);
   }
 
   async listSkills(options: {
@@ -13289,6 +13374,77 @@ function mapSkillDescriptor(skill: ProtoSkillDescriptor): SkillDescriptorView {
   };
 }
 
+function mapSkillLearningRun(value: ProtoSkillLearningRun | undefined): SkillLearningRunView {
+  if (value === undefined) throw new GatewayError("The service returned an empty learning run.");
+  const states = new Map<ProtoSkillLearningState, SkillLearningRunView["state"]>([
+    [ProtoSkillLearningState.COLLECTING, "collecting"],
+    [ProtoSkillLearningState.DISTILLING, "distilling"],
+    [ProtoSkillLearningState.AWAITING_REVIEW, "awaitingReview"],
+    [ProtoSkillLearningState.APPLIED, "applied"],
+    [ProtoSkillLearningState.DISCARDED, "discarded"],
+    [ProtoSkillLearningState.FAILED, "failed"],
+    [ProtoSkillLearningState.CANCELLED, "cancelled"],
+    [ProtoSkillLearningState.EXPIRED, "expired"]
+  ]);
+  const sourceKinds = new Map<ProtoSkillLearningSourceKind, SkillLearningRunView["sourceKind"]>([
+    [ProtoSkillLearningSourceKind.TEXT, "text"],
+    [ProtoSkillLearningSourceKind.SESSION, "session"],
+    [ProtoSkillLearningSourceKind.MARKET, "market"]
+  ]);
+  const state = states.get(value.state);
+  const sourceKind = sourceKinds.get(value.sourceKind);
+  const revision = value.revision?.value;
+  if (!/^skill_learning_[a-f0-9]{32}$/u.test(value.runId) || revision === undefined || revision < 1n
+    || state === undefined || sourceKind === undefined || value.backendId.trim() === "" || value.targetId.trim() === ""
+    || value.summary.length > 160 || privatePathLikeLabel(value.summary)
+    || value.createdAt === undefined || value.updatedAt === undefined || value.expiresAt === undefined) {
+    throw new GatewayError("The service returned an invalid learning run.");
+  }
+  const proposal = value.proposal;
+  const currentResourceRevision = proposal?.currentResourceRevision?.value;
+  if (proposal !== undefined && (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(proposal.name)
+    || !/^sha256:[a-f0-9]{64}$/u.test(proposal.revision) || proposal.resourceId.trim() === ""
+    || (proposal.currentResourceId !== undefined && (currentResourceRevision === undefined || currentResourceRevision < 1n))
+    || proposal.files.length > 64 || proposal.files.some((file) => !portableSkillKey(file.key)))) {
+    throw new GatewayError("The service returned an invalid learning proposal.");
+  }
+  return {
+    id: value.runId,
+    revision,
+    state,
+    sourceKind,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    ...(value.sourceSessionId === undefined ? {} : { sourceSessionId: value.sourceSessionId }),
+    ...(value.distillationSessionId === undefined ? {} : { distillationSessionId: value.distillationSessionId }),
+    summary: value.summary,
+    ...(value.error === undefined ? {} : { error: value.error }),
+    ...(proposal === undefined ? {} : {
+      proposal: {
+        name: proposal.name,
+        description: proposal.description,
+        explanation: proposal.explanation,
+        revision: proposal.revision,
+        files: proposal.files.map((file) => ({ key: file.key, content: file.content })),
+        resourceId: proposal.resourceId,
+        ...(proposal.currentResourceId === undefined ? {} : { currentResourceId: proposal.currentResourceId }),
+        ...(currentResourceRevision === undefined ? {} : { currentResourceRevision }),
+        ...(proposal.currentObservedRevision === undefined ? {} : { currentObservedRevision: proposal.currentObservedRevision }),
+        diff: {
+          available: proposal.diffAvailable,
+          ...(proposal.diffReason === undefined ? {} : { reason: proposal.diffReason }),
+          changes: proposal.changes.map(mapSkillDiffChange),
+          truncated: proposal.diffTruncated
+        }
+      }
+    }),
+    ...(value.appliedResourceId === undefined ? {} : { appliedResourceId: value.appliedResourceId }),
+    createdAt: timestampMs(value.createdAt),
+    updatedAt: timestampMs(value.updatedAt),
+    expiresAt: timestampMs(value.expiresAt)
+  };
+}
+
 function mapSkillFileEntry(file: ProtoSkillFileEntry): SkillFileEntryView {
   const kind = file.kind === SkillFileKind.DIRECTORY
     ? "directory" as const
@@ -13823,6 +13979,8 @@ function mapSkillMarketCurrentResource(value: NonNullable<ProtoSkillMarketInstal
           ? "extensionSource" as const
           : value.sourceKind === ResourceAcquisitionKind.SKILL_MARKET
             ? "skillMarket" as const
+            : value.sourceKind === ResourceAcquisitionKind.LEARNED
+              ? "learned" as const
             : undefined;
   if (value.resourceId.trim() === "" || resourceRevision === undefined || resourceRevision < 1n || value.name.trim() === ""
     || sourceKind === undefined || value.sourceDisplay.trim() === "" || privatePathLikeLabel(value.sourceDisplay)

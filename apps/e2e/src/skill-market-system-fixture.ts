@@ -75,7 +75,7 @@ export function seedSkillResourceUsage(
 }
 
 export async function writeSkillMarketSource(
-  fixture: SkillMarketSystemFixture,
+  fixture: Pick<SkillMarketSystemFixture, "rootDirectory">,
   version: string,
   body: string
 ): Promise<string> {

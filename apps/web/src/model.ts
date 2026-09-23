@@ -2655,6 +2655,47 @@ export interface SkillCatalogView {
   readonly skills: readonly SkillDescriptorView[];
 }
 
+export type SkillLearningStateView = "collecting" | "distilling" | "awaitingReview" | "applied" | "discarded" | "failed" | "cancelled" | "expired";
+
+export interface SkillLearningProposalView {
+  readonly name: string;
+  readonly description: string;
+  readonly explanation: string;
+  readonly revision: string;
+  readonly files: readonly { readonly key: string; readonly content: string }[];
+  readonly resourceId: string;
+  readonly currentResourceId?: string;
+  readonly currentResourceRevision?: bigint;
+  readonly currentObservedRevision?: string;
+  readonly diff: SkillDiffView;
+}
+
+export interface SkillLearningRunView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: SkillLearningStateView;
+  readonly sourceKind: "text" | "session" | "market";
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly sourceSessionId?: string;
+  readonly distillationSessionId?: string;
+  readonly summary: string;
+  readonly error?: string;
+  readonly proposal?: SkillLearningProposalView;
+  readonly appliedResourceId?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly expiresAt: number;
+}
+
+export interface StartSkillLearningDraft {
+  readonly requestId: string;
+  readonly targetId: string;
+  readonly instruction: string;
+  readonly sourceSessionId?: string;
+  readonly marketIdentity?: SkillMarketEntryIdentityView;
+}
+
 export interface SkillMetadataView {
   readonly name?: string;
   readonly description?: string;
@@ -2992,7 +3033,7 @@ export interface SkillMarketCurrentResourceView {
   readonly resourceRevision: bigint;
   readonly name: string;
   readonly version?: string;
-  readonly sourceKind: "local" | "npm" | "git" | "extensionSource" | "skillMarket";
+  readonly sourceKind: "local" | "npm" | "git" | "extensionSource" | "skillMarket" | "learned";
   readonly sourceDisplay: string;
   readonly discoveredRevision: string;
   readonly observedRevision: string;
@@ -5410,6 +5451,12 @@ export interface OperationApi {
     readonly scope?: SkillScopeView;
     readonly signal?: AbortSignal;
   }): Promise<SkillCatalogView>;
+  startSkillLearning(draft: StartSkillLearningDraft, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  listSkillLearningRuns(signal?: AbortSignal): Promise<readonly SkillLearningRunView[]>;
+  getSkillLearningRun(runId: string, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  applySkillLearning(run: SkillLearningRunView, confirmReplace: boolean, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  discardSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  cancelSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView>;
   getSkillResourceUsageReport(resourceId: string, timeZone: string, signal?: AbortSignal): Promise<ResourceUsageReportView>;
   openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView>;
   listSkillFiles(sessionId: string, parentKey?: string, signal?: AbortSignal): Promise<readonly SkillFileEntryView[]>;

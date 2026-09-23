@@ -29,7 +29,7 @@ import { isExtensionLibraryDescriptor, isExtensionMainViewDescriptor } from "./e
 
 export type PiResourceKind = "extension" | "skill" | "prompt" | "theme" | "package";
 export type PiResourceScope = "user" | "global" | "project" | "managed";
-export type PiResourceSourceKind = PiPackageSource["kind"] | "extension_source" | "skill_market";
+export type PiResourceSourceKind = PiPackageSource["kind"] | "extension_source" | "skill_market" | "learned";
 export type PiResourceState =
   | "discovered"
   | "awaiting_approval"
@@ -118,7 +118,13 @@ interface StoredSkillMarketSource {
   readonly relativeParent?: string;
 }
 
-type StoredResourceSource = PiPackageSource | StoredExtensionSourcePackage | StoredSkillMarketSource;
+interface StoredLearnedSkillSource {
+  readonly kind: "learned";
+  readonly runId: string;
+  readonly slug: string;
+}
+
+type StoredResourceSource = PiPackageSource | StoredExtensionSourcePackage | StoredSkillMarketSource | StoredLearnedSkillSource;
 
 interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber" | "extensionSource" | "skillMarket"> {
   readonly versionNumber: string;
@@ -292,6 +298,41 @@ export interface PreparedPiMarketSkillMutation {
   readonly mutation: PreparedPiResourceMutation<PiResourceDescriptor>;
 }
 
+export interface PiLearnedSkillPreview {
+  readonly resourceId: string;
+  readonly backendId: string;
+  readonly name: string;
+  readonly candidateRevision: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly currentResource?: {
+    readonly resourceId: string;
+    readonly resourceVersion: bigint;
+    readonly observedRevision: string;
+  };
+  readonly diffAvailable: boolean;
+  readonly diffReason?: string;
+  readonly changes: readonly PiMarketSkillDiffChange[];
+  readonly diffTruncated: boolean;
+}
+
+export interface PiLearnedSkillInput {
+  readonly runId: string;
+  readonly backendId: string;
+  readonly name: string;
+  readonly candidateRoot: string;
+}
+
+export interface PreparePiLearnedSkillInput extends PiLearnedSkillInput {
+  readonly approvedByConnectionId: string;
+  readonly expectedCandidateRevision: string;
+  readonly expectedResourceId: string;
+  readonly expectedCurrentResourceId?: string;
+  readonly expectedCurrentResourceVersion?: bigint;
+  readonly expectedCurrentObservedRevision?: string;
+  readonly allowReplacement: boolean;
+}
+
 export interface DiscoverPiPackageInput {
   readonly id?: string;
   readonly backendId: string;
@@ -389,6 +430,17 @@ interface InspectedMarketSkill {
   readonly currentInspection?: ResourceInspection;
   readonly unregisteredDestination: boolean;
   readonly sourceReplacement: boolean;
+  readonly diffAvailable: boolean;
+  readonly diffReason?: string;
+  readonly changes: readonly PiMarketSkillDiffChange[];
+  readonly diffTruncated: boolean;
+}
+
+interface InspectedLearnedSkill {
+  readonly inspection: ResourceInspection;
+  readonly compatibility: PiPackageInspection;
+  readonly current?: StoredResource;
+  readonly currentInspection?: ResourceInspection;
   readonly diffAvailable: boolean;
   readonly diffReason?: string;
   readonly changes: readonly PiMarketSkillDiffChange[];
@@ -1077,7 +1129,7 @@ export class PiResourceManager {
     const approvalRevision = piPackageSourceApprovalRevision(source);
     const now = this.#now();
     const previous = this.#records.get(id);
-    if (previous?.source.kind === "extension_source" || previous?.source.kind === "skill_market") {
+    if (previous?.source.kind === "extension_source" || previous?.source.kind === "skill_market" || previous?.source.kind === "learned") {
       throw new Error("Pi resource ID is already reserved by a source-owned Resource.");
     }
     if (previous !== undefined && (
@@ -1428,6 +1480,136 @@ export class PiResourceManager {
     return { preview, mutation };
   }
 
+  /** Inspect one private learning proposal against the current global Skill slot. */
+  async previewLearnedSkill(input: PiLearnedSkillInput): Promise<PiLearnedSkillPreview> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectLearnedSkill(input);
+    return this.#publicLearnedSkillPreview(input, inspected);
+  }
+
+  /** Prepare immutable managed content; the caller adopts it with its review operation. */
+  async prepareLearnedSkill(input: PreparePiLearnedSkillInput): Promise<{
+    readonly preview: PiLearnedSkillPreview;
+    readonly mutation: PreparedPiResourceMutation<PiResourceDescriptor>;
+  }> {
+    this.#assertInitialized();
+    const inspected = await this.#inspectLearnedSkill(input);
+    const preview = this.#publicLearnedSkillPreview(input, inspected);
+    if (preview.candidateRevision !== input.expectedCandidateRevision
+      || preview.resourceId !== input.expectedResourceId
+      || preview.currentResource?.resourceId !== input.expectedCurrentResourceId
+      || preview.currentResource?.resourceVersion !== input.expectedCurrentResourceVersion
+      || preview.currentResource?.observedRevision !== input.expectedCurrentObservedRevision) {
+      throw new Error("Learned Skill proposal or install target changed after review.");
+    }
+    if (preview.currentResource !== undefined && !input.allowReplacement) {
+      throw new Error("Replacing an existing Skill requires explicit confirmation.");
+    }
+    const source = normalizeStoredLearnedSkillSource(input.runId, input.name);
+    const expectedTarget = this.#records.get(preview.resourceId);
+    const replaced = inspected.current?.id === preview.resourceId ? undefined : inspected.current;
+    const now = this.#now();
+    const base: StoredResource = {
+      id: preview.resourceId,
+      backendId: input.backendId,
+      kind: "skill",
+      scope: "global",
+      name: source.slug,
+      sourceKind: "learned",
+      sourceIdentity: learnedSkillSourceIdentity(source),
+      sourceDisplay: learnedSkillSourceDisplay(source),
+      canonicalPathFingerprint: learnedSkillSourceFingerprint(source),
+      symbolicLinkDetected: false,
+      specialFileDetected: false,
+      discoveredRevision: inspected.inspection.revision,
+      ...compatibilityFields(inspected.compatibility, false),
+      state: inspected.current?.state === "disabled" ? "disabled" : "installed",
+      enabled: inspected.current?.enabled === true && inspected.compatibility.canToggle,
+      approvedAt: now,
+      approvedByConnectionId: nonBlank(input.approvedByConnectionId, "Approving connection ID"),
+      versionNumber: ((expectedTarget === undefined ? 0n : BigInt(expectedTarget.versionNumber)) + 1n).toString(10),
+      updatedAt: now,
+      source
+    };
+    return {
+      preview,
+      mutation: await this.#prepareManagedMarketSkill(base, expectedTarget, replaced, inspected)
+    };
+  }
+
+  async #inspectLearnedSkill(input: PiLearnedSkillInput): Promise<InspectedLearnedSkill> {
+    const backendId = nonBlank(input.backendId, "Backend ID");
+    const source = normalizeStoredLearnedSkillSource(input.runId, input.name);
+    if (!this.#backendSupportsResourceKind(backendId, "skill")) {
+      throw new Error("Selected Backend does not advertise Skill resources.");
+    }
+    const candidateRoot = await canonicalDirectory(input.candidateRoot, "Learning proposal");
+    const inspection = await inspectSkillPackage(candidateRoot, this.#maximumFiles, this.#maximumBytes);
+    const runtimeVersion = this.#runtimeVersion(backendId);
+    const compatibility = await inspectPiResourceCompatibility("skill", candidateRoot, {
+      ...(runtimeVersion === undefined ? {} : { currentRuntimeVersion: runtimeVersion }),
+      contentFingerprint: inspection.revision
+    });
+    if (!compatibility.canToggle) throw new Error("Learning proposal has no usable Skill content.");
+    const conflicts = [...this.#records.values()].filter((record) =>
+      record.backendId === backendId && record.targetId === undefined && record.scope !== "project"
+      && record.kind === "skill" && record.name === source.slug && record.state !== "removed");
+    if (conflicts.length > 1) throw new Error("Multiple global Skills already claim this name.");
+    const current = conflicts[0];
+    let currentInspection: ResourceInspection | undefined;
+    let diffAvailable = true;
+    let diffReason: string | undefined;
+    if (current?.installedPath !== undefined) {
+      assertExpectedInstalledLocation(this.#managedRoot, current);
+      await assertContainedPath(this.#managedRoot, current.installedPath, "Existing global Skill");
+      currentInspection = await inspectSkillPackage(current.installedPath, this.#maximumFiles, this.#maximumBytes);
+    } else if (current !== undefined) {
+      diffAvailable = false;
+      diffReason = "Existing Skill content is unavailable for comparison.";
+    }
+    const diff = diffAvailable
+      ? await compareMarketSkillTrees(current?.installedPath, candidateRoot)
+      : { changes: [] as readonly PiMarketSkillDiffChange[], truncated: false };
+    if (!this.#backendSupportsResourceKind(backendId, "skill")) throw new Error("Selected Backend Skill capability changed.");
+    if (current !== undefined && this.#records.get(current.id) !== current) {
+      throw new Error("Skill Resource authority changed during learning review.");
+    }
+    return {
+      inspection,
+      compatibility,
+      ...(current === undefined ? {} : { current }),
+      ...(currentInspection === undefined ? {} : { currentInspection }),
+      diffAvailable,
+      ...(diffReason === undefined ? {} : { diffReason }),
+      changes: diff.changes,
+      diffTruncated: diff.truncated
+    };
+  }
+
+  #publicLearnedSkillPreview(input: PiLearnedSkillInput, inspected: InspectedLearnedSkill): PiLearnedSkillPreview {
+    const name = portableSkillName(input.name);
+    const resourceId = learnedGlobalSkillResourceId(input.backendId, name);
+    return {
+      resourceId,
+      backendId: input.backendId,
+      name,
+      candidateRevision: inspected.inspection.revision,
+      files: inspected.inspection.files,
+      bytes: inspected.inspection.bytes,
+      ...(inspected.current === undefined ? {} : {
+        currentResource: {
+          resourceId: inspected.current.id,
+          resourceVersion: BigInt(inspected.current.versionNumber),
+          observedRevision: inspected.currentInspection?.revision ?? inspected.current.discoveredRevision
+        }
+      }),
+      diffAvailable: inspected.diffAvailable,
+      ...(inspected.diffReason === undefined ? {} : { diffReason: inspected.diffReason }),
+      changes: inspected.changes,
+      diffTruncated: inspected.diffTruncated
+    };
+  }
+
   async #inspectMarketSkill(input: PiMarketSkillSourceInput & PiMarketSkillTargetInput): Promise<InspectedMarketSkill> {
     const backendId = nonBlank(input.backendId, "Backend ID");
     if (!this.#backendSupportsResourceKind(backendId, "skill")) {
@@ -1547,7 +1729,7 @@ export class PiResourceManager {
     seed: StoredResource,
     expectedTarget: StoredResource | undefined,
     replaced: StoredResource | undefined,
-    inspected: InspectedMarketSkill
+    inspected: Pick<InspectedMarketSkill, "inspection">
   ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     const owner = resourceOwnerPath(this.#managedRoot, seed);
     await mkdir(owner, { recursive: true, mode: 0o700 });
@@ -1779,7 +1961,7 @@ export class PiResourceManager {
       if (inspection.revision !== discoveredRevision || !samePath(inspection.canonicalPath, current.canonicalPath)) {
         throw new Error("Resource changed after discovery and must be discovered again.");
       }
-    } else if (current.source.kind === "extension_source" || current.source.kind === "skill_market") {
+    } else if (current.source.kind === "extension_source" || current.source.kind === "skill_market" || current.source.kind === "learned") {
       throw new Error("Source-owned resource approval must use its exact catalog entry.");
     } else if (current.kind !== "package" || piPackageSourceApprovalRevision(current.source) !== discoveredRevision) {
       throw new Error("Package acquisition source changed after discovery and must be discovered again.");
@@ -1828,7 +2010,7 @@ export class PiResourceManager {
     if (!(current.state === "installed" || current.state === "loaded" || current.state === "disabled" || current.state === "update_available")) {
       throw new Error("Only an installed resource can be updated.");
     }
-    if (current.source.kind === "extension_source" || current.source.kind === "skill_market") {
+    if (current.source.kind === "extension_source" || current.source.kind === "skill_market" || current.source.kind === "learned") {
       throw new Error("Source-owned resources must be updated through their revision-fenced catalog entry.");
     }
     this.#assertStoredProjectTargetTrusted(current);
@@ -2995,7 +3177,7 @@ export class PiResourceManager {
     if (approved.approvedAt === undefined || approved.approvedByConnectionId === undefined) {
       throw new Error("Resource installation requires an explicit owner approval.");
     }
-    if (approved.source.kind === "extension_source" || approved.source.kind === "skill_market") {
+    if (approved.source.kind === "extension_source" || approved.source.kind === "skill_market" || approved.source.kind === "learned") {
       throw new Error("Source-owned resources require their leased Resource adoption path.");
     }
     this.#assertStoredProjectTargetTrusted(approved);
@@ -4171,6 +4353,10 @@ function marketGlobalSkillResourceId(backendId: string, name: string): string {
   return `resource_skill_market_${createHash("sha256").update(`${backendId}\0global\0${name}`).digest("hex").slice(0, 32)}`;
 }
 
+function learnedGlobalSkillResourceId(backendId: string, name: string): string {
+  return `resource_skill_learned_${createHash("sha256").update(`${backendId}\0global\0${name}`).digest("hex").slice(0, 32)}`;
+}
+
 function portableProjectSkillParent(value: string): string {
   const path = nonBlank(value, "Project Skill parent");
   if (path.length > 512 || path.includes("\\") || path.startsWith("/") || isAbsolute(path) || /^[A-Za-z]:/u.test(path)) {
@@ -4678,12 +4864,15 @@ function validateStoredResource(value: StoredResource): StoredResource {
     ? validateStoredExtensionSourcePackage(stored.source)
     : stored.source.kind === "skill_market"
       ? validateStoredSkillMarketSource(stored.source)
+      : stored.source.kind === "learned"
+        ? validateStoredLearnedSkillSource(stored.source)
       : normalizePiPackageSource(stored.source);
   if (!sameFlatRecord(source, stored.source)) throw new Error("Stored Pi resource source is not canonical.");
-  if (source.kind !== "local" && source.kind !== "skill_market" && stored.kind !== "package") {
+  if (source.kind !== "local" && source.kind !== "skill_market" && source.kind !== "learned" && stored.kind !== "package") {
     throw new Error("Only package resources may use managed package acquisition.");
   }
   if (source.kind === "skill_market" && stored.kind !== "skill") throw new Error("Skill market provenance may only own a Skill Resource.");
+  if (source.kind === "learned" && stored.kind !== "skill") throw new Error("Learning provenance may only own a Skill Resource.");
   let canonicalPath: string | undefined;
   if (source.kind === "local" || source.kind === "skill_market" && stored.scope === "project") {
     canonicalPath = normalizedAbsolute(stored.canonicalPath!, "Stored canonical resource path");
@@ -4702,10 +4891,15 @@ function validateStoredResource(value: StoredResource): StoredResource {
     stored.scope === "project" && stored.installedPath !== undefined
     || stored.scope !== "project" && stored.scope !== "global"
   )) throw new Error("Stored Skill market Resource has an invalid install scope.");
+  if (source.kind === "learned" && (stored.scope !== "global" || stored.installedPath === undefined)) {
+    throw new Error("Stored learned Skill has an invalid install scope.");
+  }
   const sourceIdentity = source.kind === "extension_source"
     ? extensionSourcePackageIdentity(source)
     : source.kind === "skill_market"
       ? skillMarketSourceIdentity(source)
+    : source.kind === "learned"
+      ? learnedSkillSourceIdentity(source)
     : stored.kind === "package"
       ? piPackageSourceIdentity(source)
     : `${stored.kind}:${pathIdentity(canonicalPath!)}`;
@@ -4718,6 +4912,8 @@ function validateStoredResource(value: StoredResource): StoredResource {
       ? source.sourceDisplay
       : source.kind === "skill_market"
         ? skillMarketSourceDisplay(source)
+      : source.kind === "learned"
+        ? learnedSkillSourceDisplay(source)
       : piPackageSourceDisplay(source);
   const canonicalPathFingerprint = source.kind === "local"
     ? pathFingerprint(canonicalPath!)
@@ -4725,6 +4921,8 @@ function validateStoredResource(value: StoredResource): StoredResource {
       ? extensionSourcePackageFingerprint(source)
       : source.kind === "skill_market"
         ? stored.scope === "project" ? pathFingerprint(canonicalPath!) : skillMarketSourceFingerprint(source)
+      : source.kind === "learned"
+        ? learnedSkillSourceFingerprint(source)
       : `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`;
   if (stored.sourceDisplay !== sourceDisplay || stored.canonicalPathFingerprint !== canonicalPathFingerprint) {
     throw new Error("Stored Pi resource source metadata is malformed.");
@@ -4742,7 +4940,7 @@ function validateStoredResource(value: StoredResource): StoredResource {
   const storedCompatibility = validateStoredCompatibility(stored);
   let pendingUpdate: StoredResourceUpdateIntent | undefined;
   if (stored.pendingUpdate !== undefined) {
-    if (source.kind === "extension_source" || source.kind === "skill_market") {
+    if (source.kind === "extension_source" || source.kind === "skill_market" || source.kind === "learned") {
       throw new Error("Stored source-owned resources cannot contain a generic update intent.");
     }
     if (!stored.pendingUpdate || typeof stored.pendingUpdate !== "object") {
@@ -4896,6 +5094,32 @@ function skillMarketSourceDisplay(source: StoredSkillMarketSource): string {
 }
 
 function skillMarketSourceFingerprint(source: StoredSkillMarketSource): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(source)).digest("hex")}`;
+}
+
+function normalizeStoredLearnedSkillSource(runId: string, slug: string): StoredLearnedSkillSource {
+  if (!/^skill_learning_[a-f0-9]{32}$/u.test(runId)) throw new Error("Learning run ID is invalid.");
+  return { kind: "learned", runId, slug: portableSkillName(slug) };
+}
+
+function validateStoredLearnedSkillSource(value: StoredLearnedSkillSource): StoredLearnedSkillSource {
+  if (!value || typeof value !== "object" || value.kind !== "learned") {
+    throw new Error("Stored learning provenance is malformed.");
+  }
+  const normalized = normalizeStoredLearnedSkillSource(value.runId, value.slug);
+  if (!sameFlatRecord(normalized, value)) throw new Error("Stored learning provenance is not canonical.");
+  return normalized;
+}
+
+function learnedSkillSourceIdentity(source: StoredLearnedSkillSource): string {
+  return `learned:${source.runId}`;
+}
+
+function learnedSkillSourceDisplay(source: StoredLearnedSkillSource): string {
+  return `Learned · ${source.slug}`;
+}
+
+function learnedSkillSourceFingerprint(source: StoredLearnedSkillSource): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(source)).digest("hex")}`;
 }
 

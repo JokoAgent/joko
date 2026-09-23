@@ -385,6 +385,12 @@ service ExtensionService {
 }
 
 service SkillService {
+  rpc StartSkillLearning(StartSkillLearningRequest) returns (StartSkillLearningResponse);
+  rpc ListSkillLearningRuns(ListSkillLearningRunsRequest) returns (ListSkillLearningRunsResponse);
+  rpc GetSkillLearningRun(GetSkillLearningRunRequest) returns (GetSkillLearningRunResponse);
+  rpc ApplySkillLearning(ApplySkillLearningRequest) returns (ApplySkillLearningResponse);
+  rpc DiscardSkillLearning(DiscardSkillLearningRequest) returns (DiscardSkillLearningResponse);
+  rpc CancelSkillLearning(CancelSkillLearningRequest) returns (CancelSkillLearningResponse);
   rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
   rpc OpenSkill(OpenSkillRequest) returns (OpenSkillResponse);
   rpc ListSkillFiles(ListSkillFilesRequest) returns (ListSkillFilesResponse);
@@ -414,6 +420,47 @@ service SkillService {
   rpc GetCollaborationDirectory(GetCollaborationDirectoryRequest) returns (GetCollaborationDirectoryResponse);
   rpc GetSkillResourceUsageReport(GetSkillResourceUsageReportRequest) returns (GetSkillResourceUsageReportResponse);
 }
+
+message StartSkillLearningRequest {
+  string request_id = 1;
+  string target_id = 2;
+  string instruction = 3;
+  optional string source_session_id = 4;
+  optional SkillMarketEntryIdentity market_identity = 5;
+}
+
+message StartSkillLearningResponse { SkillLearningRun run = 1; }
+message ListSkillLearningRunsRequest { PageRequest page = 1; }
+message ListSkillLearningRunsResponse {
+  repeated SkillLearningRun runs = 1;
+  PageInfo page = 2;
+}
+message GetSkillLearningRunRequest { string run_id = 1; }
+message GetSkillLearningRunResponse { SkillLearningRun run = 1; }
+message ApplySkillLearningRequest {
+  string operation_id = 1;
+  string run_id = 2;
+  Revision expected_run_revision = 3;
+  string expected_proposal_revision = 4;
+  string expected_resource_id = 5;
+  optional string expected_current_resource_id = 6;
+  optional Revision expected_current_resource_revision = 7;
+  optional string expected_current_observed_revision = 8;
+  bool confirm_replace = 9;
+}
+message ApplySkillLearningResponse { SkillLearningRun run = 1; }
+message DiscardSkillLearningRequest {
+  string operation_id = 1;
+  string run_id = 2;
+  Revision expected_run_revision = 3;
+}
+message DiscardSkillLearningResponse { SkillLearningRun run = 1; }
+message CancelSkillLearningRequest {
+  string operation_id = 1;
+  string run_id = 2;
+  Revision expected_run_revision = 3;
+}
+message CancelSkillLearningResponse { SkillLearningRun run = 1; }
 
 service SubagentService {
   rpc ListSubagentRuns(ListSubagentRunsRequest) returns (ListSubagentRunsResponse);

@@ -39,6 +39,7 @@ import { SkillMarketCatalogTools, SkillMarketSourcesTools } from "./SkillMarketT
 import { SkillCollaborationTools } from "./SkillCollaborationTools.js";
 import { SkillPublicationDialog } from "./SkillPublicationTools.js";
 import { SkillUsagePanel } from "./SkillUsagePanel.js";
+import { SkillLearningTools } from "./SkillLearningTools.js";
 import { Button, EmptyState, IconButton, Modal, Pill, SelectControl, cx, formatRelativeTime } from "./ui.js";
 
 type LoadState<T> =
@@ -87,8 +88,9 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
   readonly locale: string;
   readonly t: Translator;
 }): JSX.Element {
-  const [tab, setTab] = useState<"installed" | "market" | "sources" | "sharing">("installed");
+  const [tab, setTab] = useState<"installed" | "market" | "sources" | "sharing" | "learning">("installed");
   const [marketHandoff, setMarketHandoff] = useState<SkillMarketEntryIdentityView>();
+  const [learningSource, setLearningSource] = useState<SkillMarketEntryIdentityView>();
   const openPublishedEntry = (result: SkillPublicationResultView): void => {
     setMarketHandoff({
       sourceId: result.sourceId,
@@ -101,7 +103,7 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
   };
   return <div className="skill-hub">
     <div className="skill-hub__tabs" role="tablist" aria-label={t("skills.sections.label")}>
-      {(["installed", "market", "sources", "sharing"] as const).map((value) => <button
+      {(["installed", "market", "learning", "sources", "sharing"] as const).map((value) => <button
         key={value}
         type="button"
         role="tab"
@@ -109,11 +111,12 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
         tabIndex={tab === value ? 0 : -1}
         className={cx(tab === value && "is-active")}
         onKeyDown={(event) => moveTablistSelection(event, "horizontal")}
-        onClick={() => setTab(value)}
+        onClick={() => { if (value === "learning") setLearningSource(undefined); setTab(value); }}
       >{t(`skills.sections.${value}`)}</button>)}
     </div>
     {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} onOpenPublished={openPublishedEntry} />}
-    {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} initialSelection={marketHandoff} onOpenSources={() => setTab("sources")} />}
+    {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} initialSelection={marketHandoff} onOpenSources={() => setTab("sources")} onLearn={(identity) => { setLearningSource(identity); setTab("learning"); }} />}
+    {tab === "learning" && <SkillLearningTools controller={controller} backends={backends} targets={targets} marketIdentity={learningSource} t={t} />}
     {tab === "sources" && <SkillMarketSourcesTools controller={controller} locale={locale} t={t} onOpenMarket={() => setTab("market")} />}
     {tab === "sharing" && <SkillCollaborationTools controller={controller} t={t} />}
   </div>;
