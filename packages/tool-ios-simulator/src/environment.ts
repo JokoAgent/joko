@@ -58,7 +58,7 @@ export interface SimulatorCommandResult {
 }
 
 export interface SimulatorCommandRunner {
-  run(command: string, args: readonly string[], signal?: AbortSignal): Promise<SimulatorCommandResult>;
+  run(command: string, args: readonly string[], options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<SimulatorCommandResult>;
 }
 
 export interface SimulatorEnvironmentRuntime {
@@ -67,7 +67,12 @@ export interface SimulatorEnvironmentRuntime {
 
 export function createNodeSimulatorCommandRunner(): SimulatorCommandRunner {
   return {
-    run(command, args, signal) {
+    run(command, args, options) {
+      const signal = options?.signal;
+      const timeoutMs = options?.timeoutMs ?? 15_000;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 180_000) {
+        throw new RangeError("Simulator command timeout is invalid.");
+      }
       if (signal?.aborted) return Promise.resolve({ stdout: "", stderr: "", exitCode: null, aborted: true });
       return new Promise<SimulatorCommandResult>((resolve) => {
         let child: ChildProcess;
@@ -118,7 +123,7 @@ export function createNodeSimulatorCommandRunner(): SimulatorCommandRunner {
           forceTimer = setTimeout(() => finish(null), 1_000);
         };
         const onAbort = (): void => { aborted = true; stop(); };
-        const timer = setTimeout(() => { timedOut = true; stop(); }, 15_000);
+        const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
         const append = (parts: Buffer[], chunk: Buffer): void => {
           if (settled || outputTruncated) return;
           bytes += chunk.length;
@@ -210,12 +215,12 @@ export function createSimulatorEnvironmentRuntime(options: { readonly platform?:
   return {
     async inspect(signal) {
       if (platform !== "darwin") return unavailable(platform, "UNSUPPORTED_PLATFORM", "iOS Simulator is available only for local macOS sessions.", ["Open this task on a macOS host with Xcode installed."]);
-      const selected = await runner.run(XCODE_SELECT, ["-p"], signal);
+      const selected = await runner.run(XCODE_SELECT, ["-p"], { signal });
       if (commandFailed(selected) || !selected.stdout.trim()) return unavailable(platform, commandIssue(selected, "XCODE_NOT_FOUND"), "Xcode command line tools are unavailable.", ["Install Xcode and select its developer tools."]);
-      const version = await runner.run(XCODEBUILD, ["-version"], signal);
+      const version = await runner.run(XCODEBUILD, ["-version"], { signal });
       if (commandFailed(version)) return unavailable(platform, commandIssue(version, "XCODE_NOT_FOUND"), "Xcode could not report its version.", ["Open or repair Xcode and select its developer tools."]);
       const xcodeVersion = version.stdout.trim().slice(0, 256) || null;
-      const listed = await runner.run(XCRUN, ["simctl", "list", "-j"], signal);
+      const listed = await runner.run(XCRUN, ["simctl", "list", "-j"], { signal });
       if (commandFailed(listed)) return unavailable(platform, commandIssue(listed, "SIMCTL_FAILED"), "Simulator device discovery failed.", ["Check the installed iOS platform in Xcode and retry."], { xcodeVersion });
       let parsed: ReturnType<typeof parseSimulatorListJson>;
       try { parsed = parseSimulatorListJson(listed.stdout); }

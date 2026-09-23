@@ -69,7 +69,7 @@ it("bounds actual argv child output and handles missing executables and cancella
   expect(await runner.run(joinMissingCommand(), [])).toMatchObject({ failed: true, exitCode: null });
   const aborted = new AbortController();
   aborted.abort();
-  expect(await runner.run(process.execPath, ["-e", "process.exit(0)"], aborted.signal)).toMatchObject({ aborted: true, exitCode: null });
+  expect(await runner.run(process.execPath, ["-e", "process.exit(0)"], { signal: aborted.signal })).toMatchObject({ aborted: true, exitCode: null });
   expect(await runner.run(process.execPath, ["-e", "process.stdout.write('x'.repeat(5*1024*1024))"]))
     .toMatchObject({ outputTruncated: true });
 });

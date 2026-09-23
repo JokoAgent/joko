@@ -1,0 +1,117 @@
+import { expect, it } from "vitest";
+import { createNodeSimulatorCommandRunner, type SimulatorCommandResult, type SimulatorCommandRunner } from "./environment.js";
+import { createSimulatorLifecycleRuntime } from "./lifecycle.js";
+
+const UDID = "A0123456-1234-1234-1234-123456789ABC";
+const XCRUN = "/usr/bin/xcrun";
+const ok = (stdout = ""): SimulatorCommandResult => ({ stdout, stderr: "", exitCode: 0 });
+const deviceList = (state: string): SimulatorCommandResult => ok(JSON.stringify({
+  runtimes: [{ identifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", name: "iOS 19.0", isAvailable: true }],
+  devices: { "com.apple.CoreSimulator.SimRuntime.iOS-19-0": [{ udid: UDID, name: "iPhone test", state,
+    isAvailable: true, deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17" }] }
+}));
+
+function scripted(...steps: { args: readonly string[]; result: SimulatorCommandResult }[]): {
+  runner: SimulatorCommandRunner; calls: string[][]; remaining(): number;
+} {
+  const pending = [...steps];
+  const calls: string[][] = [];
+  return { calls, remaining: () => pending.length, runner: { run: async (command, args) => {
+    expect(command).toBe(XCRUN);
+    calls.push([...args]);
+    const step = pending.shift();
+    expect(args).toEqual(step?.args);
+    return step?.result ?? { stdout: "", stderr: "", exitCode: null, failed: true };
+  } } };
+}
+
+it("uses exact bounded simctl routes for boot and shutdown, including already terminal states", async () => {
+  const boot = scripted(
+    { args: ["simctl", "list", "-j"], result: deviceList("Shutdown") },
+    { args: ["simctl", "boot", UDID], result: ok() },
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") },
+    { args: ["simctl", "bootstatus", UDID, "-b"], result: ok() },
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") }
+  );
+  expect(await createSimulatorLifecycleRuntime({ platform: "darwin", runner: boot.runner }).bootExact(UDID))
+    .toMatchObject({ udid: UDID, state: "Booted" });
+  expect(boot.remaining()).toBe(0);
+
+  const shutdown = scripted(
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") },
+    { args: ["simctl", "shutdown", UDID], result: ok() },
+    { args: ["simctl", "list", "-j"], result: deviceList("Shutdown") }
+  );
+  await createSimulatorLifecycleRuntime({ platform: "darwin", runner: shutdown.runner }).shutdownExact(UDID);
+  expect(shutdown.remaining()).toBe(0);
+
+  const stopped = scripted({ args: ["simctl", "list", "-j"], result: deviceList("Shutdown") });
+  await createSimulatorLifecycleRuntime({ platform: "darwin", runner: stopped.runner }).shutdownExact(UDID);
+  expect(stopped.calls).toHaveLength(1);
+
+  const starting = scripted(
+    { args: ["simctl", "list", "-j"], result: deviceList("Shutdown") },
+    { args: ["simctl", "boot", UDID], result: { stdout: "", stderr: "transition in progress", exitCode: 1 } },
+    { args: ["simctl", "list", "-j"], result: deviceList("Booting") },
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") },
+    { args: ["simctl", "bootstatus", UDID, "-b"], result: ok() },
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") }
+  );
+  expect(await createSimulatorLifecycleRuntime({ platform: "darwin", runner: starting.runner }).bootExact(UDID))
+    .toMatchObject({ state: "Booted" });
+  expect(starting.remaining()).toBe(0);
+});
+
+it("fails closed on unsupported hosts, invalid routes and uncertain command outcomes", async () => {
+  const unsupported = scripted();
+  await expect(createSimulatorLifecycleRuntime({ platform: "win32", runner: unsupported.runner }).bootExact(UDID))
+    .rejects.toMatchObject({ code: "UNSUPPORTED_PLATFORM" });
+  expect(unsupported.calls).toEqual([]);
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unsupported.runner }).findExact("booted"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  expect(unsupported.calls).toEqual([]);
+
+  const unknown = scripted(
+    { args: ["simctl", "list", "-j"], result: deviceList("Shutdown") },
+    { args: ["simctl", "boot", UDID], result: { stdout: "", stderr: "/private/secret", exitCode: null, timedOut: true } }
+  );
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner }).bootExact(UDID))
+    .rejects.toMatchObject({ code: "SIMULATOR_BOOT_UNKNOWN" });
+  expect(unknown.remaining()).toBe(0);
+
+  const malformed = scripted({ args: ["simctl", "list", "-j"], result: ok("{") });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: malformed.runner }).findExact(UDID))
+    .rejects.toMatchObject({ code: "INVALID_SIMCTL_OUTPUT" });
+  expect(JSON.stringify(malformed.calls)).not.toContain("secret");
+
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unsupported.runner }).bootExact(UDID, cancelled.signal))
+    .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+  expect(unsupported.calls).toEqual([]);
+
+  const shutdownUnknown = scripted(
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") },
+    { args: ["simctl", "shutdown", UDID], result: { stdout: "", stderr: "/private/secret", exitCode: null, timedOut: true } }
+  );
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: shutdownUnknown.runner }).shutdownExact(UDID))
+    .rejects.toMatchObject({ code: "SIMULATOR_SHUTDOWN_UNKNOWN" });
+  expect(shutdownUnknown.remaining()).toBe(0);
+
+  let now = 0;
+  const stalled = scripted(
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") },
+    { args: ["simctl", "list", "-j"], result: deviceList("Booted") },
+    { args: ["simctl", "bootstatus", UDID, "-b"], result: { stdout: "", stderr: "", exitCode: 1 } }
+  );
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: stalled.runner,
+    bootTimeoutMs: 1_000, clock: { now: () => now, sleep: async (ms) => { now += ms; } } }).bootExact(UDID))
+    .rejects.toMatchObject({ code: "SIMULATOR_BOOT_TIMEOUT" });
+  expect(stalled.remaining()).toBe(0);
+});
+
+it("uses a caller bounded timeout and terminates a real child that does not exit", async () => {
+  const result = await createNodeSimulatorCommandRunner().run(process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 30 });
+  expect(result).toMatchObject({ timedOut: true, exitCode: null });
+});
