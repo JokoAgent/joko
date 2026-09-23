@@ -29,7 +29,7 @@ it("creates and reads back a Word document through an authenticated task Tool br
     const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
     const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
     const bridge = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${internalUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx", "make_xlsx"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
     const call = async (markdown: string, overwrite = false) => {
       const response = await fetch(`${internalUrl}/internal/mcp`, {
         method: "POST",
@@ -98,7 +98,7 @@ it("advertises the document tool from the production application composition", a
       targetId: target.id,
       expectedPiGeneration: 1
     });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx", "make_xlsx"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
     const response = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -156,6 +156,23 @@ it("advertises the document tool from the production application composition", a
       format: "xlsx", sheets: [{ name: "Results", rows: 2 }], relativePath: join("documents", "actual.xlsx")
     } } });
     expect((await readFile(join(workspace, "documents", "actual.xlsx"))).subarray(0, 2).toString("ascii")).toBe("PK");
+    const readResponse = await fetch(`${url}/internal/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridge.mcpBridge.token}`,
+        "content-type": "application/json",
+        "x-joko-pi-generation": "1"
+      },
+      body: JSON.stringify({
+        requestId: randomUUID(), sessionId: "document-task", targetId: target.id, generation: 1,
+        serverId: "joko-document-tools", toolName: "read_sheet",
+        arguments: { path: "documents/actual.xlsx", sheet: "Results", startRow: 3, maxRows: 1 }
+      })
+    });
+    expect(readResponse.ok).toBe(true);
+    expect(await readResponse.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      format: "xlsx", sheet: "Results", rows: [["Total", 0.98]], totalRows: 3, truncated: false
+    } } });
     bridge.revoke();
   } finally {
     await internal?.close();

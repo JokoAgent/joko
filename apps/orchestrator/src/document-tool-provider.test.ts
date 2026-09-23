@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, it } from "vitest";
 import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
 
@@ -24,7 +27,7 @@ it("binds editable document creation to the current trusted local task and stric
     }
   });
   const context = { sessionId: "session", targetId: "target", generation: 3 };
-  expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true], ["make_xlsx", true]]);
+  expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true], ["make_xlsx", true], ["read_sheet", false]]);
   expect(provider.includeForTarget("target")).toBe(true);
   const result = await provider.callTool("make_docx", {
     markdown: "# Heading\n\n| A | B |\n|---|---|\n| 1 | 2 |",
@@ -67,4 +70,17 @@ it("binds editable document creation to the current trusted local task and stric
   expect((await provider.callTool("make_docx", { markdown: "Hi", outPath: "report.docx" }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "STALE_SCOPE" });
   expect(published).toHaveLength(3);
+  const directory = await mkdtemp(join(tmpdir(), "joko-bridge-table-"));
+  try {
+    root = directory;
+    trusted = true;
+    await writeFile(join(directory, "values.csv"), "name,value\nEast,42\nWest,21\n");
+    expect(await provider.callTool("read_sheet", { path: "values.csv", startRow: 2, maxRows: 1 }, undefined, context))
+      .toMatchObject({ isError: false, structuredContent: { rows: [["East", "42"]], totalRows: 3, truncated: true, nextStartRow: 3 } });
+    expect((await provider.callTool("read_sheet", { path: "values.csv", unknown: true }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+    expect(published).toHaveLength(3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

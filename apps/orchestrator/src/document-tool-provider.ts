@@ -1,4 +1,4 @@
-import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, type DocsThemeName } from "@joko/tool-document";
+import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, type DocsThemeName } from "@joko/tool-document";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
@@ -108,6 +108,25 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
     additionalProperties: false
   },
   requiresPermission: true
+}, {
+  serverId: DOCUMENT_TOOL_PROVIDER_ID,
+  name: "read_sheet",
+  runtimeName: "read_sheet",
+  description: "Read a task-local XLSX, XLSM, CSV or TSV file into a bounded row and column window. Returns total dimensions and explicit continuation coordinates; workbook formulas return cached values. The call only reads files.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .xlsx, .xlsm, .csv, .tsv, .tab or .txt path." },
+      sheet: { oneOf: [{ type: "string", minLength: 1, maxLength: 31 }, { type: "integer", minimum: 1 }], description: "Workbook sheet name or one-based index; defaults to first." },
+      startRow: { type: "integer", minimum: 1, default: 1 },
+      maxRows: { type: "integer", minimum: 1, maximum: 5_000, default: 200 },
+      startColumn: { type: "integer", minimum: 1, default: 1 },
+      maxColumns: { type: "integer", minimum: 1, maximum: 256, default: 64 }
+    },
+    required: ["path"],
+    additionalProperties: false
+  },
+  requiresPermission: false
 }]);
 
 export interface DocumentToolPublisher {
@@ -149,10 +168,11 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   async callTool(name: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
+      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx" && name !== "read_sheet") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
       const root = this.#requireRoot(context);
       if (name === "make_pptx") return await this.#makePptx(args, root, signal, context);
       if (name === "make_xlsx") return await this.#makeXlsx(args, root, signal, context);
+      if (name === "read_sheet") return await this.#readSheet(args, root, signal, context);
       onlyKeys(args, ["markdown", "outPath", "title", "subtitle", "cover", "theme", "overwrite"]);
       const markdown = boundedString(args["markdown"], 4 * 1024 * 1024, false, "markdown");
       const outPath = boundedString(args["outPath"], 4_096, false, "outPath");
@@ -186,8 +206,9 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       }, false);
     } catch (error) {
       if (signal?.aborted) throw error;
-      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof DocumentToolError) {
-        return response({ errorCode: error.code, message: error.message }, true);
+      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof DocumentToolError) {
+        return response({ errorCode: error.code, message: error.message,
+          ...(error instanceof SheetReadError && error.available ? { available: error.available } : {}) }, true);
       }
       return response({ errorCode: "DOCUMENT_FAILED", message: "Document creation failed." }, true);
     }
@@ -240,6 +261,14 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       path: output.path, relativePath: output.relativePath, bytes: output.bytes,
       format: "xlsx", sheets: result.sheets, theme: result.theme, zebra: result.zebra
     }, false);
+  }
+
+  async #readSheet(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
+    onlyKeys(args, ["path", "sheet", "startRow", "maxRows", "startColumn", "maxColumns"]);
+    const result = await readSheet(args, root, signal);
+    signal?.throwIfAborted();
+    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    return response({ ...result }, false);
   }
 
   #requireRoot(context: BridgeToolCallContext): string {

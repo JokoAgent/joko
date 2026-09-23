@@ -1054,6 +1054,9 @@ importers:
       exceljs:
         specifier: 4.4.0
         version: 4.4.0
+      jszip:
+        specifier: 3.10.2
+        version: 3.10.2
       marked:
         specifier: 16.4.2
         version: 16.4.2
@@ -1070,9 +1073,6 @@ importers:
       '@types/node':
         specifier: 24.12.4
         version: 24.12.4
-      jszip:
-        specifier: 3.10.2
-        version: 3.10.2
       tsx:
         specifier: 4.22.1
         version: 4.22.1
