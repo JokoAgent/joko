@@ -54,7 +54,7 @@ describe("gamepad preference authority", () => {
     expect(parseGamepadPreferences(current)).toEqual(current);
     const splitAttachments = {
       ...current,
-      buttons: current.buttons.map((action, index) => index === 0 ? "add-photos" : index === 1 ? "add-files" : action)
+      buttons: current.buttons.map((action, index) => index === 0 ? "add-photos" : index === 1 ? "add-files" : index === 2 ? "open-folder" : action)
     };
     expect(parseGamepadPreferences(splitAttachments)).toEqual(splitAttachments);
     const invalid = [

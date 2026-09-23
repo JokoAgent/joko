@@ -10,10 +10,21 @@ import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl, SelectControl } from "./ui.js";
 import { WorktreeRemovalWarnings } from "./SessionDialogs.js";
 
-export function ProjectsPage({ controller, snapshot, focusProjectId, t, runAction, onOpenNavigation, prepareSessionRemoval }: {
+export interface ProjectCreationRequest {
+  readonly requestId: number;
+  readonly ownerDocument: Document;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly connectionGeneration: bigint;
+  readonly sourceNavigationRevision: number;
+}
+
+export function ProjectsPage({ controller, snapshot, focusProjectId, createRequest, onCreateRequestConsumed, t, runAction, onOpenNavigation, prepareSessionRemoval }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly focusProjectId?: string;
+  readonly createRequest?: ProjectCreationRequest;
+  readonly onCreateRequestConsumed?: (requestId: number) => void;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onOpenNavigation: () => void;
@@ -39,6 +50,25 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     readonly complete: () => void;
   } | undefined>(undefined);
   const pageRef = useRef<HTMLElement>(null);
+  const consumedCreateRequestIdRef = useRef<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (createRequest === undefined || consumedCreateRequestIdRef.current === createRequest.requestId) return;
+    consumedCreateRequestIdRef.current = createRequest.requestId;
+    onCreateRequestConsumed?.(createRequest.requestId);
+    const page = pageRef.current;
+    const ownerDocument = createRequest.ownerDocument;
+    const ownerWindow = ownerDocument.defaultView;
+    const profile = controller.state.activeProfile;
+    const navigationRevision = controller.state.navigationRevision ?? 0;
+    if (page === null || !page.isConnected || page.ownerDocument !== ownerDocument
+      || ownerWindow === null || ownerWindow.closed || ownerDocument.visibilityState !== "visible" || !ownerDocument.hasFocus()
+      || ownerDocument.body.classList.contains("modal-open") || ownerDocument.body.dataset.appShortcutRecording === "1"
+      || ownerDocument.querySelector("[data-gamepad-preview]") !== null
+      || controller.state.connectionState !== "connected" || profile?.id !== createRequest.profileId || profile.serverId !== createRequest.serverId
+      || snapshot.generation !== createRequest.connectionGeneration || controller.state.snapshot.generation !== createRequest.connectionGeneration
+      || navigationRevision < createRequest.sourceNavigationRevision || navigationRevision > createRequest.sourceNavigationRevision + 1) return;
+    setEditor("new");
+  }, [controller, createRequest, onCreateRequestConsumed, snapshot.generation]);
   useLayoutEffect(() => {
     const scope = {};
     archiveScopeRef.current = scope;

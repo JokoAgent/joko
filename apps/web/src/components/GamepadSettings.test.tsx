@@ -113,6 +113,15 @@ describe("gamepad settings", () => {
     await act(async () => option?.click());
     expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-schedules");
   });
+  it("offers project folder registration as a persistent standard gamepad action", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const option = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent === "Open folder");
+    expect(option).toBeDefined();
+    await act(async () => option?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-folder");
+  });
 
   it("offers photos and files as independent persistent actions", async () => {
     const container = await renderSettings();

@@ -7,12 +7,69 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type SessionView, type TargetView } from "../model.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT } from "../sidebar-layout.js";
 import { ProjectsPage } from "./ProjectsPage.js";
+import type { ProjectCreationRequest } from "./ProjectsPage.js";
 
 const roots: Root[] = [];
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   document.body.replaceChildren(); vi.unstubAllGlobals();
+});
+
+it("consumes an exact project-creation owner once and only reopens for a new current request", async () => {
+  vi.spyOn(document, "hasFocus").mockReturnValue(true);
+  const host = document.createElement("div"); document.body.append(host);
+  const root = createRoot(host); roots.push(root);
+  const snapshot = { ...emptySnapshot(), generation: 7n };
+  const controller = {
+    state: {
+      connectionState: "connected",
+      activeProfile: { id: "profile", serverId: "owner" },
+      navigationRevision: 9,
+      snapshot,
+      preferences: { ...DEFAULT_UI_PREFERENCES, sidebarOwnerLayouts: {} }
+    }
+  } as unknown as AppController;
+  const consumed = vi.fn();
+  const request = (requestId: number, patch: Partial<ProjectCreationRequest> = {}): ProjectCreationRequest => ({
+    requestId,
+    ownerDocument: document,
+    profileId: "profile",
+    serverId: "owner",
+    connectionGeneration: 7n,
+    sourceNavigationRevision: 8,
+    ...patch
+  });
+  const render = (createRequest: ProjectCreationRequest) => act(async () => root.render(<ProjectsPage
+    controller={controller}
+    snapshot={snapshot}
+    createRequest={createRequest}
+    onCreateRequestConsumed={consumed}
+    t={(key) => key}
+    runAction={() => undefined}
+    onOpenNavigation={() => undefined}
+    prepareSessionRemoval={async (sessions) => ({ clean: sessions.length, dirty: 0, unknown: 0 })}
+  />));
+
+  await render(request(1));
+  expect(consumed).toHaveBeenCalledExactlyOnceWith(1);
+  expect(host.querySelector("[role='dialog']")?.textContent).toContain("projects.new");
+  await act(async () => button(host, "common.cancel").click());
+  expect(host.querySelector("[role='dialog']")).toBeNull();
+
+  await render(request(1));
+  expect(consumed).toHaveBeenCalledTimes(1);
+  expect(host.querySelector("[role='dialog']")).toBeNull();
+
+  await render(request(2, { profileId: "other-profile" }));
+  await render(request(3, { connectionGeneration: 8n }));
+  await render(request(4, { sourceNavigationRevision: 6 }));
+  expect(consumed.mock.calls.map(([requestId]) => requestId)).toEqual([1, 2, 3, 4]);
+  expect(host.querySelector("[role='dialog']")).toBeNull();
+
+  await render(request(5));
+  expect(consumed).toHaveBeenLastCalledWith(5);
+  expect(host.querySelector("[role='dialog']")?.textContent).toContain("projects.new");
 });
 
 it("restores the same project once and includes it in the current sidebar filter after persistence", async () => {

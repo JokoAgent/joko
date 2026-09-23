@@ -150,6 +150,19 @@ describe("gamepad UI target ownership", () => {
     delete document.body.dataset.appShortcutRecording;
     press(); expect(navigate).toHaveBeenCalledWith("open-schedules");
   });
+  it("admits project folder registration only from the visible focused host boundary", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (): void => input({ kind: "action", action: "open-folder", phase: "press" });
+    press(); expect(navigate).toHaveBeenCalledExactlyOnceWith("open-folder");
+    document.body.classList.add("modal-open"); press(); document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    press(); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; press(); delete document.body.dataset.appShortcutRecording;
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press(); frame.remove();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); press();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
   it("admits page history only from the visible focused host outside modal, preview and shortcut recording", () => {
     const navigate = vi.fn();
     const input = createGamepadDomInput(document, navigate);
