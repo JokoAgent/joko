@@ -48,6 +48,7 @@ import {
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
 import { useGamepadInput } from "./gamepad-client.js";
+import { toggleGamepadFullscreen } from "./gamepad-fullscreen.js";
 import { currentGamepadTaskRoot, isGamepadInspectorAction, type GamepadInspectorRequest } from "./gamepad-actions.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { promptRecommendationOwnerKey, promptRecommendationStore } from "./prompt-recommendation-store.js";
@@ -1084,6 +1085,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (action === "open-schedules") { navigateFromShortcut({ kind: "schedules" }); return; }
     if (action === "navigate-back") { if (window.history.length > 1) window.history.back(); return; }
     if (action === "navigate-forward") { window.history.forward(); return; }
+    if (action === "toggle-fullscreen") {
+      runAction("gamepad-fullscreen", () => toggleGamepadFullscreen(document, window.jokoDesktop, t("settings.gamepad.fullscreenUnavailable")));
+      return;
+    }
     if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
     if (action === "toggle-inspector") {
       if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));

@@ -26,6 +26,7 @@ import {
   type WebContents
 } from "electron";
 import windowStateKeeper from "electron-window-state";
+import { toggleApplicationWindowFullscreen } from "./window-fullscreen.js";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { release as operatingSystemRelease } from "node:os";
@@ -1133,6 +1134,7 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
+        if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
         await verifyPackagedSmokeSessionWindow(window);
       }).then(() => {
         clearTimeout(timeout);
@@ -1166,6 +1168,30 @@ function safeSmokeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error ?? "unknown error"))
     .replace(/[\r\n\t]+/gu, " ")
     .slice(0, 500);
+}
+
+async function verifyPackagedSmokeFullscreen(window: BrowserWindow): Promise<void> {
+  if (window.isDestroyed() || window.isFullScreen()) throw new Error("Packaged fullscreen smoke has no normal application window.");
+  const invoke = (): Promise<unknown> => window.webContents.executeJavaScript(
+    "window.jokoDesktop?.window?.toggleFullscreen?.()",
+    true
+  );
+  const waitForState = async (expected: boolean): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && !window.isDestroyed() && window.isFullScreen() !== expected) {
+      await waitForPackagedSmokePoll();
+    }
+    if (window.isDestroyed() || window.isFullScreen() !== expected) throw new Error("Packaged fullscreen state did not settle.");
+  };
+  try {
+    if (await invoke() !== true) throw new Error("Packaged fullscreen bridge did not request entry.");
+    await waitForState(true);
+    if (await invoke() !== false) throw new Error("Packaged fullscreen bridge did not request exit.");
+    await waitForState(false);
+    recordPackagedSmokeProgress("application_fullscreen_round_trip");
+  } finally {
+    if (!window.isDestroyed() && window.isFullScreen()) window.setFullScreen(false);
+  }
 }
 
 async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<void> {
@@ -1216,6 +1242,7 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
     throw new Error("Packaged smoke Task window lost its main-process identity.");
   }
   await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
+  if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(taskWindow);
   if (sessionWindows.get(taskOwnerKey) !== taskWindow) {
     throw new Error("Packaged smoke Task-window owner changed while its UI was loading.");
   }
@@ -4816,6 +4843,13 @@ function registerIpc(): void {
     if (window === null) return false;
     if (window.isMaximized()) window.unmaximize(); else window.maximize();
     return window.isMaximized();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.windowToggleFullscreen, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 0) throw new TypeError("Desktop fullscreen does not accept parameters.");
+    const owner = sessionWindowOwnersByContents.get(event.sender);
+    const sessionWindow = owner === undefined ? undefined : sessionWindows.get(sessionWindowOwnerKey(owner));
+    return toggleApplicationWindowFullscreen(event.sender, BrowserWindow.fromWebContents(event.sender), mainWindow, sessionWindow);
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowClose, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);

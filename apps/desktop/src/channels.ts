@@ -1,6 +1,7 @@
 export const DESKTOP_CHANNELS = {
   windowMinimize: "joko:window:minimize",
   windowToggleMaximize: "joko:window:toggle-maximize",
+  windowToggleFullscreen: "joko:window:toggle-fullscreen",
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",

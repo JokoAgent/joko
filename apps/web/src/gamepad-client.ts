@@ -177,10 +177,10 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
     }
     if (doc.body.classList.contains("modal-open")) return;
     if ((effect.action === "open-skills" || effect.action === "open-schedules" || effect.action === "navigate-back"
-      || effect.action === "navigate-forward" || isGamepadInspectorAction(effect.action)) && (doc.body.dataset.appShortcutRecording === "1"
+      || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen" || isGamepadInspectorAction(effect.action)) && (doc.body.dataset.appShortcutRecording === "1"
       || focused !== null && (focused.matches("iframe, webview, object, embed")
         || focused.closest("[data-gamepad-preview], [data-message-rewind-preview], [role='dialog'], [role='menu'], [role='listbox']") !== null))) return;
-    if ((effect.action === "navigate-back" || effect.action === "navigate-forward")
+    if ((effect.action === "navigate-back" || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen")
       && (doc.visibilityState !== "visible" || !doc.hasFocus() || doc.querySelector("[data-gamepad-preview]") !== null)) return;
     if (effect.action === "focus-composer") {
       currentGamepadTaskRoot(doc)?.querySelector<HTMLElement>("[data-composer-editor='true']")?.focus(); return;

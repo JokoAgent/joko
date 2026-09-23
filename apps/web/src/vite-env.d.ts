@@ -300,6 +300,7 @@ interface JokoDesktopApi {
   readonly window: {
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;
+    toggleFullscreen(): Promise<boolean>;
     setZoomFactor(zoomFactor: number): Promise<void>;
     close(): Promise<void>;
   };

@@ -166,6 +166,19 @@ describe("gamepad UI target ownership", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false); press("navigate-back");
     expect(navigate).toHaveBeenCalledTimes(2);
   });
+  it("routes fullscreen only from the active host input boundary", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (): void => input({ kind: "action", action: "toggle-fullscreen", phase: "press" });
+    press(); expect(navigate).toHaveBeenCalledExactlyOnceWith("toggle-fullscreen");
+    document.body.classList.add("modal-open"); press(); document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    press(); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; press(); delete document.body.dataset.appShortcutRecording;
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press(); frame.remove();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); press();
+    expect(navigate).toHaveBeenCalledTimes(1);
+  });
   it("routes inspector commands only while the focused task surface can act", () => {
     const root = task("one"); root.querySelector("button")!.focus();
     const navigate = vi.fn();

@@ -3,7 +3,7 @@ export const GAMEPAD_ACTIONS = [
   "previous-task", "next-task", "previous-panel", "next-panel", "scroll-up", "scroll-down",
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
   "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands",
-  "open-settings", "open-skills", "open-schedules", "toggle-inspector", "open-terminal", "open-browser-tab", "toggle-review-tab", "scroll-bottom", "voice"
+  "open-settings", "open-skills", "open-schedules", "toggle-inspector", "toggle-fullscreen", "open-terminal", "open-browser-tab", "toggle-review-tab", "scroll-bottom", "voice"
 ] as const;
 export type GamepadAction = (typeof GAMEPAD_ACTIONS)[number];
 export interface GamepadSkillBinding {
@@ -34,7 +34,7 @@ export function createDefaultGamepadPreferences(): GamepadPreferences {
     enabled: false,
     buttons: [
       "submit", "navigate-back", "toggle-fast", "new-task", "effort-decrease", "effort-increase",
-      "voice", "voice", "toggle-sidebar", "open-settings", "focus-composer", "scroll-bottom",
+      "voice", "voice", "toggle-fullscreen", "open-settings", "focus-composer", "scroll-bottom",
       "scroll-up", "scroll-down", "toggle-sidebar", "toggle-inspector", "open-schedules"
     ],
     leftStick: { mode: "commands", directions: { up: "previous-task", down: "next-task", left: "toggle-sidebar", right: "toggle-inspector" } },

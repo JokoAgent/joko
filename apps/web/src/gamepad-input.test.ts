@@ -113,6 +113,14 @@ describe("gamepad preference authority", () => {
 });
 
 describe("gamepad input ownership", () => {
+  it("maps the standard View button to fullscreen after a neutral sample", () => {
+    expect(createDefaultGamepadPreferences().buttons[8]).toBe("toggle-fullscreen");
+    const { sample } = sampler();
+    expect(sample([pad({ down: [8] })]).effects).toEqual([]);
+    sample();
+    expect(sample([pad({ down: [8] })]).effects).toEqual([{ kind: "action", action: "toggle-fullscreen", phase: "press" }]);
+    expect(sample([pad({ down: [8] })]).effects).toEqual([]);
+  });
   it("maps the default B button to history back and accepts a saved forward binding", () => {
     const defaultLayout = createDefaultGamepadPreferences();
     expect(defaultLayout.buttons[1]).toBe("navigate-back");

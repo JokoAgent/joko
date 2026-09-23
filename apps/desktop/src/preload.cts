@@ -73,6 +73,7 @@ const { contextBridge, ipcRenderer } = require("electron") as typeof import("ele
 const DESKTOP_CHANNELS = {
   windowMinimize: "joko:window:minimize",
   windowToggleMaximize: "joko:window:toggle-maximize",
+  windowToggleFullscreen: "joko:window:toggle-fullscreen",
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
@@ -228,6 +229,7 @@ const desktopApi = Object.freeze({
   window: Object.freeze({
     minimize: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowMinimize),
     toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowToggleMaximize),
+    toggleFullscreen: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowToggleFullscreen),
     setZoomFactor: (zoomFactor: number): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowSetZoomFactor, zoomFactor),
     close: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowClose)
   }),
