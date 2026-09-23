@@ -22,15 +22,21 @@ it("binds Simulator discovery and dispatch to an exact trusted local task", asyn
   expect(provider.includeForTarget("target")).toBe(true);
   expect(provider.tools.map(tool => tool.name)).toEqual(["list_tools", "call_tool"]);
   expect((await provider.callTool("list_tools", { category: "ios_simulator" }, undefined, context)).structuredContent)
-    .toMatchObject({ category: "ios_simulator", tools: [{ name: "check_environment" }, { name: "list_simulator_devices" }] });
+    .toMatchObject({ category: "ios_simulator", tools: [{ name: "check_environment" }, { name: "doctor" }, { name: "list_simulator_devices" }] });
   expect((await provider.callTool("call_tool", { name: "check_environment", args: {} }, undefined, context)).structuredContent)
     .toMatchObject({ ok: true, data: { issue: "UNSUPPORTED_PLATFORM" } });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, context)).structuredContent)
+    .toMatchObject({ ok: true, data: { environment: { issue: "UNSUPPORTED_PLATFORM" }, availability: {
+      doctor: { state: "available" }, list_simulator_devices: { state: "unavailable", reasonCode: "UNSUPPORTED_PLATFORM" }
+    }, instanceControl: { state: "unavailable", reasonCode: "INSTANCE_CONTROL_UNAVAILABLE" }, recommendedActions: ["check_environment"] } });
   expect((await provider.callTool("call_tool", { name: "list_simulator_devices", args: {} }, undefined, context)).structuredContent)
     .toMatchObject({ ok: false, errorCode: "UNSUPPORTED_PLATFORM" });
-  expect(probes).toBe(2);
+  expect(probes).toBe(3);
   expect((await provider.callTool("call_tool", { name: "list_devices", args: {} }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "UNKNOWN_TOOL" });
   expect((await provider.callTool("call_tool", { name: "check_environment", args: { ignored: true } }, undefined, context)).structuredContent)
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: { ignored: true } }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   generation = 4;
   expect((await provider.callTool("call_tool", { name: "check_environment", args: {} }, undefined, context)).structuredContent)
@@ -44,5 +50,5 @@ it("binds Simulator discovery and dispatch to an exact trusted local task", asyn
   expect(provider.includeForTarget("target")).toBe(false);
   expect((await provider.callTool("call_tool", { name: "check_environment", args: {} }, undefined, context)).structuredContent)
     .toMatchObject({ errorCode: "STALE_SCOPE" });
-  expect(probes).toBe(2);
+  expect(probes).toBe(3);
 });

@@ -44,7 +44,13 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
       return await response.json() as { isError: boolean; details: { mcpStructuredContent: Record<string, unknown> } };
     };
     expect(await call("list_tools", { category: "ios_simulator" })).toMatchObject({ isError: false, details: { mcpStructuredContent: {
-      tools: [{ name: "check_environment" }, { name: "list_simulator_devices" }]
+      tools: [{ name: "check_environment" }, { name: "doctor" }, { name: "list_simulator_devices" }]
+    } } });
+    const diagnosis = await call("call_tool", { name: "doctor", args: {} });
+    if (process.platform === "win32") expect(diagnosis).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { environment: { issue: "UNSUPPORTED_PLATFORM" }, availability: {
+        list_simulator_devices: { state: "unavailable", reasonCode: "UNSUPPORTED_PLATFORM" }
+      }, instanceControl: { state: "unavailable" } }
     } } });
     const environment = await call("call_tool", { name: "check_environment", args: {} });
     if (process.platform === "win32") expect(environment).toMatchObject({ isError: false, details: { mcpStructuredContent: {

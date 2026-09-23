@@ -7,13 +7,14 @@ const CATEGORY = "ios_simulator";
 
 const TOOLS = Object.freeze([
   { name: "check_environment", description: "Check the local macOS Xcode and iOS Simulator environment without opening Simulator.app.", readOnly: true },
+  { name: "doctor", description: "Diagnose the current task's iOS Simulator environment and available actions.", readOnly: true },
   { name: "list_simulator_devices", description: "List simulated iPhone and iPad devices with exact UDIDs, runtime and boot states.", readOnly: true }
 ] as const);
 
 const BRIDGE_TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
   name: "list_tools",
-  description: "Discover task-local iOS Simulator tools. Start with check_environment before selecting a device.",
+  description: "Discover task-local iOS Simulator tools. Start with doctor or check_environment before selecting a device.",
   inputSchema: { type: "object", properties: { category: { type: "string", enum: [CATEGORY] } }, additionalProperties: false },
   requiresPermission: false
 }, {
@@ -35,7 +36,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly configurablePolicy = Object.freeze({
     id: "joko-ios-simulator-tools-policy",
     displayName: "iOS Simulator tools",
-    description: "Inspect the local iOS Simulator environment and devices for this task.",
+    description: "Inspect the local iOS Simulator environment, diagnosis and devices for this task.",
     productDefaultEnabled: true
   });
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
@@ -65,7 +66,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         if (arguments_["category"] !== undefined && arguments_["category"] !== CATEGORY) throw new SimulatorToolError("INVALID_ARGUMENT", "Unknown Simulator tool category.");
         const tools = TOOLS.map(tool => ({ name: tool.name, category: CATEGORY, description: tool.description, readOnly: tool.readOnly }));
         return response(arguments_["category"] === CATEGORY
-          ? { ok: true, category: CATEGORY, tools, workflow: "Call check_environment, then list_simulator_devices. Use exact UDIDs for later instance actions." }
+          ? { ok: true, category: CATEGORY, tools, workflow: "Call doctor or check_environment, then list_simulator_devices. Use exact UDIDs for later instance actions." }
           : { ok: true, categories: [{ name: CATEGORY, tool_count: tools.length }], hint: "Call list_tools with category ios_simulator to discover actions." }, false);
       }
       if (name !== "call_tool") throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator bridge tool is unavailable.");
@@ -78,6 +79,18 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       signal?.throwIfAborted();
       this.#requireScope(context);
       if (selected === "check_environment") return response({ ok: true, data: environment }, false);
+      if (selected === "doctor") return response({ ok: true, data: {
+        environment,
+        availability: {
+          check_environment: { state: "available", backend: "host" },
+          doctor: { state: "available", backend: "host" },
+          list_simulator_devices: environment.ready
+            ? { state: "available", backend: "simctl" }
+            : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" }
+        },
+        instanceControl: { state: "unavailable", reasonCode: "INSTANCE_CONTROL_UNAVAILABLE" },
+        recommendedActions: environment.ready ? ["list_simulator_devices"] : ["check_environment"]
+      } }, false);
       if (!environment.ready) return response({ ok: false, errorCode: environment.issue, message: environment.error, data: { environment } }, true);
       return response({ ok: true, data: { devices: environment.devices, xcodeVersion: environment.xcodeVersion } }, false);
     } catch (error) {
