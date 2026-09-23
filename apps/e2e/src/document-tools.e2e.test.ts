@@ -29,7 +29,7 @@ it("creates and reads back a Word document through an authenticated task Tool br
     const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
     const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
     const bridge = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${internalUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx"]);
     const call = async (markdown: string, overwrite = false) => {
       const response = await fetch(`${internalUrl}/internal/mcp`, {
         method: "POST",
@@ -98,7 +98,7 @@ it("advertises the document tool from the production application composition", a
       targetId: target.id,
       expectedPiGeneration: 1
     });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["make_docx", "make_pptx"]);
     const response = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -115,6 +115,27 @@ it("advertises the document tool from the production application composition", a
     expect(response.ok).toBe(true);
     expect(await response.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: { format: "docx" } } });
     expect((await readFile(join(workspace, "documents", "actual.docx"))).subarray(0, 2).toString("ascii")).toBe("PK");
+    const presentationResponse = await fetch(`${url}/internal/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridge.mcpBridge.token}`,
+        "content-type": "application/json",
+        "x-joko-pi-generation": "1"
+      },
+      body: JSON.stringify({
+        requestId: randomUUID(), sessionId: "document-task", targetId: target.id, generation: 1,
+        serverId: "joko-document-tools", toolName: "make_pptx",
+        arguments: { slides: [
+          { layout: "cover", title: "Production composition" },
+          { layout: "metrics", title: "Outcomes", metrics: [{ value: "98%", label: "Uptime" }, { value: 12, label: "Regions" }] }
+        ], outPath: "documents/actual.pptx", title: "Production composition", theme: "navy" }
+      })
+    });
+    expect(presentationResponse.ok).toBe(true);
+    expect(await presentationResponse.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      format: "pptx", slides: 2, layouts: ["cover", "metrics"], relativePath: join("documents", "actual.pptx")
+    } } });
+    expect((await readFile(join(workspace, "documents", "actual.pptx"))).subarray(0, 2).toString("ascii")).toBe("PK");
     bridge.revoke();
   } finally {
     await internal?.close();
