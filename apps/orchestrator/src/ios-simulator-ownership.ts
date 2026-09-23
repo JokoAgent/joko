@@ -262,6 +262,11 @@ export class SimulatorOwnershipRegistry {
     return found === undefined ? null : publicInstance(found);
   }
 
+  /** Resource admission observes every Store-owned device, including stale task bindings. */
+  listForResourceAdmission(): readonly { readonly instanceId: string; readonly simulatorUdid: string }[] {
+    return this.#load().instances.map(item => ({ instanceId: item.instanceId, simulatorUdid: item.simulatorUdid }));
+  }
+
   restoreCreatedDevice(udid: string): PublicSimulatorInstance {
     if (!UUID.test(udid)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator UDID is invalid.");
     return this.#store.transaction(() => {

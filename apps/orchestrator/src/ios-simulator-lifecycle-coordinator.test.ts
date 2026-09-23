@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SimulatorLifecycleError, type SimulatorDevice, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
+import { SimulatorLifecycleError, SimulatorResourceScheduler, type SimulatorDevice, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
 import { OperationalStore } from "@joko/store";
 import { expect, it } from "vitest";
 import { SimulatorLifecycleCoordinator, type SimulatorLifecycleEffectAuthority } from "./ios-simulator-lifecycle-coordinator.js";
@@ -13,6 +13,8 @@ const DEVICE: SimulatorDevice = {
   deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null
 };
 const SCOPE = { sessionId: "first", targetId: "target", generation: 1 } as const;
+const OTHER = { ...SCOPE, sessionId: "second" } as const;
+const OTHER_DEVICE: SimulatorDevice = { ...DEVICE, udid: "B0123456-1234-1234-1234-123456789ABC", name: "Second iPhone" };
 const authority = (letter: string): SimulatorLifecycleEffectAuthority => ({
   effectIdentity: letter.repeat(64), requestBodyHash: `sha256:${letter.repeat(64)}`, providerGeneration: 1
 });
@@ -185,4 +187,108 @@ it("tombstones a crash-interrupted claim after SQLite reopen and allows only a n
     store?.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+it("serializes starts across coordinators and tasks sharing one Store", async () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    const ownership = seed(store);
+    const first = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const second = ownership.bindExternalDevice(OTHER, OTHER_DEVICE);
+    const states = new Map([[DEVICE.udid, "Shutdown"], [OTHER_DEVICE.udid, "Shutdown"]]);
+    let entered!: () => void;
+    const firstBoot = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const releaseFirst = new Promise<void>(resolve => { release = resolve; });
+    const calls: string[] = [];
+    const runtime: SimulatorLifecycleRuntime = {
+      findExact: async udid => ({ ...(udid === DEVICE.udid ? DEVICE : OTHER_DEVICE), state: states.get(udid)! }),
+      bootExact: async udid => {
+        calls.push(udid);
+        if (udid === DEVICE.udid) { entered(); await releaseFirst; }
+        states.set(udid, "Booted");
+        return { ...(udid === DEVICE.udid ? DEVICE : OTHER_DEVICE), state: "Booted" };
+      },
+      shutdownExact: async () => undefined
+    };
+    const firstCoordinator = new SimulatorLifecycleCoordinator(store, ownership, runtime);
+    const secondCoordinator = new SimulatorLifecycleCoordinator(store, ownership, runtime);
+    const active = firstCoordinator.start(SCOPE, route(first), authority("1"));
+    await firstBoot;
+    const controller = new AbortController();
+    const cancelledStop = secondCoordinator.stop(OTHER, route(second), authority("2"), controller.signal);
+    controller.abort();
+    await Promise.resolve();
+    expect(calls).toEqual([DEVICE.udid]);
+    release();
+    expect((await active).instance.lifecycleState).toBe("ready");
+    await expect(cancelledStop).rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+    expect(ownership.listForTask(OTHER)).toMatchObject([{ generation: 1, lifecycleState: "stopped", healthState: "healthy" }]);
+    const queued = secondCoordinator.start(OTHER, route(second), authority("3"));
+    expect((await queued).instance.lifecycleState).toBe("ready");
+    expect(calls).toEqual([DEVICE.udid, OTHER_DEVICE.udid]);
+  } finally { store.close(); }
+});
+
+it("rebuilds actual occupancy after SQLite restart and frees capacity only after exact shutdown", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-simulator-resource-"));
+  const database = join(directory, "store.db");
+  let store: OperationalStore | undefined;
+  try {
+    store = new OperationalStore(database);
+    const ownership = seed(store);
+    const first = ownership.bindExternalDevice(SCOPE, { ...DEVICE, state: "Booted" });
+    const second = ownership.bindExternalDevice(OTHER, OTHER_DEVICE);
+    store.close();
+    store = new OperationalStore(database);
+    store.recoverStartup("simulator-resource-recovery");
+    const restored = new SimulatorOwnershipRegistry(store);
+    const states = new Map([[DEVICE.udid, "Booted"], [OTHER_DEVICE.udid, "Shutdown"]]);
+    let boots = 0;
+    const runtime: SimulatorLifecycleRuntime = {
+      findExact: async udid => ({ ...(udid === DEVICE.udid ? DEVICE : OTHER_DEVICE), state: states.get(udid)! }),
+      bootExact: async udid => { boots += 1; states.set(udid, "Booted");
+        return { ...(udid === DEVICE.udid ? DEVICE : OTHER_DEVICE), state: "Booted" }; },
+      shutdownExact: async udid => { states.set(udid, "Shutdown"); }
+    };
+    const resources = new SimulatorResourceScheduler({ softLimit: 1, hardLimit: 1,
+      memoryProbe: async () => ({ source: "macos-memory-pressure", freePercentage: 30,
+        freeBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 }) });
+    const coordinator = new SimulatorLifecycleCoordinator(store, restored, runtime, resources);
+    await expect(coordinator.start(OTHER, route(second), authority("3")))
+      .rejects.toMatchObject({ code: "RESOURCE_LIMIT_REACHED" });
+    expect(boots).toBe(0);
+    expect(restored.listForTask(OTHER)).toMatchObject([{ generation: 1, lifecycleState: "stopped", healthState: "healthy" }]);
+    expect(resources.snapshot().runningCount).toBe(1);
+    await coordinator.stop(SCOPE, route(first), authority("4"));
+    expect(resources.snapshot().runningCount).toBe(0);
+    expect((await coordinator.start(OTHER, route(second), authority("5"))).instance.lifecycleState).toBe("ready");
+    expect(boots).toBe(1);
+  } finally {
+    store?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it("rechecks the task owner after resource observation and before boot dispatch", async () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    const ownership = seed(store);
+    const attached = ownership.bindExternalDevice(SCOPE, DEVICE);
+    let reads = 0;
+    let boots = 0;
+    const runtime: SimulatorLifecycleRuntime = {
+      findExact: async () => {
+        reads += 1;
+        if (reads === 2) store.upsertTarget({ ...store.getTarget("target").descriptor, workspaceRoot: "D:/changed" });
+        return DEVICE;
+      },
+      bootExact: async () => { boots += 1; return { ...DEVICE, state: "Booted" }; },
+      shutdownExact: async () => undefined
+    };
+    await expect(new SimulatorLifecycleCoordinator(store, ownership, runtime)
+      .start(SCOPE, route(attached), authority("6"))).rejects.toMatchObject({ code: "STALE_SCOPE" });
+    expect(boots).toBe(0);
+    expect(store.listOperations({ sessionId: "first" })).toMatchObject([{ status: "failed" }]);
+  } finally { store.close(); }
 });
