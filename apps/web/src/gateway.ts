@@ -5799,6 +5799,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
     if (provider.providerId.length === 0 || provider.displayName.length === 0) throw new GatewayError("Provider ID and name are required.");
     await this.submit({ case: "upsertProvider", value: { provider } }, true, [], scope.signal);
+    // A credential upload may have started a snapshot read before this commit.
+    // Let any such read settle, then project the committed Provider revision.
+    await this.#refreshPromise?.catch(() => undefined);
+    scope.signal.throwIfAborted();
+    await this.refresh();
   }
 
   async deleteProvider(providerId: string): Promise<void> {
