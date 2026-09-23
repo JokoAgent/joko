@@ -47,6 +47,7 @@
     "@joko/tool-browser": "workspace:*",
     "@joko/tool-computer": "workspace:*",
     "@joko/tool-document": "workspace:*",
+    "@joko/tool-ios-simulator": "workspace:*",
     "@joko/tool-lsp": "workspace:*",
     "@joko/tool-terminal": "workspace:*",
     "@joko/voice-input": "workspace:*",

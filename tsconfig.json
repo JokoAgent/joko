@@ -17,6 +17,7 @@
     { "path": "./packages/adapter-transcription-scribe" },
     { "path": "./packages/adapter-transcription-sauc" },
     { "path": "./packages/tool-android" },
+    { "path": "./packages/tool-ios-simulator" },
     { "path": "./packages/tool-browser" },
     { "path": "./packages/tool-computer" },
     { "path": "./packages/tool-lsp" },

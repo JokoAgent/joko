@@ -25,6 +25,7 @@ export * from "./credential-manager.js";
 export * from "./credential-vault.js";
 export * from "./diagnostics-bundle.js";
 export * from "./document-tool-provider.js";
+export * from "./ios-simulator-tool-bridge.js";
 export * from "./document-electron-pdf-renderer.js";
 export * from "./event-hub.js";
 export * from "./extension-catalog.js";

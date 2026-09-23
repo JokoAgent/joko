@@ -118,6 +118,7 @@ import {
 } from "./mobile-push.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
+import { IosSimulatorToolBridgeProvider } from "./ios-simulator-tool-bridge.js";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -804,6 +805,9 @@ export async function createOrchestratorApplication(
       ...(config.pdfRendererHost
         ? { pdfRenderer: new ElectronDocumentPdfRenderer(config.pdfRendererHost.executablePath, config.pdfRendererHost.appPath) }
         : config.browser ? { pdfRenderer: new ChromiumDocumentPdfRenderer(config.browser.executablePath) } : {}) })
+  );
+  const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
+    new IosSimulatorToolBridgeProvider({ store })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
     store,
@@ -2195,6 +2199,7 @@ export async function createOrchestratorApplication(
     unregisterLspBridge();
     unregisterRemoteHostTools();
     unregisterDocumentTools();
+    unregisterIosSimulatorTools();
     lspBridge.dispose();
     unregisterSchedulerBridgeTools();
     unregisterVisionBridgeTools();
@@ -2370,6 +2375,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());
+        await attempt(() => unregisterIosSimulatorTools());
         await attempt(() => lspBridge.dispose());
         await attempt(() => unregisterSchedulerBridgeTools());
         await attempt(() => unregisterVisionBridgeTools());
