@@ -114,6 +114,25 @@ describe("gamepad settings", () => {
     expect(readGamepadPreferences().preferences.buttons[0]).toBe("open-schedules");
   });
 
+  it("offers photos and files as independent persistent actions", async () => {
+    const container = await renderSettings();
+    const binding = control(container, "Action for South face button");
+    await act(async () => binding.click());
+    const options = [...document.querySelectorAll<HTMLElement>("[role='option']")];
+    const photos = options.find((candidate) => candidate.textContent === "Add photos");
+    const files = options.find((candidate) => candidate.textContent === "Add files");
+    expect(photos).toBeDefined();
+    expect(files).toBeDefined();
+    await act(async () => photos?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("add-photos");
+
+    await act(async () => binding.click());
+    const currentFiles = [...document.querySelectorAll<HTMLElement>("[role='option']")]
+      .find((candidate) => candidate.textContent === "Add files");
+    await act(async () => currentFiles?.click());
+    expect(readGamepadPreferences().preferences.buttons[0]).toBe("add-files");
+  });
+
   it("retains the committed binding and keyboard focus on save failure, then allows a successful retry", async () => {
     const container = await renderSettings();
     const binding = required(container.querySelector<HTMLButtonElement>("[role='combobox']"));

@@ -55,6 +55,18 @@ describe("gamepad action owner routing", () => {
     expect(dispatchGamepadOwnedAction(document, "submit")).toBe(false); expect(submit).not.toHaveBeenCalled();
   });
 
+  it("blocks a live morph menu before its delayed focus settles", async () => {
+    const submit = vi.fn(); await render(<Task name="Input" focused handlers={{ submit }} />);
+    focus("Input");
+    const panel = document.body.appendChild(document.createElement("div"));
+    panel.dataset.morphSide = "bottom";
+    expect(dispatchGamepadOwnedAction(document, "submit")).toBe(false);
+    expect(submit).not.toHaveBeenCalled();
+    panel.setAttribute("inert", "");
+    expect(dispatchGamepadOwnedAction(document, "submit")).toBe(true);
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
   it("requires the focused portal to own approval and does not confirm an unrelated modal", async () => {
     const approve = vi.fn(); const submit = vi.fn(); const portal = document.body.appendChild(document.createElement("div"));
     await render(<><Task name="Task" focused handlers={{ submit }} /><Interaction target={portal} decide={approve} /></>);

@@ -1,6 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, DragEvent, JSX } from "react";
+import type { DragEvent, JSX } from "react";
 import {
   AlertTriangle,
   AtSign,
@@ -90,6 +90,8 @@ import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./Com
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { useDraftVoiceInput } from "./use-draft-voice-input.js";
 import { useGamepadVoiceInput } from "../gamepad-client.js";
+import { useGamepadActions } from "../gamepad-actions.js";
+import { ComposerAttachmentPicker, type ComposerAttachmentPickerRequirement } from "../composer-attachment-picker.js";
 import { useHeldVoiceInput } from "./use-held-voice-input.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
@@ -230,6 +232,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const bindVoiceSend = useCallback((node: HTMLButtonElement | null) => setVoiceSendTarget(node ?? undefined), []);
   const voiceCaretRef = useRef<number | undefined>(undefined);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentPicker = useMemo(() => new ComposerAttachmentPicker(), []);
   const editorDocumentRef = useRef(editorDocument);
   const textRef = useRef(text);
   const mentionsRef = useRef(mentions);
@@ -1063,6 +1066,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
   }, [submissionScope, voiceRoot]);
+  useLayoutEffect(() => () => attachmentPicker.retire(), [attachmentPicker, submissionScope]);
   useLayoutEffect(() => {
     if (submissionOriginRef.current !== undefined && !submissionOriginRef.current.isCurrent()) submissionAbortRef.current?.abort();
   });
@@ -1464,6 +1468,29 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     if (next.length > 0) setAttachments((current) => [...current, ...next]);
   };
 
+  const attachmentPickerAdmission = () => ({
+    owner: submissionScope,
+    epoch: submissionEpochRef.current,
+    connected: controller.state.connectionState === "connected",
+    locked: !hydrated || submitting || voice.active,
+    images: attachmentPolicy.images,
+    files: attachmentPolicy.files
+  });
+  const openAttachmentPicker = (
+    requirement: ComposerAttachmentPickerRequirement = "either",
+    requireConnection = false
+  ): void => {
+    if (attachmentPicker.open(fileInputRef.current, attachmentPickerAdmission(), requirement, requireConnection)) closePalette();
+  };
+  const consumeAttachmentPicker = (input: HTMLInputElement): void => {
+    const files = attachmentPicker.consume(input, input.files, attachmentPickerAdmission());
+    if (files.length > 0) addFiles(files);
+  };
+  useGamepadActions(voiceRoot, submissionScope, "composer", {
+    "add-photos": () => openAttachmentPicker("images", true),
+    "add-files": () => openAttachmentPicker("files", true)
+  });
+
   const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
     const state = classifyComposerInternalDrop(dataTransfer, usableWorkspace?.id);
     if (state.kind === "none") {
@@ -1645,11 +1672,6 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     event.preventDefault();
     if (intent !== "ignore") void submit(activeDocument);
     return true;
-  };
-
-  const handleFiles = (event: ChangeEvent<HTMLInputElement>): void => {
-    if (event.target.files !== null) addFiles(event.target.files);
-    event.target.value = "";
   };
 
   const preventDrag = (event: DragEvent): void => {
@@ -1898,7 +1920,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             />}
             <div className="composer__toolbar new-task-composer__toolbar">
               <div className="composer__tools">
-                <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={submitting} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={handleFiles} />
+                <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={submitting} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={(event) => consumeAttachmentPicker(event.currentTarget)} />
                 {canUseAddMenu && <div className="palette-anchor">
                   <ComposerAddMenu
                     open={paletteInAddMenu}
@@ -1920,7 +1942,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     count={extraDirectoryIds.length}
                   >
                     {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
-                      {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { closePalette(); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
+                      {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => openAttachmentPicker()}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
                       {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => {
                         if (mentionPolicy.directories) {
                           openInlineMentionPalette();

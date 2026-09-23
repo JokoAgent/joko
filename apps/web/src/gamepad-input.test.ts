@@ -52,10 +52,16 @@ describe("gamepad preference authority", () => {
   it("accepts the complete current shape and rejects malformed settings without repairing persisted content", () => {
     const current = preferences();
     expect(parseGamepadPreferences(current)).toEqual(current);
+    const splitAttachments = {
+      ...current,
+      buttons: current.buttons.map((action, index) => index === 0 ? "add-photos" : index === 1 ? "add-files" : action)
+    };
+    expect(parseGamepadPreferences(splitAttachments)).toEqual(splitAttachments);
     const invalid = [
       { ...current, version: 2 }, { ...current, enabled: 1 }, { ...current, extra: true },
       { ...current, buttons: current.buttons.slice(1) }, { ...current, buttons: [...current.buttons, "none"] },
       { ...current, buttons: current.buttons.map((action, index) => index === 0 ? "arbitrary-command" : action) },
+      { ...current, buttons: current.buttons.map((action, index) => index === 0 ? "add-attachments" : action) },
       { ...current, buttons: Array(17) }, { ...current, rightStick: undefined },
       { ...current, leftStick: { ...current.leftStick, mode: "unknown" } },
       { ...current, leftStick: { ...current.leftStick, directions: { ...current.leftStick.directions, up: "voice" } } },

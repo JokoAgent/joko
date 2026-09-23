@@ -25,7 +25,7 @@ export function gamepadInspectorRequestOwned(doc: Document, request: GamepadInsp
 
 export const GAMEPAD_OWNED_ACTIONS = [
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
-  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands", "scroll-bottom"
+  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-photos", "add-files", "open-commands", "scroll-bottom"
 ] as const satisfies readonly GamepadAction[];
 export type GamepadOwnedAction = (typeof GAMEPAD_OWNED_ACTIONS)[number];
 type ActionOwner = "composer" | "session" | "interaction";
@@ -73,8 +73,9 @@ export function dispatchGamepadOwnedAction(doc: Document, action: GamepadOwnedAc
     }
   } else {
     if (doc.body.classList.contains("modal-open")) return false;
+    if (doc.querySelector("[data-morph-side]:not([inert])") !== null) return false;
     const root = currentGamepadTaskRoot(doc);
-    const kind = action === "submit" || action === "add-attachments" || action === "open-commands" ? "composer" : "session";
+    const kind = action === "submit" || action === "add-photos" || action === "add-files" || action === "open-commands" ? "composer" : "session";
     if (root?.dataset.gamepadActions === kind) target = root;
     else target = root?.querySelector(`[data-gamepad-actions='${kind}']`) ?? null;
   }

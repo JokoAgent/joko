@@ -60,6 +60,7 @@ import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
 import { createVoiceInsertedEditTracker } from "./voice-inserted-edit.js";
 import { useVoiceDictionaryLearning } from "./use-voice-dictionary-learning.js";
+import { ComposerAttachmentPicker, type ComposerAttachmentPickerRequirement } from "../composer-attachment-picker.js";
 
 export interface ComposerHistoryEntry {
   readonly text: string;
@@ -157,6 +158,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const mentionsRef = useRef(mentions);
   mentionsRef.current = mentions;
   const operationGuard = useMemo(() => new ComposerOperationGuard(), [controller.getArtifactUrl, session.generation]);
+  const attachmentPicker = useMemo(() => new ComposerAttachmentPicker(), []);
   const operationGuardRef = useRef(operationGuard);
   operationGuardRef.current = operationGuard;
   operationGuardRef.current.activate(session.id);
@@ -418,6 +420,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
   }, [voiceDictionaryOwnerKey, controller.getArtifactUrl, voiceRoot]);
+  useLayoutEffect(() => () => attachmentPicker.retire(), [attachmentPicker, sendOwner]);
   const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey });
   sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey };
   const voiceSendFlight = useRef<object | undefined>(undefined);
@@ -894,6 +897,25 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       markDraftEdited(session.id);
       setAttachments((current) => [...current, ...next]);
     }
+  };
+
+  const attachmentPickerAdmission = () => ({
+    owner: sendOwner,
+    epoch: sendEpochRef.current,
+    connected: controller.state.connectionState === "connected",
+    locked: composerLocked || effectiveBashMode,
+    images: attachmentPolicy.images,
+    files: attachmentPolicy.files
+  });
+  const openAttachmentPicker = (
+    requirement: ComposerAttachmentPickerRequirement = "either",
+    requireConnection = false
+  ): void => {
+    if (attachmentPicker.open(fileInputRef.current, attachmentPickerAdmission(), requirement, requireConnection)) closePalette();
+  };
+  const consumeAttachmentPicker = (input: HTMLInputElement): void => {
+    const files = attachmentPicker.consume(input, input.files, attachmentPickerAdmission());
+    if (files.length > 0) addFiles(files);
   };
 
   const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
@@ -1776,11 +1798,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       if (voiceActive) { if (canFinishVoiceSend) finishVoiceAndSend(); }
       else if (!composerLocked && draftCanSend) sendDraft();
     },
-    "add-attachments": () => {
-      if (!composerLocked && !effectiveBashMode && controller.state.connectionState === "connected" && (attachmentPolicy.images || attachmentPolicy.files)) {
-        closePalette(); fileInputRef.current?.click();
-      }
-    },
+    "add-photos": () => openAttachmentPicker("images", true),
+    "add-files": () => openAttachmentPicker("files", true),
     "open-commands": () => {
       if (!composerLocked && !effectiveBashMode && controller.state.connectionState === "connected") {
         openCommandMenu();
@@ -2016,7 +2035,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
         )}
         <div className="composer__toolbar">
           <div className="composer__tools">
-            <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={composerLocked} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={(event) => { if (event.target.files !== null) addFiles(event.target.files); event.target.value = ""; }} />
+            <input ref={fileInputRef} className="sr-only" type="file" multiple disabled={composerLocked} accept={attachmentPolicy.images && !attachmentPolicy.files ? "image/*" : undefined} onChange={(event) => consumeAttachmentPicker(event.currentTarget)} />
             {!effectiveBashMode && <div className="palette-anchor">
               <ComposerAddMenu
                 open={paletteInAddMenu}
@@ -2038,7 +2057,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
                 count={extraDirectoryIds?.length}
               >
                 {palette === "add" && <><div className="composer-add-menu__actions" role="menu">
-                  {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => { closePalette(); fileInputRef.current?.click(); }}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
+                  {(attachmentPolicy.images || attachmentPolicy.files) && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={() => openAttachmentPicker()}><Paperclip aria-hidden="true" /><span><strong>{t("composer.attach")}</strong><small>{t("composer.attachments")}</small></span></button>}
                   {canMention && <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openInlineMentionPalette}><AtSign aria-hidden="true" /><span><strong>{t("composer.mention")}</strong><small>{t("composer.mentionCount", { count: mentionCatalogItems.filter((item) => item.disabled !== true).length })}</small></span></button>}
                   <button className="composer-add-menu__action" type="button" role="menuitem" onClick={openCommandMenu}><Sparkles aria-hidden="true" /><span><strong>{t("composer.commands")}</strong><small>{availableCommandItems.length}</small></span></button>
                 </div>
