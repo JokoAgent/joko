@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,7 @@ export interface OrchestratorConfig {
     readonly executablePath: string;
     readonly headless: boolean;
   };
+  readonly pdfRendererHost?: { readonly executablePath: string; readonly appPath?: string };
   readonly mobilePush?: {
     readonly apns: {
       readonly teamId: string;
@@ -92,6 +93,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
   const corsOrigins = splitList(environment.JOKO_CORS_ORIGINS ?? "http://127.0.0.1:4319,http://localhost:4319")
     .map((origin) => validateCorsOrigin(origin, allowInsecureLan));
   const browserExecutable = discoverBrowserExecutable(environment);
+  const pdfHostExecutable = environment.JOKO_DOCUMENT_PDF_ELECTRON_EXECUTABLE;
+  const pdfHostApp = environment.JOKO_DOCUMENT_PDF_ELECTRON_APP;
+  if (pdfHostExecutable !== undefined && (!isAbsolute(pdfHostExecutable) || !existsSync(pdfHostExecutable)
+    || !lstatSync(pdfHostExecutable).isFile() || lstatSync(pdfHostExecutable).isSymbolicLink())) {
+    throw new Error("JOKO_DOCUMENT_PDF_ELECTRON_EXECUTABLE must be an existing absolute file.");
+  }
+  if (pdfHostApp !== undefined && (pdfHostExecutable === undefined || !isAbsolute(pdfHostApp) || !existsSync(pdfHostApp)
+    || !lstatSync(pdfHostApp).isDirectory() || lstatSync(pdfHostApp).isSymbolicLink())) {
+    throw new Error("JOKO_DOCUMENT_PDF_ELECTRON_APP must be an existing absolute directory.");
+  }
   const codexExecutable = discoverCodexExecutable(environment);
   const mobilePush = readMobilePushConfig(environment);
   return {
@@ -133,6 +144,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
             headless: environment.JOKO_BROWSER_HEADLESS === "1"
           }
         }),
+    ...(pdfHostExecutable === undefined ? {} : { pdfRendererHost: {
+      executablePath: pdfHostExecutable, ...(pdfHostApp === undefined ? {} : { appPath: pdfHostApp })
+    } }),
     ...(mobilePush === undefined ? {} : { mobilePush }),
     corsOrigins
   };
