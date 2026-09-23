@@ -3,7 +3,7 @@ export const GAMEPAD_ACTIONS = [
   "previous-task", "next-task", "previous-panel", "next-panel", "scroll-up", "scroll-down",
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
   "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands",
-  "open-settings", "open-skills", "open-schedules", "toggle-inspector", "scroll-bottom", "voice"
+  "open-settings", "open-skills", "open-schedules", "toggle-inspector", "open-terminal", "open-browser-tab", "toggle-review-tab", "scroll-bottom", "voice"
 ] as const;
 export type GamepadAction = (typeof GAMEPAD_ACTIONS)[number];
 export interface GamepadSkillBinding {

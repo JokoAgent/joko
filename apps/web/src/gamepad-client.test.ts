@@ -150,6 +150,24 @@ describe("gamepad UI target ownership", () => {
     delete document.body.dataset.appShortcutRecording;
     press(); expect(navigate).toHaveBeenCalledWith("open-schedules");
   });
+  it("routes inspector commands only while the focused task surface can act", () => {
+    const root = task("one"); root.querySelector("button")!.focus();
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    for (const action of ["open-terminal", "open-browser-tab", "toggle-review-tab"] as const) {
+      input({ kind: "action", action, phase: "press" });
+    }
+    expect(navigate.mock.calls.map(([action]) => action)).toEqual(["open-terminal", "open-browser-tab", "toggle-review-tab"]);
+    document.body.dataset.appShortcutRecording = "1";
+    input({ kind: "action", action: "open-terminal", phase: "press" });
+    delete document.body.dataset.appShortcutRecording;
+    document.body.classList.add("modal-open");
+    input({ kind: "action", action: "open-browser-tab", phase: "press" });
+    document.body.classList.remove("modal-open");
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus();
+    input({ kind: "action", action: "toggle-review-tab", phase: "press" });
+    expect(navigate).toHaveBeenCalledTimes(3);
+  });
   it("focuses the real new-task composer without selecting another task", () => {
     document.body.innerHTML = '<main class="new-task-page"><div data-composer-editor="true" tabindex="0"></div></main>';
     createGamepadDomInput(document, vi.fn())({ kind: "action", action: "focus-composer", phase: "press" });

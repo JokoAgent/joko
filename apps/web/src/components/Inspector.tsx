@@ -84,6 +84,7 @@ import { AuthenticatedImage, Button, IconButton, Modal, Pill, Spinner, StatusDot
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import { GAMEPAD_PANEL_EVENT } from "../gamepad-client.js";
+import type { GamepadInspectorRequest } from "../gamepad-actions.js";
 import { isSessionApplicationWindow } from "../session-window-navigation.js";
 import { CLIENT_LAYOUT_RESET_EVENT } from "../client-layout-reset.js";
 import { installCurrentWindowActivationClickGuard } from "../window-activation-click.js";
@@ -135,7 +136,7 @@ const INSPECTOR_WORKSPACE_SEARCH_MAX_PAGES = 10_000;
 type InspectorMenu = "add" | "more";
 const InteractiveTerminalPanel = lazy(() => import("./InteractiveTerminalPanel.js").then((module) => ({ default: module.InteractiveTerminalPanel })));
 
-export function Inspector({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, t, runAction, onClose, onDetachedChange, onSelectionQuote }: {
+export function Inspector({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, gamepadRequest, onGamepadRequestConsumed, t, runAction, onClose, onDetachedChange, onSelectionQuote }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly session: SessionView;
@@ -145,6 +146,8 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   readonly subagentFocusRequest?: { readonly sessionId: string; readonly runId: string; readonly requestId: number };
   readonly turnReviewFocusRequest?: InspectorTurnReviewRequest;
   readonly browserFocusRequest?: BrowserInspectorFocusRequest;
+  readonly gamepadRequest?: GamepadInspectorRequest;
+  readonly onGamepadRequestConsumed?: (requestId: number) => void;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onClose: () => void;
@@ -180,12 +183,15 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const [backgroundHistoryError, setBackgroundHistoryError] = useState<string>();
   const [backgroundHistoryRefresh, setBackgroundHistoryRefresh] = useState(0);
   const [terminalCatalog, setTerminalCatalog] = useState<{ readonly owner: string; readonly value: TerminalCapabilitiesView }>();
+  const [terminalCatalogResolvedOwner, setTerminalCatalogResolvedOwner] = useState<string>();
   const [terminalRecords, setTerminalRecords] = useState<Readonly<Record<string, TerminalView>>>({});
   const [terminalPending, setTerminalPending] = useState(false);
   const terminalPendingRef = useRef(false);
   const terminalCreationRef = useRef<{ readonly owner: string; readonly requestId: string; readonly shellId: string; readonly initialPalette: TerminalPaletteView } | undefined>(undefined);
   const [terminalError, setTerminalError] = useState<string>();
   const [terminalRefresh, setTerminalRefresh] = useState(0);
+  const [gamepadBrowserFocusRequest, setGamepadBrowserFocusRequest] = useState<BrowserInspectorFocusRequest>();
+  const lastGamepadRequestRef = useRef(0);
   const [terminalCatalogPending, setTerminalCatalogPending] = useState(false);
   const terminalOwner = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}\u0000${session.id}`;
   const terminalOwnerRef = useRef<string | undefined>(terminalOwner);
@@ -239,6 +245,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     backend,
     session.model?.supportsImages === true || bridgeRouted
   ).images ? [session] : [];
+  useEffect(() => { setGamepadBrowserFocusRequest(undefined); }, [browserFocusRequest?.requestId, session.id]);
   const canDetach = !isSessionApplicationWindow(window.location) && inspectorDetachAvailable(window.jokoDesktop);
   const activeDetachedHost = detachedInspectorHostAlive(detachedHost) ? detachedHost : undefined;
   const detached = activeDetachedHost !== undefined;
@@ -264,6 +271,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   useEffect(() => {
     terminalOwnerRef.current = terminalOwner;
     setTerminalError(undefined);
+    setTerminalCatalogResolvedOwner(undefined);
     setTerminalRecords({});
     terminalCreationRef.current = undefined;
     terminalPendingRef.current = false;
@@ -298,7 +306,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
       if (request.signal.aborted) return;
       const failure = results.find((result) => result.status === "rejected");
       setTerminalError(failure?.status === "rejected" ? messageOf(failure.reason) : undefined);
-    }).finally(() => { if (!request.signal.aborted) setTerminalCatalogPending(false); });
+    }).finally(() => { if (!request.signal.aborted) { setTerminalCatalogPending(false); setTerminalCatalogResolvedOwner(terminalOwner); } });
     return () => request.abort();
   }, [controller.state.connectionState, controller.getTerminalCapabilities, session.id, terminalOwner, terminalRefresh]);
 
@@ -742,6 +750,51 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     openTerminal(true);
     return true;
   };
+
+  useEffect(() => {
+    const request = gamepadRequest;
+    if (request === undefined || request.requestId === lastGamepadRequestRef.current || request.sessionId !== session.id) return;
+    if (request.action === "open-terminal" && (terminalCatalogPending || terminalCatalogResolvedOwner !== terminalOwner)) return;
+    lastGamepadRequestRef.current = request.requestId;
+    onGamepadRequestConsumed?.(request.requestId);
+    if (controller.state.connectionState !== "connected" || controller.state.activeProfile?.id !== request.profileId
+      || snapshot.generation !== request.connectionGeneration || session.generation !== request.sessionGeneration
+      || session.archived) return;
+    if (request.action === "open-terminal") {
+      if (!canTerminal && !bucket.tabs.some((tab) => tab.kind === "terminal")) {
+        runAction(`gamepad-terminal:${session.id}`, () => controller.setInspectorOpen(true));
+        return;
+      }
+      openTerminal(true);
+      return;
+    }
+    if (request.action === "toggle-review-tab") {
+      if (!canDiff && !canRewind) {
+        runAction(`gamepad-review:${session.id}`, async () => { throw new Error(t("settings.gamepad.reviewUnavailable")); });
+        return;
+      }
+      if (open && activeTab?.kind === "changes") closeTab(activeTab.id);
+      else {
+        setSessionBucket(addInspectorTab(storedBucket, "changes"));
+        runAction(`gamepad-review:${session.id}`, () => controller.setInspectorOpen(true));
+      }
+      return;
+    }
+    const browser = snapshot.browsers.find((candidate) => candidate.state === "ready");
+    if (browser === undefined) {
+      runAction(`gamepad-browser:${session.id}`, async () => { throw new Error(t("tools.noBrowser")); });
+      return;
+    }
+    runAction(`gamepad-browser:${session.id}`, async () => {
+      const pageId = await controller.openBrowserPage(browser.id, session.id, "about:blank");
+      if (terminalOwnerRef.current !== terminalOwner || inspectorControllerRef.current.state.connectionState !== "connected"
+        || inspectorControllerRef.current.state.snapshot.generation !== request.connectionGeneration
+        || inspectorControllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === request.sessionId)?.generation !== request.sessionGeneration) return;
+      setGamepadBrowserFocusRequest({ sessionId: session.id, browserId: browser.id, pageId, requestId: request.requestId });
+      setSessionBucket(addInspectorTab(storedBucketRef.current, "browser"));
+      await inspectorControllerRef.current.setInspectorOpen(true);
+    });
+  }, [gamepadRequest?.requestId, terminalCatalogPending, terminalCatalogResolvedOwner, session.id, session.generation, snapshot.generation]);
   useAppShortcut("open-terminal", shortcutOverrides, openTerminalFromShortcut, { stopImmediate: true });
   useAppShortcut("open-terminal", shortcutOverrides, openTerminalFromShortcut, { enabled: activeDetachedHost !== undefined, target: activeDetachedHost?.window ?? null, stopImmediate: true });
   useAppShortcut("right-tab-prev", shortcutOverrides, () => cycleTabsFromShortcut(-1), { stopImmediate: true });
@@ -940,7 +993,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
             locale={controller.state.preferences.locale}
             t={t}
           />}
-          {tab.kind === "browser" && canBrowser && <BrowserPanel controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} session={session} commentSessions={browserCommentSessions} locale={controller.state.preferences.locale} focusRequest={browserFocusRequest?.sessionId === session.id ? browserFocusRequest : undefined} t={t} runAction={runAction} />}
+          {tab.kind === "browser" && canBrowser && <BrowserPanel controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} session={session} commentSessions={browserCommentSessions} locale={controller.state.preferences.locale} focusRequest={gamepadBrowserFocusRequest?.sessionId === session.id ? gamepadBrowserFocusRequest : browserFocusRequest?.sessionId === session.id ? browserFocusRequest : undefined} t={t} runAction={runAction} />}
         </InspectorTabErrorBoundary></div>)}
       </div>
     </aside>
@@ -2724,7 +2777,7 @@ export function BrowserPanel({ controller, browsers, browserSettings, session, c
     if (focusRequest === undefined) return;
     setSelectedBrowserId(focusRequest.browserId);
     setSelectedPageId(focusRequest.pageId);
-  }, [focusRequest?.requestId]);
+  }, [focusRequest?.requestId, focusRequest?.browserId, focusRequest?.pageId]);
   useEffect(() => {
     if (browsers.length === 0 || browsers.some((browser) => browser.id === selectedBrowserId)) return;
     if (focusRequest?.browserId === selectedBrowserId) return;

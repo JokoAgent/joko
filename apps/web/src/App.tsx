@@ -48,6 +48,7 @@ import {
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
 import { useGamepadInput } from "./gamepad-client.js";
+import { currentGamepadTaskRoot, isGamepadInspectorAction, type GamepadInspectorRequest } from "./gamepad-actions.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { promptRecommendationOwnerKey, promptRecommendationStore } from "./prompt-recommendation-store.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
@@ -272,6 +273,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [timelineFocusRequest, setTimelineFocusRequest] = useState<{ readonly sessionId: string; readonly itemId: string; readonly requestId: number }>();
   const [inspectorSubagentFocusRequest, setInspectorSubagentFocusRequest] = useState(initialInspectorSubagentFocusRequest);
   const [inspectorTurnReviewFocusRequest, setInspectorTurnReviewFocusRequest] = useState<InspectorTurnReviewRequest>();
+  const [inspectorGamepadRequest, setInspectorGamepadRequest] = useState<GamepadInspectorRequest>();
   const [navigationDrag, setNavigationDrag] = useState<NavigationDragState>();
   const navigationDragRef = useRef<NavigationDragState | undefined>(undefined);
   const [inspectorDetached, setInspectorDetached] = useState(false);
@@ -280,6 +282,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const timelineFocusRequestIdRef = useRef(0);
   const inspectorSubagentFocusRequestIdRef = useRef(0);
   const inspectorTurnReviewFocusRequestIdRef = useRef(0);
+  const inspectorGamepadRequestIdRef = useRef(0);
   const fileSelectionQuoteInsertionIdRef = useRef(0);
   const fileAttachmentInsertionIdRef = useRef(0);
   const applicationMenuNoticeIdRef = useRef(0);
@@ -1057,6 +1060,23 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   });
   useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
     if (!state.ready || document.body.classList.contains("modal-open")) return;
+    if (isGamepadInspectorAction(action)) {
+      if (state.connectionState !== "connected" || state.route.kind !== "session" || state.activeProfile === undefined) return;
+      const root = currentGamepadTaskRoot(document);
+      const sessionId = root?.dataset.gamepadSessionId;
+      const owner = state.snapshot.sessions.find((candidate) => candidate.id === sessionId);
+      if (owner === undefined || owner.archived || reviewRunForReviewerSession(state.snapshot.reviewRuns, owner.id) !== undefined) return;
+      const request: GamepadInspectorRequest = {
+        requestId: ++inspectorGamepadRequestIdRef.current, action, sessionId: owner.id,
+        sessionGeneration: owner.generation, connectionGeneration: state.snapshot.generation,
+        profileId: state.activeProfile.id
+      };
+      if (activeSession?.id === owner.id) setInspectorGamepadRequest(request);
+      else void navigateFromApplicationMenu({ kind: "session", sessionId: owner.id }).then((allowed) => {
+        if (allowed) setInspectorGamepadRequest(request);
+      }).catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected"))));
+      return;
+    }
     if (action === "new-task") { navigateFromShortcut({ kind: "newSession" }); return; }
     if (action === "open-settings") { navigateFromShortcut({ kind: "settings" }); return; }
     if (action === "open-skills") { navigateFromShortcut({ kind: "tools", tab: "skills" }); return; }
@@ -1874,7 +1894,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         </AppErrorBoundary>
       </div>}
 
-      <Suspense fallback={null}>{activeSession !== undefined && state.route.kind === "session" && <Inspector controller={controller} snapshot={state.snapshot} session={activeSession} workspace={activeWorkspace} timeline={activeTimeline} open={inspectorOpen} subagentFocusRequest={inspectorSubagentFocusRequest?.sessionId === activeSession.id ? inspectorSubagentFocusRequest : undefined} turnReviewFocusRequest={inspectorTurnReviewFocusRequest?.sessionId === activeSession.id ? inspectorTurnReviewFocusRequest : undefined} browserFocusRequest={state.browserInspectorFocusRequest?.sessionId === activeSession.id ? state.browserInspectorFocusRequest : undefined} t={t} runAction={runAction} onClose={() => void controller.setInspectorOpen(false)} onDetachedChange={setInspectorDetached} onSelectionQuote={insertFileSelectionQuote} />}</Suspense>
+      <Suspense fallback={null}>{activeSession !== undefined && state.route.kind === "session" && <Inspector controller={controller} snapshot={state.snapshot} session={activeSession} workspace={activeWorkspace} timeline={activeTimeline} open={inspectorOpen} subagentFocusRequest={inspectorSubagentFocusRequest?.sessionId === activeSession.id ? inspectorSubagentFocusRequest : undefined} turnReviewFocusRequest={inspectorTurnReviewFocusRequest?.sessionId === activeSession.id ? inspectorTurnReviewFocusRequest : undefined} browserFocusRequest={state.browserInspectorFocusRequest?.sessionId === activeSession.id ? state.browserInspectorFocusRequest : undefined} gamepadRequest={inspectorGamepadRequest?.sessionId === activeSession.id ? inspectorGamepadRequest : undefined} onGamepadRequestConsumed={(requestId) => setInspectorGamepadRequest((current) => current?.requestId === requestId ? undefined : current)} t={t} runAction={runAction} onClose={() => void controller.setInspectorOpen(false)} onDetachedChange={setInspectorDetached} onSelectionQuote={insertFileSelectionQuote} />}</Suspense>
       {inspectorAttached && <button className="panel-scrim panel-scrim--inspector" type="button" aria-label={t("a11y.closeInspector")} onClick={() => void controller.setInspectorOpen(false)} />}
 
       <RenameSessionDialog

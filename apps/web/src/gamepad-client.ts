@@ -4,7 +4,7 @@ import {
   type GamepadAction, type GamepadDeviceInfo, type GamepadInputEffect
 } from "./gamepad-input.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
-import { currentGamepadTaskRoot, dispatchGamepadOwnedAction, isGamepadOwnedAction } from "./gamepad-actions.js";
+import { currentGamepadTaskRoot, dispatchGamepadOwnedAction, isGamepadInspectorAction, isGamepadOwnedAction } from "./gamepad-actions.js";
 
 export type GamepadClientStatus = "disabled" | "waiting" | "connected" | "unsupported" | "denied" | "error";
 export interface GamepadClientSnapshot {
@@ -176,7 +176,7 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
       return;
     }
     if (doc.body.classList.contains("modal-open")) return;
-    if ((effect.action === "open-skills" || effect.action === "open-schedules") && (doc.body.dataset.appShortcutRecording === "1"
+    if ((effect.action === "open-skills" || effect.action === "open-schedules" || isGamepadInspectorAction(effect.action)) && (doc.body.dataset.appShortcutRecording === "1"
       || focused !== null && (focused.matches("iframe, webview, object, embed")
         || focused.closest("[data-gamepad-preview], [data-message-rewind-preview], [role='dialog'], [role='menu'], [role='listbox']") !== null))) return;
     if (effect.action === "focus-composer") {

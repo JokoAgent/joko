@@ -1690,7 +1690,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   );
 
   return (
-    <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} aria-label={session.name} onKeyDownCapture={(event) => {
+    <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} data-gamepad-session-id={session.id} aria-label={session.name} onKeyDownCapture={(event) => {
       const modalOpen = document.body.classList.contains("modal-open");
       const retryEscapeInput: RetryEscapeInput = {
         key: event.key,

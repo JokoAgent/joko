@@ -1,6 +1,20 @@
 import { useLayoutEffect, useRef, type RefObject } from "react";
 import type { GamepadAction } from "./gamepad-input.js";
 
+export const GAMEPAD_INSPECTOR_ACTIONS = ["open-terminal", "open-browser-tab", "toggle-review-tab"] as const satisfies readonly GamepadAction[];
+export type GamepadInspectorAction = (typeof GAMEPAD_INSPECTOR_ACTIONS)[number];
+export interface GamepadInspectorRequest {
+  readonly requestId: number;
+  readonly action: GamepadInspectorAction;
+  readonly sessionId: string;
+  readonly sessionGeneration: bigint;
+  readonly connectionGeneration: bigint;
+  readonly profileId: string;
+}
+export function isGamepadInspectorAction(action: GamepadAction): action is GamepadInspectorAction {
+  return (GAMEPAD_INSPECTOR_ACTIONS as readonly string[]).includes(action);
+}
+
 export const GAMEPAD_OWNED_ACTIONS = [
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
   "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands", "scroll-bottom"
