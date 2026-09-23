@@ -91,6 +91,7 @@ export interface TargetView {
   readonly pinned: boolean;
   readonly archived: boolean;
   readonly remoteWorkspace?: {
+    readonly hostTargetId: string;
     readonly hostId: string;
     readonly workspaceRoot: string;
   };
@@ -230,6 +231,24 @@ export interface TargetDraft {
   readonly createIfMissing: boolean;
 }
 
+export interface RemoteTargetDraft {
+  readonly backendId: string;
+  readonly name: string;
+  readonly hostTargetId: string;
+  readonly hostId: string;
+  readonly expectedHostTargetRevision: bigint;
+  readonly expectedHostRevision: bigint;
+  readonly workspacePath: string;
+  readonly createIfMissing: boolean;
+}
+
+export interface ProjectDirectoryListingView {
+  readonly path: string;
+  readonly parentPath: string;
+  readonly directories: readonly { readonly name: string; readonly path: string }[];
+  readonly truncated: boolean;
+}
+
 export interface ModelView {
   readonly backendId: string;
   readonly providerId: string;
@@ -294,6 +313,26 @@ export interface RemoteHostView {
     readonly failure?: { readonly code: string; readonly retryable: boolean };
   };
   readonly revision: bigint;
+}
+
+export interface RemoteHostDirectoryListingView {
+  readonly targetId: string;
+  readonly hostId: string;
+  readonly targetRevision: bigint;
+  readonly hostRevision: bigint;
+  readonly path: string;
+  readonly parentPath: string;
+  readonly directories: readonly { readonly name: string; readonly path: string }[];
+  readonly truncated: boolean;
+}
+
+export interface RemoteHostDirectoryInspectionView {
+  readonly targetId: string;
+  readonly hostId: string;
+  readonly targetRevision: bigint;
+  readonly hostRevision: bigint;
+  readonly exists: boolean;
+  readonly path: string;
 }
 
 export interface SshKeyView {
@@ -2616,6 +2655,47 @@ export interface SkillCatalogView {
   readonly skills: readonly SkillDescriptorView[];
 }
 
+export type SkillLearningStateView = "collecting" | "distilling" | "awaitingReview" | "applied" | "discarded" | "failed" | "cancelled" | "expired";
+
+export interface SkillLearningProposalView {
+  readonly name: string;
+  readonly description: string;
+  readonly explanation: string;
+  readonly revision: string;
+  readonly files: readonly { readonly key: string; readonly content: string }[];
+  readonly resourceId: string;
+  readonly currentResourceId?: string;
+  readonly currentResourceRevision?: bigint;
+  readonly currentObservedRevision?: string;
+  readonly diff: SkillDiffView;
+}
+
+export interface SkillLearningRunView {
+  readonly id: string;
+  readonly revision: bigint;
+  readonly state: SkillLearningStateView;
+  readonly sourceKind: "text" | "session" | "market";
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly sourceSessionId?: string;
+  readonly distillationSessionId?: string;
+  readonly summary: string;
+  readonly error?: string;
+  readonly proposal?: SkillLearningProposalView;
+  readonly appliedResourceId?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly expiresAt: number;
+}
+
+export interface StartSkillLearningDraft {
+  readonly requestId: string;
+  readonly targetId: string;
+  readonly instruction: string;
+  readonly sourceSessionId?: string;
+  readonly marketIdentity?: SkillMarketEntryIdentityView;
+}
+
 export interface SkillMetadataView {
   readonly name?: string;
   readonly description?: string;
@@ -2953,7 +3033,7 @@ export interface SkillMarketCurrentResourceView {
   readonly resourceRevision: bigint;
   readonly name: string;
   readonly version?: string;
-  readonly sourceKind: "local" | "npm" | "git" | "extensionSource" | "skillMarket";
+  readonly sourceKind: "local" | "npm" | "git" | "extensionSource" | "skillMarket" | "learned";
   readonly sourceDisplay: string;
   readonly discoveredRevision: string;
   readonly observedRevision: string;
@@ -5262,6 +5342,8 @@ export interface OperationApi {
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
   createTarget(draft: TargetDraft): Promise<string>;
+  createRemoteTarget(draft: RemoteTargetDraft): Promise<string>;
+  listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
   prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {
     readonly name?: string;
@@ -5369,6 +5451,12 @@ export interface OperationApi {
     readonly scope?: SkillScopeView;
     readonly signal?: AbortSignal;
   }): Promise<SkillCatalogView>;
+  startSkillLearning(draft: StartSkillLearningDraft, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  listSkillLearningRuns(signal?: AbortSignal): Promise<readonly SkillLearningRunView[]>;
+  getSkillLearningRun(runId: string, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  applySkillLearning(run: SkillLearningRunView, confirmReplace: boolean, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  discardSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView>;
+  cancelSkillLearning(run: SkillLearningRunView, signal?: AbortSignal): Promise<SkillLearningRunView>;
   getSkillResourceUsageReport(resourceId: string, timeZone: string, signal?: AbortSignal): Promise<ResourceUsageReportView>;
   openSkill(skillId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<SkillSessionView>;
   listSkillFiles(sessionId: string, parentKey?: string, signal?: AbortSignal): Promise<readonly SkillFileEntryView[]>;
@@ -5746,6 +5834,8 @@ export interface OperationApi {
   syncContactsNow(peerId?: string, signal?: AbortSignal): Promise<ContactSyncStatusView>;
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
+  listRemoteHostDirectories(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, path: string, signal?: AbortSignal): Promise<RemoteHostDirectoryListingView>;
+  inspectRemoteHostDirectory(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, path: string, signal?: AbortSignal): Promise<RemoteHostDirectoryInspectionView>;
   watchRemoteHosts(targetId: string, signal?: AbortSignal): AsyncIterable<readonly RemoteHostView[]>;
   refreshRemoteHostCatalog(targetId: string): Promise<readonly RemoteHostView[]>;
   createRemoteHost(targetId: string, draft: RemoteHostDraft): Promise<RemoteHostView>;

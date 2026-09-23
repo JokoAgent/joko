@@ -3,6 +3,7 @@ import type { Dispatch, SetStateAction } from "react";
 import type { AppController, AppRoute } from "./controller.js";
 import type { ComposerDraft } from "./model.js";
 import { createDelayedSessionFromFirstInput, type DelayedNewSessionDraft, type NewSessionSubmissionOwner } from "./new-session-flow.js";
+import { recentProjectForTarget } from "./recent-projects.js";
 
 interface SubmissionView {
   observe(controller: AppController): void;
@@ -27,6 +28,9 @@ export function useNewSessionSubmission(
 
   return useCallback(async (draft, input, owner) => {
     const original = currentController.current;
+    const recentProject = draft.selection.kind === "target" && original.state.snapshot !== undefined
+      ? recentProjectForTarget(original.state.snapshot, draft.selection.targetId)
+      : undefined;
     const doc = owner.ownerDocument;
     const win = doc.defaultView;
     owner.signal.throwIfAborted();
@@ -80,6 +84,10 @@ export function useNewSessionSubmission(
     setBusy(actionKey);
     try {
       await createDelayedSessionFromFirstInput(original, draft, input, async (sessionId) => {
+        // Session creation is durable even if its initiating view retired before the response.
+        if (recentProject !== undefined && typeof original.recordRecentProject === "function") {
+          try { void original.recordRecentProject(recentProject).catch(() => undefined); } catch { /* Local history must not block durable input. */ }
+        }
         if (!isCurrent()) return;
         try {
           await original.clearNewSessionDraft();

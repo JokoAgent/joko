@@ -835,7 +835,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: true,
       trusted: false,
-      remoteWorkspace: { hostId: "fixture-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "remote-lineage-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
     };
     const context = makeContext(target, []);
     const initial = createPiAdapter(options);
@@ -925,7 +925,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: true,
       trusted: false,
-      remoteWorkspace: { hostId: "fixture-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "remote-deletion-journal-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
     };
     const binding: NativeSessionBinding = {
       opaqueRef: join(agentHome, "native-session.jsonl"),
@@ -1327,7 +1327,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: false,
       trusted: false,
-      remoteWorkspace: { hostId: "test-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { hostTargetId: "target-native-fence", hostId: "test-host", workspaceRoot: "/workspace" }
     };
     const events: EventPayload[] = [];
     const context = makeContext(target, events);

@@ -439,6 +439,7 @@ export function SelectControl({
   onClick,
   onKeyDown,
   onBlur,
+  openRequestId,
   "aria-label": ariaLabel,
   "aria-labelledby": ariaLabelledBy,
   "aria-describedby": ariaDescribedBy,
@@ -448,6 +449,7 @@ export function SelectControl({
   readonly value?: string | number;
   readonly required?: boolean;
   readonly onChange?: (event: SelectControlChangeEvent) => void;
+  readonly openRequestId?: number;
 }): JSX.Element {
   const options = useMemo(() => collectSelectControlOptions(children), [children]);
   const normalizedValue = value === undefined ? "" : String(value);
@@ -481,6 +483,13 @@ export function SelectControl({
     setActiveValue(options[selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : fallback]?.value);
     setOpenScope(scope);
   };
+  const consumedOpenRequestRef = useRef<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (openRequestId === undefined || consumedOpenRequestRef.current === openRequestId
+      || scope === undefined || disabled || firstEnabled() < 0 || !live()) return;
+    consumedOpenRequestRef.current = openRequestId;
+    show();
+  }, [openRequestId, scope, disabled, options]);
   const choose = (index: number): void => {
     const option = options[index];
     if (!live() || disabled || option === undefined || option.disabled) return;

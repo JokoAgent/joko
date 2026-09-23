@@ -48,6 +48,8 @@ import {
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
 import { useGamepadInput } from "./gamepad-client.js";
+import { toggleGamepadFullscreen } from "./gamepad-fullscreen.js";
+import { currentGamepadTaskRoot, isGamepadInspectorAction, type GamepadInspectorRequest } from "./gamepad-actions.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { promptRecommendationOwnerKey, promptRecommendationStore } from "./prompt-recommendation-store.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
@@ -100,6 +102,7 @@ import {
 import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.js";
 import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
+import type { NewSessionProjectPickerRequest } from "./components/NewSessionPage.js";
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
@@ -272,6 +275,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [timelineFocusRequest, setTimelineFocusRequest] = useState<{ readonly sessionId: string; readonly itemId: string; readonly requestId: number }>();
   const [inspectorSubagentFocusRequest, setInspectorSubagentFocusRequest] = useState(initialInspectorSubagentFocusRequest);
   const [inspectorTurnReviewFocusRequest, setInspectorTurnReviewFocusRequest] = useState<InspectorTurnReviewRequest>();
+  const [inspectorGamepadRequest, setInspectorGamepadRequest] = useState<GamepadInspectorRequest>();
+  const [projectPickerRequest, setProjectPickerRequest] = useState<NewSessionProjectPickerRequest>();
   const [navigationDrag, setNavigationDrag] = useState<NavigationDragState>();
   const navigationDragRef = useRef<NavigationDragState | undefined>(undefined);
   const [inspectorDetached, setInspectorDetached] = useState(false);
@@ -280,6 +285,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const timelineFocusRequestIdRef = useRef(0);
   const inspectorSubagentFocusRequestIdRef = useRef(0);
   const inspectorTurnReviewFocusRequestIdRef = useRef(0);
+  const inspectorGamepadRequestIdRef = useRef(0);
+  const projectPickerRequestIdRef = useRef(0);
   const fileSelectionQuoteInsertionIdRef = useRef(0);
   const fileAttachmentInsertionIdRef = useRef(0);
   const applicationMenuNoticeIdRef = useRef(0);
@@ -293,6 +300,19 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const searchInputRef = useRef<HTMLInputElement>(null);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
+  useEffect(() => {
+    const request = projectPickerRequest;
+    if (request === undefined) return;
+    const profile = state.activeProfile;
+    const navigationRevision = state.navigationRevision ?? 0;
+    if (state.connectionState !== "connected" || profile?.id !== request.profileId || profile.serverId !== request.serverId
+      || state.snapshot.generation !== request.connectionGeneration
+      || navigationRevision < request.sourceNavigationRevision || navigationRevision > request.sourceNavigationRevision + 1
+      || navigationRevision !== request.sourceNavigationRevision && state.route.kind !== "newSession") {
+      setProjectPickerRequest(undefined);
+    }
+  }, [projectPickerRequest, state.activeProfile, state.connectionState, state.navigationRevision, state.route.kind, state.snapshot.generation]);
+  useEffect(() => () => { projectPickerRequestIdRef.current += 1; }, []);
   const removalOwnerId = !state.ready || state.connectionState !== "connected" || state.activeProfile === undefined
     ? undefined
     : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
@@ -985,8 +1005,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     && state.route.kind === "session"
     && activeSession !== undefined
     && activeReviewerRun === undefined;
-  const navigateFromApplicationMenu = async (route: Parameters<AppController["navigate"]>[0]): Promise<boolean> => {
+  const navigateFromApplicationMenu = async (route: Parameters<AppController["navigate"]>[0], canNavigate: () => boolean = () => true): Promise<boolean> => {
     if (state.route.kind !== "files") {
+      if (!canNavigate()) return false;
       controller.navigate(route);
       return true;
     }
@@ -995,7 +1016,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       reason: "switch-session",
       matches: (identity) => identity.sessionId === filesSessionId
     });
-    if (allowed) controller.navigate(route);
+    if (allowed && canNavigate()) controller.navigate(route);
+    else return false;
     return allowed;
   };
   const navigateFromShortcut = (route: Parameters<AppController["navigate"]>[0]): void => {
@@ -1057,8 +1079,73 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   });
   useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
     if (!state.ready || document.body.classList.contains("modal-open")) return;
+    if (isGamepadInspectorAction(action)) {
+      if (state.connectionState !== "connected" || state.route.kind !== "session" || state.activeProfile === undefined) return;
+      const root = currentGamepadTaskRoot(document);
+      const sessionId = root?.dataset.gamepadSessionId;
+      const owner = state.snapshot.sessions.find((candidate) => candidate.id === sessionId);
+      if (owner === undefined || owner.archived || reviewRunForReviewerSession(state.snapshot.reviewRuns, owner.id) !== undefined) return;
+      const request: GamepadInspectorRequest = {
+        requestId: ++inspectorGamepadRequestIdRef.current, action, sessionId: owner.id,
+        sessionGeneration: owner.generation, connectionGeneration: state.snapshot.generation,
+        profileId: state.activeProfile.id,
+        navigationRevision: (state.navigationRevision ?? 0) + Number(activeSession?.id !== owner.id)
+      };
+      if (activeSession?.id === owner.id) setInspectorGamepadRequest(request);
+      else void navigateFromApplicationMenu({ kind: "session", sessionId: owner.id }).then((allowed) => {
+        if (allowed) setInspectorGamepadRequest(request);
+      }).catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected"))));
+      return;
+    }
     if (action === "new-task") { navigateFromShortcut({ kind: "newSession" }); return; }
     if (action === "open-settings") { navigateFromShortcut({ kind: "settings" }); return; }
+    if (action === "open-skills") { navigateFromShortcut({ kind: "tools", tab: "skills" }); return; }
+    if (action === "open-schedules") { navigateFromShortcut({ kind: "schedules" }); return; }
+    if (action === "open-folder") {
+      if (document.querySelector("[role='listbox'], [data-new-task-project-picker][data-state='open']") !== null) return;
+      const profile = state.activeProfile;
+      if (state.connectionState !== "connected" || profile === undefined) return;
+      const request: NewSessionProjectPickerRequest = {
+        requestId: ++projectPickerRequestIdRef.current,
+        ownerDocument: document,
+        profileId: profile.id,
+        serverId: profile.serverId,
+        connectionGeneration: state.snapshot.generation,
+        sourceNavigationRevision: state.navigationRevision ?? 0
+      };
+      const requestOwnsNavigation = (): boolean => {
+        const current = controllerRef.current.state;
+        const ownerWindow = request.ownerDocument.defaultView;
+        return projectPickerRequestIdRef.current === request.requestId
+          && ownerWindow !== null && !ownerWindow.closed
+          && request.ownerDocument.visibilityState === "visible" && request.ownerDocument.hasFocus()
+          && request.ownerDocument.body.dataset.appShortcutRecording !== "1"
+          && request.ownerDocument.querySelector("[role='listbox'], [data-new-task-project-picker][data-state='open']") === null
+          && request.ownerDocument.querySelector("[data-gamepad-preview]") === null
+          && current.connectionState === "connected" && current.activeProfile?.id === request.profileId
+          && current.activeProfile.serverId === request.serverId && current.snapshot.generation === request.connectionGeneration
+          && (current.navigationRevision ?? 0) === request.sourceNavigationRevision;
+      };
+      void navigateFromApplicationMenu({ kind: "newSession" }, requestOwnsNavigation).then((allowed) => {
+        if (!allowed || projectPickerRequestIdRef.current !== request.requestId) return;
+        const current = controllerRef.current.state;
+        const navigationRevision = current.navigationRevision ?? 0;
+        if (current.connectionState !== "connected" || current.activeProfile?.id !== request.profileId
+          || current.activeProfile.serverId !== request.serverId || current.snapshot.generation !== request.connectionGeneration
+          || navigationRevision < request.sourceNavigationRevision || navigationRevision > request.sourceNavigationRevision + 1
+          || navigationRevision !== request.sourceNavigationRevision && current.route.kind !== "newSession") return;
+        setProjectPickerRequest(request);
+      }).catch((error: unknown) => {
+        if (projectPickerRequestIdRef.current === request.requestId) setActionError(messageOf(error, t("error.unexpected")));
+      });
+      return;
+    }
+    if (action === "navigate-back") { if (window.history.length > 1) window.history.back(); return; }
+    if (action === "navigate-forward") { window.history.forward(); return; }
+    if (action === "toggle-fullscreen") {
+      runAction("gamepad-fullscreen", () => toggleGamepadFullscreen(document, window.jokoDesktop, t("settings.gamepad.fullscreenUnavailable")));
+      return;
+    }
     if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
     if (action === "toggle-inspector") {
       if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));
@@ -1811,6 +1898,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             snapshot={state.snapshot}
             initialTargetId={state.route.targetId}
             initialDialogueBackendId={state.route.dialogueBackendId}
+            projectPickerRequest={projectPickerRequest}
+            onProjectPickerRequestConsumed={(requestId) => setProjectPickerRequest((current) => current?.requestId === requestId ? undefined : current)}
             navigationOpen={navigationOpen}
             t={t}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
@@ -1841,10 +1930,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             snapshot={state.snapshot}
             runtimeSessionId={lastRuntimeSessionIdRef.current}
             selectedExtensionId={state.route.extensionId}
+            selectedTab={state.route.tab}
             locale={state.preferences.locale}
             t={t}
             runAction={runAction}
-            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? {} : { extensionId }) })}
+            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }) })}
+            onSelectTab={(tab) => controller.navigate({ kind: "tools", ...(tab === "browser" ? {} : { tab }) })}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
           />}
           {state.route.kind === "extensionMainView" && <ExtensionMainViewPage
@@ -1870,7 +1961,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         </AppErrorBoundary>
       </div>}
 
-      <Suspense fallback={null}>{activeSession !== undefined && state.route.kind === "session" && <Inspector controller={controller} snapshot={state.snapshot} session={activeSession} workspace={activeWorkspace} timeline={activeTimeline} open={inspectorOpen} subagentFocusRequest={inspectorSubagentFocusRequest?.sessionId === activeSession.id ? inspectorSubagentFocusRequest : undefined} turnReviewFocusRequest={inspectorTurnReviewFocusRequest?.sessionId === activeSession.id ? inspectorTurnReviewFocusRequest : undefined} browserFocusRequest={state.browserInspectorFocusRequest?.sessionId === activeSession.id ? state.browserInspectorFocusRequest : undefined} t={t} runAction={runAction} onClose={() => void controller.setInspectorOpen(false)} onDetachedChange={setInspectorDetached} onSelectionQuote={insertFileSelectionQuote} />}</Suspense>
+      <Suspense fallback={null}>{activeSession !== undefined && state.route.kind === "session" && <Inspector controller={controller} snapshot={state.snapshot} session={activeSession} workspace={activeWorkspace} timeline={activeTimeline} open={inspectorOpen} subagentFocusRequest={inspectorSubagentFocusRequest?.sessionId === activeSession.id ? inspectorSubagentFocusRequest : undefined} turnReviewFocusRequest={inspectorTurnReviewFocusRequest?.sessionId === activeSession.id ? inspectorTurnReviewFocusRequest : undefined} browserFocusRequest={state.browserInspectorFocusRequest?.sessionId === activeSession.id ? state.browserInspectorFocusRequest : undefined} gamepadRequest={inspectorGamepadRequest?.sessionId === activeSession.id ? inspectorGamepadRequest : undefined} onGamepadRequestConsumed={(requestId) => setInspectorGamepadRequest((current) => current?.requestId === requestId ? undefined : current)} t={t} runAction={runAction} onClose={() => void controller.setInspectorOpen(false)} onDetachedChange={setInspectorDetached} onSelectionQuote={insertFileSelectionQuote} />}</Suspense>
       {inspectorAttached && <button className="panel-scrim panel-scrim--inspector" type="button" aria-label={t("a11y.closeInspector")} onClick={() => void controller.setInspectorOpen(false)} />}
 
       <RenameSessionDialog

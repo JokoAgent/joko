@@ -4,7 +4,7 @@ import {
   type GamepadAction, type GamepadDeviceInfo, type GamepadInputEffect
 } from "./gamepad-input.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
-import { currentGamepadTaskRoot, dispatchGamepadOwnedAction, isGamepadOwnedAction } from "./gamepad-actions.js";
+import { currentGamepadTaskRoot, dispatchGamepadOwnedAction, isGamepadInspectorAction, isGamepadOwnedAction } from "./gamepad-actions.js";
 
 export type GamepadClientStatus = "disabled" | "waiting" | "connected" | "unsupported" | "denied" | "error";
 export interface GamepadClientSnapshot {
@@ -124,6 +124,7 @@ export function useGamepadSnapshot(): GamepadClientSnapshot {
 }
 
 export const GAMEPAD_VOICE_EVENT = "joko:gamepad-voice";
+export const GAMEPAD_SKILL_EVENT = "joko:gamepad-skill";
 export const GAMEPAD_PANEL_EVENT = "joko:gamepad-panel";
 export const GAMEPAD_SCROLL_EVENT = "joko:gamepad-scroll";
 type VoicePhase = "press" | "release" | "cancel";
@@ -149,6 +150,12 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
   };
   return (effect) => {
     if (effect.kind === "scroll") { scroll(effect.x, effect.y); return; }
+    if (effect.kind === "skill") {
+      if (doc.body.classList.contains("modal-open")) return;
+      const root = currentGamepadTaskRoot(doc);
+      root?.querySelector("[data-gamepad-skill]")?.dispatchEvent(new CustomEvent(GAMEPAD_SKILL_EVENT, { detail: effect.binding }));
+      return;
+    }
     if (effect.action === "voice") {
       if (effect.phase !== "press") { voice(effect.phase); return; }
       if (doc.body.classList.contains("modal-open")) return;
@@ -169,6 +176,13 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
       return;
     }
     if (doc.body.classList.contains("modal-open")) return;
+    if ((effect.action === "open-skills" || effect.action === "open-schedules" || effect.action === "open-folder" || effect.action === "navigate-back"
+      || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen" || isGamepadInspectorAction(effect.action)) && (doc.body.dataset.appShortcutRecording === "1"
+      || doc.querySelector("[role='listbox']") !== null
+      || focused !== null && (focused.matches("iframe, webview, object, embed")
+        || focused.closest("[data-gamepad-preview], [data-message-rewind-preview], [role='dialog'], [role='menu'], [role='listbox']") !== null))) return;
+    if ((effect.action === "navigate-back" || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen" || effect.action === "open-folder")
+      && (doc.visibilityState !== "visible" || !doc.hasFocus() || doc.querySelector("[data-gamepad-preview]") !== null)) return;
     if (effect.action === "focus-composer") {
       currentGamepadTaskRoot(doc)?.querySelector<HTMLElement>("[data-composer-editor='true']")?.focus(); return;
     }

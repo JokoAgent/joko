@@ -54,6 +54,7 @@ describe("Connect service composition", () => {
       contract.HistoryMaintenanceService,
       contract.CredentialService,
       contract.SettingsService,
+      contract.MessagingService,
       contract.ContactService,
       contract.PartnerService,
       contract.CollaborationService,

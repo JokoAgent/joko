@@ -2373,15 +2373,19 @@ export class OperationalStore {
       const remoteWorkspace = descriptor.remoteWorkspace === undefined
         ? undefined
         : {
+            hostTargetId: remoteHostIdentity(descriptor.remoteWorkspace.hostTargetId, "host target id", 256),
             hostId: remoteHostAlias(descriptor.remoteWorkspace.hostId),
             workspaceRoot: remoteWorkspaceRoot(descriptor.remoteWorkspace.workspaceRoot)
           };
+      if (remoteWorkspace !== undefined && remoteWorkspace.hostTargetId !== descriptor.id) {
+        this.getTarget(remoteWorkspace.hostTargetId);
+      }
       this.database.prepare(`
         INSERT INTO targets(
           id, backend_id, display_name, workspace_root, managed, trusted,
-          metadata_json, remote_host_id, remote_workspace_root,
+          metadata_json, remote_host_target_id, remote_host_id, remote_workspace_root,
           created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           backend_id = excluded.backend_id,
           display_name = excluded.display_name,
@@ -2389,6 +2393,7 @@ export class OperationalStore {
           managed = excluded.managed,
           trusted = excluded.trusted,
           metadata_json = excluded.metadata_json,
+          remote_host_target_id = excluded.remote_host_target_id,
           remote_host_id = excluded.remote_host_id,
           remote_workspace_root = excluded.remote_workspace_root,
           updated_at = excluded.updated_at,
@@ -2401,6 +2406,7 @@ export class OperationalStore {
         boolInt(descriptor.managed),
         boolInt(descriptor.trusted),
         serializeJson(metadata),
+        remoteWorkspace?.hostTargetId ?? null,
         remoteWorkspace?.hostId ?? null,
         remoteWorkspace?.workspaceRoot ?? null,
         now,
@@ -2884,6 +2890,7 @@ export class OperationalStore {
       const remoteWorkspace = descriptor.remoteWorkspace === undefined
         ? undefined
         : {
+            hostTargetId: remoteHostIdentity(descriptor.remoteWorkspace.hostTargetId, "host target id", 256),
             hostId: remoteHostAlias(descriptor.remoteWorkspace.hostId),
             workspaceRoot: remoteWorkspaceRoot(descriptor.remoteWorkspace.workspaceRoot)
           };
@@ -2939,10 +2946,10 @@ export class OperationalStore {
           summary_source_cursor, summary_updated_at, native_opaque_ref, native_binding_fingerprint, native_session_id,
           generation, pinned, archived, deleted_at, permission_mode, plan_mode,
           provider_id, model_id, effort, fast_mode, append_system_prompt,
-          remote_host_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
+          remote_host_target_id, remote_host_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
           automation_run_id, derivation_kind, derivation_source_session_id,
           derivation_source_message_id, derivation_source_event_id, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         descriptor.id,
         descriptor.backendId,
@@ -2967,6 +2974,7 @@ export class OperationalStore {
         descriptor.effort ?? null,
         boolInt(descriptor.fastMode),
         descriptor.appendSystemPrompt ?? null,
+        remoteWorkspace?.hostTargetId ?? null,
         remoteWorkspace?.hostId ?? null,
         remoteWorkspace?.workspaceRoot ?? null,
         automationOrigin?.scheduleId ?? null,
@@ -6484,14 +6492,15 @@ export class OperationalStore {
         INSERT INTO native_session_derivations(
           operation_id, body_hash, source_session_id, derived_session_id, backend_id, backend_instance_generation,
           target_id, source_native_opaque_ref, source_native_session_id, source_generation,
-          effective_workspace_root, remote_host_id, remote_workspace_root, native_opaque_ref, native_session_id,
+          effective_workspace_root, remote_host_target_id, remote_host_id, remote_workspace_root, native_opaque_ref, native_session_id,
           generation, state, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
       `).run(
         normalized.operationId, normalized.expectedBodyHash, normalized.sourceSessionId, normalized.sessionId,
         normalized.backendId, normalized.backendInstanceGeneration, normalized.targetId,
         normalized.sourceBinding.opaqueRef, normalized.sourceBinding.nativeSessionId ?? null,
         normalized.sourceBinding.generation, normalized.effectiveWorkspaceRoot,
+        normalized.remoteWorkspace?.hostTargetId ?? null,
         normalized.remoteWorkspace?.hostId ?? null, normalized.remoteWorkspace?.workspaceRoot ?? null,
         normalized.binding.opaqueRef, normalized.binding.nativeSessionId ?? null, normalized.binding.generation,
         at, at, asSqlInteger(this.requireActiveRevision())
@@ -16824,9 +16833,11 @@ function backendFromRow(row: Row): StoredBackend {
 }
 
 function targetFromRow(row: Row): StoredTarget {
+  const remoteHostTargetId = optionalString("hostTargetId", row["remote_host_target_id"]).hostTargetId;
   const remoteHostId = optionalString("hostId", row["remote_host_id"]).hostId;
   const remoteRoot = optionalString("workspaceRoot", row["remote_workspace_root"]).workspaceRoot;
-  if ((remoteHostId === undefined) !== (remoteRoot === undefined)) {
+  if ((remoteHostTargetId === undefined) !== (remoteHostId === undefined)
+    || (remoteHostId === undefined) !== (remoteRoot === undefined)) {
     throw new StoreError("Stored Target Remote workspace binding is incomplete.");
   }
   return {
@@ -16837,10 +16848,11 @@ function targetFromRow(row: Row): StoredTarget {
       workspaceRoot: stringValue(row["workspace_root"]),
       managed: booleanValue(row["managed"]),
       trusted: booleanValue(row["trusted"]),
-      ...(remoteHostId === undefined || remoteRoot === undefined
+      ...(remoteHostTargetId === undefined || remoteHostId === undefined || remoteRoot === undefined
         ? {}
         : {
             remoteWorkspace: {
+              hostTargetId: remoteHostIdentity(remoteHostTargetId, "host target id", 256),
               hostId: remoteHostAlias(remoteHostId),
               workspaceRoot: remoteWorkspaceRoot(remoteRoot)
             }
@@ -16945,6 +16957,7 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
 }
 
 function sessionFromRow(row: Row): StoredSession {
+  const remoteHostTargetId = optionalString("hostTargetId", row["remote_host_target_id"]).hostTargetId;
   const remoteHostId = optionalString("hostId", row["remote_host_id"]).hostId;
   const remoteRoot = optionalString("workspaceRoot", row["remote_workspace_root"]).workspaceRoot;
   const automationScheduleId = optionalString("scheduleId", row["automation_schedule_id"]).scheduleId;
@@ -16963,7 +16976,8 @@ function sessionFromRow(row: Row): StoredSession {
     "sourceEventId",
     row["derivation_source_event_id"]
   ).sourceEventId;
-  if ((remoteHostId === undefined) !== (remoteRoot === undefined)) {
+  if ((remoteHostTargetId === undefined) !== (remoteHostId === undefined)
+    || (remoteHostId === undefined) !== (remoteRoot === undefined)) {
     throw new StoreError("Stored Session Remote workspace binding is incomplete.");
   }
   if ((automationScheduleId === undefined) !== (automationRunId === undefined) ||
@@ -17030,10 +17044,11 @@ function sessionFromRow(row: Row): StoredSession {
       ...optionalString("effort", row["effort"]),
       fastMode: booleanValue(row["fast_mode"]),
       ...optionalString("appendSystemPrompt", row["append_system_prompt"]),
-      ...(remoteHostId === undefined || remoteRoot === undefined
+      ...(remoteHostTargetId === undefined || remoteHostId === undefined || remoteRoot === undefined
         ? {}
         : {
             remoteWorkspace: {
+              hostTargetId: remoteHostIdentity(remoteHostTargetId, "host target id", 256),
               hostId: remoteHostAlias(remoteHostId),
               workspaceRoot: remoteWorkspaceRoot(remoteRoot)
             }
@@ -17561,6 +17576,7 @@ function normalizeNativeSessionDerivation(input: RecordNativeSessionDerivationIn
     targetId: identity(input.targetId, "Target ID"),
     effectiveWorkspaceRoot: nativeBindingReference(input.effectiveWorkspaceRoot),
     ...(input.remoteWorkspace === undefined ? {} : { remoteWorkspace: {
+      hostTargetId: remoteHostIdentity(input.remoteWorkspace.hostTargetId, "host target id", 256),
       hostId: remoteHostAlias(input.remoteWorkspace.hostId),
       workspaceRoot: remoteWorkspaceRoot(input.remoteWorkspace.workspaceRoot)
     } }),
@@ -17595,6 +17611,7 @@ function nativeSessionDerivationFromRow(row: Row): NativeSessionDerivationRecord
     targetId: stringValue(row["target_id"]),
     effectiveWorkspaceRoot: stringValue(row["effective_workspace_root"]),
     ...(row["remote_host_id"] === null ? {} : { remoteWorkspace: {
+      hostTargetId: remoteHostIdentity(stringValue(row["remote_host_target_id"]), "host target id", 256),
       hostId: stringValue(row["remote_host_id"]), workspaceRoot: stringValue(row["remote_workspace_root"])
     } }),
     binding: {
@@ -18909,7 +18926,8 @@ function sameRemoteWorkspace(
   right: TargetDescriptor["remoteWorkspace"]
 ): boolean {
   if (left === undefined || right === undefined) return left === right;
-  return left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+  return left.hostTargetId === right.hostTargetId
+    && left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
 }
 
 function remoteHostCredentialReference(value: string): string {

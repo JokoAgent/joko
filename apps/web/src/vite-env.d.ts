@@ -219,6 +219,7 @@ type JokoDesktopCapability =
   | "application.menu"
   | "extension.libraryGestures"
   | "extension.libraryLocationPicker"
+  | "projects.directoryPicker"
   | "extension.windows"
   | "inspector.detach"
   | "layout.reset"
@@ -300,6 +301,7 @@ interface JokoDesktopApi {
   readonly window: {
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;
+    toggleFullscreen(): Promise<boolean>;
     setZoomFactor(zoomFactor: number): Promise<void>;
     close(): Promise<void>;
   };
@@ -341,6 +343,11 @@ interface JokoDesktopApi {
     }): Promise<number>;
     cancelSave(ticketId: string): Promise<void>;
     clipboardWrite(request: { readonly extensionId: string; readonly bytes: Uint8Array }): Promise<number>;
+  };
+  readonly projects: {
+    pickDirectory(request: { readonly profileId: string; readonly deviceId: string; readonly serverId: string; readonly origin: string }): Promise<
+      { readonly cancelled: true } | { readonly cancelled: false; readonly path: string }
+    >;
   };
   readonly windowInteraction: {
     get(): Promise<{ readonly swallowActivationClick: boolean }>;

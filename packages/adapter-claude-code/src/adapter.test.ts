@@ -100,7 +100,7 @@ describe("ClaudeCodeAdapter", () => {
   test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
     const remoteTarget: TargetDescriptor = {
       ...target, id: "remote-mcp-target", workspaceRoot: "D:\\service-owned-placeholder",
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
     const calls = vi.fn(async () => ({
@@ -160,7 +160,7 @@ describe("ClaudeCodeAdapter", () => {
     const remote = location === "remote";
     const selectedTarget: TargetDescriptor = remote ? {
       ...target, id: "remote-no-tool", workspaceRoot: "D:\\service-owned-placeholder",
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
     } : target;
     const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
     let toolsAvailable = false;
@@ -271,7 +271,7 @@ describe("ClaudeCodeAdapter", () => {
           ...target,
           id: "target-remote-managed-effort",
           workspaceRoot: "D:\\service-owned-placeholder",
-          remoteWorkspace: { hostId: "host-effort", workspaceRoot: "/srv/effort" }
+          remoteWorkspace: { hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
         }
       : target;
     const adapter = adapterFor(remote ? new FakeSdkRuntime() : runtime, {
@@ -940,7 +940,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote-managed-limits",
       workspaceRoot: "D:\\service-owned-placeholder",
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
     const close = vi.fn(async () => undefined);
@@ -3077,7 +3077,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote",
       workspaceRoot: "D:\\service-owned-placeholder",
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const localRuntime = new FakeSdkRuntime();
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
@@ -3173,7 +3173,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote-manager-replacement",
       workspaceRoot: "D:\\service-owned-placeholder",
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const runtime = new FakeSdkRuntime();
     runtime.queryFailure = Object.assign(new Error("manager generation changed"), {

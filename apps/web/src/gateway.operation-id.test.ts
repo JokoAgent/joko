@@ -40,7 +40,7 @@ describe("operation ID lifecycle", () => {
         targetId: "runtime-target",
         projectId: "navigation-project",
         displayName: "Movable task",
-        remoteWorkspace: { hostId: "host-1", workspaceRootDisplay: "/srv/work" }
+        remoteWorkspace: { hostTargetId: "runtime-target", hostId: "host-1", workspaceRootDisplay: "/srv/work" }
       }]
     }));
     expect(snapshot.sessions[0]).toMatchObject({

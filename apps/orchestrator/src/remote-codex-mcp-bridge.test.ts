@@ -413,7 +413,7 @@ async function createFixture(options: { readonly now?: () => number; readonly gr
   store.upsertTarget({
     id: "target-remote", backendId: "codex", displayName: "Remote", workspaceRoot: "D:/remote-placeholder",
     managed: false, trusted: true,
-    remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/workspace" }
+    remoteWorkspace: { hostTargetId: "target-remote", hostId: "remote-host", workspaceRoot: "/srv/workspace" }
   });
   store.upsertTarget({
     id: "target-local", backendId: "codex", displayName: "Local", workspaceRoot: "D:/workspace",
@@ -422,7 +422,7 @@ async function createFixture(options: { readonly now?: () => number; readonly gr
   store.createSession({
     id: "session-remote", backendId: "codex", targetId: "target-remote", title: "Remote",
     binding: { opaqueRef: "native-root", generation: 1 },
-    remoteWorkspace: { hostId: "remote-host", workspaceRoot: "/srv/workspace" },
+    remoteWorkspace: { hostTargetId: "target-remote", hostId: "remote-host", workspaceRoot: "/srv/workspace" },
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
     createdAt: 1, updatedAt: 1
   });

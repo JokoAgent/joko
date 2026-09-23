@@ -744,7 +744,7 @@ CREATE TABLE product_sessions (
         CHECK (
           append_system_prompt IS NULL
           OR (length(append_system_prompt) <= 8000 AND instr(append_system_prompt, char(0)) = 0)
-        ), remote_host_id TEXT CHECK (
+        ), remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT, remote_host_id TEXT CHECK (
         remote_host_id IS NULL OR (
           length(trim(remote_host_id)) BETWEEN 1 AND 256
           AND instr(remote_host_id, char(0)) = 0
@@ -1855,7 +1855,7 @@ CREATE TABLE targets (
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1)
-      , remote_host_id TEXT CHECK (
+      , remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT, remote_host_id TEXT CHECK (
         remote_host_id IS NULL OR (
           length(trim(remote_host_id)) BETWEEN 1 AND 256
           AND instr(remote_host_id, char(0)) = 0
@@ -2045,6 +2045,7 @@ CREATE TABLE native_session_derivations (
           length(effective_workspace_root) BETWEEN 1 AND 32768
           AND instr(effective_workspace_root, char(0)) = 0
         ),
+        remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
         remote_host_id TEXT,
         remote_workspace_root TEXT,
         native_opaque_ref TEXT NOT NULL COLLATE NOCASE,
@@ -2062,6 +2063,7 @@ CREATE TABLE native_session_derivations (
         updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
         revision INTEGER NOT NULL CHECK (revision >= 1),
         UNIQUE(backend_id, native_opaque_ref),
+        CHECK ((remote_host_target_id IS NULL) = (remote_host_id IS NULL)),
         CHECK ((remote_host_id IS NULL) = (remote_workspace_root IS NULL)),
       CHECK (source_session_id <> derived_session_id OR generation = source_generation + 1),
         CHECK (source_native_opaque_ref <> native_opaque_ref COLLATE NOCASE),
@@ -2291,7 +2293,7 @@ CREATE INDEX sessions_project_idx
         WHERE deleted_at IS NULL;
 
 CREATE INDEX sessions_remote_host_idx
-        ON product_sessions(target_id, remote_host_id, updated_at DESC)
+        ON product_sessions(remote_host_target_id, remote_host_id, updated_at DESC)
         WHERE remote_host_id IS NOT NULL;
 
 CREATE INDEX sessions_target_idx ON product_sessions(target_id, updated_at DESC);
@@ -2304,7 +2306,7 @@ CREATE INDEX native_history_marker_cursor_idx
 
 CREATE INDEX targets_backend_idx ON targets(backend_id);
 
-CREATE INDEX targets_remote_host_idx ON targets(remote_host_id)
+CREATE INDEX targets_remote_host_idx ON targets(remote_host_target_id, remote_host_id)
         WHERE remote_host_id IS NOT NULL;
 
 CREATE INDEX tool_leases_active_idx ON tool_leases(tool_id, expires_at) WHERE state = 'active';
@@ -2443,10 +2445,10 @@ CREATE TRIGGER remote_hosts_protect_bound_delete
       BEFORE DELETE ON remote_hosts
       WHEN EXISTS (
         SELECT 1 FROM targets
-        WHERE id = OLD.target_id AND remote_host_id = OLD.host_id
+        WHERE remote_host_target_id = OLD.target_id AND remote_host_id = OLD.host_id
       ) OR EXISTS (
         SELECT 1 FROM product_sessions
-        WHERE target_id = OLD.target_id AND remote_host_id = OLD.host_id AND deleted_at IS NULL
+        WHERE remote_host_target_id = OLD.target_id AND remote_host_id = OLD.host_id AND deleted_at IS NULL
       )
       BEGIN
         SELECT RAISE(ABORT, 'bound remote host cannot be deleted');
@@ -2646,28 +2648,32 @@ CREATE TRIGGER messaging_inbound_queue_update
 
 CREATE TRIGGER sessions_remote_binding_insert
       BEFORE INSERT ON product_sessions
-      WHEN (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
+        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
       BEGIN
         SELECT RAISE(ABORT, 'session remote workspace binding is incomplete');
       END;
 
 CREATE TRIGGER sessions_remote_binding_update
-      BEFORE UPDATE OF remote_host_id, remote_workspace_root ON product_sessions
-      WHEN (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      BEFORE UPDATE OF remote_host_target_id, remote_host_id, remote_workspace_root ON product_sessions
+      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
+        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
       BEGIN
         SELECT RAISE(ABORT, 'session remote workspace binding is incomplete');
       END;
 
 CREATE TRIGGER targets_remote_binding_insert
       BEFORE INSERT ON targets
-      WHEN (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
+        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
       BEGIN
         SELECT RAISE(ABORT, 'target remote workspace binding is incomplete');
       END;
 
 CREATE TRIGGER targets_remote_binding_update
-      BEFORE UPDATE OF remote_host_id, remote_workspace_root ON targets
-      WHEN (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
+      BEFORE UPDATE OF remote_host_target_id, remote_host_id, remote_workspace_root ON targets
+      WHEN (NEW.remote_host_target_id IS NULL) <> (NEW.remote_host_id IS NULL)
+        OR (NEW.remote_host_id IS NULL) <> (NEW.remote_workspace_root IS NULL)
       BEGIN
         SELECT RAISE(ABORT, 'target remote workspace binding is incomplete');
       END;

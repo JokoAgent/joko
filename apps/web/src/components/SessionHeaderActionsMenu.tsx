@@ -16,6 +16,7 @@ import {
   PanelRight,
   Pencil,
   Pin,
+  Sparkles,
   Rows2,
   Trash2,
   Undo2
@@ -38,10 +39,12 @@ export interface SessionHeaderActionsMenuProps {
   readonly onDelete: () => void;
   readonly onMoveSessionProject?: (placement: SessionProjectNavigationPlacement) => void;
   readonly onCopyTaskLink?: () => void;
+  readonly onCopyConversationMarkdown?: () => void;
   readonly onExportPortableSession?: () => void;
   readonly onExportHtml?: (ownerDocument: Document) => void;
   readonly exportHtmlPending?: boolean;
   readonly onClone?: () => void;
+  readonly onLearnFromSession?: () => void;
   readonly onSplitSession?: (side: "right" | "bottom") => void;
   readonly onOpenSessionWindow?: () => void;
   readonly onOpenCodeHostPullRequest?: (url: string) => void;
@@ -59,10 +62,12 @@ export function SessionHeaderActionsMenu({
   onDelete,
   onMoveSessionProject,
   onCopyTaskLink,
+  onCopyConversationMarkdown,
   onExportPortableSession,
   onExportHtml,
   exportHtmlPending,
   onClone,
+  onLearnFromSession,
   onSplitSession,
   onOpenSessionWindow,
   onOpenCodeHostPullRequest
@@ -240,6 +245,10 @@ export function SessionHeaderActionsMenu({
           <Copy aria-hidden="true" />
           {t("session.copyTaskLink")}
         </button>}
+        {onCopyConversationMarkdown !== undefined && <button type="button" role="menuitem" onClick={() => run(onCopyConversationMarkdown)}>
+          <Copy aria-hidden="true" />
+          {t("session.copyConversationMarkdown")}
+        </button>}
         {onExportPortableSession !== undefined && <button type="button" role="menuitem" onClick={() => run(onExportPortableSession)}>
           <FileOutput aria-hidden="true" />
           {t("session.exportPortable")}
@@ -251,6 +260,10 @@ export function SessionHeaderActionsMenu({
         {onClone !== undefined && <button type="button" role="menuitem" onClick={() => run(onClone)}>
           <GitBranch aria-hidden="true" />
           {t("session.clone")}
+        </button>}
+        {onLearnFromSession !== undefined && <button type="button" role="menuitem" onClick={() => run(onLearnFromSession)}>
+          <Sparkles aria-hidden="true" />
+          {t("skills.learning.fromSession")}
         </button>}
         {!session.archived && onSplitSession !== undefined && <>
           <button type="button" role="menuitem" onClick={() => run(() => onSplitSession("right"))}>

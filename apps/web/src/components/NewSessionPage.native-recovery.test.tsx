@@ -141,7 +141,7 @@ describe("new-task native draft recovery", () => {
     const remoteTarget = {
       ...base.targets[1]!,
       name: "Project",
-      remoteWorkspace: { hostId: "build-host", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { hostTargetId: "target-1", hostId: "build-host", workspaceRoot: "/srv/project" }
     };
     const remoteWorkspace = { ...base.workspaces[1]!, name: "Project", serverPath: "/srv/project" };
     const snapshotValue = { ...base, targets: [base.targets[0]!, remoteTarget], workspaces: [base.workspaces[0]!, remoteWorkspace] };
@@ -162,7 +162,7 @@ describe("new-task native draft recovery", () => {
     await flush();
     expect(container.querySelector('[role="status"]')?.textContent).toContain("newTask.workspaceChecking");
     const options = [...targetSelect(container).querySelectorAll("option")].map((option) => option.textContent);
-    expect(options).toContain("Project · build-host · /srv/project");
+    expect(options).toContain("Project · Project / build-host · /srv/project");
 
     await act(async () => setSelect(targetSelect(container), "target:target-2"));
     await flush();
@@ -956,7 +956,7 @@ describe("new-task worktree authority", () => {
     const remoteSnapshot: AppSnapshot = {
       ...base,
       targets: base.targets.map((target) => target.id === "target-1"
-        ? { ...target, remoteWorkspace: { hostId: "remote-1", workspaceRoot: "/srv/project" } }
+        ? { ...target, remoteWorkspace: { hostTargetId: "target-1", hostId: "remote-1", workspaceRoot: "/srv/project" } }
         : target)
     };
     const probe = vi.fn(async (): Promise<TargetWorktreeProbeView> => {
@@ -1255,6 +1255,8 @@ function controller(options: {
   return {
     state: {
       connectionState: "connected",
+      route: { kind: "newSession" },
+      navigationRevision: 1,
       snapshot: options.snapshotValue ?? snapshot(),
       ...(options.profile === undefined ? {} : { activeProfile: options.profile }),
       preferences: {

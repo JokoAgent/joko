@@ -69,13 +69,15 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
       ?? dependencies.store.getTarget(session.descriptor.targetId).descriptor;
     const remote = session.descriptor.remoteWorkspace;
     const registeredRemote = dependencies.store.getTarget(session.descriptor.targetId).descriptor.remoteWorkspace;
-    if (remote?.hostId !== registeredRemote?.hostId || remote?.workspaceRoot !== registeredRemote?.workspaceRoot) {
+    if (remote?.hostTargetId !== registeredRemote?.hostTargetId
+      || remote?.hostId !== registeredRemote?.hostId || remote?.workspaceRoot !== registeredRemote?.workspaceRoot) {
       throw new ConnectError("The task workspace changed during the terminal request.", Code.Aborted);
     }
     if (remote !== undefined) {
       const worktree = session.descriptor.worktree;
       if (worktree !== undefined && worktree.state !== "active") throw new ConnectError("The task workspace is no longer active.", Code.FailedPrecondition);
-      return { sessionId, targetId: session.descriptor.targetId, remoteHostId: remote.hostId, workspaceRoot: worktree?.path ?? remote.workspaceRoot };
+      return { sessionId, targetId: session.descriptor.targetId, remoteHostTargetId: remote.hostTargetId,
+        remoteHostId: remote.hostId, workspaceRoot: worktree?.path ?? remote.workspaceRoot };
     }
     return { sessionId, targetId: session.descriptor.targetId, workspaceRoot: target.workspaceRoot };
   };
@@ -92,7 +94,8 @@ export function createTerminalConnectService(dependencies: TerminalServiceDepend
     dependencies.authenticate(context);
     if (context.signal.aborted) throw new ConnectError("Terminal request cancelled.", Code.Canceled);
     const current = scope(initial.sessionId, mutate);
-    if (current.targetId !== initial.targetId || current.workspaceRoot !== initial.workspaceRoot || current.remoteHostId !== initial.remoteHostId) {
+    if (current.targetId !== initial.targetId || current.workspaceRoot !== initial.workspaceRoot
+      || current.remoteHostTargetId !== initial.remoteHostTargetId || current.remoteHostId !== initial.remoteHostId) {
       throw new ConnectError("The task workspace changed during the terminal request.", Code.Aborted);
     }
   };

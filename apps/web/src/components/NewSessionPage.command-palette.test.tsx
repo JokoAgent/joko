@@ -7,12 +7,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { AppController } from "../controller.js";
+import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
 import {
   emptySnapshot,
   type AppSnapshot,
   type ComposerDraft,
   type ComposerInlineMentionRange,
   type ExtensionCatalogEntryView,
+  type ModelView,
   type NewSessionLocalDraft,
   type PendingExtensionUseView
 } from "../model.js";
@@ -180,6 +182,31 @@ describe("NewSessionPage typed slash commands", () => {
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
+  it("routes separate photo and file actions through the live new-task composer and retires a late chooser result", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft) => undefined);
+    await renderPage(onSubmit, { attachmentActions: true });
+    const file = required(document.querySelector<HTMLInputElement>(".new-task-composer input[type='file']"));
+    const pick = vi.spyOn(file, "click").mockImplementation(() => undefined);
+
+    await act(async () => {
+      expect(dispatchGamepadOwnedAction(document, "add-photos")).toBe(true);
+      expect(dispatchGamepadOwnedAction(document, "add-files")).toBe(true);
+    });
+    expect(pick).toHaveBeenCalledTimes(2);
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-files"); });
+    Object.defineProperty(file, "files", { configurable: true, value: [new File(["late"], "late.txt", { type: "text/plain" })] });
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+      file.dispatchEvent(new Event("change", { bubbles: true }));
+      await flush();
+    });
+    expect(document.body.textContent).not.toContain("late.txt");
+    expect(editorElement?.textContent).toBe("");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
   it("routes a private task drag through the positional editor contract", async () => {
     await renderPage(vi.fn(async () => undefined));
     const composer = required(document.querySelector<HTMLElement>(".new-task-composer"));
@@ -221,16 +248,17 @@ async function renderPage(
     readonly pending?: PendingExtensionUseView;
     readonly getExtension?: AppController["getExtension"];
     readonly clearPendingExtensionUse?: AppController["clearPendingExtensionUse"];
+    readonly attachmentActions?: boolean;
   } = {}
 ): Promise<void> {
-  const snapshotValue = snapshot();
+  const snapshotValue = snapshot(options.attachmentActions === true);
   const controller = {
     state: {
       connectionState: "connected",
       snapshot: snapshotValue,
       preferences: { locale: "en", composerSendShortcut: "enter", newSessionWorktreeEnabled: false }
     },
-    readNewSessionDraft: vi.fn(async () => draft()),
+    readNewSessionDraft: vi.fn(async () => draft(options.attachmentActions === true)),
     saveNewSessionDraft: vi.fn(async () => undefined),
     readPendingExtensionUse: vi.fn(async () => options.pending),
     getExtension: options.getExtension ?? vi.fn(async () => ({ revision: 0n, extensions: [], recoveredFromCorruption: false })),
@@ -324,10 +352,30 @@ function commandOptions(): HTMLButtonElement[] {
   return [...document.querySelectorAll<HTMLButtonElement>('[aria-label="composer.commands"] [role="option"]')];
 }
 
-function snapshot(): AppSnapshot {
+const visionModel: ModelView = {
+  backendId: "backend-1",
+  providerId: "provider-1",
+  providerName: "Provider",
+  modelId: "vision-1",
+  name: "Vision",
+  available: true,
+  supportsImages: true,
+  supportsFast: false,
+  inputModalities: ["text", "image"],
+  outputModalities: ["text"],
+  efforts: [],
+  contextWindow: 8_192,
+  maximumOutputTokens: 2_048,
+  inputCostMicrosPerMillion: 0,
+  outputCostMicrosPerMillion: 0,
+  currencyCode: "USD"
+};
+
+function snapshot(attachmentActions = false): AppSnapshot {
   const initial = emptySnapshot();
   return {
     ...initial,
+    models: attachmentActions ? [visionModel] : [],
     backends: [{
       id: "backend-1",
       name: "Backend",
@@ -338,7 +386,12 @@ function snapshot(): AppSnapshot {
       capabilities: new Map([
         ["input.text", { name: "input.text", supported: true, options: [] }],
         ["runtime.commands", { name: "runtime.commands", supported: true, options: [] }],
-        ["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }]
+        ["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }],
+        ...(attachmentActions ? [
+          ["model.switch", { name: "model.switch", supported: true, options: [] }],
+          ["input.image", { name: "input.image", supported: true, options: [] }],
+          ["input.file", { name: "input.file", supported: true, options: [] }]
+        ] as const : [])
       ])
     }],
     targets: [{
@@ -356,12 +409,12 @@ function snapshot(): AppSnapshot {
   };
 }
 
-function draft(): NewSessionLocalDraft {
+function draft(attachmentActions = false): NewSessionLocalDraft {
   return {
     selection: { kind: "target", targetId: "target-1" },
     nativeStart: { kind: "fresh" },
-    providerId: "",
-    modelId: "",
+    providerId: attachmentActions ? visionModel.providerId : "",
+    modelId: attachmentActions ? visionModel.modelId : "",
     fastMode: false,
     permissionMode: "ask",
     planMode: false,

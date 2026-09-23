@@ -192,6 +192,31 @@ describe("remote connection auth and durable operations", () => {
     expect(sessionIdFrom(session)).not.toBe("");
   });
 
+  it("browses only the authenticated service-node directory before creating a project binding", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const paired = await fixture.pair("service directory owner");
+    const parent = join(fixture.rootDirectory, "browse-projects");
+    const chosen = join(parent, "chosen");
+    await mkdir(chosen, { recursive: true });
+    await expect(fixture.anonymous.target.listProjectDirectories({ path: parent })).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const listing = await paired.clients.target.listProjectDirectories({ path: parent });
+    expect(listing.path).toBe(parent);
+    expect(listing.directories).toMatchObject([{ name: "chosen", path: chosen }]);
+    expect((await paired.clients.target.listProjectDirectories({ path: chosen })).parentPath).toBe(parent);
+    await expect(paired.clients.target.listProjectDirectories({ path: join(parent, "missing") })).rejects.toMatchObject({ code: Code.NotFound });
+
+    const created = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "createTarget", value: create(CreateTargetMutationSchema, {
+        backendId: fixture.adapter().id, displayName: "Chosen project",
+        workspace: create(TargetWorkspaceInputSchema, {
+          kind: WorkspaceKind.USER_PROJECT, serverPath: listing.directories[0]!.path, createIfMissing: false
+        })
+      }) }
+    }));
+    if (created.result?.payload.case !== "target") throw new Error("Project creation returned no Target.");
+    expect(fixture.application.store.getTarget(created.result.payload.value.targetId).descriptor.workspaceRoot).toBe(chosen);
+  });
+
   it("preflights every task before a Backend-wide restart changes any runtime generation", async () => {
     fixture = await OrchestratorE2eFixture.start();
     const paired = await fixture.pair("atomic Backend restart");

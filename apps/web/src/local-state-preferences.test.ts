@@ -84,6 +84,27 @@ describe("cross-window durable UI preference mutations", () => {
   });
 });
 
+describe("device-local recent projects", () => {
+  it("partitions exact connection owners and keeps failed removal from inventing a successful state", async () => {
+    const database = memoryPreferenceDatabase();
+    const firstWindow = memoryLocalState(database.database);
+    const secondWindow = memoryLocalState(database.database);
+    const project = { targetId: "target", workspaceId: "workspace", name: "Project", serverPath: "/srv/project", lastUsedAt: 1 };
+    await firstWindow.recordRecentProject("server-a\u0000profile-a", project);
+    await expect(secondWindow.readRecentProjects("server-a\u0000profile-a")).resolves.toEqual([expect.objectContaining({
+      targetId: project.targetId, workspaceId: project.workspaceId, serverPath: project.serverPath
+    })]);
+    await expect(secondWindow.readRecentProjects("server-a\u0000profile-b")).resolves.toEqual([]);
+    await expect(secondWindow.readRecentProjects("server-b\u0000profile-a")).resolves.toEqual([]);
+
+    database.failNextPut();
+    await expect(secondWindow.removeRecentProject("server-a\u0000profile-a", project)).rejects.toThrow("preference write failed");
+    await expect(firstWindow.readRecentProjects("server-a\u0000profile-a")).resolves.toHaveLength(1);
+    await secondWindow.removeRecentProject("server-a\u0000profile-a", project);
+    await expect(firstWindow.readRecentProjects("server-a\u0000profile-a")).resolves.toEqual([]);
+  });
+});
+
 function memoryLocalState(database: IDBDatabase): LocalState {
   const LocalStateConstructor = LocalState as unknown as new (database: IDBDatabase) => LocalState;
   return new LocalStateConstructor(database);

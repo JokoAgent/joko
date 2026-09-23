@@ -19,6 +19,7 @@ const model: ModelView = {
   available: true, supportsImages: false, supportsFast: false, inputModalities: ["text"], outputModalities: ["text"],
   efforts: [], contextWindow: 8192, maximumOutputTokens: 2048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD"
 };
+const visionModel: ModelView = { ...model, supportsImages: true, inputModalities: ["text", "image"] };
 const provider: ProviderRuntimeView = {
   backendId: "backend-one", id: "source-one", name: "Source one", kind: "oauth", compatibility: "native",
   authenticationState: "authenticated", endpoint: "", ownerManaged: false, supportsLogin: true, loginMethods: ["deviceCode"],
@@ -42,15 +43,22 @@ describe("Composer model authorization", () => {
     view.host.className = "new-task-page";
     const file = view.host.querySelector<HTMLInputElement>("input[type='file']")!;
     const pick = vi.spyOn(file, "click").mockImplementation(() => undefined);
-    await act(async () => { dispatchGamepadOwnedAction(document, "add-attachments"); });
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-photos"); dispatchGamepadOwnedAction(document, "add-files"); });
     expect(pick).not.toHaveBeenCalled();
-    const attachmentsBackend = { ...backend, capabilities: new Map([...backend.capabilities, ["input.file", { name: "input.file", supported: true, options: [] }]]) };
-    await view.render([provider], session, attachmentsBackend);
-    await act(async () => { dispatchGamepadOwnedAction(document, "add-attachments"); });
+    const fileBackend = { ...backend, capabilities: new Map([...backend.capabilities, ["input.file", { name: "input.file", supported: true, options: [] }]]) };
+    const attachmentsBackend = { ...fileBackend, capabilities: new Map([...fileBackend.capabilities, ["input.image", { name: "input.image", supported: true, options: [] }]]) };
+    await view.render([provider], session, fileBackend);
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-photos"); dispatchGamepadOwnedAction(document, "add-files"); });
     expect(pick).toHaveBeenCalledOnce();
-    await view.render([provider], session, attachmentsBackend, true);
-    await act(async () => { dispatchGamepadOwnedAction(document, "submit"); dispatchGamepadOwnedAction(document, "add-attachments"); });
-    expect(view.api.send).not.toHaveBeenCalled(); expect(pick).toHaveBeenCalledOnce();
+    await view.render([provider], { ...session, model: visionModel }, attachmentsBackend);
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-photos"); dispatchGamepadOwnedAction(document, "add-files"); });
+    expect(pick).toHaveBeenCalledTimes(3);
+    await view.render([provider], { ...session, model: visionModel }, attachmentsBackend, true);
+    await act(async () => { dispatchGamepadOwnedAction(document, "submit"); dispatchGamepadOwnedAction(document, "add-photos"); dispatchGamepadOwnedAction(document, "add-files"); });
+    expect(view.api.send).not.toHaveBeenCalled(); expect(pick).toHaveBeenCalledTimes(3);
+    await view.render([provider], { ...session, model: visionModel }, attachmentsBackend, false, undefined, "disconnected");
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-photos"); dispatchGamepadOwnedAction(document, "add-files"); });
+    expect(pick).toHaveBeenCalledTimes(3);
     await view.render([provider]);
     await act(async () => {
       dispatchGamepadOwnedAction(document, "submit"); dispatchGamepadOwnedAction(document, "submit");
@@ -61,6 +69,30 @@ describe("Composer model authorization", () => {
     expect(view.draft()).toBe("");
     await act(async () => { dispatchGamepadOwnedAction(document, "open-commands"); });
     expect(document.body.textContent).toContain("/help");
+  });
+
+  it("retires a native chooser result when the owning task changes and leaves a cancelled draft untouched", async () => {
+    const view = await mount();
+    view.host.className = "new-task-page";
+    const attachmentsBackend = { ...backend, capabilities: new Map([...backend.capabilities, ["input.file", { name: "input.file", supported: true, options: [] }]]) };
+    await view.render([provider], session, attachmentsBackend);
+    const file = view.host.querySelector<HTMLInputElement>("input[type='file']")!;
+    vi.spyOn(file, "click").mockImplementation(() => undefined);
+
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-files"); });
+    Object.defineProperty(file, "files", { configurable: true, value: [new File(["late"], "late.txt", { type: "text/plain" })] });
+    await view.render([provider], { ...session, id: "task-two" }, attachmentsBackend);
+    await act(async () => file.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(view.host.textContent).not.toContain("late.txt");
+    expect(view.draft()).toBe("Keep this draft");
+    expect(view.api.send).not.toHaveBeenCalled();
+
+    const currentFile = view.host.querySelector<HTMLInputElement>("input[type='file']")!;
+    await act(async () => { dispatchGamepadOwnedAction(document, "add-files"); });
+    Object.defineProperty(currentFile, "files", { configurable: true, value: [] });
+    await act(async () => currentFile.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(view.draft()).toBe("Keep this draft");
+    expect(view.api.send).not.toHaveBeenCalled();
   });
 
   it("gates the native default with its Backend authentication while leaving unrelated provider states out of the decision", async () => {
@@ -163,8 +195,8 @@ async function mount() {
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host); roots.push(root);
   const actions: Promise<unknown>[] = []; const stop = vi.fn();
-  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false, rejectedFirstInputRecovery?: AppController["state"]["rejectedFirstInputRecovery"]) => act(async () => root.render(<Composer
-    controller={{ ...api, state: { ...api.state, snapshot: { ...api.state.snapshot, providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } }} session={currentSession} backend={currentBackend}
+  const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false, rejectedFirstInputRecovery?: AppController["state"]["rejectedFirstInputRecovery"], connectionState: AppController["state"]["connectionState"] = "connected") => act(async () => root.render(<Composer
+    controller={{ ...api, state: { ...api.state, connectionState, snapshot: { ...api.state.snapshot, providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } }} session={currentSession} backend={currentBackend}
     readOnly={readOnly}
     autoFocus={false} queue={[]} extraDirectories={[]} resources={[]} commands={[]} messageHistory={[]}
     t={(key) => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />));

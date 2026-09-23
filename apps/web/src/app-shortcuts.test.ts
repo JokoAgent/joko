@@ -29,9 +29,10 @@ const ctrlG: AppShortcutCombo = { code: "KeyG", meta: false, ctrl: true, alt: fa
 
 describe("application shortcut registry", () => {
   it("registers every executable action including the interactive terminal", () => {
-    expect(APP_SHORTCUT_IDS).toHaveLength(27);
+    expect(APP_SHORTCUT_IDS).toHaveLength(28);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toEqual(APP_SHORTCUT_IDS);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toContain("open-terminal");
+    expect(effectiveAppShortcutCombos("copy-conversation-markdown", {}, "win32")).toEqual([]);
     expect(SWITCH_SESSION_SHORTCUT_IDS).toHaveLength(9);
   });
 
@@ -142,6 +143,7 @@ describe("application shortcut registry", () => {
       "right-tab-prev",
       "right-tab-next",
       "open-terminal",
+      "copy-conversation-markdown",
       "find-in-page",
       "search-in-project",
       "zoom-in",
@@ -159,6 +161,7 @@ describe("application shortcut registry", () => {
       "right-tab-prev",
       "right-tab-next",
       "open-terminal",
+      "copy-conversation-markdown",
       "find-in-page",
       "search-in-project",
       "browser-focus-url",

@@ -92,7 +92,7 @@ it("dispatches a remote Claude turn through HTTP only after durable admission an
       ...initialTarget,
       workspaceRoot: "D:\\service-owned-placeholder",
       managed: false,
-      remoteWorkspace: { hostId: "host-a", workspaceRoot: REMOTE_WORKSPACE }
+      remoteWorkspace: { hostTargetId: targetId, hostId: "host-a", workspaceRoot: REMOTE_WORKSPACE }
     });
     const paired = await fixture.pair("Remote Claude product client");
     const sessionId = sessionIdFrom(await submit(

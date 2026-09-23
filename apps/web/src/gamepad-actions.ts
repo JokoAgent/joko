@@ -1,9 +1,31 @@
 import { useLayoutEffect, useRef, type RefObject } from "react";
 import type { GamepadAction } from "./gamepad-input.js";
 
+export const GAMEPAD_INSPECTOR_ACTIONS = ["open-terminal", "open-browser-tab", "toggle-review-tab"] as const satisfies readonly GamepadAction[];
+export type GamepadInspectorAction = (typeof GAMEPAD_INSPECTOR_ACTIONS)[number];
+export interface GamepadInspectorRequest {
+  readonly requestId: number;
+  readonly action: GamepadInspectorAction;
+  readonly sessionId: string;
+  readonly sessionGeneration: bigint;
+  readonly connectionGeneration: bigint;
+  readonly profileId: string;
+  readonly navigationRevision: number;
+}
+export function isGamepadInspectorAction(action: GamepadAction): action is GamepadInspectorAction {
+  return (GAMEPAD_INSPECTOR_ACTIONS as readonly string[]).includes(action);
+}
+
+export function gamepadInspectorRequestOwned(doc: Document, request: GamepadInspectorRequest): boolean {
+  return doc.visibilityState === "visible" && doc.hasFocus()
+    && !doc.body.classList.contains("modal-open") && doc.body.dataset.appShortcutRecording !== "1"
+    && doc.querySelector("[data-gamepad-preview]") === null
+    && currentGamepadTaskRoot(doc)?.dataset.gamepadSessionId === request.sessionId;
+}
+
 export const GAMEPAD_OWNED_ACTIONS = [
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
-  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "add-attachments", "open-commands", "scroll-bottom"
+  "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-photos", "add-files", "open-commands", "scroll-bottom"
 ] as const satisfies readonly GamepadAction[];
 export type GamepadOwnedAction = (typeof GAMEPAD_OWNED_ACTIONS)[number];
 type ActionOwner = "composer" | "session" | "interaction";
@@ -51,8 +73,9 @@ export function dispatchGamepadOwnedAction(doc: Document, action: GamepadOwnedAc
     }
   } else {
     if (doc.body.classList.contains("modal-open")) return false;
+    if (doc.querySelector("[data-morph-side]:not([inert])") !== null) return false;
     const root = currentGamepadTaskRoot(doc);
-    const kind = action === "submit" || action === "add-attachments" || action === "open-commands" ? "composer" : "session";
+    const kind = action === "submit" || action === "add-photos" || action === "add-files" || action === "open-commands" ? "composer" : "session";
     if (root?.dataset.gamepadActions === kind) target = root;
     else target = root?.querySelector(`[data-gamepad-actions='${kind}']`) ?? null;
   }
