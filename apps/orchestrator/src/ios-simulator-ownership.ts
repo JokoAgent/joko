@@ -202,6 +202,88 @@ export class SimulatorOwnershipRegistry {
     return publicInstance(instance);
   }
 
+  assertCanCreate(scope: SimulatorTaskScope): void {
+    this.assertScope(scope);
+    const stored = this.#load();
+    if (stored.instances.some(item => item.sessionId === scope.sessionId)) {
+      throw new SimulatorOwnershipError("SESSION_INSTANCE_LIMIT_REACHED", "This task already owns a Simulator device.");
+    }
+    if (stored.instances.length >= MAX_INSTANCES) throw new SimulatorOwnershipError("DEVICE_BUSY", "Simulator capacity is exhausted.");
+  }
+
+  bindCreatedDevice(scope: SimulatorTaskScope, device: SimulatorDevice, name: string): PublicSimulatorInstance {
+    if (!UUID.test(device.udid) || !device.isAvailable || !bounded(name, 128)
+      || !bounded(device.runtimeIdentifier) || !bounded(device.deviceTypeIdentifier)) {
+      throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Created Simulator device is invalid.");
+    }
+    return this.#store.transaction(() => {
+      this.assertCanCreate(scope);
+      const stored = this.#load();
+      const udid = device.udid.toUpperCase();
+      if (stored.instances.some(item => item.simulatorUdid === udid)) {
+        throw new SimulatorOwnershipError("DEVICE_BUSY", "Simulator device belongs to another task.");
+      }
+      const session = this.#store.getSession(scope.sessionId).descriptor;
+      const now = this.#now();
+      const instance: SimulatorOwnedInstance = {
+        instanceId: this.#createId(), sessionId: scope.sessionId, targetId: scope.targetId,
+        backendId: session.backendId, bindingGeneration: scope.generation,
+        workspaceFingerprint: this.#fingerprint(scope), simulatorUdid: udid,
+        simulatorName: name, runtimeIdentifier: device.runtimeIdentifier,
+        deviceTypeIdentifier: device.deviceTypeIdentifier!, creationProvenance: "joko",
+        bootProvenance: "user_booted", generation: 1, lifecycleState: "stopped",
+        viewerState: "detached", healthState: "healthy",
+        lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
+        createdAt: now, updatedAt: now, errorCode: null
+      };
+      this.#save({ format: 1, instances: [...stored.instances, instance] });
+      return publicInstance(instance);
+    });
+  }
+
+  /** Recovery may inspect adopted devices after their Session becomes stale. */
+  createdDeviceByUdid(udid: string, bindingGeneration: number): PublicSimulatorInstance | null {
+    if (!UUID.test(udid)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator UDID is invalid.");
+    if (!positive(bindingGeneration)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator binding generation is invalid.");
+    const normalized = udid.toUpperCase();
+    const found = this.#load().instances.find(item => item.simulatorUdid === normalized);
+    if (found !== undefined && found.creationProvenance !== "joko") {
+      throw new SimulatorOwnershipError("DEVICE_BUSY", "Pending Simulator belongs to another task.");
+    }
+    if (found !== undefined && found.bindingGeneration !== bindingGeneration) {
+      throw new SimulatorOwnershipError("STALE_SCOPE", "Created Simulator binding changed.");
+    }
+    return found === undefined ? null : publicInstance(found);
+  }
+
+  deviceByUdid(udid: string): PublicSimulatorInstance | null {
+    if (!UUID.test(udid)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator UDID is invalid.");
+    const found = this.#load().instances.find(item => item.simulatorUdid === udid.toUpperCase());
+    return found === undefined ? null : publicInstance(found);
+  }
+
+  restoreCreatedDevice(udid: string): PublicSimulatorInstance {
+    if (!UUID.test(udid)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator UDID is invalid.");
+    return this.#store.transaction(() => {
+      const stored = this.#load();
+      const normalized = udid.toUpperCase();
+      const current = stored.instances.find(item => item.simulatorUdid === normalized && item.creationProvenance === "joko");
+      if (!current) throw new SimulatorOwnershipError("STALE_SCOPE", "Created Simulator ownership is unavailable.");
+      if (current.generation >= Number.MAX_SAFE_INTEGER) {
+        throw new SimulatorOwnershipError("INVALID_OWNERSHIP", "Simulator instance generation is exhausted.");
+      }
+      if (current.lifecycleState === "stopped" && current.healthState === "healthy" && current.errorCode === null) {
+        return publicInstance(current);
+      }
+      const now = this.#now();
+      const restored: SimulatorOwnedInstance = { ...current, generation: current.generation + 1,
+        lifecycleState: "stopped", viewerState: "detached", healthState: "healthy", errorCode: null,
+        lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now };
+      this.#save({ format: 1, instances: stored.instances.map(item => item.instanceId === current.instanceId ? restored : item) });
+      return publicInstance(restored);
+    });
+  }
+
   /** Called inside the effect completion transaction, after an exact terminal simctl observation. */
   completeLifecycle(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, input: {
     readonly action: "start" | "stop";
