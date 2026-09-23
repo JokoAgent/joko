@@ -1082,6 +1082,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (action === "open-settings") { navigateFromShortcut({ kind: "settings" }); return; }
     if (action === "open-skills") { navigateFromShortcut({ kind: "tools", tab: "skills" }); return; }
     if (action === "open-schedules") { navigateFromShortcut({ kind: "schedules" }); return; }
+    if (action === "navigate-back") { if (window.history.length > 1) window.history.back(); return; }
+    if (action === "navigate-forward") { window.history.forward(); return; }
     if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
     if (action === "toggle-inspector") {
       if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));

@@ -150,6 +150,22 @@ describe("gamepad UI target ownership", () => {
     delete document.body.dataset.appShortcutRecording;
     press(); expect(navigate).toHaveBeenCalledWith("open-schedules");
   });
+  it("admits page history only from the visible focused host outside modal, preview and shortcut recording", () => {
+    const navigate = vi.fn();
+    const input = createGamepadDomInput(document, navigate);
+    const press = (action: "navigate-back" | "navigate-forward"): void => input({ kind: "action", action, phase: "press" });
+    press("navigate-back"); press("navigate-forward");
+    expect(navigate.mock.calls.map(([action]) => action)).toEqual(["navigate-back", "navigate-forward"]);
+    document.body.classList.add("modal-open"); press("navigate-back");
+    document.body.classList.remove("modal-open");
+    const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
+    press("navigate-forward"); preview.remove();
+    document.body.dataset.appShortcutRecording = "1"; press("navigate-back");
+    delete document.body.dataset.appShortcutRecording;
+    const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press("navigate-forward"); frame.remove();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false); press("navigate-back");
+    expect(navigate).toHaveBeenCalledTimes(2);
+  });
   it("routes inspector commands only while the focused task surface can act", () => {
     const root = task("one"); root.querySelector("button")!.focus();
     const navigate = vi.fn();

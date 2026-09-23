@@ -113,6 +113,21 @@ describe("gamepad preference authority", () => {
 });
 
 describe("gamepad input ownership", () => {
+  it("maps the default B button to history back and accepts a saved forward binding", () => {
+    const defaultLayout = createDefaultGamepadPreferences();
+    expect(defaultLayout.buttons[1]).toBe("navigate-back");
+    const layout = { ...defaultLayout, enabled: true, buttons: defaultLayout.buttons.map((binding, index) => index === 3 ? "navigate-forward" as const : binding) };
+    saveGamepadPreferences(layout);
+    expect(readGamepadPreferences().preferences.buttons[3]).toBe("navigate-forward");
+    const { sample } = sampler();
+    expect(sample([pad({ down: [1, 3] })], { preferences: layout }).effects).toEqual([]);
+    sample([pad()], { preferences: layout });
+    expect(sample([pad({ down: [1, 3] })], { preferences: layout }).effects).toEqual([
+      { kind: "action", action: "navigate-back", phase: "press" },
+      { kind: "action", action: "navigate-forward", phase: "press" }
+    ]);
+    expect(sample([pad({ down: [1, 3] })], { preferences: layout }).effects).toEqual([]);
+  });
   it("maps the standard home button to schedule management after a neutral sample", () => {
     expect(createDefaultGamepadPreferences().buttons[16]).toBe("open-schedules");
     const { sample } = sampler();

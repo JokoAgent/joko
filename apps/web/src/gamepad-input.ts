@@ -1,5 +1,5 @@
 export const GAMEPAD_ACTIONS = [
-  "none", "activate", "back", "new-task", "toggle-sidebar", "focus-composer",
+  "none", "activate", "back", "navigate-back", "navigate-forward", "new-task", "toggle-sidebar", "focus-composer",
   "previous-task", "next-task", "previous-panel", "next-panel", "scroll-up", "scroll-down",
   "approve", "reject", "submit", "stop", "toggle-plan", "toggle-fast", "effort-increase", "effort-decrease",
   "toggle-pin", "archive-task", "fork-task", "copy-task-link", "copy-conversation-markdown", "add-attachments", "open-commands",
@@ -33,7 +33,7 @@ export function createDefaultGamepadPreferences(): GamepadPreferences {
     version: 1,
     enabled: false,
     buttons: [
-      "submit", "back", "toggle-fast", "new-task", "effort-decrease", "effort-increase",
+      "submit", "navigate-back", "toggle-fast", "new-task", "effort-decrease", "effort-increase",
       "voice", "voice", "toggle-sidebar", "open-settings", "focus-composer", "scroll-bottom",
       "scroll-up", "scroll-down", "toggle-sidebar", "toggle-inspector", "open-schedules"
     ],
