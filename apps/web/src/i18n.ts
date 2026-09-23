@@ -3158,6 +3158,8 @@ const en = {
   "session.permissionFixed": "Fixed by this backend",
   "session.optionalModes": "Optional execution modes",
   "newTask.location": "Project or dialogue",
+  "newTask.addProject": "Add project…",
+  "newTask.browseLocalProject": "Choose another folder…",
   "newTask.dialogues": "Dialogues",
   "newTask.dialogue": "Dialogue (not in a project)",
   "newTask.unavailable": "Unavailable",
@@ -3526,10 +3528,13 @@ const en = {
   "projects.edit": "Edit project",
   "projects.editBody": "The workspace binding is immutable; rename this project or create another binding.",
   "projects.createBody": "Paths are interpreted and canonicalized on the Orchestrator service node, not on this browser device.",
+  "projects.createLocalBody": "Choose a directory on this computer or enter a path for its managed local service.",
   "projects.name": "Project name",
   "projects.serverPath": "Service-node path",
   "projects.serverPathPlaceholder": "Absolute path on the Orchestrator node",
   "projects.serverPathHelp": "This is a path on the machine running Orchestrator. The Web file picker cannot select it.",
+  "projects.browseLocal": "Browse local directory",
+  "projects.localPathHelp": "Choose a directory on this computer, or enter a path on the local service node.",
   "projects.createMissing": "Create the directory if missing",
   "projects.createMissingBody": "Orchestrator creates and owns the directory only after validating its canonical path.",
   "projects.create": "Create project",
@@ -8118,7 +8123,12 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.status.offline": "离线",
     "messaging.status.conflict": "冲突",
     "messaging.status.authLoss": "授权失效",
-    "messaging.status.error": "错误"
+    "messaging.status.error": "错误",
+    "newTask.addProject": "添加项目…",
+    "newTask.browseLocalProject": "选择其他目录…",
+    "projects.browseLocal": "选择本机目录",
+    "projects.createLocalBody": "选择本机目录，或填写本机受管服务的路径。",
+    "projects.localPathHelp": "选择本机目录，或输入本机服务节点上的路径。"
   }
 };
 

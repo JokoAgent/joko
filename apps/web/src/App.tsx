@@ -102,7 +102,7 @@ import {
 import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.js";
 import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
-import type { ProjectCreationRequest } from "./components/ProjectsPage.js";
+import type { NewSessionProjectPickerRequest } from "./components/NewSessionPage.js";
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
@@ -276,7 +276,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [inspectorSubagentFocusRequest, setInspectorSubagentFocusRequest] = useState(initialInspectorSubagentFocusRequest);
   const [inspectorTurnReviewFocusRequest, setInspectorTurnReviewFocusRequest] = useState<InspectorTurnReviewRequest>();
   const [inspectorGamepadRequest, setInspectorGamepadRequest] = useState<GamepadInspectorRequest>();
-  const [projectCreationRequest, setProjectCreationRequest] = useState<ProjectCreationRequest>();
+  const [projectPickerRequest, setProjectPickerRequest] = useState<NewSessionProjectPickerRequest>();
   const [navigationDrag, setNavigationDrag] = useState<NavigationDragState>();
   const navigationDragRef = useRef<NavigationDragState | undefined>(undefined);
   const [inspectorDetached, setInspectorDetached] = useState(false);
@@ -286,7 +286,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const inspectorSubagentFocusRequestIdRef = useRef(0);
   const inspectorTurnReviewFocusRequestIdRef = useRef(0);
   const inspectorGamepadRequestIdRef = useRef(0);
-  const projectCreationRequestIdRef = useRef(0);
+  const projectPickerRequestIdRef = useRef(0);
   const fileSelectionQuoteInsertionIdRef = useRef(0);
   const fileAttachmentInsertionIdRef = useRef(0);
   const applicationMenuNoticeIdRef = useRef(0);
@@ -301,18 +301,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   useEffect(() => {
-    const request = projectCreationRequest;
+    const request = projectPickerRequest;
     if (request === undefined) return;
     const profile = state.activeProfile;
     const navigationRevision = state.navigationRevision ?? 0;
     if (state.connectionState !== "connected" || profile?.id !== request.profileId || profile.serverId !== request.serverId
       || state.snapshot.generation !== request.connectionGeneration
       || navigationRevision < request.sourceNavigationRevision || navigationRevision > request.sourceNavigationRevision + 1
-      || navigationRevision !== request.sourceNavigationRevision && state.route.kind !== "projects") {
-      setProjectCreationRequest(undefined);
+      || navigationRevision !== request.sourceNavigationRevision && state.route.kind !== "newSession") {
+      setProjectPickerRequest(undefined);
     }
-  }, [projectCreationRequest, state.activeProfile, state.connectionState, state.navigationRevision, state.route.kind, state.snapshot.generation]);
-  useEffect(() => () => { projectCreationRequestIdRef.current += 1; }, []);
+  }, [projectPickerRequest, state.activeProfile, state.connectionState, state.navigationRevision, state.route.kind, state.snapshot.generation]);
+  useEffect(() => () => { projectPickerRequestIdRef.current += 1; }, []);
   const removalOwnerId = !state.ready || state.connectionState !== "connected" || state.activeProfile === undefined
     ? undefined
     : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
@@ -1102,10 +1102,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (action === "open-skills") { navigateFromShortcut({ kind: "tools", tab: "skills" }); return; }
     if (action === "open-schedules") { navigateFromShortcut({ kind: "schedules" }); return; }
     if (action === "open-folder") {
+      if (document.querySelector("[role='listbox']") !== null) return;
       const profile = state.activeProfile;
       if (state.connectionState !== "connected" || profile === undefined) return;
-      const request: ProjectCreationRequest = {
-        requestId: ++projectCreationRequestIdRef.current,
+      const request: NewSessionProjectPickerRequest = {
+        requestId: ++projectPickerRequestIdRef.current,
         ownerDocument: document,
         profileId: profile.id,
         serverId: profile.serverId,
@@ -1115,26 +1116,27 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       const requestOwnsNavigation = (): boolean => {
         const current = controllerRef.current.state;
         const ownerWindow = request.ownerDocument.defaultView;
-        return projectCreationRequestIdRef.current === request.requestId
+        return projectPickerRequestIdRef.current === request.requestId
           && ownerWindow !== null && !ownerWindow.closed
           && request.ownerDocument.visibilityState === "visible" && request.ownerDocument.hasFocus()
           && request.ownerDocument.body.dataset.appShortcutRecording !== "1"
+          && request.ownerDocument.querySelector("[role='listbox']") === null
           && request.ownerDocument.querySelector("[data-gamepad-preview]") === null
           && current.connectionState === "connected" && current.activeProfile?.id === request.profileId
           && current.activeProfile.serverId === request.serverId && current.snapshot.generation === request.connectionGeneration
           && (current.navigationRevision ?? 0) === request.sourceNavigationRevision;
       };
-      void navigateFromApplicationMenu({ kind: "projects" }, requestOwnsNavigation).then((allowed) => {
-        if (!allowed || projectCreationRequestIdRef.current !== request.requestId) return;
+      void navigateFromApplicationMenu({ kind: "newSession" }, requestOwnsNavigation).then((allowed) => {
+        if (!allowed || projectPickerRequestIdRef.current !== request.requestId) return;
         const current = controllerRef.current.state;
         const navigationRevision = current.navigationRevision ?? 0;
         if (current.connectionState !== "connected" || current.activeProfile?.id !== request.profileId
           || current.activeProfile.serverId !== request.serverId || current.snapshot.generation !== request.connectionGeneration
           || navigationRevision < request.sourceNavigationRevision || navigationRevision > request.sourceNavigationRevision + 1
-          || navigationRevision !== request.sourceNavigationRevision && current.route.kind !== "projects") return;
-        setProjectCreationRequest(request);
+          || navigationRevision !== request.sourceNavigationRevision && current.route.kind !== "newSession") return;
+        setProjectPickerRequest(request);
       }).catch((error: unknown) => {
-        if (projectCreationRequestIdRef.current === request.requestId) setActionError(messageOf(error, t("error.unexpected")));
+        if (projectPickerRequestIdRef.current === request.requestId) setActionError(messageOf(error, t("error.unexpected")));
       });
       return;
     }
@@ -1896,6 +1898,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             snapshot={state.snapshot}
             initialTargetId={state.route.targetId}
             initialDialogueBackendId={state.route.dialogueBackendId}
+            projectPickerRequest={projectPickerRequest}
+            onProjectPickerRequestConsumed={(requestId) => setProjectPickerRequest((current) => current?.requestId === requestId ? undefined : current)}
             navigationOpen={navigationOpen}
             t={t}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
@@ -1919,7 +1923,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           />)}
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.preferences.locale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
-          {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} createRequest={projectCreationRequest} onCreateRequestConsumed={(requestId) => setProjectCreationRequest((current) => current?.requestId === requestId ? undefined : current)} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
+          {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "partners" && <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}

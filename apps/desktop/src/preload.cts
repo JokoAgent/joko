@@ -41,6 +41,8 @@ import type {
   DesktopPageSearchRequest,
   DesktopPageSearchResult,
   DesktopPageSearchStopAction,
+  DesktopProjectDirectoryRequest,
+  DesktopProjectDirectorySelection,
   DesktopProviderModelRefreshLifecycleHint,
   DesktopSaveFileRequest,
   DesktopCopyFileRequest,
@@ -80,6 +82,7 @@ const DESKTOP_CHANNELS = {
   sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
+  projectPickDirectory: "joko:project:pick-directory",
   extensionLibraryReveal: "joko:extension-library:reveal",
   extensionLibraryBeginSave: "joko:extension-library:save:begin",
   extensionLibraryCommitSave: "joko:extension-library:save:commit",
@@ -215,6 +218,7 @@ const desktopCapabilities = Object.freeze([
   "session.windows",
   "extension.windows",
   "extension.libraryLocationPicker",
+  "projects.directoryPicker",
   "extension.libraryGestures",
   "voice.globalDictation",
   "window.activationClick"
@@ -294,6 +298,13 @@ const desktopApi = Object.freeze({
         extensionId: request.extensionId,
         bytes: new Uint8Array(request.bytes)
       }).then(parseExtensionLibraryByteCount);
+    }
+  }),
+  projects: Object.freeze({
+    pickDirectory: (request: DesktopProjectDirectoryRequest): Promise<DesktopProjectDirectorySelection> => {
+      if (!isProjectDirectoryRequest(request)) return Promise.reject(new TypeError("Project directory request is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.projectPickDirectory, request)
+        .then(parseDesktopProjectDirectorySelection);
     }
   }),
   runtimeProcessMonitor: Object.freeze({
@@ -1213,6 +1224,31 @@ function parseDesktopExtensionLibraryLocationSelection(value: unknown): DesktopE
     || typeof record["path"] !== "string" || record["path"].length === 0 || record["path"].length > 32_768
     || record["path"].trim() !== record["path"] || record["path"].includes("\0")) {
     throw new TypeError("Extension Library location selection is invalid.");
+  }
+  return Object.freeze({ cancelled: false, path: record["path"] });
+}
+
+function isProjectDirectoryRequest(value: unknown): value is DesktopProjectDirectoryRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).sort().join(",") === "deviceId,origin,profileId,serverId"
+    && [record["profileId"], record["deviceId"], record["serverId"], record["origin"]].every((item) =>
+      typeof item === "string" && item.length > 0 && item.length <= 2048
+      && item.trim() === item && !/[\u0000-\u001f\u007f]/u.test(item));
+}
+
+function parseDesktopProjectDirectorySelection(value: unknown): DesktopProjectDirectorySelection {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Project directory selection is invalid.");
+  }
+  const record = value as Record<string, unknown>;
+  if (record["cancelled"] === true && Object.keys(record).join(",") === "cancelled") {
+    return Object.freeze({ cancelled: true });
+  }
+  if (record["cancelled"] !== false || Object.keys(record).sort().join(",") !== "cancelled,path"
+    || typeof record["path"] !== "string" || record["path"].length === 0 || record["path"].length > 32_768
+    || record["path"].trim() !== record["path"] || record["path"].includes("\0")) {
+    throw new TypeError("Project directory selection is invalid.");
   }
   return Object.freeze({ cancelled: false, path: record["path"] });
 }

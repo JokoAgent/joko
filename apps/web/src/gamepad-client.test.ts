@@ -150,7 +150,7 @@ describe("gamepad UI target ownership", () => {
     delete document.body.dataset.appShortcutRecording;
     press(); expect(navigate).toHaveBeenCalledWith("open-schedules");
   });
-  it("admits project folder registration only from the visible focused host boundary", () => {
+  it("admits project picking only from the visible focused host outside an open selection popup", () => {
     const navigate = vi.fn();
     const input = createGamepadDomInput(document, navigate);
     const press = (): void => input({ kind: "action", action: "open-folder", phase: "press" });
@@ -159,6 +159,8 @@ describe("gamepad UI target ownership", () => {
     const preview = document.body.appendChild(document.createElement("div")); preview.dataset.gamepadPreview = "true";
     press(); preview.remove();
     document.body.dataset.appShortcutRecording = "1"; press(); delete document.body.dataset.appShortcutRecording;
+    const picker = document.body.appendChild(document.createElement("div")); picker.setAttribute("role", "listbox");
+    press(); picker.remove();
     const frame = document.body.appendChild(document.createElement("iframe")); frame.focus(); press(); frame.remove();
     vi.spyOn(document, "hasFocus").mockReturnValue(false); press();
     expect(navigate).toHaveBeenCalledTimes(1);

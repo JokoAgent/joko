@@ -2,29 +2,19 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import { Archive, FolderKanban, FolderPlus, Menu, Pencil, Pin, Plus, ScanSearch, Shield, ShieldAlert, Trash2 } from "lucide-react";
 import type { AppController } from "../controller.js";
-import type { AppSnapshot, ExtraDirectoryView, SessionView, TargetDraft, TargetView, WorkspaceView } from "../model.js";
+import type { AppSnapshot, ExtraDirectoryView, SessionView, TargetView, WorkspaceView } from "../model.js";
 import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
 import { sidebarOwnerLayoutFor } from "../sidebar-layout.js";
 import { backendSupportsResourceDiscovery } from "../resource-capabilities.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl, SelectControl } from "./ui.js";
 import { WorktreeRemovalWarnings } from "./SessionDialogs.js";
+import { ProjectEditor } from "./ProjectEditor.js";
 
-export interface ProjectCreationRequest {
-  readonly requestId: number;
-  readonly ownerDocument: Document;
-  readonly profileId: string;
-  readonly serverId: string;
-  readonly connectionGeneration: bigint;
-  readonly sourceNavigationRevision: number;
-}
-
-export function ProjectsPage({ controller, snapshot, focusProjectId, createRequest, onCreateRequestConsumed, t, runAction, onOpenNavigation, prepareSessionRemoval }: {
+export function ProjectsPage({ controller, snapshot, focusProjectId, t, runAction, onOpenNavigation, prepareSessionRemoval }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly focusProjectId?: string;
-  readonly createRequest?: ProjectCreationRequest;
-  readonly onCreateRequestConsumed?: (requestId: number) => void;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onOpenNavigation: () => void;
@@ -50,25 +40,6 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, createReque
     readonly complete: () => void;
   } | undefined>(undefined);
   const pageRef = useRef<HTMLElement>(null);
-  const consumedCreateRequestIdRef = useRef<number | undefined>(undefined);
-  useLayoutEffect(() => {
-    if (createRequest === undefined || consumedCreateRequestIdRef.current === createRequest.requestId) return;
-    consumedCreateRequestIdRef.current = createRequest.requestId;
-    onCreateRequestConsumed?.(createRequest.requestId);
-    const page = pageRef.current;
-    const ownerDocument = createRequest.ownerDocument;
-    const ownerWindow = ownerDocument.defaultView;
-    const profile = controller.state.activeProfile;
-    const navigationRevision = controller.state.navigationRevision ?? 0;
-    if (page === null || !page.isConnected || page.ownerDocument !== ownerDocument
-      || ownerWindow === null || ownerWindow.closed || ownerDocument.visibilityState !== "visible" || !ownerDocument.hasFocus()
-      || ownerDocument.body.classList.contains("modal-open") || ownerDocument.body.dataset.appShortcutRecording === "1"
-      || ownerDocument.querySelector("[data-gamepad-preview]") !== null
-      || controller.state.connectionState !== "connected" || profile?.id !== createRequest.profileId || profile.serverId !== createRequest.serverId
-      || snapshot.generation !== createRequest.connectionGeneration || controller.state.snapshot.generation !== createRequest.connectionGeneration
-      || navigationRevision < createRequest.sourceNavigationRevision || navigationRevision > createRequest.sourceNavigationRevision + 1) return;
-    setEditor("new");
-  }, [controller, createRequest, onCreateRequestConsumed, snapshot.generation]);
   useLayoutEffect(() => {
     const scope = {};
     archiveScopeRef.current = scope;
@@ -190,7 +161,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, createReque
         <footer><Button onClick={() => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}><Pin aria-hidden="true" />{target.pinned ? t("projects.unpin") : t("projects.pin")}</Button><Button onClick={() => setEditor(target)}><Pencil aria-hidden="true" />{t("common.edit")}</Button><Button data-project-archive-action="" disabled={archivePendingIds.has(archiveOperationKey(target.id))} onClick={(event) => toggleArchived(target, event.currentTarget)}><Archive aria-hidden="true" />{archivePendingIds.has(archiveOperationKey(target.id)) ? t("common.working") : target.archived ? t("projects.restore") : t("session.archive")}</Button><Button tone="ghost" className="project-card__delete" onClick={() => setDeleteTarget(target)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></footer>
       </article>;
     })}{targets.length === 0 && <div className="project-empty"><FolderKanban aria-hidden="true" /><h2>{showArchived ? t("projects.noArchived") : t("projects.empty")}</h2><p>{t("projects.emptyBody")}</p>{!showArchived && <Button tone="primary" onClick={() => setEditor("new")}>{t("projects.new")}</Button>}</div>}</section>
-    <ProjectEditor open={editor !== undefined} target={editor === "new" ? undefined : editor} snapshot={snapshot} t={t} onClose={() => setEditor(undefined)} onSave={(draft) => { const target = editor === "new" ? undefined : editor; setEditor(undefined); runAction(target === undefined ? "project-create" : `project-edit:${target.id}`, async () => { if (target === undefined) await controller.createTarget(draft); else await controller.updateTarget(target.id, { name: draft.name }, target.revision); }); }} />
+    <ProjectEditor open={editor !== undefined} target={editor === "new" ? undefined : editor} controller={controller} snapshot={snapshot} t={t} onClose={() => setEditor(undefined)} onSave={(draft) => { const target = editor === "new" ? undefined : editor; setEditor(undefined); runAction(target === undefined ? "project-create" : `project-edit:${target.id}`, async () => { if (target === undefined) await controller.createTarget(draft); else await controller.updateTarget(target.id, { name: draft.name }, target.revision); }); }} />
     <TrustDialog workspace={trustWorkspace} t={t} onClose={() => setTrustWorkspace(undefined)} onConfirm={() => { const workspace = trustWorkspace; setTrustWorkspace(undefined); if (workspace !== undefined) runAction(`workspace-trust:${workspace.id}`, () => controller.setWorkspaceTrust(workspace.id, !workspace.trusted)); }} />
     <DeleteProjectDialog
       target={deleteTarget}
@@ -219,18 +190,6 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, createReque
     <ExtraDirectoryDialog workspace={extraWorkspace} t={t} onClose={() => setExtraWorkspace(undefined)} onSave={(path, access) => { const workspace = extraWorkspace; setExtraWorkspace(undefined); if (workspace !== undefined) runAction(`extra-directory:${workspace.id}`, () => controller.addExtraDirectory(workspace.id, path, access)); }} />
     <Modal open={removeExtra !== undefined} title={t("projects.removeDirectory")} description={removeExtra?.serverPath} size="small" onClose={() => setRemoveExtra(undefined)}><p>{t("projects.removeDirectoryBody")}</p><div className="modal__actions"><Button onClick={() => setRemoveExtra(undefined)}>{t("common.cancel")}</Button><Button tone="danger" onClick={() => { const directory = removeExtra; setRemoveExtra(undefined); if (directory !== undefined) runAction(`extra-remove:${directory.id}`, () => controller.removeExtraDirectory(directory.id)); }}>{t("common.remove")}</Button></div></Modal>
   </main>;
-}
-
-function ProjectEditor({ open, target, snapshot, t, onClose, onSave }: { readonly open: boolean; readonly target?: TargetView; readonly snapshot: AppSnapshot; readonly t: Translator; readonly onClose: () => void; readonly onSave: (draft: TargetDraft) => void }): JSX.Element {
-  const [draft, setDraft] = useState<TargetDraft>(() => emptyTargetDraft(snapshot));
-  useEffect(() => {
-    if (!open) return;
-    const workspace = snapshot.workspaces.find((candidate) => candidate.id === target?.workspaceId);
-    setDraft(target === undefined ? emptyTargetDraft(snapshot) : { backendId: target.backendId, name: target.name, workspaceKind: workspace?.kind ?? "userProject", serverPath: workspace?.serverPath ?? "", createIfMissing: false });
-  }, [open, target?.id]);
-  const editing = target !== undefined;
-  const valid = draft.name.trim().length > 0 && draft.backendId.length > 0 && (editing || draft.workspaceKind === "managedDialogue" || draft.serverPath.trim().length > 0);
-  return <Modal open={open} title={editing ? t("projects.edit") : t("projects.new")} description={editing ? t("projects.editBody") : t("projects.createBody")} size="large" onClose={onClose}><form className="settings-form" onSubmit={(event) => { event.preventDefault(); if (valid) onSave(draft); }}><div className="settings-form__grid"><label className="field"><span>{t("projects.name")}</span><input required maxLength={120} value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} /></label><label className="field"><span>{t("controls.backend")}</span><SelectControl disabled={editing} value={draft.backendId} onChange={(event) => setDraft((current) => ({ ...current, backendId: event.target.value }))}>{snapshot.backends.map((backend) => <option value={backend.id} key={backend.id}>{backend.name}</option>)}</SelectControl></label>{!editing && <><label className="field"><span>{t("projects.workspaceType")}</span><SelectControl value={draft.workspaceKind} onChange={(event) => setDraft((current) => ({ ...current, workspaceKind: event.target.value as TargetDraft["workspaceKind"] }))}><option value="userProject">{t("projects.userProject")}</option><option value="managedDialogue">{t("projects.managed")}</option></SelectControl></label>{draft.workspaceKind === "userProject" && <label className="field settings-form__wide"><span>{t("projects.serverPath")}</span><input required value={draft.serverPath} onChange={(event) => setDraft((current) => ({ ...current, serverPath: event.target.value }))} placeholder={t("projects.serverPathPlaceholder")} /><small>{t("projects.serverPathHelp")}</small></label>}<label className="check-row settings-form__wide"><CheckboxControl checked={draft.createIfMissing} disabled={draft.workspaceKind === "managedDialogue"} onChange={(event) => setDraft((current) => ({ ...current, createIfMissing: event.target.checked }))} /><span><strong>{t("projects.createMissing")}</strong><small>{t("projects.createMissingBody")}</small></span></label></>}</div><div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={!valid}>{editing ? t("common.save") : t("projects.create")}</Button></div></form></Modal>;
 }
 
 function TrustDialog({ workspace, t, onClose, onConfirm }: { readonly workspace?: WorkspaceView; readonly t: Translator; readonly onClose: () => void; readonly onConfirm: () => void }): JSX.Element {
@@ -315,10 +274,6 @@ function ExtraDirectoryDialog({ workspace, t, onClose, onSave }: { readonly work
   const [access, setAccess] = useState<ExtraDirectoryView["access"]>("readOnly");
   useEffect(() => { setPath(""); setAccess("readOnly"); }, [workspace?.id]);
   return <Modal open={workspace !== undefined} title={t("projects.addDirectory")} description={t("projects.addDirectoryBody")} size="medium" onClose={onClose}><form className="settings-form" onSubmit={(event) => { event.preventDefault(); if (path.trim()) onSave(path.trim(), access); }}><label className="field"><span>{t("projects.serverPath")}</span><input required value={path} onChange={(event) => setPath(event.target.value)} placeholder={t("projects.serverPathPlaceholder")} /><small>{t("projects.serverPathHelp")}</small></label><label className="field"><span>{t("projects.access")}</span><SelectControl value={access} onChange={(event) => setAccess(event.target.value as ExtraDirectoryView["access"])}><option value="readOnly">{t("projects.readOnly")}</option><option value="readWrite">{t("projects.readWrite")}</option></SelectControl></label><div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={path.trim().length === 0}>{t("common.add")}</Button></div></form></Modal>;
-}
-
-function emptyTargetDraft(snapshot: AppSnapshot): TargetDraft {
-  return { backendId: snapshot.backends[0]?.id ?? "", name: "", workspaceKind: "userProject", serverPath: "", createIfMissing: false };
 }
 
 function sameRemovalSummary(left: WorktreeRemovalPreflightSummary, right: WorktreeRemovalPreflightSummary): boolean {

@@ -3656,6 +3656,10 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .project-card dl div { display: grid; gap: 3px; min-width: 0; padding: 8px; border-radius: 8px; background: var(--surface-sunken); }
 .project-card dt { color: var(--text-soft); font-size: var(--text-10); }.project-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-12); }
 .project-card__error { padding: 9px 10px; border-radius: 8px; background: var(--red-soft); color: var(--red); }
+.project-editor__path { display: flex; align-items: stretch; gap: 8px; }
+.project-editor__path input { min-width: 0; flex: 1; }
+.project-editor__path .button { flex: 0 0 auto; }
+@media (max-width: 560px) { .project-editor__path { flex-wrap: wrap; }.project-editor__path .button { width: 100%; } }
 .project-card__trust { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; }
 .project-card__trust > div { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }.project-card__trust svg { width: 18px; flex: none; }.project-card__trust span { display: grid; gap: 2px; }.project-card__trust small { color: var(--text-soft); line-height: 1.35; }
 .project-card__trust .project-card__trust-actions { align-items: center; flex-wrap: wrap; justify-content: flex-end; }

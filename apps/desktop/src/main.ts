@@ -66,6 +66,7 @@ import {
   INSPECTOR_WINDOW_FEATURES,
   INSPECTOR_WINDOW_URL,
   isDesktopExtensionId,
+  isDesktopProjectDirectoryRequest,
   isDesktopSessionDragGestureId,
   isDesktopSessionDragPreviewRequest,
   isDesktopSessionWindowOwner,
@@ -74,6 +75,7 @@ import {
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
+import { projectDirectoryAuthorityMatches } from "./project-directory-authority.js";
 import {
   DESKTOP_DEEP_LINK_SCHEME,
   DesktopDeepLinkDeliveryBuffer,
@@ -4644,6 +4646,30 @@ function registerIpc(): void {
       title: "Choose an Extension Library location",
       properties: ["openDirectory"]
     });
+    const selected = selection.canceled ? undefined : selection.filePaths[0];
+    return selected === undefined
+      ? { cancelled: true as const }
+      : { cancelled: false as const, path: resolve(selected) };
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.projectPickDirectory, async (event, ...parameters: unknown[]) => {
+    const owner = assertFocusedTrustedIpcSender(event);
+    if (parameters.length !== 1 || !isDesktopProjectDirectoryRequest(parameters[0])) {
+      throw new TypeError("Project directory selection requires one managed service identity.");
+    }
+    const request = parameters[0];
+    const ownsWindow = (): boolean => event.sender === mainWindow?.webContents
+      || sessionWindowOwnersByContents.get(event.sender)?.profileId === request.profileId;
+    const ownsService = (): boolean => projectDirectoryAuthorityMatches(
+      request, managedOrchestratorStatus, managedOrchestratorRuntime?.connection,
+      managedOrchestratorConnection, managedOrchestratorExitFence.shutdownStarted
+    );
+    if (!ownsWindow() || !ownsService()) throw new Error("Project directory selection requires the current local service.");
+    const selection = await dialog.showOpenDialog(owner, {
+      title: "Choose a project directory",
+      properties: ["openDirectory"]
+    });
+    assertTrustedIpcSender(event);
+    if (owner.isDestroyed() || !ownsWindow() || !ownsService()) throw new Error("Project directory selection expired.");
     const selected = selection.canceled ? undefined : selection.filePaths[0];
     return selected === undefined
       ? { cancelled: true as const }

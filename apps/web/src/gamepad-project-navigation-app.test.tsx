@@ -43,11 +43,10 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-it("guards Files navigation and opens the real new-project editor exactly once per admitted folder action", async () => {
+it("guards Files navigation and opens the new-task project picker exactly once per admitted folder action", async () => {
   const view = controller({ kind: "files", sessionId: "draft-session" });
   const host = document.createElement("div"); document.body.append(host);
   root = createRoot(host);
-  await import("./components/ProjectsPage.js");
   await act(async () => {
     root?.render(createElement(AppWithController, { controller: view.value }));
     await Promise.resolve();
@@ -64,10 +63,10 @@ it("guards Files navigation and opens the real new-project editor exactly once p
   expect(view.navigate).not.toHaveBeenCalled();
 
   await act(async () => {
-    view.replaceRoute({ kind: "projects" });
+    view.replaceRoute({ kind: "newSession" });
     root?.render(createElement(AppWithController, { controller: view.value }));
   });
-  expect(host.querySelector("[role='dialog']")).toBeNull();
+  expect(document.querySelector("[role='listbox']")).toBeNull();
   await act(async () => {
     view.replaceRoute({ kind: "files", sessionId: "draft-session" });
     root?.render(createElement(AppWithController, { controller: view.value }));
@@ -79,20 +78,29 @@ it("guards Files navigation and opens the real new-project editor exactly once p
     await Promise.resolve();
     await Promise.resolve();
   });
-  await vi.waitFor(() => expect(host.querySelector("[role='dialog']")?.textContent).toContain("New project"));
-  expect(view.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "projects" });
+  await vi.waitFor(() => expect(document.querySelector("[role='listbox']")?.textContent).toContain("Add project"));
+  expect(view.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
+  await act(async () => { gamepad.action?.("open-folder"); await Promise.resolve(); });
+  expect(view.navigate).toHaveBeenCalledTimes(1);
 
-  await act(async () => button(host, "Cancel").click());
-  expect(host.querySelector("[role='dialog']")).toBeNull();
+  await act(async () => {
+    const addProject = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((option) => option.textContent?.includes("Add project"));
+    if (addProject === undefined) throw new Error("Missing add-project option.");
+    addProject.click();
+  });
+  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(document.querySelector("[role='dialog']")?.textContent).toContain("New project");
+  await act(async () => button(document.body, "Cancel").click());
+  expect(document.querySelector("[role='dialog']")).toBeNull();
   await act(async () => root?.render(createElement(AppWithController, { controller: view.value })));
-  expect(host.querySelector("[role='dialog']")).toBeNull();
+  expect(document.querySelector("[role='listbox']")).toBeNull();
 
   await act(async () => {
     gamepad.action?.("open-folder");
     await Promise.resolve();
     await Promise.resolve();
   });
-  await vi.waitFor(() => expect(host.querySelector("[role='dialog']")?.textContent).toContain("New project"));
+  await vi.waitFor(() => expect(document.querySelector("[role='listbox']")?.textContent).toContain("Add project"));
   expect(view.navigate).toHaveBeenCalledTimes(2);
   expect(gamepad.requestLeave).toHaveBeenCalledTimes(2);
 });
@@ -115,10 +123,10 @@ it("drops a pending folder action when navigation changes before the Files leave
   expect(view.navigate).not.toHaveBeenCalled();
 
   await act(async () => {
-    view.replaceRoute({ kind: "projects" });
+    view.replaceRoute({ kind: "newSession" });
     root?.render(createElement(AppWithController, { controller: view.value }));
   });
-  expect(host.querySelector("[role='dialog']")).toBeNull();
+  expect(document.querySelector("[role='listbox']")).toBeNull();
 });
 
 function controller(route: AppRoute): {
@@ -157,7 +165,14 @@ function controller(route: AppRoute): {
     setNavigationOpen: vi.fn(async () => undefined),
     setNavigationLayout: vi.fn(async () => undefined),
     setWindowZoom: vi.fn(async () => undefined),
-    probeRuntimeActivity: vi.fn(async () => false)
+    probeRuntimeActivity: vi.fn(async () => false),
+    readNewSessionDraft: vi.fn(async () => undefined),
+    saveNewSessionDraft: vi.fn(async () => undefined),
+    readPendingExtensionUse: vi.fn(async () => undefined),
+    prepareTargetWorkspace: vi.fn(async () => undefined),
+    probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
+    listTargetWorktreeSources: vi.fn(async () => []),
+    setNewSessionWorktreeEnabled: vi.fn(async () => undefined)
   } as unknown as AppController;
   return {
     value,

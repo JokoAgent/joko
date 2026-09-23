@@ -8,6 +8,7 @@ export const DESKTOP_CHANNELS = {
   sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
+  projectPickDirectory: "joko:project:pick-directory",
   extensionLibraryReveal: "joko:extension-library:reveal",
   extensionLibraryBeginSave: "joko:extension-library:save:begin",
   extensionLibraryCommitSave: "joko:extension-library:save:commit",
@@ -323,6 +324,21 @@ export interface DesktopExtensionWindowOpenResult {
 export type DesktopExtensionLibraryLocationSelection =
   | { readonly cancelled: true }
   | { readonly cancelled: false; readonly path: string };
+
+export interface DesktopProjectDirectoryRequest {
+  readonly profileId: string;
+  readonly deviceId: string;
+  readonly serverId: string;
+  readonly origin: string;
+}
+
+export type DesktopProjectDirectorySelection = DesktopExtensionLibraryLocationSelection;
+
+export function isDesktopProjectDirectoryRequest(value: unknown): value is DesktopProjectDirectoryRequest {
+  return plainRecordWithKeys(value, ["profileId", "deviceId", "serverId", "origin"])
+    && boundedDragText(value.profileId, 256) && boundedDragText(value.deviceId, 256)
+    && boundedDragText(value.serverId, 256) && boundedDragText(value.origin, 2048);
+}
 
 export interface DesktopExtensionLibraryRevealRequest {
   readonly extensionId: string;
