@@ -1,6 +1,7 @@
 import { createSimulatorEnvironmentRuntime, type SimulatorEnvironmentRuntime } from "@joko/tool-ios-simulator";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
+import { SimulatorOwnershipError, type SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
 
 export const IOS_SIMULATOR_TOOL_PROVIDER_ID = "joko_ios_simulator";
 const CATEGORY = "ios_simulator";
@@ -8,7 +9,8 @@ const CATEGORY = "ios_simulator";
 const TOOLS = Object.freeze([
   { name: "check_environment", description: "Check the local macOS Xcode and iOS Simulator environment without opening Simulator.app.", readOnly: true },
   { name: "doctor", description: "Diagnose the current task's iOS Simulator environment and available actions.", readOnly: true },
-  { name: "list_simulator_devices", description: "List simulated iPhone and iPad devices with exact UDIDs, runtime and boot states.", readOnly: true }
+  { name: "list_simulator_devices", description: "List simulated iPhone and iPad devices with exact UDIDs, runtime and boot states.", readOnly: true },
+  { name: "list_instances", description: "List only Simulator instances registered to this task.", readOnly: true }
 ] as const);
 
 const BRIDGE_TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
@@ -41,12 +43,15 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   });
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
   readonly #runtime: SimulatorEnvironmentRuntime;
+  readonly #ownership: SimulatorOwnershipRegistry;
 
   constructor(options: {
     readonly store: Pick<OperationalStore, "getSession" | "getTarget">;
+    readonly ownership: SimulatorOwnershipRegistry;
     readonly runtime?: SimulatorEnvironmentRuntime;
   }) {
     this.#store = options.store;
+    this.#ownership = options.ownership;
     this.#runtime = options.runtime ?? createSimulatorEnvironmentRuntime();
   }
 
@@ -75,6 +80,12 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       const args = arguments_["args"];
       if (typeof selected !== "string" || !TOOLS.some(tool => tool.name === selected)) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator tool is unavailable in this runtime.");
       if (!isRecord(args) || Object.keys(args).length !== 0) throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator tool arguments must be an empty object.");
+      if (selected === "list_instances") {
+        const instances = this.#ownership.listForTask(context);
+        signal?.throwIfAborted();
+        this.#requireScope(context);
+        return response({ ok: true, data: { instances } }, false);
+      }
       const environment = await this.#runtime.inspect(signal);
       signal?.throwIfAborted();
       this.#requireScope(context);
@@ -86,16 +97,19 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
           doctor: { state: "available", backend: "host" },
           list_simulator_devices: environment.ready
             ? { state: "available", backend: "simctl" }
-            : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" }
+            : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
+          list_instances: { state: "available", backend: "host" }
         },
+        instances: this.#ownership.listForTask(context),
         instanceControl: { state: "unavailable", reasonCode: "INSTANCE_CONTROL_UNAVAILABLE" },
+        drivers: { state: "unavailable", reasonCode: "INSTANCE_DRIVER_UNAVAILABLE" },
         recommendedActions: environment.ready ? ["list_simulator_devices"] : ["check_environment"]
       } }, false);
       if (!environment.ready) return response({ ok: false, errorCode: environment.issue, message: environment.error, data: { environment } }, true);
       return response({ ok: true, data: { devices: environment.devices, xcodeVersion: environment.xcodeVersion } }, false);
     } catch (error) {
-      const code = error instanceof SimulatorToolError ? error.code : signal?.aborted ? "PROBE_ABORTED" : "SIMULATOR_HOST_ERROR";
-      const message = error instanceof SimulatorToolError ? error.message : signal?.aborted ? "Simulator probe was cancelled." : "Simulator host call failed.";
+      const code = error instanceof SimulatorToolError || error instanceof SimulatorOwnershipError ? error.code : signal?.aborted ? "PROBE_ABORTED" : "SIMULATOR_HOST_ERROR";
+      const message = error instanceof SimulatorToolError || error instanceof SimulatorOwnershipError ? error.message : signal?.aborted ? "Simulator probe was cancelled." : "Simulator host call failed.";
       return response({ ok: false, errorCode: code, message }, true);
     }
   }

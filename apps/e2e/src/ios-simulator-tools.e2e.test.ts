@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CredentialManager, CredentialVault, IOS_SIMULATOR_TOOL_PROVIDER_ID, IosSimulatorToolBridgeProvider,
-  McpRouter, createInternalServer, createOrchestratorApplication, type OrchestratorConfig
+  McpRouter, SimulatorOwnershipRegistry, createInternalServer, createOrchestratorApplication, type OrchestratorConfig
 } from "@joko/orchestrator";
 import { expect, it } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
@@ -21,7 +21,7 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
         await credentials.initialize();
         const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
         await mcpRouter.initialize();
-        mcpRouter.registerBridgeToolProvider(new IosSimulatorToolBridgeProvider({ store }));
+        mcpRouter.registerBridgeToolProvider(new IosSimulatorToolBridgeProvider({ store, ownership: new SimulatorOwnershipRegistry(store) }));
         return { mcpRouter };
       }
     });
@@ -44,8 +44,21 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
       return await response.json() as { isError: boolean; details: { mcpStructuredContent: Record<string, unknown> } };
     };
     expect(await call("list_tools", { category: "ios_simulator" })).toMatchObject({ isError: false, details: { mcpStructuredContent: {
-      tools: [{ name: "check_environment" }, { name: "doctor" }, { name: "list_simulator_devices" }]
+      tools: [{ name: "check_environment" }, { name: "doctor" }, { name: "list_simulator_devices" }, { name: "list_instances" }]
     } } });
+    expect(await call("call_tool", { name: "list_instances", args: {} })).toMatchObject({ isError: false, details: {
+      mcpStructuredContent: { data: { instances: [] } }
+    } });
+    const owned = new SimulatorOwnershipRegistry(fixture.application.store).bindExternalDevice(
+      { sessionId, targetId, generation },
+      { udid: "A0123456-1234-1234-1234-123456789ABC", name: "iPhone test", state: "Shutdown",
+        isAvailable: true, runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0",
+        runtimeName: "iOS 19.0", runtimeVersion: "19.0",
+        deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null }
+    );
+    expect(await call("call_tool", { name: "list_instances", args: {} })).toMatchObject({ isError: false, details: {
+      mcpStructuredContent: { data: { instances: [{ instanceId: owned.instanceId, simulatorUdid: owned.simulatorUdid }] } }
+    } });
     const diagnosis = await call("call_tool", { name: "doctor", args: {} });
     if (process.platform === "win32") expect(diagnosis).toMatchObject({ isError: false, details: { mcpStructuredContent: {
       data: { environment: { issue: "UNSUPPORTED_PLATFORM" }, availability: {

@@ -119,6 +119,7 @@ import {
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
 import { IosSimulatorToolBridgeProvider } from "./ios-simulator-tool-bridge.js";
+import { SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -807,7 +808,7 @@ export async function createOrchestratorApplication(
         : config.browser ? { pdfRenderer: new ChromiumDocumentPdfRenderer(config.browser.executablePath) } : {}) })
   );
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
-    new IosSimulatorToolBridgeProvider({ store })
+    new IosSimulatorToolBridgeProvider({ store, ownership: new SimulatorOwnershipRegistry(store) })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
     store,
