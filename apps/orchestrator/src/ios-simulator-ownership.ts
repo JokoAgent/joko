@@ -16,6 +16,12 @@ export interface SimulatorTaskScope {
   readonly generation: number;
 }
 
+export interface SimulatorInstanceRoute {
+  readonly instanceId: string;
+  readonly generation: number;
+  readonly leaseId: string;
+}
+
 export interface SimulatorOwnedInstance {
   readonly instanceId: string;
   readonly sessionId: string;
@@ -131,6 +137,7 @@ export class SimulatorOwnershipRegistry {
   }
 
   listForTask(scope: SimulatorTaskScope): readonly PublicSimulatorInstance[] {
+    this.reconcileRecoveredEffects(scope);
     const fingerprint = this.#fingerprint(scope);
     const stored = this.#load();
     const owned = stored.instances.filter(item => item.sessionId === scope.sessionId);
@@ -149,6 +156,85 @@ export class SimulatorOwnershipRegistry {
       this.#save({ format: 1, instances: current.instances.map(item => item.instanceId === found.instanceId ? renewed : item) });
       return [publicInstance(renewed)];
     });
+  }
+
+  assertScope(scope: SimulatorTaskScope): void {
+    const fingerprint = this.#fingerprint(scope);
+    for (const instance of this.#load().instances) {
+      if (instance.sessionId === scope.sessionId) this.#assertOwner(instance, scope, fingerprint);
+    }
+  }
+
+  /** Store startup recovery tombstones unknown effects; project that fact onto the owned route. */
+  reconcileRecoveredEffects(scope: SimulatorTaskScope): void {
+    this.#fingerprint(scope);
+    let offset = 0;
+    for (;;) {
+      const page = this.#store.listOperations({ sessionId: scope.sessionId, status: "failed", limit: 500, offset });
+      for (const operation of page) {
+        if (operation.kind !== "ios_simulator_lifecycle" || !record(operation.error)
+          || operation.error["code"] !== "EFFECT_OUTCOME_UNKNOWN" || !record(operation.body)) continue;
+        const body = operation.body;
+        if (body["sessionId"] !== scope.sessionId || body["targetId"] !== scope.targetId
+          || body["bindingGeneration"] !== scope.generation
+          || !bounded(body["instanceId"], 128) || !positive(body["instanceGeneration"])
+          || !bounded(body["leaseId"], 128)) continue;
+        try {
+          this.failLifecycle(scope, {
+            instanceId: body["instanceId"], generation: body["instanceGeneration"], leaseId: body["leaseId"]
+          }, "EFFECT_OUTCOME_UNKNOWN");
+        } catch (error) {
+          if (!(error instanceof SimulatorOwnershipError) || error.code !== "STALE_SCOPE") throw error;
+        }
+      }
+      if (page.length < 500) return;
+      offset += page.length;
+      if (offset >= 10_000) throw new SimulatorOwnershipError("INVALID_OWNERSHIP", "Simulator effect recovery budget is exhausted.");
+    }
+  }
+
+  /** Admission uses the caller's current lease; a long-running effect may renew it before commit. */
+  requireRoute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): PublicSimulatorInstance {
+    const instance = this.#routedInstance(scope, route);
+    if (instance.lease.id !== route.leaseId || instance.lease.expiresAt <= this.#now()) {
+      throw new SimulatorOwnershipError("STALE_SCOPE", "Simulator instance lease is stale.");
+    }
+    return publicInstance(instance);
+  }
+
+  /** Called inside the effect completion transaction, after an exact terminal simctl observation. */
+  completeLifecycle(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, input: {
+    readonly action: "start" | "stop";
+    readonly bootedByAgent: boolean;
+  }): PublicSimulatorInstance {
+    return this.#replaceRouted(scope, route, (instance, now) => ({
+      ...instance,
+      generation: instance.generation + 1,
+      lifecycleState: input.action === "start" ? "ready" : "stopped",
+      bootProvenance: input.action === "start"
+        ? input.bootedByAgent ? "agent_booted" : instance.bootProvenance === "agent_booted" ? "agent_booted" : "preexisting"
+        : instance.bootProvenance,
+      viewerState: "detached",
+      healthState: "healthy",
+      errorCode: null,
+      lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
+      updatedAt: now
+    }));
+  }
+
+  /** A claimed effect failed or became unknown; rotate the route so callers must refresh. */
+  failLifecycle(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, code: string): PublicSimulatorInstance {
+    if (!bounded(code, 128)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator failure code is invalid.");
+    return this.#replaceRouted(scope, route, (instance, now) => ({
+      ...instance,
+      generation: instance.generation + 1,
+      lifecycleState: "error",
+      viewerState: "detached",
+      healthState: "degraded",
+      errorCode: code,
+      lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
+      updatedAt: now
+    }));
   }
 
   /** Reserve an exact available device before a later lifecycle or viewer action. */
@@ -210,6 +296,33 @@ export class SimulatorOwnershipRegistry {
       || instance.workspaceFingerprint !== fingerprint) {
       throw new SimulatorOwnershipError("STALE_SCOPE", "Simulator instance ownership no longer matches this task.");
     }
+  }
+
+  #routedInstance(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): SimulatorOwnedInstance {
+    if (!bounded(route.instanceId, 128) || !positive(route.generation) || !bounded(route.leaseId, 128)) {
+      throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator instance route is invalid.");
+    }
+    const fingerprint = this.#fingerprint(scope);
+    const instance = this.#load().instances.find(item => item.instanceId === route.instanceId);
+    if (instance === undefined || instance.sessionId !== scope.sessionId || instance.generation !== route.generation) {
+      throw new SimulatorOwnershipError("STALE_SCOPE", "Simulator instance route is stale or unavailable.");
+    }
+    this.#assertOwner(instance, scope, fingerprint);
+    return instance;
+  }
+
+  #replaceRouted(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
+    project: (instance: SimulatorOwnedInstance, now: number) => SimulatorOwnedInstance): PublicSimulatorInstance {
+    return this.#store.transaction(() => {
+      const current = this.#routedInstance(scope, route);
+      if (current.generation >= Number.MAX_SAFE_INTEGER) {
+        throw new SimulatorOwnershipError("INVALID_OWNERSHIP", "Simulator instance generation is exhausted.");
+      }
+      const next = project(current, this.#now());
+      const stored = this.#load();
+      this.#save({ format: 1, instances: stored.instances.map(item => item.instanceId === current.instanceId ? next : item) });
+      return publicInstance(next);
+    });
   }
 
   #load(): StoredOwnership {
