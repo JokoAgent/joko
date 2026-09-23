@@ -66,7 +66,7 @@ it("guards Files navigation and opens the new-task project picker exactly once p
     view.replaceRoute({ kind: "newSession" });
     root?.render(createElement(AppWithController, { controller: view.value }));
   });
-  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(projectPicker()).toBeNull();
   await act(async () => {
     view.replaceRoute({ kind: "files", sessionId: "draft-session" });
     root?.render(createElement(AppWithController, { controller: view.value }));
@@ -78,29 +78,29 @@ it("guards Files navigation and opens the new-task project picker exactly once p
     await Promise.resolve();
     await Promise.resolve();
   });
-  await vi.waitFor(() => expect(document.querySelector("[role='listbox']")?.textContent).toContain("Add project"));
+  await vi.waitFor(() => expect(projectPicker()?.textContent).toContain("Add project"));
   expect(view.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
   await act(async () => { gamepad.action?.("open-folder"); await Promise.resolve(); });
   expect(view.navigate).toHaveBeenCalledTimes(1);
 
   await act(async () => {
-    const addProject = [...document.querySelectorAll<HTMLElement>("[role='option']")].find((option) => option.textContent?.includes("Add project"));
+    const addProject = [...document.querySelectorAll<HTMLElement>("[data-new-task-project-picker][data-state='open'] [data-project-picker-choice]")].find((option) => option.textContent?.includes("Add project"));
     if (addProject === undefined) throw new Error("Missing add-project option.");
     addProject.click();
   });
-  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(projectPicker()).toBeNull();
   expect(document.querySelector("[role='dialog']")?.textContent).toContain("New project");
   await act(async () => button(document.body, "Cancel").click());
-  expect(document.querySelector("[role='dialog']")).toBeNull();
+  expect(document.querySelector("[role='dialog'] form")).toBeNull();
   await act(async () => root?.render(createElement(AppWithController, { controller: view.value })));
-  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(projectPicker()).toBeNull();
 
   await act(async () => {
     gamepad.action?.("open-folder");
     await Promise.resolve();
     await Promise.resolve();
   });
-  await vi.waitFor(() => expect(document.querySelector("[role='listbox']")?.textContent).toContain("Add project"));
+  await vi.waitFor(() => expect(projectPicker()?.textContent).toContain("Add project"));
   expect(view.navigate).toHaveBeenCalledTimes(2);
   expect(gamepad.requestLeave).toHaveBeenCalledTimes(2);
 });
@@ -126,7 +126,7 @@ it("drops a pending folder action when navigation changes before the Files leave
     view.replaceRoute({ kind: "newSession" });
     root?.render(createElement(AppWithController, { controller: view.value }));
   });
-  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(projectPicker()).toBeNull();
 });
 
 function controller(route: AppRoute): {
@@ -185,4 +185,8 @@ function button(host: HTMLElement, label: string): HTMLButtonElement {
   const result = [...host.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent === label);
   if (result === undefined) throw new Error(`Missing ${label} action.`);
   return result;
+}
+
+function projectPicker(): HTMLElement | null {
+  return document.querySelector<HTMLElement>("[data-new-task-project-picker][data-state='open']");
 }

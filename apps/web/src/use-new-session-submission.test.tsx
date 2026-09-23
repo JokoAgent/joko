@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController, AppRoute } from "./controller.js";
 import type { ComposerDraft } from "./model.js";
+import { emptySnapshot } from "./model.js";
 import type { DelayedNewSessionDraft } from "./new-session-flow.js";
 import { useNewSessionSubmission } from "./use-new-session-submission.js";
 
@@ -23,11 +24,18 @@ function deferred<T>() {
 
 function api() {
   return {
-    state: { route: { kind: "newSession" }, connectionState: "connected", activeProfile: { id: "profile" }, navigationRevision: 0 },
+    state: { route: { kind: "newSession" }, connectionState: "connected", activeProfile: { id: "profile" }, navigationRevision: 0,
+      snapshot: { ...emptySnapshot(), targets: [{ id: "target", workspaceId: "workspace", backendId: "backend", name: "Project",
+        workspaceName: "Project", revision: 1n, trusted: true, pinned: false, archived: false }],
+        workspaces: [{ id: "workspace", targetId: "target", name: "Project", kind: "userProject", serverPath: "/srv/project",
+          trusted: true, dirty: false, entries: [] }] } },
     createSession: vi.fn(async () => ({ sessionId: "created", generation: 4n })),
+    createTarget: vi.fn(async () => "dialogue-target"),
+    refresh: vi.fn(async () => undefined),
     send: vi.fn(async () => undefined),
     restoreFirstInputDraft: vi.fn(async () => undefined),
     clearNewSessionDraft: vi.fn(async () => undefined),
+    recordRecentProject: vi.fn(async () => []),
     navigate: vi.fn()
   } as unknown as AppController;
 }
@@ -68,6 +76,7 @@ it.each(["draft", "route", "pagehide"] as const)("keeps accepted creation on its
   expect(probe.busy()).toBeUndefined();
   await act(async () => { creation.resolve({ sessionId: "created", generation: 4n }); await pending; });
   expect(original.send).toHaveBeenCalledExactlyOnceWith("created", input, { expectedGeneration: 4n });
+  expect(original.recordRecentProject).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ targetId: "target", workspaceId: "workspace", serverPath: "/srv/project" }));
   expect(original.clearNewSessionDraft).not.toHaveBeenCalled();
   expect(original.navigate).not.toHaveBeenCalled();
   expect(probe.error()).toBeUndefined();
@@ -96,6 +105,7 @@ it("shows a send failure on the task it revealed, but a later route never adopts
   expect(probe.error()).toBe("Upload failed");
   expect(original.clearNewSessionDraft).toHaveBeenCalledTimes(1);
   expect(original.restoreFirstInputDraft).toHaveBeenCalledExactlyOnceWith("created", input);
+  expect(original.recordRecentProject).toHaveBeenCalledOnce();
   expect(probe.busy()).toBeUndefined();
 });
 
@@ -139,4 +149,17 @@ it("rechecks the draft after its clear completes and never navigates a retired o
   await act(async () => { clear.resolve(); await pending; });
   expect(original.navigate).not.toHaveBeenCalled();
   expect(original.send).toHaveBeenCalledExactlyOnceWith("created", input, { expectedGeneration: 4n });
+});
+
+it("does not record a recent project before Session creation or for a managed dialogue", async () => {
+  const original = api();
+  vi.mocked(original.createSession).mockRejectedValueOnce(new Error("Creation failed"));
+  const probe = await mount(original);
+  const owner = { ownerDocument: document, signal: new AbortController().signal, isCurrent: () => true };
+  await act(async () => { await expect(probe.submit(draft, input, owner)).rejects.toThrow("Creation failed"); });
+  expect(original.recordRecentProject).not.toHaveBeenCalled();
+
+  await act(async () => { await probe.submit({ ...draft, selection: { kind: "dialogue", backendId: "backend" }, expectedTargetRevision: undefined }, input, owner); });
+  expect(original.createTarget).toHaveBeenCalledOnce();
+  expect(original.recordRecentProject).not.toHaveBeenCalled();
 });

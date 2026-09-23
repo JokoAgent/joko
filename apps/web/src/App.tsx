@@ -1102,7 +1102,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (action === "open-skills") { navigateFromShortcut({ kind: "tools", tab: "skills" }); return; }
     if (action === "open-schedules") { navigateFromShortcut({ kind: "schedules" }); return; }
     if (action === "open-folder") {
-      if (document.querySelector("[role='listbox']") !== null) return;
+      if (document.querySelector("[role='listbox'], [data-new-task-project-picker][data-state='open']") !== null) return;
       const profile = state.activeProfile;
       if (state.connectionState !== "connected" || profile === undefined) return;
       const request: NewSessionProjectPickerRequest = {
@@ -1120,7 +1120,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           && ownerWindow !== null && !ownerWindow.closed
           && request.ownerDocument.visibilityState === "visible" && request.ownerDocument.hasFocus()
           && request.ownerDocument.body.dataset.appShortcutRecording !== "1"
-          && request.ownerDocument.querySelector("[role='listbox']") === null
+          && request.ownerDocument.querySelector("[role='listbox'], [data-new-task-project-picker][data-state='open']") === null
           && request.ownerDocument.querySelector("[data-gamepad-preview]") === null
           && current.connectionState === "connected" && current.activeProfile?.id === request.profileId
           && current.activeProfile.serverId === request.serverId && current.snapshot.generation === request.connectionGeneration

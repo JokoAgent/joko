@@ -30,6 +30,7 @@ import {
 import { isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
 import { normalizeNavigationWidth, type NavigationLayout } from "./navigation-layout.js";
+import type { RecentProject } from "./recent-projects.js";
 import { parseWorkspaceFilesHash, workspaceFilesHash } from "./workspace-files-navigation.js";
 import { requestWorkspaceDocumentLeave, workspaceRouteLeaveRequest } from "./workspace-document-lifecycle.js";
 import type {
@@ -210,6 +211,9 @@ export interface AppController extends OperationApi {
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
+  readRecentProjects(): Promise<readonly RecentProject[]>;
+  recordRecentProject(entry: RecentProject): Promise<readonly RecentProject[]>;
+  removeRecentProject(entry: RecentProject): Promise<readonly RecentProject[]>;
   readPendingExtensionUse(): Promise<PendingExtensionUseView | undefined>;
   savePendingExtensionUse(value: PendingExtensionUseView): Promise<void>;
   clearPendingExtensionUse(): Promise<void>;
@@ -1644,6 +1648,9 @@ export function useAppController(): AppController {
         const selectedScope = scope();
         return enqueue(selectedScope, () => requireLocal(draftStore).clearNewSessionDraft(selectedScope));
       },
+      readRecentProjects: (): Promise<readonly RecentProject[]> => requireLocal(draftStore).readRecentProjects(scope()),
+      recordRecentProject: (entry: RecentProject): Promise<readonly RecentProject[]> => requireLocal(draftStore).recordRecentProject(scope(), entry),
+      removeRecentProject: (entry: RecentProject): Promise<readonly RecentProject[]> => requireLocal(draftStore).removeRecentProject(scope(), entry),
       readPendingExtensionUse: (): Promise<PendingExtensionUseView | undefined> => requireLocal(draftStore).readPendingExtensionUse(scope()),
       savePendingExtensionUse: (value: PendingExtensionUseView): Promise<void> => requireLocal(draftStore).savePendingExtensionUse(scope(), value),
       clearPendingExtensionUse: (): Promise<void> => requireLocal(draftStore).clearPendingExtensionUse(scope())

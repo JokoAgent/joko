@@ -52,6 +52,7 @@ import type {
 import type { TargetDraft } from "../model.js";
 import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
+import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
 import {
   currentComposerPlatform,
   resolveComposerAttachmentPolicy,
@@ -80,6 +81,7 @@ import {
 import { nativeSessionDiscoveryAvailability } from "./session-discovery.js";
 import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
 import { ProjectEditor, localProjectPickerOwner, sameProjectPickerOwner } from "./ProjectEditor.js";
+import { NewTaskProjectPicker } from "./NewTaskProjectPicker.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
@@ -195,6 +197,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [projectBrowseError, setProjectBrowseError] = useState<string>();
   const [openPickerRequestId, setOpenPickerRequestId] = useState<number>();
   const pickerOpenSequenceRef = useRef(0);
+  const [recentProjects, setRecentProjects] = useState<{ readonly owner: string; readonly entries: readonly RecentProject[] }>();
+  const [recentProjectsError, setRecentProjectsError] = useState<string>();
+  const recentProjectsEpochRef = useRef(0);
   const pageRef = useRef<HTMLElement>(null);
   const consumedPickerRequestIdRef = useRef<number | undefined>(undefined);
   const projectCreateEpochRef = useRef(0);
@@ -333,7 +338,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     if (page === null || !page.isConnected || page.ownerDocument !== ownerDocument
       || ownerWindow === null || ownerWindow.closed || ownerDocument.visibilityState !== "visible" || !ownerDocument.hasFocus()
       || ownerDocument.body.classList.contains("modal-open") || ownerDocument.body.dataset.appShortcutRecording === "1"
-      || ownerDocument.querySelector("[role='listbox']") !== null
+      || ownerDocument.querySelector("[role='listbox'], [data-new-task-project-picker][data-state='open']") !== null
       || ownerDocument.querySelector("[data-gamepad-preview]") !== null
       || controller.state.route.kind !== "newSession" || controller.state.connectionState !== "connected"
       || profile?.id !== request.profileId || profile.serverId !== request.serverId
@@ -351,6 +356,61 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setProjectBrowsePending(false);
     setProjectBrowseError(undefined);
   }, [profileScope, snapshot.generation]);
+  useEffect(() => {
+    recentProjectsEpochRef.current += 1;
+    setRecentProjects(undefined);
+    setRecentProjectsError(undefined);
+  }, [profileScope, snapshot.generation]);
+  const loadRecentProjects = (): void => {
+    const current = controllerRef.current;
+    if (current.state.connectionState !== "connected" || current.state.activeProfile === undefined
+      || current.state.route.kind !== "newSession"
+      || `${current.state.activeProfile.serverId}\u0000${current.state.activeProfile.id}` !== profileScope) return;
+    const owner = profileScope;
+    const generation = current.state.snapshot.generation;
+    const epoch = ++recentProjectsEpochRef.current;
+    const read = current.readRecentProjects?.() ?? Promise.resolve([]);
+    void read.then((entries) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== owner
+        || state.snapshot.generation !== generation) return;
+      setRecentProjects({ owner, entries });
+      setRecentProjectsError(undefined);
+    }).catch((cause: unknown) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== owner
+        || state.snapshot.generation !== generation) return;
+      setRecentProjects({ owner, entries: [] });
+      setRecentProjectsError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    });
+  };
+  const loadRecentProjectsRef = useRef(loadRecentProjects);
+  loadRecentProjectsRef.current = loadRecentProjects;
+  useEffect(() => subscribeRecentProjectsChange(profileScope, () => loadRecentProjectsRef.current()), [profileScope]);
+  const removeRecentProject = (entry: RecentProject): void => {
+    const current = controllerRef.current;
+    if (current.state.connectionState !== "connected" || current.state.route.kind !== "newSession"
+      || current.state.activeProfile === undefined
+      || `${current.state.activeProfile.serverId}\u0000${current.state.activeProfile.id}` !== profileScope) return;
+    const epoch = ++recentProjectsEpochRef.current;
+    const generation = current.state.snapshot.generation;
+    void current.removeRecentProject(entry).then((entries) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== profileScope
+        || state.snapshot.generation !== generation) return;
+      setRecentProjects({ owner: profileScope, entries });
+      setRecentProjectsError(undefined);
+    }).catch((cause: unknown) => {
+      const state = controllerRef.current.state;
+      if (recentProjectsEpochRef.current !== epoch || state.connectionState !== "connected"
+        || state.activeProfile === undefined || `${state.activeProfile.serverId}\u0000${state.activeProfile.id}` !== profileScope
+        || state.snapshot.generation !== generation) return;
+      setRecentProjectsError(cause instanceof Error ? cause.message : t("error.unexpected"));
+    });
+  };
   const browseProjectDirectory = (): void => {
     const picker = window.jokoDesktop?.projects?.pickDirectory;
     const owner = localProjectPickerOwner(controller);
@@ -943,10 +1003,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [initialDialogueBackendId, initialTargetId, profileScope]);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || projectPickerRequest !== undefined || openPickerRequestId !== undefined) return;
     const frame = window.requestAnimationFrame(() => richEditorRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [hydrated, profileScope]);
+  }, [hydrated, profileScope, projectPickerRequest?.requestId, openPickerRequestId]);
 
   useEffect(() => {
     if (selection?.kind === "target") return;
@@ -1848,47 +1908,73 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const activeFullAccessConfirmation = fullAccessConfirmation?.scope === fullAccessConfirmationScope
     ? fullAccessConfirmation
     : undefined;
+  const visibleRecentProjects = controller.state.connectionState === "connected" && recentProjects?.owner === profileScope
+    ? recentProjects.entries : [];
+  const recentOptions = visibleRecentProjects.map((entry) => {
+    const target = resolveRecentProject(entry, snapshot);
+    return { entry, available: target !== undefined && target.error === undefined
+      && activeTargets.some((candidate) => candidate.id === target.id)
+      && snapshot.backends.some((candidate) => candidate.id === target.backendId
+        && candidate.health !== "unavailable" && candidate.capabilities.get("input.text")?.supported === true) };
+  });
+  const recentlyShownTargets = new Set(recentOptions.filter((option) => option.available).map((option) => option.entry.targetId));
+  const projectPickerOptions = projectTargets.filter((target) => !recentlyShownTargets.has(target.id)).map((target) => {
+    const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
+    const location = target.remoteWorkspace === undefined
+      ? targetWorkspace?.serverPath || target.workspaceName
+      : `${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
+    const available = activeTargets.some((candidate) => candidate.id === target.id)
+      && target.error === undefined && targetWorkspace !== undefined && targetWorkspace.targetId === target.id;
+    return { value: newSessionSelectionValue({ kind: "target" as const, targetId: target.id }),
+      name: `${target.name}${available ? "" : ` · ${t("newTask.unavailable")}`}`, location, disabled: !available };
+  });
+  const dialoguePickerOptions = eligibleDialogueBackends.map((candidate) => ({
+    value: newSessionSelectionValue({ kind: "dialogue" as const, backendId: candidate.id }),
+    name: `${t("newTask.dialogue")} · ${candidate.name}`
+  }));
+  const selectProjectPickerValue = (value: string): void => {
+    const next = parseNewSessionSelection(value, projectTargets, eligibleDialogueBackends);
+    if (next === undefined) return;
+    setSelection(next);
+    setStartKind("fresh");
+    setNativeReference("");
+    setNativeSelectionWarning(undefined);
+  };
+  const selectRecentProject = (entry: RecentProject): boolean => {
+    const current = controllerRef.current.state;
+    if (current.connectionState !== "connected" || current.route.kind !== "newSession"
+      || current.activeProfile === undefined || `${current.activeProfile.serverId}\u0000${current.activeProfile.id}` !== profileScope
+      || current.snapshot.generation !== snapshot.generation) return false;
+    const target = resolveRecentProject(entry, current.snapshot);
+    if (target === undefined || target.error !== undefined
+      || !newSessionTargets([target], current.snapshot.settings.backendSettings).some((candidate) => candidate.id === target.id)
+      || !current.snapshot.backends.some((candidate) => candidate.id === target.backendId
+        && candidate.health !== "unavailable" && candidate.capabilities.get("input.text")?.supported === true)) {
+      setRecentProjectsError(t("newTask.projectUnavailable"));
+      return false;
+    }
+    selectProjectPickerValue(newSessionSelectionValue({ kind: "target", targetId: target.id }));
+    return true;
+  };
 
   return <main ref={pageRef} className="new-task-page">
     <header className="new-task-page__header">
       {!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       <div className="new-task-context" aria-label={t("session.newDescription")}>
-        <label className="new-task-context__control new-task-context__control--target">
-          <FolderKanban aria-hidden="true" />
-          <span className="sr-only">{t("newTask.location")}</span>
-          <SelectControl value={selectionKey} openRequestId={hydrated && hydratedProfileScope === profileScope ? openPickerRequestId : undefined} disabled={submitting || !hydrated || projectBrowsePending} onChange={(event) => {
-            if (event.target.value === "__browse_local__") { browseProjectDirectory(); return; }
-            if (event.target.value === "__new_project__") {
-              setProjectEditorInitialDirectory(undefined);
-              setProjectCreateError(undefined);
-              setProjectEditorOpen(true);
-              return;
-            }
-            const next = parseNewSessionSelection(event.target.value, projectTargets, eligibleDialogueBackends);
-            if (next !== undefined) {
-              setSelection(next);
-              setStartKind("fresh");
-              setNativeReference("");
-              setNativeSelectionWarning(undefined);
-            }
-          }}>
-            {projectTargets.length === 0 && selected === undefined && eligibleDialogueBackends.length === 0 && <option value="" disabled>{t("session.noProjects")}</option>}
-            {(projectTargets.length > 0 || selection?.kind === "target" && !projectTargets.some((target) => target.id === selection.targetId)) && <optgroup label={t("nav.projects")}>
-              {selection?.kind === "target" && !projectTargets.some((target) => target.id === selection.targetId) && <option value={selectionKey} disabled>{selected?.name ?? selection.targetId} · {t("newTask.unavailable")}</option>}
-              {projectTargets.map((target) => {
-                const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
-                const location = target.remoteWorkspace === undefined
-                  ? targetWorkspace?.serverPath || target.workspaceName
-                  : `${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
-                const available = activeTargets.some((candidate) => candidate.id === target.id) && target.error === undefined && targetWorkspace !== undefined;
-                return <option value={newSessionSelectionValue({ kind: "target", targetId: target.id })} disabled={!available} key={target.id}>{target.name} · {location}{available ? "" : ` · ${t("newTask.unavailable")}`}</option>;
-              })}
-            </optgroup>}
-            {eligibleDialogueBackends.length > 0 && <optgroup label={t("newTask.dialogues")}>{eligibleDialogueBackends.map((candidate) => <option value={newSessionSelectionValue({ kind: "dialogue", backendId: candidate.id })} key={`dialogue:${candidate.id}`}>{t("newTask.dialogue")} · {candidate.name}</option>)}</optgroup>}
-            {localProjectPickerOwner(controller) !== undefined && <option value="__browse_local__">{t("newTask.browseLocalProject")}</option>}
-            <option value="__new_project__">{t("newTask.addProject")}</option>
-          </SelectControl>
-        </label>
+        <NewTaskProjectPicker value={selectionKey}
+          selectedName={selected?.name ?? (selection?.kind === "dialogue" ? `${t("newTask.dialogue")} · ${backend?.name ?? ""}` : t("session.noProjects"))}
+          projects={projectPickerOptions} dialogues={dialoguePickerOptions} recent={recentOptions}
+          ownerKey={`${profileScope}\u0000${snapshot.generation}`}
+          requestId={hydrated && hydratedProfileScope === profileScope ? openPickerRequestId : undefined}
+          disabled={submitting || !hydrated || projectBrowsePending || controller.state.connectionState !== "connected"}
+          canBrowse={localProjectPickerOwner(controller) !== undefined}
+          error={recentProjectsError} onOpen={loadRecentProjects}
+          onChoose={selectProjectPickerValue} onChooseRecent={selectRecentProject} onRemoveRecent={removeRecentProject}
+          onBrowse={browseProjectDirectory} onAdd={() => {
+            setProjectEditorInitialDirectory(undefined);
+            setProjectCreateError(undefined);
+            setProjectEditorOpen(true);
+          }} t={t} />
         {canDiscover && <label className="new-task-context__control new-task-context__control--native">
           <span className="sr-only">{t("session.startMode")}</span>
           <SelectControl value={startKind} disabled={submitting} onChange={(event) => { const next = event.target.value as "fresh" | "attach"; setStartKind(next); setNativeSelectionWarning(undefined); if (next === "fresh") setNativeReference(""); }}>

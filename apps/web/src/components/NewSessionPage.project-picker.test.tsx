@@ -36,17 +36,17 @@ it("opens the current new-task picker once and preserves the draft when an exist
   const view = await mount();
   await view.render(request(1));
   expect(view.consumed).toHaveBeenCalledExactlyOnceWith(1);
-  expect(document.querySelector("[role='listbox']")?.textContent).toContain("newTask.addProject");
-  expect(document.querySelector("[role='listbox']")?.textContent).not.toContain("newTask.browseLocalProject");
+  expect(picker()?.textContent).toContain("newTask.addProject");
+  expect(picker()?.textContent).not.toContain("newTask.browseLocalProject");
   await act(async () => option("Second project").click());
   expect(selectionValue(view.host)).toBe("target:second");
   expect(view.host.textContent).toContain("Keep this draft");
   await view.render(request(1));
   expect(view.consumed).toHaveBeenCalledTimes(1);
-  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(picker()).toBeNull();
   await view.render(request(2, { profileId: "foreign" }));
   expect(view.consumed).toHaveBeenLastCalledWith(2);
-  expect(document.querySelector("[role='listbox']")).toBeNull();
+  expect(picker()).toBeNull();
 });
 
 it("creates a project in the same draft, retains failed input for retry, and discards a late result after owner change", async () => {
@@ -65,7 +65,7 @@ it("creates a project in the same draft, retains failed input for retry, and dis
   view.createTarget.mockResolvedValueOnce("created");
   await act(async () => { form.requestSubmit(); await Promise.resolve(); });
   expect(view.createTarget).toHaveBeenLastCalledWith(expect.objectContaining({ name: "New project", serverPath: "/service/new-project" }));
-  expect(document.querySelector("[role='dialog']")).toBeNull();
+  expect(document.querySelector("[role='dialog'] form")).toBeNull();
   expect(selectionValue(view.host)).toBe("target:created");
   expect(view.host.textContent).toContain("Keep this draft");
 
@@ -92,7 +92,7 @@ it("reopens project choices after a cancelled local directory picker and prefill
   await view.render(request(1));
   await act(async () => { option("newTask.browseLocalProject").click(); await Promise.resolve(); });
   expect(pickDirectory).toHaveBeenCalledTimes(1);
-  await vi.waitFor(() => expect(document.querySelector("[role='listbox']")?.textContent).toContain("newTask.browseLocalProject"));
+  await vi.waitFor(() => expect(picker()?.textContent).toContain("newTask.browseLocalProject"));
   await act(async () => { option("newTask.browseLocalProject").click(); await Promise.resolve(); });
   expect(document.querySelector<HTMLInputElement>("#project-editor-path")?.value).toBe("C:\\work\\chosen");
   expect(document.querySelector<HTMLInputElement>('[role="dialog"] input[maxlength="120"]')?.value).toBe("chosen");
@@ -111,8 +111,67 @@ it("does not carry a late native directory result into another service owner", a
   expect(pickDirectory).toHaveBeenCalledOnce();
   await view.changeProfile("foreign");
   await act(async () => { resolvePick({ cancelled: false, path: "C:\\wrong-owner" }); await Promise.resolve(); });
-  expect(document.querySelector("[role='dialog']")).toBeNull();
+  expect(document.querySelector("[role='dialog'] form")).toBeNull();
   expect(view.host.textContent).toContain("Keep this draft");
+});
+
+it("shows durable recent projects first, rechecks their Target identity, and removes history without deleting a project", async () => {
+  const view = await mount();
+  const recent = { targetId: "second", workspaceId: "workspace-second", name: "Second project", serverPath: "/service/second", lastUsedAt: 4 };
+  view.readRecentProjects.mockResolvedValue([recent]);
+  await view.render(request(1));
+  await vi.waitFor(() => expect(picker()?.textContent).toContain("newTask.recentProjects"));
+  expect(picker()?.querySelector("section")?.textContent).toContain("Second project");
+  await act(async () => option("Second project").click());
+  expect(selectionValue(view.host)).toBe("target:second");
+  expect(view.host.textContent).toContain("Keep this draft");
+
+  await view.render(request(2));
+  await vi.waitFor(() => expect(picker()?.textContent).toContain("newTask.recentProjects"));
+  view.removeRecentProject.mockRejectedValueOnce(new Error("Local storage unavailable"));
+  await act(async () => required(picker()?.querySelector<HTMLButtonElement>(".new-task-project-picker__remove")).click());
+  await vi.waitFor(() => expect(picker()?.querySelector("[role='alert']")?.textContent).toContain("Local storage unavailable"));
+  expect(picker()?.textContent).toContain("newTask.recentProjects");
+  await act(async () => required(picker()?.querySelector<HTMLButtonElement>(".new-task-project-picker__remove")).click());
+  expect(view.removeRecentProject).toHaveBeenCalledTimes(2);
+  expect(view.removeRecentProject).toHaveBeenLastCalledWith(recent);
+  await vi.waitFor(() => expect(picker()?.textContent).not.toContain("newTask.recentProjects"));
+  expect(picker()?.textContent).toContain("Second project");
+  expect(view.host.textContent).toContain("Keep this draft");
+});
+
+it("keeps current projects selectable when recent-history storage cannot be read", async () => {
+  const view = await mount();
+  view.readRecentProjects.mockRejectedValueOnce(new Error("Local storage unavailable"));
+  await view.render(request(1));
+  await vi.waitFor(() => expect(picker()?.querySelector("[role='alert']")?.textContent).toContain("Local storage unavailable"));
+  await act(async () => option("Second project").click());
+  expect(selectionValue(view.host)).toBe("target:second");
+  expect(view.host.textContent).toContain("Keep this draft");
+});
+
+it("does not select a rebound recent path or reveal an old owner's late history", async () => {
+  const view = await mount();
+  const recent = { targetId: "second", workspaceId: "workspace-second", name: "Second project", serverPath: "/service/second", lastUsedAt: 4 };
+  view.readRecentProjects.mockResolvedValueOnce([recent]);
+  await view.render(request(1));
+  await vi.waitFor(() => expect(picker()?.textContent).toContain("newTask.recentProjects"));
+  view.changeSnapshotSilently((snapshot) => ({ ...snapshot, workspaces: snapshot.workspaces.map((workspace) =>
+    workspace.id === "workspace-second" ? { ...workspace, serverPath: "/service/rebound" } : workspace) }));
+  await act(async () => option("Second project").click());
+  expect(selectionValue(view.host)).toBe("target:first");
+  expect(picker()?.querySelector("[role='alert']")?.textContent).toContain("newTask.projectUnavailable");
+  await view.render(request(1));
+  await vi.waitFor(() => expect(picker()?.querySelector<HTMLButtonElement>(".new-task-project-picker__recent [data-project-picker-choice]")?.disabled).toBe(true));
+  expect(selectionValue(view.host)).toBe("target:first");
+
+  let resolveLate!: (value: typeof recent[]) => void;
+  view.readRecentProjects.mockReturnValueOnce(new Promise((resolve) => { resolveLate = resolve; }));
+  await act(async () => required(view.host.querySelector<HTMLButtonElement>(".new-task-project-picker__trigger")).click());
+  await act(async () => required(view.host.querySelector<HTMLButtonElement>(".new-task-project-picker__trigger")).click());
+  await view.changeProfile("foreign");
+  await act(async () => { resolveLate([recent]); await Promise.resolve(); });
+  expect(picker()).toBeNull();
 });
 
 function request(requestId: number, patch: Partial<NewSessionProjectPickerRequest> = {}): NewSessionProjectPickerRequest {
@@ -133,6 +192,8 @@ async function mount(local = false) {
     snapshot, preferences: { locale: "en", composerSendShortcut: "enter", newSessionWorktreeEnabled: false }
   } as unknown as ControllerState;
   const createTarget = vi.fn<(_draft: unknown) => Promise<string>>();
+  const readRecentProjects = vi.fn(async () => [] as readonly { targetId: string; workspaceId: string; name: string; serverPath: string; lastUsedAt: number }[]);
+  const removeRecentProject = vi.fn(async () => [] as readonly { targetId: string; workspaceId: string; name: string; serverPath: string; lastUsedAt: number }[]);
   const controller = {
     get state() { return state; },
     readNewSessionDraft: vi.fn(async () => savedDraft()),
@@ -142,7 +203,7 @@ async function mount(local = false) {
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined),
-    createTarget
+    createTarget, readRecentProjects, removeRecentProject
   } as unknown as AppController;
   const consumed = vi.fn();
   const host = document.body.appendChild(document.createElement("div"));
@@ -154,10 +215,14 @@ async function mount(local = false) {
     await Promise.resolve();
   });
   await render();
-  return { host, consumed, createTarget, render, changeProfile: async (id: string) => {
-    state = { ...state, activeProfile: { ...state.activeProfile!, id } };
-    await render();
-  } };
+  return { host, consumed, createTarget, readRecentProjects, removeRecentProject, render,
+    changeSnapshotSilently: (update: (value: AppSnapshot) => AppSnapshot) => {
+      state = { ...state, snapshot: update(state.snapshot) };
+    },
+    changeProfile: async (id: string) => {
+      state = { ...state, activeProfile: { ...state.activeProfile!, id } };
+      await render();
+    } };
 }
 
 function projectSnapshot(): AppSnapshot {
@@ -178,7 +243,11 @@ function savedDraft(): NewSessionLocalDraft {
 }
 
 function option(label: string): HTMLElement {
-  return required([...document.querySelectorAll<HTMLElement>("[role='option']")].find((candidate) => candidate.textContent?.includes(label)));
+  return required([...required(picker()).querySelectorAll<HTMLElement>("[data-project-picker-choice]")].find((candidate) => candidate.textContent?.includes(label)));
+}
+
+function picker(): HTMLElement | null {
+  return document.querySelector<HTMLElement>("[data-new-task-project-picker][data-state='open']");
 }
 
 function selectionValue(host: HTMLElement): string {
