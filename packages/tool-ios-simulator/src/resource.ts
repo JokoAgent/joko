@@ -17,6 +17,45 @@ export class SimulatorResourceError extends Error {
     | "RESOURCE_STATE_UNKNOWN" | "MUTATION_CANCELLED", message: string) { super(message); }
 }
 
+export interface SimulatorResourceAdmission {
+  readonly allowed: boolean;
+  readonly reasonCode: "ADMITTED" | "MEMORY_PRESSURE" | "RESOURCE_LIMIT_REACHED";
+  readonly runningCount: number;
+  readonly softLimit: number;
+  readonly hardLimit: number;
+}
+
+/** The same thresholds drive mutation admission and the read-only doctor projection. */
+export function assessSimulatorResourceAdmission(input: {
+  readonly runningCount: number;
+  readonly softLimit?: number;
+  readonly hardLimit?: number;
+  readonly memory: SimulatorMemorySnapshot;
+}): SimulatorResourceAdmission {
+  const softLimit = input.softLimit ?? 2;
+  const hardLimit = input.hardLimit ?? 4;
+  if (!Number.isSafeInteger(input.runningCount) || input.runningCount < 0
+    || !Number.isSafeInteger(softLimit) || !Number.isSafeInteger(hardLimit)
+    || softLimit < 1 || hardLimit < softLimit || hardLimit > 4) {
+    throw new SimulatorResourceError("INVALID_ARGUMENT", "Simulator resource state is invalid.");
+  }
+  const base = { runningCount: input.runningCount, softLimit, hardLimit };
+  if (input.runningCount >= hardLimit) return { ...base, allowed: false, reasonCode: "RESOURCE_LIMIT_REACHED" };
+  const memory = input.memory;
+  if (memory.freePercentage !== null && Number.isFinite(memory.freePercentage)
+    && memory.freePercentage >= 0 && memory.freePercentage <= 100) {
+    const required = input.runningCount >= softLimit ? 20 : 10;
+    if (memory.freePercentage >= required) return { ...base, allowed: true, reasonCode: "ADMITTED" };
+  } else {
+    const required = input.runningCount === 0 ? 512 * MIB
+      : input.runningCount < softLimit ? 1.5 * GIB : 2.5 * GIB;
+    if (Number.isSafeInteger(memory.freeBytes) && memory.freeBytes >= required) {
+      return { ...base, allowed: true, reasonCode: "ADMITTED" };
+    }
+  }
+  return { ...base, allowed: false, reasonCode: "MEMORY_PRESSURE" };
+}
+
 export function parseSimulatorMemoryFreePercentage(output: string): number | null {
   const match = /System-wide memory free percentage:\s*([0-9]+(?:\.[0-9]+)?)%/iu.exec(output);
   if (!match) return null;
@@ -117,15 +156,9 @@ export class SimulatorResourceScheduler {
       throw new SimulatorResourceError("RESOURCE_STATE_UNKNOWN", "Simulator memory state could not be read.");
     }
     this.#requireActive(signal);
-    if (memory.freePercentage !== null && Number.isFinite(memory.freePercentage)
-      && memory.freePercentage >= 0 && memory.freePercentage <= 100) {
-      const required = this.#running.size >= this.#softLimit ? 20 : 10;
-      if (memory.freePercentage >= required) return;
-    } else {
-      const required = this.#running.size === 0 ? 512 * MIB
-        : this.#running.size < this.#softLimit ? 1.5 * GIB : 2.5 * GIB;
-      if (Number.isSafeInteger(memory.freeBytes) && memory.freeBytes >= required) return;
-    }
+    const admission = assessSimulatorResourceAdmission({ runningCount: this.#running.size,
+      softLimit: this.#softLimit, hardLimit: this.#hardLimit, memory });
+    if (admission.allowed) return;
     throw new SimulatorResourceError("MEMORY_PRESSURE", "System memory pressure is too high for another Simulator.");
   }
 

@@ -63,7 +63,8 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
     if (process.platform === "win32") expect(diagnosis).toMatchObject({ isError: false, details: { mcpStructuredContent: {
       data: { environment: { issue: "UNSUPPORTED_PLATFORM" }, availability: {
         list_simulator_devices: { state: "unavailable", reasonCode: "UNSUPPORTED_PLATFORM" }
-      }, instanceControl: { state: "unavailable" } }
+      }, resources: { state: "unavailable", reasonCode: "UNSUPPORTED_PLATFORM" },
+      instanceControl: { state: "unavailable" } }
     } } });
     const environment = await call("call_tool", { name: "check_environment", args: {} });
     if (process.platform === "win32") expect(environment).toMatchObject({ isError: false, details: { mcpStructuredContent: {

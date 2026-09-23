@@ -1,4 +1,5 @@
-import { createSimulatorEnvironmentRuntime, type SimulatorEnvironmentRuntime } from "@joko/tool-ios-simulator";
+import { assessSimulatorResourceAdmission, collectSimulatorMemorySnapshot, createSimulatorEnvironmentRuntime,
+  type SimulatorEnvironmentReport, type SimulatorEnvironmentRuntime, type SimulatorMemorySnapshot } from "@joko/tool-ios-simulator";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import { SimulatorOwnershipError, type SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
@@ -44,15 +45,18 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
   readonly #runtime: SimulatorEnvironmentRuntime;
   readonly #ownership: SimulatorOwnershipRegistry;
+  readonly #memoryProbe: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
 
   constructor(options: {
     readonly store: Pick<OperationalStore, "getSession" | "getTarget">;
     readonly ownership: SimulatorOwnershipRegistry;
     readonly runtime?: SimulatorEnvironmentRuntime;
+    readonly memoryProbe?: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
   }) {
     this.#store = options.store;
     this.#ownership = options.ownership;
     this.#runtime = options.runtime ?? createSimulatorEnvironmentRuntime();
+    this.#memoryProbe = options.memoryProbe ?? (signal => collectSimulatorMemorySnapshot({ signal }));
   }
 
   includeForTarget(targetId: string): boolean {
@@ -90,27 +94,58 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       signal?.throwIfAborted();
       this.#requireScope(context);
       if (selected === "check_environment") return response({ ok: true, data: environment }, false);
-      if (selected === "doctor") return response({ ok: true, data: {
-        environment,
-        availability: {
-          check_environment: { state: "available", backend: "host" },
-          doctor: { state: "available", backend: "host" },
-          list_simulator_devices: environment.ready
-            ? { state: "available", backend: "simctl" }
-            : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
-          list_instances: { state: "available", backend: "host" }
-        },
-        instances: this.#ownership.listForTask(context),
-        instanceControl: { state: "unavailable", reasonCode: "INSTANCE_CONTROL_UNAVAILABLE" },
-        drivers: { state: "unavailable", reasonCode: "INSTANCE_DRIVER_UNAVAILABLE" },
-        recommendedActions: environment.ready ? ["list_simulator_devices"] : ["check_environment"]
-      } }, false);
+      if (selected === "doctor") {
+        const instances = this.#ownership.listForTask(context);
+        const resources = await this.#diagnoseResources(environment, signal, context);
+        signal?.throwIfAborted();
+        this.#requireScope(context);
+        return response({ ok: true, data: {
+          environment,
+          availability: {
+            check_environment: { state: "available", backend: "host" },
+            doctor: { state: "available", backend: "host" },
+            list_simulator_devices: environment.ready
+              ? { state: "available", backend: "simctl" }
+              : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
+            list_instances: { state: "available", backend: "host" }
+          },
+          instances, resources,
+          instanceControl: { state: "unavailable", reasonCode: "INSTANCE_CONTROL_UNAVAILABLE" },
+          drivers: { state: "unavailable", reasonCode: "INSTANCE_DRIVER_UNAVAILABLE" },
+          recommendedActions: environment.ready ? ["list_simulator_devices"] : ["check_environment"]
+        } }, false);
+      }
       if (!environment.ready) return response({ ok: false, errorCode: environment.issue, message: environment.error, data: { environment } }, true);
       return response({ ok: true, data: { devices: environment.devices, xcodeVersion: environment.xcodeVersion } }, false);
     } catch (error) {
       const code = error instanceof SimulatorToolError || error instanceof SimulatorOwnershipError ? error.code : signal?.aborted ? "PROBE_ABORTED" : "SIMULATOR_HOST_ERROR";
       const message = error instanceof SimulatorToolError || error instanceof SimulatorOwnershipError ? error.message : signal?.aborted ? "Simulator probe was cancelled." : "Simulator host call failed.";
       return response({ ok: false, errorCode: code, message }, true);
+    }
+  }
+
+  async #diagnoseResources(environment: SimulatorEnvironmentReport, signal: AbortSignal | undefined,
+    context: BridgeToolCallContext): Promise<Readonly<Record<string, unknown>>> {
+    if (!environment.ready) return { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" };
+    try {
+      const devices = new Map<string, string>();
+      for (const device of environment.devices) {
+        const udid = device.udid.toUpperCase();
+        if (devices.has(udid)) throw new Error("Duplicate Simulator device identity.");
+        devices.set(udid, device.state.toLowerCase());
+      }
+      const runningCount = this.#ownership.listForResourceAdmission()
+        .filter(item => { const state = devices.get(item.simulatorUdid); return state !== undefined && state !== "shutdown"; }).length;
+      const memory = await this.#memoryProbe(signal);
+      signal?.throwIfAborted();
+      this.#requireScope(context);
+      const admission = assessSimulatorResourceAdmission({ runningCount, memory });
+      return { state: "available", ...admission,
+        memory: { source: memory.source, freePercentage: memory.freePercentage, freeBytes: memory.freeBytes } };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      this.#requireScope(context);
+      return { state: "unavailable", reasonCode: "RESOURCE_STATE_UNKNOWN" };
     }
   }
 
