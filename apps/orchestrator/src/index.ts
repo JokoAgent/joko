@@ -24,6 +24,7 @@ export * from "./contact-tool-provider.js";
 export * from "./credential-manager.js";
 export * from "./credential-vault.js";
 export * from "./diagnostics-bundle.js";
+export * from "./document-tool-provider.js";
 export * from "./event-hub.js";
 export * from "./extension-catalog.js";
 export * from "./extension-package-publisher.js";

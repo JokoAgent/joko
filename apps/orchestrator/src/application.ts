@@ -117,6 +117,7 @@ import {
   type MobilePushProviderPort
 } from "./mobile-push.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
+import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
@@ -795,6 +796,9 @@ export async function createOrchestratorApplication(
   );
   const unregisterRemoteHostTools = mcpRouter.registerBridgeToolProvider(
     new RemoteHostToolBridgeProvider({ store, registry: remoteHosts, outputRedactor: credentials })
+  );
+  const unregisterDocumentTools = mcpRouter.registerBridgeToolProvider(
+    new DocumentToolBridgeProvider({ store })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
     store,
@@ -2185,6 +2189,7 @@ export async function createOrchestratorApplication(
     unregisterPartnerTools();
     unregisterLspBridge();
     unregisterRemoteHostTools();
+    unregisterDocumentTools();
     lspBridge.dispose();
     unregisterSchedulerBridgeTools();
     unregisterVisionBridgeTools();
@@ -2359,6 +2364,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
+        await attempt(() => unregisterDocumentTools());
         await attempt(() => lspBridge.dispose());
         await attempt(() => unregisterSchedulerBridgeTools());
         await attempt(() => unregisterVisionBridgeTools());

@@ -1,0 +1,25 @@
+{
+  "name": "@joko/tool-document",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "docx": "9.7.1",
+    "marked": "16.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "jszip": "3.10.2",
+    "tsx": "4.22.1",
+    "vitest": "4.1.9"
+  }
+}
