@@ -121,6 +121,14 @@ describe("Orchestrator network configuration", () => {
     });
   });
 
+  it("accepts only an existing local PDF helper executable and app directory", () => {
+    expect(loadConfig({ ...base, JOKO_DOCUMENT_PDF_ELECTRON_EXECUTABLE: process.execPath,
+      JOKO_DOCUMENT_PDF_ELECTRON_APP: process.cwd() }).pdfRendererHost)
+      .toEqual({ executablePath: process.execPath, appPath: process.cwd() });
+    expect(() => loadConfig({ ...base, JOKO_DOCUMENT_PDF_ELECTRON_APP: process.cwd() })).toThrow();
+    expect(() => loadConfig({ ...base, JOKO_DOCUMENT_PDF_ELECTRON_EXECUTABLE: "relative/helper" })).toThrow();
+  });
+
   it("enables APNs only from one complete bounded credential configuration", () => {
     expect(loadConfig(base).mobilePush).toBeUndefined();
     expect(loadConfig({

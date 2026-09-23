@@ -28,6 +28,8 @@ it("binds editable document creation to the current trusted local task and stric
   });
   const context = { sessionId: "session", targetId: "target", generation: 3 };
   expect(provider.tools.map(tool => [tool.name, tool.requiresPermission])).toEqual([["make_docx", true], ["make_pptx", true], ["make_xlsx", true], ["read_sheet", false], ["inspect_pdf", false]]);
+  expect((await provider.callTool("render_pdf", { html: "<p>Unavailable</p>", outPath: "a.pdf" }, undefined, context)).structuredContent)
+    .toMatchObject({ errorCode: "UNKNOWN_TOOL" });
   expect(provider.includeForTarget("target")).toBe(true);
   const result = await provider.callTool("make_docx", {
     markdown: "# Heading\n\n| A | B |\n|---|---|\n| 1 | 2 |",
@@ -92,6 +94,40 @@ it("binds editable document creation to the current trusted local task and stric
     expect((await provider.callTool("inspect_pdf", { path: "empty.pdf" }, undefined, context)).structuredContent)
       .toMatchObject({ errorCode: "STALE_SCOPE" });
     expect(published).toHaveLength(3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it("advertises PDF rendering only with a renderer and binds publication to the current task", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "joko-bridge-pdf-"));
+  let generation = 7;
+  let published = 0;
+  const provider = new DocumentToolBridgeProvider({
+    store: {
+      getSession: () => ({ descriptor: { id: "session", targetId: "target", backendId: "backend",
+        binding: { generation }, archived: false, worktree: { path: directory, state: "active" } } }) as never,
+      getTarget: () => ({ descriptor: { id: "target", backendId: "backend", trusted: true, workspaceRoot: directory } }) as never
+    },
+    pdfRenderer: { render: async input => {
+      expect(input.html).toContain("Rendered report");
+      return { buffer: Buffer.from("%PDF-1.4\nfixture"), fontsReady: false };
+    } },
+    publish: async input => { published += 1; return { path: join(input.root, input.outPath), relativePath: input.outPath, bytes: input.bytes.length }; }
+  });
+  const context = { sessionId: "session", targetId: "target", generation: 7 };
+  try {
+    expect(provider.tools.at(-1)).toMatchObject({ name: "render_pdf", requiresPermission: true });
+    expect(await provider.callTool("render_pdf", { html: "<h1>Rendered report</h1>", outPath: "documents/report.pdf" }, undefined, context))
+      .toMatchObject({ isError: false, structuredContent: { format: "pdf", pageSize: "A4", fontsReady: false,
+        templateApplied: true, relativePath: "documents/report.pdf" } });
+    expect(published).toBe(1);
+    expect((await provider.callTool("render_pdf", { html: "<p>Bad</p>", outPath: "bad.pdf", unknown: true }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+    generation = 8;
+    expect((await provider.callTool("render_pdf", { html: "<p>Stale</p>", outPath: "stale.pdf" }, undefined, context)).structuredContent)
+      .toMatchObject({ errorCode: "STALE_SCOPE" });
+    expect(published).toBe(1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

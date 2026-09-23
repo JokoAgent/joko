@@ -91,12 +91,18 @@ it("advertises the document tool from the production application composition", a
   const root = await mkdtemp(join(tmpdir(), "joko-document-app-"));
   const workspace = join(root, "workspace");
   const dataDirectory = join(root, "data");
+  const browserExecutable = process.env.JOKO_BROWSER_EXECUTABLE;
+  const electronExecutable = process.env.JOKO_PDF_ELECTRON_TEST_EXECUTABLE;
+  const hasRenderer = Boolean(browserExecutable || electronExecutable);
   await mkdir(workspace);
   const config: OrchestratorConfig = {
     host: "127.0.0.1", port: 0, internalPort: 4317, publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4317",
     dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"), allowInsecureLoopback: true, allowInsecureLan: false,
     lanDiscoveryEnabled: false, codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
     workspace: { id: "workspace", root: workspace, displayName: "Document fixture", trusted: true },
+    ...(browserExecutable ? { browser: { executablePath: browserExecutable, headless: true } } : {}),
+    ...(electronExecutable ? { pdfRendererHost: { executablePath: electronExecutable,
+      ...(process.env.JOKO_PDF_ELECTRON_TEST_APP ? { appPath: process.env.JOKO_PDF_ELECTRON_TEST_APP } : {}) } } : {}),
     artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web"), corsOrigins: []
   };
   const application = await createOrchestratorApplication(config);
@@ -117,7 +123,9 @@ it("advertises the document tool from the production application composition", a
       targetId: target.id,
       expectedPiGeneration: 1
     });
-    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
+    expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(hasRenderer
+      ? ["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet", "render_pdf"]
+      : ["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
     const response = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -211,6 +219,41 @@ it("advertises the document tool from the production application composition", a
       numPages: 1, pagesInspected: 1, inspectedThrough: 1, verdict: "ok", blankPages: [],
       pages: [{ page: 1, paper: "A4", textPreview: "Visible report", blank: false }]
     } } });
+    if (hasRenderer) {
+      const renderCall = async (html: string, overwrite = false) => {
+        const response = await fetch(`${url}/internal/mcp`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${bridge.mcpBridge.token}`, "content-type": "application/json", "x-joko-pi-generation": "1" },
+          body: JSON.stringify({ requestId: randomUUID(), sessionId: "document-task", targetId: target.id, generation: 1,
+            serverId: "joko-document-tools", toolName: "render_pdf",
+            arguments: { html, outPath: "documents/rendered.pdf", theme: "navy", overwrite } })
+        });
+        expect(response.ok).toBe(true);
+        return await response.json() as { isError: boolean; details: { mcpStructuredContent: Record<string, unknown> } };
+      };
+      expect(await renderCall("<h1>PDF production chain</h1><p>Rendered text.</p>")).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+        format: "pdf", relativePath: join("documents", "rendered.pdf"), templateApplied: true, pageSize: "A4"
+      } } });
+      const renderedPath = join(workspace, "documents", "rendered.pdf");
+      const renderedBytes = await readFile(renderedPath);
+      expect(renderedBytes.subarray(0, 5).toString()).toBe("%PDF-");
+      expect(await renderCall("<h1>Rejected replacement</h1>")).toMatchObject({ isError: true,
+        details: { mcpStructuredContent: { errorCode: "FILE_EXISTS" } } });
+      expect(await readFile(renderedPath)).toEqual(renderedBytes);
+      expect(await renderCall("<h1>Replacement PDF</h1>", true)).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { format: "pdf" } } });
+      expect(await readFile(renderedPath)).not.toEqual(renderedBytes);
+      const inspectRendered = await fetch(`${url}/internal/mcp`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${bridge.mcpBridge.token}`, "content-type": "application/json", "x-joko-pi-generation": "1" },
+        body: JSON.stringify({ requestId: randomUUID(), sessionId: "document-task", targetId: target.id, generation: 1,
+          serverId: "joko-document-tools", toolName: "inspect_pdf", arguments: { path: "documents/rendered.pdf" } })
+      });
+      expect(inspectRendered.ok).toBe(true);
+      expect(await inspectRendered.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+        numPages: 1, verdict: "ok", blankPages: [], pages: [{ page: 1, paper: "A4", textPreview: "Replacement PDF", blank: false }]
+      } } });
+    }
     bridge.revoke();
   } finally {
     await internal?.close();

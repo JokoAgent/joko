@@ -118,6 +118,8 @@ import {
 } from "./mobile-push.js";
 import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
+import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
+import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
@@ -798,7 +800,10 @@ export async function createOrchestratorApplication(
     new RemoteHostToolBridgeProvider({ store, registry: remoteHosts, outputRedactor: credentials })
   );
   const unregisterDocumentTools = mcpRouter.registerBridgeToolProvider(
-    new DocumentToolBridgeProvider({ store })
+    new DocumentToolBridgeProvider({ store,
+      ...(config.pdfRendererHost
+        ? { pdfRenderer: new ElectronDocumentPdfRenderer(config.pdfRendererHost.executablePath, config.pdfRendererHost.appPath) }
+        : config.browser ? { pdfRenderer: new ChromiumDocumentPdfRenderer(config.browser.executablePath) } : {}) })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
     store,

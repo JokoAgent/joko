@@ -1,4 +1,4 @@
-import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, type DocsThemeName } from "@joko/tool-document";
+import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, renderPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PdfRenderError, PdfResourceError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, PDF_PAGE_SIZES, RENDER_PDF_MAX_HTML_BYTES, type DocsThemeName, type PdfRenderer } from "@joko/tool-document";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
@@ -146,6 +146,34 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
     additionalProperties: false
   },
   requiresPermission: false
+}, {
+  serverId: DOCUMENT_TOOL_PROVIDER_ID,
+  name: "render_pdf",
+  runtimeName: "render_pdf",
+  description: "Render task-local HTML to PDF with an isolated offline Chromium job. Supply exactly one of htmlPath or html. Task-local relative styles, images and fonts are snapshotted before rendering. Report styling is added to unstyled HTML unless template is none. Existing files require overwrite: true. Inspect the PDF before delivery.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      htmlPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .html file path; exclusive with html." },
+      html: { type: "string", minLength: 1, maxLength: RENDER_PDF_MAX_HTML_BYTES, description: "Inline HTML, at most 16 MiB UTF-8; exclusive with htmlPath." },
+      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .pdf output path." },
+      pageSize: { type: "string", enum: [...PDF_PAGE_SIZES], default: "A4" },
+      landscape: { type: "boolean", default: false },
+      printBackground: { type: "boolean", default: true },
+      margins: { type: "object", properties: {
+        top: { type: "number", minimum: 0, maximum: 5, default: 0.4 },
+        bottom: { type: "number", minimum: 0, maximum: 5, default: 0.4 },
+        left: { type: "number", minimum: 0, maximum: 5, default: 0.4 },
+        right: { type: "number", minimum: 0, maximum: 5, default: 0.4 }
+      }, additionalProperties: false },
+      template: { type: "string", enum: ["auto", "report", "none"], default: "auto" },
+      theme: { type: "string", enum: [...DOCS_THEME_NAMES], default: "light" },
+      overwrite: { type: "boolean", default: false }
+    },
+    required: ["outPath"],
+    additionalProperties: false
+  },
+  requiresPermission: true
 }]);
 
 export interface DocumentToolPublisher {
@@ -157,7 +185,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   readonly id = DOCUMENT_TOOL_PROVIDER_ID;
   readonly generation = 1;
   readonly available = true;
-  readonly tools = TOOLS;
+  readonly tools: readonly McpToolDescriptor[];
   readonly configurablePolicy = Object.freeze({
     id: "joko-document-tools-policy",
     displayName: "Document tools",
@@ -166,13 +194,17 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   });
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
   readonly #publish: DocumentToolPublisher;
+  readonly #pdfRenderer: PdfRenderer | undefined;
 
   constructor(options: {
     readonly store: Pick<OperationalStore, "getSession" | "getTarget">;
     readonly publish?: DocumentToolPublisher;
+    readonly pdfRenderer?: PdfRenderer;
   }) {
     this.#store = options.store;
     this.#publish = options.publish ?? publishDocumentOutput;
+    this.#pdfRenderer = options.pdfRenderer;
+    this.tools = options.pdfRenderer ? TOOLS : TOOLS.filter(tool => tool.name !== "render_pdf");
   }
 
   includeForTarget(targetId: string): boolean {
@@ -187,12 +219,14 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   async callTool(name: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx" && name !== "read_sheet" && name !== "inspect_pdf") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
+      if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx" && name !== "read_sheet" && name !== "inspect_pdf" && name !== "render_pdf") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
+      if (name === "render_pdf" && !this.#pdfRenderer) throw new DocumentToolError("UNKNOWN_TOOL", "PDF rendering is unavailable in this runtime.");
       const root = this.#requireRoot(context);
       if (name === "make_pptx") return await this.#makePptx(args, root, signal, context);
       if (name === "make_xlsx") return await this.#makeXlsx(args, root, signal, context);
       if (name === "read_sheet") return await this.#readSheet(args, root, signal, context);
       if (name === "inspect_pdf") return await this.#inspectPdf(args, root, signal, context);
+      if (name === "render_pdf") return await this.#renderPdf(args, root, signal, context);
       onlyKeys(args, ["markdown", "outPath", "title", "subtitle", "cover", "theme", "overwrite"]);
       const markdown = boundedString(args["markdown"], 4 * 1024 * 1024, false, "markdown");
       const outPath = boundedString(args["outPath"], 4_096, false, "outPath");
@@ -226,7 +260,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       }, false);
     } catch (error) {
       if (signal?.aborted) throw error;
-      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof DocumentToolError) {
+      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof PdfRenderError || error instanceof PdfResourceError || error instanceof DocumentToolError) {
         return response({ errorCode: error.code, message: error.message,
           ...(error instanceof SheetReadError && error.available ? { available: error.available } : {}) }, true);
       }
@@ -297,6 +331,26 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     signal?.throwIfAborted();
     if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
     return response({ ...result }, false);
+  }
+
+  async #renderPdf(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
+    onlyKeys(args, ["htmlPath", "html", "outPath", "pageSize", "landscape", "printBackground", "margins", "template", "theme", "overwrite"]);
+    const outPath = boundedString(args["outPath"], 4_096, false, "outPath");
+    if (!outPath.toLowerCase().endsWith(".pdf")) throw new DocumentToolError("INVALID_EXTENSION", "Output filename must end in .pdf.");
+    const overwrite = optionalBoolean(args["overwrite"], "overwrite") ?? false;
+    const { outPath: _outPath, overwrite: _overwrite, ...content } = args;
+    const rendered = await renderPdf(content, root, this.#pdfRenderer!, signal);
+    signal?.throwIfAborted();
+    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    const output = await this.#publish({ root, outPath, bytes: rendered.buffer, overwrite, ...(signal ? { signal } : {}) });
+    signal?.throwIfAborted();
+    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    return response({ path: output.path, relativePath: output.relativePath, bytes: output.bytes,
+      format: "pdf", pageSize: rendered.pageSize, landscape: rendered.landscape,
+      fontsReady: rendered.fontsReady, template: rendered.template, theme: rendered.theme,
+      templateApplied: rendered.templateApplied, ...(rendered.title ? { title: rendered.title } : {}),
+      ...(rendered.warning ? { warning: rendered.warning } : {}),
+      nextStep: "Call inspect_pdf on this path to verify page count, size, text and blank pages before delivery." }, false);
   }
 
   #requireRoot(context: BridgeToolCallContext): string {
