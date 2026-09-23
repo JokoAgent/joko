@@ -230,6 +230,13 @@ export interface TargetDraft {
   readonly createIfMissing: boolean;
 }
 
+export interface ProjectDirectoryListingView {
+  readonly path: string;
+  readonly parentPath: string;
+  readonly directories: readonly { readonly name: string; readonly path: string }[];
+  readonly truncated: boolean;
+}
+
 export interface ModelView {
   readonly backendId: string;
   readonly providerId: string;
@@ -5262,6 +5269,7 @@ export interface OperationApi {
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
   createTarget(draft: TargetDraft): Promise<string>;
+  listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
   prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {
     readonly name?: string;

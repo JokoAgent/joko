@@ -835,6 +835,7 @@ import type {
   TelegramMessagingConfigurationView,
   VoiceInputTranscriptionProtocolView,
   TargetDraft,
+  ProjectDirectoryListingView,
   TargetWorktreeProbeView,
   WorktreeSourceView,
   WorkspaceView
@@ -1872,6 +1873,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator completed project creation without a typed project result.");
     }
     return payload.value.targetId;
+  }
+
+  async listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView> {
+    const scope = this.captureActionScope(signal);
+    const listing = await createClient(TargetService, scope.transport).listProjectDirectories({ path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (listing.path === "" || listing.parentPath === "" || listing.directories.length > 200
+      || listing.directories.some((entry) => entry.name === "" || entry.path === "")) {
+      throw new GatewayError("Orchestrator returned an invalid project directory listing.");
+    }
+    return { path: listing.path, parentPath: listing.parentPath,
+      directories: listing.directories.map((entry) => ({ name: entry.name, path: entry.path })), truncated: listing.truncated };
   }
 
   async prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void> {

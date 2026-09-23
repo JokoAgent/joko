@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { listProjectDirectories } from "./project-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import {
@@ -2062,6 +2063,13 @@ export function createConnectServices(application: OrchestratorApplication): Con
     getTarget: (request, context) => {
       authenticate(context);
       return { target: toProtoTarget(dependencies.store.getTarget(request.targetId)) };
+    },
+    listProjectDirectories: async (request, context) => {
+      const connection = authenticate(context);
+      const listing = await listProjectDirectories(request.path, context.signal);
+      context.signal.throwIfAborted();
+      dependencies.connections.fence(connection);
+      return { ...listing, directories: listing.directories.map((entry) => ({ name: entry.name, path: entry.path })) };
     },
     prepareTargetWorkspace: async (request, context) => {
       const connection = authenticate(context);

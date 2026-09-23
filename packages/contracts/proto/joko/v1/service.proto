@@ -81,6 +81,8 @@ service BackendService {
 service TargetService {
   rpc ListTargets(ListTargetsRequest) returns (ListTargetsResponse);
   rpc GetTarget(GetTargetRequest) returns (GetTargetResponse);
+  // Browses directories on the connected Orchestrator node, never the client.
+  rpc ListProjectDirectories(ListProjectDirectoriesRequest) returns (ListProjectDirectoriesResponse);
   // Revalidates and registers the exact durable workspace binding for a
   // Target. Clients use the returned revision-fenced result before creating a
   // task; the service never substitutes another Target or workspace.
@@ -789,6 +791,23 @@ message GetTargetRequest {
 
 message GetTargetResponse {
   Target target = 1;
+}
+
+message ListProjectDirectoriesRequest {
+  // Empty starts at the service account's home; otherwise an absolute service-node path.
+  string path = 1;
+}
+
+message ProjectDirectoryEntry {
+  string name = 1;
+  string path = 2;
+}
+
+message ListProjectDirectoriesResponse {
+  string path = 1;
+  string parent_path = 2;
+  repeated ProjectDirectoryEntry directories = 3;
+  bool truncated = 4;
 }
 
 message ListSessionsRequest {
