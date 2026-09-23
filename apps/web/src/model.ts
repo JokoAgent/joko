@@ -303,6 +303,17 @@ export interface RemoteHostView {
   readonly revision: bigint;
 }
 
+export interface RemoteHostDirectoryListingView {
+  readonly targetId: string;
+  readonly hostId: string;
+  readonly targetRevision: bigint;
+  readonly hostRevision: bigint;
+  readonly path: string;
+  readonly parentPath: string;
+  readonly directories: readonly { readonly name: string; readonly path: string }[];
+  readonly truncated: boolean;
+}
+
 export interface SshKeyView {
   readonly id: string;
   readonly name: string;
@@ -5754,6 +5765,7 @@ export interface OperationApi {
   syncContactsNow(peerId?: string, signal?: AbortSignal): Promise<ContactSyncStatusView>;
   getRemoteHostCapabilities(targetId: string, signal?: AbortSignal): Promise<RemoteHostCapabilitiesView>;
   listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]>;
+  listRemoteHostDirectories(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, path: string, signal?: AbortSignal): Promise<RemoteHostDirectoryListingView>;
   watchRemoteHosts(targetId: string, signal?: AbortSignal): AsyncIterable<readonly RemoteHostView[]>;
   refreshRemoteHostCatalog(targetId: string): Promise<readonly RemoteHostView[]>;
   createRemoteHost(targetId: string, draft: RemoteHostDraft): Promise<RemoteHostView>;

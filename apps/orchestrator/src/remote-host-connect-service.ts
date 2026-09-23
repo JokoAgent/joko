@@ -23,6 +23,7 @@ import {
   RemoteHostRegistry,
   type RemoteHostRegistryChange
 } from "./remote-host-registry.js";
+import { listRemoteHostDirectories, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 
 const DEFAULT_PAGE_SIZE = 100;
 const MAXIMUM_PAGE_SIZE = 500;
@@ -151,6 +152,45 @@ export function createRemoteHostConnectService(
         publicHostAlias(request.hostId)
       );
       return create(contract.GetRemoteHostResponseSchema, { host: toProtoRemoteHost(host) });
+    }),
+
+    listRemoteHostDirectories: async (request, context) => remoteHostRpc(async () => {
+      authenticate(context);
+      const authority = requireRegistry(registry);
+      const targetId = publicIdentity(request.targetId, "target_id");
+      const hostId = publicHostAlias(request.hostId);
+      const expectedTargetRevision = fromProtoRevision(request.expectedTargetRevision, "expected_target_revision");
+      const expectedHostRevision = fromProtoRevision(request.expectedHostRevision, "expected_host_revision");
+      validateRemoteHostDirectoryPath(request.path);
+      if (authority.targetRevision(targetId) !== expectedTargetRevision) {
+        throw new ConnectError("Target changed; reload it and retry.", Code.Aborted);
+      }
+      const host = authority.get(targetId, hostId);
+      if (host.revision !== expectedHostRevision) throw new ConnectError("Remote Host changed; reload it and retry.", Code.Aborted);
+      if (host.status.state !== "ready" || host.trust === undefined) {
+        throw new ConnectError("The selected SSH Host is not ready for directory browsing.", Code.FailedPrecondition);
+      }
+      const transport = await authority.captureTransportAuthority(targetId, hostId, context.signal);
+      if (transport.hostRevision !== expectedHostRevision || transport.lease.files === undefined) {
+        throw new ConnectError("SSH Host file browsing is unavailable.", Code.FailedPrecondition);
+      }
+      const assertBrowseCurrent = (): void => {
+        try { transport.assertCurrent(); }
+        catch { throw new ConnectError("SSH Host changed while browsing; reload it and retry.", Code.Aborted); }
+      };
+      const listing = await listRemoteHostDirectories(transport.lease.files, request.path, context.signal, assertBrowseCurrent);
+      context.signal.throwIfAborted();
+      assertBrowseCurrent();
+      if (authority.targetRevision(targetId) !== expectedTargetRevision) {
+        throw new ConnectError("Target changed; reload it and retry.", Code.Aborted);
+      }
+      authenticate(context);
+      return create(contract.ListRemoteHostDirectoriesResponseSchema, {
+        targetId, hostId, targetRevision: toProtoRevision(expectedTargetRevision),
+        hostRevision: toProtoRevision(expectedHostRevision), path: listing.path, parentPath: listing.parentPath,
+        directories: listing.directories.map((entry) => ({ name: entry.name, path: entry.path })),
+        truncated: listing.truncated
+      });
     }),
 
     watchRemoteHosts: async function* (request, context) {

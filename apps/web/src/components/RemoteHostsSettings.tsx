@@ -8,6 +8,7 @@ import type {
   RemoteBackendRuntimeInstallEventView,
   RemoteBackendRuntimeView,
   RemoteHostCapabilitiesView,
+  RemoteHostDirectoryListingView,
   RemoteHostDraft,
   RemoteHostView
 } from "../model.js";
@@ -30,7 +31,7 @@ const NO_CAPABILITIES: RemoteHostCapabilitiesView = {
   backendRuntimeSetup: false
 };
 
-type RemoteHostApi = KeyApi & Pick<AppController, "getRemoteHostCapabilities" | "watchRemoteHosts" | "refreshRemoteHostCatalog" | "createRemoteHost" | "updateRemoteHost" | "deleteRemoteHost" | "connectRemoteHost" | "disconnectRemoteHost" | "testRemoteHostConnection" | "clearRemoteHostTrust" | "probeRemoteBackendRuntime" | "installRemoteBackendRuntime" | "uninstallRemoteBackendRuntime" | "saveCredential" | "updateTarget">;
+type RemoteHostApi = KeyApi & Pick<AppController, "getRemoteHostCapabilities" | "watchRemoteHosts" | "listRemoteHostDirectories" | "refreshRemoteHostCatalog" | "createRemoteHost" | "updateRemoteHost" | "deleteRemoteHost" | "connectRemoteHost" | "disconnectRemoteHost" | "testRemoteHostConnection" | "clearRemoteHostTrust" | "probeRemoteBackendRuntime" | "installRemoteBackendRuntime" | "uninstallRemoteBackendRuntime" | "saveCredential" | "updateTarget">;
 interface CatalogScope {
   readonly id: string;
   readonly abort: AbortController;
@@ -81,6 +82,7 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
     getSshKeyInstallCommand: controller.getSshKeyInstallCommand,
     getRemoteHostCapabilities: controller.getRemoteHostCapabilities,
     watchRemoteHosts: controller.watchRemoteHosts,
+    listRemoteHostDirectories: controller.listRemoteHostDirectories,
     refreshRemoteHostCatalog: controller.refreshRemoteHostCatalog,
     createRemoteHost: controller.createRemoteHost,
     updateRemoteHost: controller.updateRemoteHost,
@@ -94,7 +96,7 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
     uninstallRemoteBackendRuntime: controller.uninstallRemoteBackendRuntime,
     saveCredential: controller.saveCredential,
     updateTarget: controller.updateTarget
-  }), [controller.listSshKeys, controller.generateSshKey, controller.addSshKeyToAgent, controller.readSshPublicKey, controller.getSshKeyInstallCommand, controller.getRemoteHostCapabilities, controller.watchRemoteHosts, controller.refreshRemoteHostCatalog, controller.createRemoteHost, controller.updateRemoteHost, controller.deleteRemoteHost, controller.connectRemoteHost, controller.disconnectRemoteHost, controller.testRemoteHostConnection, controller.clearRemoteHostTrust, controller.probeRemoteBackendRuntime, controller.installRemoteBackendRuntime, controller.uninstallRemoteBackendRuntime, controller.saveCredential, controller.updateTarget]);
+  }), [controller.listSshKeys, controller.generateSshKey, controller.addSshKeyToAgent, controller.readSshPublicKey, controller.getSshKeyInstallCommand, controller.getRemoteHostCapabilities, controller.watchRemoteHosts, controller.listRemoteHostDirectories, controller.refreshRemoteHostCatalog, controller.createRemoteHost, controller.updateRemoteHost, controller.deleteRemoteHost, controller.connectRemoteHost, controller.disconnectRemoteHost, controller.testRemoteHostConnection, controller.clearRemoteHostTrust, controller.probeRemoteBackendRuntime, controller.installRemoteBackendRuntime, controller.uninstallRemoteBackendRuntime, controller.saveCredential, controller.updateTarget]);
   const scope = useMemo<CatalogScope>(() => ({ id: randomUuid(), abort: new AbortController(), pending: new Set() }), [api, targetId, occurrence, controller.state.connectionState, controller.state.route, controller.state.navigationRevision]);
   const emptyCatalog = (): CatalogState => ({ scope, hosts: [], capabilities: NO_CAPABILITIES, capabilitiesReady: false, streamReady: false, loading: targetId !== "" && controller.state.connectionState === "connected" });
   const [catalog, setCatalog] = useState<CatalogState>(emptyCatalog);
@@ -206,6 +208,8 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
         hosts={hosts}
         capabilities={capabilities}
         ready={ready}
+        scope={scope}
+        isCurrent={isCurrent}
         busy={scope.pending.has("workspace")}
         perform={perform}
         drafts={drafts}
@@ -453,12 +457,22 @@ function RemoteBackendRuntimeSetup({ api, scope, target, host, ready, t }: {
   </div>;
 }
 
-function RemoteWorkspaceBinding({ api, target, hosts, capabilities, ready, busy, perform, drafts, t }: {
+interface RemoteDirectoryBrowserState {
+  readonly owner: string;
+  readonly requestedPath: string;
+  readonly status: "loading" | "ready" | "error";
+  readonly listing?: RemoteHostDirectoryListingView;
+  readonly error?: string;
+}
+
+function RemoteWorkspaceBinding({ api, target, hosts, capabilities, ready, scope, isCurrent, busy, perform, drafts, t }: {
   readonly api: RemoteHostApi;
   readonly target: AppSnapshot["targets"][number];
   readonly hosts: readonly RemoteHostView[];
   readonly capabilities: RemoteHostCapabilitiesView;
   readonly ready: boolean;
+  readonly scope: CatalogScope;
+  readonly isCurrent: (owner?: CatalogScope) => boolean;
   readonly busy: boolean;
   readonly perform: PerformAction;
   readonly drafts: Map<string, BindingDraft>;
@@ -469,6 +483,19 @@ function RemoteWorkspaceBinding({ api, target, hosts, capabilities, ready, busy,
   const [draft, setDraft] = useState<BindingDraft>(() => drafts.get(target.id) ?? baseline());
   const updateDraft = (next: BindingDraft): void => { drafts.set(target.id, next); setDraft(next); };
   const { hostId, workspaceRoot } = draft;
+  const selectedHost = bindable.find(host => host.id === hostId);
+  const browserOwner = `${scope.id}:${target.id}:${target.revision}:${hostId}:${selectedHost?.revision ?? ""}`;
+  const browserOwnerRef = useRef(browserOwner); browserOwnerRef.current = browserOwner;
+  const browserRef = useRef<HTMLDivElement>(null);
+  const browserAbortRef = useRef<AbortController | undefined>(undefined);
+  const browserGenerationRef = useRef(0);
+  const [browser, setBrowser] = useState<RemoteDirectoryBrowserState>();
+  useEffect(() => {
+    browserGenerationRef.current += 1;
+    browserAbortRef.current?.abort();
+    setBrowser(undefined);
+    return () => { browserGenerationRef.current += 1; browserAbortRef.current?.abort(); };
+  }, [browserOwner]);
   useEffect(() => {
     const applied = draft.submitted !== undefined && target.revision !== draft.baseRevision && (draft.submitted.kind === "serviceNode"
       ? target.remoteWorkspace === undefined
@@ -479,11 +506,42 @@ function RemoteWorkspaceBinding({ api, target, hosts, capabilities, ready, busy,
   const transportsReady = capabilities.processStreaming && capabilities.fileTransfer;
   const conflict = draft.dirty && target.revision !== draft.baseRevision;
   const selectedReady = bindable.some(host => host.id === hostId);
+  const closeBrowser = (): void => {
+    browserGenerationRef.current += 1;
+    browserAbortRef.current?.abort();
+    setBrowser(undefined);
+  };
+  const browsePath = (path: string): void => {
+    if (!isCurrent(scope) || !ready || busy || conflict || !transportsReady || selectedHost === undefined) return;
+    const ownerDocument = browserRef.current?.ownerDocument;
+    if (ownerDocument === undefined || !browserRef.current?.isConnected) return;
+    browserAbortRef.current?.abort();
+    const abort = new AbortController();
+    browserAbortRef.current = abort;
+    const generation = ++browserGenerationRef.current;
+    const owner = browserOwner;
+    const expectedHostRevision = selectedHost.revision;
+    setBrowser({ owner, requestedPath: path, status: "loading" });
+    const ownsResult = (): boolean => browserGenerationRef.current === generation && !abort.signal.aborted
+      && isCurrent(scope) && browserOwnerRef.current === owner && browserRef.current?.isConnected === true
+      && browserRef.current.ownerDocument === ownerDocument && ownerDocument.defaultView !== null
+      && !ownerDocument.defaultView.closed;
+    void api.listRemoteHostDirectories(target.id, selectedHost.id, target.revision, expectedHostRevision, path, abort.signal).then(listing => {
+      if (ownsResult() && listing.targetId === target.id && listing.hostId === selectedHost.id
+        && listing.targetRevision === target.revision && listing.hostRevision === expectedHostRevision) {
+        setBrowser({ owner, requestedPath: path, status: "ready", listing });
+      }
+    }).catch((cause: unknown) => {
+      if (ownsResult()) setBrowser({ owner, requestedPath: path, status: "error",
+        error: cause instanceof Error ? cause.message : t("settings.remoteHosts.browseFailed") });
+    });
+  };
+  const visibleBrowser = browser?.owner === browserOwner ? browser : undefined;
   const submit = (workspaceLocation: NonNullable<BindingDraft["submitted"]>): void => {
     if (busy || conflict) return;
     perform("workspace", () => api.updateTarget(target.id, { workspaceLocation }, draft.baseRevision), () => updateDraft({ ...draft, dirty: true, submitted: workspaceLocation }));
   };
-  return <div className="remote-workspace-binding">
+  return <div ref={browserRef} className="remote-workspace-binding">
     <div className="remote-workspace-binding__heading">
       <span><strong>{t("settings.remoteHosts.workspace")}</strong><small>{target.remoteWorkspace === undefined ? t("settings.remoteHosts.serviceNodeActive") : t("settings.remoteHosts.remoteActive")}</small></span>
       {target.remoteWorkspace !== undefined && <Button disabled={!ready || busy || conflict} onClick={() => submit({ kind: "serviceNode" })}>{t("settings.remoteHosts.useServiceNode")}</Button>}
@@ -491,8 +549,32 @@ function RemoteWorkspaceBinding({ api, target, hosts, capabilities, ready, busy,
     <div className="remote-workspace-binding__fields">
       <label className="field"><span>{t("settings.remoteHosts.host")}</span><SelectControl disabled={busy} value={hostId} onChange={(event) => updateDraft({ ...draft, hostId: event.target.value, dirty: true, submitted: undefined })}><option value="">{t("settings.remoteHosts.selectHost")}</option>{hostId !== "" && !selectedReady && <option value={hostId} disabled>{hostId} · {t("settings.remoteHosts.hostUnavailable")}</option>}{bindable.map((host) => <option key={host.id} value={host.id}>{host.id}</option>)}</SelectControl></label>
       <label className="field"><span>{t("settings.remoteHosts.workspaceRoot")}</span><input disabled={busy} value={workspaceRoot} onChange={(event) => updateDraft({ ...draft, workspaceRoot: event.target.value, dirty: true, submitted: undefined })} placeholder="/home/user/project" /></label>
+      <Button disabled={!ready || busy || conflict || !transportsReady || !selectedReady} onClick={() => browsePath(workspaceRoot.trim().startsWith("/") ? workspaceRoot.trim() : "")}>{t("settings.remoteHosts.browse")}</Button>
       <Button tone="primary" disabled={!ready || busy || conflict || !transportsReady || !selectedReady || workspaceRoot.trim() === ""} onClick={() => submit({ kind: "remote", hostId, workspaceRoot: workspaceRoot.trim() })}><Link2 aria-hidden="true" />{t("settings.remoteHosts.bind")}</Button>
     </div>
+    {visibleBrowser !== undefined && <div className="remote-workspace-binding__browser">
+      <p>{t("settings.remoteHosts.browseBody")}</p>
+      <strong>{visibleBrowser.listing?.path || visibleBrowser.requestedPath || t("settings.remoteHosts.browseHome")}</strong>
+      {!ready ? <p role="alert">{t("settings.remoteHosts.browseDisconnected")}</p>
+        : visibleBrowser.status === "loading" ? <p role="status">{t("common.loading")}</p>
+        : visibleBrowser.status === "error" ? <p role="alert">{visibleBrowser.error}</p>
+        : <>
+          {visibleBrowser.listing?.directories.length === 0 && <p role="status">{t("settings.remoteHosts.browseEmpty")}</p>}
+          <ul className="remote-workspace-binding__directories">{visibleBrowser.listing?.directories.map(entry => <li key={entry.path}><button type="button" onClick={() => browsePath(entry.path)}>{entry.name}</button></li>)}</ul>
+          {visibleBrowser.listing?.truncated && <p role="status">{t("settings.remoteHosts.browseTruncated")}</p>}
+        </>}
+      <div className="remote-workspace-binding__browser-actions">
+        <Button onClick={closeBrowser}>{t("common.cancel")}</Button>
+        <Button disabled={!ready || visibleBrowser.status === "loading"} onClick={() => browsePath("")}>{t("settings.remoteHosts.browseHome")}</Button>
+        {visibleBrowser.listing !== undefined && <Button disabled={!ready || visibleBrowser.status === "loading" || visibleBrowser.listing.parentPath === visibleBrowser.listing.path} onClick={() => browsePath(visibleBrowser.listing!.parentPath)}>{t("settings.remoteHosts.browseParent")}</Button>}
+        {visibleBrowser.status === "error" && <Button disabled={!ready} onClick={() => browsePath(visibleBrowser.requestedPath)}>{t("common.retry")}</Button>}
+        <Button tone="primary" disabled={!ready || visibleBrowser.status !== "ready" || visibleBrowser.listing === undefined || conflict || busy} onClick={() => {
+          if (browserOwnerRef.current !== visibleBrowser.owner || !isCurrent(scope) || visibleBrowser.listing === undefined) return;
+          updateDraft({ ...draft, workspaceRoot: visibleBrowser.listing.path, dirty: true, submitted: undefined });
+          closeBrowser();
+        }}>{t("settings.remoteHosts.browseChoose")}</Button>
+      </div>
+    </div>}
     {conflict && <p role="status">{t("settings.remoteHosts.projectChanged")} <Button disabled={busy} onClick={() => updateDraft(baseline())}>{t("settings.remoteHosts.reload")}</Button></p>}
     {!transportsReady && <p className="muted">{t("settings.remoteHosts.transportUnavailable")}</p>}
   </div>;

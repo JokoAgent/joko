@@ -106,6 +106,7 @@ service RemoteHostService {
   rpc GetRemoteHostCapabilities(GetRemoteHostCapabilitiesRequest) returns (GetRemoteHostCapabilitiesResponse);
   rpc ListRemoteHosts(ListRemoteHostsRequest) returns (ListRemoteHostsResponse);
   rpc GetRemoteHost(GetRemoteHostRequest) returns (GetRemoteHostResponse);
+  rpc ListRemoteHostDirectories(ListRemoteHostDirectoriesRequest) returns (ListRemoteHostDirectoriesResponse);
   // Emits one authoritative initial catalog snapshot, then ordered changes for
   // this authenticated owner and exact target until the stream ends.
   rpc WatchRemoteHosts(WatchRemoteHostsRequest) returns (stream WatchRemoteHostsResponse);
@@ -259,6 +260,31 @@ message GetRemoteHostRequest {
 
 message GetRemoteHostResponse {
   RemoteHost host = 1;
+}
+
+message ListRemoteHostDirectoriesRequest {
+  string target_id = 1;
+  string host_id = 2;
+  Revision expected_target_revision = 3;
+  Revision expected_host_revision = 4;
+  // Empty resolves the SSH user's home; otherwise an absolute POSIX path.
+  string path = 5;
+}
+
+message RemoteHostDirectoryEntry {
+  string name = 1;
+  string path = 2;
+}
+
+message ListRemoteHostDirectoriesResponse {
+  string target_id = 1;
+  string host_id = 2;
+  Revision target_revision = 3;
+  Revision host_revision = 4;
+  string path = 5;
+  string parent_path = 6;
+  repeated RemoteHostDirectoryEntry directories = 7;
+  bool truncated = 8;
 }
 
 message WatchRemoteHostsRequest {

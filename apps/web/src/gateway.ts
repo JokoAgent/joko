@@ -693,6 +693,7 @@ import type {
   RemoteBackendRuntimeInstallEventView,
   RemoteBackendRuntimeView,
   RemoteHostCapabilitiesView,
+  RemoteHostDirectoryListingView,
   RemoteHostDraft,
   RemoteHostView,
   ScheduleView,
@@ -7515,6 +7516,35 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       remoteHostRpcOptions(this.#abort?.signal)
     );
     return requireRemoteHost(response.host);
+  }
+
+  async listRemoteHostDirectories(
+    targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint,
+    path: string, signal?: AbortSignal
+  ): Promise<RemoteHostDirectoryListingView> {
+    if (targetId.trim() === "" || hostId.trim() === "" || expectedTargetRevision < 1n || expectedHostRevision < 1n
+      || (path !== "" && !path.startsWith("/"))) {
+      throw new GatewayError("A current Target, SSH Host, and absolute directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(RemoteHostService, scope.transport).listRemoteHostDirectories({
+      targetId, hostId,
+      expectedTargetRevision: { value: expectedTargetRevision },
+      expectedHostRevision: { value: expectedHostRevision }, path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.targetId !== targetId || response.hostId !== hostId
+      || response.targetRevision?.value !== expectedTargetRevision
+      || response.hostRevision?.value !== expectedHostRevision
+      || !response.path.startsWith("/") || !response.parentPath.startsWith("/")
+      || response.directories.length > 200
+      || response.directories.some((entry) => entry.name === "" || !entry.path.startsWith("/"))) {
+      throw new GatewayError("Orchestrator returned a directory listing for another SSH Host or revision.");
+    }
+    return { targetId, hostId, targetRevision: expectedTargetRevision, hostRevision: expectedHostRevision,
+      path: response.path, parentPath: response.parentPath,
+      directories: response.directories.map((entry) => ({ name: entry.name, path: entry.path })),
+      truncated: response.truncated };
   }
 
   async probeRemoteBackendRuntime(

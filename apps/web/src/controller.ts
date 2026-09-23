@@ -1712,6 +1712,7 @@ export function useAppController(): AppController {
       saveCredential: async (...args: Parameters<OperationApi["saveCredential"]>) => original().saveCredential(...args),
       getRemoteHostCapabilities: async (...args: Parameters<OperationApi["getRemoteHostCapabilities"]>) => original().getRemoteHostCapabilities(...args),
       listRemoteHosts: async (...args: Parameters<OperationApi["listRemoteHosts"]>) => original().listRemoteHosts(...args),
+      listRemoteHostDirectories: async (...args: Parameters<OperationApi["listRemoteHostDirectories"]>) => original().listRemoteHostDirectories(...args),
       watchRemoteHosts: (...args: Parameters<OperationApi["watchRemoteHosts"]>) => original().watchRemoteHosts(...args),
       refreshRemoteHostCatalog: async (...args: Parameters<OperationApi["refreshRemoteHostCatalog"]>) => original().refreshRemoteHostCatalog(...args),
       createRemoteHost: async (...args: Parameters<OperationApi["createRemoteHost"]>) => original().createRemoteHost(...args),

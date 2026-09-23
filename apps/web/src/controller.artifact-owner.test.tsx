@@ -78,7 +78,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const loginCalls = new Map<string, Record<typeof loginMethods[number], ReturnType<typeof vi.fn>>>();
   const sshMethods = ["listSshKeys", "generateSshKey", "addSshKeyToAgent", "readSshPublicKey", "getSshKeyInstallCommand"] as const;
   const sshCalls = new Map<string, Record<typeof sshMethods[number], ReturnType<typeof vi.fn>>>();
-  const remoteMethods = ["getRemoteHostCapabilities", "listRemoteHosts", "refreshRemoteHostCatalog", "createRemoteHost", "updateRemoteHost", "deleteRemoteHost", "connectRemoteHost", "disconnectRemoteHost", "testRemoteHostConnection", "clearRemoteHostTrust", "saveCredential", "saveProvider", "updateTarget"] as const;
+  const remoteMethods = ["getRemoteHostCapabilities", "listRemoteHosts", "listRemoteHostDirectories", "refreshRemoteHostCatalog", "createRemoteHost", "updateRemoteHost", "deleteRemoteHost", "connectRemoteHost", "disconnectRemoteHost", "testRemoteHostConnection", "clearRemoteHostTrust", "saveCredential", "saveProvider", "updateTarget"] as const;
   const remoteCalls = new Map<string, Record<typeof remoteMethods[number], ReturnType<typeof vi.fn>>>();
   const voiceMethods = ["getVoiceInputCapabilities", "startVoiceInput", "appendVoiceAudio", "stopVoiceInput", "cancelVoiceInput", "getVoiceInputSession"] as const;
   const publishSnapshot = new Map<string, (snapshot?: AppSnapshot) => void>();

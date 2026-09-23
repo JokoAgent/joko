@@ -10,6 +10,7 @@ import {
   GetRemoteHostCapabilitiesResponseSchema,
   GetSnapshotResponseSchema,
   ListRemoteHostsResponseSchema,
+  ListRemoteHostDirectoriesResponseSchema,
   OperationState,
   RemoteHostAuthenticationMode,
   InstallRemoteBackendRuntimeResponseSchema,
@@ -34,6 +35,32 @@ import type { AppSnapshot } from "./model.js";
 
 describe("Remote Host gateway", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("uses the generated SSH directory contract and rejects a listing for another Host revision", async () => {
+    const requests: any[] = [];
+    let wrongRevision = false;
+    const gateway = createOrchestratorGateway(
+      { id: "remote-directory", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "auth-key", {}, () => remoteTransport((method, input) => {
+        if (method !== "listRemoteHostDirectories") throw new Error(`Unexpected method: ${method}`);
+        requests.push(input);
+        return create(ListRemoteHostDirectoriesResponseSchema, {
+          targetId: "target-one", hostId: "build-box", targetRevision: { value: 7n },
+          hostRevision: { value: wrongRevision ? 5n : 4n }, path: "/home/joko", parentPath: "/home",
+          directories: [{ name: "project", path: "/home/joko/project" }]
+        });
+      })
+    );
+    await gateway.connect();
+    await expect(gateway.listRemoteHostDirectories("target-one", "build-box", 7n, 4n, "")).resolves.toMatchObject({
+      path: "/home/joko", directories: [{ name: "project", path: "/home/joko/project" }]
+    });
+    expect(requests[0]).toEqual({ targetId: "target-one", hostId: "build-box",
+      expectedTargetRevision: { value: 7n }, expectedHostRevision: { value: 4n }, path: "" });
+    wrongRevision = true;
+    await expect(gateway.listRemoteHostDirectories("target-one", "build-box", 7n, 4n, "")).rejects.toThrow("another SSH Host or revision");
+    gateway.disconnect();
+  });
 
   it.each([undefined, 0n])("rejects a Target projection without a usable revision (%s)", (revision) => {
     expect(() => mapSnapshot(create(SnapshotSchema, { targets: [{

@@ -251,6 +251,7 @@ export function VisualHarness(): JSX.Element {
       readSshPublicKey: remoteHosts.readSshPublicKey,
       getSshKeyInstallCommand: remoteHosts.getSshKeyInstallCommand,
       listRemoteHosts: remoteHosts.listRemoteHosts,
+      listRemoteHostDirectories: remoteHosts.listRemoteHostDirectories,
       watchRemoteHosts: remoteHosts.watchRemoteHosts,
       refreshRemoteHostCatalog: remoteHosts.refreshRemoteHostCatalog,
       createRemoteHost: remoteHosts.createRemoteHost,

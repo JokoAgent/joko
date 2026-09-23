@@ -762,7 +762,8 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
   }
 
   async realpath(path: string, signal?: AbortSignal): Promise<string> {
-    const accepted = absoluteRemotePath(path);
+    // SFTP realpath(".") is the SSH user's home. No other relative path is accepted.
+    const accepted = path === "." ? path : absoluteRemotePath(path);
     return this.withSftp(signal, (sftp) => callbackOperation(
       signal,
       (done) => sftp.realpath(accepted, done),

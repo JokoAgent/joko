@@ -171,6 +171,11 @@ export class RemoteHostRegistry {
     return this.#store.getRemoteHost(this.#ownerId, targetId, id);
   }
 
+  targetRevision(targetId: string): bigint {
+    this.assertOpen();
+    return this.#store.getTarget(targetId).revision;
+  }
+
   async refresh(targetId: string): Promise<RemoteHostRecord[]> {
     this.assertOpen();
     const target = boundedIdentity(targetId, "target ID", 256);

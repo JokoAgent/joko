@@ -286,6 +286,8 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
       atomic: true
     })).resolves.toBeUndefined();
     expect(await files.realpath("/workspace/nested/note.txt")).toBe("/workspace/nested/note.txt");
+    expect(await files.realpath(".")).toBe("/");
+    await expect(files.realpath("workspace/nested")).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
     expect(await files.stat("/workspace/nested/note.txt")).toMatchObject({
       kind: "file",
       size: 14,
@@ -735,7 +737,7 @@ function installMemorySftp(sftp: SFTPWrapper): void {
     handle.byteLength === 4 ? handles.get(handle.readUInt32BE(0)) : undefined;
 
   sftp.on("REALPATH", (requestId: number, value: string) => {
-    const path = memoryPath(value);
+    const path = value === "." ? "/" : memoryPath(value);
     if (path === undefined || !files.has(path)) {
       missing(requestId);
       return;

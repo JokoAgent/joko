@@ -44,6 +44,67 @@ it("uses one authoritative catalog stream and keeps an edited root through snaps
   expect(root.value).toBe("/home/joko/unsaved");
 });
 
+it("browses the selected SSH Host home and child, then only prefills the binding draft", async () => {
+  const fixture = await mountSettings();
+  const ready = { ...host(), revision: 4n, trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready" as const, changedAt: 2 } };
+  const list = vi.mocked(fixture.controller.listRemoteHostDirectories);
+  list.mockImplementation(async (targetId, hostId, targetRevision, hostRevision, path) => ({
+    targetId, hostId, targetRevision, hostRevision,
+    path: path === "" ? "/home/joko" : path,
+    parentPath: path === "/home/joko/project" ? "/home/joko" : "/home",
+    directories: path === "" ? [{ name: "project", path: "/home/joko/project" }] : [],
+    truncated: false
+  }));
+  await fixture.publish([ready]);
+  await act(async () => button("Browse SSH Host").click());
+  expect(list).toHaveBeenCalledWith("target-one", "build-box", 1n, 4n, "", expect.any(AbortSignal));
+  expect(input("Remote workspace path").value).toBe("");
+  await act(async () => button("project").click());
+  expect(document.body.textContent).toContain("/home/joko/project");
+  await act(async () => button("Use this directory").click());
+  expect(input("Remote workspace path").value).toBe("/home/joko/project");
+  expect(fixture.controller.updateTarget).not.toHaveBeenCalled();
+  await act(async () => button("Use remote workspace").click());
+  expect(fixture.controller.updateTarget).toHaveBeenCalledWith("target-one", {
+    workspaceLocation: { kind: "remote", hostId: "build-box", workspaceRoot: "/home/joko/project" }
+  }, 1n);
+});
+
+it("retires a delayed SSH directory listing when the selected Host revision changes", async () => {
+  const fixture = await mountSettings();
+  const ready = { ...host(), revision: 4n, trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready" as const, changedAt: 2 } };
+  const listing = deferred<Awaited<ReturnType<AppController["listRemoteHostDirectories"]>>>();
+  vi.mocked(fixture.controller.listRemoteHostDirectories).mockReturnValue(listing.promise);
+  await fixture.publish([ready]);
+  await act(async () => button("Browse SSH Host").click());
+  const signal = vi.mocked(fixture.controller.listRemoteHostDirectories).mock.calls[0]![5]!;
+  await fixture.publish([{ ...ready, revision: 5n }]);
+  expect(signal.aborted).toBe(true);
+  await act(async () => listing.resolve({ targetId: "target-one", hostId: "build-box", targetRevision: 1n,
+    hostRevision: 4n, path: "/home/joko", parentPath: "/home", directories: [], truncated: false }));
+  expect(document.body.textContent).not.toContain("Use this directory");
+  expect(input("Remote workspace path").value).toBe("");
+});
+
+it("shows SSH browse failure, retries an empty directory, and cancels without changing the draft", async () => {
+  const fixture = await mountSettings();
+  const ready = { ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready" as const, changedAt: 2 } };
+  const list = vi.mocked(fixture.controller.listRemoteHostDirectories);
+  list.mockRejectedValueOnce(new Error("SSH directory unavailable"));
+  list.mockImplementation(async (targetId, hostId, targetRevision, hostRevision) => ({
+    targetId, hostId, targetRevision, hostRevision, path: "/home/joko", parentPath: "/home", directories: [], truncated: false
+  }));
+  await fixture.publish([ready]);
+  await act(async () => button("Browse SSH Host").click());
+  expect(document.body.textContent).toContain("SSH directory unavailable");
+  await act(async () => button("Retry").click());
+  expect(document.body.textContent).toContain("No subdirectories are available here.");
+  await act(async () => button("Cancel").click());
+  expect(document.body.textContent).not.toContain("Use this directory");
+  expect(input("Remote workspace path").value).toBe("");
+  expect(fixture.controller.updateTarget).not.toHaveBeenCalled();
+});
+
 it("retires target occurrences and ignores their late mutation errors without using the page action handler", async () => {
   const fixture = await mountSettings();
   await fixture.publish([host()]);
@@ -395,6 +456,7 @@ async function mountSettings(options: {
     watchRemoteHosts,
     getRemoteHostCapabilities: vi.fn(async () => ({ catalog: true, management: true, connectionControl: true, connectionTest: true, trustReset: true, commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: true, backendRuntimeSetup: options.runtimeSetup === true })),
     listRemoteHosts: vi.fn(async () => []),
+    listRemoteHostDirectories: vi.fn(async () => { throw new Error("No SSH directory fixture configured."); }),
     refreshRemoteHostCatalog: vi.fn(() => importResult.promise),
     updateTarget: vi.fn(async () => undefined), saveCredential: options.saveCredential ?? vi.fn(async () => undefined),
     createRemoteHost: vi.fn(async () => host()), updateRemoteHost: vi.fn(async () => host()),

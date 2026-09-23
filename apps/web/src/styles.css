@@ -4678,7 +4678,13 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .remote-workspace-binding__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .remote-workspace-binding__heading > span { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .remote-workspace-binding__heading small { color: var(--text-soft); font-size: var(--text-10); }
-.remote-workspace-binding__fields { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(220px, 1.4fr) auto; align-items: end; gap: 9px; }
+.remote-workspace-binding__fields { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(220px, 1.4fr) auto auto; align-items: end; gap: 9px; }
+.remote-workspace-binding__browser { display: grid; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-raised); }
+.remote-workspace-binding__browser > strong { overflow-wrap: anywhere; font-family: var(--font-mono); }
+.remote-workspace-binding__directories { display: grid; gap: 4px; max-height: 240px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+.remote-workspace-binding__directories button { width: 100%; padding: 7px 9px; border: 0; border-radius: 7px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.remote-workspace-binding__directories button:hover, .remote-workspace-binding__directories button:focus-visible { background: var(--surface-hover); }
+.remote-workspace-binding__browser-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .remote-host-editor textarea {
   width: 100%;
   resize: vertical;

@@ -27,6 +27,18 @@ export class VisualRemoteHostFixture {
 
   getRemoteHostCapabilities = async (): Promise<RemoteHostCapabilitiesView> => ({ catalog: true, management: true, connectionControl: true, connectionTest: true, trustReset: true, commandExecution: false, processStreaming: true, fileTransfer: true, tcpForwarding: false, backendRuntimeSetup: true });
   listRemoteHosts = async (targetId: string): Promise<readonly RemoteHostView[]> => [...this.catalog(targetId).values()];
+  listRemoteHostDirectories: AppController["listRemoteHostDirectories"] = async (targetId, hostId, targetRevision, hostRevision, path, signal) => {
+    await Promise.resolve(); signal?.throwIfAborted();
+    const target = this.#targets.get(targetId);
+    if (target?.revision !== targetRevision) throw new ConnectError("Project changed.", Code.Aborted);
+    const host = this.requireHost(targetId, hostId, hostRevision);
+    if (host.status.state !== "ready" || host.trust === undefined) throw new ConnectError("Host is not ready.", Code.FailedPrecondition);
+    const currentPath = path === "" ? "/home/joko" : path;
+    if (!currentPath.startsWith("/")) throw new ConnectError("Use an absolute SSH path.", Code.InvalidArgument);
+    return { targetId, hostId, targetRevision, hostRevision, path: currentPath,
+      parentPath: currentPath === "/" ? "/" : currentPath.slice(0, currentPath.lastIndexOf("/")) || "/",
+      directories: currentPath === "/home/joko" ? [{ name: "project", path: "/home/joko/project" }] : [], truncated: false };
+  };
   watchRemoteHosts = async function* (this: VisualRemoteHostFixture, targetId: string, signal?: AbortSignal): AsyncGenerator<readonly RemoteHostView[]> {
     const listeners = this.#listeners.get(targetId) ?? new Set(); this.#listeners.set(targetId, listeners);
     const queue: (readonly RemoteHostView[])[] = [];
