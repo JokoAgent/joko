@@ -1,7 +1,8 @@
 import { createWdaOwnerFingerprint } from "./wda-build-plan.js";
 
 export type WdaClientErrorCode = "INVALID_CONFIGURATION" | "UNREACHABLE" | "TIMEOUT" | "CANCELLED" |
-  "HTTP_ERROR" | "PROTOCOL_ERROR" | "RESPONSE_TOO_LARGE" | "OWNER_MISMATCH" | "NOT_READY" | "INVALID_SESSION";
+  "HTTP_ERROR" | "PROTOCOL_ERROR" | "RESPONSE_TOO_LARGE" | "OWNER_MISMATCH" | "NOT_READY" |
+  "INVALID_SESSION" | "INPUT_OUTCOME_UNKNOWN";
 
 export class WdaClientError extends Error {
   constructor(readonly code: WdaClientErrorCode, message: string, readonly statusCode?: number) { super(message); }
@@ -33,6 +34,8 @@ export interface WdaViewport {
   readonly orientation: "PORTRAIT" | "LANDSCAPE";
 }
 
+export interface WdaPoint { readonly x: number; readonly y: number }
+
 export interface WdaLoopbackClientOptions {
   readonly controlPort: number;
   readonly cacheRoot: string;
@@ -63,6 +66,15 @@ function integer(value: number, label: string, min: number, max: number): number
     throw new WdaClientError("INVALID_CONFIGURATION", `${label} is invalid.`);
   }
   return value;
+}
+
+function point(value: WdaPoint, label: string): WdaPoint {
+  if (!value || typeof value.x !== "number" || !Number.isFinite(value.x) || value.x < 0 ||
+      value.x > 1_000_000 || typeof value.y !== "number" || !Number.isFinite(value.y) ||
+      value.y < 0 || value.y > 1_000_000) {
+    throw new WdaClientError("INVALID_CONFIGURATION", `${label} must contain bounded device coordinates.`);
+  }
+  return { x: value.x, y: value.y };
 }
 
 async function boundedBody(response: Response, maxBytes: number): Promise<Buffer> {
@@ -227,5 +239,58 @@ export class WdaLoopbackClient {
     }
     return { width: size.value["width"], height: size.value["height"],
       orientation: direction.value };
+  }
+
+  /** A dispatched POST may have acted even when its response is lost. Callers must reconcile before retrying. */
+  async #input(id: string, path: string, payload: unknown, signal?: AbortSignal): Promise<void> {
+    const exactId = sessionId(id);
+    const health = await this.probe(signal);
+    if (!health.ready) throw new WdaClientError("NOT_READY", "Driver is not ready for input.");
+    if (signal?.aborted) throw new WdaClientError("CANCELLED", "Driver input was cancelled before dispatch.");
+    try {
+      await this.#request(`/session/${exactId}${path}`, "POST", JSON.stringify(payload), signal);
+    } catch (error) {
+      if (error instanceof WdaClientError && error.code === "INVALID_SESSION") throw error;
+      throw new WdaClientError("INPUT_OUTCOME_UNKNOWN", "Driver input outcome is unknown; observe before retrying.");
+    }
+  }
+
+  async #performActions(id: string, actions: readonly Readonly<Record<string, unknown>>[],
+    signal?: AbortSignal): Promise<void> {
+    await this.#input(id, "/actions", { actions: [{ type: "pointer", id: "finger",
+      parameters: { pointerType: "touch" }, actions }] }, signal);
+  }
+
+  async tap(id: string, target: WdaPoint, signal?: AbortSignal): Promise<void> {
+    const at = point(target, "point");
+    await this.#performActions(id, [
+      { type: "pointerMove", duration: 0, origin: "viewport", x: at.x, y: at.y },
+      { type: "pointerDown", button: 0 }, { type: "pause", duration: 50 },
+      { type: "pointerUp", button: 0 }
+    ], signal);
+  }
+
+  async swipe(id: string, start: WdaPoint, end: WdaPoint, durationMs: number,
+    signal?: AbortSignal): Promise<void> {
+    const from = point(start, "start");
+    const to = point(end, "end");
+    const duration = integer(durationMs, "durationMs", 1, 60_000);
+    await this.#performActions(id, [
+      { type: "pointerMove", duration: 0, origin: "viewport", x: from.x, y: from.y },
+      { type: "pointerDown", button: 0 }, { type: "pause", duration: 50 },
+      { type: "pointerMove", duration, origin: "viewport", x: to.x, y: to.y },
+      { type: "pointerUp", button: 0 }
+    ], signal);
+  }
+
+  async typeText(id: string, value: string, signal?: AbortSignal): Promise<void> {
+    if (typeof value !== "string" || value.length > 10_000) {
+      throw new WdaClientError("INVALID_CONFIGURATION", "Driver text input exceeds its limit.");
+    }
+    await this.#input(id, "/wda/keys", { value: Array.from(value) }, signal);
+  }
+
+  async home(id: string, signal?: AbortSignal): Promise<void> {
+    await this.#input(id, "/wda/pressButton", { name: "home" }, signal);
   }
 }

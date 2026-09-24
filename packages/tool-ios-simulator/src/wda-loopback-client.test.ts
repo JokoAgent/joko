@@ -140,3 +140,91 @@ it("bounds stalled loopback reads and distinguishes timeout from caller cancella
   controller.abort();
   await expect(pending).rejects.toMatchObject({ code: "CANCELLED" });
 });
+
+it("sends bounded device input only to the exact owned WDA session", async () => {
+  let fingerprint = "";
+  let ready = true;
+  let rejectSession = false;
+  const calls: { path: string; method: string; body: unknown }[] = [];
+  const port = await loopback((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      calls.push({ path: request.url ?? "", method: request.method ?? "",
+        body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null });
+      if (request.url === "/status") json(response, { value: { ready,
+        build: { upgradedAt: fingerprint } } });
+      else if (rejectSession) json(response, { value: { error: "invalid session id" } }, 404);
+      else json(response, { value: null });
+    });
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  await driver.tap("SESSION-1", { x: 12, y: 25 });
+  await driver.swipe("SESSION-1", { x: 12, y: 25 }, { x: 150, y: 300 }, 300);
+  await driver.typeText("SESSION-1", "A😀");
+  await driver.home("SESSION-1");
+  expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
+    "GET /status", "POST /session/SESSION-1/actions",
+    "GET /status", "POST /session/SESSION-1/actions",
+    "GET /status", "POST /session/SESSION-1/wda/keys",
+    "GET /status", "POST /session/SESSION-1/wda/pressButton"
+  ]);
+  expect(calls[1]?.body).toMatchObject({ actions: [{ type: "pointer", id: "finger",
+    parameters: { pointerType: "touch" }, actions: [
+      { type: "pointerMove", x: 12, y: 25 }, { type: "pointerDown" },
+      { type: "pause", duration: 50 }, { type: "pointerUp" }
+    ] }] });
+  expect(calls[3]?.body).toMatchObject({ actions: [{ actions: [
+    { type: "pointerMove", x: 12, y: 25 }, { type: "pointerDown" },
+    { type: "pause" }, { type: "pointerMove", x: 150, y: 300, duration: 300 },
+    { type: "pointerUp" }
+  ] }] });
+  expect(calls[5]?.body).toEqual({ value: ["A", "😀"] });
+  expect(calls[7]?.body).toEqual({ name: "home" });
+  await expect(driver.tap("SESSION-1", { x: -1, y: 0 })).rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.swipe("SESSION-1", { x: 0, y: 0 }, { x: 1, y: 1 }, 60_001))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.typeText("SESSION-1", "x".repeat(10_001)))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.home("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(calls).toHaveLength(8);
+  ready = false;
+  await expect(driver.tap("SESSION-1", { x: 0, y: 0 })).rejects.toMatchObject({ code: "NOT_READY" });
+  fingerprint = "foreign";
+  await expect(driver.home("SESSION-1")).rejects.toMatchObject({ code: "OWNER_MISMATCH" });
+  fingerprint = driver.ownerFingerprint;
+  ready = true;
+  rejectSession = true;
+  await expect(driver.home("SESSION-1")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(calls.filter(call => call.method === "POST")).toHaveLength(5);
+});
+
+it("marks dispatched input as outcome-unknown when the response times out or caller cancels", async () => {
+  let fingerprint = "";
+  let started!: () => void;
+  let entered = new Promise<void>(resolve => { started = resolve; });
+  let posts = 0;
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") {
+      json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+      return;
+    }
+    posts += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write("{");
+    started();
+  });
+  const driver = client(port, { timeoutMs: 50 });
+  fingerprint = driver.ownerFingerprint;
+  const timed = driver.tap("SESSION-1", { x: 10, y: 10 });
+  await entered;
+  await expect(timed).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  entered = new Promise<void>(resolve => { started = resolve; });
+  const controller = new AbortController();
+  const cancelled = driver.typeText("SESSION-1", "private input", controller.signal);
+  await entered;
+  controller.abort();
+  await expect(cancelled).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  expect(posts).toBe(2);
+});
