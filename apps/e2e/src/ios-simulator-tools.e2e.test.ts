@@ -89,7 +89,8 @@ it("registers Simulator discovery in the production application composition", as
     dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"), allowInsecureLoopback: true, allowInsecureLan: false,
     lanDiscoveryEnabled: false, codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
     workspace: { id: "workspace", root: workspace, displayName: "Simulator fixture", trusted: true },
-    artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web"), corsOrigins: []
+    artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web"), corsOrigins: [],
+    iosSimulatorDriver: { archivePath: join(root, "missing-source.tar.gz"), cacheRoot: join(dataDirectory, "driver-cache") }
   };
   const application = await createOrchestratorApplication(config);
   try {
@@ -98,9 +99,121 @@ it("registers Simulator discovery in the production application composition", as
       binding: { opaqueRef: "simulator-task-native", generation: 1 }, pinned: false, archived: false,
       permissionMode: "ask", planMode: false, fastMode: false, createdAt: Date.now(), updatedAt: Date.now() });
     const snapshot = application.mcpRouter!.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1/internal/mcp", sessionId: "simulator-task", targetId: target.id, expectedPiGeneration: 1 });
-    expect(snapshot.mcpBridge.tools.filter(tool => tool.serverId === IOS_SIMULATOR_TOOL_PROVIDER_ID).map(tool => tool.name)).toEqual(["call_tool", "list_tools"]);
+    const simulatorTools = snapshot.mcpBridge.tools.filter(tool => tool.serverId === IOS_SIMULATOR_TOOL_PROVIDER_ID);
+    expect(simulatorTools.map(tool => tool.name)).toEqual(["call_tool", "control_tool", "list_tools"]);
+    expect(simulatorTools.find(tool => tool.name === "call_tool")?.requiresPermission).toBe(false);
+    expect(simulatorTools.find(tool => tool.name === "control_tool")?.requiresPermission).toBe(true);
+    if (process.platform === "win32") {
+      const internal = await createInternalServer(application);
+      try {
+        const url = await internal.listen({ host: "127.0.0.1", port: 0 });
+        const response = await fetch(`${url}/internal/mcp`, { method: "POST", headers: {
+          authorization: `Bearer ${snapshot.mcpBridge.token}`, "content-type": "application/json",
+          "x-joko-pi-generation": "1"
+        }, body: JSON.stringify({ requestId: randomUUID(), sessionId: "simulator-task", targetId: target.id,
+          generation: 1, serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID, toolName: "control_tool",
+          arguments: { name: "create_instance", args: {
+            templateUdid: "A0123456-1234-1234-1234-123456789ABC", name: "Joko iPhone" } } }) });
+        expect(response.ok).toBe(true);
+        expect(await response.json()).toMatchObject({ isError: true, details: {
+          mcpStructuredContent: { errorCode: "UNSUPPORTED_PLATFORM" }
+        } });
+        expect(application.store.listOperations({ sessionId: "simulator-task" })).toEqual([]);
+      } finally { await internal.close(); }
+    }
     snapshot.revoke();
   } finally {
+    await application.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("runs task-bound Simulator attach, live diagnosis and detach through production HTTP and SQLite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-simulator-control-"));
+  const workspace = join(root, "workspace");
+  const dataDirectory = join(root, "data");
+  await mkdir(workspace);
+  const config: OrchestratorConfig = {
+    host: "127.0.0.1", port: 0, internalPort: 4317, publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4317",
+    dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"), allowInsecureLoopback: true, allowInsecureLan: false,
+    lanDiscoveryEnabled: false, codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
+    workspace: { id: "workspace", root: workspace, displayName: "Simulator fixture", trusted: true },
+    artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web"), corsOrigins: [],
+    iosSimulatorDriver: { archivePath: join(root, "pinned-source.tar.gz"), cacheRoot: join(dataDirectory, "driver-cache") }
+  };
+  const udid = "A0123456-1234-1234-1234-123456789ABC";
+  const device = { udid, name: "Existing iPhone", state: "Booted", isAvailable: true,
+    runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", runtimeName: "iOS 19.0",
+    runtimeVersion: "19.0", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null };
+  const events: string[] = [];
+  let active: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
+    controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
+    driverSessionId: string; health: { ready: true; message: null; osName: string;
+      osVersion: string; sdkVersion: string; deviceIp: null }; state: "ready" } | null = null;
+  const application = await createOrchestratorApplication(config, { simulatorRuntime: {
+    environment: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+      xcodeVersion: "Xcode 16.4\nBuild version 16F6", runtimes: [], devices: [device], issue: null,
+      error: null, setupSteps: [] }) },
+    lifecycle: { findExact: async value => value.toUpperCase() === udid ? device : null,
+      bootExact: async () => { throw new Error("Unexpected boot."); },
+      shutdownExact: async () => { throw new Error("Preexisting device must remain booted."); } },
+    driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
+      manager: { get: () => active,
+        retryOwnedCleanup: async () => { events.push("retry-cleanup"); },
+        start: async options => { events.push("driver-start");
+          active = { instanceId: options.instanceId, simulatorUdid: options.simulatorUdid,
+            leaseId: "B0123456-1234-1234-1234-123456789ABC", pid: 301, controlPort: 18100, mjpegPort: 19100,
+            sourceRevision: "5f8280e761dc0b5b9b28368e63a8f0cc8d868346", buildCacheKey: "a".repeat(64),
+            driverSessionId: "SESSION-1", health: { ready: true, message: null, osName: "iOS",
+              osVersion: "19.0", sdkVersion: "19.0", deviceIp: null }, state: "ready" };
+          return active; },
+        stop: async () => { events.push("driver-stop"); active = null; } } }
+  } });
+  let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
+  try {
+    const target = application.store.getTarget("workspace").descriptor;
+    application.store.createSession({ id: "simulator-task", backendId: target.backendId, targetId: target.id,
+      title: "Simulator task", binding: { opaqueRef: "simulator-task-native", generation: 1 },
+      pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
+      createdAt: Date.now(), updatedAt: Date.now() });
+    internal = await createInternalServer(application);
+    const url = await internal.listen({ host: "127.0.0.1", port: 0 });
+    const snapshot = application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${url}/internal/mcp`,
+      sessionId: "simulator-task", targetId: target.id, expectedPiGeneration: 1 });
+    const call = async (toolName: string, name: string, args: Record<string, unknown>) => {
+      const response = await fetch(`${url}/internal/mcp`, { method: "POST", headers: {
+        authorization: `Bearer ${snapshot.mcpBridge.token}`, "content-type": "application/json",
+        "x-joko-pi-generation": "1"
+      }, body: JSON.stringify({ requestId: randomUUID(), sessionId: "simulator-task", targetId: target.id,
+        generation: 1, serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID, toolName,
+        arguments: { name, args } }) });
+      expect(response.ok).toBe(true);
+      return await response.json() as { isError: boolean; details: { mcpStructuredContent: {
+        data?: { instance?: { instanceId: string; generation: number; lease: { id: string };
+          viewerState: string; graceExpiresAt: number | null }; drivers?: { state: string; instances: readonly { state: string }[] } };
+        errorCode?: string } } };
+    };
+    const attached = await call("control_tool", "attach_device", { udid });
+    expect(attached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      instance: { simulatorUdid: udid, viewerState: "attached", bootProvenance: "preexisting" }
+    } } } });
+    const instance = attached.details.mcpStructuredContent.data!.instance!;
+    expect(events).toEqual(["retry-cleanup", "orphan-cleanup", "driver-start"]);
+    const doctor = await call("call_tool", "doctor", {});
+    expect(doctor.details.mcpStructuredContent.data?.drivers).toMatchObject({ state: "available",
+      instances: [{ state: "ready" }] });
+    const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
+      generation: instance.generation, leaseId: instance.lease.id });
+    expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      instance: { viewerState: "detached", graceExpiresAt: null }
+    } } } });
+    expect(events).toEqual(["retry-cleanup", "orphan-cleanup", "driver-start", "driver-stop",
+      "retry-cleanup", "orphan-cleanup"]);
+    expect((await call("call_tool", "list_instances", {})).details.mcpStructuredContent.data)
+      .toMatchObject({ instances: [] });
+    snapshot.revoke();
+  } finally {
+    await internal?.close();
     await application.close();
     await rm(root, { recursive: true, force: true });
   }

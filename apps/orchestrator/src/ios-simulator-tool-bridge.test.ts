@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import { OperationInProgressError } from "@joko/store";
 import type { SimulatorEnvironmentRuntime } from "@joko/tool-ios-simulator";
 import { IosSimulatorToolBridgeProvider } from "./ios-simulator-tool-bridge.js";
 
@@ -109,4 +110,67 @@ it("reports live cross-task resource admission and hides probe failures or stale
   failProbe = false;
   drift = true;
   expect(await diagnose()).toMatchObject({ ok: false, errorCode: "STALE_SCOPE" });
+});
+
+it("publishes instance mutations only with a composed control owner and requires exact effect authority", async () => {
+  const calls: string[] = [];
+  const instance = { instanceId: "owned", simulatorUdid: "A0123456-1234-1234-1234-123456789ABC",
+    generation: 2, lease: { id: "lease", issuedAt: 1, expiresAt: 60_001 } };
+  let ready = true;
+  let conflict = false;
+  const control = {
+    diagnoseDrivers: () => [],
+    create: async () => { calls.push("create"); return { instance, replayed: false }; },
+    attach: async () => { calls.push("attach"); return { instance, replayed: false }; },
+    start: async () => { calls.push("start"); return { instance, replayed: false }; },
+    stop: async () => { if (conflict) throw new OperationInProgressError("private-operation-id");
+      calls.push("stop"); return { instance, replayed: false }; },
+    detach: async () => { calls.push("detach"); return { instance, replayed: false }; }
+  };
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [] } as never, control: control as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: ready ? null : "XCODE_NOT_FOUND",
+      error: ready ? null : "Simulator unavailable", setupSteps: [] }) }
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const authority = { ...scope, effectIdentity: "a".repeat(64), requestBodyHash: `sha256:${"b".repeat(64)}`,
+    providerGeneration: 1 };
+  expect(provider.tools.find(tool => tool.name === "call_tool")?.requiresPermission).toBe(false);
+  expect(provider.tools.find(tool => tool.name === "control_tool")?.requiresPermission).toBe(true);
+  expect((await provider.callTool("list_tools", { category: "ios_simulator" }, undefined, scope)).structuredContent)
+    .toMatchObject({ tools: expect.arrayContaining([{ name: "create_instance", category: "ios_simulator",
+      readOnly: false, via: "control_tool", description: expect.any(String) }]) });
+  const invoke = (name: string, args: Record<string, unknown>, context: typeof scope | typeof authority = authority) =>
+    provider.callTool("control_tool", { name, args }, undefined, context);
+  expect((await provider.callTool("call_tool", { name: "start_instance", args: {} }, undefined, authority))
+    .structuredContent).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await invoke("create_instance", { templateUdid: instance.simulatorUdid, name: "Joko iPhone" }, scope))
+    .structuredContent).toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect((await invoke("create_instance", { templateUdid: instance.simulatorUdid, name: "Joko iPhone", extra: 1 }))
+    .structuredContent).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect((await invoke("create_instance", { templateUdid: instance.simulatorUdid, name: "Joko iPhone" }))
+    .structuredContent).toMatchObject({ ok: true, data: { instance, replayed: false } });
+  expect((await invoke("attach_device", { udid: instance.simulatorUdid })).structuredContent)
+    .toMatchObject({ ok: true });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope)).structuredContent)
+    .toMatchObject({ ok: true, data: { instanceControl: { state: "available" },
+      drivers: { state: "available", instances: [] },
+      availability: { create_instance: { state: "available" }, start_instance: { reasonCode: "INSTANCE_REQUIRED" } } } });
+  for (const name of ["start_instance", "stop_instance", "detach_device"]) {
+    expect((await invoke(name, { instanceId: "owned", generation: 2, leaseId: "lease" })).structuredContent)
+      .toMatchObject({ ok: true });
+  }
+  expect(calls).toEqual(["create", "attach", "start", "stop", "detach"]);
+  conflict = true;
+  const blocked = await invoke("stop_instance", { instanceId: "owned", generation: 2, leaseId: "lease" });
+  expect(blocked.structuredContent).toMatchObject({ errorCode: "MUTATION_IN_PROGRESS" });
+  expect(JSON.stringify(blocked.structuredContent)).not.toContain("private-operation-id");
+  ready = false;
+  expect((await invoke("start_instance", { instanceId: "owned", generation: 2, leaseId: "lease" }))
+    .structuredContent).toMatchObject({ ok: false, errorCode: "XCODE_NOT_FOUND" });
+  expect(calls).toHaveLength(5);
 });

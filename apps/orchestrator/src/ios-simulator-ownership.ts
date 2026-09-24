@@ -39,6 +39,7 @@ export interface SimulatorOwnedInstance {
   readonly generation: number;
   readonly lifecycleState: "stopped" | "ready" | "error";
   readonly viewerState: "detached" | "attached";
+  readonly graceExpiresAt: number | null;
   readonly healthState: "healthy" | "degraded" | "error";
   readonly lease: { readonly id: string; readonly issuedAt: number; readonly expiresAt: number };
   readonly createdAt: number;
@@ -82,7 +83,7 @@ function timestamp(value: unknown): value is number {
 function validInstance(value: unknown): value is SimulatorOwnedInstance {
   if (!record(value) || !exactKeys(value, ["instanceId", "sessionId", "targetId", "backendId", "bindingGeneration", "workspaceFingerprint",
     "simulatorUdid", "simulatorName", "runtimeIdentifier", "deviceTypeIdentifier", "creationProvenance", "bootProvenance",
-    "generation", "lifecycleState", "viewerState", "healthState", "lease", "createdAt", "updatedAt", "errorCode"])) return false;
+    "generation", "lifecycleState", "viewerState", "graceExpiresAt", "healthState", "lease", "createdAt", "updatedAt", "errorCode"])) return false;
   if (!bounded(value["instanceId"], 128) || !bounded(value["sessionId"]) || !bounded(value["targetId"])
     || !bounded(value["backendId"]) || !positive(value["bindingGeneration"])
     || typeof value["workspaceFingerprint"] !== "string" || !DIGEST.test(value["workspaceFingerprint"])
@@ -96,6 +97,8 @@ function validInstance(value: unknown): value is SimulatorOwnedInstance {
     || !["agent_booted", "user_booted", "preexisting"].includes(String(value["bootProvenance"]))
     || !["stopped", "ready", "error"].includes(String(value["lifecycleState"]))
     || !["detached", "attached"].includes(String(value["viewerState"]))
+    || value["graceExpiresAt"] !== null && (!timestamp(value["graceExpiresAt"]) ||
+      value["viewerState"] !== "detached" || value["bootProvenance"] !== "agent_booted")
     || !["healthy", "degraded", "error"].includes(String(value["healthState"]))
     || value["errorCode"] !== null && !bounded(value["errorCode"], 128)) return false;
   const lease = value["lease"];
@@ -234,7 +237,7 @@ export class SimulatorOwnershipRegistry {
         simulatorName: name, runtimeIdentifier: device.runtimeIdentifier,
         deviceTypeIdentifier: device.deviceTypeIdentifier!, creationProvenance: "joko",
         bootProvenance: "user_booted", generation: 1, lifecycleState: "stopped",
-        viewerState: "detached", healthState: "healthy",
+        viewerState: "detached", graceExpiresAt: null, healthState: "healthy",
         lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
         createdAt: now, updatedAt: now, errorCode: null
       };
@@ -284,7 +287,7 @@ export class SimulatorOwnershipRegistry {
       }
       const now = this.#now();
       const restored: SimulatorOwnedInstance = { ...current, generation: current.generation + 1,
-        lifecycleState: "stopped", viewerState: "detached", healthState: "healthy", errorCode: null,
+        lifecycleState: "stopped", viewerState: "detached", graceExpiresAt: null, healthState: "healthy", errorCode: null,
         lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now };
       this.#save({ format: 1, instances: stored.instances.map(item => item.instanceId === current.instanceId ? restored : item) });
       return publicInstance(restored);
@@ -304,6 +307,7 @@ export class SimulatorOwnershipRegistry {
         ? input.bootedByAgent ? "agent_booted" : instance.bootProvenance === "agent_booted" ? "agent_booted" : "preexisting"
         : instance.bootProvenance,
       viewerState: "detached",
+      graceExpiresAt: null,
       healthState: "healthy",
       errorCode: null,
       lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
@@ -319,6 +323,7 @@ export class SimulatorOwnershipRegistry {
       generation: instance.generation + 1,
       lifecycleState: "error",
       viewerState: "detached",
+      graceExpiresAt: null,
       healthState: "degraded",
       errorCode: code,
       lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
@@ -340,6 +345,116 @@ export class SimulatorOwnershipRegistry {
       ...instance, generation: instance.generation + 1, healthState: "degraded", errorCode: code,
       lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now
     }));
+  }
+
+  /** Viewer presentation is an exact task route transition, separate from device and driver state. */
+  attachViewer(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): PublicSimulatorInstance {
+    return this.#replaceRouted(scope, route, (instance, now) => {
+      this.#assertLiveLease(instance, route, now);
+      return { ...instance, generation: instance.generation + 1, viewerState: "attached", graceExpiresAt: null,
+        lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now };
+    });
+  }
+
+  detachViewer(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
+    graceExpiresAt: number | null = null): PublicSimulatorInstance {
+    return this.#replaceRouted(scope, route, (instance, now) => {
+      this.#assertLiveLease(instance, route, now);
+      if (graceExpiresAt !== null && (instance.bootProvenance !== "agent_booted" ||
+          !timestamp(graceExpiresAt) || graceExpiresAt <= now)) {
+        throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator detach grace is invalid.");
+      }
+      return { ...instance, generation: instance.generation + 1, viewerState: "detached", graceExpiresAt,
+        lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now };
+    });
+  }
+
+  /** Release only a route whose Viewer has already been detached and whose runtime was retired by the caller. */
+  releaseDetached(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): PublicSimulatorInstance {
+    return this.#store.transaction(() => {
+      const current = this.#routedInstance(scope, route);
+      this.#assertLiveLease(current, route, this.#now());
+      if (current.viewerState !== "detached") {
+        throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator Viewer is still attached.");
+      }
+      if (current.graceExpiresAt !== null) {
+        throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator detach grace is still active.");
+      }
+      const stored = this.#load();
+      this.#save({ format: 1, instances: stored.instances.filter(item => item.instanceId !== current.instanceId) });
+      return publicInstance(current);
+    });
+  }
+
+  detachedGraceCandidates(): readonly PublicSimulatorInstance[] {
+    return this.#load().instances.filter(item => item.graceExpiresAt !== null).map(publicInstance);
+  }
+
+  listForRecovery(): readonly PublicSimulatorInstance[] {
+    return this.#load().instances.map(publicInstance);
+  }
+
+  isTaskBindingActive(instanceId: string): boolean {
+    const current = this.#load().instances.find(item => item.instanceId === instanceId);
+    if (!current) return false;
+    const scope = { sessionId: current.sessionId, targetId: current.targetId,
+      generation: current.bindingGeneration };
+    try {
+      this.#assertOwner(current, scope, this.#fingerprint(scope));
+      return true;
+    } catch (error) {
+      if (error instanceof SimulatorOwnershipError && error.code === "STALE_SCOPE") return false;
+      throw error;
+    }
+  }
+
+  quarantineAbandoned(expected: PublicSimulatorInstance): PublicSimulatorInstance | null {
+    return this.#store.transaction(() => {
+      const stored = this.#load();
+      const current = stored.instances.find(item => item.instanceId === expected.instanceId);
+      if (!current || current.simulatorUdid !== expected.simulatorUdid ||
+          current.generation !== expected.generation || this.isTaskBindingActive(current.instanceId)) return null;
+      if (current.errorCode === "TASK_UNAVAILABLE" && current.viewerState === "detached") {
+        return publicInstance(current);
+      }
+      if (current.generation >= Number.MAX_SAFE_INTEGER) {
+        throw new SimulatorOwnershipError("INVALID_OWNERSHIP", "Simulator instance generation is exhausted.");
+      }
+      const now = this.#now();
+      const next: SimulatorOwnedInstance = { ...current, generation: current.generation + 1,
+        viewerState: "detached", graceExpiresAt: null, healthState: "degraded",
+        errorCode: "TASK_UNAVAILABLE",
+        lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now };
+      this.#save({ format: 1, instances: stored.instances.map(item => item.instanceId === current.instanceId ? next : item) });
+      return publicInstance(next);
+    });
+  }
+
+  /** Called after exact resource retirement when the originating task is no longer active. */
+  releaseAbandoned(expected: PublicSimulatorInstance): PublicSimulatorInstance | null {
+    return this.#store.transaction(() => {
+      const stored = this.#load();
+      const current = stored.instances.find(item => item.instanceId === expected.instanceId);
+      if (!current || current.simulatorUdid !== expected.simulatorUdid ||
+          current.generation !== expected.generation || this.isTaskBindingActive(current.instanceId)) return null;
+      this.#save({ format: 1, instances: stored.instances.filter(item => item.instanceId !== current.instanceId) });
+      return publicInstance(current);
+    });
+  }
+
+  /** Only a caller that observed exact shutdown may release a due, unchanged detached binding. */
+  releaseAfterGrace(input: { readonly instanceId: string; readonly simulatorUdid: string;
+    readonly generation: number; readonly graceExpiresAt: number }): PublicSimulatorInstance | null {
+    return this.#store.transaction(() => {
+      const stored = this.#load();
+      const current = stored.instances.find(item => item.instanceId === input.instanceId);
+      if (!current || current.simulatorUdid !== input.simulatorUdid ||
+          current.generation !== input.generation || current.viewerState !== "detached" ||
+          current.bootProvenance !== "agent_booted" || current.graceExpiresAt !== input.graceExpiresAt ||
+          current.graceExpiresAt > this.#now()) return null;
+      this.#save({ format: 1, instances: stored.instances.filter(item => item.instanceId !== current.instanceId) });
+      return publicInstance(current);
+    });
   }
 
   /** Reserve an exact available device before a later lifecycle or viewer action. */
@@ -371,7 +486,8 @@ export class SimulatorOwnershipRegistry {
         simulatorUdid: udid, simulatorName: device.name, runtimeIdentifier: device.runtimeIdentifier,
         deviceTypeIdentifier: device.deviceTypeIdentifier!, creationProvenance: "external",
         bootProvenance: running ? "preexisting" : "user_booted", generation: 1,
-        lifecycleState: running ? "ready" : "stopped", viewerState: "detached", healthState: "healthy",
+        lifecycleState: running ? "ready" : "stopped", viewerState: "detached", graceExpiresAt: null,
+        healthState: "healthy",
         lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
         createdAt: now, updatedAt: now, errorCode: null
       };
@@ -428,6 +544,12 @@ export class SimulatorOwnershipRegistry {
       this.#save({ format: 1, instances: stored.instances.map(item => item.instanceId === current.instanceId ? next : item) });
       return publicInstance(next);
     });
+  }
+
+  #assertLiveLease(instance: SimulatorOwnedInstance, route: SimulatorInstanceRoute, now: number): void {
+    if (instance.lease.id !== route.leaseId || instance.lease.expiresAt <= now) {
+      throw new SimulatorOwnershipError("STALE_SCOPE", "Simulator instance lease is stale.");
+    }
   }
 
   #load(): StoredOwnership {

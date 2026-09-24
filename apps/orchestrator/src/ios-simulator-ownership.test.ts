@@ -70,3 +70,28 @@ it("rejects an invalid persisted registry as a whole", () => {
   expect(() => new SimulatorOwnershipRegistry(store)).toThrow(/invalid/u);
   store.close();
 });
+
+it("rotates an exact Viewer route and releases only a detached owned binding", () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    let now = 1_000;
+    const registry = new SimulatorOwnershipRegistry(store, { now: () => now });
+    const scope = { sessionId: "first", targetId: "target", generation: 1 };
+    const initial = registry.bindExternalDevice(scope, DEVICE);
+    const route = (value: typeof initial) => ({ instanceId: value.instanceId,
+      generation: value.generation, leaseId: value.lease.id });
+    const attached = registry.attachViewer(scope, route(initial));
+    expect(attached).toMatchObject({ viewerState: "attached", generation: initial.generation + 1 });
+    expect(() => registry.releaseDetached(scope, route(attached))).toThrow(/still attached/u);
+    expect(() => registry.detachViewer(scope, route(initial))).toThrow(/stale/u);
+    const detached = registry.detachViewer(scope, route(attached));
+    expect(detached).toMatchObject({ viewerState: "detached", generation: attached.generation + 1 });
+    expect(() => registry.releaseDetached({ ...scope, sessionId: "second" }, route(detached))).toThrow(/stale/u);
+    now = detached.lease.expiresAt;
+    expect(() => registry.releaseDetached(scope, route(detached))).toThrow(/stale/u);
+    const renewed = registry.listForTask(scope)[0]!;
+    expect(registry.releaseDetached(scope, route(renewed)).instanceId).toBe(initial.instanceId);
+    expect(registry.listForTask(scope)).toEqual([]);
+  } finally { store.close(); }
+});

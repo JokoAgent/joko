@@ -120,6 +120,12 @@ import { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
 import { IosSimulatorToolBridgeProvider } from "./ios-simulator-tool-bridge.js";
 import { SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
+import { SimulatorPendingCreateRegistry } from "./ios-simulator-pending-create.js";
+import { SimulatorCreateCoordinator } from "./ios-simulator-create-coordinator.js";
+import { SimulatorLifecycleCoordinator } from "./ios-simulator-lifecycle-coordinator.js";
+import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
+import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
+import type { SimulatorCreateRuntime, SimulatorEnvironmentRuntime, SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -449,6 +455,13 @@ export interface OrchestratorApplicationDependencies {
   readonly messagingCreateWeChatAuthorization?: () => WeChatAuthorizationPort;
   readonly messagingPollTimeoutSeconds?: number;
   readonly messagingRetryDelayMs?: number;
+  /** Test-only host seams; production uses the macOS environment, simctl and pinned driver. */
+  readonly simulatorRuntime?: {
+    readonly environment?: SimulatorEnvironmentRuntime;
+    readonly lifecycle?: SimulatorLifecycleRuntime;
+    readonly create?: SimulatorCreateRuntime;
+    readonly driver?: Pick<SimulatorDriverCoordinatorOptions, "manager" | "cleanupOrphans" | "architecture">;
+  };
 }
 
 export type OutboundProxyResolver = (
@@ -807,8 +820,27 @@ export async function createOrchestratorApplication(
         ? { pdfRenderer: new ElectronDocumentPdfRenderer(config.pdfRendererHost.executablePath, config.pdfRendererHost.appPath) }
         : config.browser ? { pdfRenderer: new ChromiumDocumentPdfRenderer(config.browser.executablePath) } : {}) })
   );
+  const simulatorOwnership = new SimulatorOwnershipRegistry(store);
+  const simulatorPendingCreate = config.iosSimulatorDriver === undefined
+    ? undefined : new SimulatorPendingCreateRegistry(store);
+  const simulatorCreate = simulatorPendingCreate === undefined ? undefined
+    : new SimulatorCreateCoordinator(store, simulatorOwnership, simulatorPendingCreate,
+      { create: dependencies.simulatorRuntime?.create, lifecycle: dependencies.simulatorRuntime?.lifecycle });
+  const simulatorControl = config.iosSimulatorDriver === undefined || simulatorCreate === undefined
+    ? undefined : new SimulatorInstanceControlCoordinator(store, simulatorOwnership, {
+      create: simulatorCreate,
+      lifecycle: new SimulatorLifecycleCoordinator(store, simulatorOwnership, dependencies.simulatorRuntime?.lifecycle),
+      driver: new SimulatorDriverCoordinator(store, simulatorOwnership, {
+        ...config.iosSimulatorDriver,
+        environment: dependencies.simulatorRuntime?.environment,
+        lifecycle: dependencies.simulatorRuntime?.lifecycle,
+        ...dependencies.simulatorRuntime?.driver
+      }),
+      devices: dependencies.simulatorRuntime?.lifecycle
+    });
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
-    new IosSimulatorToolBridgeProvider({ store, ownership: new SimulatorOwnershipRegistry(store) })
+    new IosSimulatorToolBridgeProvider({ store, ownership: simulatorOwnership, control: simulatorControl,
+      runtime: dependencies.simulatorRuntime?.environment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
     store,
@@ -1322,6 +1354,10 @@ export async function createOrchestratorApplication(
     onServiceInteractionSettled: (input) => messaging?.onInteractionSettled(input),
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
+  await simulatorCreate?.recoverPending();
+  await simulatorControl?.reconcileDetachedGrace();
+  await simulatorControl?.reconcileAbandoned();
+  simulatorControl?.startRecoverySweep();
   let reconcileLearnedResourceRuntime: (backendId: string, resourceId: string, fence: symbol) => Promise<void> = async () => undefined;
   const skillLearning = new SkillLearningManager({
     store,
@@ -2377,6 +2413,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());
         await attempt(() => unregisterIosSimulatorTools());
+        simulatorControl?.dispose();
         await attempt(() => lspBridge.dispose());
         await attempt(() => unregisterSchedulerBridgeTools());
         await attempt(() => unregisterVisionBridgeTools());

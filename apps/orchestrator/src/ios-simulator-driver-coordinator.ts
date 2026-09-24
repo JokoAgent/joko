@@ -82,6 +82,52 @@ export class SimulatorDriverCoordinator {
     return this.#execute("stop", scope, route, authority, signal);
   }
 
+  isReady(instance: PublicSimulatorInstance): boolean {
+    const active = this.#manager.get(instance.instanceId);
+    return active?.state === "ready" && active.simulatorUdid === instance.simulatorUdid &&
+      this.#state.isCurrentReady(instance.instanceId, instance.generation, active.leaseId);
+  }
+
+  diagnose(instance: PublicSimulatorInstance): { readonly state: "ready" | "stopped" | "error" | "unavailable";
+    readonly reasonCode: string | null } {
+    if (this.isReady(instance)) return { state: "ready", reasonCode: null };
+    const record = this.#state.get(instance.instanceId);
+    if (!record) return { state: "stopped", reasonCode: null };
+    if (record.state === "error") return { state: "error", reasonCode: record.errorCode };
+    return { state: "unavailable", reasonCode: "DRIVER_RUNTIME_LOST" };
+  }
+
+  /** Keep the ready projection aligned when presentation alone rotates an instance route. */
+  rebindReadyRoute(previous: PublicSimulatorInstance, next: PublicSimulatorInstance): void {
+    const active = this.#manager.get(previous.instanceId);
+    if (!active || !this.isReady(previous) || next.instanceId !== previous.instanceId ||
+        next.simulatorUdid !== previous.simulatorUdid || next.generation !== previous.generation + 1) {
+      throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver route changed before Viewer attachment.");
+    }
+    this.#state.ready(next, active.leaseId);
+  }
+
+  /** A caller with a durable lost-task cleanup claim may retire only this service's exact runtime. */
+  async retireAbandoned(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<void> {
+    const prior = this.#state.get(instance.instanceId);
+    const active = this.#manager.get(instance.instanceId);
+    if (prior && prior.simulatorUdid !== instance.simulatorUdid ||
+        active && active.simulatorUdid !== instance.simulatorUdid) {
+      throw new SimulatorDriverError("DRIVER_CONFLICT", "Simulator driver ownership changed.");
+    }
+    if (prior?.state === "ready" && (!active || active.state !== "ready" ||
+        !this.#state.isCurrentReady(instance.instanceId, prior.instanceGeneration, active.leaseId) ||
+        ![instance.generation, instance.generation - 1].includes(prior.instanceGeneration))) {
+      throw new SimulatorDriverError("DRIVER_BUSY", "Another driver runtime still owns this simulator.");
+    }
+    if (signal?.aborted) throw new SimulatorDriverError("MUTATION_CANCELLED", "Simulator cleanup was cancelled.");
+    if (active) await this.#manager.stop(instance.instanceId, active.leaseId);
+    await this.#manager.retryOwnedCleanup(instance.instanceId);
+    await this.#cleanup({ cacheRoot: this.#cacheRoot, instanceId: instance.instanceId,
+      simulatorUdid: instance.simulatorUdid, signal });
+    this.#state.clear(instance.instanceId);
+  }
+
   async #execute(action: "start" | "stop", scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
     authority: SimulatorLifecycleEffectAuthority, signal?: AbortSignal): Promise<SimulatorDriverExecution> {
     if (!DIGEST.test(authority.effectIdentity) || !BODY_HASH.test(authority.requestBodyHash) ||
