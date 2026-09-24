@@ -51,6 +51,9 @@ function fixture() {
   let privacy = async (action: SimulatorPrivacyAction, service: string, bundleId?: string) => {
     calls.push({ type: "privacy", value: { action, service, bundleId }, claimed: hasClaim(store) });
   };
+  let push = async (bundleId: string, payload: Readonly<Record<string, unknown>>) => {
+    calls.push({ type: "push_notification", value: { bundleId, payload }, claimed: hasClaim(store) });
+  };
   const driver = {
     isReady: () => true,
     observeAccessibilityTree: async () => ({ capturedAt: new Date().toISOString(),
@@ -84,7 +87,9 @@ function fixture() {
     },
     clearStatusBar: async () => {
       calls.push({ type: "clear_status_bar", value: null, claimed: hasClaim(store) });
-    }
+    },
+    pushNotification: (_udid: string, bundleId: string,
+      payload: Readonly<Record<string, unknown>>) => push(bundleId, payload)
   };
   const state = new SimulatorStateControlCoordinator(store, ownership, driver, screen, lifecycle,
     { now: () => 1_000 });
@@ -92,7 +97,8 @@ function fixture() {
     setOrientation: (value: typeof orientation) => { orientation = value; },
     setAppearance: (value: typeof appearance) => { appearance = value; },
     setLocation: (value: typeof location) => { location = value; },
-    setPrivacy: (value: typeof privacy) => { privacy = value; } };
+    setPrivacy: (value: typeof privacy) => { privacy = value; },
+    setPush: (value: typeof push) => { push = value; } };
 }
 
 function hasClaim(store: OperationalStore): boolean {
@@ -141,6 +147,16 @@ it("claims each state change, rotates from the current snapshot and does not rep
     await h.state.execute(SCOPE, route(h.instance),
       { type: "set_status_bar", overrides: statusOverrides }, authority("0"));
     await h.state.execute(SCOPE, route(h.instance), { type: "clear_status_bar" }, authority("6"));
+    const pushPayload = { aps: { alert: "private push body" } };
+    const pushed = await h.state.execute(SCOPE, route(h.instance), {
+      type: "push_notification", bundleId: "app.joko.fixture", payload: pushPayload
+    }, authority("5"));
+    expect(pushed).toMatchObject({ replayed: false, receipt: {
+      interaction: "push_notification", backend: "simctl", bundleId: "app.joko.fixture",
+      delivered: true } });
+    expect(await h.state.execute(SCOPE, route(h.instance), {
+      type: "push_notification", bundleId: "app.joko.fixture", payload: pushPayload
+    }, authority("5"))).toMatchObject({ replayed: true });
     expect(h.calls.slice(1)).toEqual([
       { type: "appearance", value: "dark", claimed: true },
       { type: "contrast", value: true, claimed: true },
@@ -155,10 +171,15 @@ it("claims each state change, rotates from the current snapshot and does not rep
       { type: "privacy", value: { action: "grant", service: "camera",
         bundleId: "app.joko.fixture" }, claimed: true },
       { type: "status_bar", value: statusOverrides, claimed: true },
-      { type: "clear_status_bar", value: null, claimed: true }
+      { type: "clear_status_bar", value: null, claimed: true },
+      { type: "push_notification", value: { bundleId: "app.joko.fixture",
+        payload: pushPayload }, claimed: true }
     ]);
-    expect(h.store.listOperations({ sessionId: SCOPE.sessionId })
-      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(11);
+    const stateOperations = h.store.listOperations({ sessionId: SCOPE.sessionId })
+      .filter(operation => operation.kind === "ios_simulator_state_control");
+    expect(stateOperations).toHaveLength(12);
+    expect(JSON.stringify(stateOperations, (_key, value: unknown) =>
+      typeof value === "bigint" ? value.toString() : value)).not.toContain("private push body");
     await expect(h.state.execute(SCOPE, route(h.instance), {
       type: "start_location_route", waypoints: [
         { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
@@ -170,7 +191,10 @@ it("claims each state change, rotates from the current snapshot and does not rep
     await expect(h.state.execute(SCOPE, route(h.instance),
       { type: "set_privacy", action: "grant", service: "camera" }, authority("2")))
       .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
-    expect(h.calls).toHaveLength(10);
+    await expect(h.state.execute(SCOPE, route(h.instance),
+      { type: "push_notification", bundleId: "app.joko.fixture", payload: {} }, authority("a")))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(h.calls).toHaveLength(11);
   } finally { h.store.close(); }
 });
 
@@ -186,15 +210,18 @@ it("serializes with input and fences an uncertain simctl result from replay", as
       new Error("Controlled input interruption."));
 
     let calls = 0;
-    h.setPrivacy(async () => { calls += 1;
+    h.setPush(async () => { calls += 1;
       throw new SimulatorLifecycleError("SIMULATOR_CONTROL_UNKNOWN", "private host detail"); });
-    const action = { type: "set_privacy" as const, action: "revoke" as const,
-      service: "camera", bundleId: "app.joko.fixture" };
+    const action = { type: "push_notification" as const, bundleId: "app.joko.fixture",
+      payload: { aps: { alert: "private push body" } } };
     await expect(h.state.execute(SCOPE, route(h.instance), action, authority("1")))
       .rejects.toMatchObject({ code: "STATE_OUTCOME_UNKNOWN" });
     await expect(h.state.execute(SCOPE, route(h.instance), action, authority("1")))
       .rejects.toMatchObject({ code: "STATE_OUTCOME_UNKNOWN" });
     expect(calls).toBe(1);
+    expect(JSON.stringify(h.store.listOperations({ sessionId: SCOPE.sessionId }),
+      (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value))
+      .not.toContain("private push body");
   } finally { h.store.close(); }
 });
 

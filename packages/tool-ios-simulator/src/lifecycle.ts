@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createNodeSimulatorCommandRunner, parseSimulatorListJson,
   type SimulatorCommandResult, type SimulatorCommandRunner, type SimulatorDevice
@@ -33,6 +36,8 @@ export interface SimulatorLifecycleRuntime {
   setStatusBar?(udid: string, overrides: SimulatorStatusBarOverrides,
     signal?: AbortSignal): Promise<void>;
   clearStatusBar?(udid: string, signal?: AbortSignal): Promise<void>;
+  pushNotification?(udid: string, bundleId: string,
+    payload: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<void>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -81,6 +86,41 @@ const LOCATION_ROUTE_LIMITS = Object.freeze({
 });
 const PRIVACY_SERVICE = /^[a-z][a-z0-9-]{0,63}$/u;
 const BUNDLE_ID = /^[A-Za-z0-9][A-Za-z0-9.-]{1,254}$/u;
+
+/** Validate the exact JSON body that can be sent to simctl without silent field loss. */
+export function serializeSimulatorPushPayload(payload: unknown): string {
+  const seen = new WeakSet<object>();
+  const visit = (value: unknown): boolean => {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+    if (typeof value === "number") return Number.isFinite(value);
+    if (typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    let valid: boolean;
+    if (Array.isArray(value)) valid = value.every(visit);
+    else {
+      const prototype = Object.getPrototypeOf(value);
+      valid = (prototype === Object.prototype || prototype === null) &&
+        Object.getOwnPropertySymbols(value).length === 0 &&
+        Object.keys(value).every(key => visit((value as Record<string, unknown>)[key]));
+    }
+    seen.delete(value);
+    return valid;
+  };
+  try {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+        !Object.prototype.hasOwnProperty.call(payload, "aps") ||
+        !(payload as Record<string, unknown>)["aps"] || !visit(payload)) {
+      throw new Error("Invalid payload.");
+    }
+    const serialized = JSON.stringify(payload);
+    if (typeof serialized !== "string" || Buffer.byteLength(serialized, "utf8") > 4_096) {
+      throw new Error("Invalid payload size.");
+    }
+    return serialized;
+  } catch {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator push payload is invalid.");
+  }
+}
 const STATUS_BAR_KEYS = new Set([
   "time", "dataNetwork", "wifiMode", "wifiBars", "cellularMode", "cellularBars",
   "operatorName", "batteryState", "batteryLevel"
@@ -466,6 +506,53 @@ export function createSimulatorLifecycleRuntime(options: {
     async clearStatusBar(udid, signal) {
       await runSimctlControl(udid, "status_bar", ["clear"],
         "Simulator status bar override could not be cleared.", signal);
+    },
+    async pushNotification(udid, bundleId, payload, signal) {
+      requirePlatform();
+      const normalized = exactUdid(udid);
+      if (typeof bundleId !== "string" || !BUNDLE_ID.test(bundleId)) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator bundle identity is invalid.");
+      }
+      const serialized = serializeSimulatorPushPayload(payload);
+      let tempRoot: string | undefined;
+      let dispatched = false;
+      try {
+        cancelled(signal);
+        tempRoot = await mkdtemp(join(tmpdir(), "joko-ios-push-"));
+        cancelled(signal);
+        const payloadPath = join(tempRoot, "payload.json");
+        await writeFile(payloadPath, serialized, { encoding: "utf8", mode: 0o600, signal });
+        cancelled(signal);
+        dispatched = true;
+        const result = await runMutation(["simctl", "push", normalized, bundleId, payloadPath],
+          15_000, "SIMULATOR_CONTROL_UNKNOWN", signal);
+        if (result.exitCode !== 0 || result.failed) {
+          throw new SimulatorLifecycleError("SIMULATOR_CONTROL_FAILED",
+            "Simulator push notification could not be delivered.");
+        }
+      } catch (error) {
+        if (dispatched) {
+          if (error instanceof SimulatorLifecycleError &&
+              error.code === "SIMULATOR_CONTROL_FAILED") throw error;
+          throw new SimulatorLifecycleError("SIMULATOR_CONTROL_UNKNOWN",
+            "Simulator push outcome is unknown; inspect device state before retrying.");
+        }
+        if (signal?.aborted) {
+          throw new SimulatorLifecycleError("MUTATION_CANCELLED",
+            "Simulator push was cancelled before dispatch.");
+        }
+        if (error instanceof SimulatorLifecycleError) throw error;
+        throw new SimulatorLifecycleError("SIMULATOR_CONTROL_FAILED",
+          "Simulator push payload could not be prepared.");
+      } finally {
+        if (tempRoot) {
+          try { await rm(tempRoot, { recursive: true, force: true }); }
+          catch {
+            throw new SimulatorLifecycleError(dispatched ? "SIMULATOR_CONTROL_UNKNOWN" :
+              "SIMULATOR_CONTROL_FAILED", "Simulator push temporary payload could not be cleaned up.");
+          }
+        }
+      }
     }
   };
 }

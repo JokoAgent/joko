@@ -1,4 +1,5 @@
 import { assessSimulatorResourceAdmission, collectSimulatorMemorySnapshot, createSimulatorEnvironmentRuntime,
+  serializeSimulatorPushPayload,
   type SimulatorEnvironmentReport, type SimulatorEnvironmentRuntime, type SimulatorMemorySnapshot,
   type SimulatorStatusBarOverrides } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
@@ -80,7 +81,8 @@ const STATE_TOOLS = Object.freeze([
   { name: "clear_location", description: "Clear the simulated location or active route.", readOnly: false },
   { name: "set_privacy", description: "Grant, revoke or reset one simulated app privacy permission.", readOnly: false },
   { name: "set_status_bar", description: "Apply bounded deterministic Simulator status-bar overrides.", readOnly: false },
-  { name: "clear_status_bar", description: "Clear all Simulator status-bar overrides.", readOnly: false }
+  { name: "clear_status_bar", description: "Clear all Simulator status-bar overrides.", readOnly: false },
+  { name: "push_notification", description: "Send one bounded APNs payload to an installed app on the exact Simulator.", readOnly: false }
 ] as const);
 
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
@@ -555,6 +557,17 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     } else if (name === "clear_status_bar") {
       onlyKeys(args, ["instanceId", "generation", "leaseId"]);
       action = { type: "clear_status_bar" };
+    } else if (name === "push_notification") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "bundleId", "payload"]);
+      const bundleId = args["bundleId"];
+      if (typeof bundleId !== "string" || !BUNDLE_ID.test(bundleId)) {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator push bundle identity is invalid.");
+      }
+      const payload = args["payload"];
+      try { serializeSimulatorPushPayload(payload); }
+      catch { throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator push payload is invalid."); }
+      action = { type: "push_notification", bundleId,
+        payload: payload as Readonly<Record<string, unknown>> };
     } else {
       throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator state control is unavailable.");
     }

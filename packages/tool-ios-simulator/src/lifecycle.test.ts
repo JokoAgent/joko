@@ -1,3 +1,4 @@
+import { readFile, stat } from "node:fs/promises";
 import { expect, it } from "vitest";
 import { createNodeSimulatorCommandRunner, type SimulatorCommandResult, type SimulatorCommandRunner } from "./environment.js";
 import { createSimulatorLifecycleRuntime } from "./lifecycle.js";
@@ -263,4 +264,58 @@ it("rejects invalid privacy/status-bar controls before dispatch and fences unkno
     result: { stdout: "", stderr: "/private/secret", exitCode: null, timedOut: true } });
   await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner })
     .clearStatusBar!(UDID)).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
+});
+
+it("delivers a bounded push through an exact private temporary file and removes it", async () => {
+  const payload = { aps: { alert: "Hello" }, marker: "private push body" };
+  let payloadPath = "";
+  const runner: SimulatorCommandRunner = { run: async (command, args, options) => {
+    expect(command).toBe(XCRUN);
+    expect(args.slice(0, 4)).toEqual(["simctl", "push", UDID, "app.joko.fixture"]);
+    expect(options?.timeoutMs).toBe(15_000);
+    payloadPath = args[4]!;
+    expect(payloadPath).toMatch(/joko-ios-push-[^\\/]+[\\/]payload\.json$/u);
+    expect(await readFile(payloadPath, "utf8")).toBe(JSON.stringify(payload));
+    if (process.platform !== "win32") expect((await stat(payloadPath)).mode & 0o777).toBe(0o600);
+    return ok();
+  } };
+  await createSimulatorLifecycleRuntime({ platform: "darwin", runner })
+    .pushNotification!(UDID.toLowerCase(), "app.joko.fixture", payload);
+  await expect(stat(payloadPath)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("rejects malformed push bodies before dispatch and cleans an uncertain delivery", async () => {
+  let calls = 0;
+  const payloadPaths: string[] = [];
+  const runner: SimulatorCommandRunner = { run: async (_command, args) => {
+    calls += 1;
+    payloadPaths.push(args[4]!);
+    expect(await readFile(args[4]!, "utf8")).toContain("private push body");
+    return calls === 1
+      ? { stdout: "", stderr: "private host output", exitCode: 1 }
+      : { stdout: "", stderr: "private host output", exitCode: null, timedOut: true };
+  } };
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner });
+  await expect(runtime.pushNotification!(UDID, "invalid bundle", { aps: {} }))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.pushNotification!(UDID, "app.joko.fixture", { marker: "missing aps" }))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.pushNotification!(UDID, "app.joko.fixture", { aps: {}, alert: "界".repeat(1_400) }))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  const cycle: Record<string, unknown> = { aps: {} };
+  cycle["cycle"] = cycle;
+  await expect(runtime.pushNotification!(UDID, "app.joko.fixture", cycle))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  const controller = new AbortController();
+  controller.abort();
+  await expect(runtime.pushNotification!(UDID, "app.joko.fixture", { aps: {} }, controller.signal))
+    .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+  expect(calls).toBe(0);
+  await expect(runtime.pushNotification!(UDID, "app.joko.fixture",
+    { aps: { alert: "private push body" } })).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_FAILED" });
+  await expect(stat(payloadPaths[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(runtime.pushNotification!(UDID, "app.joko.fixture",
+    { aps: { alert: "private push body" } })).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
+  expect(calls).toBe(2);
+  await expect(stat(payloadPaths[1]!)).rejects.toMatchObject({ code: "ENOENT" });
 });

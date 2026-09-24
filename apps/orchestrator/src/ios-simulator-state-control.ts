@@ -1,7 +1,8 @@
 import { OperationConflictError, OperationInProgressError, OperationPreviouslyFailedError,
   type OperationalStore } from "@joko/store";
 import { JokoError } from "@joko/core";
-import { createSimulatorLifecycleRuntime, SimulatorLifecycleError, SimulatorScreenMapError,
+import { createSimulatorLifecycleRuntime, serializeSimulatorPushPayload,
+  SimulatorLifecycleError, SimulatorScreenMapError,
   WdaClientError, type SimulatorAppearance, type SimulatorContentSize,
   type SimulatorLifecycleRuntime, type SimulatorLocationRouteOptions,
   type SimulatorLocationWaypoint, type SimulatorPrivacyAction,
@@ -47,7 +48,7 @@ type StateScreen = Pick<SimulatorScreenObservationCoordinator,
 type StateLifecycle = Pick<SimulatorLifecycleRuntime,
   "setAppearance" | "setIncreaseContrast" | "setContentSize" | "setLocation" |
   "startLocationRoute" | "clearLocation" | "setPrivacy" | "setStatusBar" |
-  "clearStatusBar">;
+  "clearStatusBar" | "pushNotification">;
 
 export type SimulatorStateControlAction =
   | { readonly type: "set_orientation"; readonly snapshotId: string;
@@ -63,7 +64,9 @@ export type SimulatorStateControlAction =
   | { readonly type: "set_privacy"; readonly action: SimulatorPrivacyAction;
       readonly service: string; readonly bundleId?: string }
   | { readonly type: "set_status_bar"; readonly overrides: SimulatorStatusBarOverrides }
-  | { readonly type: "clear_status_bar" };
+  | { readonly type: "clear_status_bar" }
+  | { readonly type: "push_notification"; readonly bundleId: string;
+      readonly payload: Readonly<Record<string, unknown>> };
 
 export interface SimulatorStateControlReceipt {
   readonly interaction: SimulatorStateControlAction["type"];
@@ -83,6 +86,7 @@ export interface SimulatorStateControlReceipt {
   readonly action?: SimulatorPrivacyAction;
   readonly service?: string;
   readonly bundleId?: string | null;
+  readonly delivered?: true;
   readonly overrides?: SimulatorStatusBarOverrides;
 }
 
@@ -178,7 +182,8 @@ export class SimulatorStateControlCoordinator {
             action.type === "clear_location" && !this.#lifecycle.clearLocation ||
             action.type === "set_privacy" && !this.#lifecycle.setPrivacy ||
             action.type === "set_status_bar" && !this.#lifecycle.setStatusBar ||
-            action.type === "clear_status_bar" && !this.#lifecycle.clearStatusBar) {
+            action.type === "clear_status_bar" && !this.#lifecycle.clearStatusBar ||
+            action.type === "push_notification" && !this.#lifecycle.pushNotification) {
           throw new SimulatorStateControlError("CONTROL_UNAVAILABLE",
             "Simulator system setting control is unavailable.");
         }
@@ -261,10 +266,15 @@ export class SimulatorStateControlCoordinator {
         attempted = true;
         await this.#lifecycle.setStatusBar!(instance.simulatorUdid, action.overrides, signal);
         result = { backend: "simctl", overrides: action.overrides };
-      } else {
+      } else if (action.type === "clear_status_bar") {
         attempted = true;
         await this.#lifecycle.clearStatusBar!(instance.simulatorUdid, signal);
         result = { backend: "simctl" };
+      } else {
+        attempted = true;
+        await this.#lifecycle.pushNotification!(instance.simulatorUdid,
+          action.bundleId, action.payload, signal);
+        result = { backend: "simctl", bundleId: action.bundleId, delivered: true };
       }
       const current = this.#ownership.requireRoute(scope, route);
       if (!this.#driver.isReady(current)) {
@@ -355,6 +365,15 @@ export class SimulatorStateControlCoordinator {
       this.#validateStatusBar(action.overrides);
     } else if (action.type === "clear_status_bar") {
       // The exact route and effect authority are the complete request shape.
+    } else if (action.type === "push_notification") {
+      if (typeof action.bundleId !== "string" || !BUNDLE_ID.test(action.bundleId)) {
+        throw new SimulatorStateControlError("INVALID_ARGUMENT",
+          "Simulator push bundle identity is invalid.");
+      }
+      try { serializeSimulatorPushPayload(action.payload); }
+      catch {
+        throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator push payload is invalid.");
+      }
     } else {
       throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator state control is invalid.");
     }
@@ -399,6 +418,9 @@ export class SimulatorStateControlCoordinator {
     }
     if (error instanceof SimulatorLifecycleError && error.code === "SIMULATOR_CONTROL_FAILED") {
       return new SimulatorStateControlError(error.code, error.message);
+    }
+    if (error instanceof SimulatorLifecycleError && error.code === "MUTATION_CANCELLED") {
+      return new SimulatorStateControlError(error.code, "Simulator state control was cancelled before dispatch.");
     }
     if (!attempted && (error instanceof SimulatorStateControlError ||
         error instanceof SimulatorObservationError || error instanceof SimulatorScreenMapError ||
