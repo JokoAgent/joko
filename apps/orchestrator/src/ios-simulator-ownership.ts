@@ -401,6 +401,19 @@ export class SimulatorOwnershipRegistry {
     });
   }
 
+  /** Called only inside a completed, exact physical deletion effect. External attachments cannot use this path. */
+  releaseDeletedCreated(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): PublicSimulatorInstance {
+    return this.#store.transaction(() => {
+      const current = this.#routedInstance(scope, route);
+      this.#assertLiveLease(current, route, this.#now());
+      if (current.creationProvenance !== "joko") throw new SimulatorOwnershipError(
+        "INVALID_ARGUMENT", "Only a Joko-created Simulator can be released after deletion.");
+      const stored = this.#load();
+      this.#save({ format: 1, instances: stored.instances.filter(item => item.instanceId !== current.instanceId) });
+      return publicInstance(current);
+    });
+  }
+
   detachedGraceCandidates(): readonly PublicSimulatorInstance[] {
     return this.#load().instances.filter(item => item.graceExpiresAt !== null).map(publicInstance);
   }

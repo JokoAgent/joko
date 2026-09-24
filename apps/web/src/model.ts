@@ -5273,7 +5273,57 @@ export interface ArtifactDownloadContext {
 /** Browser dispatch does not acknowledge that a file reached the user's disk. */
 export type ArtifactDownloadOutcome = "saved" | "dispatched" | "cancelled";
 
+export interface SimulatorViewerRouteView {
+  readonly instanceId: string;
+  readonly generation: bigint;
+  readonly leaseId: string;
+}
+
+export interface SimulatorViewerDeviceView {
+  readonly udid: string;
+  readonly name: string;
+  readonly state: string;
+  readonly runtimeIdentifier: string;
+  readonly runtimeName: string;
+  readonly deviceTypeIdentifier: string;
+  readonly available: boolean;
+}
+
+export interface SimulatorViewerInstanceView {
+  readonly route: SimulatorViewerRouteView;
+  readonly simulatorUdid: string;
+  readonly simulatorName: string;
+  readonly runtimeIdentifier: string;
+  readonly deviceTypeIdentifier: string;
+  readonly creationProvenance: "joko" | "external";
+  readonly lifecycleState: "stopped" | "ready" | "error";
+  readonly viewerState: "detached" | "attached";
+  readonly healthState: string;
+  readonly errorCode?: string;
+  readonly graceExpiresAtMs?: number;
+}
+
+export interface SimulatorViewerStateView {
+  readonly support: "supported" | "platformLimited" | "temporarilyUnavailable" | "unavailable";
+  readonly reasonCode?: string;
+  readonly devices: readonly SimulatorViewerDeviceView[];
+  readonly instances: readonly SimulatorViewerInstanceView[];
+}
+
+export type SimulatorViewerControlView =
+  | { readonly action: "create"; readonly templateUdid: string; readonly name: string }
+  | { readonly action: "attach"; readonly deviceUdid: string }
+  | { readonly action: "start" | "stop" | "detach" | "delete"; readonly route: SimulatorViewerRouteView };
+
+export interface SimulatorViewerControlResultView {
+  readonly instance: SimulatorViewerInstanceView;
+  readonly deleted: boolean;
+  readonly replayed: boolean;
+}
+
 export interface OperationApi {
+  getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
+  controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   getTerminalCapabilities(sessionId?: string, signal?: AbortSignal): Promise<TerminalCapabilitiesView>;
   listTerminals(sessionId: string, signal?: AbortSignal): Promise<readonly TerminalView[]>;
   createTerminal(sessionId: string, requestId: string, shellId: string, columns: number, rows: number, initialPalette: TerminalPaletteView, signal?: AbortSignal): Promise<TerminalView>;

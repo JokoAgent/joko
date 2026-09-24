@@ -67,6 +67,7 @@ describe("Connect service composition", () => {
       contract.SshKeyService,
       contract.VoiceInputService,
       contract.TerminalService,
+      contract.SimulatorViewerService,
       contract.PiService
     ] as unknown as Array<{ method: Record<string, unknown> }>;
     expect(registrations.map((item) => item.descriptor)).toEqual(expectedServices);

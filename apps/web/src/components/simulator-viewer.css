@@ -1,0 +1,21 @@
+.simulator-viewer { container-type: inline-size; display: grid; gap: 24px; min-width: 0; padding: 20px; }
+.simulator-viewer__header { display: flex; flex-wrap: wrap; align-items: start; justify-content: space-between; gap: 12px; }
+.simulator-viewer__header h2 { margin: 0; font-size: var(--text-20); }
+.simulator-viewer__section { display: grid; gap: 12px; min-width: 0; }
+.simulator-viewer__section h3 { margin: 0; font-size: var(--text-15); }
+.simulator-viewer__section > p { margin: 0; }
+.simulator-viewer__notice { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-subtle); }
+.simulator-viewer__grid, .simulator-viewer__forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; }
+.simulator-viewer__card, .simulator-viewer__forms form { display: grid; align-content: start; gap: 12px; min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-raised); }
+.simulator-viewer__card-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.simulator-viewer__card-header h4 { margin: 0; font-size: var(--text-15); }
+.simulator-viewer__card-header span { color: var(--text-muted); font-size: var(--text-12); }
+.simulator-viewer__screen { display: grid; place-content: center; justify-items: center; gap: 8px; min-height: 175px; padding: 16px; border: 1px dashed var(--line-strong); border-radius: 10px; background: var(--surface-sunken); color: var(--text-muted); text-align: center; }
+.simulator-viewer__screen svg { width: 30px; height: 30px; }
+.simulator-viewer__metadata { margin: 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
+.simulator-viewer__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.simulator-viewer__forms label { display: grid; gap: 5px; min-width: 0; }
+.simulator-viewer__forms input, .simulator-viewer__forms select { width: 100%; min-width: 0; min-height: 36px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+.simulator-viewer__delete { display: grid; gap: 10px; }
+.simulator-viewer__delete p { margin: 0; }
+@container (max-width: 340px) { .simulator-viewer { padding: 12px; } .simulator-viewer__header .button { width: 100%; } }

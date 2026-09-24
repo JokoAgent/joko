@@ -71,6 +71,26 @@ it("rejects an invalid persisted registry as a whole", () => {
   store.close();
 });
 
+it("releases an exact created device after deletion but never an external attachment", () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    const registry = new SimulatorOwnershipRegistry(store);
+    const first = { sessionId: "first", targetId: "target", generation: 1 };
+    const second = { sessionId: "second", targetId: "target", generation: 1 };
+    const external = registry.bindExternalDevice(first, DEVICE);
+    const route = (instance: typeof external) => ({ instanceId: instance.instanceId,
+      generation: instance.generation, leaseId: instance.lease.id });
+    expect(() => registry.releaseDeletedCreated(first, route(external))).toThrow(/Joko-created/u);
+    registry.releaseDetached(first, route(external));
+    const created = registry.bindCreatedDevice(second, DEVICE, "Joko iPhone");
+    const attached = registry.attachViewer(second, route(created));
+    expect(() => registry.releaseDeletedCreated(second, route(created))).toThrow(/stale/u);
+    expect(registry.releaseDeletedCreated(second, route(attached)).instanceId).toBe(created.instanceId);
+    expect(registry.listForTask(second)).toEqual([]);
+  } finally { store.close(); }
+});
+
 it("rotates an exact Viewer route and releases only a detached owned binding", () => {
   const store = new OperationalStore(":memory:");
   try {

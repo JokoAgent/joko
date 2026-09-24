@@ -1826,6 +1826,13 @@ export function useAppController(): AppController {
       closeTerminal: (...args: Parameters<OperationApi["closeTerminal"]>) => original().closeTerminal(...args)
     };
   }, [artifactGateway]);
+  const simulatorViewerApi = useMemo(() => {
+    const original = () => { if (artifactGateway === undefined) throw new Error("Connect to Joko before using Simulator Viewer."); return artifactGateway; };
+    return {
+      getSimulatorViewerState: (...args: Parameters<OperationApi["getSimulatorViewerState"]>) => original().getSimulatorViewerState(...args),
+      controlSimulatorInstance: (...args: Parameters<OperationApi["controlSimulatorInstance"]>) => original().controlSimulatorInstance(...args)
+    };
+  }, [artifactGateway]);
   const readWorkspaceFile = useCallback<AppController["readWorkspaceFile"]>(async (workspaceId, path) => {
     if (artifactGateway === undefined) throw new Error("Connect to Joko before reading a workspace file.");
     return artifactGateway.readWorkspaceFile(workspaceId, path);
@@ -2016,6 +2023,7 @@ export function useAppController(): AppController {
     cancelTaskHistoryCleanup: (maintenanceId) => gateway().cancelTaskHistoryCleanup(maintenanceId),
     ...voiceApi,
     ...terminalApi,
+    ...simulatorViewerApi,
     testVoiceInputConnection: (signal) => gateway().testVoiceInputConnection(signal),
     adviseVoiceInputDictionaryEdit: (draft, signal) => gateway().adviseVoiceInputDictionaryEdit(draft, signal),
     startReview: (sourceSessionId, focus, attachments) => gateway().startReview(sourceSessionId, focus, attachments),
@@ -2591,7 +2599,7 @@ export function useAppController(): AppController {
     copyArtifactFile,
     openArtifactFile,
     revealArtifactSource
-  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
+  }), [saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setMachineSelection, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

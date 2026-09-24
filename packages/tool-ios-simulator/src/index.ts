@@ -16,5 +16,6 @@ export * from "./visual-diff.js";
 export * from "./native-touch-path.js";
 export * from "./native-hid-runtime.js";
 export * from "./recording-runtime.js";
+export * from "./delete.js";
 export * from "./project-build.js";
 export * from "./app-artifact.js";

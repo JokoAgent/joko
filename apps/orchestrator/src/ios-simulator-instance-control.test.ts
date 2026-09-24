@@ -40,7 +40,8 @@ function seed(store: OperationalStore): void {
 }
 
 function harness(store: OperationalStore, options: { readonly now?: () => number;
-  readonly detachGraceMs?: number; readonly onShutdown?: () => Promise<void> } = {}) {
+  readonly detachGraceMs?: number; readonly onShutdown?: () => Promise<void>;
+  readonly onDelete?: () => Promise<void> } = {}) {
   seed(store);
   const events: string[] = [];
   const devices = new Map<string, SimulatorDevice>([[TEMPLATE, template]]);
@@ -96,7 +97,17 @@ function harness(store: OperationalStore, options: { readonly now?: () => number
     { create: createRuntime, lifecycle: lifecycleRuntime });
   return { control: new SimulatorInstanceControlCoordinator(store, ownership,
     { create, lifecycle, driver, devices: lifecycleRuntime, now: options.now,
-      detachGraceMs: options.detachGraceMs }), ownership, driver, events, devices };
+      detachGraceMs: options.detachGraceMs,
+      recording: { discardInstance: async () => { events.push("recording-discard"); } },
+      deleteRuntime: { deleteExact: async input => {
+        expect(input.udid).toBe(CREATED);
+        expect(input.name).toBe("Joko iPhone");
+        expect(store.listOperations({ sessionId: SCOPE.sessionId, status: "started" })
+          .some(operation => operation.kind === "ios_simulator_instance_control")).toBe(true);
+        events.push("delete");
+        await options.onDelete?.();
+        devices.delete(input.udid);
+      } } }), ownership, driver, events, devices };
 }
 
 it("composes durable create, boot, driver, Viewer and stop effects with exact replay", async () => {
@@ -124,6 +135,49 @@ it("composes durable create, boot, driver, Viewer and stop effects with exact re
       .rejects.toMatchObject({ code: "STALE_SCOPE" });
     h.control.dispose();
   } finally { store.close(); }
+});
+
+it("retires recording and driver, shuts down, then deletes only the exact created instance", async () => {
+  const store = new OperationalStore(":memory:");
+  const h = harness(store);
+  try {
+    const created = await h.control.create(SCOPE,
+      { templateUdid: TEMPLATE, name: "Joko iPhone" }, authority("a"));
+    const running = await h.control.start(SCOPE, route(created.instance), authority("b"));
+    const deleted = await h.control.delete(SCOPE, route(running.instance), authority("c"));
+    expect(deleted).toMatchObject({ replayed: false,
+      instance: { instanceId: running.instance.instanceId, creationProvenance: "joko" } });
+    expect(h.events.slice(-6)).toEqual(["recording-discard", "driver-stop", "retry-cleanup",
+      "orphan-cleanup", "shutdown", "delete"]);
+    expect(h.ownership.listForTask(SCOPE)).toEqual([]);
+    expect(h.devices.has(CREATED)).toBe(false);
+    expect(await h.control.delete(SCOPE, route(running.instance), authority("c")))
+      .toMatchObject({ replayed: true });
+    expect(h.events.filter(event => event === "delete")).toHaveLength(1);
+  } finally { h.control.dispose(); store.close(); }
+});
+
+it("forbids deletion of external attachments and retains ownership after an uncertain delete", async () => {
+  const store = new OperationalStore(":memory:");
+  let fail = true;
+  const h = harness(store, { onDelete: async () => {
+    if (fail) { fail = false; throw new Error("delete did not confirm"); }
+  } });
+  try {
+    const external = h.ownership.bindExternalDevice(SCOPE, template);
+    await expect(h.control.delete(SCOPE, route(external), authority("d")))
+      .rejects.toMatchObject({ code: "DELETE_FORBIDDEN" });
+    expect(h.events).not.toContain("delete");
+    h.ownership.releaseDetached(SCOPE, route(external));
+    const created = await h.control.create(SCOPE,
+      { templateUdid: TEMPLATE, name: "Joko iPhone" }, authority("e"));
+    await expect(h.control.delete(SCOPE, route(created.instance), authority("f")))
+      .rejects.toMatchObject({ code: "INSTANCE_CONTROL_UNKNOWN" });
+    expect(h.ownership.listForTask(SCOPE)).toHaveLength(1);
+    expect(h.devices.has(CREATED)).toBe(true);
+    await h.control.delete(SCOPE, route(created.instance), authority("0"));
+    expect(h.ownership.listForTask(SCOPE)).toEqual([]);
+  } finally { h.control.dispose(); store.close(); }
 });
 
 it("attaches an exact preexisting booted device and retains its driver on a ready start", async () => {

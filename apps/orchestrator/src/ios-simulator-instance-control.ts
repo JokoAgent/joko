@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { createSimulatorLifecycleRuntime, SimulatorCreateError, SimulatorLifecycleError,
-  SimulatorResourceError, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
+  SimulatorResourceError, createSimulatorOwnedDeleteRuntime, SimulatorDeleteError,
+  type SimulatorLifecycleRuntime, type SimulatorOwnedDeleteRuntime } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import { SimulatorCreateCoordinator } from "./ios-simulator-create-coordinator.js";
 import { SimulatorDriverCoordinator, SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorLifecycleCoordinator, type SimulatorLifecycleEffectAuthority } from "./ios-simulator-lifecycle-coordinator.js";
+import { SimulatorRecordingError, type SimulatorRecordingCoordinator } from "./ios-simulator-recording.js";
 import { SimulatorOwnershipError, SimulatorOwnershipRegistry,
   type PublicSimulatorInstance, type SimulatorInstanceRoute, type SimulatorTaskScope } from "./ios-simulator-ownership.js";
 
@@ -17,7 +19,8 @@ const DETACH_RETRY_MS = 60_000;
 
 export class SimulatorInstanceControlError extends Error {
   constructor(readonly code: "INVALID_ARGUMENT" | "MUTATION_CANCELLED" | "INSTANCE_CONTROL_UNKNOWN" |
-    "STALE_INSTANCE" | "MUTATION_IN_PROGRESS", message: string) { super(message); }
+    "STALE_INSTANCE" | "MUTATION_IN_PROGRESS" | "DELETE_FORBIDDEN" | "DELETE_UNAVAILABLE",
+    message: string) { super(message); }
 }
 
 export interface SimulatorInstanceControlExecution {
@@ -37,6 +40,8 @@ export class SimulatorInstanceControlCoordinator {
   readonly #lifecycle: SimulatorLifecycleCoordinator;
   readonly #driver: SimulatorDriverCoordinator;
   readonly #devices: SimulatorLifecycleRuntime;
+  readonly #deleteRuntime: SimulatorOwnedDeleteRuntime;
+  readonly #recording: Pick<SimulatorRecordingCoordinator, "discardInstance"> | undefined;
   readonly #now: () => number;
   readonly #graceMs: number;
   readonly #timers = new Map<string, NodeJS.Timeout>();
@@ -48,6 +53,8 @@ export class SimulatorInstanceControlCoordinator {
     readonly lifecycle: SimulatorLifecycleCoordinator;
     readonly driver: SimulatorDriverCoordinator;
     readonly devices?: SimulatorLifecycleRuntime;
+    readonly deleteRuntime?: SimulatorOwnedDeleteRuntime;
+    readonly recording?: Pick<SimulatorRecordingCoordinator, "discardInstance">;
     readonly now?: () => number;
     readonly detachGraceMs?: number;
   }) {
@@ -57,6 +64,8 @@ export class SimulatorInstanceControlCoordinator {
     this.#lifecycle = input.lifecycle;
     this.#driver = input.driver;
     this.#devices = input.devices ?? createSimulatorLifecycleRuntime();
+    this.#deleteRuntime = input.deleteRuntime ?? createSimulatorOwnedDeleteRuntime();
+    this.#recording = input.recording;
     this.#now = input.now ?? Date.now;
     this.#graceMs = input.detachGraceMs ?? DETACH_GRACE_MS;
     if (!Number.isSafeInteger(this.#graceMs) || this.#graceMs < 1) {
@@ -128,6 +137,55 @@ export class SimulatorInstanceControlCoordinator {
       }, signal);
   }
 
+  /** UI-only action: physical deletion must be confirmed before ownership is released. */
+  delete(scope: SimulatorTaskScope, instanceRoute: SimulatorInstanceRoute,
+    authority: SimulatorLifecycleEffectAuthority, signal?: AbortSignal): Promise<SimulatorInstanceControlExecution> {
+    return this.#run("delete", scope, { ...instanceRoute }, authority, () => {
+      const instance = this.#ownership.requireRoute(scope, instanceRoute);
+      if (instance.creationProvenance !== "joko") throw new SimulatorInstanceControlError(
+        "DELETE_FORBIDDEN", "Only a Joko-created Simulator can be deleted.");
+      if (!this.#recording) throw new SimulatorInstanceControlError(
+        "DELETE_UNAVAILABLE", "Simulator recording cleanup is unavailable.");
+    }, async () => {
+      const instance = this.#ownership.requireRoute(scope, instanceRoute);
+      let leaseFailure: unknown;
+      const timer = setInterval(() => {
+        try { this.#ownership.heartbeatRoute(scope, instanceRoute); }
+        catch (error) { leaseFailure = error; }
+      }, 5_000);
+      timer.unref?.();
+      const current = (): void => {
+        if (leaseFailure) throw leaseFailure;
+        this.#ownership.requireRoute(scope, instanceRoute);
+        if (signal?.aborted) throw new SimulatorInstanceControlError(
+          "INSTANCE_CONTROL_UNKNOWN", "Simulator deletion was interrupted.");
+      };
+      try {
+        current();
+        await this.#recording!.discardInstance(instance.instanceId);
+        current();
+        await this.#driver.retireAbandoned(instance, signal);
+        current();
+        const device = await this.#devices.findExact(instance.simulatorUdid, signal);
+        if (device && (device.udid.toUpperCase() !== instance.simulatorUdid ||
+            device.name !== instance.simulatorName ||
+            device.runtimeIdentifier !== instance.runtimeIdentifier ||
+            device.deviceTypeIdentifier !== instance.deviceTypeIdentifier)) throw new SimulatorDeleteError(
+          "DEVICE_IDENTITY_CHANGED", "Simulator device identity changed before deletion.");
+        current();
+        if (device && device.state.toLowerCase() !== "shutdown") {
+          await this.#devices.shutdownExact(instance.simulatorUdid, signal);
+        }
+        current();
+        await this.#deleteRuntime.deleteExact({ udid: instance.simulatorUdid,
+          name: instance.simulatorName, runtimeIdentifier: instance.runtimeIdentifier,
+          deviceTypeIdentifier: instance.deviceTypeIdentifier }, signal);
+        current();
+        return instance;
+      } finally { clearInterval(timer); }
+    }, () => this.#ownership.releaseDeletedCreated(scope, instanceRoute), signal);
+  }
+
   /** Re-arm persisted grace after Store startup recovery; due records are handled before returning. */
   async reconcileDetachedGrace(): Promise<void> {
     for (const candidate of this.#ownership.detachedGraceCandidates()) {
@@ -170,7 +228,7 @@ export class SimulatorInstanceControlCoordinator {
     return instances.map(instance => ({ instanceId: instance.instanceId, ...this.#driver.diagnose(instance) }));
   }
 
-  async #run(action: "create" | "attach" | "start" | "stop" | "detach", scope: SimulatorTaskScope,
+  async #run(action: "create" | "attach" | "start" | "stop" | "detach" | "delete", scope: SimulatorTaskScope,
     arguments_: Readonly<Record<string, unknown>>, authority: SimulatorLifecycleEffectAuthority,
     admit: () => unknown, perform: () => Promise<PublicSimulatorInstance>,
     finish: (instance: PublicSimulatorInstance) => PublicSimulatorInstance,
@@ -205,7 +263,7 @@ export class SimulatorInstanceControlCoordinator {
     });
     if (!claim.claimed) {
       const current = this.#ownership.listForTask(scope).find(item => item.instanceId === claim.value.instanceId);
-      const released = action === "detach" && !current &&
+      const released = (action === "detach" || action === "delete") && !current &&
         this.#ownership.deviceByUdid(claim.value.simulatorUdid) === null;
       if (!released && (!current || current.generation !== claim.value.generation)) {
         throw new SimulatorInstanceControlError("STALE_INSTANCE", "Simulator instance changed after this operation.");
@@ -222,7 +280,8 @@ export class SimulatorInstanceControlCoordinator {
     } catch (error) {
       const safe = error instanceof SimulatorInstanceControlError || error instanceof SimulatorCreateError ||
         error instanceof SimulatorLifecycleError || error instanceof SimulatorResourceError ||
-        error instanceof SimulatorDriverError || error instanceof SimulatorOwnershipError ? error
+        error instanceof SimulatorDriverError || error instanceof SimulatorOwnershipError ||
+        error instanceof SimulatorDeleteError || error instanceof SimulatorRecordingError ? error
         : error instanceof OperationInProgressError
           ? new SimulatorInstanceControlError("MUTATION_IN_PROGRESS", "Simulator operation is already in progress.")
           : new SimulatorInstanceControlError("INSTANCE_CONTROL_UNKNOWN", "Simulator instance outcome is unknown.");

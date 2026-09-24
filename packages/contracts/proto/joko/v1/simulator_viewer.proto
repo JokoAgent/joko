@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/capability.proto";
+
+// Visible Viewer controls use authenticated task authority, never an agent Tool call.
+service SimulatorViewerService {
+  rpc GetSimulatorViewerState(GetSimulatorViewerStateRequest) returns (GetSimulatorViewerStateResponse);
+  rpc ControlSimulatorInstance(ControlSimulatorInstanceRequest) returns (ControlSimulatorInstanceResponse);
+}
+
+enum SimulatorViewerAction {
+  SIMULATOR_VIEWER_ACTION_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_ACTION_CREATE = 1;
+  SIMULATOR_VIEWER_ACTION_ATTACH = 2;
+  SIMULATOR_VIEWER_ACTION_START = 3;
+  SIMULATOR_VIEWER_ACTION_STOP = 4;
+  SIMULATOR_VIEWER_ACTION_DETACH = 5;
+  SIMULATOR_VIEWER_ACTION_DELETE = 6;
+}
+
+message SimulatorViewerRoute {
+  string instance_id = 1;
+  uint64 generation = 2;
+  string lease_id = 3;
+}
+
+message SimulatorViewerDevice {
+  string udid = 1;
+  string name = 2;
+  string state = 3;
+  string runtime_identifier = 4;
+  string runtime_name = 5;
+  string device_type_identifier = 6;
+  bool available = 7;
+}
+
+message SimulatorViewerInstance {
+  SimulatorViewerRoute route = 1;
+  string simulator_udid = 2;
+  string simulator_name = 3;
+  string runtime_identifier = 4;
+  string device_type_identifier = 5;
+  string creation_provenance = 6;
+  string boot_provenance = 7;
+  string lifecycle_state = 8;
+  string viewer_state = 9;
+  string health_state = 10;
+  string error_code = 11;
+  uint64 grace_expires_at_ms = 12;
+  uint64 lease_expires_at_ms = 13;
+}
+
+message GetSimulatorViewerStateRequest {
+  string session_id = 1;
+}
+
+message GetSimulatorViewerStateResponse {
+  CapabilitySupport support = 1;
+  string reason_code = 2;
+  repeated SimulatorViewerDevice devices = 3;
+  repeated SimulatorViewerInstance instances = 4;
+}
+
+message ControlSimulatorInstanceRequest {
+  string session_id = 1;
+  string request_id = 2;
+  SimulatorViewerAction action = 3;
+  SimulatorViewerRoute route = 4;
+  string template_udid = 5;
+  string name = 6;
+  string device_udid = 7;
+}
+
+message ControlSimulatorInstanceResponse {
+  SimulatorViewerInstance instance = 1;
+  bool deleted = 2;
+  bool replayed = 3;
+}

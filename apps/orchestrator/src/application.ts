@@ -127,7 +127,8 @@ import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } fr
 import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import { SimulatorInputCoordinator } from "./ios-simulator-input-coordinator.js";
-import { createSimulatorLifecycleRuntime, inspectSimulatorAppArtifact, type SimulatorCreateRuntime,
+import { createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
+  inspectSimulatorAppArtifact, type SimulatorCreateRuntime,
   type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
 import { SimulatorStateControlCoordinator } from "./ios-simulator-state-control.js";
 import { SimulatorProjectBuildCoordinator } from "./ios-simulator-project-build.js";
@@ -138,7 +139,9 @@ import { SimulatorScreenshotCoordinator } from "./ios-simulator-screenshot.js";
 import { SimulatorRecordingCoordinator } from "./ios-simulator-recording.js";
 import { SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
 import { SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
-import type { SimulatorProjectBuilder, SimulatorRecordingRuntime } from "@joko/tool-ios-simulator";
+import type { SimulatorViewerServiceOwner } from "./simulator-viewer-connect-service.js";
+import type { SimulatorProjectBuilder, SimulatorRecordingRuntime,
+  SimulatorOwnedDeleteRuntime } from "@joko/tool-ios-simulator";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -353,6 +356,7 @@ export interface OrchestratorApplication {
   readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
   readonly sshKeys?: SshKeyManager;
   readonly terminals?: TerminalProvider;
+  readonly simulatorViewer?: SimulatorViewerServiceOwner;
   readonly voiceInput?: VoiceInputCoordinator;
   readonly voiceInputSettings?: VoiceInputSettingsController;
   readonly mobilePush?: MobilePushCoordinator;
@@ -478,6 +482,7 @@ export interface OrchestratorApplicationDependencies {
     readonly projectBuilder?: Pick<SimulatorProjectBuilder, "inspect" | "build" | "readXcresult">;
     readonly inspectAppArtifact?: typeof inspectSimulatorAppArtifact;
     readonly recording?: SimulatorRecordingRuntime;
+    readonly delete?: SimulatorOwnedDeleteRuntime;
   };
 }
 
@@ -838,6 +843,7 @@ export async function createOrchestratorApplication(
         : config.browser ? { pdfRenderer: new ChromiumDocumentPdfRenderer(config.browser.executablePath) } : {}) })
   );
   const simulatorOwnership = new SimulatorOwnershipRegistry(store);
+  const simulatorEnvironment = dependencies.simulatorRuntime?.environment ?? createSimulatorEnvironmentRuntime();
   const simulatorPendingCreate = config.iosSimulatorDriver === undefined
     ? undefined : new SimulatorPendingCreateRegistry(store);
   const simulatorCreate = simulatorPendingCreate === undefined ? undefined
@@ -850,12 +856,20 @@ export async function createOrchestratorApplication(
         lifecycle: dependencies.simulatorRuntime?.lifecycle,
         ...dependencies.simulatorRuntime?.driver
       });
+  const simulatorRecording = simulatorDriver === undefined || config.iosSimulatorDriver === undefined
+    ? undefined : new SimulatorRecordingCoordinator(store, simulatorOwnership, simulatorDriver, artifacts,
+        join(config.dataDirectory, "simulator-recordings"), {
+          runtime: dependencies.simulatorRuntime?.recording,
+          device: dependencies.simulatorRuntime?.lifecycle
+        });
   const simulatorControl = simulatorDriver === undefined || simulatorCreate === undefined
     ? undefined : new SimulatorInstanceControlCoordinator(store, simulatorOwnership, {
       create: simulatorCreate,
       lifecycle: new SimulatorLifecycleCoordinator(store, simulatorOwnership, dependencies.simulatorRuntime?.lifecycle),
       driver: simulatorDriver,
-      devices: dependencies.simulatorRuntime?.lifecycle
+      devices: dependencies.simulatorRuntime?.lifecycle,
+      recording: simulatorRecording,
+      deleteRuntime: dependencies.simulatorRuntime?.delete
     });
   const simulatorScreen = simulatorDriver === undefined ? undefined
     : new SimulatorScreenObservationCoordinator(simulatorOwnership, simulatorDriver);
@@ -884,18 +898,20 @@ export async function createOrchestratorApplication(
   const simulatorScreenshot = simulatorScreen === undefined ? undefined
     : new SimulatorScreenshotCoordinator(store, simulatorOwnership, artifacts,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
-    const simulatorRecording = simulatorScreen === undefined || simulatorDriver === undefined ||
-      config.iosSimulatorDriver === undefined ? undefined
-      : new SimulatorRecordingCoordinator(store, simulatorOwnership, simulatorDriver, artifacts,
-        join(config.dataDirectory, "simulator-recordings"), {
-        runtime: dependencies.simulatorRuntime?.recording,
-        device: dependencies.simulatorRuntime?.lifecycle
-      });
   const simulatorVisual = simulatorScreen === undefined ? undefined
     : new SimulatorVisualComparisonCoordinator(store, simulatorOwnership,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
   const simulatorStateDiagnostics = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorStateDiagnosticsCoordinator(simulatorOwnership, simulatorDriver, simulatorScreen);
+  const simulatorViewer: SimulatorViewerServiceOwner | undefined = simulatorControl === undefined ? undefined : {
+    ownership: simulatorOwnership, control: simulatorControl, environment: simulatorEnvironment,
+    clearInstance: async instanceId => {
+      simulatorScreen?.clear(instanceId);
+      simulatorVisual?.clear(instanceId);
+      simulatorStateDiagnostics?.clear(instanceId);
+      await simulatorRecording?.discardInstance(instanceId);
+    }
+  };
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
     new IosSimulatorToolBridgeProvider({ store, ownership: simulatorOwnership, control: simulatorControl,
       screen: simulatorScreen, input: simulatorInput, stateControl: simulatorStateControl,
@@ -903,7 +919,7 @@ export async function createOrchestratorApplication(
       appControl: simulatorAppControl, urlControl: simulatorUrlControl,
       screenshot: simulatorScreenshot, recording: simulatorRecording, visual: simulatorVisual,
       stateDiagnostics: simulatorStateDiagnostics,
-      runtime: dependencies.simulatorRuntime?.environment })
+      runtime: simulatorEnvironment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
     store,
@@ -2350,6 +2366,7 @@ export async function createOrchestratorApplication(
     remoteBackendRuntimeSetup,
     sshKeys,
     terminals,
+    simulatorViewer,
     voiceInput,
     voiceInputSettings,
     mobilePush,

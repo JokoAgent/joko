@@ -43,6 +43,7 @@ import {
   Plus,
   RefreshCcw,
   Search,
+  Smartphone,
   ShieldAlert,
   SquareArrowOutUpRight,
   Square,
@@ -98,6 +99,7 @@ import { SubagentsPanel } from "./SubagentsPanel.js";
 import { InspectorTabErrorBoundary } from "./InspectorTabErrorBoundary.js";
 import { SortableList } from "./SortableList.js";
 import { BrowserCanvas } from "./ToolsPage.js";
+import { SimulatorViewerPanel } from "./SimulatorViewerPanel.js";
 import { BrowserLostPageCard, BrowserPageRail } from "./BrowserPageRail.js";
 import { sessionBrowserCommentDraftTarget } from "../browser-comment-draft-target.js";
 import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
@@ -258,6 +260,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     ...(canSubagents ? ["subagents" as const] : []),
     ...(canUserShell ? ["shell" as const] : []),
     "terminal",
+    "simulator",
     "tools",
     ...(canBrowser ? ["browser" as const] : [])
   ]), [canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
@@ -991,6 +994,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
           {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.preferences.locale} t={t} runAction={runAction} />}
           {tab.kind === "shell" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
           {tab.kind === "terminal" && terminalCapabilities !== undefined && <Suspense fallback={<p role="status">{t("terminal.connecting")}</p>}><InteractiveTerminalPanel controller={controller} sessionId={session.id} terminalId={tab.id} active={open && tab.id === bucket.activeTabId} capabilities={terminalCapabilities} t={t} onState={(value) => setTerminalRecords((current) => current[value.id]?.generation === value.generation && current[value.id]?.status === value.status && current[value.id]?.shellLabel === value.shellLabel ? current : { ...current, [value.id]: value })} /></Suspense>}
+          {tab.kind === "simulator" && <SimulatorViewerPanel controller={controller} sessionId={session.id} active={open && tab.id === bucket.activeTabId} t={t} />}
           {tab.kind === "tools" && <ToolPanel
             toolItems={toolItems}
             resources={snapshot.resources}
@@ -1053,7 +1057,7 @@ function InspectorTabPill({ tab, active, label, closeLabel, onActivate, onClose,
 }
 
 function inspectorTabKindsInMenuOrder(): readonly InspectorTabKind[] {
-  return ["context", "files", "changes", "branches", "background", "subagents", "browser", "terminal", "shell", "tools"];
+  return ["context", "files", "changes", "branches", "background", "subagents", "browser", "simulator", "terminal", "shell", "tools"];
 }
 
 function inspectorTabLabel(kind: InspectorTabKind, t: Translator): string {
@@ -1066,6 +1070,7 @@ function inspectorTabLabel(kind: InspectorTabKind, t: Translator): string {
     case "subagents": return t("subagents.title");
     case "shell": return t("composer.shell");
     case "terminal": return t("terminal.title");
+    case "simulator": return t("simulator.title");
     case "tools": return t("nav.tools");
     case "browser": return t("tools.browser");
   }
@@ -1082,6 +1087,7 @@ function inspectorTabIcon(kind: InspectorTabKind): JSX.Element {
     case "shell":
     case "terminal": return <Terminal aria-hidden="true" />;
     case "tools": return <Wrench aria-hidden="true" />;
+    case "simulator": return <Smartphone aria-hidden="true" />;
     case "browser": return <Globe2 aria-hidden="true" />;
   }
 }

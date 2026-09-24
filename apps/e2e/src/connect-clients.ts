@@ -23,6 +23,7 @@ import {
   SkillService,
   TargetService,
   TerminalService,
+  SimulatorViewerService,
   ToolService,
   VoiceInputService,
   WorktreeService,
@@ -55,6 +56,7 @@ export interface E2eClients {
   readonly browser: Client<typeof BrowserService>;
   readonly pi: Client<typeof PiService>;
   readonly terminal: Client<typeof TerminalService>;
+  readonly simulatorViewer: Client<typeof SimulatorViewerService>;
   readonly worktree: Client<typeof WorktreeService>;
 }
 
@@ -105,6 +107,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     browser: createClient(BrowserService, transport),
     pi: createClient(PiService, transport),
     terminal: createClient(TerminalService, transport),
+    simulatorViewer: createClient(SimulatorViewerService, transport),
     worktree: createClient(WorktreeService, transport)
   };
 }
