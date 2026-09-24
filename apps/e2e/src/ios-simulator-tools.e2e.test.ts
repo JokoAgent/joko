@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import {
   CredentialManager, CredentialVault, IOS_SIMULATOR_TOOL_PROVIDER_ID, IosSimulatorToolBridgeProvider,
   McpRouter, SimulatorOwnershipRegistry, SimulatorScreenshotCoordinator,
+  SimulatorVisualComparisonCoordinator,
   createInternalServer, createOrchestratorApplication, type OrchestratorConfig
 } from "@joko/orchestrator";
 import { expect, it } from "vitest";
@@ -82,7 +83,9 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
 });
 
 it("downloads a task-owned Simulator screenshot through authenticated Connect after Tool capture", async () => {
-  const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4]);
+  const image = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWNgYGD4DwABBAEAfbLI3wAAAABJRU5ErkJggg==", "base64");
+  const changedImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWPQ4OL6DwAB1gE8svJN/gAAAABJRU5ErkJggg==", "base64");
+  let visualFrame = image;
   const device = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "iPhone test",
     state: "Booted", isAvailable: true,
     runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0",
@@ -101,12 +104,14 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
         const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
         await mcpRouter.initialize();
         const ownership = new SimulatorOwnershipRegistry(store);
-        const screenshot = new SimulatorScreenshotCoordinator(store, ownership, artifacts, {
+        const simulatorRuntime = {
           findExact: async () => device,
-          takeScreenshot: async () => { captures += 1; return image; }
-        });
+          takeScreenshot: async () => { captures += 1; return visualFrame; }
+        };
+        const screenshot = new SimulatorScreenshotCoordinator(store, ownership, artifacts, simulatorRuntime);
+        const visual = new SimulatorVisualComparisonCoordinator(store, ownership, simulatorRuntime);
         mcpRouter.registerBridgeToolProvider(new IosSimulatorToolBridgeProvider({ store, ownership,
-          screenshot, runtime: { inspect: async () => ({ platform: "darwin", supported: true,
+          screenshot, visual, runtime: { inspect: async () => ({ platform: "darwin", supported: true,
             ready: true, xcodeVersion: "Xcode fixture", runtimes: [], devices: [device],
             issue: null, error: null, setupSteps: [] }) } }));
         return { mcpRouter };
@@ -126,26 +131,28 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
     const snapshot = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${url}/internal/mcp`,
       sessionId, targetId, expectedPiGeneration: generation });
     const requestId = randomUUID();
-    const invoke = async () => {
+    const route = { instanceId: instance.instanceId, generation: instance.generation,
+      leaseId: instance.lease.id };
+    const invoke = async (name = "take_simulator_screenshot",
+      args: Record<string, unknown> = route, callId = requestId) => {
       const response = await fetch(`${url}/internal/mcp`, { method: "POST", headers: {
         authorization: `Bearer ${snapshot.mcpBridge.token}`, "content-type": "application/json",
         "x-joko-pi-generation": String(generation)
-      }, body: JSON.stringify({ requestId, sessionId, targetId, generation,
+      }, body: JSON.stringify({ requestId: callId, sessionId, targetId, generation,
         serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID, toolName: "control_tool",
-        arguments: { name: "take_simulator_screenshot", args: {
-          instanceId: instance.instanceId, generation: instance.generation,
-          leaseId: instance.lease.id } } }) });
+        arguments: { name, args } }) });
       expect(response.ok).toBe(true);
       return await response.json() as { isError: boolean; details: {
-        mcpStructuredContent: { data: { replayed: boolean } };
-        jokoMcpBridge: { imageOutputs: Array<{ blob: { id: string; sha256: string;
+        mcpStructuredContent: { data: { replayed: boolean; baselineId?: string;
+          diff?: { differentPixels: number; meanAbsoluteError: number } } };
+        jokoMcpBridge: { imageOutputs?: Array<{ blob: { id: string; sha256: string;
           byteLength: number; mimeType: string } }> } } };
     };
     const first = await invoke();
     expect(first).toMatchObject({ isError: false, details: { mcpStructuredContent: {
       data: { replayed: false } }, jokoMcpBridge: { imageOutputs: [
         { blob: { mimeType: "image/png", byteLength: image.byteLength } }] } } });
-    const blob = first.details.jokoMcpBridge.imageOutputs[0]!.blob;
+    const blob = first.details.jokoMcpBridge.imageOutputs![0]!.blob;
     expect(fixture.application.store.getArtifact(blob.id).blob.sha256).toBe(blob.sha256);
     const downloadTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: blob.id });
     const downloaded = await fetch(`${fixture.baseUrl}${downloadTicket.ticket!.relativeEndpoint}`, {
@@ -155,6 +162,17 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
     expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(image);
     expect((await invoke()).details.mcpStructuredContent.data.replayed).toBe(true);
     expect(captures).toBe(1);
+    const baseline = await invoke("capture_visual_baseline", route, randomUUID());
+    expect(baseline).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { baselineId: expect.any(String), replayed: false } } } });
+    expect(baseline.details.jokoMcpBridge.imageOutputs).toBeUndefined();
+    const baselineId = baseline.details.mcpStructuredContent.data.baselineId!;
+    visualFrame = changedImage;
+    const diff = await invoke("visual_diff", { ...route, baselineId }, randomUUID());
+    expect(diff).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { baselineId, diff: { differentPixels: 1, meanAbsoluteError: 15 } } } } });
+    expect(diff.details.jokoMcpBridge.imageOutputs).toBeUndefined();
+    expect(captures).toBe(3);
     snapshot.revoke();
   } finally {
     await internal?.close();
@@ -194,7 +212,9 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
   let terminateCalls = 0;
   let urlCalls = 0;
   let screenshotCalls = 0;
-  const screenshotBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+  const screenshotBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWNgYGD4DwABBAEAfbLI3wAAAABJRU5ErkJggg==", "base64");
+  const changedScreenBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWPQ4OL6DwAB1gE8svJN/gAAAABJRU5ErkJggg==", "base64");
+  let visualFrame = screenshotBytes;
   const privateUrl = "myapp://screen?token=private-url-value";
   try {
     application = await createOrchestratorApplication(config, { simulatorRuntime: {
@@ -238,8 +258,9 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
           screenshotCalls += 1;
           expect(value).toBe(udid);
           expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
-            .some(operation => operation.kind === "ios_simulator_screenshot")).toBe(true);
-          return screenshotBytes;
+            .some(operation => operation.kind === "ios_simulator_screenshot" ||
+              operation.kind === "ios_simulator_visual_capture")).toBe(true);
+          return visualFrame;
         } },
       projectBuilder: {
         inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
@@ -286,7 +307,8 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
         imageOutputs?: Array<{ blob: { id: string; sha256: string; byteLength: number; mimeType: string } }> };
         mcpStructuredContent: {
         data?: { artifact?: { artifactId: string; bundleId: string };
-          diagnostics?: { diagnosticsId: string }; text?: string; available?: boolean };
+          diagnostics?: { diagnosticsId: string }; text?: string; available?: boolean;
+          baselineId?: string; diff?: { differentPixels: number; meanAbsoluteError: number } };
         errorCode?: string } } };
     };
     expect(await call("list_tools", "list_tools", { category: "ios_simulator" }))
@@ -296,7 +318,9 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
           expect.objectContaining({ name: "launch_app", readOnly: false, via: "control_tool" }),
           expect.objectContaining({ name: "terminate_app", readOnly: false, via: "control_tool" }),
           expect.objectContaining({ name: "open_simulator_url", readOnly: false, via: "control_tool" }),
-          expect.objectContaining({ name: "take_simulator_screenshot", readOnly: false, via: "control_tool" })])
+          expect.objectContaining({ name: "take_simulator_screenshot", readOnly: false, via: "control_tool" }),
+          expect.objectContaining({ name: "capture_visual_baseline", readOnly: false, via: "control_tool" }),
+          expect.objectContaining({ name: "visual_diff", readOnly: true, via: "control_tool" })])
       } } });
     const route = { instanceId: instance.instanceId, generation: instance.generation,
       leaseId: instance.lease.id };
@@ -361,6 +385,20 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
     const imageBlob = screenshot.details.jokoMcpBridge!.imageOutputs![0]!.blob;
     expect((await application.artifacts.readBlob(imageBlob)).data).toEqual(screenshotBytes);
     expect(screenshotCalls).toBe(1);
+    const baseline = await call("control_tool", "capture_visual_baseline", route);
+    expect(baseline).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { baselineId: expect.any(String), byteLength: screenshotBytes.byteLength } } } });
+    expect(baseline.details.jokoMcpBridge?.imageOutputs).toBeUndefined();
+    const baselineId = baseline.details.mcpStructuredContent.data!.baselineId!;
+    visualFrame = changedScreenBytes;
+    expect(await call("control_tool", "visual_diff", { ...route, baselineId, threshold: 256 }))
+      .toMatchObject({ isError: true, details: { mcpStructuredContent: {
+        errorCode: "INVALID_ARGUMENT" } } });
+    const visualDiff = await call("control_tool", "visual_diff", { ...route, baselineId });
+    expect(visualDiff).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { baselineId, diff: { differentPixels: 1, meanAbsoluteError: 15 } } } } });
+    expect(visualDiff.details.jokoMcpBridge?.imageOutputs).toBeUndefined();
+    expect(screenshotCalls).toBe(3);
     expect(JSON.stringify(application.store.listOperations({ sessionId: "simulator-build-task" }),
       (_key, value: unknown) => typeof value === "bigint" ? String(value) : value))
       .not.toContain("private-launch-value");

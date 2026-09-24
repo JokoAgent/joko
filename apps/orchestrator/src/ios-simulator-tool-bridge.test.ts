@@ -214,6 +214,57 @@ it("routes Simulator screenshot only through permissioned control and trusted im
   expect(calls).toHaveLength(1);
 });
 
+it("advertises visual baseline and read-only diff through the permissioned task route", async () => {
+  const baselineId = randomUUID();
+  const calls: string[] = [];
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [], listForResourceAdmission: () => [] } as never,
+    visual: { captureBaseline: async () => { calls.push("baseline"); return { replayed: false,
+      receipt: { baselineId, instanceId: "owned", generation: 2, byteLength: 80,
+        capturedAt: "2026-09-24T00:00:00.000Z" } }; },
+    visualDiff: async (_scope: unknown, _route: unknown, id: string, threshold: number) => {
+      calls.push(`diff:${id}:${threshold}`);
+      return { replayed: false, receipt: { baselineId: id,
+        diff: { comparedPixels: 1, differentPixels: 1, differenceRatio: 1,
+          width: 1, height: 1, meanAbsoluteError: 15, maxAbsoluteError: 40, threshold } } };
+    } } as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: null,
+      error: null, setupSteps: [] }) }
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const authority = { ...scope, effectIdentity: "a".repeat(64),
+    requestBodyHash: `sha256:${"b".repeat(64)}`, providerGeneration: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease" };
+  const catalog = (await provider.callTool("list_tools", { category: "ios_simulator" },
+    undefined, scope)).structuredContent;
+  expect(catalog).toMatchObject({ tools: expect.arrayContaining([
+    expect.objectContaining({ name: "capture_visual_baseline", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "visual_diff", readOnly: true, via: "control_tool" })]) });
+  expect((await provider.callTool("call_tool", { name: "visual_diff",
+    args: { ...route, baselineId } }, undefined, authority)).structuredContent)
+    .toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await provider.callTool("control_tool", { name: "capture_visual_baseline", args: route },
+    undefined, scope)).structuredContent).toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect((await provider.callTool("control_tool", { name: "capture_visual_baseline",
+    args: { ...route, path: "/private/output.png" } }, undefined, authority)).structuredContent)
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect((await provider.callTool("control_tool", { name: "capture_visual_baseline", args: route },
+    undefined, authority)).structuredContent).toMatchObject({ data: { baselineId } });
+  expect((await provider.callTool("control_tool", { name: "visual_diff",
+    args: { ...route, baselineId, threshold: 256 } }, undefined, authority)).structuredContent)
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  const diff = await provider.callTool("control_tool", { name: "visual_diff",
+    args: { ...route, baselineId } }, undefined, authority);
+  expect(diff).toMatchObject({ structuredContent: { data: { diff: { differentPixels: 1,
+    threshold: 16 } } } });
+  expect(diff.hostImages).toBeUndefined();
+  expect(calls).toEqual(["baseline", `diff:${baselineId}:16`]);
+});
+
 it("publishes task-owned screen observations through the permission bridge with strict input bounds", async () => {
   let ready = true;
   let archived = false;

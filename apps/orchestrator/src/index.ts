@@ -36,6 +36,7 @@ export * from "./ios-simulator-screen-observation.js";
 export * from "./ios-simulator-input-coordinator.js";
 export * from "./ios-simulator-state-control.js";
 export * from "./ios-simulator-screenshot.js";
+export * from "./ios-simulator-visual-comparison.js";
 export * from "./document-electron-pdf-renderer.js";
 export * from "./event-hub.js";
 export * from "./extension-catalog.js";

@@ -12,5 +12,6 @@ export * from "./wda-driver-manager.js";
 export * from "./wda-orphan-inspector.js";
 export * from "./wda-orphan-cleaner.js";
 export * from "./screen-map.js";
+export * from "./visual-diff.js";
 export * from "./project-build.js";
 export * from "./app-artifact.js";

@@ -93,7 +93,8 @@ export class SimulatorLifecycleCoordinator {
             operation.kind === "ios_simulator_app_install" ||
             operation.kind === "ios_simulator_app_control" ||
             operation.kind === "ios_simulator_url_control" ||
-            operation.kind === "ios_simulator_screenshot") && operation.id !== operationId);
+            operation.kind === "ios_simulator_screenshot" ||
+            operation.kind === "ios_simulator_visual_capture") && operation.id !== operationId);
         if (conflicting !== undefined) throw new OperationInProgressError(conflicting.id);
         if (page.length < 500) break;
         offset += page.length;
