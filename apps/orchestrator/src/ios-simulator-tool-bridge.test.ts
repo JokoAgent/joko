@@ -292,6 +292,10 @@ it("publishes bounded Simulator input only through permission authority and stri
   expect(catalog).toMatchObject({ tools: expect.arrayContaining([
     expect.objectContaining({ name: "tap", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "swipe", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "drag_on_simulator", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "long_press", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "press_simulator_key", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "batch", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "type_simulator_text", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "press_home", readOnly: false, via: "control_tool" })
   ]) });
@@ -307,23 +311,43 @@ it("publishes bounded Simulator input only through permission authority and stri
   expect(await invoke("swipe", { ...route, startX: 0, startY: 1, endX: 2, endY: 3,
     observeAfter: "stable", observeTimeoutMs: 1_000, stableForMs: 100 }))
     .toMatchObject({ ok: true, data: { action: "swipe" } });
+  expect(await invoke("drag_on_simulator", { ...route, fromElementId: "from",
+    toElementId: "to" })).toMatchObject({ ok: true, data: { action: "drag" } });
+  expect(await invoke("long_press", { ...route, elementId: "element" }))
+    .toMatchObject({ ok: true, data: { action: "long_press" } });
+  expect(await invoke("press_simulator_key", { ...route, key: "return" }))
+    .toMatchObject({ ok: true, data: { action: "key_press" } });
+  expect(await invoke("batch", { ...route, actions: [
+    { type: "tap", elementId: "element" }, { type: "key_press", key: "tab" }
+  ] })).toMatchObject({ ok: true, data: { action: "batch" } });
   expect(await invoke("type_simulator_text", { ...route, text: "" }))
     .toMatchObject({ ok: true, data: { action: "type_text" } });
   expect(await invoke("press_home", route)).toMatchObject({ ok: true,
     data: { action: "press_home" } });
-  expect(calls).toHaveLength(4);
+  expect(await invoke("press_simulator_key", { ...route, key: "space" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("batch", { ...route, actions: [], observeAfter: "none" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(calls).toHaveLength(8);
   expect(calls[0]).toMatchObject({ action: { type: "tap", target: { elementId: "element" } },
     observe: { mode: "none", timeoutMs: 3_000, stableForMs: 300 },
     authority: { effectIdentity: "a".repeat(64), providerGeneration: 1 } });
   expect(calls[1]).toMatchObject({ action: { type: "swipe", durationMs: 300 },
     observe: { mode: "stable", timeoutMs: 1_000, stableForMs: 100 } });
+  expect(calls[2]).toMatchObject({ action: { type: "drag", fromElementId: "from",
+    toElementId: "to", durationMs: 500 } });
+  expect(calls[3]).toMatchObject({ action: { type: "long_press", durationMs: 750 } });
+  expect(calls[4]).toMatchObject({ action: { type: "key_press", key: "return" } });
+  expect(calls[5]).toMatchObject({ action: { type: "batch", actions: [
+    { type: "tap", elementId: "element" }, { type: "key_press", key: "tab" }
+  ] }, observe: { mode: "stable" } });
   expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
     .structuredContent).toMatchObject({ data: { availability: {
       tap: { state: "available", backend: "wda" }, press_home: { state: "available" }
     } } });
   ready = false;
   expect(await invoke("press_home", route)).toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
-  expect(calls).toHaveLength(4);
+  expect(calls).toHaveLength(8);
   archived = true;
   expect(await invoke("press_home", route)).toMatchObject({ errorCode: "STALE_SCOPE" });
 });

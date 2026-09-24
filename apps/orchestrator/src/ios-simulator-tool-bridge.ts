@@ -9,7 +9,8 @@ import { SimulatorCreateError, SimulatorLifecycleError, SimulatorResourceError }
 import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorObservationError, type SimulatorScreenObservationCoordinator,
   type SimulatorElementSelector, type SimulatorWaitCondition } from "./ios-simulator-screen-observation.js";
-import { SimulatorInputError, type SimulatorInputAction, type SimulatorInputCoordinator,
+import { SimulatorInputError, type SimulatorBatchAction, type SimulatorInputAction,
+  type SimulatorInputCoordinator, type SimulatorInputKey,
   type SimulatorInputObserveOptions } from "./ios-simulator-input-coordinator.js";
 import { SimulatorScreenMapError, WdaClientError, type SimulatorScreenMap } from "@joko/tool-ios-simulator";
 
@@ -18,6 +19,8 @@ const CATEGORY = "ios_simulator";
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 const DIGEST = /^[0-9a-f]{64}$/u;
 const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
+const INPUT_KEYS = ["return", "tab", "escape", "delete", "arrow_up", "arrow_down",
+  "arrow_left", "arrow_right"] as const satisfies readonly SimulatorInputKey[];
 
 const TOOLS = Object.freeze([
   { name: "check_environment", description: "Check the local macOS Xcode and iOS Simulator environment without opening Simulator.app.", readOnly: true },
@@ -44,6 +47,10 @@ const OBSERVATION_TOOLS = Object.freeze([
 const INPUT_TOOLS = Object.freeze([
   { name: "tap", description: "Tap an element in the current Simulator screen map or bounded device coordinates.", readOnly: false },
   { name: "swipe", description: "Swipe between bounded device coordinates from the current Simulator screen map.", readOnly: false },
+  { name: "drag_on_simulator", description: "Drag between two elements in the current Simulator screen map.", readOnly: false },
+  { name: "long_press", description: "Long-press an element in the current Simulator screen map.", readOnly: false },
+  { name: "press_simulator_key", description: "Send one supported WebDriver key to the focused Simulator control.", readOnly: false },
+  { name: "batch", description: "Run up to 16 fenced Simulator UI actions and return a final observation.", readOnly: false },
   { name: "type_simulator_text", description: "Type bounded text into the focused control inside the Simulator.", readOnly: false },
   { name: "press_home", description: "Press the simulated Home button from the current Simulator screen map.", readOnly: false }
 ] as const);
@@ -338,7 +345,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     }
     const route = requiredRoute(args);
     const snapshotId = requiredSnapshotId(args["snapshotId"]);
-    const observe = requiredObserveOptions(args);
+    const observe = requiredObserveOptions(args, name === "batch" ? "stable" : "none");
     let action: SimulatorInputAction;
     if (name === "tap") {
       onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "elementId", "x", "y",
@@ -362,6 +369,30 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         start: { x: requiredCoordinate(args["startX"]), y: requiredCoordinate(args["startY"]) },
         end: { x: requiredCoordinate(args["endX"]), y: requiredCoordinate(args["endY"]) },
         durationMs: optionalInteger(args["durationMs"], 50, 60_000, 300) };
+    } else if (name === "drag_on_simulator") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "fromElementId",
+        "toElementId", "durationMs", "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      action = { type: "drag", snapshotId,
+        fromElementId: requiredElementId(args["fromElementId"]),
+        toElementId: requiredElementId(args["toElementId"]),
+        durationMs: optionalInteger(args["durationMs"], 100, 10_000, 500) };
+    } else if (name === "long_press") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "elementId",
+        "durationMs", "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      action = { type: "long_press", snapshotId,
+        elementId: requiredElementId(args["elementId"]),
+        durationMs: optionalInteger(args["durationMs"], 300, 10_000, 750) };
+    } else if (name === "press_simulator_key") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "key",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      action = { type: "key_press", snapshotId, key: requiredInputKey(args["key"]) };
+    } else if (name === "batch") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "actions",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      if (observe.mode === "none") {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator batch requires a final observation.");
+      }
+      action = { type: "batch", snapshotId, actions: requiredBatchActions(args["actions"]) };
     } else if (name === "type_simulator_text") {
       onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "text",
         "observeAfter", "observeTimeoutMs", "stableForMs"]);
@@ -493,14 +524,74 @@ function requiredSnapshotId(value: unknown): string {
   return value;
 }
 
-function requiredObserveOptions(value: Readonly<Record<string, unknown>>): SimulatorInputObserveOptions {
-  const mode = value["observeAfter"] ?? "none";
+function requiredObserveOptions(value: Readonly<Record<string, unknown>>,
+  fallback: SimulatorInputObserveOptions["mode"]): SimulatorInputObserveOptions {
+  const mode = value["observeAfter"] ?? fallback;
   if (mode !== "none" && mode !== "immediate" && mode !== "stable") {
     throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator post-input observation mode is invalid.");
   }
   return { mode,
     timeoutMs: optionalInteger(value["observeTimeoutMs"], 100, 15_000, 3_000),
     stableForMs: optionalInteger(value["stableForMs"], 100, 2_000, 300) };
+}
+
+function requiredElementId(value: unknown): string {
+  if (!boundedText(value, 128) || value.trim() !== value) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator element identity is invalid.");
+  }
+  return value;
+}
+
+function requiredInputKey(value: unknown): SimulatorInputKey {
+  if (typeof value !== "string" || !INPUT_KEYS.some(key => key === value)) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator key is unsupported.");
+  }
+  return value as SimulatorInputKey;
+}
+
+function requiredBatchActions(value: unknown): readonly SimulatorBatchAction[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator batch must contain between 1 and 16 actions.");
+  }
+  return value.map(raw => {
+    if (!isRecord(raw) || typeof raw["type"] !== "string") {
+      throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator batch action is invalid.");
+    }
+    if (raw["type"] === "tap") {
+      onlyKeys(raw, ["type", "elementId"]);
+      return { type: "tap", elementId: requiredElementId(raw["elementId"]) };
+    }
+    if (raw["type"] === "swipe") {
+      onlyKeys(raw, ["type", "startX", "startY", "endX", "endY", "durationMs"]);
+      return { type: "swipe", start: { x: requiredCoordinate(raw["startX"]),
+        y: requiredCoordinate(raw["startY"]) }, end: { x: requiredCoordinate(raw["endX"]),
+        y: requiredCoordinate(raw["endY"]) },
+        durationMs: optionalInteger(raw["durationMs"], 50, 10_000, 300) };
+    }
+    if (raw["type"] === "drag") {
+      onlyKeys(raw, ["type", "fromElementId", "toElementId", "durationMs"]);
+      return { type: "drag", fromElementId: requiredElementId(raw["fromElementId"]),
+        toElementId: requiredElementId(raw["toElementId"]),
+        durationMs: optionalInteger(raw["durationMs"], 100, 10_000, 500) };
+    }
+    if (raw["type"] === "long_press") {
+      onlyKeys(raw, ["type", "elementId", "durationMs"]);
+      return { type: "long_press", elementId: requiredElementId(raw["elementId"]),
+        durationMs: optionalInteger(raw["durationMs"], 300, 10_000, 750) };
+    }
+    if (raw["type"] === "type_text") {
+      onlyKeys(raw, ["type", "text"]);
+      if (typeof raw["text"] !== "string" || raw["text"].length > 10_000) {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator batch text exceeds its limit.");
+      }
+      return { type: "type_text", text: raw["text"] };
+    }
+    if (raw["type"] === "key_press") {
+      onlyKeys(raw, ["type", "key"]);
+      return { type: "key_press", key: requiredInputKey(raw["key"]) };
+    }
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator batch action is unsupported.");
+  });
 }
 
 function boundedText(value: unknown, max: number): value is string {

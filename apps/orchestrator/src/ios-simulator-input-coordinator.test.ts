@@ -40,6 +40,7 @@ function fixture() {
   let ready = true;
   const calls: Array<{ type: string; value?: unknown }> = [];
   let tap = async (target: WdaPoint): Promise<void> => { calls.push({ type: "tap", value: target }); };
+  let typeText = async (text: string): Promise<void> => { calls.push({ type: "type_text", value: text }); };
   const driver = {
     isReady: () => ready,
     observeAccessibilityTree: async () => ({ capturedAt: new Date().toISOString(), tree }),
@@ -47,9 +48,7 @@ function fixture() {
     tap: (_instance: PublicSimulatorInstance, target: WdaPoint) => tap(target),
     swipe: async (_instance: PublicSimulatorInstance, start: WdaPoint, end: WdaPoint,
       durationMs: number) => { calls.push({ type: "swipe", value: { start, end, durationMs } }); },
-    typeText: async (_instance: PublicSimulatorInstance, text: string) => {
-      calls.push({ type: "type_text", value: text });
-    },
+    typeText: (_instance: PublicSimulatorInstance, text: string) => typeText(text),
     pressHome: async () => { calls.push({ type: "press_home" }); }
   };
   const screen = new SimulatorScreenObservationCoordinator(ownership, driver);
@@ -57,7 +56,8 @@ function fixture() {
   return { store, ownership, instance, screen, input, calls,
     setTree: (value: unknown) => { tree = value; },
     setReady: (value: boolean) => { ready = value; },
-    setTap: (value: typeof tap) => { tap = value; } };
+    setTap: (value: typeof tap) => { tap = value; },
+    setTypeText: (value: typeof typeText) => { typeText = value; } };
 }
 
 const OBSERVE_NONE = { mode: "none", timeoutMs: 3_000, stableForMs: 300 } as const;
@@ -143,5 +143,77 @@ it("commits confirmed input even when its requested observation is cancelled", a
       observationResult: { state: "failed", reasonCode: "OBSERVATION_CANCELLED" }
     }, observation: null, observationError: { code: "OBSERVATION_CANCELLED" } });
     expect(h.store.findOperation(`ios-simulator-input:${"f".repeat(64)}`)?.status).toBe("completed");
+  } finally { h.store.close(); }
+});
+
+it("runs drag, long-press, key and a bounded batch against successive current snapshots", async () => {
+  const h = fixture();
+  try {
+    const initial = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    const elementId = initial.elements[0]!.elementId;
+    const drag = await h.input.execute(SCOPE, route(h.instance), { type: "drag",
+      snapshotId: initial.snapshotId, fromElementId: elementId, toElementId: elementId, durationMs: 500 },
+    { mode: "immediate", timeoutMs: 3_000, stableForMs: 300 }, authority("1"));
+    expect(h.calls.at(-1)).toEqual({ type: "swipe", value: {
+      start: { x: 60, y: 40 }, end: { x: 60, y: 40 }, durationMs: 500
+    } });
+    const afterDrag = drag.observation!.screenMap;
+    const held = await h.input.execute(SCOPE, route(h.instance), { type: "long_press",
+      snapshotId: afterDrag.snapshotId, elementId, durationMs: 750 },
+    { mode: "immediate", timeoutMs: 3_000, stableForMs: 300 }, authority("2"));
+    expect(h.calls.at(-1)).toEqual({ type: "swipe", value: {
+      start: { x: 60, y: 40 }, end: { x: 60, y: 40 }, durationMs: 750
+    } });
+    const afterHold = held.observation!.screenMap;
+    const keyed = await h.input.execute(SCOPE, route(h.instance), { type: "key_press",
+      snapshotId: afterHold.snapshotId, key: "return" },
+    { mode: "immediate", timeoutMs: 3_000, stableForMs: 300 }, authority("3"));
+    expect(h.calls.at(-1)).toEqual({ type: "type_text", value: "\uE007" });
+    const afterKey = keyed.observation!.screenMap;
+    const secret = "batch-text-must-not-persist";
+    const batch = await h.input.execute(SCOPE, route(h.instance), { type: "batch",
+      snapshotId: afterKey.snapshotId, actions: [
+        { type: "tap", elementId }, { type: "type_text", text: secret },
+        { type: "key_press", key: "tab" }
+      ] }, { mode: "immediate", timeoutMs: 3_000, stableForMs: 300 }, authority("4"));
+    expect(batch).toMatchObject({ receipt: { action: "batch", completed: [
+      { index: 0, type: "tap", backend: "wda" },
+      { index: 1, type: "type_text", backend: "wda" },
+      { index: 2, type: "key_press", backend: "wda" }
+    ], observationResult: { state: "captured" } }, observation: { mode: "immediate" } });
+    expect(h.calls.slice(-3)).toEqual([
+      { type: "tap", value: { x: 60, y: 40 } },
+      { type: "type_text", value: secret }, { type: "type_text", value: "\uE004" }
+    ]);
+    const operation = h.store.findOperation(`ios-simulator-input:${"4".repeat(64)}`);
+    expect(JSON.stringify({ body: operation?.body,
+      response: operation && "response" in operation ? operation.response : null })).not.toContain(secret);
+  } finally { h.store.close(); }
+});
+
+it("stops a partially completed batch and fences the whole effect from replay", async () => {
+  const h = fixture();
+  let calls = 0;
+  h.setTypeText(async text => {
+    calls += 1;
+    h.calls.push({ type: "type_text", value: text });
+    if (calls === 2) throw new WdaClientError("INVALID_SESSION", "Driver session changed.");
+  });
+  try {
+    const initial = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    const action = { type: "batch" as const, snapshotId: initial.snapshotId, actions: [
+      { type: "type_text" as const, text: "first" },
+      { type: "type_text" as const, text: "second" },
+      { type: "type_text" as const, text: "must-not-run" }
+    ] };
+    await expect(h.input.execute(SCOPE, route(h.instance), action,
+      { mode: "stable", timeoutMs: 1_000, stableForMs: 100 }, authority("5")))
+      .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    expect(h.calls.map(item => item.value)).toEqual(["first", "second"]);
+    expect(h.store.findOperation(`ios-simulator-input:${"5".repeat(64)}`)?.status).toBe("failed");
+    await expect(h.input.execute(SCOPE, route(h.instance), action,
+      { mode: "stable", timeoutMs: 1_000, stableForMs: 100 }, authority("5")))
+      .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    expect(h.calls).toHaveLength(2);
   } finally { h.store.close(); }
 });

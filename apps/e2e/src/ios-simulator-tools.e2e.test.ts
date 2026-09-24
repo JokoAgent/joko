@@ -315,12 +315,56 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       action: "type_text", observation: { screenMap: { elements: [{ label: "Input 3" }] } }
     } } } });
     const afterType = typed.details.mcpStructuredContent.data!.observation!.screenMap;
+    const dragged = await call("control_tool", "drag_on_simulator", { ...route,
+      snapshotId: afterType.snapshotId, fromElementId: afterType.elements![0]!.elementId,
+      toElementId: afterType.elements![0]!.elementId, durationMs: 500,
+      observeAfter: "immediate" });
+    expect(dragged).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "drag", backend: "wda",
+      observation: { screenMap: { elements: [{ label: "Input 4" }] } }
+    } } } });
+    const afterDrag = dragged.details.mcpStructuredContent.data!.observation!.screenMap;
+    const longPressed = await call("control_tool", "long_press", { ...route,
+      snapshotId: afterDrag.snapshotId, elementId: afterDrag.elements![0]!.elementId,
+      durationMs: 750, observeAfter: "immediate" });
+    expect(longPressed).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "long_press", observation: { screenMap: { elements: [{ label: "Input 5" }] } }
+    } } } });
+    const afterLongPress = longPressed.details.mcpStructuredContent.data!.observation!.screenMap;
+    const keyed = await call("control_tool", "press_simulator_key", { ...route,
+      snapshotId: afterLongPress.snapshotId, key: "return", observeAfter: "immediate" });
+    expect(keyed).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "key_press", observation: { screenMap: { elements: [{ label: "Input 6" }] } }
+    } } } });
+    const afterKey = keyed.details.mcpStructuredContent.data!.observation!.screenMap;
+    const batchSecret = "ephemeral batch text";
+    const batched = await call("control_tool", "batch", { ...route,
+      snapshotId: afterKey.snapshotId,
+      actions: [
+        { type: "tap", elementId: afterKey.elements![0]!.elementId },
+        { type: "type_text", text: batchSecret },
+        { type: "key_press", key: "tab" }
+      ],
+      observeAfter: "stable", observeTimeoutMs: 1_000, stableForMs: 100
+    });
+    expect(batched).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "batch", completed: [
+        { index: 0, type: "tap", backend: "wda" },
+        { index: 1, type: "type_text", backend: "wda" },
+        { index: 2, type: "key_press", backend: "wda" }
+      ], observation: { mode: "stable", timedOut: false,
+        screenMap: { elements: [{ label: "Input 9" }] } }
+    } } } });
+    const afterBatch = batched.details.mcpStructuredContent.data!.observation!.screenMap;
     expect(await call("control_tool", "press_home", { ...route,
-      snapshotId: afterType.snapshotId })).toMatchObject({ isError: false,
+      snapshotId: afterBatch.snapshotId })).toMatchObject({ isError: false,
       details: { mcpStructuredContent: { data: { action: "press_home",
         screenMapInvalidated: true, observation: null } } } });
     expect(inputs.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
+      "/session/SESSION-1/wda/keys", "/session/SESSION-1/actions",
+      "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
+      "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton"
     ]);
     expect(inputs.every(item => item.claimed)).toBe(true);
@@ -328,8 +372,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       .filter(operation => operation.kind === "ios_simulator_input")
       .map(operation => ({ body: operation.body,
         response: "response" in operation ? operation.response : null }));
-    expect(inputOperations).toHaveLength(4);
+    expect(inputOperations).toHaveLength(8);
     expect(JSON.stringify(inputOperations)).not.toContain(secret);
+    expect(JSON.stringify(inputOperations)).not.toContain(batchSecret);
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
       generation: instance.generation, leaseId: instance.lease.id });
     expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
