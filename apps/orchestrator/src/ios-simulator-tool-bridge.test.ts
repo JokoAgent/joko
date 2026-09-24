@@ -176,6 +176,44 @@ it("publishes instance mutations only with a composed control owner and requires
   expect(calls).toHaveLength(5);
 });
 
+it("routes Simulator screenshot only through permissioned control and trusted image output", async () => {
+  const calls: unknown[] = [];
+  const image = { id: randomUUID(), sha256: "a".repeat(64), byteLength: 12,
+    mimeType: "image/png", fileName: "capture.png" };
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [], listForResourceAdmission: () => [] } as never,
+    screenshot: { execute: async (...args: unknown[]) => {
+      calls.push(args);
+      return { replayed: false, receipt: { instanceId: "owned", generation: 2,
+        backend: "simctl", capturedAt: "2026-09-24T00:00:00.000Z", image } };
+    } } as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: null,
+      error: null, setupSteps: [] }) }
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const authority = { ...scope, effectIdentity: "a".repeat(64),
+    requestBodyHash: `sha256:${"b".repeat(64)}`, providerGeneration: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease" };
+  expect(provider.tools.find(tool => tool.name === "control_tool")?.requiresPermission).toBe(true);
+  expect((await provider.callTool("call_tool", { name: "take_simulator_screenshot", args: route },
+    undefined, authority)).structuredContent).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await provider.callTool("control_tool", { name: "take_simulator_screenshot", args: route },
+    undefined, scope)).structuredContent).toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect((await provider.callTool("control_tool", { name: "take_simulator_screenshot",
+    args: { ...route, outputPath: "/private/output.png" } }, undefined, authority)).structuredContent)
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  const result = await provider.callTool("control_tool", { name: "take_simulator_screenshot", args: route },
+    undefined, authority);
+  expect(result).toMatchObject({ isError: false, hostImages: [{ blob: image }],
+    structuredContent: { data: { byteLength: 12, mimeType: "image/png" } } });
+  expect(JSON.stringify(result)).not.toContain("/private/");
+  expect(calls).toHaveLength(1);
+});
+
 it("publishes task-owned screen observations through the permission bridge with strict input bounds", async () => {
   let ready = true;
   let archived = false;

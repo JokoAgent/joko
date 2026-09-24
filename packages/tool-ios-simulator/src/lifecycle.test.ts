@@ -1,5 +1,5 @@
-import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, readFile, stat, truncate, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { expect, it } from "vitest";
 import { createNodeSimulatorCommandRunner, type SimulatorCommandResult, type SimulatorCommandRunner } from "./environment.js";
 import { createSimulatorLifecycleRuntime } from "./lifecycle.js";
@@ -417,4 +417,50 @@ it("hands only validated non-file URLs to the exact Simulator", async () => {
   result = { stdout: "", stderr: "private host output", exitCode: null, timedOut: true };
   await expect(runtime.openSimulatorUrl!(UDID, "https://example.test"))
     .rejects.toMatchObject({ code: "OPEN_URL_UNKNOWN" });
+});
+
+it("captures bounded PNG bytes through exact simctl and removes private temporary output", async () => {
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+  const paths: string[] = [];
+  let output = png;
+  let outputKind: "file" | "oversize" | "directory" = "file";
+  let result: SimulatorCommandResult = ok();
+  const runner: SimulatorCommandRunner = { run: async (command, args, options) => {
+    expect(command).toBe(XCRUN);
+    expect(args.slice(0, 5)).toEqual(["simctl", "io", UDID, "screenshot", "--type=png"]);
+    expect(options?.timeoutMs).toBe(30_000);
+    const path = args[5]!;
+    paths.push(path);
+    if (outputKind === "directory") await mkdir(path);
+    else {
+      await writeFile(path, output);
+      if (outputKind === "oversize") await truncate(path, 32 * 1024 * 1024 + 1);
+    }
+    return result;
+  } };
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner });
+  expect(Buffer.from(await runtime.takeScreenshot!(UDID.toLowerCase()))).toEqual(png);
+  await expect(stat(dirname(paths[0]!))).rejects.toMatchObject({ code: "ENOENT" });
+  output = Buffer.from("not-png");
+  await expect(runtime.takeScreenshot!(UDID)).rejects.toMatchObject({ code: "SCREENSHOT_INVALID" });
+  await expect(stat(dirname(paths[1]!))).rejects.toMatchObject({ code: "ENOENT" });
+  output = Buffer.alloc(0);
+  await expect(runtime.takeScreenshot!(UDID)).rejects.toMatchObject({ code: "SCREENSHOT_INVALID" });
+  outputKind = "oversize";
+  await expect(runtime.takeScreenshot!(UDID)).rejects.toMatchObject({ code: "SCREENSHOT_INVALID" });
+  outputKind = "directory";
+  await expect(runtime.takeScreenshot!(UDID)).rejects.toMatchObject({ code: "SCREENSHOT_INVALID" });
+  for (const path of paths.slice(2)) {
+    await expect(stat(dirname(path))).rejects.toMatchObject({ code: "ENOENT" });
+  }
+  outputKind = "file";
+  output = png;
+  result = { stdout: "", stderr: "/private/host-secret", exitCode: null, timedOut: true };
+  await expect(runtime.takeScreenshot!(UDID)).rejects.toMatchObject({ code: "SCREENSHOT_UNKNOWN" });
+  await expect(stat(dirname(paths[5]!))).rejects.toMatchObject({ code: "ENOENT" });
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await expect(runtime.takeScreenshot!(UDID, cancelled.signal))
+    .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+  expect(paths).toHaveLength(6);
 });

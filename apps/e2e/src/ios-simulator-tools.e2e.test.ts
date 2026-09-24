@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   CredentialManager, CredentialVault, IOS_SIMULATOR_TOOL_PROVIDER_ID, IosSimulatorToolBridgeProvider,
-  McpRouter, SimulatorOwnershipRegistry, createInternalServer, createOrchestratorApplication, type OrchestratorConfig
+  McpRouter, SimulatorOwnershipRegistry, SimulatorScreenshotCoordinator,
+  createInternalServer, createOrchestratorApplication, type OrchestratorConfig
 } from "@joko/orchestrator";
 import { expect, it } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
@@ -80,6 +81,87 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
   }
 });
 
+it("downloads a task-owned Simulator screenshot through authenticated Connect after Tool capture", async () => {
+  const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4]);
+  const device = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "iPhone test",
+    state: "Booted", isAvailable: true,
+    runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0",
+    runtimeName: "iOS 19.0", runtimeVersion: "19.0",
+    deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null } as const;
+  let fixture: OrchestratorE2eFixture | undefined;
+  let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
+  let captures = 0;
+  try {
+    fixture = await OrchestratorE2eFixture.start({
+      createAuxiliaryServices: async (store, directory, artifacts) => {
+        const vault = await CredentialVault.open(join(directory, "screenshot-vault.key"));
+        const credentials = new CredentialManager({ vault,
+          storagePath: join(directory, "screenshot-credentials.json") });
+        await credentials.initialize();
+        const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
+        await mcpRouter.initialize();
+        const ownership = new SimulatorOwnershipRegistry(store);
+        const screenshot = new SimulatorScreenshotCoordinator(store, ownership, artifacts, {
+          findExact: async () => device,
+          takeScreenshot: async () => { captures += 1; return image; }
+        });
+        mcpRouter.registerBridgeToolProvider(new IosSimulatorToolBridgeProvider({ store, ownership,
+          screenshot, runtime: { inspect: async () => ({ platform: "darwin", supported: true,
+            ready: true, xcodeVersion: "Xcode fixture", runtimes: [], devices: [device],
+            issue: null, error: null, setupSteps: [] }) } }));
+        return { mcpRouter };
+      }
+    });
+    internal = await createInternalServer(fixture.application);
+    const url = await internal.listen({ host: "127.0.0.1", port: 0 });
+    const paired = await fixture.pair();
+    const [backendId, targetId] = [...fixture.targets][0]!;
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId, targetId })));
+    const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
+    const ownership = new SimulatorOwnershipRegistry(fixture.application.store);
+    const bound = ownership.bindExternalDevice({ sessionId, targetId, generation }, device);
+    const instance = ownership.attachViewer({ sessionId, targetId, generation }, {
+      instanceId: bound.instanceId, generation: bound.generation, leaseId: bound.lease.id });
+    const snapshot = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${url}/internal/mcp`,
+      sessionId, targetId, expectedPiGeneration: generation });
+    const requestId = randomUUID();
+    const invoke = async () => {
+      const response = await fetch(`${url}/internal/mcp`, { method: "POST", headers: {
+        authorization: `Bearer ${snapshot.mcpBridge.token}`, "content-type": "application/json",
+        "x-joko-pi-generation": String(generation)
+      }, body: JSON.stringify({ requestId, sessionId, targetId, generation,
+        serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID, toolName: "control_tool",
+        arguments: { name: "take_simulator_screenshot", args: {
+          instanceId: instance.instanceId, generation: instance.generation,
+          leaseId: instance.lease.id } } }) });
+      expect(response.ok).toBe(true);
+      return await response.json() as { isError: boolean; details: {
+        mcpStructuredContent: { data: { replayed: boolean } };
+        jokoMcpBridge: { imageOutputs: Array<{ blob: { id: string; sha256: string;
+          byteLength: number; mimeType: string } }> } } };
+    };
+    const first = await invoke();
+    expect(first).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { replayed: false } }, jokoMcpBridge: { imageOutputs: [
+        { blob: { mimeType: "image/png", byteLength: image.byteLength } }] } } });
+    const blob = first.details.jokoMcpBridge.imageOutputs[0]!.blob;
+    expect(fixture.application.store.getArtifact(blob.id).blob.sha256).toBe(blob.sha256);
+    const downloadTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: blob.id });
+    const downloaded = await fetch(`${fixture.baseUrl}${downloadTicket.ticket!.relativeEndpoint}`, {
+      headers: { authorization: `Bearer ${paired.authKey}` }
+    });
+    expect(downloaded.status).toBe(200);
+    expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(image);
+    expect((await invoke()).details.mcpStructuredContent.data.replayed).toBe(true);
+    expect(captures).toBe(1);
+    snapshot.revoke();
+  } finally {
+    await internal?.close();
+    await fixture?.close();
+  }
+});
+
 it("builds a task-owned app and reads redacted diagnostics through production HTTP and SQLite", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-simulator-project-chain-"));
   const workspace = join(root, "workspace");
@@ -111,6 +193,8 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
   let launchCalls = 0;
   let terminateCalls = 0;
   let urlCalls = 0;
+  let screenshotCalls = 0;
+  const screenshotBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
   const privateUrl = "myapp://screen?token=private-url-value";
   try {
     application = await createOrchestratorApplication(config, { simulatorRuntime: {
@@ -149,6 +233,13 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
           expect(url).toBe(privateUrl);
           expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_url_control")).toBe(true);
+        },
+        takeScreenshot: async (value) => {
+          screenshotCalls += 1;
+          expect(value).toBe(udid);
+          expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_screenshot")).toBe(true);
+          return screenshotBytes;
         } },
       projectBuilder: {
         inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
@@ -191,7 +282,9 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
         targetId: target.id, generation: 1, serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
         toolName, arguments: toolName === "list_tools" ? args : { name, args } }) });
       expect(response.ok).toBe(true);
-      return await response.json() as { isError: boolean; details: { mcpStructuredContent: {
+      return await response.json() as { isError: boolean; details: { jokoMcpBridge?: {
+        imageOutputs?: Array<{ blob: { id: string; sha256: string; byteLength: number; mimeType: string } }> };
+        mcpStructuredContent: {
         data?: { artifact?: { artifactId: string; bundleId: string };
           diagnostics?: { diagnosticsId: string }; text?: string; available?: boolean };
         errorCode?: string } } };
@@ -202,7 +295,8 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
           name: "install_app", readOnly: false, via: "control_tool" }),
           expect.objectContaining({ name: "launch_app", readOnly: false, via: "control_tool" }),
           expect.objectContaining({ name: "terminate_app", readOnly: false, via: "control_tool" }),
-          expect.objectContaining({ name: "open_simulator_url", readOnly: false, via: "control_tool" })])
+          expect.objectContaining({ name: "open_simulator_url", readOnly: false, via: "control_tool" }),
+          expect.objectContaining({ name: "take_simulator_screenshot", readOnly: false, via: "control_tool" })])
       } } });
     const route = { instanceId: instance.instanceId, generation: instance.generation,
       leaseId: instance.lease.id };
@@ -255,6 +349,18 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
       .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
         opened: true, screenMapInvalidated: true } } } });
     expect(urlCalls).toBe(1);
+    expect(await call("control_tool", "take_simulator_screenshot", { ...route,
+      outputPath: "C:/private/output.png" })).toMatchObject({ isError: true,
+        details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    expect(screenshotCalls).toBe(0);
+    const screenshot = await call("control_tool", "take_simulator_screenshot", route);
+    expect(screenshot).toMatchObject({ isError: false, details: {
+      mcpStructuredContent: { data: { mimeType: "image/png", byteLength: screenshotBytes.byteLength } },
+      jokoMcpBridge: { imageOutputs: [{ blob: { byteLength: screenshotBytes.byteLength,
+        mimeType: "image/png" } }] } } });
+    const imageBlob = screenshot.details.jokoMcpBridge!.imageOutputs![0]!.blob;
+    expect((await application.artifacts.readBlob(imageBlob)).data).toEqual(screenshotBytes);
+    expect(screenshotCalls).toBe(1);
     expect(JSON.stringify(application.store.listOperations({ sessionId: "simulator-build-task" }),
       (_key, value: unknown) => typeof value === "bigint" ? String(value) : value))
       .not.toContain("private-launch-value");

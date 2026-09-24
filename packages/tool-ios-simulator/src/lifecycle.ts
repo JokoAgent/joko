@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, isAbsolute, join } from "node:path";
 import {
@@ -18,7 +19,8 @@ export type SimulatorLifecycleErrorCode =
   | "APP_INSTALL_FAILED" | "APP_INSTALL_UNKNOWN"
   | "APP_LAUNCH_FAILED" | "APP_LAUNCH_UNKNOWN"
   | "APP_TERMINATE_FAILED" | "APP_TERMINATE_UNKNOWN"
-  | "OPEN_URL_FAILED" | "OPEN_URL_UNKNOWN";
+  | "OPEN_URL_FAILED" | "OPEN_URL_UNKNOWN"
+  | "SCREENSHOT_FAILED" | "SCREENSHOT_UNKNOWN" | "SCREENSHOT_INVALID";
 
 export class SimulatorLifecycleError extends Error {
   constructor(readonly code: SimulatorLifecycleErrorCode, message: string) { super(message); }
@@ -47,6 +49,7 @@ export interface SimulatorLifecycleRuntime {
     signal?: AbortSignal): Promise<void>;
   terminateApp?(udid: string, bundleId: string, signal?: AbortSignal): Promise<void>;
   openSimulatorUrl?(udid: string, rawUrl: string, signal?: AbortSignal): Promise<void>;
+  takeScreenshot?(udid: string, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -572,6 +575,40 @@ export function createSimulatorLifecycleRuntime(options: {
         30_000, "OPEN_URL_UNKNOWN", signal);
       if (result.exitCode !== 0 || result.failed) {
         throw new SimulatorLifecycleError("OPEN_URL_FAILED", "Simulator URL could not be opened.");
+      }
+    },
+    async takeScreenshot(udid, signal) {
+      requirePlatform();
+      const normalized = exactUdid(udid);
+      cancelled(signal);
+      const directory = await mkdtemp(join(tmpdir(), "joko-simulator-screenshot-"));
+      const path = join(directory, "capture.png");
+      try {
+        const result = await runMutation(["simctl", "io", normalized, "screenshot", "--type=png", path],
+          30_000, "SCREENSHOT_UNKNOWN", signal);
+        if (result.exitCode !== 0 || result.failed) {
+          throw new SimulatorLifecycleError("SCREENSHOT_FAILED", "Simulator screenshot could not be captured.");
+        }
+        let handle;
+        try {
+          handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+          const info = await handle.stat();
+          if (!info.isFile() || info.size < 8 || info.size > 32 * 1024 * 1024) {
+            throw new Error("Invalid screenshot size or file type.");
+          }
+          const bytes = await handle.readFile();
+          if (bytes.byteLength !== info.size || !bytes.subarray(0, 8).equals(
+            Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+            throw new Error("Invalid screenshot bytes.");
+          }
+          return bytes;
+        } catch {
+          throw new SimulatorLifecycleError("SCREENSHOT_INVALID", "Simulator screenshot output was invalid.");
+        } finally {
+          await handle?.close();
+        }
+      } finally {
+        await rm(directory, { recursive: true, force: true });
       }
     },
     async pushNotification(udid, bundleId, payload, signal) {
