@@ -1,6 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { extname, isAbsolute, join } from "node:path";
 import {
   createNodeSimulatorCommandRunner, parseSimulatorListJson,
   type SimulatorCommandResult, type SimulatorCommandRunner, type SimulatorDevice
@@ -14,7 +14,8 @@ export type SimulatorLifecycleErrorCode =
   | "SIMCTL_FAILED" | "INVALID_SIMCTL_OUTPUT" | "SIMULATOR_NOT_FOUND"
   | "SIMULATOR_BOOT_FAILED" | "SIMULATOR_BOOT_TIMEOUT" | "SIMULATOR_BOOT_UNKNOWN"
   | "SIMULATOR_SHUTDOWN_FAILED" | "SIMULATOR_SHUTDOWN_TIMEOUT" | "SIMULATOR_SHUTDOWN_UNKNOWN"
-  | "SIMULATOR_CONTROL_FAILED" | "SIMULATOR_CONTROL_UNKNOWN";
+  | "SIMULATOR_CONTROL_FAILED" | "SIMULATOR_CONTROL_UNKNOWN"
+  | "APP_INSTALL_FAILED" | "APP_INSTALL_UNKNOWN";
 
 export class SimulatorLifecycleError extends Error {
   constructor(readonly code: SimulatorLifecycleErrorCode, message: string) { super(message); }
@@ -38,6 +39,7 @@ export interface SimulatorLifecycleRuntime {
   clearStatusBar?(udid: string, signal?: AbortSignal): Promise<void>;
   pushNotification?(udid: string, bundleId: string,
     payload: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<void>;
+  installApp?(udid: string, appPath: string, signal?: AbortSignal): Promise<void>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -506,6 +508,19 @@ export function createSimulatorLifecycleRuntime(options: {
     async clearStatusBar(udid, signal) {
       await runSimctlControl(udid, "status_bar", ["clear"],
         "Simulator status bar override could not be cleared.", signal);
+    },
+    async installApp(udid, appPath, signal) {
+      requirePlatform();
+      const normalized = exactUdid(udid);
+      if (typeof appPath !== "string" || !isAbsolute(appPath) ||
+          extname(appPath).toLowerCase() !== ".app") {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator app path is invalid.");
+      }
+      const result = await runMutation(["simctl", "install", normalized, appPath],
+        120_000, "APP_INSTALL_UNKNOWN", signal);
+      if (result.exitCode !== 0 || result.failed) {
+        throw new SimulatorLifecycleError("APP_INSTALL_FAILED", "Simulator app could not be installed.");
+      }
     },
     async pushNotification(udid, bundleId, payload, signal) {
       requirePlatform();

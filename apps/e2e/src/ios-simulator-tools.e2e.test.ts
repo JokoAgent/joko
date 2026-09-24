@@ -107,11 +107,23 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
   let application: Awaited<ReturnType<typeof createOrchestratorApplication>> | undefined;
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   let buildCalls = 0;
+  let installCalls = 0;
   try {
     application = await createOrchestratorApplication(config, { simulatorRuntime: {
       environment: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
         xcodeVersion: "Xcode 16.4", runtimes: [], devices: [device], issue: null,
         error: null, setupSteps: [] }) },
+      lifecycle: { findExact: async () => device,
+        bootExact: async () => { throw new Error("Unexpected Simulator boot."); },
+        shutdownExact: async () => { throw new Error("Unexpected Simulator shutdown."); },
+        installApp: async (value, appPath) => {
+          installCalls += 1;
+          expect(value).toBe(udid);
+          expect(appPath).toContain("Application.app");
+          expect(appPath).not.toBe(sourceApp);
+          expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_app_install")).toBe(true);
+        } },
       projectBuilder: {
         inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
           projectRoot: workspace, containerPath: join(workspace, "Example.xcodeproj") }),
@@ -136,8 +148,11 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
       binding: { opaqueRef: "simulator-build-task-native", generation: 1 }, pinned: false,
       archived: false, permissionMode: "ask", planMode: false, fastMode: false,
       createdAt: Date.now(), updatedAt: Date.now() });
-    const instance = new SimulatorOwnershipRegistry(application.store).bindExternalDevice(
-      { sessionId: "simulator-build-task", targetId: target.id, generation: 1 }, device);
+    const scope = { sessionId: "simulator-build-task", targetId: target.id, generation: 1 };
+    const ownership = new SimulatorOwnershipRegistry(application.store);
+    const bound = ownership.bindExternalDevice(scope, device);
+    const instance = ownership.attachViewer(scope, { instanceId: bound.instanceId,
+      generation: bound.generation, leaseId: bound.lease.id });
     internal = await createInternalServer(application);
     const url = await internal.listen({ host: "127.0.0.1", port: 0 });
     const snapshot = application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${url}/internal/mcp`,
@@ -156,7 +171,10 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
         errorCode?: string } } };
     };
     expect(await call("list_tools", "list_tools", { category: "ios_simulator" }))
-      .toMatchObject({ isError: false });
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: {
+        tools: expect.arrayContaining([expect.objectContaining({
+          name: "install_app", readOnly: false, via: "control_tool" })])
+      } } });
     const route = { instanceId: instance.instanceId, generation: instance.generation,
       leaseId: instance.lease.id };
     const built = await call("control_tool", "build_app", route);
@@ -174,6 +192,19 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
     expect(await call("call_tool", "read_build_diagnostics",
       { diagnosticsId: randomUUID(), source: "build-log" })).toMatchObject({ isError: true,
         details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    const artifactId = built.details.mcpStructuredContent.data!.artifact!.artifactId;
+    expect(await call("control_tool", "install_app", { ...route, artifactId,
+      appPath: sourceApp })).toMatchObject({ isError: true,
+      details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    expect(installCalls).toBe(0);
+    expect(await call("control_tool", "install_app", { ...route, artifactId }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        artifactId, bundleId: "app.joko.example", backend: "simctl" } } } });
+    expect(installCalls).toBe(1);
+    expect(await call("control_tool", "install_app", { ...route, artifactId: randomUUID() }))
+      .toMatchObject({ isError: true, details: { mcpStructuredContent: {
+        errorCode: "APP_ARTIFACT_INVALID" } } });
+    expect(installCalls).toBe(1);
     snapshot.revoke();
   } finally {
     await internal?.close();

@@ -26,7 +26,8 @@ const DIAGNOSTICS_TTL_MS = 30 * 60_000;
 const ORPHAN_STORAGE_TTL_MS = 24 * 60 * 60_000;
 const CONFLICTING_KINDS = new Set([KIND, "ios_simulator_instance_control", "ios_simulator_create",
   "ios_simulator_lifecycle", "ios_simulator_driver", "ios_simulator_input",
-  "ios_simulator_state_control", "ios_simulator_grace_cleanup", "ios_simulator_removed_cleanup"]);
+  "ios_simulator_state_control", "ios_simulator_app_install",
+  "ios_simulator_grace_cleanup", "ios_simulator_removed_cleanup"]);
 
 export interface SimulatorBuildArtifact {
   readonly artifactId: string;

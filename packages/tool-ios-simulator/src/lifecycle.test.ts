@@ -1,4 +1,5 @@
 import { readFile, stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import { expect, it } from "vitest";
 import { createNodeSimulatorCommandRunner, type SimulatorCommandResult, type SimulatorCommandRunner } from "./environment.js";
 import { createSimulatorLifecycleRuntime } from "./lifecycle.js";
@@ -318,4 +319,34 @@ it("rejects malformed push bodies before dispatch and cleans an uncertain delive
     { aps: { alert: "private push body" } })).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
   expect(calls).toBe(2);
   await expect(stat(payloadPaths[1]!)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("installs only an absolute app on the exact simulator with bounded unknown outcomes", async () => {
+  const appPath = resolve("Application.app");
+  const calls: Array<{ command: string; args: readonly string[]; timeoutMs: number | undefined }> = [];
+  let result: SimulatorCommandResult = ok();
+  const runner: SimulatorCommandRunner = { run: async (command, args, options) => {
+    calls.push({ command, args, timeoutMs: options?.timeoutMs });
+    return result;
+  } };
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner });
+  await runtime.installApp!(UDID.toLowerCase(), appPath);
+  expect(calls).toEqual([{ command: XCRUN,
+    args: ["simctl", "install", UDID, appPath], timeoutMs: 120_000 }]);
+  await expect(runtime.installApp!(UDID, "relative.app"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  const controller = new AbortController();
+  controller.abort();
+  await expect(runtime.installApp!(UDID, appPath, controller.signal))
+    .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+  expect(calls).toHaveLength(1);
+  result = { stdout: "", stderr: "private host output", exitCode: 1 };
+  await expect(runtime.installApp!(UDID, appPath))
+    .rejects.toMatchObject({ code: "APP_INSTALL_FAILED" });
+  result = { stdout: "", stderr: "private host output", exitCode: null, timedOut: true };
+  await expect(runtime.installApp!(UDID, appPath))
+    .rejects.toMatchObject({ code: "APP_INSTALL_UNKNOWN" });
+  expect(calls).toHaveLength(3);
+  await expect(createSimulatorLifecycleRuntime({ platform: "win32", runner }).installApp!(UDID, appPath))
+    .rejects.toMatchObject({ code: "UNSUPPORTED_PLATFORM" });
 });
