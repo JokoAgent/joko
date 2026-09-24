@@ -58,6 +58,36 @@ it("uses exact loopback routes, verifies the device-bound process marker and man
   expect(JSON.parse(calls[2]?.body ?? "")).toEqual({ capabilities: { alwaysMatch: {} } });
 });
 
+it("reads only the exact owned session's bounded accessibility tree", async () => {
+  let fingerprint = "";
+  let malformed = false;
+  const paths: string[] = [];
+  const port = await loopback((request, response) => {
+    paths.push(request.url ?? "");
+    if (request.url === "/status") json(response, { value: { ready: true,
+      build: { upgradedAt: fingerprint } } });
+    else if (request.url === "/session/SESSION-1/source?format=json") {
+      json(response, { value: malformed ? null : { type: "XCUIElementTypeButton", label: "Continue" } });
+    } else if (request.url === "/session/SESSION-1/window/size") {
+      json(response, { value: { width: 393, height: 852 } });
+    } else if (request.url === "/session/SESSION-1/orientation") {
+      json(response, { value: "PORTRAIT" });
+    } else json(response, { value: { error: "invalid session id" } }, 404);
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  expect(await driver.getAccessibilityTree("SESSION-1")).toMatchObject({
+    tree: { type: "XCUIElementTypeButton", label: "Continue" }
+  });
+  expect(paths).toEqual(["/status", "/session/SESSION-1/source?format=json"]);
+  expect(await driver.getViewport("SESSION-1")).toEqual({ width: 393, height: 852,
+    orientation: "PORTRAIT" });
+  await expect(driver.getAccessibilityTree("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(paths).toHaveLength(5);
+  malformed = true;
+  await expect(driver.getAccessibilityTree("SESSION-1")).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+});
+
 it("fails closed on foreign ownership, non-ready status, invalid session and unsafe local port", async () => {
   let status: unknown = { value: { ready: true, build: { upgradedAt: "foreign" } } };
   let postCount = 0;

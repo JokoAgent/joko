@@ -1,6 +1,7 @@
 import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
-  WdaDriverManager, type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
-  type WdaDriverStartOptions, type WdaOrphanCleanupInput, type WdaRunningDriver } from "@joko/tool-ios-simulator";
+  WdaDriverManager, WdaLoopbackClient, type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
+  type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
+  type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
 import { SimulatorOwnershipError, SimulatorOwnershipRegistry,
@@ -86,6 +87,40 @@ export class SimulatorDriverCoordinator {
     const active = this.#manager.get(instance.instanceId);
     return active?.state === "ready" && active.simulatorUdid === instance.simulatorUdid &&
       this.#state.isCurrentReady(instance.instanceId, instance.generation, active.leaseId);
+  }
+
+  async observeAccessibilityTree(instance: PublicSimulatorInstance,
+    signal?: AbortSignal): Promise<WdaAccessibilitySnapshot> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) {
+      throw new SimulatorDriverError("DRIVER_RUNTIME_LOST", "Simulator driver is not ready for observation.");
+    }
+    const client = new WdaLoopbackClient({ controlPort: active.controlPort, cacheRoot: this.#cacheRoot,
+      instanceId: instance.instanceId, simulatorUdid: instance.simulatorUdid,
+      maxResponseBytes: 8 * 1024 * 1024 });
+    const observed = await client.getAccessibilityTree(active.driverSessionId, signal);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
+      throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during observation.");
+    }
+    return observed;
+  }
+
+  async observeViewport(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<WdaViewport> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) {
+      throw new SimulatorDriverError("DRIVER_RUNTIME_LOST", "Simulator driver is not ready for observation.");
+    }
+    const client = new WdaLoopbackClient({ controlPort: active.controlPort, cacheRoot: this.#cacheRoot,
+      instanceId: instance.instanceId, simulatorUdid: instance.simulatorUdid });
+    const viewport = await client.getViewport(active.driverSessionId, signal);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
+      throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during observation.");
+    }
+    return viewport;
   }
 
   diagnose(instance: PublicSimulatorInstance): { readonly state: "ready" | "stopped" | "error" | "unavailable";

@@ -22,6 +22,17 @@ export interface WdaDriverSession {
   readonly createdAt: string;
 }
 
+export interface WdaAccessibilitySnapshot {
+  readonly capturedAt: string;
+  readonly tree: unknown;
+}
+
+export interface WdaViewport {
+  readonly width: number;
+  readonly height: number;
+  readonly orientation: "PORTRAIT" | "LANDSCAPE";
+}
+
 export interface WdaLoopbackClientOptions {
   readonly controlPort: number;
   readonly cacheRoot: string;
@@ -186,5 +197,35 @@ export class WdaLoopbackClient {
     const health = await this.probe(signal);
     if (!health.ready) throw new WdaClientError("NOT_READY", "Driver is not ready for session cleanup.");
     await this.#request(`/session/${exactId}`, "DELETE", undefined, signal);
+  }
+
+  async getAccessibilityTree(id: string, signal?: AbortSignal): Promise<WdaAccessibilitySnapshot> {
+    const exactId = sessionId(id);
+    const health = await this.probe(signal);
+    if (!health.ready) throw new WdaClientError("NOT_READY", "Driver is not ready for screen observation.");
+    const envelope = await this.#request(`/session/${exactId}/source?format=json`, "GET", undefined, signal);
+    if (!record(envelope.value) && !Array.isArray(envelope.value)) {
+      throw new WdaClientError("PROTOCOL_ERROR", "Driver accessibility response is invalid.");
+    }
+    return { capturedAt: new Date().toISOString(), tree: envelope.value };
+  }
+
+  async getViewport(id: string, signal?: AbortSignal): Promise<WdaViewport> {
+    const exactId = sessionId(id);
+    const health = await this.probe(signal);
+    if (!health.ready) throw new WdaClientError("NOT_READY", "Driver is not ready for viewport observation.");
+    const [size, direction] = await Promise.all([
+      this.#request(`/session/${exactId}/window/size`, "GET", undefined, signal),
+      this.#request(`/session/${exactId}/orientation`, "GET", undefined, signal)
+    ]);
+    if (!record(size.value) || typeof size.value["width"] !== "number" ||
+        !Number.isFinite(size.value["width"]) || size.value["width"] <= 0 ||
+        typeof size.value["height"] !== "number" || !Number.isFinite(size.value["height"]) ||
+        size.value["height"] <= 0 ||
+        direction.value !== "PORTRAIT" && direction.value !== "LANDSCAPE") {
+      throw new WdaClientError("PROTOCOL_ERROR", "Driver viewport response is invalid.");
+    }
+    return { width: size.value["width"], height: size.value["height"],
+      orientation: direction.value };
   }
 }

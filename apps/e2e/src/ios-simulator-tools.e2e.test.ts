@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   CredentialManager, CredentialVault, IOS_SIMULATOR_TOOL_PROVIDER_ID, IosSimulatorToolBridgeProvider,
   McpRouter, SimulatorOwnershipRegistry, createInternalServer, createOrchestratorApplication, type OrchestratorConfig
@@ -146,6 +147,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", runtimeName: "iOS 19.0",
     runtimeVersion: "19.0", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null };
   const events: string[] = [];
+  let wdaPort = 0;
+  let ownerFingerprint = "";
+  let screenLabel = "Continue";
   let active: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -161,16 +165,40 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       manager: { get: () => active,
         retryOwnedCleanup: async () => { events.push("retry-cleanup"); },
         start: async options => { events.push("driver-start");
+          ownerFingerprint = createHash("sha256").update([
+            resolve(join(dataDirectory, "driver-cache")), options.instanceId,
+            options.simulatorUdid.toUpperCase()
+          ].join("\0")).digest("hex");
           active = { instanceId: options.instanceId, simulatorUdid: options.simulatorUdid,
-            leaseId: "B0123456-1234-1234-1234-123456789ABC", pid: 301, controlPort: 18100, mjpegPort: 19100,
+            leaseId: "B0123456-1234-1234-1234-123456789ABC", pid: 301, controlPort: wdaPort, mjpegPort: 19100,
             sourceRevision: "5f8280e761dc0b5b9b28368e63a8f0cc8d868346", buildCacheKey: "a".repeat(64),
             driverSessionId: "SESSION-1", health: { ready: true, message: null, osName: "iOS",
               osVersion: "19.0", sdkVersion: "19.0", deviceIp: null }, state: "ready" };
           return active; },
         stop: async () => { events.push("driver-stop"); active = null; } } }
   } });
+  const wda = createServer((request, response) => {
+    const send = (value: unknown): void => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ value }));
+    };
+    if (request.method !== "GET") { response.writeHead(405); response.end(); return; }
+    if (request.url === "/status") send({ ready: true, build: { upgradedAt: ownerFingerprint } });
+    else if (request.url === "/session/SESSION-1/source?format=json") send({
+      type: "XCUIElementTypeOther", children: [{ type: "XCUIElementTypeButton", label: screenLabel,
+        rect: { x: 10, y: 10, width: 120, height: 44 }, privatePath: "/private/driver-only" }]
+    });
+    else if (request.url === "/session/SESSION-1/window/size") send({ width: 393, height: 852 });
+    else if (request.url === "/session/SESSION-1/orientation") send("PORTRAIT");
+    else { response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ value: { error: "invalid session id" } })); }
+  });
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   try {
+    await new Promise<void>(done => wda.listen(0, "127.0.0.1", done));
+    const address = wda.address();
+    if (!address || typeof address === "string") throw new Error("WDA loopback port was not allocated.");
+    wdaPort = address.port;
     const target = application.store.getTarget("workspace").descriptor;
     application.store.createSession({ id: "simulator-task", backendId: target.backendId, targetId: target.id,
       title: "Simulator task", binding: { opaqueRef: "simulator-task-native", generation: 1 },
@@ -190,7 +218,13 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       expect(response.ok).toBe(true);
       return await response.json() as { isError: boolean; details: { mcpStructuredContent: {
         data?: { instance?: { instanceId: string; generation: number; lease: { id: string };
-          viewerState: string; graceExpiresAt: number | null }; drivers?: { state: string; instances: readonly { state: string }[] } };
+          viewerState: string; graceExpiresAt: number | null };
+          drivers?: { state: string; instances: readonly { state: string }[] };
+          screenMap?: Record<string, unknown> & { snapshotId: string };
+          viewport?: { width: number; height: number; orientation: string };
+          audit?: { violationCount: number }; diff?: { baselineSnapshotId: string;
+            added: readonly unknown[]; removed: readonly unknown[] };
+          timedOut?: boolean };
         errorCode?: string } } };
     };
     const attached = await call("control_tool", "attach_device", { udid });
@@ -202,11 +236,44 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     const doctor = await call("call_tool", "doctor", {});
     expect(doctor.details.mcpStructuredContent.data?.drivers).toMatchObject({ state: "available",
       instances: [{ state: "ready" }] });
+    expect(doctor.details.mcpStructuredContent.data).toMatchObject({ availability: {
+      get_screen_map: { state: "available" }, wait_for_ui: { state: "available" }
+    } });
+    const route = { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
+    const mapped = await call("control_tool", "get_screen_map", route);
+    expect(mapped).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      screenMap: { instanceId: instance.instanceId, elements: [{ label: "Continue" }] },
+      viewport: { width: 393, height: 852, orientation: "PORTRAIT" }
+    } } } });
+    expect(JSON.stringify(mapped)).not.toContain("driver-only");
+    const baseline = mapped.details.mcpStructuredContent.data!.screenMap!;
+    expect(await call("control_tool", "audit_accessibility", { ...route })).toMatchObject({
+      isError: false, details: { mcpStructuredContent: { data: {
+        audit: { violationCount: 0 }
+      } } }
+    });
+    screenLabel = "Next";
+    const compared = await call("control_tool", "compare_screen_maps", { ...route, baseline });
+    expect(compared).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      diff: { baselineSnapshotId: baseline.snapshotId, added: [expect.any(Object)],
+        removed: [expect.any(Object)] }
+    } } } });
+    expect(await call("control_tool", "wait_for_ui", { ...route,
+      condition: { kind: "element_exists", selector: { labelContains: "Next" } },
+      timeoutMs: 1_000, pollIntervalMs: 100, stableForMs: 100 })).toMatchObject({
+      isError: false, details: { mcpStructuredContent: { data: { timedOut: false,
+        screenMap: { elements: [{ label: "Next" }] } } } }
+    });
+    expect(await call("control_tool", "wait_for_ui", { ...route,
+      condition: { kind: "element_exists", selector: {} } })).toMatchObject({
+      isError: true, details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } }
+    });
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
       generation: instance.generation, leaseId: instance.lease.id });
     expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
       instance: { viewerState: "detached", graceExpiresAt: null }
     } } } });
+    expect((await call("control_tool", "get_screen_map", route)).isError).toBe(true);
     expect(events).toEqual(["retry-cleanup", "orphan-cleanup", "driver-start", "driver-stop",
       "retry-cleanup", "orphan-cleanup"]);
     expect((await call("call_tool", "list_instances", {})).details.mcpStructuredContent.data)
@@ -215,6 +282,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
   } finally {
     await internal?.close();
     await application.close();
+    wda.closeAllConnections();
+    await new Promise<void>(done => wda.close(() => done()));
     await rm(root, { recursive: true, force: true });
   }
 });

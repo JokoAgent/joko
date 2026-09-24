@@ -125,6 +125,7 @@ import { SimulatorCreateCoordinator } from "./ios-simulator-create-coordinator.j
 import { SimulatorLifecycleCoordinator } from "./ios-simulator-lifecycle-coordinator.js";
 import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
+import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import type { SimulatorCreateRuntime, SimulatorEnvironmentRuntime, SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
@@ -826,20 +827,25 @@ export async function createOrchestratorApplication(
   const simulatorCreate = simulatorPendingCreate === undefined ? undefined
     : new SimulatorCreateCoordinator(store, simulatorOwnership, simulatorPendingCreate,
       { create: dependencies.simulatorRuntime?.create, lifecycle: dependencies.simulatorRuntime?.lifecycle });
-  const simulatorControl = config.iosSimulatorDriver === undefined || simulatorCreate === undefined
-    ? undefined : new SimulatorInstanceControlCoordinator(store, simulatorOwnership, {
-      create: simulatorCreate,
-      lifecycle: new SimulatorLifecycleCoordinator(store, simulatorOwnership, dependencies.simulatorRuntime?.lifecycle),
-      driver: new SimulatorDriverCoordinator(store, simulatorOwnership, {
+  const simulatorDriver = config.iosSimulatorDriver === undefined ? undefined
+    : new SimulatorDriverCoordinator(store, simulatorOwnership, {
         ...config.iosSimulatorDriver,
         environment: dependencies.simulatorRuntime?.environment,
         lifecycle: dependencies.simulatorRuntime?.lifecycle,
         ...dependencies.simulatorRuntime?.driver
-      }),
+      });
+  const simulatorControl = simulatorDriver === undefined || simulatorCreate === undefined
+    ? undefined : new SimulatorInstanceControlCoordinator(store, simulatorOwnership, {
+      create: simulatorCreate,
+      lifecycle: new SimulatorLifecycleCoordinator(store, simulatorOwnership, dependencies.simulatorRuntime?.lifecycle),
+      driver: simulatorDriver,
       devices: dependencies.simulatorRuntime?.lifecycle
     });
+  const simulatorScreen = simulatorDriver === undefined ? undefined
+    : new SimulatorScreenObservationCoordinator(simulatorOwnership, simulatorDriver);
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
     new IosSimulatorToolBridgeProvider({ store, ownership: simulatorOwnership, control: simulatorControl,
+      screen: simulatorScreen,
       runtime: dependencies.simulatorRuntime?.environment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({

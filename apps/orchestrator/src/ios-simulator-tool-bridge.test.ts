@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { OperationInProgressError } from "@joko/store";
 import type { SimulatorEnvironmentRuntime } from "@joko/tool-ios-simulator";
@@ -173,4 +174,79 @@ it("publishes instance mutations only with a composed control owner and requires
   expect((await invoke("start_instance", { instanceId: "owned", generation: 2, leaseId: "lease" }))
     .structuredContent).toMatchObject({ ok: false, errorCode: "XCODE_NOT_FOUND" });
   expect(calls).toHaveLength(5);
+});
+
+it("publishes task-owned screen observations through the permission bridge with strict input bounds", async () => {
+  let ready = true;
+  let archived = false;
+  const calls: string[] = [];
+  const screenMap = { snapshotId: randomUUID(), instanceId: "owned", generation: 2,
+    interactionEpoch: 0, capturedAt: new Date().toISOString(), truncated: false, elements: [{
+      elementId: "a".repeat(20), role: "XCUIElementTypeButton", label: "Continue", value: null,
+      enabled: true, visible: true, frame: { x: 0, y: 0, width: 100, height: 44 }
+    }] };
+  const screen = {
+    screenMap: async () => { calls.push("map"); return { screenMap, viewport: { width: 393, height: 852,
+      orientation: "PORTRAIT" } }; },
+    audit: async () => { calls.push("audit"); return { audit: { violationCount: 0 } }; },
+    compare: async (_scope: unknown, _route: unknown, baseline: typeof screenMap) => {
+      calls.push(`compare:${baseline.snapshotId}`); return { diff: { unchangedCount: 1 } }; },
+    wait: async () => { calls.push("wait"); return { screenMap, elapsedMs: 1, timedOut: false }; },
+    clear: () => undefined
+  };
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [{ instanceId: "owned" }],
+      listForResourceAdmission: () => [] } as never,
+    control: { diagnoseDrivers: () => [{ state: "ready" }] } as never,
+    screen: screen as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: ready ? null : "XCODE_NOT_FOUND",
+      error: ready ? null : "Simulator unavailable", setupSteps: [] }) },
+    memoryProbe: async () => ({ source: "macos-memory-pressure", freePercentage: 50,
+      freeBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 })
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease" };
+  const invoke = async (name: string, args: Record<string, unknown>) =>
+    (await provider.callTool("control_tool", { name, args }, undefined, scope)).structuredContent;
+  expect(provider.tools.find(tool => tool.name === "control_tool")?.requiresPermission).toBe(true);
+  const catalog = (await provider.callTool("list_tools", { category: "ios_simulator" }, undefined, scope))
+    .structuredContent;
+  expect(catalog).toMatchObject({ tools: expect.arrayContaining([
+    expect.objectContaining({ name: "get_screen_map", readOnly: true, via: "control_tool" }),
+    expect.objectContaining({ name: "audit_accessibility", readOnly: true, via: "control_tool" }),
+    expect.objectContaining({ name: "compare_screen_maps", readOnly: true, via: "control_tool" }),
+    expect.objectContaining({ name: "wait_for_ui", readOnly: true, via: "control_tool" })
+  ]) });
+  expect((await provider.callTool("call_tool", { name: "get_screen_map", args: route }, undefined, scope))
+    .structuredContent).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
+    .structuredContent).toMatchObject({ data: { availability: {
+      get_screen_map: { state: "available" }, wait_for_ui: { state: "available" }
+    } } });
+  expect(await invoke("get_screen_map", route)).toMatchObject({ ok: true, data: { screenMap,
+    viewport: { width: 393 } } });
+  expect(await invoke("audit_accessibility", { ...route, maxViolations: 40 }))
+    .toMatchObject({ ok: true, data: { audit: { violationCount: 0 } } });
+  expect(await invoke("compare_screen_maps", { ...route, baseline: screenMap }))
+    .toMatchObject({ ok: true, data: { diff: { unchangedCount: 1 } } });
+  expect(await invoke("wait_for_ui", { ...route,
+    condition: { kind: "element_exists", selector: { labelContains: "Continue" } },
+    timeoutMs: 1_000, pollIntervalMs: 100, stableForMs: 100 }))
+    .toMatchObject({ ok: true, data: { timedOut: false } });
+  expect(await invoke("compare_screen_maps", { ...route,
+    baseline: { ...screenMap, snapshotId: 123 } })).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("wait_for_ui", { ...route,
+    condition: { kind: "element_exists", selector: {} } })).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("wait_for_ui", { ...route, condition: { kind: "screen_stable" },
+    timeoutMs: 30_001 })).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(calls).toEqual(["map", "audit", `compare:${screenMap.snapshotId}`, "wait"]);
+  ready = false;
+  expect(await invoke("get_screen_map", route)).toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
+  archived = true;
+  expect(await invoke("get_screen_map", route)).toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect(calls).toHaveLength(4);
 });
