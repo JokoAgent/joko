@@ -351,3 +351,88 @@ it("publishes bounded Simulator input only through permission authority and stri
   archived = true;
   expect(await invoke("press_home", route)).toMatchObject({ errorCode: "STALE_SCOPE" });
 });
+
+it("publishes strict Simulator presentation and accessibility controls only with effect authority", async () => {
+  let ready = true;
+  const calls: Array<{ action: Record<string, unknown>; authority: unknown }> = [];
+  const stateControl = { execute: async (_scope: unknown,
+    route: { instanceId: string; generation: number }, action: Record<string, unknown>,
+    authority: unknown) => {
+    calls.push({ action, authority });
+    return { replayed: false, receipt: { interaction: action["type"],
+      instanceId: route.instanceId, generation: route.generation,
+      backend: action["type"] === "set_orientation" ? "wda" : "simctl",
+      completedAt: new Date().toISOString(),
+      ...(action["type"] === "set_orientation" ? { orientation: action["orientation"], mode: "device",
+        viewport: { width: 852, height: 393, orientation: action["orientation"] } } : {}),
+      ...(action["type"] === "set_appearance" ? { appearance: action["appearance"] } : {}),
+      ...(action["type"] === "set_increase_contrast" ? { enabled: action["enabled"] } : {}),
+      ...(action["type"] === "set_content_size" ? { contentSize: action["contentSize"] } : {}) } };
+  } };
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [{ instanceId: "owned" }],
+      listForResourceAdmission: () => [] } as never,
+    control: { diagnoseDrivers: () => [{ state: "ready" }] } as never,
+    screen: { clear: () => undefined } as never,
+    stateControl: stateControl as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: ready ? null : "XCODE_NOT_FOUND",
+      error: ready ? null : "Simulator unavailable", setupSteps: [] }) },
+    memoryProbe: async () => ({ source: "macos-memory-pressure", freePercentage: 50,
+      freeBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 })
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const authority = { ...scope, effectIdentity: "a".repeat(64),
+    requestBodyHash: `sha256:${"b".repeat(64)}`, providerGeneration: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease" };
+  const snapshotId = randomUUID();
+  const invoke = async (name: string, args: Record<string, unknown>,
+    context: typeof scope | typeof authority = authority) =>
+    (await provider.callTool("control_tool", { name, args }, undefined, context)).structuredContent;
+  expect((await provider.callTool("list_tools", { category: "ios_simulator" }, undefined, scope))
+    .structuredContent).toMatchObject({ tools: expect.arrayContaining([
+      expect.objectContaining({ name: "set_orientation", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "set_appearance", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "set_increase_contrast", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "set_content_size", readOnly: false, via: "control_tool" })
+    ]) });
+  expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "LANDSCAPE" }))
+    .toMatchObject({ ok: true, data: { interaction: "set_orientation", backend: "wda",
+      orientation: "LANDSCAPE", screenMapInvalidated: true } });
+  expect(await invoke("set_appearance", { ...route, appearance: "dark" }))
+    .toMatchObject({ ok: true, data: { interaction: "set_appearance", appearance: "dark" } });
+  expect(await invoke("set_increase_contrast", { ...route, enabled: true }))
+    .toMatchObject({ ok: true, data: { interaction: "set_increase_contrast", enabled: true } });
+  expect(await invoke("set_content_size", { ...route,
+    contentSize: "accessibility-extra-large" })).toMatchObject({ ok: true,
+      data: { interaction: "set_content_size", contentSize: "accessibility-extra-large" } });
+  expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "UPSIDE_DOWN" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_appearance", { ...route, appearance: "blue" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_increase_contrast", { ...route, enabled: 1 }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_content_size", { ...route, contentSize: "huge" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_appearance", { ...route, appearance: "light" }, scope))
+    .toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect(calls).toHaveLength(4);
+  expect(calls.map(call => call.action)).toEqual([
+    { type: "set_orientation", snapshotId, orientation: "LANDSCAPE" },
+    { type: "set_appearance", appearance: "dark" },
+    { type: "set_increase_contrast", enabled: true },
+    { type: "set_content_size", contentSize: "accessibility-extra-large" }
+  ]);
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
+    .structuredContent).toMatchObject({ data: { availability: {
+      set_orientation: { state: "available", backend: "wda" },
+      set_appearance: { state: "available", backend: "simctl" }
+    } } });
+  ready = false;
+  expect(await invoke("set_appearance", { ...route, appearance: "light" }))
+    .toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
+  expect(calls).toHaveLength(4);
+});

@@ -16,7 +16,8 @@ const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 const CONFLICTING_KINDS = new Set([
   KIND, "ios_simulator_instance_control", "ios_simulator_create", "ios_simulator_lifecycle",
-  "ios_simulator_driver", "ios_simulator_grace_cleanup", "ios_simulator_removed_cleanup"
+  "ios_simulator_driver", "ios_simulator_state_control", "ios_simulator_grace_cleanup",
+  "ios_simulator_removed_cleanup"
 ]);
 const WEB_DRIVER_KEYS = Object.freeze({
   return: "\uE007", tab: "\uE004", escape: "\uE00C", delete: "\uE017",

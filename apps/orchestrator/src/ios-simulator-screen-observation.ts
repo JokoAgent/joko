@@ -173,6 +173,11 @@ export class SimulatorScreenObservationCoordinator {
     return this.#maps.invalidate(route.instanceId);
   }
 
+  invalidateRoute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): number {
+    this.#requireReady(scope, route);
+    return this.#maps.invalidate(route.instanceId);
+  }
+
   async observeAfter(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
     mode: SimulatorObserveAfterMode, options: { readonly timeoutMs: number;
       readonly stableForMs: number }, signal?: AbortSignal): Promise<SimulatorInteractionObservation | null> {

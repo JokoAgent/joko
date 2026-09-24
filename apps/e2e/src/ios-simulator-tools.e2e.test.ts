@@ -150,7 +150,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
   let wdaPort = 0;
   let ownerFingerprint = "";
   let screenLabel = "Continue";
+  let orientation: "PORTRAIT" | "LANDSCAPE" = "PORTRAIT";
   const inputs: Array<{ url: string; body: unknown; claimed: boolean }> = [];
+  const stateChanges: Array<{ action: string; value: unknown; claimed: boolean }> = [];
   let active: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -161,7 +163,25 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       error: null, setupSteps: [] }) },
     lifecycle: { findExact: async value => value.toUpperCase() === udid ? device : null,
       bootExact: async () => { throw new Error("Unexpected boot."); },
-      shutdownExact: async () => { throw new Error("Preexisting device must remain booted."); } },
+      shutdownExact: async () => { throw new Error("Preexisting device must remain booted."); },
+      setAppearance: async (value, appearance) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "set_appearance", value: appearance,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      setIncreaseContrast: async (value, enabled) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "set_increase_contrast", value: enabled,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      setContentSize: async (value, contentSize) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "set_content_size", value: contentSize,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      } },
     driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
       manager: { get: () => active,
         retryOwnedCleanup: async () => { events.push("retry-cleanup"); },
@@ -183,6 +203,19 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ value }));
     };
+    if (request.method === "POST" && request.url === "/session/SESSION-1/orientation") {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { orientation: "PORTRAIT" | "LANDSCAPE" };
+        const claimed = application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+          .some(operation => operation.kind === "ios_simulator_state_control");
+        orientation = body.orientation;
+        stateChanges.push({ action: "set_orientation", value: body.orientation, claimed });
+        send(null);
+      });
+      return;
+    }
     if (request.method === "POST" && request.url && [
       "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
       "/session/SESSION-1/wda/pressButton"
@@ -204,8 +237,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       type: "XCUIElementTypeOther", children: [{ type: "XCUIElementTypeButton", label: screenLabel,
         rect: { x: 10, y: 10, width: 120, height: 44 }, privatePath: "/private/driver-only" }]
     });
-    else if (request.url === "/session/SESSION-1/window/size") send({ width: 393, height: 852 });
-    else if (request.url === "/session/SESSION-1/orientation") send("PORTRAIT");
+    else if (request.url === "/session/SESSION-1/window/size") send(orientation === "PORTRAIT"
+      ? { width: 393, height: 852 } : { width: 852, height: 393 });
+    else if (request.url === "/session/SESSION-1/orientation") send(orientation);
     else { response.writeHead(404, { "content-type": "application/json" });
       response.end(JSON.stringify({ value: { error: "invalid session id" } })); }
   });
@@ -241,6 +275,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
           observation?: { mode: string; screenMap: Record<string, unknown> & {
             snapshotId: string; elements: readonly { elementId: string; label: string }[] } } | null;
           action?: string; backend?: string; screenMapInvalidated?: boolean;
+          interaction?: string; appearance?: string; enabled?: boolean; contentSize?: string;
+          mode?: string; replayed?: boolean;
           viewport?: { width: number; height: number; orientation: string };
           audit?: { violationCount: number }; diff?: { baselineSnapshotId: string;
             added: readonly unknown[]; removed: readonly unknown[] };
@@ -258,7 +294,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       instances: [{ state: "ready" }] });
     expect(doctor.details.mcpStructuredContent.data).toMatchObject({ availability: {
       get_screen_map: { state: "available" }, wait_for_ui: { state: "available" },
-      tap: { state: "available", backend: "wda" }, press_home: { state: "available" }
+      tap: { state: "available", backend: "wda" }, press_home: { state: "available" },
+      set_orientation: { state: "available", backend: "wda" },
+      set_appearance: { state: "available", backend: "simctl" }
     } });
     const route = { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
     const mapped = await call("control_tool", "get_screen_map", route);
@@ -356,10 +394,33 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
         screenMap: { elements: [{ label: "Input 9" }] } }
     } } } });
     const afterBatch = batched.details.mcpStructuredContent.data!.observation!.screenMap;
+    const rotated = await call("control_tool", "set_orientation", { ...route,
+      snapshotId: afterBatch.snapshotId, orientation: "LANDSCAPE" });
+    expect(rotated).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      interaction: "set_orientation", backend: "wda", orientation: "LANDSCAPE", mode: "device",
+      viewport: { width: 852, height: 393, orientation: "LANDSCAPE" },
+      screenMapInvalidated: true
+    } } } });
+    const afterRotation = await call("control_tool", "get_screen_map", route);
+    expect(afterRotation).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      viewport: { width: 852, height: 393, orientation: "LANDSCAPE" }
+    } } } });
     expect(await call("control_tool", "press_home", { ...route,
-      snapshotId: afterBatch.snapshotId })).toMatchObject({ isError: false,
+      snapshotId: afterRotation.details.mcpStructuredContent.data!.screenMap!.snapshotId })).toMatchObject({ isError: false,
       details: { mcpStructuredContent: { data: { action: "press_home",
         screenMapInvalidated: true, observation: null } } } });
+    expect(await call("control_tool", "set_appearance", { ...route, appearance: "dark" }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        interaction: "set_appearance", backend: "simctl", appearance: "dark"
+      } } } });
+    expect(await call("control_tool", "set_increase_contrast", { ...route, enabled: true }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        interaction: "set_increase_contrast", enabled: true
+      } } } });
+    expect(await call("control_tool", "set_content_size", { ...route,
+      contentSize: "accessibility-extra-large" })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { interaction: "set_content_size",
+          contentSize: "accessibility-extra-large" } } } });
     expect(inputs.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/actions",
@@ -368,6 +429,12 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton"
     ]);
     expect(inputs.every(item => item.claimed)).toBe(true);
+    expect(stateChanges).toEqual([
+      { action: "set_orientation", value: "LANDSCAPE", claimed: true },
+      { action: "set_appearance", value: "dark", claimed: true },
+      { action: "set_increase_contrast", value: true, claimed: true },
+      { action: "set_content_size", value: "accessibility-extra-large", claimed: true }
+    ]);
     const inputOperations = application.store.listOperations({ sessionId: "simulator-task" })
       .filter(operation => operation.kind === "ios_simulator_input")
       .map(operation => ({ body: operation.body,
@@ -375,6 +442,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(inputOperations).toHaveLength(8);
     expect(JSON.stringify(inputOperations)).not.toContain(secret);
     expect(JSON.stringify(inputOperations)).not.toContain(batchSecret);
+    expect(application.store.listOperations({ sessionId: "simulator-task" })
+      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(4);
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
       generation: instance.generation, leaseId: instance.lease.id });
     expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {

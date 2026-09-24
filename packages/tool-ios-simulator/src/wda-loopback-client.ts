@@ -2,7 +2,7 @@ import { createWdaOwnerFingerprint } from "./wda-build-plan.js";
 
 export type WdaClientErrorCode = "INVALID_CONFIGURATION" | "UNREACHABLE" | "TIMEOUT" | "CANCELLED" |
   "HTTP_ERROR" | "PROTOCOL_ERROR" | "RESPONSE_TOO_LARGE" | "OWNER_MISMATCH" | "NOT_READY" |
-  "INVALID_SESSION" | "INPUT_OUTCOME_UNKNOWN";
+  "INVALID_SESSION" | "INPUT_OUTCOME_UNKNOWN" | "ORIENTATION_UNSUPPORTED";
 
 export class WdaClientError extends Error {
   constructor(readonly code: WdaClientErrorCode, message: string, readonly statusCode?: number) { super(message); }
@@ -160,6 +160,11 @@ export class WdaLoopbackClient {
         if (response.status === 404 && record(value) && value["error"] === "invalid session id") {
           throw new WdaClientError("INVALID_SESSION", "Driver session no longer exists.", response.status);
         }
+        if (method === "POST" && path.endsWith("/orientation") && record(value) &&
+            typeof value["message"] === "string" && /\bUnable To Rotate Device\b/iu.test(value["message"])) {
+          throw new WdaClientError("ORIENTATION_UNSUPPORTED",
+            "The foreground app does not support the requested orientation.", response.status);
+        }
         throw new WdaClientError("HTTP_ERROR", "Driver request failed.", response.status);
       }
       if (record(value) && typeof value["error"] === "string") {
@@ -239,6 +244,28 @@ export class WdaLoopbackClient {
     }
     return { width: size.value["width"], height: size.value["height"],
       orientation: direction.value };
+  }
+
+  async setOrientation(id: string, orientation: WdaViewport["orientation"],
+    signal?: AbortSignal): Promise<void> {
+    if (orientation !== "PORTRAIT" && orientation !== "LANDSCAPE") {
+      throw new WdaClientError("INVALID_CONFIGURATION", "Driver orientation is invalid.");
+    }
+    const exactId = sessionId(id);
+    const health = await this.probe(signal);
+    if (!health.ready) throw new WdaClientError("NOT_READY", "Driver is not ready for orientation control.");
+    if (signal?.aborted) {
+      throw new WdaClientError("CANCELLED", "Driver orientation control was cancelled before dispatch.");
+    }
+    try {
+      await this.#request(`/session/${exactId}/orientation`, "POST",
+        JSON.stringify({ orientation }), signal);
+    } catch (error) {
+      if (error instanceof WdaClientError &&
+          (error.code === "INVALID_SESSION" || error.code === "ORIENTATION_UNSUPPORTED")) throw error;
+      throw new WdaClientError("INPUT_OUTCOME_UNKNOWN",
+        "Driver orientation outcome is unknown; observe before retrying.");
+    }
   }
 
   /** A dispatched POST may have acted even when its response is lost. Callers must reconcile before retrying. */

@@ -142,6 +142,26 @@ export class SimulatorDriverCoordinator {
     return this.#input(instance, (client, sessionId) => client.home(sessionId, signal));
   }
 
+  async setOrientation(instance: PublicSimulatorInstance, orientation: WdaViewport["orientation"],
+    signal?: AbortSignal): Promise<WdaViewport> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) {
+      throw new SimulatorDriverError("DRIVER_RUNTIME_LOST",
+        "Simulator driver is not ready for orientation control.");
+    }
+    const client = new WdaLoopbackClient({ controlPort: active.controlPort, cacheRoot: this.#cacheRoot,
+      instanceId: instance.instanceId, simulatorUdid: instance.simulatorUdid });
+    await client.setOrientation(active.driverSessionId, orientation, signal);
+    const viewport = await client.getViewport(active.driverSessionId, signal);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
+      throw new SimulatorDriverError("INPUT_OUTCOME_UNKNOWN",
+        "Simulator orientation completed while its driver route changed; observe before retrying.");
+    }
+    return viewport;
+  }
+
   diagnose(instance: PublicSimulatorInstance): { readonly state: "ready" | "stopped" | "error" | "unavailable";
     readonly reasonCode: string | null } {
     if (this.isReady(instance)) return { state: "ready", reasonCode: null };
@@ -222,7 +242,8 @@ export class SimulatorDriverCoordinator {
         const page = this.#store.listOperations({ sessionId: scope.sessionId, status: "started", limit: 500, offset });
         const conflicting = page.find(operation =>
           (operation.kind === KIND || operation.kind === "ios_simulator_lifecycle" ||
-            operation.kind === "ios_simulator_input") && operation.id !== operationId);
+            operation.kind === "ios_simulator_input" ||
+            operation.kind === "ios_simulator_state_control") && operation.id !== operationId);
         if (conflicting) throw new OperationInProgressError(conflicting.id);
         if (page.length < 500) break;
         offset += page.length;

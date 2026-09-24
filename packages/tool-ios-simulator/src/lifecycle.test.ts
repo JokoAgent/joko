@@ -115,3 +115,44 @@ it("uses a caller bounded timeout and terminates a real child that does not exit
     ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 30 });
   expect(result).toMatchObject({ timedOut: true, exitCode: null });
 });
+
+it("uses exact bounded simctl ui routes for appearance, contrast and content size", async () => {
+  const controls = scripted(
+    { args: ["simctl", "ui", UDID, "appearance", "dark"], result: ok() },
+    { args: ["simctl", "ui", UDID, "increase_contrast", "enabled"], result: ok() },
+    { args: ["simctl", "ui", UDID, "increase_contrast", "disabled"], result: ok() },
+    { args: ["simctl", "ui", UDID, "content_size", "accessibility-extra-large"], result: ok() }
+  );
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner: controls.runner });
+  await runtime.setAppearance!(UDID.toLowerCase(), "dark");
+  await runtime.setIncreaseContrast!(UDID, true);
+  await runtime.setIncreaseContrast!(UDID, false);
+  await runtime.setContentSize!(UDID, "accessibility-extra-large");
+  expect(controls.remaining()).toBe(0);
+});
+
+it("rejects invalid system controls before dispatch and fences uncertain results", async () => {
+  const unused = scripted();
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner: unused.runner });
+  await expect(runtime.setAppearance!(UDID, "blue" as "dark"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setIncreaseContrast!(UDID, "yes" as unknown as boolean))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setContentSize!(UDID, "huge" as "large"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  expect(unused.calls).toEqual([]);
+
+  await expect(createSimulatorLifecycleRuntime({ platform: "win32", runner: unused.runner })
+    .setAppearance!(UDID, "light")).rejects.toMatchObject({ code: "UNSUPPORTED_PLATFORM" });
+  expect(unused.calls).toEqual([]);
+
+  const rejected = scripted({ args: ["simctl", "ui", UDID, "appearance", "light"],
+    result: { stdout: "", stderr: "/private/secret", exitCode: 1 } });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: rejected.runner })
+    .setAppearance!(UDID, "light")).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_FAILED" });
+
+  const unknown = scripted({ args: ["simctl", "ui", UDID, "content_size", "large"],
+    result: { stdout: "", stderr: "/private/secret", exitCode: null, timedOut: true } });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner })
+    .setContentSize!(UDID, "large")).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
+});

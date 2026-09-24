@@ -145,6 +145,7 @@ it("routes input through the exact ready driver session and rechecks its lease",
   let ownerFingerprint = "";
   let retireOnReply = false;
   let loseActive = (): void => undefined;
+  let orientation: "PORTRAIT" | "LANDSCAPE" = "PORTRAIT";
   const server = createServer((request, response) => {
     const send = (value: unknown): void => {
       response.writeHead(200, { "content-type": "application/json" });
@@ -154,11 +155,20 @@ it("routes input through the exact ready driver session and rechecks its lease",
       send({ ready: true, build: { upgradedAt: ownerFingerprint } });
       return;
     }
+    if (request.method === "GET" && request.url === "/session/SESSION-1/window/size") {
+      send({ width: 393, height: 852 });
+      return;
+    }
+    if (request.method === "GET" && request.url === "/session/SESSION-1/orientation") {
+      send(orientation);
+      return;
+    }
     if (request.method !== "POST") { response.writeHead(404); response.end(); return; }
     const chunks: Buffer[] = [];
     request.on("data", chunk => chunks.push(Buffer.from(chunk)));
     request.on("end", () => {
       requests.push({ url: request.url ?? "", body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      if (request.url === "/session/SESSION-1/orientation") orientation = "LANDSCAPE";
       if (retireOnReply) { retireOnReply = false; loseActive(); }
       send(null);
     });
@@ -180,9 +190,13 @@ it("routes input through the exact ready driver session and rechecks its lease",
     await h.coordinator.swipe(started.instance, { x: 1, y: 2 }, { x: 3, y: 4 }, 300);
     await h.coordinator.typeText(started.instance, "hello");
     await h.coordinator.pressHome(started.instance);
+    await expect(h.coordinator.setOrientation(started.instance, "LANDSCAPE")).resolves.toEqual({
+      width: 393, height: 852, orientation: "LANDSCAPE"
+    });
     expect(requests.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
-      "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton"
+      "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton",
+      "/session/SESSION-1/orientation"
     ]);
     const tapBody = requests[0]?.body as { actions: Array<{ id: string;
       actions: Array<Record<string, unknown>> }> };
@@ -190,6 +204,7 @@ it("routes input through the exact ready driver session and rechecks its lease",
     expect(tapBody.actions[0]?.actions[0]).toMatchObject({ type: "pointerMove", x: 10, y: 20 });
     expect(requests[2]?.body).toEqual({ value: ["h", "e", "l", "l", "o"] });
     expect(requests[3]?.body).toEqual({ name: "home" });
+    expect(requests[4]?.body).toEqual({ orientation: "LANDSCAPE" });
     retireOnReply = true;
     await expect(h.coordinator.tap(started.instance, { x: 1, y: 1 }))
       .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });

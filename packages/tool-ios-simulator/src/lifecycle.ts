@@ -10,7 +10,8 @@ export type SimulatorLifecycleErrorCode =
   | "UNSUPPORTED_PLATFORM" | "INVALID_ARGUMENT" | "MUTATION_CANCELLED"
   | "SIMCTL_FAILED" | "INVALID_SIMCTL_OUTPUT" | "SIMULATOR_NOT_FOUND"
   | "SIMULATOR_BOOT_FAILED" | "SIMULATOR_BOOT_TIMEOUT" | "SIMULATOR_BOOT_UNKNOWN"
-  | "SIMULATOR_SHUTDOWN_FAILED" | "SIMULATOR_SHUTDOWN_TIMEOUT" | "SIMULATOR_SHUTDOWN_UNKNOWN";
+  | "SIMULATOR_SHUTDOWN_FAILED" | "SIMULATOR_SHUTDOWN_TIMEOUT" | "SIMULATOR_SHUTDOWN_UNKNOWN"
+  | "SIMULATOR_CONTROL_FAILED" | "SIMULATOR_CONTROL_UNKNOWN";
 
 export class SimulatorLifecycleError extends Error {
   constructor(readonly code: SimulatorLifecycleErrorCode, message: string) { super(message); }
@@ -20,7 +21,23 @@ export interface SimulatorLifecycleRuntime {
   findExact(udid: string, signal?: AbortSignal): Promise<SimulatorDevice | null>;
   bootExact(udid: string, signal?: AbortSignal): Promise<SimulatorDevice>;
   shutdownExact(udid: string, signal?: AbortSignal): Promise<void>;
+  setAppearance?(udid: string, appearance: SimulatorAppearance, signal?: AbortSignal): Promise<void>;
+  setIncreaseContrast?(udid: string, enabled: boolean, signal?: AbortSignal): Promise<void>;
+  setContentSize?(udid: string, contentSize: SimulatorContentSize, signal?: AbortSignal): Promise<void>;
 }
+
+export type SimulatorAppearance = "light" | "dark";
+export type SimulatorContentSize = "extra-small" | "small" | "medium" | "large" | "extra-large" |
+  "extra-extra-large" | "extra-extra-extra-large" | "accessibility-medium" |
+  "accessibility-large" | "accessibility-extra-large" | "accessibility-extra-extra-large" |
+  "accessibility-extra-extra-extra-large";
+
+const CONTENT_SIZES = new Set<SimulatorContentSize>([
+  "extra-small", "small", "medium", "large", "extra-large", "extra-extra-large",
+  "extra-extra-extra-large", "accessibility-medium", "accessibility-large",
+  "accessibility-extra-large", "accessibility-extra-extra-large",
+  "accessibility-extra-extra-extra-large"
+]);
 
 export interface SimulatorLifecycleClock {
   now(): number;
@@ -110,6 +127,17 @@ export function createSimulatorLifecycleRuntime(options: {
     return result;
   }
 
+  async function runControl(udid: string, args: readonly string[], signal?: AbortSignal): Promise<void> {
+    requirePlatform();
+    const normalized = exactUdid(udid);
+    const result = await runMutation(["simctl", "ui", normalized, ...args], 15_000,
+      "SIMULATOR_CONTROL_UNKNOWN", signal);
+    if (result.exitCode !== 0 || result.failed) {
+      throw new SimulatorLifecycleError("SIMULATOR_CONTROL_FAILED",
+        "Simulator system setting could not be changed.");
+    }
+  }
+
   return {
     findExact,
     async bootExact(udid, signal) {
@@ -188,6 +216,24 @@ export function createSimulatorLifecycleRuntime(options: {
         if (error instanceof SimulatorLifecycleError) throw error;
         throw new SimulatorLifecycleError("SIMULATOR_SHUTDOWN_FAILED", "Selected Simulator device could not be stopped.");
       }
+    },
+    async setAppearance(udid, appearance, signal) {
+      if (appearance !== "light" && appearance !== "dark") {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator appearance is invalid.");
+      }
+      await runControl(udid, ["appearance", appearance], signal);
+    },
+    async setIncreaseContrast(udid, enabled, signal) {
+      if (typeof enabled !== "boolean") {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator contrast setting is invalid.");
+      }
+      await runControl(udid, ["increase_contrast", enabled ? "enabled" : "disabled"], signal);
+    },
+    async setContentSize(udid, contentSize, signal) {
+      if (!CONTENT_SIZES.has(contentSize)) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator content size is invalid.");
+      }
+      await runControl(udid, ["content_size", contentSize], signal);
     }
   };
 }

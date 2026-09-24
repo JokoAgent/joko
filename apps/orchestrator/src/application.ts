@@ -127,7 +127,9 @@ import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } fr
 import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import { SimulatorInputCoordinator } from "./ios-simulator-input-coordinator.js";
-import type { SimulatorCreateRuntime, SimulatorEnvironmentRuntime, SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
+import { createSimulatorLifecycleRuntime, type SimulatorCreateRuntime,
+  type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
+import { SimulatorStateControlCoordinator } from "./ios-simulator-state-control.js";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -846,9 +848,12 @@ export async function createOrchestratorApplication(
     : new SimulatorScreenObservationCoordinator(simulatorOwnership, simulatorDriver);
   const simulatorInput = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorInputCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen);
+  const simulatorStateControl = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
+    : new SimulatorStateControlCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen,
+      dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
     new IosSimulatorToolBridgeProvider({ store, ownership: simulatorOwnership, control: simulatorControl,
-      screen: simulatorScreen, input: simulatorInput,
+      screen: simulatorScreen, input: simulatorInput, stateControl: simulatorStateControl,
       runtime: dependencies.simulatorRuntime?.environment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({

@@ -228,3 +228,54 @@ it("marks dispatched input as outcome-unknown when the response times out or cal
   await expect(cancelled).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
   expect(posts).toBe(2);
 });
+
+it("sets orientation through the exact owned WDA session with a bounded payload", async () => {
+  let fingerprint = "";
+  const calls: { path: string; method: string; body: unknown }[] = [];
+  const port = await loopback((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      calls.push({ path: request.url ?? "", method: request.method ?? "",
+        body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null });
+      if (request.url === "/status") {
+        json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+      } else json(response, { value: null });
+    });
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  await driver.setOrientation("SESSION-1", "LANDSCAPE");
+  expect(calls).toEqual([
+    { path: "/status", method: "GET", body: null },
+    { path: "/session/SESSION-1/orientation", method: "POST",
+      body: { orientation: "LANDSCAPE" } }
+  ]);
+  await expect(driver.setOrientation("SESSION-1", "UPSIDE_DOWN" as "PORTRAIT"))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  expect(calls).toHaveLength(2);
+});
+
+it("distinguishes unsupported orientation from an uncertain dispatched rotation", async () => {
+  let fingerprint = "";
+  let mode: "unsupported" | "stalled" = "unsupported";
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") {
+      json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+    } else if (mode === "unsupported") {
+      json(response, { value: { error: "unknown error",
+        message: "Unable To Rotate Device: private application detail" } }, 500);
+    } else {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write("{");
+    }
+  });
+  const driver = client(port, { timeoutMs: 40 });
+  fingerprint = driver.ownerFingerprint;
+  await expect(driver.setOrientation("SESSION-1", "LANDSCAPE"))
+    .rejects.toMatchObject({ code: "ORIENTATION_UNSUPPORTED",
+      message: "The foreground app does not support the requested orientation." });
+  mode = "stalled";
+  await expect(driver.setOrientation("SESSION-1", "PORTRAIT"))
+    .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+});
