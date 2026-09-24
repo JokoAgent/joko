@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { createWdaBuildCacheKey, createWdaBuildPlan } from "./wda-build-plan.js";
+import { createWdaBuildCacheKey, createWdaBuildPlan, createWdaOwnerFingerprint } from "./wda-build-plan.js";
 
 const udid = "a0123456-1234-1234-1234-123456789abc";
 const owner = "b".repeat(64);
@@ -25,6 +25,10 @@ it("pins exact Xcode build and launch argv while withholding unrelated host secr
     env: { PATH: "/usr/bin:/bin", HOME: "/Users/test", USE_PORT: "8100", MJPEG_SERVER_PORT: "9100" } });
   expect(plan.controlPort).toBe(8100);
   expect(plan.mjpegPort).toBe(9100);
+  const fingerprint = createWdaOwnerFingerprint({ cacheRoot: "/private/joko/cache", instanceId: "one", simulatorUdid: udid });
+  expect(fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+  expect(createWdaOwnerFingerprint({ cacheRoot: "/private/joko/cache", instanceId: "one",
+    simulatorUdid: udid.toUpperCase() })).toBe(fingerprint);
   expect(createWdaBuildCacheKey({ sourceRevision: "a".repeat(40), xcodeBuild: "19A1",
     runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", architecture: "arm64" }))
     .toMatch(/^[0-9a-f]{64}$/u);

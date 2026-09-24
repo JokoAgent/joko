@@ -39,6 +39,22 @@ export interface WdaBuildPlanOptions {
   readonly hostEnvironment?: Readonly<NodeJS.ProcessEnv>;
 }
 
+/** Bind one service cache, owned instance and exact Simulator device to Xcode's runner marker. */
+export function createWdaOwnerFingerprint(input: {
+  readonly cacheRoot: string;
+  readonly instanceId: string;
+  readonly simulatorUdid: string;
+}): string {
+  const cacheRoot = absolute(input.cacheRoot, "cacheRoot");
+  if (!input.instanceId || input.instanceId.length > 128 || input.instanceId.trim() !== input.instanceId ||
+      /[\0\r\n]/u.test(input.instanceId)) throw new Error("instanceId is invalid.");
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(input.simulatorUdid)) {
+    throw new Error("simulatorUdid is invalid.");
+  }
+  return createHash("sha256").update([cacheRoot, input.instanceId,
+    input.simulatorUdid.toUpperCase()].join("\0")).digest("hex");
+}
+
 function absolute(value: string, label: string): string {
   if (!isAbsolute(value) || value.includes("\0") || /[\r\n]/u.test(value)) throw new Error(`${label} must be an absolute path.`);
   return normalize(value);
