@@ -227,3 +227,36 @@ export async function inspectWdaOrphanProcesses(input: WdaOrphanInspectionInput)
     throw fail();
   }
 }
+
+/** Re-read one group leader immediately before a caller considers a signal. */
+export async function verifyWdaOrphanGroup(input: WdaOrphanInspectionInput, groupId: number): Promise<boolean> {
+  if ((input.platform ?? process.platform) !== "darwin") {
+    throw new WdaOrphanInspectionError("UNSUPPORTED_PLATFORM", "Driver process inspection requires macOS.");
+  }
+  if (!Number.isSafeInteger(groupId) || groupId <= 1) {
+    throw new WdaOrphanInspectionError("INVALID_CONFIGURATION", "Driver process group is invalid.");
+  }
+  cancelled(input.signal);
+  const reader = input.reader ?? hostReader();
+  try {
+    const snapshot = await reader.listExecutables(input.signal);
+    cancelled(input.signal);
+    if (Buffer.byteLength(snapshot) > MAX_SNAPSHOT_BYTES) throw fail();
+    const rows = parseRows(snapshot);
+    if (new Set(rows.map(row => row.pid)).size !== rows.length) throw fail();
+    const ownRows = rows.filter(row => row.pid === process.pid);
+    if (ownRows.length !== 1) throw fail();
+    const candidate = rows.find(row => row.pid === groupId && row.pgid === groupId);
+    if (!candidate || ownRows[0]!.pgid === groupId) return false;
+    const scopedReader: WdaProcessInventoryReader = {
+      listExecutables: async () => `${ownRows[0]!.pid} ${ownRows[0]!.pgid} ${ownRows[0]!.command}\n` +
+        `${candidate.pid} ${candidate.pgid} ${candidate.command}`,
+      readCandidate: (pid, includeEnvironment, signal) => reader.readCandidate(pid, includeEnvironment, signal)
+    };
+    const fresh = await inspectWdaOrphanProcesses({ ...input, reader: scopedReader });
+    return !fresh.conflict && fresh.ownedGroupIds.includes(groupId);
+  } catch (error) {
+    if (error instanceof WdaOrphanInspectionError) throw error;
+    throw fail();
+  }
+}

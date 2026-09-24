@@ -10,3 +10,4 @@ export * from "./wda-loopback-client.js";
 export * from "./wda-child-process.js";
 export * from "./wda-driver-manager.js";
 export * from "./wda-orphan-inspector.js";
+export * from "./wda-orphan-cleaner.js";
