@@ -108,6 +108,8 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   let buildCalls = 0;
   let installCalls = 0;
+  let launchCalls = 0;
+  let terminateCalls = 0;
   try {
     application = await createOrchestratorApplication(config, { simulatorRuntime: {
       environment: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
@@ -123,6 +125,21 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
           expect(appPath).not.toBe(sourceApp);
           expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_app_install")).toBe(true);
+        },
+        launchApp: async (value, bundleId, args) => {
+          launchCalls += 1;
+          expect(value).toBe(udid);
+          expect(bundleId).toBe("app.joko.example");
+          expect(args).toEqual(["--token", "private-launch-value"]);
+          expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_app_control")).toBe(true);
+        },
+        terminateApp: async (value, bundleId) => {
+          terminateCalls += 1;
+          expect(value).toBe(udid);
+          expect(bundleId).toBe("app.joko.example");
+          expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_app_control")).toBe(true);
         } },
       projectBuilder: {
         inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
@@ -173,7 +190,9 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
     expect(await call("list_tools", "list_tools", { category: "ios_simulator" }))
       .toMatchObject({ isError: false, details: { mcpStructuredContent: {
         tools: expect.arrayContaining([expect.objectContaining({
-          name: "install_app", readOnly: false, via: "control_tool" })])
+          name: "install_app", readOnly: false, via: "control_tool" }),
+          expect.objectContaining({ name: "launch_app", readOnly: false, via: "control_tool" }),
+          expect.objectContaining({ name: "terminate_app", readOnly: false, via: "control_tool" })])
       } } });
     const route = { instanceId: instance.instanceId, generation: instance.generation,
       leaseId: instance.lease.id };
@@ -205,6 +224,22 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
       .toMatchObject({ isError: true, details: { mcpStructuredContent: {
         errorCode: "APP_ARTIFACT_INVALID" } } });
     expect(installCalls).toBe(1);
+    expect(await call("control_tool", "launch_app", { ...route, artifactId,
+      bundleId: "app.other.example" })).toMatchObject({ isError: true,
+        details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    expect(launchCalls).toBe(0);
+    expect(await call("control_tool", "launch_app", { ...route, artifactId,
+      args: ["--token", "private-launch-value"] })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { action: "launch_app", bundleId: "app.joko.example",
+          screenMapInvalidated: true } } } });
+    expect(launchCalls).toBe(1);
+    expect(await call("control_tool", "terminate_app", { ...route, artifactId }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        action: "terminate_app", screenMapInvalidated: true } } } });
+    expect(terminateCalls).toBe(1);
+    expect(JSON.stringify(application.store.listOperations({ sessionId: "simulator-build-task" }),
+      (_key, value: unknown) => typeof value === "bigint" ? String(value) : value))
+      .not.toContain("private-launch-value");
     snapshot.revoke();
   } finally {
     await internal?.close();

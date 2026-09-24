@@ -350,3 +350,41 @@ it("installs only an absolute app on the exact simulator with bounded unknown ou
   await expect(createSimulatorLifecycleRuntime({ platform: "win32", runner }).installApp!(UDID, appPath))
     .rejects.toMatchObject({ code: "UNSUPPORTED_PLATFORM" });
 });
+
+it("launches and terminates one bundle with bounded exact simctl arguments", async () => {
+  const calls: Array<{ args: readonly string[]; timeoutMs: number | undefined }> = [];
+  let result: SimulatorCommandResult = ok();
+  const runner: SimulatorCommandRunner = { run: async (command, args, options) => {
+    expect(command).toBe(XCRUN);
+    calls.push({ args, timeoutMs: options?.timeoutMs });
+    return result;
+  } };
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner });
+  await runtime.launchApp!(UDID.toLowerCase(), "app.joko.fixture", ["--mode", "test"]);
+  await runtime.terminateApp!(UDID.toLowerCase(), "app.joko.fixture");
+  expect(calls).toEqual([
+    { args: ["simctl", "launch", UDID, "app.joko.fixture", "--mode", "test"], timeoutMs: 30_000 },
+    { args: ["simctl", "terminate", UDID, "app.joko.fixture"], timeoutMs: 30_000 }
+  ]);
+  await expect(runtime.launchApp!(UDID, "app.joko.fixture", ["a".repeat(4_097)]))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.launchApp!(UDID, "app.joko.fixture", Array(65).fill("arg")))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.terminateApp!(UDID, "invalid bundle"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await expect(runtime.launchApp!(UDID, "app.joko.fixture", [], cancelled.signal))
+    .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+  expect(calls).toHaveLength(2);
+  result = { stdout: "", stderr: "private host output", exitCode: 1 };
+  await expect(runtime.launchApp!(UDID, "app.joko.fixture", []))
+    .rejects.toMatchObject({ code: "APP_LAUNCH_FAILED" });
+  await expect(runtime.terminateApp!(UDID, "app.joko.fixture"))
+    .rejects.toMatchObject({ code: "APP_TERMINATE_FAILED" });
+  result = { stdout: "", stderr: "private host output", exitCode: null, timedOut: true };
+  await expect(runtime.launchApp!(UDID, "app.joko.fixture", []))
+    .rejects.toMatchObject({ code: "APP_LAUNCH_UNKNOWN" });
+  await expect(runtime.terminateApp!(UDID, "app.joko.fixture"))
+    .rejects.toMatchObject({ code: "APP_TERMINATE_UNKNOWN" });
+});

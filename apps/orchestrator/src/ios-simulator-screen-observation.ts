@@ -178,6 +178,12 @@ export class SimulatorScreenObservationCoordinator {
     return this.#maps.invalidate(route.instanceId);
   }
 
+  /** App lifecycle may change the screen even when no WDA driver is attached. */
+  invalidateOwnedRoute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): number {
+    this.#ownership.requireRoute(scope, route);
+    return this.#maps.invalidate(route.instanceId);
+  }
+
   async observeAfter(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
     mode: SimulatorObserveAfterMode, options: { readonly timeoutMs: number;
       readonly stableForMs: number }, signal?: AbortSignal): Promise<SimulatorInteractionObservation | null> {

@@ -15,7 +15,9 @@ export type SimulatorLifecycleErrorCode =
   | "SIMULATOR_BOOT_FAILED" | "SIMULATOR_BOOT_TIMEOUT" | "SIMULATOR_BOOT_UNKNOWN"
   | "SIMULATOR_SHUTDOWN_FAILED" | "SIMULATOR_SHUTDOWN_TIMEOUT" | "SIMULATOR_SHUTDOWN_UNKNOWN"
   | "SIMULATOR_CONTROL_FAILED" | "SIMULATOR_CONTROL_UNKNOWN"
-  | "APP_INSTALL_FAILED" | "APP_INSTALL_UNKNOWN";
+  | "APP_INSTALL_FAILED" | "APP_INSTALL_UNKNOWN"
+  | "APP_LAUNCH_FAILED" | "APP_LAUNCH_UNKNOWN"
+  | "APP_TERMINATE_FAILED" | "APP_TERMINATE_UNKNOWN";
 
 export class SimulatorLifecycleError extends Error {
   constructor(readonly code: SimulatorLifecycleErrorCode, message: string) { super(message); }
@@ -40,6 +42,9 @@ export interface SimulatorLifecycleRuntime {
   pushNotification?(udid: string, bundleId: string,
     payload: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<void>;
   installApp?(udid: string, appPath: string, signal?: AbortSignal): Promise<void>;
+  launchApp?(udid: string, bundleId: string, args: readonly string[],
+    signal?: AbortSignal): Promise<void>;
+  terminateApp?(udid: string, bundleId: string, signal?: AbortSignal): Promise<void>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -520,6 +525,32 @@ export function createSimulatorLifecycleRuntime(options: {
         120_000, "APP_INSTALL_UNKNOWN", signal);
       if (result.exitCode !== 0 || result.failed) {
         throw new SimulatorLifecycleError("APP_INSTALL_FAILED", "Simulator app could not be installed.");
+      }
+    },
+    async launchApp(udid, bundleId, args, signal) {
+      requirePlatform();
+      const normalized = exactUdid(udid);
+      if (typeof bundleId !== "string" || !BUNDLE_ID.test(bundleId) ||
+          !Array.isArray(args) || args.length > 64 ||
+          args.some(arg => typeof arg !== "string" || arg.length > 4_096 || /\0/u.test(arg))) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator app launch arguments are invalid.");
+      }
+      const result = await runMutation(["simctl", "launch", normalized, bundleId, ...args],
+        30_000, "APP_LAUNCH_UNKNOWN", signal);
+      if (result.exitCode !== 0 || result.failed) {
+        throw new SimulatorLifecycleError("APP_LAUNCH_FAILED", "Simulator app could not be launched.");
+      }
+    },
+    async terminateApp(udid, bundleId, signal) {
+      requirePlatform();
+      const normalized = exactUdid(udid);
+      if (typeof bundleId !== "string" || !BUNDLE_ID.test(bundleId)) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator app bundle identity is invalid.");
+      }
+      const result = await runMutation(["simctl", "terminate", normalized, bundleId],
+        30_000, "APP_TERMINATE_UNKNOWN", signal);
+      if (result.exitCode !== 0 || result.failed) {
+        throw new SimulatorLifecycleError("APP_TERMINATE_FAILED", "Simulator app could not be terminated.");
       }
     },
     async pushNotification(udid, bundleId, payload, signal) {

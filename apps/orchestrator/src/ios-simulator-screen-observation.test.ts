@@ -73,6 +73,21 @@ it("fences screen observations by the current task route and driver readiness", 
   } finally { h.store.close(); }
 });
 
+it("invalidates an owned app screen without requiring a live driver", async () => {
+  const h = fixture();
+  try {
+    const current = await h.screen.screenMap(SCOPE, route(h.instance));
+    h.setReady(false);
+    expect(h.screen.invalidateOwnedRoute(SCOPE, route(h.instance))).toBeGreaterThan(0);
+    h.setReady(true);
+    expect(() => h.screen.requireInteractionSnapshot(SCOPE, route(h.instance),
+      current.screenMap.snapshotId)).toThrowError("The UI changed. Read a new screen map.");
+    h.store.updateSession(SCOPE.sessionId, { archived: true });
+    expect(() => h.screen.invalidateOwnedRoute(SCOPE, route(h.instance)))
+      .toThrowError(/task|scope|archived/iu);
+  } finally { h.store.close(); }
+});
+
 it("rejects an older asynchronous screen capture after a newer one completes", async () => {
   const h = fixture();
   let release!: () => void;

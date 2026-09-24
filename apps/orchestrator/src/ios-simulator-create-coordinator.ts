@@ -77,7 +77,8 @@ export class SimulatorCreateCoordinator {
           (operation.kind === KIND || operation.kind === "ios_simulator_input" ||
             operation.kind === "ios_simulator_state_control" ||
             operation.kind === "ios_simulator_app_build" ||
-            operation.kind === "ios_simulator_app_install") &&
+            operation.kind === "ios_simulator_app_install" ||
+            operation.kind === "ios_simulator_app_control") &&
           operation.id !== operationId);
         if (conflicting !== undefined) throw new OperationInProgressError(conflicting.id);
         if (page.length < 500) break;
