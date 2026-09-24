@@ -24,6 +24,8 @@ import { SimulatorAppControlError, type SimulatorAppControlCoordinator,
   type SimulatorAppControlAction } from "./ios-simulator-app-control.js";
 import { SimulatorUrlControlError, type SimulatorUrlControlCoordinator } from "./ios-simulator-url-control.js";
 import { SimulatorScreenshotError, type SimulatorScreenshotCoordinator } from "./ios-simulator-screenshot.js";
+import { SimulatorRecordingError, type SimulatorRecordingCoordinator,
+  type SimulatorRecordingStopReceipt } from "./ios-simulator-recording.js";
 import { SimulatorVisualComparisonError, type SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
 import { SimulatorStateDiagnosticsError, type SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
 
@@ -87,6 +89,11 @@ const SCREENSHOT_TOOLS = Object.freeze([
   { name: "take_simulator_screenshot", description: "Capture a PNG from the exact attached Simulator and return a task-owned image artifact.", readOnly: false }
 ] as const);
 
+const RECORDING_TOOLS = Object.freeze([
+  { name: "start_recording", description: "Start one task-owned H.264 recording of the exact Simulator.", readOnly: false },
+  { name: "stop_recording", description: "Finalize one task-owned Simulator recording and return its MOV artifact.", readOnly: false }
+] as const);
+
 const VISUAL_TOOLS = Object.freeze([
   { name: "capture_visual_baseline", description: "Capture a bounded in-memory visual baseline for later comparison on this Simulator task.", readOnly: false },
   { name: "visual_diff", description: "Compare the current Simulator screen with a task-owned in-memory baseline and return pixel metrics.", readOnly: true }
@@ -139,7 +146,7 @@ const STATE_TOOLS = Object.freeze([
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
   stateControl: boolean, projectBuild: boolean, appInstall: boolean,
   appControl: boolean, urlControl: boolean, screenshot: boolean,
-  visual: boolean, stateDiagnostics: boolean): readonly McpToolDescriptor[] {
+  recording: boolean, visual: boolean, stateDiagnostics: boolean): readonly McpToolDescriptor[] {
   const tools: McpToolDescriptor[] = [{
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "list_tools",
@@ -157,7 +164,7 @@ function bridgeTools(control: boolean, screen: boolean, input: boolean,
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: false
   }];
-  if (control || screen || input || stateControl || projectBuild || appInstall || appControl || urlControl || screenshot || visual || stateDiagnostics) tools.push({
+  if (control || screen || input || stateControl || projectBuild || appInstall || appControl || urlControl || screenshot || recording || visual || stateDiagnostics) tools.push({
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "control_tool",
     description: "Call one validated task-local iOS Simulator control or screen observation with the current task's permission.",
@@ -167,6 +174,7 @@ function bridgeTools(control: boolean, screen: boolean, input: boolean,
         ...(stateControl ? STATE_TOOLS : []), ...(projectBuild ? BUILD_TOOLS : []),
         ...(appInstall ? INSTALL_TOOLS : []), ...(appControl ? APP_CONTROL_TOOLS : []),
         ...(urlControl ? URL_TOOLS : []), ...(screenshot ? SCREENSHOT_TOOLS : []),
+        ...(recording ? RECORDING_TOOLS : []),
         ...(visual ? VISUAL_TOOLS : []),
         ...(stateDiagnostics ? STATE_OBSERVATION_TOOLS : [])].map(tool => tool.name) },
       args: { type: "object", additionalProperties: true }
@@ -199,6 +207,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly #appControl: SimulatorAppControlCoordinator | undefined;
   readonly #urlControl: SimulatorUrlControlCoordinator | undefined;
   readonly #screenshot: SimulatorScreenshotCoordinator | undefined;
+  readonly #recording: SimulatorRecordingCoordinator | undefined;
   readonly #visual: SimulatorVisualComparisonCoordinator | undefined;
   readonly #stateDiagnostics: SimulatorStateDiagnosticsCoordinator | undefined;
   readonly #memoryProbe: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
@@ -215,6 +224,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     readonly appControl?: SimulatorAppControlCoordinator;
     readonly urlControl?: SimulatorUrlControlCoordinator;
     readonly screenshot?: SimulatorScreenshotCoordinator;
+    readonly recording?: SimulatorRecordingCoordinator;
     readonly visual?: SimulatorVisualComparisonCoordinator;
     readonly stateDiagnostics?: SimulatorStateDiagnosticsCoordinator;
     readonly runtime?: SimulatorEnvironmentRuntime;
@@ -231,13 +241,15 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#appControl = options.appControl;
     this.#urlControl = options.urlControl;
     this.#screenshot = options.screenshot;
+    this.#recording = options.recording;
     this.#visual = options.visual;
     this.#stateDiagnostics = options.stateDiagnostics;
     this.tools = bridgeTools(options.control !== undefined, options.screen !== undefined,
       options.input !== undefined, options.stateControl !== undefined,
       options.projectBuild !== undefined, options.appInstall !== undefined,
       options.appControl !== undefined, options.urlControl !== undefined,
-      options.screenshot !== undefined, options.visual !== undefined,
+      options.screenshot !== undefined, options.recording !== undefined,
+      options.visual !== undefined,
       options.stateDiagnostics !== undefined);
     this.#runtime = options.runtime ?? createSimulatorEnvironmentRuntime();
     this.#memoryProbe = options.memoryProbe ?? (signal => collectSimulatorMemorySnapshot({ signal }));
@@ -265,6 +277,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
           ...(this.#appInstall ? INSTALL_TOOLS : []),
           ...(this.#appControl ? APP_CONTROL_TOOLS : []),
           ...(this.#urlControl ? URL_TOOLS : []), ...(this.#screenshot ? SCREENSHOT_TOOLS : []),
+          ...(this.#recording ? RECORDING_TOOLS : []),
           ...(this.#visual ? VISUAL_TOOLS : []),
           ...(this.#stateDiagnostics ? STATE_OBSERVATION_TOOLS : [])]
           .map(tool => ({ name: tool.name, category: CATEGORY, description: tool.description,
@@ -277,7 +290,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       if (name !== "call_tool" &&
           (name !== "control_tool" || !this.#control && !this.#screen && !this.#input &&
             !this.#stateControl && !this.#projectBuild && !this.#appInstall &&
-            !this.#appControl && !this.#urlControl && !this.#screenshot && !this.#visual &&
+            !this.#appControl && !this.#urlControl && !this.#screenshot && !this.#recording && !this.#visual &&
             !this.#stateDiagnostics)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator bridge tool is unavailable.");
       }
@@ -290,7 +303,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         ...(this.#input ? INPUT_TOOLS : []), ...(this.#stateControl ? STATE_TOOLS : []),
         ...(this.#projectBuild ? BUILD_TOOLS : []), ...(this.#appInstall ? INSTALL_TOOLS : []),
         ...(this.#appControl ? APP_CONTROL_TOOLS : []), ...(this.#urlControl ? URL_TOOLS : []),
-        ...(this.#screenshot ? SCREENSHOT_TOOLS : []), ...(this.#visual ? VISUAL_TOOLS : []),
+        ...(this.#screenshot ? SCREENSHOT_TOOLS : []), ...(this.#recording ? RECORDING_TOOLS : []),
+        ...(this.#visual ? VISUAL_TOOLS : []),
         ...(this.#stateDiagnostics ? STATE_OBSERVATION_TOOLS : []) ];
       if (typeof selected !== "string" || !available.some(tool => tool.name === selected)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator tool is unavailable in this runtime.");
@@ -314,6 +328,9 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         }
         if (selected === "open_simulator_url") return await this.#callUrl(args, signal, context);
         if (selected === "take_simulator_screenshot") return await this.#callScreenshot(args, signal, context);
+        if (selected === "start_recording" || selected === "stop_recording") {
+          return await this.#callRecording(selected, args, signal, context);
+        }
         if (selected === "capture_visual_baseline" || selected === "visual_diff") {
           return await this.#callVisual(selected, args, signal, context);
         }
@@ -433,6 +450,16 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
             : { state: "unavailable", reasonCode: environment.ready
               ? "INSTANCE_REQUIRED" : environment.issue ?? "ENVIRONMENT_NOT_READY" }
         };
+        const recordingAvailability = this.#recording === undefined ? {} : Object.fromEntries(
+          RECORDING_TOOLS.map(tool => [tool.name, environment.ready && instances.some(instance =>
+            instance.lifecycleState === "ready" && instance.viewerState === "attached" &&
+            (tool.name === "start_recording" ? !this.#recording!.hasActive(instance.instanceId)
+              : this.#recording!.hasActive(instance.instanceId)))
+            ? { state: "available", backend: "simctl" }
+            : { state: "unavailable", reasonCode: environment.ready
+              ? tool.name === "stop_recording" ? "RECORDING_NOT_FOUND" : "INSTANCE_REQUIRED"
+              : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
+        );
         const visualAvailability = this.#visual === undefined ? {} : Object.fromEntries(
           VISUAL_TOOLS.map(tool => [tool.name, environment.ready && instances.some(instance =>
             instance.lifecycleState === "ready" && instance.viewerState === "attached")
@@ -463,7 +490,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
             list_instances: { state: "available", backend: "host" },
             ...controlAvailability, ...screenAvailability, ...inputAvailability, ...stateAvailability,
             ...buildAvailability, ...installAvailability, ...appControlAvailability, ...urlAvailability,
-            ...screenshotAvailability, ...visualAvailability, ...stateDiagnosticsAvailability
+            ...screenshotAvailability, ...recordingAvailability,
+            ...visualAvailability, ...stateDiagnosticsAvailability
           },
           instances, resources,
           instanceControl: controlAvailable ? { state: "available" }
@@ -487,7 +515,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         error instanceof SimulatorInputError || error instanceof SimulatorStateControlError ||
         error instanceof SimulatorAppBuildError || error instanceof SimulatorAppInstallError ||
         error instanceof SimulatorAppControlError || error instanceof SimulatorUrlControlError ||
-        error instanceof SimulatorScreenshotError || error instanceof SimulatorVisualComparisonError ||
+        error instanceof SimulatorScreenshotError || error instanceof SimulatorRecordingError ||
+        error instanceof SimulatorVisualComparisonError ||
         error instanceof SimulatorStateDiagnosticsError ||
         error instanceof SimulatorScreenMapError ||
         error instanceof WdaClientError;
@@ -539,6 +568,9 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#screen?.clear(result.instance.instanceId);
     this.#visual?.clear(result.instance.instanceId);
     this.#stateDiagnostics?.clear(result.instance.instanceId);
+    try { await this.#recording?.discardInstance(result.instance.instanceId); }
+    catch { throw new SimulatorRecordingError("RECORDING_OUTCOME_UNKNOWN",
+      "Simulator instance changed, but recording cleanup is still being retried."); }
     this.#requireScope(context);
     return response({ ok: true, data: { instance: result.instance, replayed: result.replayed } }, false);
   }
@@ -975,6 +1007,42 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       mimeType: result.receipt.image.mimeType, replayed: result.replayed } };
     return { ...response(payload, false), hostImages: [{ blob: result.receipt.image,
       alt: "iOS Simulator screenshot" }] };
+  }
+
+  async #callRecording(name: "start_recording" | "stop_recording",
+    args: Record<string, unknown>, signal: AbortSignal | undefined,
+    context: BridgeToolCallContext): Promise<BridgeToolCallResult> {
+    if (!this.#recording) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator recording is unavailable.");
+    onlyKeys(args, name === "start_recording"
+      ? ["instanceId", "generation", "leaseId"]
+      : ["instanceId", "generation", "leaseId", "recordingId"]);
+    const route = requiredRoute(args);
+    const recordingId = args["recordingId"];
+    if (name === "stop_recording" && (typeof recordingId !== "string" || !UUID.test(recordingId))) {
+      throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator recording identity is invalid.");
+    }
+    const authority = { effectIdentity: context.effectIdentity, requestBodyHash: context.requestBodyHash,
+      providerGeneration: context.providerGeneration };
+    if (!DIGEST.test(authority.effectIdentity ?? "") || !BODY_HASH.test(authority.requestBodyHash ?? "") ||
+        !Number.isSafeInteger(authority.providerGeneration) || (authority.providerGeneration ?? 0) < 1) {
+      throw new SimulatorToolError("STALE_SCOPE", "Simulator mutation authority is unavailable.");
+    }
+    const environment = await this.#runtime.inspect(signal);
+    signal?.throwIfAborted();
+    this.#requireScope(context);
+    if (!environment.ready) return response({ ok: false, errorCode: environment.issue,
+      message: environment.error, data: { environment } }, true);
+    const verified = { effectIdentity: authority.effectIdentity!, requestBodyHash: authority.requestBodyHash!,
+      providerGeneration: authority.providerGeneration! };
+    const result = name === "start_recording"
+      ? await this.#recording.start(context, route, verified, signal)
+      : await this.#recording.stop(context, route, recordingId as string, verified, signal);
+    this.#requireScope(context);
+    const payload = response({ ok: true, data: { ...result.receipt, replayed: result.replayed } }, false);
+    return name === "stop_recording"
+      ? { ...payload, hostArtifacts: [{ blob: (result.receipt as SimulatorRecordingStopReceipt).video,
+        label: "iOS Simulator recording" }] }
+      : payload;
   }
 
   async #callVisual(name: "capture_visual_baseline" | "visual_diff",

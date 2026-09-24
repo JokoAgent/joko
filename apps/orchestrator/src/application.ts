@@ -135,9 +135,10 @@ import { SimulatorAppInstallCoordinator } from "./ios-simulator-app-install.js";
 import { SimulatorAppControlCoordinator } from "./ios-simulator-app-control.js";
 import { SimulatorUrlControlCoordinator } from "./ios-simulator-url-control.js";
 import { SimulatorScreenshotCoordinator } from "./ios-simulator-screenshot.js";
+import { SimulatorRecordingCoordinator } from "./ios-simulator-recording.js";
 import { SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
 import { SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
-import type { SimulatorProjectBuilder } from "@joko/tool-ios-simulator";
+import type { SimulatorProjectBuilder, SimulatorRecordingRuntime } from "@joko/tool-ios-simulator";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -476,6 +477,7 @@ export interface OrchestratorApplicationDependencies {
       "manager" | "cleanupOrphans" | "architecture" | "nativeHidRuntime">;
     readonly projectBuilder?: Pick<SimulatorProjectBuilder, "inspect" | "build" | "readXcresult">;
     readonly inspectAppArtifact?: typeof inspectSimulatorAppArtifact;
+    readonly recording?: SimulatorRecordingRuntime;
   };
 }
 
@@ -882,6 +884,13 @@ export async function createOrchestratorApplication(
   const simulatorScreenshot = simulatorScreen === undefined ? undefined
     : new SimulatorScreenshotCoordinator(store, simulatorOwnership, artifacts,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
+    const simulatorRecording = simulatorScreen === undefined || simulatorDriver === undefined ||
+      config.iosSimulatorDriver === undefined ? undefined
+      : new SimulatorRecordingCoordinator(store, simulatorOwnership, simulatorDriver, artifacts,
+        join(config.dataDirectory, "simulator-recordings"), {
+        runtime: dependencies.simulatorRuntime?.recording,
+        device: dependencies.simulatorRuntime?.lifecycle
+      });
   const simulatorVisual = simulatorScreen === undefined ? undefined
     : new SimulatorVisualComparisonCoordinator(store, simulatorOwnership,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
@@ -892,7 +901,7 @@ export async function createOrchestratorApplication(
       screen: simulatorScreen, input: simulatorInput, stateControl: simulatorStateControl,
       projectBuild: simulatorProjectBuild, appInstall: simulatorAppInstall,
       appControl: simulatorAppControl, urlControl: simulatorUrlControl,
-      screenshot: simulatorScreenshot, visual: simulatorVisual,
+      screenshot: simulatorScreenshot, recording: simulatorRecording, visual: simulatorVisual,
       stateDiagnostics: simulatorStateDiagnostics,
       runtime: dependencies.simulatorRuntime?.environment })
   );
@@ -2291,6 +2300,7 @@ export async function createOrchestratorApplication(
     unregisterRemoteHostTools();
     unregisterDocumentTools();
     unregisterIosSimulatorTools();
+    await simulatorRecording?.close().catch(() => undefined);
     lspBridge.dispose();
     unregisterSchedulerBridgeTools();
     unregisterVisionBridgeTools();
@@ -2467,6 +2477,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());
         await attempt(() => unregisterIosSimulatorTools());
+        await attempt(() => simulatorRecording?.close());
         simulatorControl?.dispose();
         await attempt(() => lspBridge.dispose());
         await attempt(() => unregisterSchedulerBridgeTools());

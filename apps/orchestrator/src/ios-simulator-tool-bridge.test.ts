@@ -214,6 +214,70 @@ it("routes Simulator screenshot only through permissioned control and trusted im
   expect(calls).toHaveLength(1);
 });
 
+it("routes recording start and stop through permissioned control with a task-owned MOV identity", async () => {
+  const recordingId = randomUUID();
+  const video = { id: randomUUID(), sha256: "a".repeat(64), byteLength: 16,
+    mimeType: "video/quicktime", fileName: "recording.mov" };
+  let active = false;
+  const calls: string[] = [];
+  const instance = { instanceId: "owned", generation: 2, lifecycleState: "ready",
+    viewerState: "attached", simulatorUdid: "A0123456-1234-1234-1234-123456789ABC",
+    lease: { id: "lease" } };
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [instance], listForResourceAdmission: () => [] } as never,
+    recording: { hasActive: () => active,
+      start: async () => { calls.push("start"); active = true; return { replayed: false,
+        receipt: { recordingId, instanceId: "owned", generation: 2, backend: "simctl",
+          startedAt: "2026-09-25T00:00:00.000Z" } }; },
+      stop: async () => { calls.push("stop"); active = false; return { replayed: false,
+        receipt: { recordingId, instanceId: "owned", generation: 2, backend: "simctl",
+          stoppedAt: "2026-09-25T00:00:01.000Z", video } }; } } as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: null,
+      error: null, setupSteps: [] }) },
+    memoryProbe: async () => ({ source: "node-os", freePercentage: 50,
+      freeBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 })
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const authority = { ...scope, effectIdentity: "a".repeat(64),
+    requestBodyHash: `sha256:${"b".repeat(64)}`, providerGeneration: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease" };
+  expect((await provider.callTool("list_tools", { category: "ios_simulator" }, undefined, scope))
+    .structuredContent).toMatchObject({ tools: expect.arrayContaining([
+      expect.objectContaining({ name: "start_recording", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "stop_recording", readOnly: false, via: "control_tool" })
+    ]) });
+  expect((await provider.callTool("call_tool", { name: "start_recording", args: route },
+    undefined, authority)).structuredContent).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await provider.callTool("control_tool", { name: "start_recording", args: route },
+    undefined, scope)).structuredContent).toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect((await provider.callTool("control_tool", { name: "start_recording",
+    args: { ...route, outputPath: "/private/recording.mov" } }, undefined, authority))
+    .structuredContent).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
+    .structuredContent).toMatchObject({ data: { availability: {
+      start_recording: { state: "available" },
+      stop_recording: { state: "unavailable", reasonCode: "RECORDING_NOT_FOUND" }
+    } } });
+  expect((await provider.callTool("control_tool", { name: "start_recording", args: route },
+    undefined, authority)).structuredContent).toMatchObject({ data: { recordingId } });
+  expect((await provider.callTool("control_tool", { name: "stop_recording",
+    args: { ...route, recordingId: "wrong" } }, undefined, authority))
+    .structuredContent).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
+    .structuredContent).toMatchObject({ data: { availability: {
+      start_recording: { state: "unavailable" }, stop_recording: { state: "available" }
+    } } });
+  const stopped = await provider.callTool("control_tool", { name: "stop_recording",
+    args: { ...route, recordingId } }, undefined, authority);
+  expect(stopped).toMatchObject({ isError: false, structuredContent: { data: { video } } });
+  expect(JSON.stringify(stopped)).not.toContain("/private/");
+  expect(calls).toEqual(["start", "stop"]);
+});
+
 it("routes state capture through permission and diagnostics readback through the task-only read channel", async () => {
   const diagnosticsId = randomUUID();
   const calls: string[] = [];

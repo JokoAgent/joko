@@ -15,7 +15,7 @@ const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
 const CONFLICTING_KINDS = new Set([KIND, "ios_simulator_instance_control", "ios_simulator_create",
   "ios_simulator_lifecycle", "ios_simulator_driver", "ios_simulator_input",
   "ios_simulator_state_control", "ios_simulator_app_build", "ios_simulator_app_install",
-  "ios_simulator_app_control", "ios_simulator_url_control", "ios_simulator_visual_capture",
+  "ios_simulator_app_control", "ios_simulator_url_control", "ios_simulator_visual_capture", "ios_simulator_recording",
   "ios_simulator_grace_cleanup",
   "ios_simulator_removed_cleanup"]);
 

@@ -139,8 +139,14 @@ export interface BridgeToolImageOutput {
   readonly alt?: string;
 }
 
+export interface BridgeToolArtifactOutput {
+  readonly blob: BlobRef;
+  readonly label: string;
+}
+
 export interface BridgeToolCallResult extends McpCallResult {
   readonly hostImages?: readonly BridgeToolImageOutput[];
+  readonly hostArtifacts?: readonly BridgeToolArtifactOutput[];
 }
 
 export interface McpListedTool {
@@ -889,6 +895,7 @@ export class McpRouter {
       const effectIdentity = bridgeEffectIdentity(requestIdentity, requestBodyHash);
       let result: McpCallResult;
       let hostImages: readonly BridgeToolImageOutput[] = [];
+      let hostArtifacts: readonly BridgeToolArtifactOutput[] = [];
       if (bridgeProvider === undefined) {
         const runtime = this.#requireRuntime(input.serverId, serverGeneration);
         const targetRevision = this.#store.getTarget(session.targetId).revision;
@@ -956,6 +963,7 @@ export class McpRouter {
           );
         guard();
         hostImages = execution.hostImages;
+        hostArtifacts = execution.hostArtifacts;
         const replay = this.#audioArtifacts?.replay(context);
         result = replay ?? (this.#audioArtifacts === undefined ? execution.result : await this.#audioArtifacts.publish(
           execution.result,
@@ -972,7 +980,7 @@ export class McpRouter {
         ));
         guard();
       }
-      return await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages);
+      return await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts);
     } catch (error) {
       const errorCode = mcpBridgeErrorCode(error);
       return {
@@ -1792,7 +1800,8 @@ export class McpRouter {
     result: McpCallResult,
     serverId: string,
     toolName: string,
-    hostImages: readonly BridgeToolImageOutput[] = []
+    hostImages: readonly BridgeToolImageOutput[] = [],
+    hostArtifacts: readonly BridgeToolArtifactOutput[] = []
   ): Promise<McpBridgeCallResult> {
     const normalized = this.#normalizeResult(result, "MCP bridge result");
     const hostDetails = {
@@ -1803,6 +1812,11 @@ export class McpRouter {
         imageOutputs: hostImages.map((image) => ({
           blob: publicBlobRef(image.blob),
           ...(image.alt === undefined ? {} : { alt: image.alt })
+        }))
+      }),
+      ...(hostArtifacts.length === 0 ? {} : {
+        artifactOutputs: hostArtifacts.map((artifact) => ({
+          blob: publicBlobRef(artifact.blob), label: artifact.label
         }))
       })
     } as const;
@@ -1859,6 +1873,7 @@ export class McpRouter {
   ): Promise<{
     readonly result: McpCallResult;
     readonly hostImages: readonly BridgeToolImageOutput[];
+    readonly hostArtifacts: readonly BridgeToolArtifactOutput[];
   }> {
     const assertCurrent = (): void => {
       signal?.throwIfAborted();
@@ -1879,13 +1894,19 @@ export class McpRouter {
       this.#resultCapacityBytes,
       (value) => this.#redactText(value)
     );
+    const hostArtifacts = normalizeBridgeToolArtifactOutputs(
+      result.hostArtifacts,
+      this.#resultCapacityBytes,
+      (value) => this.#redactText(value)
+    );
     return {
       result: this.#normalizeResult({
         content: result.content,
         ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
         isError: result.isError
       }, "Bridge Tool result").value,
-      hostImages
+      hostImages,
+      hostArtifacts
     };
   }
 
@@ -2653,6 +2674,48 @@ function normalizeBridgeToolImageOutputs(
       blob: safeBlob,
       ...(alt === undefined ? {} : { alt })
     };
+  });
+}
+
+function normalizeBridgeToolArtifactOutputs(
+  value: readonly BridgeToolArtifactOutput[] | undefined,
+  maximumBlobBytes: number,
+  redact: (value: string) => string
+): readonly BridgeToolArtifactOutput[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 8) {
+    throw new McpInvalidResultError("Bridge Tool Artifact output list is invalid.");
+  }
+  return value.map((artifact) => {
+    if (artifact === null || typeof artifact !== "object" || artifact.blob === null ||
+        typeof artifact.blob !== "object") {
+      throw new McpInvalidResultError("Bridge Tool Artifact output is invalid.");
+    }
+    const blob = artifact.blob;
+    if (typeof blob.id !== "string" || blob.id.length === 0 ||
+        Buffer.byteLength(blob.id, "utf8") > 512 || /[\u0000-\u001f\u007f]/u.test(blob.id) ||
+        typeof blob.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(blob.sha256) ||
+        typeof blob.byteLength !== "number" || !Number.isSafeInteger(blob.byteLength) ||
+        blob.byteLength < 1 || blob.byteLength > maximumBlobBytes ||
+        typeof blob.mimeType !== "string" || !/^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/u.test(blob.mimeType) ||
+        (blob.fileName !== undefined && (typeof blob.fileName !== "string" ||
+          blob.fileName.length === 0 || Buffer.byteLength(blob.fileName, "utf8") > 512 ||
+          /[\u0000-\u001f\u007f]/u.test(blob.fileName))) ||
+        typeof artifact.label !== "string" || artifact.label.length === 0 ||
+        Buffer.byteLength(artifact.label, "utf8") > 4_096 ||
+        /[\u0000-\u001f\u007f]/u.test(artifact.label)) {
+      throw new McpInvalidResultError("Bridge Tool Artifact identity is invalid.");
+    }
+    const fileName = blob.fileName === undefined ? undefined : redact(blob.fileName);
+    const label = redact(artifact.label);
+    if (label.length === 0 || Buffer.byteLength(label, "utf8") > 4_096 ||
+        /[\u0000-\u001f\u007f]/u.test(label) ||
+        (fileName !== undefined && (fileName.length === 0 ||
+          Buffer.byteLength(fileName, "utf8") > 512 || /[\u0000-\u001f\u007f]/u.test(fileName)))) {
+      throw new McpInvalidResultError("Bridge Tool Artifact output is invalid after redaction.");
+    }
+    return { blob: { id: blob.id, sha256: blob.sha256, byteLength: blob.byteLength,
+      mimeType: blob.mimeType, ...(fileName === undefined ? {} : { fileName }) }, label };
   });
 }
 

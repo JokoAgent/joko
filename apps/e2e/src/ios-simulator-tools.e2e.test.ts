@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   CredentialManager, CredentialVault, IOS_SIMULATOR_TOOL_PROVIDER_ID, IosSimulatorToolBridgeProvider,
   McpRouter, SimulatorOwnershipRegistry, SimulatorScreenshotCoordinator,
+  SimulatorRecordingCoordinator,
   SimulatorVisualComparisonCoordinator,
   createInternalServer, createOrchestratorApplication, type OrchestratorConfig
 } from "@joko/orchestrator";
@@ -84,6 +85,7 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
 
 it("downloads a task-owned Simulator screenshot through authenticated Connect after Tool capture", async () => {
   const image = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWNgYGD4DwABBAEAfbLI3wAAAABJRU5ErkJggg==", "base64");
+  const movie = Buffer.from([0, 0, 0, 16, 102, 116, 121, 112, 113, 116, 32, 32, 0, 0, 0, 0]);
   const changedImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWPQ4OL6DwAB1gE8svJN/gAAAABJRU5ErkJggg==", "base64");
   let visualFrame = image;
   const device = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "iPhone test",
@@ -93,7 +95,9 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
     deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null } as const;
   let fixture: OrchestratorE2eFixture | undefined;
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
+  let recording: SimulatorRecordingCoordinator | undefined;
   let captures = 0;
+  const recordingCalls: string[] = [];
   try {
     fixture = await OrchestratorE2eFixture.start({
       createAuxiliaryServices: async (store, directory, artifacts) => {
@@ -110,8 +114,32 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
         };
         const screenshot = new SimulatorScreenshotCoordinator(store, ownership, artifacts, simulatorRuntime);
         const visual = new SimulatorVisualComparisonCoordinator(store, ownership, simulatorRuntime);
+        const recordingId = randomUUID();
+        const moviePath = join(directory, "fixture-recording.mov");
+        await writeFile(moviePath, movie);
+        recording = new SimulatorRecordingCoordinator(store, ownership,
+          { isReady: () => true } as never, artifacts, join(directory, "recordings"), {
+            device: { findExact: async () => device }, runtime: {
+              start: async udid => {
+                expect(udid).toBe(device.udid);
+                expect(store.listOperations({ status: "started" }).some(operation =>
+                  operation.kind === "ios_simulator_recording")).toBe(true);
+                recordingCalls.push("start");
+                return { recordingId, simulatorUdid: udid };
+              },
+              stop: async handle => {
+                expect(handle.recordingId).toBe(recordingId);
+                recordingCalls.push("stop");
+                return { file: await open(moviePath, "r"), byteLength: movie.byteLength };
+              },
+              isActive: () => true,
+              release: async () => { recordingCalls.push("release"); },
+              discard: async () => { recordingCalls.push("discard"); },
+              close: async () => { recordingCalls.push("close"); }
+            }
+          });
         mcpRouter.registerBridgeToolProvider(new IosSimulatorToolBridgeProvider({ store, ownership,
-          screenshot, visual, runtime: { inspect: async () => ({ platform: "darwin", supported: true,
+          screenshot, recording, visual, runtime: { inspect: async () => ({ platform: "darwin", supported: true,
             ready: true, xcodeVersion: "Xcode fixture", runtimes: [], devices: [device],
             issue: null, error: null, setupSteps: [] }) } }));
         return { mcpRouter };
@@ -144,9 +172,12 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
       expect(response.ok).toBe(true);
       return await response.json() as { isError: boolean; details: {
         mcpStructuredContent: { data: { replayed: boolean; baselineId?: string;
+          recordingId?: string; video?: { id: string; sha256: string; byteLength: number; mimeType: string };
           diff?: { differentPixels: number; meanAbsoluteError: number } } };
         jokoMcpBridge: { imageOutputs?: Array<{ blob: { id: string; sha256: string;
-          byteLength: number; mimeType: string } }> } } };
+          byteLength: number; mimeType: string } }>;
+          artifactOutputs?: Array<{ blob: { id: string; sha256: string;
+            byteLength: number; mimeType: string }; label: string }> } } };
     };
     const first = await invoke();
     expect(first).toMatchObject({ isError: false, details: { mcpStructuredContent: {
@@ -160,6 +191,32 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
     });
     expect(downloaded.status).toBe(200);
     expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(image);
+    const start = await invoke("start_recording", route, randomUUID());
+    expect(start).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      recordingId: expect.any(String), replayed: false } } } });
+    const stop = await invoke("stop_recording", { ...route,
+      recordingId: start.details.mcpStructuredContent.data.recordingId }, randomUUID());
+    expect(stop).toMatchObject({ isError: false, details: {
+      mcpStructuredContent: { data: { video: { mimeType: "video/quicktime",
+        byteLength: movie.byteLength }, replayed: false } },
+      jokoMcpBridge: { artifactOutputs: [{ blob: { mimeType: "video/quicktime",
+        byteLength: movie.byteLength }, label: "iOS Simulator recording" }] }
+    } });
+    expect(recordingCalls).toEqual(["start", "stop", "release"]);
+    const movieBlob = stop.details.jokoMcpBridge.artifactOutputs![0]!.blob;
+    expect(fixture.application.store.getArtifact(movieBlob.id).blob.sha256).toBe(movieBlob.sha256);
+    const movieTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: movieBlob.id });
+    const movieDownload = await fetch(`${fixture.baseUrl}${movieTicket.ticket!.relativeEndpoint}`, {
+      headers: { authorization: `Bearer ${paired.authKey}` }
+    });
+    expect(movieDownload.status).toBe(200);
+    expect(Buffer.from(await movieDownload.arrayBuffer())).toEqual(movie);
+    const recordingOperations = fixture.application.store.listOperations({ sessionId })
+      .filter(operation => operation.kind === "ios_simulator_recording");
+    expect(recordingOperations).toHaveLength(2);
+    expect(recordingOperations.every(operation => operation.status === "completed")).toBe(true);
+    expect(JSON.stringify(recordingOperations, (_key, value: unknown) =>
+      typeof value === "bigint" ? String(value) : value)).not.toContain("fixture-recording.mov");
     expect((await invoke()).details.mcpStructuredContent.data.replayed).toBe(true);
     expect(captures).toBe(1);
     const baseline = await invoke("capture_visual_baseline", route, randomUUID());
@@ -176,9 +233,10 @@ it("downloads a task-owned Simulator screenshot through authenticated Connect af
     snapshot.revoke();
   } finally {
     await internal?.close();
+    await recording?.close();
     await fixture?.close();
   }
-});
+}, 15_000);
 
 it("builds a task-owned app and reads redacted diagnostics through production HTTP and SQLite", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-simulator-project-chain-"));
@@ -467,6 +525,11 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
   const workspace = join(root, "workspace");
   const dataDirectory = join(root, "data");
   await mkdir(workspace);
+  const movie = Buffer.from([0, 0, 0, 16, 102, 116, 121, 112, 113, 116, 32, 32, 0, 0, 0, 0]);
+  const moviePath = join(root, "fixture-recording.mov");
+  await writeFile(moviePath, movie);
+  const recordingId = randomUUID();
+  const recordingCalls: string[] = [];
   const config: OrchestratorConfig = {
     host: "127.0.0.1", port: 0, internalPort: 4317, publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4317",
     dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"), allowInsecureLoopback: true, allowInsecureLan: false,
@@ -559,6 +622,24 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
           claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_state_control") });
       } },
+    recording: {
+      start: async simulatorUdid => {
+        expect(simulatorUdid).toBe(udid);
+        expect(application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+          .some(operation => operation.kind === "ios_simulator_recording")).toBe(true);
+        recordingCalls.push("start");
+        return { recordingId, simulatorUdid };
+      },
+      stop: async handle => {
+        expect(handle.recordingId).toBe(recordingId);
+        recordingCalls.push("stop");
+        return { file: await open(moviePath, "r"), byteLength: movie.byteLength };
+      },
+      isActive: () => true,
+      release: async () => { recordingCalls.push("release"); },
+      discard: async () => { recordingCalls.push("discard"); },
+      close: async () => { recordingCalls.push("close"); }
+    },
     driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
       nativeHidRuntime: {
         probe: async identity => nativeReady && identity.simulatorUdid === udid,
@@ -682,13 +763,15 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
           interaction?: string; appearance?: string; enabled?: boolean; contentSize?: string;
           latitude?: number; longitude?: number; waypointCount?: number;
           service?: string; bundleId?: string | null; overrides?: Record<string, unknown>;
-          delivered?: boolean;
+          delivered?: boolean; recordingId?: string;
+          video?: { id: string; sha256: string; byteLength: number; mimeType: string };
           mode?: string; replayed?: boolean;
           viewport?: { width: number; height: number; orientation: string };
           audit?: { violationCount: number }; diff?: { baselineSnapshotId: string;
             added: readonly unknown[]; removed: readonly unknown[] };
           timedOut?: boolean };
-        errorCode?: string } } };
+        errorCode?: string }; jokoMcpBridge?: { artifactOutputs?: Array<{
+          blob: { id: string; sha256: string; byteLength: number; mimeType: string } }> } } };
     };
     const attached = await call("control_tool", "attach_device", { udid });
     expect(attached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
@@ -704,6 +787,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       tap: { state: "available", backend: "wda" }, press_home: { state: "available" },
       touch_path: { state: "available", backend: "native-hid" },
       touch2_path: { state: "available", backend: "native-hid" },
+      start_recording: { state: "available", backend: "simctl" },
       set_orientation: { state: "available", backend: "wda" },
       set_appearance: { state: "available", backend: "simctl" },
       set_location: { state: "available", backend: "simctl" },
@@ -751,6 +835,21 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
         action: "touch2_path", backend: "native-hid" } } } });
     expect(nativeTouches).toEqual([{ fingers: 1, claimed: true }, { fingers: 2, claimed: true }]);
+    const startedRecording = await call("control_tool", "start_recording", route);
+    expect(startedRecording).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      data: { recordingId, backend: "simctl", replayed: false } } } });
+    const stoppedRecording = await call("control_tool", "stop_recording", { ...route, recordingId });
+    expect(stoppedRecording).toMatchObject({ isError: false, details: {
+      mcpStructuredContent: { data: { video: { mimeType: "video/quicktime",
+        byteLength: movie.byteLength }, replayed: false } },
+      jokoMcpBridge: { artifactOutputs: [{ blob: { mimeType: "video/quicktime",
+        byteLength: movie.byteLength } }] }
+    } });
+    const videoBlob = stoppedRecording.details.jokoMcpBridge!.artifactOutputs![0]!.blob;
+    expect((await application.artifacts.readBlob(videoBlob)).data).toEqual(movie);
+    expect(recordingCalls).toEqual(["start", "stop", "release"]);
+    expect(application.store.listOperations({ sessionId: "simulator-task" })
+      .filter(operation => operation.kind === "ios_simulator_recording")).toHaveLength(2);
     nativeReady = false;
     expect(await call("call_tool", "doctor", {})).toMatchObject({ isError: false,
       details: { mcpStructuredContent: { data: { availability: {

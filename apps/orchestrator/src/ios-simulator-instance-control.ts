@@ -195,7 +195,7 @@ export class SimulatorInstanceControlCoordinator {
           [KIND, "ios_simulator_create", "ios_simulator_lifecycle", "ios_simulator_driver",
             "ios_simulator_input", "ios_simulator_state_control", "ios_simulator_app_build",
             "ios_simulator_app_install", "ios_simulator_app_control", "ios_simulator_url_control",
-            "ios_simulator_screenshot", "ios_simulator_visual_capture",
+            "ios_simulator_screenshot", "ios_simulator_visual_capture", "ios_simulator_recording",
             "ios_simulator_grace_cleanup",
             "ios_simulator_removed_cleanup"].includes(operation.kind));
         if (conflict) throw new OperationInProgressError(conflict.id);
@@ -294,7 +294,7 @@ export class SimulatorInstanceControlCoordinator {
           [KIND, "ios_simulator_create", "ios_simulator_lifecycle", "ios_simulator_driver",
             "ios_simulator_input", "ios_simulator_state_control", "ios_simulator_app_build",
             "ios_simulator_app_install", "ios_simulator_app_control", "ios_simulator_url_control",
-            "ios_simulator_screenshot", "ios_simulator_visual_capture",
+            "ios_simulator_screenshot", "ios_simulator_visual_capture", "ios_simulator_recording",
             "ios_simulator_grace_cleanup",
             "ios_simulator_removed_cleanup"].includes(operation.kind));
         if (conflict) throw new OperationInProgressError(conflict.id);
@@ -348,7 +348,7 @@ export class SimulatorInstanceControlCoordinator {
           [KIND, "ios_simulator_create", "ios_simulator_lifecycle", "ios_simulator_driver",
             "ios_simulator_input", "ios_simulator_state_control", "ios_simulator_app_build",
             "ios_simulator_app_install", "ios_simulator_app_control", "ios_simulator_url_control",
-            "ios_simulator_screenshot", "ios_simulator_visual_capture",
+            "ios_simulator_screenshot", "ios_simulator_visual_capture", "ios_simulator_recording",
             "ios_simulator_grace_cleanup",
             "ios_simulator_removed_cleanup"].includes(operation.kind));
         if (conflict) throw new OperationInProgressError(conflict.id);

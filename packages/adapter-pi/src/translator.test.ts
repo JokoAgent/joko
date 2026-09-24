@@ -1159,6 +1159,39 @@ describe("PiEventTranslator", () => {
     expect(storeArtifact).not.toHaveBeenCalled();
   });
 
+  it("projects a managed MCP recording as a durable Artifact part online and after history replay", async () => {
+    const events: EventPayload[] = [];
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-recording-workspace-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-recording-artifacts-"));
+    const storeArtifact = vi.fn();
+    const translator = new PiEventTranslator({
+      context: { ...context(workspace, events, []), storeArtifact },
+      artifactDirectory: artifacts, wasAbortRequested: () => false
+    });
+    const video: BlobRef = { id: "recording-blob", sha256: "d".repeat(64), byteLength: 16,
+      mimeType: "video/quicktime", fileName: "simulator-recording.mov" };
+    const result = { content: [{ type: "text", text: "Recording complete" }],
+      details: { jokoMcpBridge: { format: 1, artifactOutputs: [{ blob: video,
+        label: "iOS Simulator recording" }] } } };
+    await translator.translate({ type: "tool_execution_end", toolCallId: "recording-call",
+      toolName: "mcp__joko_ios_simulator__control_tool", isError: false, result } as unknown as PiRpcEvent);
+    expect(events.filter(event => event.type === "tool_result")).toEqual([
+      expect.objectContaining({ parts: [{ kind: "text", text: "Recording complete" },
+        { kind: "artifact", blob: video, label: "iOS Simulator recording" }] })
+    ]);
+    const nativeEntry = await translator.materializeNativeHistoryEntry({
+      id: "recording-result", type: "message", timestamp: 1,
+      data: { message: { role: "toolResult", toolCallId: "recording-call",
+        toolName: "mcp__joko_ios_simulator__control_tool", content: result.content,
+        details: result.details, isError: false, timestamp: 1 } }
+    });
+    const projected = projectPiNativeHistory(undefined, { entries: [nativeEntry], leafId: nativeEntry.id });
+    expect(projected.events.find(event => event.payload.type === "tool_result")?.payload)
+      .toMatchObject({ parts: [{ kind: "text", text: "Recording complete" },
+        { kind: "artifact", blob: video, label: "iOS Simulator recording" }] });
+    expect(storeArtifact).not.toHaveBeenCalled();
+  });
+
   it("deep-redacts managed credentials from native history text, tool input, and summaries", async () => {
     const events: EventPayload[] = [];
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-native-redaction-workspace-"));

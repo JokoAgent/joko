@@ -81,6 +81,7 @@ export class SimulatorCreateCoordinator {
             operation.kind === "ios_simulator_app_control" ||
             operation.kind === "ios_simulator_url_control" ||
             operation.kind === "ios_simulator_screenshot" ||
+            operation.kind === "ios_simulator_recording" ||
             operation.kind === "ios_simulator_visual_capture") &&
           operation.id !== operationId);
         if (conflicting !== undefined) throw new OperationInProgressError(conflicting.id);
