@@ -30,8 +30,14 @@ it("pins exact Xcode build and launch argv while withholding unrelated host secr
   expect(createWdaOwnerFingerprint({ cacheRoot: "/private/joko/cache", instanceId: "one",
     simulatorUdid: udid.toUpperCase() })).toBe(fingerprint);
   expect(createWdaBuildCacheKey({ sourceRevision: "a".repeat(40), xcodeBuild: "19A1",
-    runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", architecture: "arm64" }))
+    runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", architecture: "arm64",
+    ownerFingerprint: fingerprint }))
     .toMatch(/^[0-9a-f]{64}$/u);
+  expect(createWdaBuildCacheKey({ sourceRevision: "a".repeat(40), xcodeBuild: "19A1",
+    runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", architecture: "arm64",
+    ownerFingerprint: fingerprint })).not.toBe(createWdaBuildCacheKey({ sourceRevision: "a".repeat(40),
+    xcodeBuild: "19A1", runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0",
+    architecture: "arm64", ownerFingerprint: "c".repeat(64) }));
 });
 
 it("rejects ambiguous simulator identity and conflicting driver ports before planning", () => {

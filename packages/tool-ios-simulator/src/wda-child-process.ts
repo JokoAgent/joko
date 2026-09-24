@@ -96,7 +96,12 @@ export class WdaManagedChild {
 
   async stop(): Promise<void> {
     this.#stopPromise ??= this.#stopGroup();
-    return this.#stopPromise;
+    const operation = this.#stopPromise;
+    try { await operation; }
+    catch (error) {
+      if (this.#stopPromise === operation) this.#stopPromise = undefined;
+      throw error;
+    }
   }
 
   async #stopGroup(): Promise<void> {
@@ -122,6 +127,7 @@ export class WdaProcessExecutor {
   readonly #group: WdaProcessGroupControl;
   readonly #clock: WdaProcessClock;
   readonly #plan: ReturnType<typeof createWdaBuildPlan>;
+  #pendingBuild: WdaManagedChild | undefined;
 
   constructor(options: WdaProcessExecutorOptions) {
     this.#platform = options.platform ?? process.platform;
@@ -153,6 +159,7 @@ export class WdaProcessExecutor {
   /** Build is one owned child process; failures and cancellation retire its entire group. */
   async build(signal?: AbortSignal): Promise<void> {
     const child = this.#start(this.#plan.build, signal);
+    this.#pendingBuild = child;
     let timeout!: ReturnType<typeof setTimeout>;
     let onAbort!: () => void;
     const interrupted = new Promise<never>((_resolve, reject) => {
@@ -169,7 +176,15 @@ export class WdaProcessExecutor {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", onAbort);
       await child.stop();
+      if (this.#pendingBuild === child) this.#pendingBuild = undefined;
     }
+  }
+
+  async retryPendingBuildCleanup(): Promise<void> {
+    const child = this.#pendingBuild;
+    if (!child) return;
+    await child.stop();
+    if (this.#pendingBuild === child) this.#pendingBuild = undefined;
   }
 
   /** The caller observes health and owns stop; no new Session is created here. */

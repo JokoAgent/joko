@@ -8,3 +8,4 @@ export type { PreparedWdaSource, PrepareWdaSourceOptions, WdaSourceErrorCode } f
 export * from "./wda-build-plan.js";
 export * from "./wda-loopback-client.js";
 export * from "./wda-child-process.js";
+export * from "./wda-driver-manager.js";

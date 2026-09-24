@@ -114,3 +114,22 @@ it("escalates only its known group and caps a real child process output buffer",
   }
   expect((await real.exited).signal).not.toBeNull();
 });
+
+it("retains a build child whose group could not be stopped and retries that exact group", async () => {
+  const fake = mockChild(81);
+  let alive = true;
+  let signals = 0;
+  const executor = new WdaProcessExecutor({ ...base, platform: "darwin",
+    spawnProcess: () => { queueMicrotask(() => fake.close(0)); return fake.child; },
+    group: { isAlive: () => alive, signal: pid => {
+      expect(pid).toBe(81);
+      signals += 1;
+      if (signals === 1) throw new Error("signal unavailable");
+      alive = false;
+    } } });
+  await expect(executor.build()).rejects.toMatchObject({ code: "STOP_FAILED" });
+  expect(alive).toBe(true);
+  await executor.retryPendingBuildCleanup();
+  expect(alive).toBe(false);
+  expect(signals).toBe(2);
+});

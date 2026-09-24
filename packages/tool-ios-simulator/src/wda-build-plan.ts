@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, normalize } from "node:path/posix";
+import { isAbsolute as isHostAbsolute, resolve as resolveHostPath } from "node:path";
 
 const XCODEBUILD = "/usr/bin/xcodebuild";
 const SCHEME = "WebDriverAgentRunner";
@@ -26,6 +27,7 @@ export interface WdaBuildCacheIdentity {
   readonly xcodeBuild: string;
   readonly runtimeIdentifier: string;
   readonly architecture: "arm64" | "x86_64";
+  readonly ownerFingerprint: string;
 }
 
 export interface WdaBuildPlanOptions {
@@ -45,7 +47,10 @@ export function createWdaOwnerFingerprint(input: {
   readonly instanceId: string;
   readonly simulatorUdid: string;
 }): string {
-  const cacheRoot = absolute(input.cacheRoot, "cacheRoot");
+  if (!isHostAbsolute(input.cacheRoot) || input.cacheRoot.includes("\0") || /[\r\n]/u.test(input.cacheRoot)) {
+    throw new Error("cacheRoot must be an absolute path.");
+  }
+  const cacheRoot = resolveHostPath(input.cacheRoot);
   if (!input.instanceId || input.instanceId.length > 128 || input.instanceId.trim() !== input.instanceId ||
       /[\0\r\n]/u.test(input.instanceId)) throw new Error("instanceId is invalid.");
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(input.simulatorUdid)) {
@@ -79,11 +84,13 @@ export function createWdaChildEnvironment(source: Readonly<NodeJS.ProcessEnv> = 
 /** Deterministic build cache identity without service paths or credentials. */
 export function createWdaBuildCacheKey(identity: WdaBuildCacheIdentity): string {
   if (!/^[0-9a-f]{40}$/u.test(identity.sourceRevision) || !identity.xcodeBuild.trim() ||
-      !identity.runtimeIdentifier.trim() || !["arm64", "x86_64"].includes(identity.architecture)) {
+      !identity.runtimeIdentifier.trim() || !["arm64", "x86_64"].includes(identity.architecture) ||
+      !/^[0-9a-f]{64}$/u.test(identity.ownerFingerprint)) {
     throw new Error("WDA build cache identity is invalid.");
   }
   return createHash("sha256").update([
-    identity.sourceRevision, identity.xcodeBuild.trim(), identity.runtimeIdentifier.trim(), identity.architecture
+    identity.sourceRevision, identity.xcodeBuild.trim(), identity.runtimeIdentifier.trim(), identity.architecture,
+    identity.ownerFingerprint
   ].join("\0")).digest("hex");
 }
 
