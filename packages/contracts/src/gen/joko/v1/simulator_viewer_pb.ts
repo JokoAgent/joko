@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/simulator_viewer.proto.
  */
 export const file_joko_v1_simulator_viewer: GenFile = /*@__PURE__*/
-  fileDesc("Ch5qb2tvL3YxL3NpbXVsYXRvcl92aWV3ZXIucHJvdG8SB2pva28udjEiUQoUU2ltdWxhdG9yVmlld2VyUm91dGUSEwoLaW5zdGFuY2VfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBIQCghsZWFzZV9pZBgDIAEoCSKnAQoVU2ltdWxhdG9yVmlld2VyRGV2aWNlEgwKBHVkaWQYASABKAkSDAoEbmFtZRgCIAEoCRINCgVzdGF0ZRgDIAEoCRIaChJydW50aW1lX2lkZW50aWZpZXIYBCABKAkSFAoMcnVudGltZV9uYW1lGAUgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBiABKAkSEQoJYXZhaWxhYmxlGAcgASgIIvwCChdTaW11bGF0b3JWaWV3ZXJJbnN0YW5jZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSFgoOc2ltdWxhdG9yX3VkaWQYAiABKAkSFgoOc2ltdWxhdG9yX25hbWUYAyABKAkSGgoScnVudGltZV9pZGVudGlmaWVyGAQgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBSABKAkSGwoTY3JlYXRpb25fcHJvdmVuYW5jZRgGIAEoCRIXCg9ib290X3Byb3ZlbmFuY2UYByABKAkSFwoPbGlmZWN5Y2xlX3N0YXRlGAggASgJEhQKDHZpZXdlcl9zdGF0ZRgJIAEoCRIUCgxoZWFsdGhfc3RhdGUYCiABKAkSEgoKZXJyb3JfY29kZRgLIAEoCRIbChNncmFjZV9leHBpcmVzX2F0X21zGAwgASgEEhsKE2xlYXNlX2V4cGlyZXNfYXRfbXMYDSABKAQiNAoeR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiyQEKH0dldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USKwoHc3VwcG9ydBgBIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQSEwoLcmVhc29uX2NvZGUYAiABKAkSLwoHZGV2aWNlcxgDIAMoCzIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyRGV2aWNlEjMKCWluc3RhbmNlcxgEIAMoCzIgLmpva28udjEuU2ltdWxhdG9yVmlld2VySW5zdGFuY2Ui4QEKH0NvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEi4KBmFjdGlvbhgDIAEoDjIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyQWN0aW9uEiwKBXJvdXRlGAQgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIVCg10ZW1wbGF0ZV91ZGlkGAUgASgJEgwKBG5hbWUYBiABKAkSEwoLZGV2aWNlX3VkaWQYByABKAkieQogQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USMgoIaW5zdGFuY2UYASABKAsyIC5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckluc3RhbmNlEg8KB2RlbGV0ZWQYAiABKAgSEAoIcmVwbGF5ZWQYAyABKAgqlQIKFVNpbXVsYXRvclZpZXdlckFjdGlvbhInCiNTSU1VTEFUT1JfVklFV0VSX0FDVElPTl9VTlNQRUNJRklFRBAAEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0NSRUFURRABEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0FUVEFDSBACEiEKHVNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX1NUQVJUEAMSIAocU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fU1RPUBAEEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0RFVEFDSBAFEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0RFTEVURRAGMvcBChZTaW11bGF0b3JWaWV3ZXJTZXJ2aWNlEmwKF0dldFNpbXVsYXRvclZpZXdlclN0YXRlEicuam9rby52MS5HZXRTaW11bGF0b3JWaWV3ZXJTdGF0ZVJlcXVlc3QaKC5qb2tvLnYxLkdldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USbwoYQ29udHJvbFNpbXVsYXRvckluc3RhbmNlEiguam9rby52MS5Db250cm9sU2ltdWxhdG9ySW5zdGFuY2VSZXF1ZXN0Gikuam9rby52MS5Db250cm9sU2ltdWxhdG9ySW5zdGFuY2VSZXNwb25zZWIGcHJvdG8z", [file_joko_v1_capability]);
+  fileDesc("Ch5qb2tvL3YxL3NpbXVsYXRvcl92aWV3ZXIucHJvdG8SB2pva28udjEiUQoUU2ltdWxhdG9yVmlld2VyUm91dGUSEwoLaW5zdGFuY2VfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBIQCghsZWFzZV9pZBgDIAEoCSKnAQoVU2ltdWxhdG9yVmlld2VyRGV2aWNlEgwKBHVkaWQYASABKAkSDAoEbmFtZRgCIAEoCRINCgVzdGF0ZRgDIAEoCRIaChJydW50aW1lX2lkZW50aWZpZXIYBCABKAkSFAoMcnVudGltZV9uYW1lGAUgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBiABKAkSEQoJYXZhaWxhYmxlGAcgASgIIvwCChdTaW11bGF0b3JWaWV3ZXJJbnN0YW5jZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSFgoOc2ltdWxhdG9yX3VkaWQYAiABKAkSFgoOc2ltdWxhdG9yX25hbWUYAyABKAkSGgoScnVudGltZV9pZGVudGlmaWVyGAQgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBSABKAkSGwoTY3JlYXRpb25fcHJvdmVuYW5jZRgGIAEoCRIXCg9ib290X3Byb3ZlbmFuY2UYByABKAkSFwoPbGlmZWN5Y2xlX3N0YXRlGAggASgJEhQKDHZpZXdlcl9zdGF0ZRgJIAEoCRIUCgxoZWFsdGhfc3RhdGUYCiABKAkSEgoKZXJyb3JfY29kZRgLIAEoCRIbChNncmFjZV9leHBpcmVzX2F0X21zGAwgASgEEhsKE2xlYXNlX2V4cGlyZXNfYXRfbXMYDSABKAQiNAoeR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiyQEKH0dldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USKwoHc3VwcG9ydBgBIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQSEwoLcmVhc29uX2NvZGUYAiABKAkSLwoHZGV2aWNlcxgDIAMoCzIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyRGV2aWNlEjMKCWluc3RhbmNlcxgEIAMoCzIgLmpva28udjEuU2ltdWxhdG9yVmlld2VySW5zdGFuY2Ui4QEKH0NvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEi4KBmFjdGlvbhgDIAEoDjIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyQWN0aW9uEiwKBXJvdXRlGAQgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIVCg10ZW1wbGF0ZV91ZGlkGAUgASgJEgwKBG5hbWUYBiABKAkSEwoLZGV2aWNlX3VkaWQYByABKAkieQogQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USMgoIaW5zdGFuY2UYASABKAsyIC5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckluc3RhbmNlEg8KB2RlbGV0ZWQYAiABKAgSEAoIcmVwbGF5ZWQYAyABKAgiXwobV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSLAoFcm91dGUYAiABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclJvdXRlItMBChxXYXRjaFNpbXVsYXRvckZyYW1lc1Jlc3BvbnNlEiwKBXJvdXRlGAEgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIyCgVzdGF0ZRgCIAEoDjIjLmpva28udjEuU2ltdWxhdG9yVmlld2VyU3RyZWFtU3RhdGUSEAoIc2VxdWVuY2UYAyABKAQSFgoOcmVjZWl2ZWRfYXRfbXMYBCABKAMSDAoEanBlZxgFIAEoDBIZChFyZWNvbm5lY3RfYXR0ZW1wdBgGIAEoDSqVAgoVU2ltdWxhdG9yVmlld2VyQWN0aW9uEicKI1NJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX1VOU1BFQ0lGSUVEEAASIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fQ1JFQVRFEAESIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fQVRUQUNIEAISIQodU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fU1RBUlQQAxIgChxTSU1VTEFUT1JfVklFV0VSX0FDVElPTl9TVE9QEAQSIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fREVUQUNIEAUSIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fREVMRVRFEAYqggIKGlNpbXVsYXRvclZpZXdlclN0cmVhbVN0YXRlEi0KKVNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX1VOU1BFQ0lGSUVEEAASLAooU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfQ09OTkVDVElORxABEi4KKlNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX1JFQ09OTkVDVElORxACEicKI1NJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX0ZSQU1FEAMSLgoqU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfRElTQ09OTkVDVEVEEAQy3gIKFlNpbXVsYXRvclZpZXdlclNlcnZpY2USbAoXR2V0U2ltdWxhdG9yVmlld2VyU3RhdGUSJy5qb2tvLnYxLkdldFNpbXVsYXRvclZpZXdlclN0YXRlUmVxdWVzdBooLmpva28udjEuR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXNwb25zZRJvChhDb250cm9sU2ltdWxhdG9ySW5zdGFuY2USKC5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QaKS5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlc3BvbnNlEmUKFFdhdGNoU2ltdWxhdG9yRnJhbWVzEiQuam9rby52MS5XYXRjaFNpbXVsYXRvckZyYW1lc1JlcXVlc3QaJS5qb2tvLnYxLldhdGNoU2ltdWxhdG9yRnJhbWVzUmVzcG9uc2UwAWIGcHJvdG8z", [file_joko_v1_capability]);
 
 /**
  * @generated from message joko.v1.SimulatorViewerRoute
@@ -289,6 +289,70 @@ export const ControlSimulatorInstanceResponseSchema: GenMessage<ControlSimulator
   messageDesc(file_joko_v1_simulator_viewer, 6);
 
 /**
+ * @generated from message joko.v1.WatchSimulatorFramesRequest
+ */
+export type WatchSimulatorFramesRequest = Message<"joko.v1.WatchSimulatorFramesRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerRoute route = 2;
+   */
+  route?: SimulatorViewerRoute | undefined;
+};
+
+/**
+ * Describes the message joko.v1.WatchSimulatorFramesRequest.
+ * Use `create(WatchSimulatorFramesRequestSchema)` to create a new message.
+ */
+export const WatchSimulatorFramesRequestSchema: GenMessage<WatchSimulatorFramesRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 7);
+
+/**
+ * @generated from message joko.v1.WatchSimulatorFramesResponse
+ */
+export type WatchSimulatorFramesResponse = Message<"joko.v1.WatchSimulatorFramesResponse"> & {
+  /**
+   * @generated from field: joko.v1.SimulatorViewerRoute route = 1;
+   */
+  route?: SimulatorViewerRoute | undefined;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerStreamState state = 2;
+   */
+  state: SimulatorViewerStreamState;
+
+  /**
+   * @generated from field: uint64 sequence = 3;
+   */
+  sequence: bigint;
+
+  /**
+   * @generated from field: int64 received_at_ms = 4;
+   */
+  receivedAtMs: bigint;
+
+  /**
+   * @generated from field: bytes jpeg = 5;
+   */
+  jpeg: Uint8Array;
+
+  /**
+   * @generated from field: uint32 reconnect_attempt = 6;
+   */
+  reconnectAttempt: number;
+};
+
+/**
+ * Describes the message joko.v1.WatchSimulatorFramesResponse.
+ * Use `create(WatchSimulatorFramesResponseSchema)` to create a new message.
+ */
+export const WatchSimulatorFramesResponseSchema: GenMessage<WatchSimulatorFramesResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 8);
+
+/**
  * @generated from enum joko.v1.SimulatorViewerAction
  */
 export enum SimulatorViewerAction {
@@ -335,6 +399,42 @@ export const SimulatorViewerActionSchema: GenEnum<SimulatorViewerAction> = /*@__
   enumDesc(file_joko_v1_simulator_viewer, 0);
 
 /**
+ * @generated from enum joko.v1.SimulatorViewerStreamState
+ */
+export enum SimulatorViewerStreamState {
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_STREAM_STATE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_STREAM_STATE_CONNECTING = 1;
+   */
+  CONNECTING = 1,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_STREAM_STATE_RECONNECTING = 2;
+   */
+  RECONNECTING = 2,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_STREAM_STATE_FRAME = 3;
+   */
+  FRAME = 3,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_STREAM_STATE_DISCONNECTED = 4;
+   */
+  DISCONNECTED = 4,
+}
+
+/**
+ * Describes the enum joko.v1.SimulatorViewerStreamState.
+ */
+export const SimulatorViewerStreamStateSchema: GenEnum<SimulatorViewerStreamState> = /*@__PURE__*/
+  enumDesc(file_joko_v1_simulator_viewer, 1);
+
+/**
  * Visible Viewer controls use authenticated task authority, never an agent Tool call.
  *
  * @generated from service joko.v1.SimulatorViewerService
@@ -355,6 +455,14 @@ export const SimulatorViewerService: GenService<{
     methodKind: "unary";
     input: typeof ControlSimulatorInstanceRequestSchema;
     output: typeof ControlSimulatorInstanceResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SimulatorViewerService.WatchSimulatorFrames
+   */
+  watchSimulatorFrames: {
+    methodKind: "server_streaming";
+    input: typeof WatchSimulatorFramesRequestSchema;
+    output: typeof WatchSimulatorFramesResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_joko_v1_simulator_viewer, 0);

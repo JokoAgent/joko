@@ -1830,7 +1830,8 @@ export function useAppController(): AppController {
     const original = () => { if (artifactGateway === undefined) throw new Error("Connect to Joko before using Simulator Viewer."); return artifactGateway; };
     return {
       getSimulatorViewerState: (...args: Parameters<OperationApi["getSimulatorViewerState"]>) => original().getSimulatorViewerState(...args),
-      controlSimulatorInstance: (...args: Parameters<OperationApi["controlSimulatorInstance"]>) => original().controlSimulatorInstance(...args)
+      controlSimulatorInstance: (...args: Parameters<OperationApi["controlSimulatorInstance"]>) => original().controlSimulatorInstance(...args),
+      watchSimulatorFrames: (...args: Parameters<OperationApi["watchSimulatorFrames"]>) => original().watchSimulatorFrames(...args)
     };
   }, [artifactGateway]);
   const readWorkspaceFile = useCallback<AppController["readWorkspaceFile"]>(async (workspaceId, path) => {

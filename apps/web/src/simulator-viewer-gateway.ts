@@ -1,6 +1,6 @@
 import { createClient, type Transport } from "@connectrpc/connect";
 import {
-  CapabilitySupport, SimulatorViewerAction, SimulatorViewerService,
+  CapabilitySupport, SimulatorViewerAction, SimulatorViewerService, SimulatorViewerStreamState,
   type SimulatorViewerInstance
 } from "@joko/contracts";
 import type {
@@ -8,7 +8,8 @@ import type {
   SimulatorViewerStateView
 } from "./model.js";
 
-type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance">;
+type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance" |
+  "watchSimulatorFrames">;
 
 export function createSimulatorViewerGateway(transport: Transport, ownerSignal?: AbortSignal): ViewerApi {
   const client = createClient(SimulatorViewerService, transport);
@@ -45,6 +46,37 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
             : { route: input.route })
       }, options(signal));
       return { instance: instanceView(response.instance), deleted: response.deleted, replayed: response.replayed };
+    },
+    async *watchSimulatorFrames(sessionId, route, signal) {
+      let sequence = 0n;
+      for await (const response of client.watchSimulatorFrames({ sessionId, route }, options(signal))) {
+        if (response.route?.instanceId !== route.instanceId ||
+            response.route.generation !== route.generation || response.route.leaseId !== route.leaseId) {
+          throw new Error("Simulator frame belongs to another instance route.");
+        }
+        if (response.state === SimulatorViewerStreamState.FRAME) {
+          if (response.sequence <= sequence || response.receivedAtMs <= 0n ||
+              response.jpeg.length < 4 || response.jpeg.length > 16 * 1024 * 1024 ||
+              response.jpeg[0] !== 0xff || response.jpeg[1] !== 0xd8 ||
+              response.jpeg[response.jpeg.length - 2] !== 0xff ||
+              response.jpeg[response.jpeg.length - 1] !== 0xd9) {
+            throw new Error("Simulator frame response is invalid.");
+          }
+          sequence = response.sequence;
+          yield { kind: "frame", sequence, receivedAtMs: Number(response.receivedAtMs),
+            jpeg: response.jpeg };
+          continue;
+        }
+        if (response.jpeg.length !== 0 || response.sequence !== 0n ||
+            !Number.isSafeInteger(response.reconnectAttempt) || response.reconnectAttempt > 3) {
+          throw new Error("Simulator frame status is invalid.");
+        }
+        yield { kind: response.state === SimulatorViewerStreamState.CONNECTING ? "connecting"
+          : response.state === SimulatorViewerStreamState.RECONNECTING ? "reconnecting"
+            : response.state === SimulatorViewerStreamState.DISCONNECTED ? "disconnected"
+              : (() => { throw new Error("Simulator frame state is invalid."); })(),
+        attempt: response.reconnectAttempt };
+      }
     }
   };
 }

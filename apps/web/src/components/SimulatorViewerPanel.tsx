@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
-import { AlertTriangle, MonitorSmartphone, RefreshCcw } from "lucide-react";
+import { AlertTriangle, RefreshCcw } from "lucide-react";
 import type { AppController } from "../controller.js";
 import type {
   SimulatorViewerControlView, SimulatorViewerInstanceView, SimulatorViewerStateView
@@ -7,6 +7,7 @@ import type {
 import { randomUuid } from "../web-crypto.js";
 import type { Translator } from "./types.js";
 import { Button, Modal } from "./ui.js";
+import { SimulatorViewerScreen } from "./SimulatorViewerScreen.js";
 import "./simulator-viewer.css";
 
 export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
@@ -109,7 +110,10 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
         <div className="simulator-viewer__grid">
           {state.instances.map(instance => <article className="simulator-viewer__card" key={instance.route.instanceId} aria-label={instance.simulatorName}>
             <div className="simulator-viewer__card-header"><h4>{instance.simulatorName}</h4><span>{instance.creationProvenance === "joko" ? t("simulator.createdHere") : t("simulator.external")}</span></div>
-            <div className="simulator-viewer__screen" role="img" aria-label={t("simulator.screenUnavailable")}><MonitorSmartphone aria-hidden="true" /><span>{t("simulator.screenUnavailable")}</span></div>
+            <SimulatorViewerScreen key={`${instance.route.instanceId}:${instance.route.generation}:${instance.route.leaseId}`}
+              controller={controller} sessionId={sessionId} route={instance.route}
+              enabled={canMutate && instance.lifecycleState === "ready" && instance.viewerState === "attached"}
+              ownerDocument={ownerDocument} t={t} />
             <p className="simulator-viewer__metadata">{instance.simulatorUdid}</p>
             <p className="simulator-viewer__metadata">{t("simulator.state", {
               lifecycle: t(`simulator.lifecycle.${instance.lifecycleState}`),

@@ -46,7 +46,7 @@ it("mounts the task grid and confirms deletion only for an exact Joko-created in
   });
   const container = await mount(read, control);
   expect(container.querySelectorAll(".simulator-viewer__card")).toHaveLength(2);
-  expect(container.textContent).toContain("Live screen is not available yet");
+  expect(container.textContent).toContain("Live screen disconnected");
   expect(container.textContent).toContain("Detach the current instance before adding another");
   expect(button(container, "Attach").disabled).toBe(true);
   expect([...container.querySelectorAll(".simulator-viewer__card")][1]?.textContent).not.toContain("Delete");
@@ -88,7 +88,9 @@ it("keeps the same task observation across unrelated controller snapshots", asyn
   roots.push(root);
   const render = async (revision: number) => act(async () => root.render(<SimulatorViewerPanel
     controller={{ state: { connectionState: "connected", activeProfile: { id: "local" }, revision },
-      getSimulatorViewerState: read } as unknown as AppController}
+      getSimulatorViewerState: read, watchSimulatorFrames: async function* () {
+        yield { kind: "disconnected", attempt: 3 } as const;
+      } } as unknown as AppController}
     sessionId="task-one" active t={(key, values) => translate("en", key, values)} />));
   await render(1);
   await render(2);
@@ -103,7 +105,9 @@ async function mount(read: AppController["getSimulatorViewerState"],
   const root = createRoot(container);
   roots.push(root);
   const controller = { state: { connectionState: connected ? "connected" : "offline" },
-    getSimulatorViewerState: read, controlSimulatorInstance: control } as unknown as AppController;
+    getSimulatorViewerState: read, controlSimulatorInstance: control,
+    watchSimulatorFrames: async function* () { yield { kind: "disconnected", attempt: 3 } as const; }
+  } as unknown as AppController;
   await act(async () => root.render(<SimulatorViewerPanel controller={controller} sessionId="task-one" active t={(key, values) => translate("en", key, values)} />));
   return container;
 }

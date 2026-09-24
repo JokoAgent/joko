@@ -6,6 +6,7 @@ import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
 import type { SimulatorOwnershipRegistry, PublicSimulatorInstance,
   SimulatorInstanceRoute, SimulatorTaskScope } from "./ios-simulator-ownership.js";
 import { SimulatorObservationError, type SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
+import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 
 const TTL_MS = 60 * 60_000;
 const MAX_ENTRIES = 64;
@@ -13,6 +14,7 @@ const MAX_ENTRY_BYTES = 2 * 1024;
 
 type StateDriver = Pick<SimulatorDriverCoordinator, "isReady" | "observeHealth">;
 type StateScreen = Pick<SimulatorScreenObservationCoordinator, "screenMap">;
+type StateFrames = Pick<SimulatorViewerFrameCoordinator, "snapshot">;
 
 export class SimulatorStateDiagnosticsError extends Error {
   constructor(readonly code: "INVALID_ARGUMENT", message: string) { super(message); }
@@ -54,14 +56,16 @@ export class SimulatorStateDiagnosticsCoordinator {
   readonly #ownership: SimulatorOwnershipRegistry;
   readonly #driver: StateDriver;
   readonly #screen: StateScreen;
+  readonly #frames: StateFrames | undefined;
   readonly #now: () => number;
   readonly #entries = new Map<string, StoredEntry>();
 
   constructor(ownership: SimulatorOwnershipRegistry, driver: StateDriver, screen: StateScreen,
-    now: () => number = Date.now) {
+    now: () => number = Date.now, frames?: StateFrames) {
     this.#ownership = ownership;
     this.#driver = driver;
     this.#screen = screen;
+    this.#frames = frames;
     this.#now = now;
   }
 
@@ -74,16 +78,17 @@ export class SimulatorStateDiagnosticsCoordinator {
       throw new SimulatorObservationError("OBSERVATION_CANCELLED", "Simulator observation was cancelled.");
     }
     this.#requireReady(scope, route);
+    const stream = this.#frames?.snapshot(scope, route) ?? null;
     const sanitizedHealth = publicHealth(health);
     const driverDiagnostics = { running: true, logTail: "", capabilityReport: null, nativeSidecar: null };
     const data = { instance, health: sanitizedHealth, orientation: observed.viewport.orientation,
-      screenMap: observed.screenMap, stream: null, driverDiagnostics };
+      screenMap: observed.screenMap, stream, driverDiagnostics };
     const summary = { instanceId: instance.instanceId, generation: instance.generation,
       simulatorUdid: instance.simulatorUdid, health: { ready: sanitizedHealth.ready },
       orientation: observed.viewport.orientation, viewport: { width: observed.viewport.width,
         height: observed.viewport.height }, screenMap: { snapshotId: observed.screenMap.snapshotId,
         elementCount: observed.screenMap.elements.length, truncated: observed.screenMap.truncated },
-      stream: null, driverDiagnostics };
+      stream, driverDiagnostics };
     const entry = this.#record(scope, route, summary);
     return { ...data, diagnosticsId: entry.diagnosticsId };
   }

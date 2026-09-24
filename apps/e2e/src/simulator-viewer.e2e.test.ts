@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -95,6 +96,15 @@ it("serves authenticated task-owned Simulator inventory and durable exact deleti
     const state = await clients.simulatorViewer.getSimulatorViewerState({ sessionId: "viewer-task" });
     expect(state).toMatchObject({ support: CapabilitySupport.SUPPORTED,
       devices: [{ udid }], instances: [{ simulatorUdid: udid, creationProvenance: "joko" }] });
+    const watchRequest = { sessionId: "viewer-task", route: { instanceId: owned.instanceId,
+      generation: BigInt(owned.generation), leaseId: owned.lease.id } };
+    await expect(anonymous.simulatorViewer.watchSimulatorFrames(watchRequest)[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
+    await expect(clients.simulatorViewer.watchSimulatorFrames({ ...watchRequest,
+      route: { ...watchRequest.route, leaseId: "wrong-lease" } })[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.Aborted });
+    await expect(clients.simulatorViewer.watchSimulatorFrames(watchRequest)[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
     const request = { sessionId: "viewer-task", requestId: randomUUID(),
       action: SimulatorViewerAction.DELETE,
       route: { instanceId: owned.instanceId, generation: BigInt(owned.generation), leaseId: owned.lease.id } };
@@ -142,15 +152,39 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     runtimeVersion: "19.0", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
     lastBootedAt: null } as const;
   let existing = true;
+  let booted = false;
   let deletes = 0;
+  let jpeg: Buffer | undefined;
+  let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
+    controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
+    driverSessionId: string; health: { ready: true; message: null; osName: string;
+      osVersion: string; sdkVersion: string; deviceIp: null }; state: "ready" } | null = null;
+  const mjpegServer: Server = createServer((_request, response) => {
+    if (!jpeg) { response.writeHead(503); response.end(); return; }
+    response.writeHead(200, { "content-type": "multipart/x-mixed-replace; boundary=frame" });
+    const send = (): void => {
+      if (!jpeg || response.destroyed) return;
+      response.write(Buffer.concat([Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n`),
+        jpeg, Buffer.from("\r\n")]));
+    };
+    send();
+    const timer = setInterval(send, 500);
+    response.on("close", () => clearInterval(timer));
+  });
+  await new Promise<void>(resolve => mjpegServer.listen(0, "127.0.0.1", resolve));
+  const address = mjpegServer.address();
+  if (!address || typeof address === "string") throw new Error("MJPEG loopback port was not allocated.");
   const application = await createOrchestratorApplication(config, { simulatorRuntime: {
     environment: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
-      xcodeVersion: "Xcode 16.4", runtimes: [], devices: existing ? [device] : [],
+      xcodeVersion: "Xcode 16.4\nBuild version 16F6", runtimes: [],
+      devices: existing ? [{ ...device, state: booted ? "Booted" : "Shutdown" }] : [],
       issue: null, error: null, setupSteps: [] }) },
     lifecycle: {
-      findExact: async value => existing && value === udid ? device : null,
-      bootExact: async () => { throw new Error("Unexpected boot."); },
-      shutdownExact: async () => { throw new Error("Shutdown device should not be shut down twice."); }
+      findExact: async value => existing && value === udid
+        ? { ...device, state: booted ? "Booted" : "Shutdown" } : null,
+      bootExact: async value => { expect(value).toBe(udid); booted = true;
+        return { ...device, state: "Booted" }; },
+      shutdownExact: async value => { expect(value).toBe(udid); booted = false; }
     },
     delete: { deleteExact: async input => {
       expect(input.udid).toBe(udid);
@@ -158,8 +192,16 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       existing = false;
     } },
     driver: { architecture: "arm64", manager: {
-      get: () => null, start: async () => { throw new Error("Unexpected driver start."); },
-      stop: async () => { throw new Error("Unexpected driver stop."); },
+      get: instanceId => activeDriver?.instanceId === instanceId ? activeDriver : null,
+      start: async options => {
+        activeDriver = { instanceId: options.instanceId, simulatorUdid: udid,
+          leaseId: randomUUID(), pid: process.pid, controlPort: 18100,
+          mjpegPort: address.port, sourceRevision: "fixture", buildCacheKey: "a".repeat(64),
+          driverSessionId: "SESSION-1", health: { ready: true, message: null,
+            osName: "iOS", osVersion: "19.0", sdkVersion: "19.0", deviceIp: null }, state: "ready" };
+        return activeDriver;
+      },
+      stop: async () => { activeDriver = null; },
       retryOwnedCleanup: async () => {}
     }, cleanupOrphans: async () => {} }
   } });
@@ -187,6 +229,17 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       if (!code) throw new Error("Viewer Web pairing code was not observed.");
       browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
       const page = await browser.newPage({ viewport: { width: 1160, height: 850 } });
+      const dataUrl = await page.evaluate(() => {
+        const canvas = document.createElement("canvas");
+        canvas.width = 16; canvas.height = 12;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Browser canvas is unavailable.");
+        context.fillStyle = "#497cbd";
+        context.fillRect(0, 0, 16, 12);
+        return canvas.toDataURL("image/jpeg", 0.8);
+      });
+      jpeg = Buffer.from(dataUrl.split(",")[1] ?? "", "base64");
+      expect(jpeg.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
       await page.goto(`${baseUrl}/#/tasks/viewer-web-task`, { waitUntil: "domcontentloaded" });
       await page.locator(".connection-tabs > button").nth(2).click();
       await page.getByLabel("Joko node address").fill(baseUrl);
@@ -206,8 +259,15 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await inspector.getByRole("menuitem", { name: "Simulator" }).click();
       const panel = inspector.locator('[data-tab-kind="simulator"]');
       await panel.getByRole("article", { name: "Joko iPhone" }).waitFor({ state: "visible" });
-      await panel.getByText("Live screen is not available yet").first().waitFor();
+      await panel.getByText("paused").first().waitFor();
+      await panel.getByRole("button", { name: "Start", exact: true }).click();
+      await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
+      await page.waitForFunction(() => {
+        const image = document.querySelector<HTMLImageElement>(".simulator-viewer__screen img");
+        return image?.complete && image.naturalWidth === 16 && image.naturalHeight === 12;
+      });
       await page.setViewportSize({ width: 390, height: 844 });
+      await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       const deleteButton = panel.getByRole("button", { name: "Delete", exact: true });
       await deleteButton.focus();
       await page.keyboard.press("Enter");
@@ -229,6 +289,8 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     await browser?.close();
     await server?.close();
     await application.close();
+    mjpegServer.closeAllConnections();
+    await new Promise<void>(resolve => mjpegServer.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
 });

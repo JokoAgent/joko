@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OperationalStore } from "@joko/store";
 import { createWdaOwnerFingerprint, WDA_SOURCE_PIN, type SimulatorNativeHidRuntime,
-  type WdaRunningDriver } from "@joko/tool-ios-simulator";
+  type WdaRunningDriver, type streamSimulatorMjpeg } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
@@ -51,12 +51,14 @@ function running(instanceId: string, controlPort = 18100): WdaRunningDriver {
 function harness(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
   input: { readonly onStart?: () => Promise<void>; readonly onInspect?: () => void;
     readonly environmentReady?: boolean; readonly controlPort?: number;
-    readonly nativeHidRuntime?: SimulatorNativeHidRuntime } = {}) {
+    readonly nativeHidRuntime?: SimulatorNativeHidRuntime;
+    readonly mjpegStream?: typeof streamSimulatorMjpeg } = {}) {
   let active: WdaRunningDriver | null = null;
   const effects: string[] = [];
   const options: SimulatorDriverCoordinatorOptions = { archivePath: "/private/joko/wda.tar.gz",
     cacheRoot: "/private/joko/driver-cache", architecture: "arm64",
     nativeHidRuntime: input.nativeHidRuntime,
+    mjpegStream: input.mjpegStream,
     environment: { inspect: async () => { input.onInspect?.();
       return { ...ENVIRONMENT, ready: input.environmentReady ?? true }; } },
     lifecycle: { findExact: async () => DEVICE, bootExact: async () => DEVICE,
@@ -104,6 +106,27 @@ it("fences native HID dispatch to the exact ready driver lease", async () => {
     expect(calls).toEqual([`probe:${UDID}:${started.instance.generation}`,
       `touch:${UDID}:${started.instance.generation}:2:2`,
       `touch:${UDID}:${started.instance.generation}:2:0`]);
+  } finally { store.close(); }
+});
+
+it("reads MJPEG only from the current owned driver port and rejects a changed manager lease", async () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    const ownership = new SimulatorOwnershipRegistry(store);
+    const initial = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const ports: number[] = [];
+    const h = harness(store, ownership, { mjpegStream: async function* (port) {
+      ports.push(port);
+      yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), receivedAt: new Date().toISOString() };
+      yield { bytes: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), receivedAt: new Date().toISOString() };
+    } });
+    const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    const stream = h.coordinator.streamMjpegFrames(started.instance);
+    expect((await stream.next()).value?.bytes).toEqual(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
+    expect(ports).toEqual([19100]);
+    h.loseActive();
+    await expect(stream.next()).rejects.toMatchObject({ code: "STALE_DRIVER" });
   } finally { store.close(); }
 });
 

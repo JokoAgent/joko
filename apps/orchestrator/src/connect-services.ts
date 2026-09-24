@@ -6,7 +6,7 @@ import { listProjectDirectories } from "./project-directory-browser.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
-import { SimulatorCreateError, SimulatorDeleteError, SimulatorLifecycleError,
+import { SimulatorCreateError, SimulatorDeleteError, SimulatorLifecycleError, SimulatorMjpegError,
   SimulatorResourceError } from "@joko/tool-ios-simulator";
 import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM,
@@ -399,6 +399,7 @@ import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
 import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
 import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
+import { SimulatorViewerFrameError } from "./ios-simulator-viewer-frames.js";
 import { SimulatorInstanceControlError } from "./ios-simulator-instance-control.js";
 import { SimulatorOwnershipError } from "./ios-simulator-ownership.js";
 import type { TerminalProvider } from "@joko/tool-terminal";
@@ -745,13 +746,19 @@ function toConnectError(error: unknown): ConnectError {
     return new ConnectError(redactSecrets(storedMessage ?? error.message), Code.FailedPrecondition);
   }
   if (error instanceof OperationInProgressError) return new ConnectError(error.message, Code.Aborted);
+  if (error instanceof SimulatorViewerFrameError) return new ConnectError(error.message, Code.ResourceExhausted);
+  if (error instanceof SimulatorMjpegError) return new ConnectError(error.message,
+    error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
+      : error.code === "STREAM_TOO_LARGE" ? Code.ResourceExhausted
+        : error.code === "STREAM_TIMEOUT" ? Code.DeadlineExceeded
+          : error.code === "STREAM_INVALID" ? Code.DataLoss : Code.Unavailable);
   if (error instanceof SimulatorOwnershipError || error instanceof SimulatorInstanceControlError ||
       error instanceof SimulatorCreateError || error instanceof SimulatorDeleteError ||
       error instanceof SimulatorLifecycleError || error instanceof SimulatorResourceError ||
       error instanceof SimulatorDriverError) {
     const code = error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
       : error.code === "MUTATION_CANCELLED" ? Code.Canceled
-        : error.code === "STALE_SCOPE" || error.code === "STALE_INSTANCE" ||
+        : error.code === "STALE_SCOPE" || error.code === "STALE_INSTANCE" || error.code === "STALE_DRIVER" ||
           error.code === "MUTATION_IN_PROGRESS" || error.code === "DEVICE_BUSY" ? Code.Aborted
           : error.code === "DELETE_FORBIDDEN" ? Code.PermissionDenied
             : error.code === "SESSION_INSTANCE_LIMIT_REACHED" ||

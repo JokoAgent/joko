@@ -3,6 +3,7 @@ import type { WdaDriverHealth } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance } from "./ios-simulator-ownership.js";
 import { SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
+import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 
 const SCOPE = { sessionId: "state-task", targetId: "local", generation: 1 } as const;
 const DEVICE = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "iPhone", state: "Booted",
@@ -14,7 +15,7 @@ function route(instance: PublicSimulatorInstance) {
   return { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
 }
 
-function fixture() {
+function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "snapshot">) {
   const store = new OperationalStore(":memory:");
   store.upsertBackend({ id: "pi", displayName: "Pi", version: "fixture", health: "healthy",
     adapterKind: "fixture", instanceGeneration: 0, installationState: "installed",
@@ -39,11 +40,24 @@ function fixture() {
         value: null, enabled: true, visible: true, frame: null }] } });
   const coordinator = new SimulatorStateDiagnosticsCoordinator(ownership, {
     isReady: () => ready, observeHealth: () => health()
-  }, { screenMap: () => screen() }, () => now);
+  }, { screenMap: () => screen() }, () => now, frames);
   return { store, instance, coordinator, setReady: (value: boolean) => { ready = value; },
     setNow: (value: number) => { now = value; }, setHealth: (value: typeof health) => { health = value; },
     setScreen: (value: typeof screen) => { screen = value; } };
 }
+
+it("reports only current production MJPEG metadata, never the frame body", async () => {
+  const snapshot = () => ({ adapter: "wda-mjpeg" as const, encoding: "jpeg" as const,
+    state: "streaming" as const, sequence: 12, lastFrameAt: "2026-09-25T00:00:00.000Z" });
+  const h = fixture({ snapshot });
+  try {
+    const captured = await h.coordinator.capture(SCOPE, route(h.instance));
+    expect(captured.stream).toEqual(snapshot());
+    const entry = h.coordinator.get(SCOPE, captured.diagnosticsId);
+    expect(entry.data.stream).toEqual(snapshot());
+    expect(JSON.stringify(entry)).not.toMatch(/user-secret-screen-text|"bytes"|"jpeg":\[/u);
+  } finally { h.store.close(); }
+});
 
 it("captures live driver state without retaining screen text, credentials or host paths", async () => {
   const h = fixture();

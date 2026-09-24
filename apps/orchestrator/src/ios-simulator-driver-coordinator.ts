@@ -1,9 +1,11 @@
 import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
   MacSimulatorNativeHidRuntime, WdaDriverManager, WdaLoopbackClient,
+  streamSimulatorMjpeg,
   type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
   type SimulatorNativeHidRuntime, type SimulatorNormalizedTouchSample,
   type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
   type WdaDriverHealth, type WdaPoint, type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
+import type { SimulatorMjpegFrame } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
 import { SimulatorOwnershipError, SimulatorOwnershipRegistry,
@@ -38,6 +40,7 @@ export interface SimulatorDriverCoordinatorOptions {
   readonly state?: SimulatorDriverStateRegistry;
   readonly nativeHidPath?: string;
   readonly nativeHidRuntime?: SimulatorNativeHidRuntime;
+  readonly mjpegStream?: typeof streamSimulatorMjpeg;
 }
 
 function buildVersion(value: string | null): string | null {
@@ -64,6 +67,7 @@ export class SimulatorDriverCoordinator {
   readonly #cacheRoot: string;
   readonly #architecture: "arm64" | "x86_64";
   readonly #nativeHid: SimulatorNativeHidRuntime | undefined;
+  readonly #mjpegStream: typeof streamSimulatorMjpeg;
 
   constructor(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
     options: SimulatorDriverCoordinatorOptions) {
@@ -79,6 +83,7 @@ export class SimulatorDriverCoordinator {
     this.#architecture = architecture(options.architecture);
     this.#nativeHid = options.nativeHidRuntime ?? (options.nativeHidPath === undefined
       ? undefined : new MacSimulatorNativeHidRuntime({ helperPath: options.nativeHidPath }));
+    this.#mjpegStream = options.mjpegStream ?? streamSimulatorMjpeg;
   }
 
   start(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
@@ -95,6 +100,23 @@ export class SimulatorDriverCoordinator {
     const active = this.#manager.get(instance.instanceId);
     return active?.state === "ready" && active.simulatorUdid === instance.simulatorUdid &&
       this.#state.isCurrentReady(instance.instanceId, instance.generation, active.leaseId);
+  }
+
+  /** A transient frame subscription to this exact ready driver; no frame enters Store. */
+  async *streamMjpegFrames(instance: PublicSimulatorInstance,
+    signal?: AbortSignal): AsyncGenerator<SimulatorMjpegFrame> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) throw new SimulatorDriverError(
+      "DRIVER_RUNTIME_LOST", "Simulator driver is not ready for streaming.");
+    for await (const frame of this.#mjpegStream(active.mjpegPort, { signal })) {
+      const current = this.#manager.get(instance.instanceId);
+      if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+          current.driverSessionId !== active.driverSessionId ||
+          current.mjpegPort !== active.mjpegPort || signal?.aborted) {
+        throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during streaming.");
+      }
+      yield frame;
+    }
   }
 
   async observeHealth(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<WdaDriverHealth> {

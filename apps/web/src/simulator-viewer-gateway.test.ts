@@ -2,7 +2,8 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
-  SimulatorViewerInstanceSchema } from "@joko/contracts";
+  SimulatorViewerInstanceSchema, SimulatorViewerStreamState,
+  WatchSimulatorFramesResponseSchema } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 
@@ -44,4 +45,29 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
   expect(requests.filter(item => item.input.requestId === "uncertain")).toHaveLength(1);
   owner.abort();
   expect(requests.every(item => item.signal.aborted)).toBe(true);
+});
+
+it("validates generated frame stream route, sequence and JPEG bytes before presentation", async () => {
+  const route = { instanceId: "owned", generation: 4n, leaseId: "lease" };
+  const responses = [
+    create(WatchSimulatorFramesResponseSchema,
+      { route, state: SimulatorViewerStreamState.CONNECTING }),
+    create(WatchSimulatorFramesResponseSchema,
+      { route, state: SimulatorViewerStreamState.FRAME, sequence: 1n,
+        receivedAtMs: 1_000n, jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) }),
+    create(WatchSimulatorFramesResponseSchema,
+      { route: { ...route, generation: 5n }, state: SimulatorViewerStreamState.FRAME,
+        sequence: 2n, receivedAtMs: 2_000n, jpeg: new Uint8Array([0xff, 0xd8, 2, 0xff, 0xd9]) })
+  ];
+  const stream = vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown,
+    _headers: unknown, input: any) => ({ service: method.parent, method, stream: true,
+      header: new Headers(), trailer: new Headers(), message: (async function* () {
+        for (const response of responses) yield response;
+      })(), signal, input }));
+  const gateway = createSimulatorViewerGateway({ stream } as unknown as Transport);
+  const iterator = gateway.watchSimulatorFrames("task", route)[Symbol.asyncIterator]();
+  expect((await iterator.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+  expect((await iterator.next()).value).toMatchObject({ kind: "frame", sequence: 1n });
+  await expect(iterator.next()).rejects.toThrow("another instance route");
+  expect(stream).toHaveBeenCalledOnce();
 });

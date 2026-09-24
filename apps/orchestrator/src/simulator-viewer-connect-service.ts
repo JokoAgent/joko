@@ -7,6 +7,7 @@ import type { SimulatorEnvironmentRuntime } from "@joko/tool-ios-simulator";
 import type { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
 import type { PublicSimulatorInstance, SimulatorInstanceRoute,
   SimulatorOwnershipRegistry, SimulatorTaskScope } from "./ios-simulator-ownership.js";
+import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 
@@ -14,6 +15,7 @@ export interface SimulatorViewerServiceOwner {
   readonly ownership: SimulatorOwnershipRegistry;
   readonly control: SimulatorInstanceControlCoordinator;
   readonly environment: SimulatorEnvironmentRuntime;
+  readonly frames?: SimulatorViewerFrameCoordinator;
   clearInstance(instanceId: string): Promise<void>;
 }
 
@@ -130,6 +132,29 @@ export function createSimulatorViewerConnectService(input: {
         deleted: action === contract.SimulatorViewerAction.DELETE,
         replayed: result.replayed
       });
+    },
+    watchSimulatorFrames: async function* (request, context) {
+      input.authenticate(context);
+      const task = scope(request.sessionId, false);
+      const currentOwner = owner();
+      if (!currentOwner.frames) throw new ConnectError(
+        "Simulator Viewer frames are unavailable.", Code.Unimplemented);
+      const route = requiredRoute(request.route);
+      fence(context, task, false);
+      for await (const event of currentOwner.frames.watch(task, route, context.signal)) {
+        fence(context, task, false);
+        yield create(contract.WatchSimulatorFramesResponseSchema, {
+          route: create(contract.SimulatorViewerRouteSchema, { instanceId: route.instanceId,
+            generation: BigInt(route.generation), leaseId: route.leaseId }),
+          state: event.kind === "frame" ? contract.SimulatorViewerStreamState.FRAME
+            : event.kind === "connecting" ? contract.SimulatorViewerStreamState.CONNECTING
+              : event.kind === "reconnecting" ? contract.SimulatorViewerStreamState.RECONNECTING
+                : contract.SimulatorViewerStreamState.DISCONNECTED,
+          ...(event.kind === "frame" ? { sequence: BigInt(event.sequence),
+            receivedAtMs: BigInt(Date.parse(event.receivedAt)), jpeg: event.bytes }
+            : { reconnectAttempt: event.attempt })
+        });
+      }
     }
   };
 }

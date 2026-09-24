@@ -5,6 +5,7 @@ import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { expect, it, vi } from "vitest";
 import { SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
+import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
 
 const SCOPE = { sessionId: "simulator-task", targetId: "local", generation: 1 } as const;
@@ -14,7 +15,7 @@ const DEVICE = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "Joko iPhon
   runtimeName: "iOS 19.0", runtimeVersion: "19.0",
   deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null } as const;
 
-function fixture() {
+function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch">) {
   const store = new OperationalStore(":memory:");
   store.upsertBackend({ id: "pi", displayName: "Pi", version: "fixture", health: "healthy",
     adapterKind: "fixture", instanceGeneration: 0, installationState: "installed",
@@ -41,12 +42,43 @@ function fixture() {
     owner: { ownership, control: { delete: remove } as never,
       environment: { inspect: async () => ({ platform: "darwin", ready: true,
         devices: [DEVICE], issue: null }) } as never,
-      clearInstance: clear },
+      clearInstance: clear, frames: frames as never },
     authenticate: () => { if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated); }
   });
   return { store, ownership, instance, remove, clear, service, context,
     revoke: () => { authorized = false; }, authorize: () => { authorized = true; } };
 }
+
+it("streams task-bound frame messages and fences authentication between yields", async () => {
+  const jpeg = new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]);
+  const watch = vi.fn(async function* () {
+    yield { kind: "connecting", attempt: 0 } as const;
+    yield { kind: "frame", sequence: 1, receivedAt: new Date(1_000).toISOString(), bytes: jpeg } as const;
+  });
+  const h = fixture({ watch });
+  try {
+    const request = create(contract.WatchSimulatorFramesRequestSchema, {
+      sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
+        generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id }
+    });
+    const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
+    expect((await stream.next()).value).toMatchObject({
+      state: contract.SimulatorViewerStreamState.CONNECTING,
+      route: { instanceId: h.instance.instanceId }
+    });
+    h.revoke();
+    await expect(stream.next()).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(watch).toHaveBeenCalledOnce();
+    h.authorize();
+    const second = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
+    await second.next();
+    expect((await second.next()).value).toMatchObject({
+      state: contract.SimulatorViewerStreamState.FRAME, sequence: 1n,
+      receivedAtMs: 1_000n, jpeg
+    });
+    await second.return?.();
+  } finally { h.store.close(); }
+});
 
 it("projects only the authenticated task's exact instance and routes UI deletion outside the agent catalog", async () => {
   const h = fixture();

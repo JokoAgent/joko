@@ -139,6 +139,7 @@ import { SimulatorScreenshotCoordinator } from "./ios-simulator-screenshot.js";
 import { SimulatorRecordingCoordinator } from "./ios-simulator-recording.js";
 import { SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
 import { SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
+import { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 import type { SimulatorViewerServiceOwner } from "./simulator-viewer-connect-service.js";
 import type { SimulatorProjectBuilder, SimulatorRecordingRuntime,
   SimulatorOwnedDeleteRuntime } from "@joko/tool-ios-simulator";
@@ -478,7 +479,7 @@ export interface OrchestratorApplicationDependencies {
     readonly lifecycle?: SimulatorLifecycleRuntime;
     readonly create?: SimulatorCreateRuntime;
     readonly driver?: Pick<SimulatorDriverCoordinatorOptions,
-      "manager" | "cleanupOrphans" | "architecture" | "nativeHidRuntime">;
+      "manager" | "cleanupOrphans" | "architecture" | "nativeHidRuntime" | "mjpegStream">;
     readonly projectBuilder?: Pick<SimulatorProjectBuilder, "inspect" | "build" | "readXcresult">;
     readonly inspectAppArtifact?: typeof inspectSimulatorAppArtifact;
     readonly recording?: SimulatorRecordingRuntime;
@@ -901,11 +902,16 @@ export async function createOrchestratorApplication(
   const simulatorVisual = simulatorScreen === undefined ? undefined
     : new SimulatorVisualComparisonCoordinator(store, simulatorOwnership,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
+  const simulatorViewerFrames = simulatorDriver === undefined ? undefined
+    : new SimulatorViewerFrameCoordinator(simulatorOwnership, simulatorDriver);
   const simulatorStateDiagnostics = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
-    : new SimulatorStateDiagnosticsCoordinator(simulatorOwnership, simulatorDriver, simulatorScreen);
+    : new SimulatorStateDiagnosticsCoordinator(simulatorOwnership, simulatorDriver, simulatorScreen,
+      Date.now, simulatorViewerFrames);
   const simulatorViewer: SimulatorViewerServiceOwner | undefined = simulatorControl === undefined ? undefined : {
     ownership: simulatorOwnership, control: simulatorControl, environment: simulatorEnvironment,
+    frames: simulatorViewerFrames,
     clearInstance: async instanceId => {
+      simulatorViewerFrames?.clear(instanceId);
       simulatorScreen?.clear(instanceId);
       simulatorVisual?.clear(instanceId);
       simulatorStateDiagnostics?.clear(instanceId);
