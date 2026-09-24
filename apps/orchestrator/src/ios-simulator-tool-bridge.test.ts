@@ -367,7 +367,11 @@ it("publishes strict Simulator presentation and accessibility controls only with
         viewport: { width: 852, height: 393, orientation: action["orientation"] } } : {}),
       ...(action["type"] === "set_appearance" ? { appearance: action["appearance"] } : {}),
       ...(action["type"] === "set_increase_contrast" ? { enabled: action["enabled"] } : {}),
-      ...(action["type"] === "set_content_size" ? { contentSize: action["contentSize"] } : {}) } };
+      ...(action["type"] === "set_content_size" ? { contentSize: action["contentSize"] } : {}),
+      ...(action["type"] === "set_location" ? { latitude: action["latitude"],
+        longitude: action["longitude"] } : {}),
+      ...(action["type"] === "start_location_route" ? {
+        waypointCount: (action["waypoints"] as readonly unknown[]).length } : {}) } };
   } };
   const provider = new IosSimulatorToolBridgeProvider({
     store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
@@ -397,7 +401,10 @@ it("publishes strict Simulator presentation and accessibility controls only with
       expect.objectContaining({ name: "set_orientation", readOnly: false, via: "control_tool" }),
       expect.objectContaining({ name: "set_appearance", readOnly: false, via: "control_tool" }),
       expect.objectContaining({ name: "set_increase_contrast", readOnly: false, via: "control_tool" }),
-      expect.objectContaining({ name: "set_content_size", readOnly: false, via: "control_tool" })
+      expect.objectContaining({ name: "set_content_size", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "set_location", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "start_location_route", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "clear_location", readOnly: false, via: "control_tool" })
     ]) });
   expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "LANDSCAPE" }))
     .toMatchObject({ ok: true, data: { interaction: "set_orientation", backend: "wda",
@@ -409,6 +416,15 @@ it("publishes strict Simulator presentation and accessibility controls only with
   expect(await invoke("set_content_size", { ...route,
     contentSize: "accessibility-extra-large" })).toMatchObject({ ok: true,
       data: { interaction: "set_content_size", contentSize: "accessibility-extra-large" } });
+  expect(await invoke("set_location", { ...route, latitude: 31.2304, longitude: 121.4737 }))
+    .toMatchObject({ ok: true, data: { interaction: "set_location",
+      latitude: 31.2304, longitude: 121.4737 } });
+  expect(await invoke("start_location_route", { ...route, waypoints: [
+    { latitude: 31.2304, longitude: 121.4737 }, { latitude: 31.233, longitude: 121.48 }
+  ], speedMetersPerSecond: 12, intervalSeconds: 0.5 })).toMatchObject({ ok: true,
+      data: { interaction: "start_location_route", waypointCount: 2 } });
+  expect(await invoke("clear_location", route)).toMatchObject({ ok: true,
+    data: { interaction: "clear_location", backend: "simctl" } });
   expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "UPSIDE_DOWN" }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_appearance", { ...route, appearance: "blue" }))
@@ -417,22 +433,37 @@ it("publishes strict Simulator presentation and accessibility controls only with
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_content_size", { ...route, contentSize: "huge" }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_location", { ...route, latitude: 91, longitude: 0 }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("start_location_route", { ...route,
+    waypoints: [{ latitude: 0, longitude: 0 }] }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("start_location_route", { ...route, waypoints: [
+    { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
+  ], intervalSeconds: 1, distanceMeters: 1 })).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_appearance", { ...route, appearance: "light" }, scope))
     .toMatchObject({ errorCode: "STALE_SCOPE" });
-  expect(calls).toHaveLength(4);
+  expect(calls).toHaveLength(7);
   expect(calls.map(call => call.action)).toEqual([
     { type: "set_orientation", snapshotId, orientation: "LANDSCAPE" },
     { type: "set_appearance", appearance: "dark" },
     { type: "set_increase_contrast", enabled: true },
-    { type: "set_content_size", contentSize: "accessibility-extra-large" }
+    { type: "set_content_size", contentSize: "accessibility-extra-large" },
+    { type: "set_location", latitude: 31.2304, longitude: 121.4737 },
+    { type: "start_location_route", waypoints: [
+      { latitude: 31.2304, longitude: 121.4737 }, { latitude: 31.233, longitude: 121.48 }
+    ], speedMetersPerSecond: 12, intervalSeconds: 0.5 },
+    { type: "clear_location" }
   ]);
   expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
     .structuredContent).toMatchObject({ data: { availability: {
       set_orientation: { state: "available", backend: "wda" },
-      set_appearance: { state: "available", backend: "simctl" }
+      set_appearance: { state: "available", backend: "simctl" },
+      set_location: { state: "available", backend: "simctl" },
+      clear_location: { state: "available", backend: "simctl" }
     } } });
   ready = false;
   expect(await invoke("set_appearance", { ...route, appearance: "light" }))
     .toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
-  expect(calls).toHaveLength(4);
+  expect(calls).toHaveLength(7);
 });

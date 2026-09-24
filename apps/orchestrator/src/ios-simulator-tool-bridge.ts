@@ -65,7 +65,10 @@ const STATE_TOOLS = Object.freeze([
   { name: "set_orientation", description: "Rotate the current Simulator device after validating its screen snapshot.", readOnly: false },
   { name: "set_appearance", description: "Set the simulated system appearance to light or dark.", readOnly: false },
   { name: "set_increase_contrast", description: "Enable or disable the simulated Increase Contrast setting.", readOnly: false },
-  { name: "set_content_size", description: "Set the simulated Dynamic Type content-size category.", readOnly: false }
+  { name: "set_content_size", description: "Set the simulated Dynamic Type content-size category.", readOnly: false },
+  { name: "set_location", description: "Set one bounded simulated latitude and longitude.", readOnly: false },
+  { name: "start_location_route", description: "Start a bounded simulated route through explicit waypoints.", readOnly: false },
+  { name: "clear_location", description: "Clear the simulated location or active route.", readOnly: false }
 ] as const);
 
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
@@ -493,6 +496,31 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator content size is invalid.");
       }
       action = { type: "set_content_size", contentSize };
+    } else if (name === "set_location") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "latitude", "longitude"]);
+      action = { type: "set_location",
+        latitude: requiredBoundedFinite(args["latitude"], -90, 90, "latitude"),
+        longitude: requiredBoundedFinite(args["longitude"], -180, 180, "longitude") };
+    } else if (name === "start_location_route") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "waypoints",
+        "speedMetersPerSecond", "intervalSeconds", "distanceMeters"]);
+      const speedMetersPerSecond = optionalPositiveFinite(args["speedMetersPerSecond"],
+        10_000, "speedMetersPerSecond");
+      const intervalSeconds = optionalPositiveFinite(args["intervalSeconds"],
+        86_400, "intervalSeconds");
+      const distanceMeters = optionalPositiveFinite(args["distanceMeters"],
+        10_000_000, "distanceMeters");
+      if (intervalSeconds !== undefined && distanceMeters !== undefined) {
+        throw new SimulatorToolError("INVALID_ARGUMENT",
+          "Simulator location route interval and distance are mutually exclusive.");
+      }
+      action = { type: "start_location_route", waypoints: requiredLocationWaypoints(args["waypoints"]),
+        ...(speedMetersPerSecond === undefined ? {} : { speedMetersPerSecond }),
+        ...(intervalSeconds === undefined ? {} : { intervalSeconds }),
+        ...(distanceMeters === undefined ? {} : { distanceMeters }) };
+    } else if (name === "clear_location") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId"]);
+      action = { type: "clear_location" };
     } else {
       throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator state control is unavailable.");
     }
@@ -603,6 +631,43 @@ function requiredCoordinate(value: unknown): number {
     throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator input coordinate is invalid.");
   }
   return value;
+}
+
+function requiredBoundedFinite(value: unknown, minimum: number, maximum: number,
+  label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", `Simulator ${label} is invalid.`);
+  }
+  return value;
+}
+
+function optionalPositiveFinite(value: unknown, maximum: number, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > maximum) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", `Simulator ${label} is invalid.`);
+  }
+  return value;
+}
+
+function requiredLocationWaypoints(value: unknown): readonly {
+  readonly latitude: number; readonly longitude: number }[] {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 64) {
+    throw new SimulatorToolError("INVALID_ARGUMENT",
+      "Simulator location route must contain between 2 and 64 waypoints.");
+  }
+  return value.map((waypoint, index) => {
+    if (!isRecord(waypoint)) {
+      throw new SimulatorToolError("INVALID_ARGUMENT",
+        `Simulator location waypoint ${index} is invalid.`);
+    }
+    onlyKeys(waypoint, ["latitude", "longitude"]);
+    return {
+      latitude: requiredBoundedFinite(waypoint["latitude"], -90, 90,
+        `location waypoint ${index} latitude`),
+      longitude: requiredBoundedFinite(waypoint["longitude"], -180, 180,
+        `location waypoint ${index} longitude`)
+    };
+  });
 }
 
 function requiredSnapshotId(value: unknown): string {

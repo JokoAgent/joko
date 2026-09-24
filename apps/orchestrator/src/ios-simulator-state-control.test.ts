@@ -1,6 +1,7 @@
 import { OperationalStore } from "@joko/store";
 import { SimulatorLifecycleError, WdaClientError,
-  type SimulatorAppearance, type SimulatorContentSize } from "@joko/tool-ios-simulator";
+  type SimulatorAppearance, type SimulatorContentSize,
+  type SimulatorLocationRouteOptions } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance } from "./ios-simulator-ownership.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
@@ -43,6 +44,9 @@ function fixture() {
   let appearance = async (value: SimulatorAppearance) => {
     calls.push({ type: "appearance", value, claimed: hasClaim(store) });
   };
+  let location = async (latitude: number, longitude: number) => {
+    calls.push({ type: "location", value: { latitude, longitude }, claimed: hasClaim(store) });
+  };
   const driver = {
     isReady: () => true,
     observeAccessibilityTree: async () => ({ capturedAt: new Date().toISOString(),
@@ -60,13 +64,22 @@ function fixture() {
     },
     setContentSize: async (_udid: string, value: SimulatorContentSize) => {
       calls.push({ type: "content_size", value, claimed: hasClaim(store) });
+    },
+    setLocation: (_udid: string, latitude: number, longitude: number) =>
+      location(latitude, longitude),
+    startLocationRoute: async (_udid: string, options: SimulatorLocationRouteOptions) => {
+      calls.push({ type: "location_route", value: options, claimed: hasClaim(store) });
+    },
+    clearLocation: async () => {
+      calls.push({ type: "clear_location", value: null, claimed: hasClaim(store) });
     }
   };
   const state = new SimulatorStateControlCoordinator(store, ownership, driver, screen, lifecycle,
     { now: () => 1_000 });
   return { store, ownership, instance, screen, state, calls,
     setOrientation: (value: typeof orientation) => { orientation = value; },
-    setAppearance: (value: typeof appearance) => { appearance = value; } };
+    setAppearance: (value: typeof appearance) => { appearance = value; },
+    setLocation: (value: typeof location) => { location = value; } };
 }
 
 function hasClaim(store: OperationalStore): boolean {
@@ -98,13 +111,34 @@ it("claims each state change, rotates from the current snapshot and does not rep
       { type: "set_increase_contrast", enabled: true }, authority("d"));
     await h.state.execute(SCOPE, route(h.instance),
       { type: "set_content_size", contentSize: "accessibility-extra-large" }, authority("e"));
+    await h.state.execute(SCOPE, route(h.instance),
+      { type: "set_location", latitude: 31.2304, longitude: 121.4737 }, authority("f"));
+    const routeAction = { type: "start_location_route" as const, waypoints: [
+      { latitude: 31.2304, longitude: 121.4737 },
+      { latitude: 31.233, longitude: 121.48 }
+    ], speedMetersPerSecond: 12, intervalSeconds: 0.5 };
+    await h.state.execute(SCOPE, route(h.instance), routeAction, authority("7"));
+    await h.state.execute(SCOPE, route(h.instance), { type: "clear_location" }, authority("8"));
     expect(h.calls.slice(1)).toEqual([
       { type: "appearance", value: "dark", claimed: true },
       { type: "contrast", value: true, claimed: true },
-      { type: "content_size", value: "accessibility-extra-large", claimed: true }
+      { type: "content_size", value: "accessibility-extra-large", claimed: true },
+      { type: "location", value: { latitude: 31.2304, longitude: 121.4737 }, claimed: true },
+      { type: "location_route", value: {
+        waypoints: [{ latitude: 31.2304, longitude: 121.4737 },
+          { latitude: 31.233, longitude: 121.48 }],
+        speedMetersPerSecond: 12, intervalSeconds: 0.5, distanceMeters: undefined
+      }, claimed: true },
+      { type: "clear_location", value: null, claimed: true }
     ]);
     expect(h.store.listOperations({ sessionId: SCOPE.sessionId })
-      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(5);
+      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(8);
+    await expect(h.state.execute(SCOPE, route(h.instance), {
+      type: "start_location_route", waypoints: [
+        { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
+      ], intervalSeconds: 1, distanceMeters: 1
+    }, authority("9"))).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(h.calls).toHaveLength(7);
   } finally { h.store.close(); }
 });
 
@@ -120,9 +154,9 @@ it("serializes with input and fences an uncertain simctl result from replay", as
       new Error("Controlled input interruption."));
 
     let calls = 0;
-    h.setAppearance(async () => { calls += 1;
+    h.setLocation(async () => { calls += 1;
       throw new SimulatorLifecycleError("SIMULATOR_CONTROL_UNKNOWN", "private host detail"); });
-    const action = { type: "set_appearance" as const, appearance: "light" as const };
+    const action = { type: "set_location" as const, latitude: 0, longitude: 0 };
     await expect(h.state.execute(SCOPE, route(h.instance), action, authority("1")))
       .rejects.toMatchObject({ code: "STATE_OUTCOME_UNKNOWN" });
     await expect(h.state.execute(SCOPE, route(h.instance), action, authority("1")))

@@ -181,6 +181,24 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
         stateChanges.push({ action: "set_content_size", value: contentSize,
           claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      setLocation: async (value, latitude, longitude) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "set_location", value: { latitude, longitude },
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      startLocationRoute: async (value, options) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "start_location_route", value: options,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      clearLocation: async value => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "clear_location", value: null,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
       } },
     driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
       manager: { get: () => active,
@@ -276,6 +294,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
             snapshotId: string; elements: readonly { elementId: string; label: string }[] } } | null;
           action?: string; backend?: string; screenMapInvalidated?: boolean;
           interaction?: string; appearance?: string; enabled?: boolean; contentSize?: string;
+          latitude?: number; longitude?: number; waypointCount?: number;
           mode?: string; replayed?: boolean;
           viewport?: { width: number; height: number; orientation: string };
           audit?: { violationCount: number }; diff?: { baselineSnapshotId: string;
@@ -296,7 +315,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       get_screen_map: { state: "available" }, wait_for_ui: { state: "available" },
       tap: { state: "available", backend: "wda" }, press_home: { state: "available" },
       set_orientation: { state: "available", backend: "wda" },
-      set_appearance: { state: "available", backend: "simctl" }
+      set_appearance: { state: "available", backend: "simctl" },
+      set_location: { state: "available", backend: "simctl" }
     } });
     const route = { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
     const mapped = await call("control_tool", "get_screen_map", route);
@@ -421,6 +441,19 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       contentSize: "accessibility-extra-large" })).toMatchObject({ isError: false,
         details: { mcpStructuredContent: { data: { interaction: "set_content_size",
           contentSize: "accessibility-extra-large" } } } });
+    expect(await call("control_tool", "set_location", { ...route,
+      latitude: 31.2304, longitude: 121.4737 })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { interaction: "set_location",
+          latitude: 31.2304, longitude: 121.4737, screenMapInvalidated: true } } } });
+    expect(await call("control_tool", "start_location_route", { ...route, waypoints: [
+      { latitude: 31.2304, longitude: 121.4737 },
+      { latitude: 31.233, longitude: 121.48 }
+    ], speedMetersPerSecond: 12, intervalSeconds: 0.5 })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { interaction: "start_location_route",
+          waypointCount: 2, screenMapInvalidated: true } } } });
+    expect(await call("control_tool", "clear_location", route)).toMatchObject({ isError: false,
+      details: { mcpStructuredContent: { data: { interaction: "clear_location",
+        backend: "simctl", screenMapInvalidated: true } } } });
     expect(inputs.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/actions",
@@ -433,7 +466,13 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       { action: "set_orientation", value: "LANDSCAPE", claimed: true },
       { action: "set_appearance", value: "dark", claimed: true },
       { action: "set_increase_contrast", value: true, claimed: true },
-      { action: "set_content_size", value: "accessibility-extra-large", claimed: true }
+      { action: "set_content_size", value: "accessibility-extra-large", claimed: true },
+      { action: "set_location", value: { latitude: 31.2304, longitude: 121.4737 }, claimed: true },
+      { action: "start_location_route", value: { waypoints: [
+        { latitude: 31.2304, longitude: 121.4737 },
+        { latitude: 31.233, longitude: 121.48 }
+      ], speedMetersPerSecond: 12, intervalSeconds: 0.5 }, claimed: true },
+      { action: "clear_location", value: null, claimed: true }
     ]);
     const inputOperations = application.store.listOperations({ sessionId: "simulator-task" })
       .filter(operation => operation.kind === "ios_simulator_input")
@@ -443,7 +482,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(JSON.stringify(inputOperations)).not.toContain(secret);
     expect(JSON.stringify(inputOperations)).not.toContain(batchSecret);
     expect(application.store.listOperations({ sessionId: "simulator-task" })
-      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(4);
+      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(7);
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
       generation: instance.generation, leaseId: instance.lease.id });
     expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {

@@ -3,7 +3,8 @@ import { OperationConflictError, OperationInProgressError, OperationPreviouslyFa
 import { JokoError } from "@joko/core";
 import { createSimulatorLifecycleRuntime, SimulatorLifecycleError, SimulatorScreenMapError,
   WdaClientError, type SimulatorAppearance, type SimulatorContentSize,
-  type SimulatorLifecycleRuntime, type WdaViewport } from "@joko/tool-ios-simulator";
+  type SimulatorLifecycleRuntime, type SimulatorLocationRouteOptions,
+  type SimulatorLocationWaypoint, type WdaViewport } from "@joko/tool-ios-simulator";
 import { SimulatorDriverError, type SimulatorDriverCoordinator } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorObservationError,
   type SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
@@ -31,14 +32,20 @@ type StateDriver = Pick<SimulatorDriverCoordinator, "isReady" | "setOrientation"
 type StateScreen = Pick<SimulatorScreenObservationCoordinator,
   "requireInteractionSnapshot" | "invalidateInteraction" | "invalidateRoute">;
 type StateLifecycle = Pick<SimulatorLifecycleRuntime,
-  "setAppearance" | "setIncreaseContrast" | "setContentSize">;
+  "setAppearance" | "setIncreaseContrast" | "setContentSize" | "setLocation" |
+  "startLocationRoute" | "clearLocation">;
 
 export type SimulatorStateControlAction =
   | { readonly type: "set_orientation"; readonly snapshotId: string;
       readonly orientation: WdaViewport["orientation"] }
   | { readonly type: "set_appearance"; readonly appearance: SimulatorAppearance }
   | { readonly type: "set_increase_contrast"; readonly enabled: boolean }
-  | { readonly type: "set_content_size"; readonly contentSize: SimulatorContentSize };
+  | { readonly type: "set_content_size"; readonly contentSize: SimulatorContentSize }
+  | { readonly type: "set_location"; readonly latitude: number; readonly longitude: number }
+  | { readonly type: "start_location_route"; readonly waypoints: readonly SimulatorLocationWaypoint[];
+      readonly speedMetersPerSecond?: number; readonly intervalSeconds?: number;
+      readonly distanceMeters?: number }
+  | { readonly type: "clear_location" };
 
 export interface SimulatorStateControlReceipt {
   readonly interaction: SimulatorStateControlAction["type"];
@@ -52,6 +59,9 @@ export interface SimulatorStateControlReceipt {
   readonly appearance?: SimulatorAppearance;
   readonly enabled?: boolean;
   readonly contentSize?: SimulatorContentSize;
+  readonly latitude?: number;
+  readonly longitude?: number;
+  readonly waypointCount?: number;
 }
 
 export interface SimulatorStateControlExecution {
@@ -85,7 +95,7 @@ function priorFailure(error: OperationPreviouslyFailedError): SimulatorStateCont
     "This Simulator state control previously failed and will not be dispatched again.");
 }
 
-/** Durable boundary for device presentation and accessibility state mutations. */
+/** Durable boundary for device presentation, accessibility and environment-state mutations. */
 export class SimulatorStateControlCoordinator {
   readonly #store: OperationalStore;
   readonly #ownership: { requireRoute(scope: SimulatorTaskScope,
@@ -140,7 +150,10 @@ export class SimulatorStateControlCoordinator {
           this.#screen.requireInteractionSnapshot(scope, route, action.snapshotId);
         } else if (action.type === "set_appearance" && !this.#lifecycle.setAppearance ||
             action.type === "set_increase_contrast" && !this.#lifecycle.setIncreaseContrast ||
-            action.type === "set_content_size" && !this.#lifecycle.setContentSize) {
+            action.type === "set_content_size" && !this.#lifecycle.setContentSize ||
+            action.type === "set_location" && !this.#lifecycle.setLocation ||
+            action.type === "start_location_route" && !this.#lifecycle.startLocationRoute ||
+            action.type === "clear_location" && !this.#lifecycle.clearLocation) {
           throw new SimulatorStateControlError("CONTROL_UNAVAILABLE",
             "Simulator system setting control is unavailable.");
         }
@@ -190,10 +203,29 @@ export class SimulatorStateControlCoordinator {
         attempted = true;
         await this.#lifecycle.setIncreaseContrast!(instance.simulatorUdid, action.enabled, signal);
         result = { backend: "simctl", enabled: action.enabled };
-      } else {
+      } else if (action.type === "set_content_size") {
         attempted = true;
         await this.#lifecycle.setContentSize!(instance.simulatorUdid, action.contentSize, signal);
         result = { backend: "simctl", contentSize: action.contentSize };
+      } else if (action.type === "set_location") {
+        attempted = true;
+        await this.#lifecycle.setLocation!(instance.simulatorUdid,
+          action.latitude, action.longitude, signal);
+        result = { backend: "simctl", latitude: action.latitude, longitude: action.longitude };
+      } else if (action.type === "start_location_route") {
+        attempted = true;
+        const options: SimulatorLocationRouteOptions = {
+          waypoints: action.waypoints,
+          speedMetersPerSecond: action.speedMetersPerSecond,
+          intervalSeconds: action.intervalSeconds,
+          distanceMeters: action.distanceMeters
+        };
+        await this.#lifecycle.startLocationRoute!(instance.simulatorUdid, options, signal);
+        result = { backend: "simctl", waypointCount: action.waypoints.length };
+      } else {
+        attempted = true;
+        await this.#lifecycle.clearLocation!(instance.simulatorUdid, signal);
+        result = { backend: "simctl" };
       }
       const current = this.#ownership.requireRoute(scope, route);
       if (!this.#driver.isReady(current)) {
@@ -239,8 +271,47 @@ export class SimulatorStateControlCoordinator {
       if (!CONTENT_SIZES.has(action.contentSize)) {
         throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator content size is invalid.");
       }
+    } else if (action.type === "set_location") {
+      this.#validateLocation(action.latitude, action.longitude, "Simulator location");
+    } else if (action.type === "start_location_route") {
+      if (!Array.isArray(action.waypoints) || action.waypoints.length < 2 ||
+          action.waypoints.length > 64) {
+        throw new SimulatorStateControlError("INVALID_ARGUMENT",
+          "Simulator location route must contain between 2 and 64 waypoints.");
+      }
+      action.waypoints.forEach((waypoint, index) => {
+        if (!waypoint || typeof waypoint !== "object") {
+          throw new SimulatorStateControlError("INVALID_ARGUMENT",
+            `Simulator location waypoint ${index} is invalid.`);
+        }
+        this.#validateLocation(waypoint.latitude, waypoint.longitude,
+          `Simulator location waypoint ${index}`);
+      });
+      for (const [key, value, maximum] of [
+        ["speedMetersPerSecond", action.speedMetersPerSecond, 10_000],
+        ["intervalSeconds", action.intervalSeconds, 86_400],
+        ["distanceMeters", action.distanceMeters, 10_000_000]
+      ] as const) {
+        if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > maximum)) {
+          throw new SimulatorStateControlError("INVALID_ARGUMENT",
+            `Simulator location route ${key} is invalid.`);
+        }
+      }
+      if (action.intervalSeconds !== undefined && action.distanceMeters !== undefined) {
+        throw new SimulatorStateControlError("INVALID_ARGUMENT",
+          "Simulator location route interval and distance are mutually exclusive.");
+      }
+    } else if (action.type === "clear_location") {
+      // The exact route and effect authority are the complete request shape.
     } else {
       throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator state control is invalid.");
+    }
+  }
+
+  #validateLocation(latitude: number, longitude: number, label: string): void {
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+        !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+      throw new SimulatorStateControlError("INVALID_ARGUMENT", `${label} is invalid.`);
     }
   }
 

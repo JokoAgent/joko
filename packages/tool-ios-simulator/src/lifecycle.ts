@@ -24,6 +24,10 @@ export interface SimulatorLifecycleRuntime {
   setAppearance?(udid: string, appearance: SimulatorAppearance, signal?: AbortSignal): Promise<void>;
   setIncreaseContrast?(udid: string, enabled: boolean, signal?: AbortSignal): Promise<void>;
   setContentSize?(udid: string, contentSize: SimulatorContentSize, signal?: AbortSignal): Promise<void>;
+  setLocation?(udid: string, latitude: number, longitude: number, signal?: AbortSignal): Promise<void>;
+  startLocationRoute?(udid: string, options: SimulatorLocationRouteOptions,
+    signal?: AbortSignal): Promise<void>;
+  clearLocation?(udid: string, signal?: AbortSignal): Promise<void>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -31,6 +35,16 @@ export type SimulatorContentSize = "extra-small" | "small" | "medium" | "large" 
   "extra-extra-large" | "extra-extra-extra-large" | "accessibility-medium" |
   "accessibility-large" | "accessibility-extra-large" | "accessibility-extra-extra-large" |
   "accessibility-extra-extra-extra-large";
+export interface SimulatorLocationWaypoint {
+  readonly latitude: number;
+  readonly longitude: number;
+}
+export interface SimulatorLocationRouteOptions {
+  readonly waypoints: readonly SimulatorLocationWaypoint[];
+  readonly speedMetersPerSecond?: number;
+  readonly intervalSeconds?: number;
+  readonly distanceMeters?: number;
+}
 
 const CONTENT_SIZES = new Set<SimulatorContentSize>([
   "extra-small", "small", "medium", "large", "extra-large", "extra-extra-large",
@@ -38,6 +52,11 @@ const CONTENT_SIZES = new Set<SimulatorContentSize>([
   "accessibility-extra-large", "accessibility-extra-extra-large",
   "accessibility-extra-extra-extra-large"
 ]);
+const LOCATION_ROUTE_LIMITS = Object.freeze({
+  speedMetersPerSecond: 10_000,
+  intervalSeconds: 86_400,
+  distanceMeters: 10_000_000
+});
 
 export interface SimulatorLifecycleClock {
   now(): number;
@@ -138,6 +157,58 @@ export function createSimulatorLifecycleRuntime(options: {
     }
   }
 
+  async function runLocationControl(udid: string, args: readonly string[],
+    failureMessage: string, signal?: AbortSignal): Promise<void> {
+    requirePlatform();
+    const normalized = exactUdid(udid);
+    const result = await runMutation(["simctl", "location", normalized, ...args], 15_000,
+      "SIMULATOR_CONTROL_UNKNOWN", signal);
+    if (result.exitCode !== 0 || result.failed) {
+      throw new SimulatorLifecycleError("SIMULATOR_CONTROL_FAILED", failureMessage);
+    }
+  }
+
+  function locationWaypoint(latitude: number, longitude: number, label = "Simulator location"):
+    SimulatorLocationWaypoint {
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+      throw new SimulatorLifecycleError("INVALID_ARGUMENT", `${label} latitude is invalid.`);
+    }
+    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+      throw new SimulatorLifecycleError("INVALID_ARGUMENT", `${label} longitude is invalid.`);
+    }
+    return { latitude, longitude };
+  }
+
+  function locationRoute(options: SimulatorLocationRouteOptions): SimulatorLocationRouteOptions {
+    if (!options || !Array.isArray(options.waypoints) ||
+        options.waypoints.length < 2 || options.waypoints.length > 64) {
+      throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+        "Simulator location route must contain between 2 and 64 waypoints.");
+    }
+    const waypoints = options.waypoints.map((waypoint, index) => {
+      if (!waypoint || typeof waypoint !== "object") {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+          `Simulator location waypoint ${index} is invalid.`);
+      }
+      return locationWaypoint(waypoint.latitude, waypoint.longitude,
+        `Simulator location waypoint ${index}`);
+    });
+    for (const key of ["speedMetersPerSecond", "intervalSeconds", "distanceMeters"] as const) {
+      const value = options[key];
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0 ||
+          value > LOCATION_ROUTE_LIMITS[key])) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+          `Simulator location route ${key} is invalid.`);
+      }
+    }
+    if (options.intervalSeconds !== undefined && options.distanceMeters !== undefined) {
+      throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+        "Simulator location route accepts intervalSeconds or distanceMeters, not both.");
+    }
+    return { waypoints, speedMetersPerSecond: options.speedMetersPerSecond,
+      intervalSeconds: options.intervalSeconds, distanceMeters: options.distanceMeters };
+  }
+
   return {
     findExact,
     async bootExact(udid, signal) {
@@ -234,6 +305,30 @@ export function createSimulatorLifecycleRuntime(options: {
         throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator content size is invalid.");
       }
       await runControl(udid, ["content_size", contentSize], signal);
+    },
+    async setLocation(udid, latitude, longitude, signal) {
+      const point = locationWaypoint(latitude, longitude);
+      await runLocationControl(udid, ["set", `${point.latitude},${point.longitude}`],
+        "Simulator location could not be changed.", signal);
+    },
+    async startLocationRoute(udid, options, signal) {
+      const route = locationRoute(options);
+      const args = ["start"];
+      if (route.speedMetersPerSecond !== undefined) {
+        args.push(`--speed=${route.speedMetersPerSecond}`);
+      }
+      if (route.distanceMeters !== undefined) {
+        args.push(`--distance=${route.distanceMeters}`);
+      } else if (route.intervalSeconds !== undefined) {
+        args.push(`--interval=${route.intervalSeconds}`);
+      }
+      args.push(...route.waypoints.map(point => `${point.latitude},${point.longitude}`));
+      await runLocationControl(udid, args,
+        "Simulator location route could not be started.", signal);
+    },
+    async clearLocation(udid, signal) {
+      await runLocationControl(udid, ["clear"],
+        "Simulator location could not be cleared.", signal);
     }
   };
 }

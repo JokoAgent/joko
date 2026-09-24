@@ -156,3 +156,57 @@ it("rejects invalid system controls before dispatch and fences uncertain results
   await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner })
     .setContentSize!(UDID, "large")).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
 });
+
+it("uses exact bounded simctl location routes for point, route and clear", async () => {
+  const controls = scripted(
+    { args: ["simctl", "location", UDID, "set", "31.2304,121.4737"], result: ok() },
+    { args: ["simctl", "location", UDID, "start", "--speed=12", "--interval=0.5",
+      "31.2304,121.4737", "31.233,121.48"], result: ok() },
+    { args: ["simctl", "location", UDID, "start", "--distance=25",
+      "0,0", "1,-1"], result: ok() },
+    { args: ["simctl", "location", UDID, "clear"], result: ok() }
+  );
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner: controls.runner });
+  await runtime.setLocation!(UDID.toLowerCase(), 31.2304, 121.4737);
+  await runtime.startLocationRoute!(UDID, { waypoints: [
+    { latitude: 31.2304, longitude: 121.4737 },
+    { latitude: 31.233, longitude: 121.48 }
+  ], speedMetersPerSecond: 12, intervalSeconds: 0.5 });
+  await runtime.startLocationRoute!(UDID, { waypoints: [
+    { latitude: 0, longitude: 0 }, { latitude: 1, longitude: -1 }
+  ], distanceMeters: 25 });
+  await runtime.clearLocation!(UDID);
+  expect(controls.remaining()).toBe(0);
+});
+
+it("rejects invalid location controls before dispatch and fences uncertain outcomes", async () => {
+  const unused = scripted();
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner: unused.runner });
+  await expect(runtime.setLocation!(UDID, 91, 0))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setLocation!(UDID, 0, Number.NaN))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.startLocationRoute!(UDID, { waypoints: [{ latitude: 0, longitude: 0 }] }))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.startLocationRoute!(UDID, { waypoints: [
+    { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
+  ], intervalSeconds: 1, distanceMeters: 1 })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.startLocationRoute!(UDID, { waypoints: [
+    { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
+  ], speedMetersPerSecond: 10_001 })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  expect(unused.calls).toEqual([]);
+
+  await expect(createSimulatorLifecycleRuntime({ platform: "win32", runner: unused.runner })
+    .clearLocation!(UDID)).rejects.toMatchObject({ code: "UNSUPPORTED_PLATFORM" });
+  expect(unused.calls).toEqual([]);
+
+  const rejected = scripted({ args: ["simctl", "location", UDID, "clear"],
+    result: { stdout: "", stderr: "/private/secret", exitCode: 1 } });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: rejected.runner })
+    .clearLocation!(UDID)).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_FAILED" });
+
+  const unknown = scripted({ args: ["simctl", "location", UDID, "set", "0,0"],
+    result: { stdout: "", stderr: "/private/secret", exitCode: null, aborted: true } });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner })
+    .setLocation!(UDID, 0, 0)).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
+});
