@@ -250,3 +250,80 @@ it("publishes task-owned screen observations through the permission bridge with 
   expect(await invoke("get_screen_map", route)).toMatchObject({ errorCode: "STALE_SCOPE" });
   expect(calls).toHaveLength(4);
 });
+
+it("publishes bounded Simulator input only through permission authority and strict snapshot arguments", async () => {
+  let ready = true;
+  let archived = false;
+  const calls: Array<{ action: unknown; observe: unknown; authority: unknown }> = [];
+  const input = { execute: async (_scope: unknown, route: { instanceId: string; generation: number },
+    action: { type: "tap" | "swipe" | "type_text" | "press_home" }, observe: unknown,
+    authority: unknown) => {
+    calls.push({ action, observe, authority });
+    return { receipt: { action: action.type, instanceId: route.instanceId, generation: route.generation,
+      backend: "wda", completedAt: new Date(0).toISOString(),
+      observationResult: { mode: "none", state: "not_requested" } }, replayed: false,
+      observation: null, observationError: null };
+  } };
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [{ instanceId: "owned" }],
+      listForResourceAdmission: () => [] } as never,
+    control: { diagnoseDrivers: () => [{ state: "ready" }] } as never,
+    screen: { clear: () => undefined } as never,
+    input: input as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: ready ? null : "XCODE_NOT_FOUND",
+      error: ready ? null : "Simulator unavailable", setupSteps: [] }) },
+    memoryProbe: async () => ({ source: "macos-memory-pressure", freePercentage: 50,
+      freeBytes: 4 * 1024 ** 3, totalBytes: 8 * 1024 ** 3 })
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const authority = { ...scope, effectIdentity: "a".repeat(64),
+    requestBodyHash: `sha256:${"b".repeat(64)}`, providerGeneration: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease",
+    snapshotId: randomUUID() };
+  const invoke = async (name: string, args: Record<string, unknown>,
+    context: typeof scope | typeof authority = authority) =>
+    (await provider.callTool("control_tool", { name, args }, undefined, context)).structuredContent;
+  const catalog = (await provider.callTool("list_tools", { category: "ios_simulator" }, undefined, scope))
+    .structuredContent;
+  expect(catalog).toMatchObject({ tools: expect.arrayContaining([
+    expect.objectContaining({ name: "tap", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "swipe", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "type_simulator_text", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "press_home", readOnly: false, via: "control_tool" })
+  ]) });
+  expect((await provider.callTool("call_tool", { name: "tap", args: route }, undefined, authority))
+    .structuredContent).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect(await invoke("tap", { ...route, x: 1, y: 2 }, scope))
+    .toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect(await invoke("tap", { ...route, elementId: "element", x: 1, y: 2 }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("tap", { ...route, elementId: "element" }))
+    .toMatchObject({ ok: true, data: { action: "tap", backend: "wda",
+      screenMapInvalidated: true, replayed: false } });
+  expect(await invoke("swipe", { ...route, startX: 0, startY: 1, endX: 2, endY: 3,
+    observeAfter: "stable", observeTimeoutMs: 1_000, stableForMs: 100 }))
+    .toMatchObject({ ok: true, data: { action: "swipe" } });
+  expect(await invoke("type_simulator_text", { ...route, text: "" }))
+    .toMatchObject({ ok: true, data: { action: "type_text" } });
+  expect(await invoke("press_home", route)).toMatchObject({ ok: true,
+    data: { action: "press_home" } });
+  expect(calls).toHaveLength(4);
+  expect(calls[0]).toMatchObject({ action: { type: "tap", target: { elementId: "element" } },
+    observe: { mode: "none", timeoutMs: 3_000, stableForMs: 300 },
+    authority: { effectIdentity: "a".repeat(64), providerGeneration: 1 } });
+  expect(calls[1]).toMatchObject({ action: { type: "swipe", durationMs: 300 },
+    observe: { mode: "stable", timeoutMs: 1_000, stableForMs: 100 } });
+  expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
+    .structuredContent).toMatchObject({ data: { availability: {
+      tap: { state: "available", backend: "wda" }, press_home: { state: "available" }
+    } } });
+  ready = false;
+  expect(await invoke("press_home", route)).toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
+  expect(calls).toHaveLength(4);
+  archived = true;
+  expect(await invoke("press_home", route)).toMatchObject({ errorCode: "STALE_SCOPE" });
+});

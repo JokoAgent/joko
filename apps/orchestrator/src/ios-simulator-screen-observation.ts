@@ -15,6 +15,10 @@ export type SimulatorWaitCondition =
   | { readonly kind: "element_exists" | "element_missing"; readonly selector: SimulatorElementSelector }
   | { readonly kind: "screen_changed"; readonly snapshotId: string }
   | { readonly kind: "screen_stable" };
+export type SimulatorObserveAfterMode = "none" | "immediate" | "stable";
+export type SimulatorInteractionObservation = { readonly mode: Exclude<SimulatorObserveAfterMode, "none">;
+  readonly screenMap: SimulatorScreenMap; readonly elapsedMs: number;
+  readonly stable: boolean; readonly timedOut: boolean };
 
 export class SimulatorObservationError extends Error {
   constructor(readonly code: "INVALID_ARGUMENT" | "UI_WAIT_TIMEOUT" | "STALE_UI_SNAPSHOT" |
@@ -90,9 +94,9 @@ export class SimulatorScreenObservationCoordinator {
 
   async wait(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, condition: SimulatorWaitCondition,
     options: { readonly timeoutMs?: number; readonly pollIntervalMs?: number;
-      readonly stableForMs?: number } = {}, signal?: AbortSignal): Promise<{
+      readonly stableForMs?: number; readonly returnOnTimeout?: boolean } = {}, signal?: AbortSignal): Promise<{
         readonly screenMap: SimulatorScreenMap; readonly elapsedMs: number;
-        readonly stable: boolean; readonly timedOut: false }> {
+        readonly stable: boolean; readonly timedOut: boolean }> {
     const timeoutMs = options.timeoutMs ?? 10_000;
     const pollIntervalMs = options.pollIntervalMs ?? 250;
     const stableForMs = options.stableForMs ?? 300;
@@ -111,10 +115,19 @@ export class SimulatorScreenObservationCoordinator {
     const deadline = started + timeoutMs;
     let previous: string | null = null;
     let stableSince = started;
+    let lastScreenMap: SimulatorScreenMap | null = null;
+    const timeout = (): { readonly screenMap: SimulatorScreenMap; readonly elapsedMs: number;
+      readonly stable: false; readonly timedOut: true } => {
+      if (options.returnOnTimeout && lastScreenMap) {
+        return { screenMap: lastScreenMap, elapsedMs: Date.now() - started,
+          stable: false, timedOut: true };
+      }
+      throw new SimulatorObservationError("UI_WAIT_TIMEOUT", "Simulator UI condition did not become true.");
+    };
     for (;;) {
       if (signal?.aborted) throw new SimulatorObservationError("OBSERVATION_CANCELLED", "Simulator observation was cancelled.");
       const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new SimulatorObservationError("UI_WAIT_TIMEOUT", "Simulator UI condition did not become true.");
+      if (remaining <= 0) return timeout();
       const bounded = new AbortController();
       const cancel = (): void => bounded.abort();
       signal?.addEventListener("abort", cancel, { once: true });
@@ -124,15 +137,16 @@ export class SimulatorScreenObservationCoordinator {
       try { screenMap = await this.#capture(scope, route, instance, bounded.signal); }
       catch (error) {
         if (signal?.aborted) throw new SimulatorObservationError("OBSERVATION_CANCELLED", "Simulator observation was cancelled.");
-        if (bounded.signal.aborted) throw new SimulatorObservationError("UI_WAIT_TIMEOUT", "Simulator UI condition did not become true.");
+        if (bounded.signal.aborted) return timeout();
         throw error;
       } finally {
         clearTimeout(timer);
         signal?.removeEventListener("abort", cancel);
       }
+      lastScreenMap = screenMap;
       const current = fingerprint(screenMap);
       const now = Date.now();
-      if (now > deadline) throw new SimulatorObservationError("UI_WAIT_TIMEOUT", "Simulator UI condition did not become true.");
+      if (now > deadline) return timeout();
       if (current !== previous) { previous = current; stableSince = now; }
       const matched = condition.kind === "screen_changed" ? current !== baseline
         : condition.kind === "screen_stable" ? now - stableSince >= stableForMs
@@ -141,11 +155,37 @@ export class SimulatorScreenObservationCoordinator {
             : !screenMap.elements.some(element => matches(element, condition.selector));
       if (matched) return { screenMap, elapsedMs: now - started,
         stable: condition.kind === "screen_stable", timedOut: false };
-      if (now >= deadline) {
-        throw new SimulatorObservationError("UI_WAIT_TIMEOUT", "Simulator UI condition did not become true.");
-      }
+      if (now >= deadline) return timeout();
       await pause(Math.min(pollIntervalMs, deadline - now), signal);
     }
+  }
+
+  requireInteractionSnapshot(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
+    snapshotId: string): SimulatorScreenMap {
+    this.#requireReady(scope, route);
+    return this.#maps.requireCurrent({ instanceId: route.instanceId,
+      generation: route.generation, snapshotId });
+  }
+
+  invalidateInteraction(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
+    snapshotId: string): number {
+    this.requireInteractionSnapshot(scope, route, snapshotId);
+    return this.#maps.invalidate(route.instanceId);
+  }
+
+  async observeAfter(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
+    mode: SimulatorObserveAfterMode, options: { readonly timeoutMs: number;
+      readonly stableForMs: number }, signal?: AbortSignal): Promise<SimulatorInteractionObservation | null> {
+    if (mode === "none") return null;
+    if (mode === "immediate") {
+      const observed = await this.screenMap(scope, route, signal);
+      return { mode, screenMap: observed.screenMap, elapsedMs: 0, stable: false, timedOut: false };
+    }
+    const observed = await this.wait(scope, route, { kind: "screen_stable" }, {
+      timeoutMs: options.timeoutMs, pollIntervalMs: 100,
+      stableForMs: options.stableForMs, returnOnTimeout: true
+    }, signal);
+    return { mode, ...observed };
   }
 
   clear(instanceId: string): void {

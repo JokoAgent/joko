@@ -1,8 +1,9 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OperationalStore } from "@joko/store";
-import { WDA_SOURCE_PIN, type WdaRunningDriver } from "@joko/tool-ios-simulator";
+import { createWdaOwnerFingerprint, WDA_SOURCE_PIN, type WdaRunningDriver } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
@@ -39,8 +40,8 @@ function route(instance: { instanceId: string; generation: number; lease: { id: 
   return { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
 }
 
-function running(instanceId: string): WdaRunningDriver {
-  return { instanceId, simulatorUdid: UDID, leaseId: LEASE, pid: 301, controlPort: 18100,
+function running(instanceId: string, controlPort = 18100): WdaRunningDriver {
+  return { instanceId, simulatorUdid: UDID, leaseId: LEASE, pid: 301, controlPort,
     mjpegPort: 19100, sourceRevision: WDA_SOURCE_PIN.revision, buildCacheKey: "a".repeat(64),
     driverSessionId: "SESSION-1", health: { ready: true, message: null, osName: "iOS",
       osVersion: "19.0", sdkVersion: "19.0", deviceIp: null }, state: "ready" };
@@ -48,7 +49,7 @@ function running(instanceId: string): WdaRunningDriver {
 
 function harness(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
   input: { readonly onStart?: () => Promise<void>; readonly onInspect?: () => void;
-    readonly environmentReady?: boolean } = {}) {
+    readonly environmentReady?: boolean; readonly controlPort?: number } = {}) {
   let active: WdaRunningDriver | null = null;
   const effects: string[] = [];
   const options: SimulatorDriverCoordinatorOptions = { archivePath: "/private/joko/wda.tar.gz",
@@ -64,10 +65,10 @@ function harness(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
       retryOwnedCleanup: async () => { effects.push("retry"); },
       start: async options => { effects.push("start");
         expect(store.findOperation(`ios-simulator-driver:${"a".repeat(64)}`)?.status).toBe("started");
-        await input.onStart?.(); active = running(options.instanceId); return active; },
+        await input.onStart?.(); active = running(options.instanceId, input.controlPort); return active; },
       stop: async () => { effects.push("stop"); active = null; } } };
   return { coordinator: new SimulatorDriverCoordinator(store, ownership, options), effects,
-    get active() { return active; } };
+    get active() { return active; }, loseActive: () => { active = null; } };
 }
 
 it("claims before cleanup and launch, commits ready with a new route, then stops and prevents stale replay", async () => {
@@ -137,6 +138,66 @@ it("does not dispatch when the device or host is unavailable and serializes a st
     store.failEffectOperation(lifecycleClaim.operation.id, lifecycleClaim.operation.bodyHash,
       new Error("Controlled lifecycle interruption."));
   } finally { store.close(); }
+});
+
+it("routes input through the exact ready driver session and rechecks its lease", async () => {
+  const requests: Array<{ url: string; body: unknown }> = [];
+  let ownerFingerprint = "";
+  let retireOnReply = false;
+  let loseActive = (): void => undefined;
+  const server = createServer((request, response) => {
+    const send = (value: unknown): void => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ value }));
+    };
+    if (request.method === "GET" && request.url === "/status") {
+      send({ ready: true, build: { upgradedAt: ownerFingerprint } });
+      return;
+    }
+    if (request.method !== "POST") { response.writeHead(404); response.end(); return; }
+    const chunks: Buffer[] = [];
+    request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => {
+      requests.push({ url: request.url ?? "", body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      if (retireOnReply) { retireOnReply = false; loseActive(); }
+      send(null);
+    });
+  });
+  const store = new OperationalStore(":memory:");
+  try {
+    await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Loopback port was not allocated.");
+    seed(store);
+    const ownership = new SimulatorOwnershipRegistry(store);
+    const initial = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const h = harness(store, ownership, { controlPort: address.port });
+    loseActive = h.loseActive;
+    const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    ownerFingerprint = createWdaOwnerFingerprint({ cacheRoot: "/private/joko/driver-cache",
+      instanceId: started.instance.instanceId, simulatorUdid: UDID });
+    await h.coordinator.tap(started.instance, { x: 10, y: 20 });
+    await h.coordinator.swipe(started.instance, { x: 1, y: 2 }, { x: 3, y: 4 }, 300);
+    await h.coordinator.typeText(started.instance, "hello");
+    await h.coordinator.pressHome(started.instance);
+    expect(requests.map(item => item.url)).toEqual([
+      "/session/SESSION-1/actions", "/session/SESSION-1/actions",
+      "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton"
+    ]);
+    const tapBody = requests[0]?.body as { actions: Array<{ id: string;
+      actions: Array<Record<string, unknown>> }> };
+    expect(tapBody.actions[0]).toMatchObject({ id: "finger" });
+    expect(tapBody.actions[0]?.actions[0]).toMatchObject({ type: "pointerMove", x: 10, y: 20 });
+    expect(requests[2]?.body).toEqual({ value: ["h", "e", "l", "l", "o"] });
+    expect(requests[3]?.body).toEqual({ name: "home" });
+    retireOnReply = true;
+    await expect(h.coordinator.tap(started.instance, { x: 1, y: 1 }))
+      .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  } finally {
+    store.close();
+    server.closeAllConnections();
+    await new Promise<void>(done => server.close(() => done()));
+  }
 });
 
 it("invalidates old process readiness after SQLite reopen and fences an unknown driver effect", async () => {

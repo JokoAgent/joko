@@ -1,7 +1,7 @@
 import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
   WdaDriverManager, WdaLoopbackClient, type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
   type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
-  type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
+  type WdaPoint, type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
 import { SimulatorOwnershipError, SimulatorOwnershipRegistry,
@@ -14,7 +14,8 @@ const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
 
 export type SimulatorDriverErrorCode = "INVALID_ARGUMENT" | "MUTATION_CANCELLED" | "DRIVER_UNAVAILABLE" |
   "DEVICE_NOT_BOOTED" | "DRIVER_BUSY" | "DRIVER_CONFLICT" | "DRIVER_START_UNKNOWN" |
-  "DRIVER_STOP_UNKNOWN" | "DRIVER_RUNTIME_LOST" | "STALE_DRIVER" | "CLEANUP_REQUIRED";
+  "DRIVER_STOP_UNKNOWN" | "DRIVER_RUNTIME_LOST" | "STALE_DRIVER" | "INPUT_OUTCOME_UNKNOWN" |
+  "CLEANUP_REQUIRED";
 
 export class SimulatorDriverError extends Error {
   constructor(readonly code: SimulatorDriverErrorCode, message: string) { super(message); }
@@ -123,6 +124,24 @@ export class SimulatorDriverCoordinator {
     return viewport;
   }
 
+  tap(instance: PublicSimulatorInstance, target: WdaPoint, signal?: AbortSignal): Promise<void> {
+    return this.#input(instance, (client, sessionId) => client.tap(sessionId, target, signal));
+  }
+
+  swipe(instance: PublicSimulatorInstance, start: WdaPoint, end: WdaPoint, durationMs: number,
+    signal?: AbortSignal): Promise<void> {
+    return this.#input(instance, (client, sessionId) =>
+      client.swipe(sessionId, start, end, durationMs, signal));
+  }
+
+  typeText(instance: PublicSimulatorInstance, text: string, signal?: AbortSignal): Promise<void> {
+    return this.#input(instance, (client, sessionId) => client.typeText(sessionId, text, signal));
+  }
+
+  pressHome(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<void> {
+    return this.#input(instance, (client, sessionId) => client.home(sessionId, signal));
+  }
+
   diagnose(instance: PublicSimulatorInstance): { readonly state: "ready" | "stopped" | "error" | "unavailable";
     readonly reasonCode: string | null } {
     if (this.isReady(instance)) return { state: "ready", reasonCode: null };
@@ -163,6 +182,23 @@ export class SimulatorDriverCoordinator {
     this.#state.clear(instance.instanceId);
   }
 
+  async #input(instance: PublicSimulatorInstance,
+    perform: (client: WdaLoopbackClient, sessionId: string) => Promise<void>): Promise<void> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) {
+      throw new SimulatorDriverError("DRIVER_RUNTIME_LOST", "Simulator driver is not ready for input.");
+    }
+    const client = new WdaLoopbackClient({ controlPort: active.controlPort, cacheRoot: this.#cacheRoot,
+      instanceId: instance.instanceId, simulatorUdid: instance.simulatorUdid });
+    await perform(client, active.driverSessionId);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
+      throw new SimulatorDriverError("INPUT_OUTCOME_UNKNOWN",
+        "Simulator input completed while its driver route changed; observe before retrying.");
+    }
+  }
+
   async #execute(action: "start" | "stop", scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
     authority: SimulatorLifecycleEffectAuthority, signal?: AbortSignal): Promise<SimulatorDriverExecution> {
     if (!DIGEST.test(authority.effectIdentity) || !BODY_HASH.test(authority.requestBodyHash) ||
@@ -185,7 +221,8 @@ export class SimulatorDriverCoordinator {
       for (;;) {
         const page = this.#store.listOperations({ sessionId: scope.sessionId, status: "started", limit: 500, offset });
         const conflicting = page.find(operation =>
-          (operation.kind === KIND || operation.kind === "ios_simulator_lifecycle") && operation.id !== operationId);
+          (operation.kind === KIND || operation.kind === "ios_simulator_lifecycle" ||
+            operation.kind === "ios_simulator_input") && operation.id !== operationId);
         if (conflicting) throw new OperationInProgressError(conflicting.id);
         if (page.length < 500) break;
         offset += page.length;

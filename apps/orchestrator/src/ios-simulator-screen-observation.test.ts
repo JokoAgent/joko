@@ -102,6 +102,10 @@ it("returns a bounded timeout when a requested UI condition does not appear", as
       { kind: "element_exists", selector: { labelContains: "Absent" } },
       { timeoutMs: 100, pollIntervalMs: 100, stableForMs: 100 }))
       .rejects.toMatchObject({ code: "UI_WAIT_TIMEOUT" });
+    await expect(h.screen.observeAfter(SCOPE, route(h.instance), "stable",
+      { timeoutMs: 100, stableForMs: 100 })).resolves.toMatchObject({
+      mode: "stable", timedOut: true, stable: false, screenMap: { elements: expect.any(Array) }
+    });
   } finally { h.store.close(); }
 });
 

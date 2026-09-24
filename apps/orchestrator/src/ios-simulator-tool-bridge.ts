@@ -9,6 +9,8 @@ import { SimulatorCreateError, SimulatorLifecycleError, SimulatorResourceError }
 import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorObservationError, type SimulatorScreenObservationCoordinator,
   type SimulatorElementSelector, type SimulatorWaitCondition } from "./ios-simulator-screen-observation.js";
+import { SimulatorInputError, type SimulatorInputAction, type SimulatorInputCoordinator,
+  type SimulatorInputObserveOptions } from "./ios-simulator-input-coordinator.js";
 import { SimulatorScreenMapError, WdaClientError, type SimulatorScreenMap } from "@joko/tool-ios-simulator";
 
 export const IOS_SIMULATOR_TOOL_PROVIDER_ID = "joko_ios_simulator";
@@ -39,7 +41,14 @@ const OBSERVATION_TOOLS = Object.freeze([
   { name: "wait_for_ui", description: "Wait for a bounded Simulator accessibility condition and return a fresh map.", readOnly: true }
 ] as const);
 
-function bridgeTools(control: boolean, screen: boolean): readonly McpToolDescriptor[] {
+const INPUT_TOOLS = Object.freeze([
+  { name: "tap", description: "Tap an element in the current Simulator screen map or bounded device coordinates.", readOnly: false },
+  { name: "swipe", description: "Swipe between bounded device coordinates from the current Simulator screen map.", readOnly: false },
+  { name: "type_simulator_text", description: "Type bounded text into the focused control inside the Simulator.", readOnly: false },
+  { name: "press_home", description: "Press the simulated Home button from the current Simulator screen map.", readOnly: false }
+] as const);
+
+function bridgeTools(control: boolean, screen: boolean, input: boolean): readonly McpToolDescriptor[] {
   const tools: McpToolDescriptor[] = [{
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "list_tools",
@@ -56,13 +65,13 @@ function bridgeTools(control: boolean, screen: boolean): readonly McpToolDescrip
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: false
   }];
-  if (control || screen) tools.push({
+  if (control || screen || input) tools.push({
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "control_tool",
     description: "Call one validated task-local iOS Simulator control or screen observation with the current task's permission.",
     inputSchema: { type: "object", properties: {
       name: { type: "string", enum: [...(control ? CONTROL_TOOLS : []),
-        ...(screen ? OBSERVATION_TOOLS : [])].map(tool => tool.name) },
+        ...(screen ? OBSERVATION_TOOLS : []), ...(input ? INPUT_TOOLS : [])].map(tool => tool.name) },
       args: { type: "object", additionalProperties: true }
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: true
@@ -78,7 +87,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly configurablePolicy = Object.freeze({
     id: "joko-ios-simulator-tools-policy",
     displayName: "iOS Simulator tools",
-    description: "Inspect the local iOS Simulator environment, diagnosis and devices for this task.",
+    description: "Inspect and control task-owned local iOS Simulator instances with explicit permission.",
     productDefaultEnabled: true
   });
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
@@ -86,6 +95,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly #ownership: SimulatorOwnershipRegistry;
   readonly #control: SimulatorInstanceControlCoordinator | undefined;
   readonly #screen: SimulatorScreenObservationCoordinator | undefined;
+  readonly #input: SimulatorInputCoordinator | undefined;
   readonly #memoryProbe: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
 
   constructor(options: {
@@ -93,6 +103,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     readonly ownership: SimulatorOwnershipRegistry;
     readonly control?: SimulatorInstanceControlCoordinator;
     readonly screen?: SimulatorScreenObservationCoordinator;
+    readonly input?: SimulatorInputCoordinator;
     readonly runtime?: SimulatorEnvironmentRuntime;
     readonly memoryProbe?: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
   }) {
@@ -100,7 +111,9 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#ownership = options.ownership;
     this.#control = options.control;
     this.#screen = options.screen;
-    this.tools = bridgeTools(options.control !== undefined, options.screen !== undefined);
+    this.#input = options.input;
+    this.tools = bridgeTools(options.control !== undefined, options.screen !== undefined,
+      options.input !== undefined);
     this.#runtime = options.runtime ?? createSimulatorEnvironmentRuntime();
     this.#memoryProbe = options.memoryProbe ?? (signal => collectSimulatorMemorySnapshot({ signal }));
   }
@@ -120,7 +133,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         onlyKeys(arguments_, ["category"]);
         if (arguments_["category"] !== undefined && arguments_["category"] !== CATEGORY) throw new SimulatorToolError("INVALID_ARGUMENT", "Unknown Simulator tool category.");
         const tools = [...TOOLS, ...(this.#control ? CONTROL_TOOLS : []),
-          ...(this.#screen ? OBSERVATION_TOOLS : [])]
+          ...(this.#screen ? OBSERVATION_TOOLS : []), ...(this.#input ? INPUT_TOOLS : [])]
           .map(tool => ({ name: tool.name, category: CATEGORY, description: tool.description,
             readOnly: tool.readOnly, via: TOOLS.some(item => item.name === tool.name)
               ? "call_tool" : "control_tool" }));
@@ -128,14 +141,16 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
           ? { ok: true, category: CATEGORY, tools, workflow: "Call doctor or check_environment, then list_simulator_devices. Use exact UDIDs for later instance actions." }
           : { ok: true, categories: [{ name: CATEGORY, tool_count: tools.length }], hint: "Call list_tools with category ios_simulator to discover actions." }, false);
       }
-      if (name !== "call_tool" && (name !== "control_tool" || !this.#control && !this.#screen)) {
+      if (name !== "call_tool" &&
+          (name !== "control_tool" || !this.#control && !this.#screen && !this.#input)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator bridge tool is unavailable.");
       }
       onlyKeys(arguments_, ["name", "args"]);
       const selected = arguments_["name"];
       const args = arguments_["args"];
       const available = name === "call_tool" ? TOOLS : [
-        ...(this.#control ? CONTROL_TOOLS : []), ...(this.#screen ? OBSERVATION_TOOLS : []) ];
+        ...(this.#control ? CONTROL_TOOLS : []), ...(this.#screen ? OBSERVATION_TOOLS : []),
+        ...(this.#input ? INPUT_TOOLS : []) ];
       if (typeof selected !== "string" || !available.some(tool => tool.name === selected)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator tool is unavailable in this runtime.");
       }
@@ -143,6 +158,9 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       if (name === "control_tool") {
         if (OBSERVATION_TOOLS.some(tool => tool.name === selected)) {
           return await this.#callScreenObservation(selected, args, signal, context);
+        }
+        if (INPUT_TOOLS.some(tool => tool.name === selected)) {
+          return await this.#callInput(selected, args, signal, context);
         }
         return await this.#callInstanceControl(selected, args, signal, context);
       }
@@ -172,6 +190,12 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
             : { state: "unavailable", reasonCode: environment.ready
               ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
         );
+        const inputAvailability = this.#input === undefined ? {} : Object.fromEntries(
+          INPUT_TOOLS.map(tool => [tool.name, readyScreen
+            ? { state: "available", backend: "wda" }
+            : { state: "unavailable", reasonCode: environment.ready
+              ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
+        );
         const controlAvailability = this.#control === undefined ? {} : {
           create_instance: controlAvailable ? { state: "available", backend: "simctl" }
             : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
@@ -193,7 +217,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
               ? { state: "available", backend: "simctl" }
               : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
             list_instances: { state: "available", backend: "host" },
-            ...controlAvailability, ...screenAvailability
+            ...controlAvailability, ...screenAvailability, ...inputAvailability
           },
           instances, resources,
           instanceControl: controlAvailable ? { state: "available" }
@@ -214,7 +238,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         error instanceof SimulatorInstanceControlError || error instanceof SimulatorCreateError ||
         error instanceof SimulatorLifecycleError || error instanceof SimulatorResourceError ||
         error instanceof SimulatorDriverError || error instanceof SimulatorObservationError ||
-        error instanceof SimulatorScreenMapError || error instanceof WdaClientError;
+        error instanceof SimulatorInputError || error instanceof SimulatorScreenMapError ||
+        error instanceof WdaClientError;
       const code = known ? error.code : error instanceof OperationInProgressError
         ? "MUTATION_IN_PROGRESS" : signal?.aborted ? "PROBE_ABORTED" : "SIMULATOR_HOST_ERROR";
       const message = known ? error.message : error instanceof OperationInProgressError
@@ -300,6 +325,70 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     if (signal?.aborted) throw new SimulatorObservationError("OBSERVATION_CANCELLED", "Simulator observation was cancelled.");
     this.#requireScope(context);
     return response({ ok: true, data: data as Readonly<Record<string, unknown>> }, false);
+  }
+
+  async #callInput(name: string, args: Record<string, unknown>, signal: AbortSignal | undefined,
+    context: BridgeToolCallContext): Promise<McpCallResult> {
+    if (!this.#input) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator input is unavailable.");
+    const authority = { effectIdentity: context.effectIdentity, requestBodyHash: context.requestBodyHash,
+      providerGeneration: context.providerGeneration };
+    if (!DIGEST.test(authority.effectIdentity ?? "") || !BODY_HASH.test(authority.requestBodyHash ?? "") ||
+        !Number.isSafeInteger(authority.providerGeneration) || (authority.providerGeneration ?? 0) < 1) {
+      throw new SimulatorToolError("STALE_SCOPE", "Simulator mutation authority is unavailable.");
+    }
+    const route = requiredRoute(args);
+    const snapshotId = requiredSnapshotId(args["snapshotId"]);
+    const observe = requiredObserveOptions(args);
+    let action: SimulatorInputAction;
+    if (name === "tap") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "elementId", "x", "y",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      const elementId = args["elementId"];
+      const hasCoordinates = args["x"] !== undefined || args["y"] !== undefined;
+      if (elementId !== undefined) {
+        if (!boundedText(elementId, 128) || hasCoordinates) {
+          throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator tap target is invalid.");
+        }
+        action = { type: "tap", snapshotId, target: { elementId } };
+      } else {
+        action = { type: "tap", snapshotId, target: {
+          x: requiredCoordinate(args["x"]), y: requiredCoordinate(args["y"])
+        } };
+      }
+    } else if (name === "swipe") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "startX", "startY",
+        "endX", "endY", "durationMs", "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      action = { type: "swipe", snapshotId,
+        start: { x: requiredCoordinate(args["startX"]), y: requiredCoordinate(args["startY"]) },
+        end: { x: requiredCoordinate(args["endX"]), y: requiredCoordinate(args["endY"]) },
+        durationMs: optionalInteger(args["durationMs"], 50, 60_000, 300) };
+    } else if (name === "type_simulator_text") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "text",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      if (typeof args["text"] !== "string" || args["text"].length > 10_000) {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator text input exceeds its limit.");
+      }
+      action = { type: "type_text", snapshotId, text: args["text"] };
+    } else if (name === "press_home") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      action = { type: "press_home", snapshotId };
+    } else {
+      throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator input is unavailable.");
+    }
+    const environment = await this.#runtime.inspect(signal);
+    signal?.throwIfAborted();
+    this.#requireScope(context);
+    if (!environment.ready) return response({ ok: false, errorCode: environment.issue,
+      message: environment.error, data: { environment } }, true);
+    const result = await this.#input.execute(context, route, action, observe, {
+      effectIdentity: authority.effectIdentity!, requestBodyHash: authority.requestBodyHash!,
+      providerGeneration: authority.providerGeneration!
+    }, signal);
+    this.#requireScope(context);
+    return response({ ok: true, data: { ...result.receipt, replayed: result.replayed,
+      screenMapInvalidated: result.observation === null,
+      observation: result.observation, observationError: result.observationError } }, false);
   }
 
   async #diagnoseResources(environment: SimulatorEnvironmentReport, signal: AbortSignal | undefined,
@@ -388,6 +477,30 @@ function optionalInteger(value: unknown, min: number, max: number, fallback: num
     throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator observation bound is invalid.");
   }
   return value;
+}
+
+function requiredCoordinate(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1_000_000) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator input coordinate is invalid.");
+  }
+  return value;
+}
+
+function requiredSnapshotId(value: unknown): string {
+  if (typeof value !== "string" || !UUID.test(value)) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator screen snapshot identity is invalid.");
+  }
+  return value;
+}
+
+function requiredObserveOptions(value: Readonly<Record<string, unknown>>): SimulatorInputObserveOptions {
+  const mode = value["observeAfter"] ?? "none";
+  if (mode !== "none" && mode !== "immediate" && mode !== "stable") {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator post-input observation mode is invalid.");
+  }
+  return { mode,
+    timeoutMs: optionalInteger(value["observeTimeoutMs"], 100, 15_000, 3_000),
+    stableForMs: optionalInteger(value["stableForMs"], 100, 2_000, 300) };
 }
 
 function boundedText(value: unknown, max: number): value is string {

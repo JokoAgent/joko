@@ -150,6 +150,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
   let wdaPort = 0;
   let ownerFingerprint = "";
   let screenLabel = "Continue";
+  const inputs: Array<{ url: string; body: unknown; claimed: boolean }> = [];
   let active: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -182,6 +183,21 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ value }));
     };
+    if (request.method === "POST" && request.url && [
+      "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
+      "/session/SESSION-1/wda/pressButton"
+    ].includes(request.url)) {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const claimed = application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+          .some(operation => operation.kind === "ios_simulator_input");
+        inputs.push({ url: request.url!, body: JSON.parse(Buffer.concat(chunks).toString("utf8")), claimed });
+        screenLabel = `Input ${inputs.length}`;
+        send(null);
+      });
+      return;
+    }
     if (request.method !== "GET") { response.writeHead(405); response.end(); return; }
     if (request.url === "/status") send({ ready: true, build: { upgradedAt: ownerFingerprint } });
     else if (request.url === "/session/SESSION-1/source?format=json") send({
@@ -220,7 +236,11 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
         data?: { instance?: { instanceId: string; generation: number; lease: { id: string };
           viewerState: string; graceExpiresAt: number | null };
           drivers?: { state: string; instances: readonly { state: string }[] };
-          screenMap?: Record<string, unknown> & { snapshotId: string };
+          screenMap?: Record<string, unknown> & { snapshotId: string;
+            elements?: readonly { elementId: string; label: string }[] };
+          observation?: { mode: string; screenMap: Record<string, unknown> & {
+            snapshotId: string; elements: readonly { elementId: string; label: string }[] } } | null;
+          action?: string; backend?: string; screenMapInvalidated?: boolean;
           viewport?: { width: number; height: number; orientation: string };
           audit?: { violationCount: number }; diff?: { baselineSnapshotId: string;
             added: readonly unknown[]; removed: readonly unknown[] };
@@ -237,7 +257,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(doctor.details.mcpStructuredContent.data?.drivers).toMatchObject({ state: "available",
       instances: [{ state: "ready" }] });
     expect(doctor.details.mcpStructuredContent.data).toMatchObject({ availability: {
-      get_screen_map: { state: "available" }, wait_for_ui: { state: "available" }
+      get_screen_map: { state: "available" }, wait_for_ui: { state: "available" },
+      tap: { state: "available", backend: "wda" }, press_home: { state: "available" }
     } });
     const route = { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
     const mapped = await call("control_tool", "get_screen_map", route);
@@ -258,9 +279,10 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       diff: { baselineSnapshotId: baseline.snapshotId, added: [expect.any(Object)],
         removed: [expect.any(Object)] }
     } } } });
-    expect(await call("control_tool", "wait_for_ui", { ...route,
+    const waited = await call("control_tool", "wait_for_ui", { ...route,
       condition: { kind: "element_exists", selector: { labelContains: "Next" } },
-      timeoutMs: 1_000, pollIntervalMs: 100, stableForMs: 100 })).toMatchObject({
+      timeoutMs: 1_000, pollIntervalMs: 100, stableForMs: 100 });
+    expect(waited).toMatchObject({
       isError: false, details: { mcpStructuredContent: { data: { timedOut: false,
         screenMap: { elements: [{ label: "Next" }] } } } }
     });
@@ -268,6 +290,46 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       condition: { kind: "element_exists", selector: {} } })).toMatchObject({
       isError: true, details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } }
     });
+    const current = waited.details.mcpStructuredContent.data!.screenMap!;
+    const elementId = current.elements![0]!.elementId;
+    const tapped = await call("control_tool", "tap", { ...route,
+      snapshotId: current.snapshotId, elementId, observeAfter: "stable",
+      observeTimeoutMs: 1_000, stableForMs: 100 });
+    expect(tapped).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "tap", backend: "wda", screenMapInvalidated: false,
+      observation: { mode: "stable", timedOut: false,
+        screenMap: { elements: [{ label: "Input 1" }] } }
+    } } } });
+    const afterTap = tapped.details.mcpStructuredContent.data!.observation!.screenMap;
+    const swiped = await call("control_tool", "swipe", { ...route,
+      snapshotId: afterTap.snapshotId, startX: 20, startY: 200, endX: 20, endY: 50,
+      durationMs: 300, observeAfter: "immediate" });
+    expect(swiped).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "swipe", observation: { screenMap: { elements: [{ label: "Input 2" }] } }
+    } } } });
+    const afterSwipe = swiped.details.mcpStructuredContent.data!.observation!.screenMap;
+    const secret = "ephemeral simulator text";
+    const typed = await call("control_tool", "type_simulator_text", { ...route,
+      snapshotId: afterSwipe.snapshotId, text: secret, observeAfter: "immediate" });
+    expect(typed).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      action: "type_text", observation: { screenMap: { elements: [{ label: "Input 3" }] } }
+    } } } });
+    const afterType = typed.details.mcpStructuredContent.data!.observation!.screenMap;
+    expect(await call("control_tool", "press_home", { ...route,
+      snapshotId: afterType.snapshotId })).toMatchObject({ isError: false,
+      details: { mcpStructuredContent: { data: { action: "press_home",
+        screenMapInvalidated: true, observation: null } } } });
+    expect(inputs.map(item => item.url)).toEqual([
+      "/session/SESSION-1/actions", "/session/SESSION-1/actions",
+      "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton"
+    ]);
+    expect(inputs.every(item => item.claimed)).toBe(true);
+    const inputOperations = application.store.listOperations({ sessionId: "simulator-task" })
+      .filter(operation => operation.kind === "ios_simulator_input")
+      .map(operation => ({ body: operation.body,
+        response: "response" in operation ? operation.response : null }));
+    expect(inputOperations).toHaveLength(4);
+    expect(JSON.stringify(inputOperations)).not.toContain(secret);
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
       generation: instance.generation, leaseId: instance.lease.id });
     expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {

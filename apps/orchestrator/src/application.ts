@@ -126,6 +126,7 @@ import { SimulatorLifecycleCoordinator } from "./ios-simulator-lifecycle-coordin
 import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
+import { SimulatorInputCoordinator } from "./ios-simulator-input-coordinator.js";
 import type { SimulatorCreateRuntime, SimulatorEnvironmentRuntime, SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
@@ -843,9 +844,11 @@ export async function createOrchestratorApplication(
     });
   const simulatorScreen = simulatorDriver === undefined ? undefined
     : new SimulatorScreenObservationCoordinator(simulatorOwnership, simulatorDriver);
+  const simulatorInput = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
+    : new SimulatorInputCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen);
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
     new IosSimulatorToolBridgeProvider({ store, ownership: simulatorOwnership, control: simulatorControl,
-      screen: simulatorScreen,
+      screen: simulatorScreen, input: simulatorInput,
       runtime: dependencies.simulatorRuntime?.environment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
