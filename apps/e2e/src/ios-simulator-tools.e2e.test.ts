@@ -485,6 +485,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
   let screenLabel = "Continue";
   let orientation: "PORTRAIT" | "LANDSCAPE" = "PORTRAIT";
   const inputs: Array<{ url: string; body: unknown; claimed: boolean }> = [];
+  const nativeTouches: Array<{ fingers: number; claimed: boolean }> = [];
+  let nativeReady = true;
   const stateChanges: Array<{ action: string; value: unknown; claimed: boolean }> = [];
   let active: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
@@ -558,6 +560,17 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
             .some(operation => operation.kind === "ios_simulator_state_control") });
       } },
     driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
+      nativeHidRuntime: {
+        probe: async identity => nativeReady && identity.simulatorUdid === udid,
+        touch: async (identity, first, second) => {
+          expect(identity.simulatorUdid).toBe(udid);
+          expect(first[0]).toMatchObject({ phase: "down", edge: "none" });
+          const claimed = application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_input");
+          nativeTouches.push({ fingers: second ? 2 : 1, claimed });
+          screenLabel = `Native ${nativeTouches.length}`;
+        }
+      },
       manager: { get: () => active,
         retryOwnedCleanup: async () => { events.push("retry-cleanup"); },
         start: async options => { events.push("driver-start");
@@ -689,6 +702,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(doctor.details.mcpStructuredContent.data).toMatchObject({ availability: {
       get_screen_map: { state: "available" }, wait_for_ui: { state: "available" },
       tap: { state: "available", backend: "wda" }, press_home: { state: "available" },
+      touch_path: { state: "available", backend: "native-hid" },
+      touch2_path: { state: "available", backend: "native-hid" },
       set_orientation: { state: "available", backend: "wda" },
       set_appearance: { state: "available", backend: "simctl" },
       set_location: { state: "available", backend: "simctl" },
@@ -719,6 +734,37 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       } }
     } } } });
     expect(JSON.stringify(stateReadback)).not.toContain("Continue");
+    expect(await call("control_tool", "touch_path", { ...route,
+      snapshotId: state.details.mcpStructuredContent.data!.screenMap!.snapshotId,
+      points: [{ phase: "down", x: 10, y: 10 },
+        { phase: "move", x: 20, y: 20, dtMs: 16 }, { phase: "up", x: 30, y: 30, dtMs: 16 }],
+      edge: "none", observeAfter: "immediate" })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { action: "touch_path", backend: "native-hid",
+          observation: { screenMap: { elements: [{ label: "Native 1" }] } } } } } });
+    const nativeMap = await call("control_tool", "get_screen_map", route);
+    expect(await call("control_tool", "touch2_path", { ...route,
+      snapshotId: nativeMap.details.mcpStructuredContent.data!.screenMap!.snapshotId,
+      first: [{ phase: "down", x: 10, y: 10 },
+        { phase: "move", x: 20, y: 20, dtMs: 16 }, { phase: "up", x: 30, y: 30, dtMs: 16 }],
+      second: [{ phase: "down", x: 50, y: 50 },
+        { phase: "move", x: 60, y: 60, dtMs: 16 }, { phase: "up", x: 70, y: 70, dtMs: 16 }] }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        action: "touch2_path", backend: "native-hid" } } } });
+    expect(nativeTouches).toEqual([{ fingers: 1, claimed: true }, { fingers: 2, claimed: true }]);
+    nativeReady = false;
+    expect(await call("call_tool", "doctor", {})).toMatchObject({ isError: false,
+      details: { mcpStructuredContent: { data: { availability: {
+        touch_path: { state: "unavailable", reasonCode: "NATIVE_INPUT_UNAVAILABLE" },
+        tap: { state: "available", backend: "wda" }
+      } } } } });
+    const unavailableMap = await call("control_tool", "get_screen_map", route);
+    expect(await call("control_tool", "touch_path", { ...route,
+      snapshotId: unavailableMap.details.mcpStructuredContent.data!.screenMap!.snapshotId,
+      points: [{ phase: "down", x: 10, y: 10 }, { phase: "up", x: 20, y: 20 }] }))
+      .toMatchObject({ isError: true, details: { mcpStructuredContent: {
+        errorCode: "NATIVE_INPUT_UNAVAILABLE" } } });
+    expect(nativeTouches).toHaveLength(2);
+    nativeReady = true;
     expect(await call("call_tool", "get_diagnostics", { diagnosticsId: randomUUID() }))
       .toMatchObject({ isError: true, details: { mcpStructuredContent: {
         errorCode: "INVALID_ARGUMENT" } } });
@@ -937,7 +983,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       .filter(operation => operation.kind === "ios_simulator_input")
       .map(operation => ({ body: operation.body,
         response: "response" in operation ? operation.response : null }));
-    expect(inputOperations).toHaveLength(8);
+    expect(inputOperations).toHaveLength(11);
     expect(JSON.stringify(inputOperations)).not.toContain(secret);
     expect(JSON.stringify(inputOperations)).not.toContain(batchSecret);
     const stateOperations = application.store.listOperations({ sessionId: "simulator-task" })

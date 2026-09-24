@@ -75,6 +75,14 @@
       ]
     },
     {
+      "from": "dist/native-simulator-hid",
+      "to": "native-simulator-hid",
+      "filter": [
+        "manifest.json",
+        "joko-simulator-hid"
+      ]
+    },
+    {
       "from": "dist/orchestrator-runtime",
       "to": "orchestrator-runtime",
       "filter": [

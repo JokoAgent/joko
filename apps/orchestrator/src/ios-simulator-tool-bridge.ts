@@ -2,6 +2,7 @@ import { assessSimulatorResourceAdmission, collectSimulatorMemorySnapshot, creat
   serializeSimulatorPushPayload,
   type SimulatorEnvironmentReport, type SimulatorEnvironmentRuntime, type SimulatorMemorySnapshot,
   type SimulatorStatusBarOverrides } from "@joko/tool-ios-simulator";
+import type { SimulatorTouchEdge } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolCallResult, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import { SimulatorOwnershipError, type SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
@@ -113,6 +114,8 @@ const INPUT_TOOLS = Object.freeze([
   { name: "long_press", description: "Long-press an element in the current Simulator screen map.", readOnly: false },
   { name: "press_simulator_key", description: "Send one supported WebDriver key to the focused Simulator control.", readOnly: false },
   { name: "batch", description: "Run up to 16 fenced Simulator UI actions and return a final observation.", readOnly: false },
+  { name: "touch_path", description: "Perform one bounded continuous native touch path on the current Simulator screen.", readOnly: false },
+  { name: "touch2_path", description: "Perform two synchronized bounded native touch paths on the current Simulator screen.", readOnly: false },
   { name: "type_simulator_text", description: "Type bounded text into the focused control inside the Simulator.", readOnly: false },
   { name: "press_home", description: "Press the simulated Home button from the current Simulator screen map.", readOnly: false }
 ] as const);
@@ -362,6 +365,10 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         const instanceAvailable = controlAvailable && instances.length > 0;
         const readyScreen = this.#screen !== undefined && environment.ready &&
           this.#control?.diagnoseDrivers(instances).some(driver => driver.state === "ready") === true;
+        const nativeInputReady = readyScreen && this.#input !== undefined &&
+          await this.#input.nativeInputAvailable(instances, signal);
+        signal?.throwIfAborted();
+        this.#requireScope(context);
         const screenAvailability = this.#screen === undefined ? {} : Object.fromEntries(
           OBSERVATION_TOOLS.map(tool => [tool.name, readyScreen
             ? { state: "available", backend: "wda" }
@@ -375,10 +382,15 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
           get_diagnostics: { state: "available", backend: "host" }
         };
         const inputAvailability = this.#input === undefined ? {} : Object.fromEntries(
-          INPUT_TOOLS.map(tool => [tool.name, readyScreen
-            ? { state: "available", backend: "wda" }
-            : { state: "unavailable", reasonCode: environment.ready
-              ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
+          INPUT_TOOLS.map(tool => [tool.name,
+            tool.name === "touch_path" || tool.name === "touch2_path"
+              ? nativeInputReady ? { state: "available", backend: "native-hid" }
+                : { state: "unavailable", reasonCode: readyScreen
+                  ? "NATIVE_INPUT_UNAVAILABLE" : environment.ready
+                    ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }
+              : readyScreen ? { state: "available", backend: "wda" }
+                : { state: "unavailable", reasonCode: environment.ready
+                  ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
         );
         const stateAvailability = this.#stateControl === undefined ? {} : Object.fromEntries(
           STATE_TOOLS.map(tool => [tool.name, readyScreen
@@ -645,6 +657,18 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator batch requires a final observation.");
       }
       action = { type: "batch", snapshotId, actions: requiredBatchActions(args["actions"]) };
+    } else if (name === "touch_path") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "points", "edge",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      const edge = args["edge"] ?? "none";
+      if (edge !== "none" && edge !== "left" && edge !== "top" && edge !== "bottom" && edge !== "right") {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator touch edge is invalid.");
+      }
+      action = { type: "touch_path", snapshotId, points: args["points"], edge: edge as SimulatorTouchEdge };
+    } else if (name === "touch2_path") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "first", "second",
+        "observeAfter", "observeTimeoutMs", "stableForMs"]);
+      action = { type: "touch2_path", snapshotId, first: args["first"], second: args["second"] };
     } else if (name === "type_simulator_text") {
       onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId", "text",
         "observeAfter", "observeTimeoutMs", "stableForMs"]);

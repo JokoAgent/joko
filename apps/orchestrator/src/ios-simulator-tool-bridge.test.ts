@@ -386,7 +386,8 @@ it("publishes bounded Simulator input only through permission authority and stri
   let ready = true;
   let archived = false;
   const calls: Array<{ action: unknown; observe: unknown; authority: unknown }> = [];
-  const input = { execute: async (_scope: unknown, route: { instanceId: string; generation: number },
+  const input = { nativeInputAvailable: async () => false,
+    execute: async (_scope: unknown, route: { instanceId: string; generation: number },
     action: { type: "tap" | "swipe" | "type_text" | "press_home" }, observe: unknown,
     authority: unknown) => {
     calls.push({ action, observe, authority });
@@ -427,6 +428,8 @@ it("publishes bounded Simulator input only through permission authority and stri
     expect.objectContaining({ name: "long_press", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "press_simulator_key", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "batch", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "touch_path", readOnly: false, via: "control_tool" }),
+    expect.objectContaining({ name: "touch2_path", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "type_simulator_text", readOnly: false, via: "control_tool" }),
     expect.objectContaining({ name: "press_home", readOnly: false, via: "control_tool" })
   ]) });
@@ -459,6 +462,10 @@ it("publishes bounded Simulator input only through permission authority and stri
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("batch", { ...route, actions: [], observeAfter: "none" }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("touch_path", { ...route, points: [], edge: "corner" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("touch2_path", { ...route, first: [], second: [], edge: "left" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(calls).toHaveLength(8);
   expect(calls[0]).toMatchObject({ action: { type: "tap", target: { elementId: "element" } },
     observe: { mode: "none", timeoutMs: 3_000, stableForMs: 300 },
@@ -474,7 +481,8 @@ it("publishes bounded Simulator input only through permission authority and stri
   ] }, observe: { mode: "stable" } });
   expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
     .structuredContent).toMatchObject({ data: { availability: {
-      tap: { state: "available", backend: "wda" }, press_home: { state: "available" }
+      tap: { state: "available", backend: "wda" }, press_home: { state: "available" },
+      touch_path: { state: "unavailable", reasonCode: "NATIVE_INPUT_UNAVAILABLE" }
     } } });
   ready = false;
   expect(await invoke("press_home", route)).toMatchObject({ errorCode: "XCODE_NOT_FOUND" });

@@ -9,12 +9,13 @@
     "package.json"
   ],
   "scripts": {
-    "build": "pnpm build:native-voice-shortcut && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/voice-overlay-preload.cjs && node scripts/stage-web.mjs",
+    "build": "pnpm build:native-voice-shortcut && pnpm build:native-simulator-hid && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/voice-overlay-preload.cjs && node scripts/stage-web.mjs",
     "build:native-voice-shortcut": "node scripts/build-native-voice-shortcut.mjs",
+    "build:native-simulator-hid": "node scripts/build-native-simulator-hid.mjs",
     "build:runtime-stager": "tsc -b tsconfig.json --force",
     "stage:orchestrator-runtime": "node scripts/stage-orchestrator-runtime.mjs",
-    "package:dir": "node scripts/ensure-wda-source-archive.mjs && electron-builder --config electron-builder.json --dir --publish never",
-    "package:artifacts": "node scripts/ensure-wda-source-archive.mjs && electron-builder --config electron-builder.json --publish never",
+    "package:dir": "node scripts/ensure-wda-source-archive.mjs && node scripts/build-native-simulator-hid.mjs && electron-builder --config electron-builder.json --dir --publish never",
+    "package:artifacts": "node scripts/ensure-wda-source-archive.mjs && node scripts/build-native-simulator-hid.mjs && electron-builder --config electron-builder.json --publish never",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:electron-host": "node scripts/smoke-packaged.mjs",

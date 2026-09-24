@@ -3,7 +3,8 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OperationalStore } from "@joko/store";
-import { createWdaOwnerFingerprint, WDA_SOURCE_PIN, type WdaRunningDriver } from "@joko/tool-ios-simulator";
+import { createWdaOwnerFingerprint, WDA_SOURCE_PIN, type SimulatorNativeHidRuntime,
+  type WdaRunningDriver } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
@@ -49,11 +50,13 @@ function running(instanceId: string, controlPort = 18100): WdaRunningDriver {
 
 function harness(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
   input: { readonly onStart?: () => Promise<void>; readonly onInspect?: () => void;
-    readonly environmentReady?: boolean; readonly controlPort?: number } = {}) {
+    readonly environmentReady?: boolean; readonly controlPort?: number;
+    readonly nativeHidRuntime?: SimulatorNativeHidRuntime } = {}) {
   let active: WdaRunningDriver | null = null;
   const effects: string[] = [];
   const options: SimulatorDriverCoordinatorOptions = { archivePath: "/private/joko/wda.tar.gz",
     cacheRoot: "/private/joko/driver-cache", architecture: "arm64",
+    nativeHidRuntime: input.nativeHidRuntime,
     environment: { inspect: async () => { input.onInspect?.();
       return { ...ENVIRONMENT, ready: input.environmentReady ?? true }; } },
     lifecycle: { findExact: async () => DEVICE, bootExact: async () => DEVICE,
@@ -70,6 +73,39 @@ function harness(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
   return { coordinator: new SimulatorDriverCoordinator(store, ownership, options), effects,
     get active() { return active; }, loseActive: () => { active = null; } };
 }
+
+it("fences native HID dispatch to the exact ready driver lease", async () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    const ownership = new SimulatorOwnershipRegistry(store);
+    const initial = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const calls: string[] = [];
+    let retire = false;
+    let loseActive = (): void => undefined;
+    const h = harness(store, ownership, { nativeHidRuntime: {
+      probe: async identity => { calls.push(`probe:${identity.simulatorUdid}:${identity.generation}`);
+        return true; },
+      touch: async (identity, first, second) => {
+        calls.push(`touch:${identity.simulatorUdid}:${identity.generation}:${first.length}:${second?.length ?? 0}`);
+        if (retire) loseActive();
+      }
+    } });
+    loseActive = h.loseActive;
+    const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    const samples = [{ phase: "down" as const, x: 0.1, y: 0.1, dtMs: 0, edge: "none" as const },
+      { phase: "up" as const, x: 0.2, y: 0.2, dtMs: 16, edge: "none" as const }];
+    await expect(h.coordinator.probeNativeInput(started.instance)).resolves.toBe(true);
+    await expect(h.coordinator.touchNativePath(started.instance, samples, samples)).resolves.toBeUndefined();
+    retire = true;
+    await expect(h.coordinator.touchNativePath(started.instance, samples))
+      .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    await expect(h.coordinator.probeNativeInput(started.instance)).resolves.toBe(false);
+    expect(calls).toEqual([`probe:${UDID}:${started.instance.generation}`,
+      `touch:${UDID}:${started.instance.generation}:2:2`,
+      `touch:${UDID}:${started.instance.generation}:2:0`]);
+  } finally { store.close(); }
+});
 
 it("claims before cleanup and launch, commits ready with a new route, then stops and prevents stale replay", async () => {
   const store = new OperationalStore(":memory:");

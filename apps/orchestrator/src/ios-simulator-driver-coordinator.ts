@@ -1,5 +1,7 @@
 import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
-  WdaDriverManager, WdaLoopbackClient, type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
+  MacSimulatorNativeHidRuntime, WdaDriverManager, WdaLoopbackClient,
+  type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
+  type SimulatorNativeHidRuntime, type SimulatorNormalizedTouchSample,
   type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
   type WdaDriverHealth, type WdaPoint, type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
@@ -15,7 +17,7 @@ const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
 export type SimulatorDriverErrorCode = "INVALID_ARGUMENT" | "MUTATION_CANCELLED" | "DRIVER_UNAVAILABLE" |
   "DEVICE_NOT_BOOTED" | "DRIVER_BUSY" | "DRIVER_CONFLICT" | "DRIVER_START_UNKNOWN" |
   "DRIVER_STOP_UNKNOWN" | "DRIVER_RUNTIME_LOST" | "STALE_DRIVER" | "INPUT_OUTCOME_UNKNOWN" |
-  "CLEANUP_REQUIRED";
+  "CLEANUP_REQUIRED" | "NATIVE_INPUT_UNAVAILABLE";
 
 export class SimulatorDriverError extends Error {
   constructor(readonly code: SimulatorDriverErrorCode, message: string) { super(message); }
@@ -34,6 +36,8 @@ export interface SimulatorDriverCoordinatorOptions {
   readonly cleanupOrphans?: (input: WdaOrphanCleanupInput) => Promise<void>;
   readonly architecture?: "arm64" | "x86_64";
   readonly state?: SimulatorDriverStateRegistry;
+  readonly nativeHidPath?: string;
+  readonly nativeHidRuntime?: SimulatorNativeHidRuntime;
 }
 
 function buildVersion(value: string | null): string | null {
@@ -59,6 +63,7 @@ export class SimulatorDriverCoordinator {
   readonly #cleanup: (input: WdaOrphanCleanupInput) => Promise<void>;
   readonly #cacheRoot: string;
   readonly #architecture: "arm64" | "x86_64";
+  readonly #nativeHid: SimulatorNativeHidRuntime | undefined;
 
   constructor(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
     options: SimulatorDriverCoordinatorOptions) {
@@ -72,6 +77,8 @@ export class SimulatorDriverCoordinator {
     this.#cleanup = options.cleanupOrphans ?? cleanupWdaOrphanProcesses;
     this.#cacheRoot = options.cacheRoot;
     this.#architecture = architecture(options.architecture);
+    this.#nativeHid = options.nativeHidRuntime ?? (options.nativeHidPath === undefined
+      ? undefined : new MacSimulatorNativeHidRuntime({ helperPath: options.nativeHidPath }));
   }
 
   start(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
@@ -104,6 +111,39 @@ export class SimulatorDriverCoordinator {
       throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during observation.");
     }
     return health;
+  }
+
+  async probeNativeInput(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<boolean> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) return false;
+    const available = await this.#nativeHid?.probe({ simulatorUdid: instance.simulatorUdid,
+      generation: instance.generation }, signal) ?? false;
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
+      throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during native input probe.");
+    }
+    return available;
+  }
+
+  async touchNativePath(instance: PublicSimulatorInstance,
+    first: readonly SimulatorNormalizedTouchSample[],
+    second?: readonly SimulatorNormalizedTouchSample[], signal?: AbortSignal): Promise<void> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) {
+      throw new SimulatorDriverError("DRIVER_RUNTIME_LOST", "Simulator driver is not ready for native input.");
+    }
+    if (!this.#nativeHid) {
+      throw new SimulatorDriverError("NATIVE_INPUT_UNAVAILABLE", "Simulator native touch is unavailable.");
+    }
+    await this.#nativeHid.touch({ simulatorUdid: instance.simulatorUdid,
+      generation: instance.generation }, first, second, signal);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
+      throw new SimulatorDriverError("INPUT_OUTCOME_UNKNOWN",
+        "Simulator native input completed while its driver route changed; observe before retrying.");
+    }
   }
 
   async observeAccessibilityTree(instance: PublicSimulatorInstance,

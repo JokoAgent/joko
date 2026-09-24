@@ -472,7 +472,8 @@ export interface OrchestratorApplicationDependencies {
     readonly environment?: SimulatorEnvironmentRuntime;
     readonly lifecycle?: SimulatorLifecycleRuntime;
     readonly create?: SimulatorCreateRuntime;
-    readonly driver?: Pick<SimulatorDriverCoordinatorOptions, "manager" | "cleanupOrphans" | "architecture">;
+    readonly driver?: Pick<SimulatorDriverCoordinatorOptions,
+      "manager" | "cleanupOrphans" | "architecture" | "nativeHidRuntime">;
     readonly projectBuilder?: Pick<SimulatorProjectBuilder, "inspect" | "build" | "readXcresult">;
     readonly inspectAppArtifact?: typeof inspectSimulatorAppArtifact;
   };

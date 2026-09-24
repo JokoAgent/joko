@@ -1,5 +1,5 @@
 import { OperationalStore } from "@joko/store";
-import { WdaClientError, type WdaPoint } from "@joko/tool-ios-simulator";
+import { SimulatorNativeHidError, WdaClientError, type WdaPoint } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorInputCoordinator, type SimulatorInputAction } from "./ios-simulator-input-coordinator.js";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance } from "./ios-simulator-ownership.js";
@@ -41,6 +41,10 @@ function fixture() {
   const calls: Array<{ type: string; value?: unknown }> = [];
   let tap = async (target: WdaPoint): Promise<void> => { calls.push({ type: "tap", value: target }); };
   let typeText = async (text: string): Promise<void> => { calls.push({ type: "type_text", value: text }); };
+  let nativeReady = false;
+  let nativeTouch = async (first: readonly unknown[], second: readonly unknown[] | undefined): Promise<void> => {
+    calls.push({ type: "native_touch", value: { first, second } });
+  };
   const driver = {
     isReady: () => ready,
     observeAccessibilityTree: async () => ({ capturedAt: new Date().toISOString(), tree }),
@@ -49,7 +53,10 @@ function fixture() {
     swipe: async (_instance: PublicSimulatorInstance, start: WdaPoint, end: WdaPoint,
       durationMs: number) => { calls.push({ type: "swipe", value: { start, end, durationMs } }); },
     typeText: (_instance: PublicSimulatorInstance, text: string) => typeText(text),
-    pressHome: async () => { calls.push({ type: "press_home" }); }
+    pressHome: async () => { calls.push({ type: "press_home" }); },
+    probeNativeInput: async () => nativeReady,
+    touchNativePath: (_instance: PublicSimulatorInstance, first: readonly unknown[],
+      second?: readonly unknown[]) => nativeTouch(first, second)
   };
   const screen = new SimulatorScreenObservationCoordinator(ownership, driver);
   const input = new SimulatorInputCoordinator(store, ownership, driver, screen, { now: () => 1_000 });
@@ -57,7 +64,9 @@ function fixture() {
     setTree: (value: unknown) => { tree = value; },
     setReady: (value: boolean) => { ready = value; },
     setTap: (value: typeof tap) => { tap = value; },
-    setTypeText: (value: typeof typeText) => { typeText = value; } };
+    setTypeText: (value: typeof typeText) => { typeText = value; },
+    setNativeReady: (value: boolean) => { nativeReady = value; },
+    setNativeTouch: (value: typeof nativeTouch) => { nativeTouch = value; } };
 }
 
 const OBSERVE_NONE = { mode: "none", timeoutMs: 3_000, stableForMs: 300 } as const;
@@ -215,5 +224,71 @@ it("stops a partially completed batch and fences the whole effect from replay", 
       { mode: "stable", timeoutMs: 1_000, stableForMs: 100 }, authority("5")))
       .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
     expect(h.calls).toHaveLength(2);
+  } finally { h.store.close(); }
+});
+
+it("requires native admission and dispatches bounded continuous and synchronized paths", async () => {
+  const h = fixture();
+  const first = [{ phase: "down", x: 10, y: 20 },
+    { phase: "move", x: 20, y: 30, dtMs: 16 }, { phase: "up", x: 30, y: 40, dtMs: 16 }];
+  const second = [{ phase: "down", x: 100, y: 200 },
+    { phase: "move", x: 120, y: 230, dtMs: 16 }, { phase: "up", x: 130, y: 240, dtMs: 16 }];
+  try {
+    const initial = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    expect(await h.input.nativeInputAvailable([h.instance])).toBe(false);
+    await expect(h.input.execute(SCOPE, route(h.instance),
+      { type: "touch_path", snapshotId: initial.snapshotId, points: first, edge: "none" },
+      OBSERVE_NONE, authority("6"))).rejects.toMatchObject({ code: "NATIVE_INPUT_UNAVAILABLE" });
+    expect(h.calls).toEqual([]);
+    h.setNativeReady(true);
+    expect(await h.input.nativeInputAvailable([h.instance])).toBe(true);
+    const refreshed = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    const single = await h.input.execute(SCOPE, route(h.instance),
+      { type: "touch_path", snapshotId: refreshed.snapshotId, points: first, edge: "left" },
+      { mode: "immediate", timeoutMs: 1_000, stableForMs: 100 }, authority("7"));
+    expect(single).toMatchObject({ receipt: { action: "touch_path", backend: "native-hid",
+      observationResult: { state: "captured" } }, replayed: false,
+    observation: { mode: "immediate" } });
+    expect(h.calls[0]?.type).toBe("native_touch");
+    const firstCall = h.calls[0]?.value as { first: readonly { phase: string; x: number;
+      y: number; edge: string }[] };
+    expect(firstCall.first[0]).toMatchObject({ phase: "down", x: 10 / 393,
+      y: 20 / 852, edge: "left" });
+    const next = single.observation!.screenMap;
+    const paired = await h.input.execute(SCOPE, route(h.instance),
+      { type: "touch2_path", snapshotId: next.snapshotId, first, second },
+      OBSERVE_NONE, authority("8"));
+    expect(paired.receipt).toMatchObject({ action: "touch2_path", backend: "native-hid" });
+    expect(h.calls[1]).toMatchObject({ type: "native_touch", value: {
+      second: expect.any(Array) } });
+    const operation = h.store.findOperation(`ios-simulator-input:${"8".repeat(64)}`);
+    expect(JSON.stringify(operation?.body)).not.toContain('"points"');
+    expect(JSON.stringify(operation?.body)).not.toContain('"first"');
+    expect(JSON.stringify(operation?.body)).not.toContain('"second"');
+  } finally { h.store.close(); }
+});
+
+it("rejects unsynchronized fingers before admission and never retries uncertain native touch", async () => {
+  const h = fixture();
+  h.setNativeReady(true);
+  let dispatched = 0;
+  h.setNativeTouch(async () => { dispatched += 1;
+    throw new SimulatorNativeHidError("INPUT_OUTCOME_UNKNOWN", "Native touch outcome is unknown."); });
+  const first = [{ phase: "down", x: 10, y: 20 },
+    { phase: "move", x: 20, y: 30 }, { phase: "up", x: 30, y: 40 }];
+  try {
+    const initial = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    await expect(h.input.execute(SCOPE, route(h.instance),
+      { type: "touch2_path", snapshotId: initial.snapshotId, first,
+        second: [first[0], { ...first[1], dtMs: 20 }, first[2]] },
+      OBSERVE_NONE, authority("9"))).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(h.store.findOperation(`ios-simulator-input:${"9".repeat(64)}`)).toBeFalsy();
+    const action = { type: "touch_path" as const, snapshotId: initial.snapshotId,
+      points: first, edge: "none" as const };
+    await expect(h.input.execute(SCOPE, route(h.instance), action,
+      OBSERVE_NONE, authority("a"))).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    await expect(h.input.execute(SCOPE, route(h.instance), action,
+      OBSERVE_NONE, authority("a"))).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    expect(dispatched).toBe(1);
   } finally { h.store.close(); }
 });

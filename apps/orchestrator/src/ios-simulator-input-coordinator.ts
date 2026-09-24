@@ -1,7 +1,8 @@
 import { OperationConflictError, OperationInProgressError, OperationPreviouslyFailedError,
   type OperationalStore } from "@joko/store";
-import { SimulatorScreenMapError, WdaClientError,
-  type SimulatorScreenMap, type WdaPoint } from "@joko/tool-ios-simulator";
+import { normalizeSimulatorTouchPair, normalizeSimulatorTouchPath, SimulatorNativeHidError,
+  SimulatorNativeTouchError, SimulatorScreenMapError, WdaClientError,
+  type SimulatorScreenMap, type SimulatorTouchEdge, type WdaPoint } from "@joko/tool-ios-simulator";
 import { SimulatorDriverError, type SimulatorDriverCoordinator } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorObservationError, type SimulatorInteractionObservation,
   type SimulatorObserveAfterMode, type SimulatorScreenObservationCoordinator
@@ -28,7 +29,8 @@ const WEB_DRIVER_KEYS = Object.freeze({
 } as const);
 
 type InputDriver = Pick<SimulatorDriverCoordinator,
-  "isReady" | "tap" | "swipe" | "typeText" | "pressHome">;
+  "isReady" | "tap" | "swipe" | "typeText" | "pressHome" |
+  "observeViewport" | "probeNativeInput" | "touchNativePath">;
 type InputScreen = Pick<SimulatorScreenObservationCoordinator,
   "requireInteractionSnapshot" | "invalidateInteraction" | "observeAfter">;
 
@@ -56,6 +58,10 @@ export type SimulatorInputAction =
   | { readonly type: "batch"; readonly snapshotId: string;
       readonly actions: readonly SimulatorBatchAction[] }
   | { readonly type: "type_text"; readonly snapshotId: string; readonly text: string }
+  | { readonly type: "touch_path"; readonly snapshotId: string;
+      readonly points: unknown; readonly edge: SimulatorTouchEdge }
+  | { readonly type: "touch2_path"; readonly snapshotId: string;
+      readonly first: unknown; readonly second: unknown }
   | { readonly type: "press_home"; readonly snapshotId: string };
 
 export interface SimulatorInputObserveOptions {
@@ -68,7 +74,7 @@ export interface SimulatorInputReceipt {
   readonly action: SimulatorInputAction["type"];
   readonly instanceId: string;
   readonly generation: number;
-  readonly backend: "wda";
+  readonly backend: "wda" | "native-hid";
   readonly completedAt: string;
   readonly observationResult: {
     readonly mode: SimulatorObserveAfterMode;
@@ -88,7 +94,8 @@ export interface SimulatorInputExecution {
 
 export class SimulatorInputError extends Error {
   constructor(readonly code: "INVALID_ARGUMENT" | "MUTATION_CANCELLED" |
-    "MUTATION_IN_PROGRESS" | "MUTATION_CONFLICT" | "INPUT_OUTCOME_UNKNOWN",
+    "MUTATION_IN_PROGRESS" | "MUTATION_CONFLICT" | "INPUT_OUTCOME_UNKNOWN" |
+    "NATIVE_INPUT_UNAVAILABLE",
     message: string) { super(message); }
 }
 
@@ -160,6 +167,17 @@ export class SimulatorInputCoordinator {
     this.#driver = driver;
     this.#screen = screen;
     this.#now = options.now ?? Date.now;
+  }
+
+  async nativeInputAvailable(instances: readonly PublicSimulatorInstance[], signal?: AbortSignal): Promise<boolean> {
+    for (const instance of instances) {
+      if (instance.lifecycleState !== "ready" || instance.viewerState !== "attached" ||
+          !this.#driver.isReady(instance)) continue;
+      try {
+        if (await this.#driver.probeNativeInput(instance, signal)) return true;
+      } catch { /* A stale or unavailable helper is not advertised as ready. */ }
+    }
+    return false;
   }
 
   async execute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, action: SimulatorInputAction,
@@ -241,7 +259,9 @@ export class SimulatorInputCoordinator {
             : { mode: observe.mode, state: "not_requested" };
       const completed = this.#store.completeDeferredEffectOperation<SimulatorInputReceipt>(operationId,
         claim.operation.bodyHash, () => ({ action: action.type, instanceId: instance!.instanceId,
-          generation: instance!.generation, backend: "wda", completedAt: new Date(this.#now()).toISOString(),
+          generation: instance!.generation,
+          backend: action.type === "touch_path" || action.type === "touch2_path" ? "native-hid" : "wda",
+          completedAt: new Date(this.#now()).toISOString(),
           observationResult, ...(dispatched.completed === undefined ? {} : { completed: dispatched.completed }) }));
       return { receipt: completed.value, replayed: completed.replayed,
         observation: completed.replayed ? null : observation,
@@ -322,6 +342,23 @@ export class SimulatorInputCoordinator {
       }
       return;
     }
+    if (action.type === "touch_path" || action.type === "touch2_path") {
+      if (batch) throw new SimulatorInputError("INVALID_ARGUMENT", "Native touch is not a batch action.");
+      try {
+        const viewport = { width: 1_000_000, height: 1_000_000, orientation: "PORTRAIT" as const };
+        if (action.type === "touch_path") {
+          normalizeSimulatorTouchPath(action.points, viewport, action.edge);
+        } else {
+          normalizeSimulatorTouchPair(action.first, action.second, viewport);
+        }
+      } catch (error) {
+        if (error instanceof SimulatorNativeTouchError) {
+          throw new SimulatorInputError("INVALID_ARGUMENT", error.message);
+        }
+        throw error;
+      }
+      return;
+    }
     if (action.type !== "press_home" || batch) {
       throw new SimulatorInputError("INVALID_ARGUMENT", "Simulator input action is invalid.");
     }
@@ -349,7 +386,7 @@ export class SimulatorInputCoordinator {
         readonly type: SimulatorBatchAction["type"]; readonly backend: "wda" }[];
       readonly finalObservation: SimulatorInteractionObservation | null }> {
     if (action.type !== "batch") {
-      await this.#performOne(instance, action, snapshot, signal, onAttempt, onCompleted);
+      await this.#performOne(scope, route, instance, action, snapshot, signal, onAttempt, onCompleted);
       return { finalObservation: null };
     }
     let current = snapshot;
@@ -357,7 +394,7 @@ export class SimulatorInputCoordinator {
     const completed: Array<{ index: number; type: SimulatorBatchAction["type"]; backend: "wda" }> = [];
     for (const [index, item] of action.actions.entries()) {
       if (index > 0) this.#screen.invalidateInteraction(scope, route, current.snapshotId);
-      await this.#performOne(instance, item, current, signal, onAttempt, onCompleted);
+      await this.#performOne(scope, route, instance, item, current, signal, onAttempt, onCompleted);
       finalObservation = await this.#screen.observeAfter(scope, route, "immediate", {
         timeoutMs: observe.timeoutMs, stableForMs: observe.stableForMs
       }, signal);
@@ -368,7 +405,7 @@ export class SimulatorInputCoordinator {
     return { completed, finalObservation };
   }
 
-  async #performOne(instance: PublicSimulatorInstance,
+  async #performOne(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, instance: PublicSimulatorInstance,
     action: Exclude<SimulatorInputAction, { readonly type: "batch" }> | SimulatorBatchAction,
     snapshot: SimulatorScreenMap, signal: AbortSignal | undefined,
     onAttempt: () => void, onCompleted: () => void): Promise<void> {
@@ -395,6 +432,28 @@ export class SimulatorInputCoordinator {
     } else if (action.type === "type_text") {
       onAttempt();
       await this.#driver.typeText(instance, action.text, signal);
+    } else if (action.type === "touch_path" || action.type === "touch2_path") {
+      const viewport = await this.#driver.observeViewport(instance, signal);
+      this.#ownership.requireRoute(scope, route);
+      const paths = action.type === "touch_path"
+        ? { first: normalizeSimulatorTouchPath(action.points, viewport, action.edge), second: undefined }
+        : normalizeSimulatorTouchPair(action.first, action.second, viewport);
+      if (!await this.#driver.probeNativeInput(instance, signal)) {
+        throw new SimulatorInputError("NATIVE_INPUT_UNAVAILABLE",
+          "Simulator native touch is unavailable; discrete WDA input remains available.");
+      }
+      this.#ownership.requireRoute(scope, route);
+      onAttempt();
+      await this.#driver.touchNativePath(instance, paths.first, paths.second, signal);
+      if (!this.#driver.isReady(instance)) {
+        throw new SimulatorInputError("INPUT_OUTCOME_UNKNOWN",
+          "Simulator driver changed after native input; read a new screen map before retrying.");
+      }
+      try { this.#ownership.requireRoute(scope, route); }
+      catch {
+        throw new SimulatorInputError("INPUT_OUTCOME_UNKNOWN",
+          "Simulator route changed after native input; read a new screen map before retrying.");
+      }
     } else {
       onAttempt();
       await this.#driver.pressHome(instance, signal);
@@ -410,6 +469,19 @@ export class SimulatorInputCoordinator {
     }
     if (error instanceof SimulatorInputError || error instanceof SimulatorObservationError ||
         error instanceof SimulatorScreenMapError || error instanceof SimulatorOwnershipError) return error;
+    if (error instanceof SimulatorNativeTouchError) {
+      return new SimulatorInputError("INVALID_ARGUMENT", error.message);
+    }
+    if (error instanceof SimulatorNativeHidError) {
+      if (error.code === "NATIVE_INPUT_UNAVAILABLE" && !attempted) {
+        return new SimulatorInputError("NATIVE_INPUT_UNAVAILABLE", error.message);
+      }
+      if (error.code === "MUTATION_CANCELLED" && !attempted) {
+        return new SimulatorInputError("MUTATION_CANCELLED", error.message);
+      }
+      return new SimulatorInputError("INPUT_OUTCOME_UNKNOWN",
+        "Simulator native touch outcome is unknown; read a new screen map before retrying.");
+    }
     if (error instanceof WdaClientError) {
       if (error.code === "INPUT_OUTCOME_UNKNOWN") {
         return new SimulatorInputError("INPUT_OUTCOME_UNKNOWN",

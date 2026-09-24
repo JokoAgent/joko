@@ -86,43 +86,31 @@ describe("Desktop distribution", () => {
       "!**/WORKSPACE/**",
       "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
     ]));
-    expect(config.extraResources).toEqual([
-      {
-        from: "resources/app-update.yml",
-        to: "app-update.yml"
-      },
-      {
-        from: "resources/native-task-status-sounds",
-        to: "native-task-status-sounds",
-        filter: ["*.mp3"]
-      },
-      {
-        from: "dist/native-voice-shortcut",
-        to: "native-voice-shortcut",
-        filter: [
-          "manifest.json",
-          "joko-macos-key-listener",
-          "joko-windows-function-key-listener.exe"
-        ]
-      },
-      expect.objectContaining({
-        from: "dist/orchestrator-runtime",
-        to: "orchestrator-runtime",
-        filter: expect.arrayContaining(["!node_modules/**", "!**/*.test.*", expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp")])
-      }),
-      expect.objectContaining({
-        from: "dist/orchestrator-runtime/node_modules",
-        to: "orchestrator-runtime/node_modules",
-        filter: expect.arrayContaining([
-          expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp"),
-          "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
-          "!**/*.test.*",
-          "!**/WORKSPACE",
-          "!**/WORKSPACE/**",
-          "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
-        ])
-      })
+    expect(config.extraResources.map(({ from, to }) => ({ from, to }))).toEqual([
+      { from: "resources/ios-simulator", to: "ios-simulator" },
+      { from: "resources/app-update.yml", to: "app-update.yml" },
+      { from: "resources/native-task-status-sounds", to: "native-task-status-sounds" },
+      { from: "dist/native-voice-shortcut", to: "native-voice-shortcut" },
+      { from: "dist/native-simulator-hid", to: "native-simulator-hid" },
+      { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },
+      { from: "dist/orchestrator-runtime/node_modules", to: "orchestrator-runtime/node_modules" }
     ]);
+    expect(config.extraResources.find(item => item.to === "ios-simulator")?.filter).toEqual([
+      "manifest.json", "LICENSE.appium-webdriveragent", "WebDriverAgent-v15.1.6.tar.gz"
+    ]);
+    expect(config.extraResources.find(item => item.to === "native-simulator-hid")?.filter).toEqual([
+      "manifest.json", "joko-simulator-hid"
+    ]);
+    expect(config.extraResources.filter(item => item.to.startsWith("orchestrator-runtime")))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ from: "dist/orchestrator-runtime", filter: expect.arrayContaining([
+          "!node_modules/**", "!**/*.test.*",
+          expect.stringContaining("map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp")
+        ]) }),
+        expect.objectContaining({ from: "dist/orchestrator-runtime/node_modules",
+          filter: expect.arrayContaining(["!**/*.test.*", "!**/WORKSPACE", "!**/WORKSPACE/**",
+            "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"]) })
+      ]));
     expect(config.afterPack).toBe("scripts/audit-packaged.cjs");
   });
 
