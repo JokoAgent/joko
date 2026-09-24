@@ -17,7 +17,8 @@ export type SimulatorLifecycleErrorCode =
   | "SIMULATOR_CONTROL_FAILED" | "SIMULATOR_CONTROL_UNKNOWN"
   | "APP_INSTALL_FAILED" | "APP_INSTALL_UNKNOWN"
   | "APP_LAUNCH_FAILED" | "APP_LAUNCH_UNKNOWN"
-  | "APP_TERMINATE_FAILED" | "APP_TERMINATE_UNKNOWN";
+  | "APP_TERMINATE_FAILED" | "APP_TERMINATE_UNKNOWN"
+  | "OPEN_URL_FAILED" | "OPEN_URL_UNKNOWN";
 
 export class SimulatorLifecycleError extends Error {
   constructor(readonly code: SimulatorLifecycleErrorCode, message: string) { super(message); }
@@ -45,6 +46,7 @@ export interface SimulatorLifecycleRuntime {
   launchApp?(udid: string, bundleId: string, args: readonly string[],
     signal?: AbortSignal): Promise<void>;
   terminateApp?(udid: string, bundleId: string, signal?: AbortSignal): Promise<void>;
+  openSimulatorUrl?(udid: string, rawUrl: string, signal?: AbortSignal): Promise<void>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -551,6 +553,25 @@ export function createSimulatorLifecycleRuntime(options: {
         30_000, "APP_TERMINATE_UNKNOWN", signal);
       if (result.exitCode !== 0 || result.failed) {
         throw new SimulatorLifecycleError("APP_TERMINATE_FAILED", "Simulator app could not be terminated.");
+      }
+    },
+    async openSimulatorUrl(udid, rawUrl, signal) {
+      requirePlatform();
+      const normalized = exactUdid(udid);
+      if (typeof rawUrl !== "string" || !rawUrl || rawUrl.length > 8_192 ||
+          /[\0\r\n]/u.test(rawUrl)) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator URL is invalid.");
+      }
+      let url: URL;
+      try { url = new URL(rawUrl); }
+      catch { throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator URL is invalid."); }
+      if (!url.protocol || url.protocol === "file:" || url.protocol === "javascript:") {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator URL scheme is not allowed.");
+      }
+      const result = await runMutation(["simctl", "openurl", normalized, url.toString()],
+        30_000, "OPEN_URL_UNKNOWN", signal);
+      if (result.exitCode !== 0 || result.failed) {
+        throw new SimulatorLifecycleError("OPEN_URL_FAILED", "Simulator URL could not be opened.");
       }
     },
     async pushNotification(udid, bundleId, payload, signal) {

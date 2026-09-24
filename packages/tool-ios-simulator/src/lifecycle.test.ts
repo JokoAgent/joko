@@ -388,3 +388,33 @@ it("launches and terminates one bundle with bounded exact simctl arguments", asy
   await expect(runtime.terminateApp!(UDID, "app.joko.fixture"))
     .rejects.toMatchObject({ code: "APP_TERMINATE_UNKNOWN" });
 });
+
+it("hands only validated non-file URLs to the exact Simulator", async () => {
+  const calls: Array<{ args: readonly string[]; timeoutMs: number | undefined }> = [];
+  let result: SimulatorCommandResult = ok();
+  const runner: SimulatorCommandRunner = { run: async (command, args, options) => {
+    expect(command).toBe(XCRUN);
+    calls.push({ args, timeoutMs: options?.timeoutMs });
+    return result;
+  } };
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner });
+  await runtime.openSimulatorUrl!(UDID.toLowerCase(), "myapp://screen?id=1");
+  expect(calls).toEqual([{ args: ["simctl", "openurl", UDID, "myapp://screen?id=1"],
+    timeoutMs: 30_000 }]);
+  for (const value of ["", "relative", "file:///private/a", "javascript:alert(1)",
+    "https://example.test/\npath", "https://example.test/" + "x".repeat(8_193)]) {
+    await expect(runtime.openSimulatorUrl!(UDID, value))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  }
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await expect(runtime.openSimulatorUrl!(UDID, "https://example.test", cancelled.signal))
+    .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
+  expect(calls).toHaveLength(1);
+  result = { stdout: "", stderr: "private host output", exitCode: 1 };
+  await expect(runtime.openSimulatorUrl!(UDID, "https://example.test"))
+    .rejects.toMatchObject({ code: "OPEN_URL_FAILED" });
+  result = { stdout: "", stderr: "private host output", exitCode: null, timedOut: true };
+  await expect(runtime.openSimulatorUrl!(UDID, "https://example.test"))
+    .rejects.toMatchObject({ code: "OPEN_URL_UNKNOWN" });
+});

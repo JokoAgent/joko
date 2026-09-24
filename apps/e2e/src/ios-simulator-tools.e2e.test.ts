@@ -110,6 +110,8 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
   let installCalls = 0;
   let launchCalls = 0;
   let terminateCalls = 0;
+  let urlCalls = 0;
+  const privateUrl = "myapp://screen?token=private-url-value";
   try {
     application = await createOrchestratorApplication(config, { simulatorRuntime: {
       environment: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
@@ -140,6 +142,13 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
           expect(bundleId).toBe("app.joko.example");
           expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_app_control")).toBe(true);
+        },
+        openSimulatorUrl: async (value, url) => {
+          urlCalls += 1;
+          expect(value).toBe(udid);
+          expect(url).toBe(privateUrl);
+          expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_url_control")).toBe(true);
         } },
       projectBuilder: {
         inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
@@ -192,7 +201,8 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
         tools: expect.arrayContaining([expect.objectContaining({
           name: "install_app", readOnly: false, via: "control_tool" }),
           expect.objectContaining({ name: "launch_app", readOnly: false, via: "control_tool" }),
-          expect.objectContaining({ name: "terminate_app", readOnly: false, via: "control_tool" })])
+          expect.objectContaining({ name: "terminate_app", readOnly: false, via: "control_tool" }),
+          expect.objectContaining({ name: "open_simulator_url", readOnly: false, via: "control_tool" })])
       } } });
     const route = { instanceId: instance.instanceId, generation: instance.generation,
       leaseId: instance.lease.id };
@@ -237,9 +247,20 @@ it("builds a task-owned app and reads redacted diagnostics through production HT
       .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
         action: "terminate_app", screenMapInvalidated: true } } } });
     expect(terminateCalls).toBe(1);
+    expect(await call("control_tool", "open_simulator_url", { ...route,
+      url: "file:///private/data" })).toMatchObject({ isError: true,
+        details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    expect(urlCalls).toBe(0);
+    expect(await call("control_tool", "open_simulator_url", { ...route, url: privateUrl }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        opened: true, screenMapInvalidated: true } } } });
+    expect(urlCalls).toBe(1);
     expect(JSON.stringify(application.store.listOperations({ sessionId: "simulator-build-task" }),
       (_key, value: unknown) => typeof value === "bigint" ? String(value) : value))
       .not.toContain("private-launch-value");
+    expect(JSON.stringify(application.store.listOperations({ sessionId: "simulator-build-task" }),
+      (_key, value: unknown) => typeof value === "bigint" ? String(value) : value))
+      .not.toContain(privateUrl);
     snapshot.revoke();
   } finally {
     await internal?.close();

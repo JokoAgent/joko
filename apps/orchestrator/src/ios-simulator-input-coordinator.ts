@@ -17,7 +17,8 @@ const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 const CONFLICTING_KINDS = new Set([
   KIND, "ios_simulator_instance_control", "ios_simulator_create", "ios_simulator_lifecycle",
   "ios_simulator_driver", "ios_simulator_state_control", "ios_simulator_app_build",
-  "ios_simulator_app_install", "ios_simulator_app_control", "ios_simulator_grace_cleanup",
+  "ios_simulator_app_install", "ios_simulator_app_control", "ios_simulator_url_control",
+  "ios_simulator_grace_cleanup",
   "ios_simulator_removed_cleanup"
 ]);
 const WEB_DRIVER_KEYS = Object.freeze({
