@@ -88,7 +88,8 @@ export class SimulatorLifecycleCoordinator {
         const conflicting = page.find(operation =>
           (operation.kind === KIND || operation.kind === "ios_simulator_driver" ||
             operation.kind === "ios_simulator_input" ||
-            operation.kind === "ios_simulator_state_control") && operation.id !== operationId);
+            operation.kind === "ios_simulator_state_control" ||
+            operation.kind === "ios_simulator_app_build") && operation.id !== operationId);
         if (conflicting !== undefined) throw new OperationInProgressError(conflicting.id);
         if (page.length < 500) break;
         offset += page.length;

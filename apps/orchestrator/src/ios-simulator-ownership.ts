@@ -207,6 +207,21 @@ export class SimulatorOwnershipRegistry {
     return publicInstance(instance);
   }
 
+  /** Extend only the same admitted lease while one long-running owned effect remains active. */
+  heartbeatRoute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): PublicSimulatorInstance {
+    return this.#store.transaction(() => {
+      const current = this.#routedInstance(scope, route);
+      const now = this.#now();
+      this.#assertLiveLease(current, route, now);
+      if (current.lease.expiresAt - now > LEASE_MS / 2) return publicInstance(current);
+      const next: SimulatorOwnedInstance = { ...current,
+        lease: { ...current.lease, expiresAt: now + LEASE_MS }, updatedAt: now };
+      const stored = this.#load();
+      this.#save({ format: 1, instances: stored.instances.map(item => item.instanceId === next.instanceId ? next : item) });
+      return publicInstance(next);
+    });
+  }
+
   assertCanCreate(scope: SimulatorTaskScope): void {
     this.assertScope(scope);
     const stored = this.#load();

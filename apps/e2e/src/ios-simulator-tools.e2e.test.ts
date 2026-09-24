@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -77,6 +77,108 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
   } finally {
     await internal?.close();
     await fixture?.close();
+  }
+});
+
+it("builds a task-owned app and reads redacted diagnostics through production HTTP and SQLite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-simulator-project-chain-"));
+  const workspace = join(root, "workspace");
+  const dataDirectory = join(root, "data");
+  const sourceApp = join(workspace, "Build", "Example.app");
+  await mkdir(join(workspace, "Example.xcodeproj"), { recursive: true });
+  await mkdir(sourceApp, { recursive: true });
+  await writeFile(join(sourceApp, "Info.plist"), "fixture");
+  const config: OrchestratorConfig = {
+    host: "127.0.0.1", port: 0, internalPort: 4317, publicOrigin: "http://127.0.0.1",
+    internalOrigin: "http://127.0.0.1:4317", dataDirectory,
+    databasePath: join(dataDirectory, "orchestrator.db"), allowInsecureLoopback: true,
+    allowInsecureLan: false, lanDiscoveryEnabled: false,
+    codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
+    workspace: { id: "workspace", root: workspace, displayName: "Simulator project fixture", trusted: true },
+    artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web"),
+    corsOrigins: [], iosSimulatorDriver: { archivePath: join(root, "missing-source.tar.gz"),
+      cacheRoot: join(dataDirectory, "driver-cache") }
+  };
+  const udid = "A0123456-1234-1234-1234-123456789ABC";
+  const device = { udid, name: "iPhone", state: "Booted", isAvailable: true,
+    runtimeIdentifier: "com.apple.CoreSimulator.SimRuntime.iOS-19-0", runtimeName: "iOS 19.0",
+    runtimeVersion: "19.0", deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17",
+    lastBootedAt: null } as const;
+  let application: Awaited<ReturnType<typeof createOrchestratorApplication>> | undefined;
+  let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
+  let buildCalls = 0;
+  try {
+    application = await createOrchestratorApplication(config, { simulatorRuntime: {
+      environment: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+        xcodeVersion: "Xcode 16.4", runtimes: [], devices: [device], issue: null,
+        error: null, setupSteps: [] }) },
+      projectBuilder: {
+        inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
+          projectRoot: workspace, containerPath: join(workspace, "Example.xcodeproj") }),
+        build: async input => {
+          buildCalls += 1;
+          expect(input.simulatorUdid).toBe(udid);
+          expect(application!.store.listOperations({ sessionId: "simulator-build-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_app_build")).toBe(true);
+          return { kind: "xcode-project", worktreeRoot: workspace, projectRoot: workspace,
+            containerPath: join(workspace, "Example.xcodeproj"), scheme: "Example",
+            appPath: sourceApp, resultBundlePath: null,
+            buildLogTail: "Bearer secretvalue123\nBUILD SUCCEEDED", outputTruncated: false };
+        },
+        readXcresult: async () => "{}"
+      },
+      inspectAppArtifact: async ({ appPath }) => ({ appPath, bundleId: "app.joko.example",
+        executable: "Example" })
+    } });
+    const target = application.store.getTarget("workspace").descriptor;
+    application.store.createSession({ id: "simulator-build-task", backendId: target.backendId,
+      targetId: target.id, title: "Simulator build task",
+      binding: { opaqueRef: "simulator-build-task-native", generation: 1 }, pinned: false,
+      archived: false, permissionMode: "ask", planMode: false, fastMode: false,
+      createdAt: Date.now(), updatedAt: Date.now() });
+    const instance = new SimulatorOwnershipRegistry(application.store).bindExternalDevice(
+      { sessionId: "simulator-build-task", targetId: target.id, generation: 1 }, device);
+    internal = await createInternalServer(application);
+    const url = await internal.listen({ host: "127.0.0.1", port: 0 });
+    const snapshot = application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${url}/internal/mcp`,
+      sessionId: "simulator-build-task", targetId: target.id, expectedPiGeneration: 1 });
+    const call = async (toolName: string, name: string, args: Record<string, unknown>) => {
+      const response = await fetch(`${url}/internal/mcp`, { method: "POST", headers: {
+        authorization: `Bearer ${snapshot.mcpBridge.token}`, "content-type": "application/json",
+        "x-joko-pi-generation": "1"
+      }, body: JSON.stringify({ requestId: randomUUID(), sessionId: "simulator-build-task",
+        targetId: target.id, generation: 1, serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
+        toolName, arguments: toolName === "list_tools" ? args : { name, args } }) });
+      expect(response.ok).toBe(true);
+      return await response.json() as { isError: boolean; details: { mcpStructuredContent: {
+        data?: { artifact?: { artifactId: string; bundleId: string };
+          diagnostics?: { diagnosticsId: string }; text?: string; available?: boolean };
+        errorCode?: string } } };
+    };
+    expect(await call("list_tools", "list_tools", { category: "ios_simulator" }))
+      .toMatchObject({ isError: false });
+    const route = { instanceId: instance.instanceId, generation: instance.generation,
+      leaseId: instance.lease.id };
+    const built = await call("control_tool", "build_app", route);
+    expect(built).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      artifact: { bundleId: "app.joko.example" }, diagnostics: { diagnosticsId: expect.any(String) }
+    } } } });
+    expect(buildCalls).toBe(1);
+    expect(JSON.stringify(built)).not.toContain("secretvalue123");
+    const diagnosticsId = built.details.mcpStructuredContent.data!.diagnostics!.diagnosticsId;
+    const diagnostics = await call("call_tool", "read_build_diagnostics",
+      { diagnosticsId, source: "build-log", offset: 0, limit: 1024 });
+    expect(diagnostics).toMatchObject({ isError: false,
+      details: { mcpStructuredContent: { data: { text: expect.stringContaining("BUILD SUCCEEDED") } } } });
+    expect(JSON.stringify(diagnostics)).not.toContain("secretvalue123");
+    expect(await call("call_tool", "read_build_diagnostics",
+      { diagnosticsId: randomUUID(), source: "build-log" })).toMatchObject({ isError: true,
+        details: { mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    snapshot.revoke();
+  } finally {
+    await internal?.close();
+    await application?.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

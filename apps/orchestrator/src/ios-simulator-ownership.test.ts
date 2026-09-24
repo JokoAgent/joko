@@ -95,3 +95,25 @@ it("rotates an exact Viewer route and releases only a detached owned binding", (
     expect(registry.listForTask(scope)).toEqual([]);
   } finally { store.close(); }
 });
+
+it("extends only the admitted route lease for a long-running Simulator effect", () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    let now = 1_000;
+    const registry = new SimulatorOwnershipRegistry(store, { now: () => now });
+    const scope = { sessionId: "first", targetId: "target", generation: 1 };
+    const instance = registry.bindExternalDevice(scope, DEVICE);
+    const route = { instanceId: instance.instanceId, generation: instance.generation,
+      leaseId: instance.lease.id };
+    now = 32_000;
+    const extended = registry.heartbeatRoute(scope, route);
+    expect(extended.lease).toMatchObject({ id: instance.lease.id, expiresAt: 92_000 });
+    now = 91_000;
+    expect(registry.requireRoute(scope, route).instanceId).toBe(instance.instanceId);
+    now = 92_000;
+    expect(() => registry.heartbeatRoute(scope, route)).toThrow(/stale/u);
+    expect(registry.listForTask(scope)[0]?.lease.id).not.toBe(route.leaseId);
+    expect(() => registry.heartbeatRoute(scope, route)).toThrow(/stale/u);
+  } finally { store.close(); }
+});

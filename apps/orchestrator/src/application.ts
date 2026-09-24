@@ -127,9 +127,11 @@ import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } fr
 import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import { SimulatorInputCoordinator } from "./ios-simulator-input-coordinator.js";
-import { createSimulatorLifecycleRuntime, type SimulatorCreateRuntime,
+import { createSimulatorLifecycleRuntime, inspectSimulatorAppArtifact, type SimulatorCreateRuntime,
   type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
 import { SimulatorStateControlCoordinator } from "./ios-simulator-state-control.js";
+import { SimulatorProjectBuildCoordinator } from "./ios-simulator-project-build.js";
+import type { SimulatorProjectBuilder } from "@joko/tool-ios-simulator";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -465,6 +467,8 @@ export interface OrchestratorApplicationDependencies {
     readonly lifecycle?: SimulatorLifecycleRuntime;
     readonly create?: SimulatorCreateRuntime;
     readonly driver?: Pick<SimulatorDriverCoordinatorOptions, "manager" | "cleanupOrphans" | "architecture">;
+    readonly projectBuilder?: Pick<SimulatorProjectBuilder, "inspect" | "build" | "readXcresult">;
+    readonly inspectAppArtifact?: typeof inspectSimulatorAppArtifact;
   };
 }
 
@@ -851,9 +855,17 @@ export async function createOrchestratorApplication(
   const simulatorStateControl = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorStateControlCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
+  const simulatorProjectBuild = config.iosSimulatorDriver === undefined ? undefined
+    : new SimulatorProjectBuildCoordinator(store, simulatorOwnership, {
+      artifactRoot: join(dirname(config.iosSimulatorDriver.cacheRoot), "project-build"),
+      builder: dependencies.simulatorRuntime?.projectBuilder,
+      inspectArtifact: dependencies.simulatorRuntime?.inspectAppArtifact
+    });
+  await simulatorProjectBuild?.reconcileBuildStorage();
   const unregisterIosSimulatorTools = mcpRouter.registerBridgeToolProvider(
     new IosSimulatorToolBridgeProvider({ store, ownership: simulatorOwnership, control: simulatorControl,
       screen: simulatorScreen, input: simulatorInput, stateControl: simulatorStateControl,
+      projectBuild: simulatorProjectBuild,
       runtime: dependencies.simulatorRuntime?.environment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({

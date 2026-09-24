@@ -17,6 +17,7 @@ import { SimulatorInputError, type SimulatorBatchAction, type SimulatorInputActi
 import { SimulatorStateControlError, type SimulatorStateControlAction,
   type SimulatorStateControlCoordinator } from "./ios-simulator-state-control.js";
 import { SimulatorScreenMapError, WdaClientError, type SimulatorScreenMap } from "@joko/tool-ios-simulator";
+import { SimulatorAppBuildError, type SimulatorProjectBuildCoordinator } from "./ios-simulator-project-build.js";
 
 export const IOS_SIMULATOR_TOOL_PROVIDER_ID = "joko_ios_simulator";
 const CATEGORY = "ios_simulator";
@@ -43,6 +44,14 @@ const TOOLS = Object.freeze([
   { name: "doctor", description: "Diagnose the current task's iOS Simulator environment and available actions.", readOnly: true },
   { name: "list_simulator_devices", description: "List simulated iPhone and iPad devices with exact UDIDs, runtime and boot states.", readOnly: true },
   { name: "list_instances", description: "List only Simulator instances registered to this task.", readOnly: true }
+] as const);
+
+const BUILD_READ_TOOLS = Object.freeze([
+  { name: "read_build_diagnostics", description: "Read a bounded task-owned build log or Xcode result chunk.", readOnly: true }
+] as const);
+
+const BUILD_TOOLS = Object.freeze([
+  { name: "build_app", description: "Build a trusted Xcode project for the exact Simulator. Xcode executes project build scripts as the current macOS user; those scripts can read or modify files outside the project, and bounded build diagnostics are returned to the agent. Approve only trusted projects.", readOnly: false }
 ] as const);
 
 const CONTROL_TOOLS = Object.freeze([
@@ -88,7 +97,7 @@ const STATE_TOOLS = Object.freeze([
 ] as const);
 
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
-  stateControl: boolean): readonly McpToolDescriptor[] {
+  stateControl: boolean, projectBuild: boolean): readonly McpToolDescriptor[] {
   const tools: McpToolDescriptor[] = [{
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "list_tools",
@@ -100,19 +109,19 @@ function bridgeTools(control: boolean, screen: boolean, input: boolean,
     name: "call_tool",
     description: "Call one validated read-only task-local iOS Simulator tool.",
     inputSchema: { type: "object", properties: {
-      name: { type: "string", enum: TOOLS.map(tool => tool.name) },
-      args: { type: "object", properties: {}, additionalProperties: false }
+      name: { type: "string", enum: [...TOOLS, ...(projectBuild ? BUILD_READ_TOOLS : [])].map(tool => tool.name) },
+      args: { type: "object", additionalProperties: true }
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: false
   }];
-  if (control || screen || input || stateControl) tools.push({
+  if (control || screen || input || stateControl || projectBuild) tools.push({
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "control_tool",
     description: "Call one validated task-local iOS Simulator control or screen observation with the current task's permission.",
     inputSchema: { type: "object", properties: {
       name: { type: "string", enum: [...(control ? CONTROL_TOOLS : []),
         ...(screen ? OBSERVATION_TOOLS : []), ...(input ? INPUT_TOOLS : []),
-        ...(stateControl ? STATE_TOOLS : [])].map(tool => tool.name) },
+        ...(stateControl ? STATE_TOOLS : []), ...(projectBuild ? BUILD_TOOLS : [])].map(tool => tool.name) },
       args: { type: "object", additionalProperties: true }
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: true
@@ -138,6 +147,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly #screen: SimulatorScreenObservationCoordinator | undefined;
   readonly #input: SimulatorInputCoordinator | undefined;
   readonly #stateControl: SimulatorStateControlCoordinator | undefined;
+  readonly #projectBuild: SimulatorProjectBuildCoordinator | undefined;
   readonly #memoryProbe: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
 
   constructor(options: {
@@ -147,6 +157,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     readonly screen?: SimulatorScreenObservationCoordinator;
     readonly input?: SimulatorInputCoordinator;
     readonly stateControl?: SimulatorStateControlCoordinator;
+    readonly projectBuild?: SimulatorProjectBuildCoordinator;
     readonly runtime?: SimulatorEnvironmentRuntime;
     readonly memoryProbe?: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
   }) {
@@ -156,8 +167,10 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#screen = options.screen;
     this.#input = options.input;
     this.#stateControl = options.stateControl;
+    this.#projectBuild = options.projectBuild;
     this.tools = bridgeTools(options.control !== undefined, options.screen !== undefined,
-      options.input !== undefined, options.stateControl !== undefined);
+      options.input !== undefined, options.stateControl !== undefined,
+      options.projectBuild !== undefined);
     this.#runtime = options.runtime ?? createSimulatorEnvironmentRuntime();
     this.#memoryProbe = options.memoryProbe ?? (signal => collectSimulatorMemorySnapshot({ signal }));
   }
@@ -176,11 +189,12 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       if (name === "list_tools") {
         onlyKeys(arguments_, ["category"]);
         if (arguments_["category"] !== undefined && arguments_["category"] !== CATEGORY) throw new SimulatorToolError("INVALID_ARGUMENT", "Unknown Simulator tool category.");
-        const tools = [...TOOLS, ...(this.#control ? CONTROL_TOOLS : []),
+        const tools = [...TOOLS, ...(this.#projectBuild ? BUILD_READ_TOOLS : []),
+          ...(this.#control ? CONTROL_TOOLS : []),
           ...(this.#screen ? OBSERVATION_TOOLS : []), ...(this.#input ? INPUT_TOOLS : []),
-          ...(this.#stateControl ? STATE_TOOLS : [])]
+          ...(this.#stateControl ? STATE_TOOLS : []), ...(this.#projectBuild ? BUILD_TOOLS : [])]
           .map(tool => ({ name: tool.name, category: CATEGORY, description: tool.description,
-            readOnly: tool.readOnly, via: TOOLS.some(item => item.name === tool.name)
+            readOnly: tool.readOnly, via: [...TOOLS, ...BUILD_READ_TOOLS].some(item => item.name === tool.name)
               ? "call_tool" : "control_tool" }));
         return response(arguments_["category"] === CATEGORY
           ? { ok: true, category: CATEGORY, tools, workflow: "Call doctor or check_environment, then list_simulator_devices. Use exact UDIDs for later instance actions." }
@@ -188,15 +202,16 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       }
       if (name !== "call_tool" &&
           (name !== "control_tool" || !this.#control && !this.#screen && !this.#input &&
-            !this.#stateControl)) {
+            !this.#stateControl && !this.#projectBuild)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator bridge tool is unavailable.");
       }
       onlyKeys(arguments_, ["name", "args"]);
       const selected = arguments_["name"];
       const args = arguments_["args"];
-      const available = name === "call_tool" ? TOOLS : [
+      const available = name === "call_tool" ? [...TOOLS, ...(this.#projectBuild ? BUILD_READ_TOOLS : [])] : [
         ...(this.#control ? CONTROL_TOOLS : []), ...(this.#screen ? OBSERVATION_TOOLS : []),
-        ...(this.#input ? INPUT_TOOLS : []), ...(this.#stateControl ? STATE_TOOLS : []) ];
+        ...(this.#input ? INPUT_TOOLS : []), ...(this.#stateControl ? STATE_TOOLS : []),
+        ...(this.#projectBuild ? BUILD_TOOLS : []) ];
       if (typeof selected !== "string" || !available.some(tool => tool.name === selected)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator tool is unavailable in this runtime.");
       }
@@ -211,7 +226,23 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         if (STATE_TOOLS.some(tool => tool.name === selected)) {
           return await this.#callStateControl(selected, args, signal, context);
         }
+        if (selected === "build_app") return await this.#callProjectBuild(args, signal, context);
         return await this.#callInstanceControl(selected, args, signal, context);
+      }
+      if (selected === "read_build_diagnostics") {
+        if (!this.#projectBuild) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator build diagnostics are unavailable.");
+        onlyKeys(args, ["diagnosticsId", "source", "offset", "limit"]);
+        const diagnosticsId = args["diagnosticsId"];
+        const source = args["source"];
+        if (typeof diagnosticsId !== "string" || !UUID.test(diagnosticsId) ||
+            source !== "build-log" && source !== "xcresult") {
+          throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator build diagnostics request is invalid.");
+        }
+        const offset = optionalInteger(args["offset"], 0, Number.MAX_SAFE_INTEGER, 0);
+        const limit = optionalInteger(args["limit"], 1, 65_536, 16_384);
+        const result = await this.#projectBuild.readDiagnostics(context, diagnosticsId, source, offset, limit);
+        this.#requireScope(context);
+        return response({ ok: true, data: result }, false);
       }
       if (Object.keys(args).length !== 0) throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator tool arguments must be an empty object.");
       if (selected === "list_instances") {
@@ -252,6 +283,12 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
             : { state: "unavailable", reasonCode: environment.ready
               ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
         );
+        const buildAvailability = this.#projectBuild === undefined ? {} : {
+          build_app: environment.ready && instances.some(instance => instance.lifecycleState === "ready")
+            ? { state: "available", backend: "xcodebuild" }
+            : { state: "unavailable", reasonCode: environment.ready ? "INSTANCE_REQUIRED" : environment.issue ?? "ENVIRONMENT_NOT_READY" },
+          read_build_diagnostics: { state: "available", backend: "host" }
+        };
         const controlAvailability = this.#control === undefined ? {} : {
           create_instance: controlAvailable ? { state: "available", backend: "simctl" }
             : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
@@ -273,7 +310,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
               ? { state: "available", backend: "simctl" }
               : { state: "unavailable", reasonCode: environment.issue ?? "ENVIRONMENT_NOT_READY" },
             list_instances: { state: "available", backend: "host" },
-            ...controlAvailability, ...screenAvailability, ...inputAvailability, ...stateAvailability
+            ...controlAvailability, ...screenAvailability, ...inputAvailability, ...stateAvailability,
+            ...buildAvailability
           },
           instances, resources,
           instanceControl: controlAvailable ? { state: "available" }
@@ -295,13 +333,16 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         error instanceof SimulatorLifecycleError || error instanceof SimulatorResourceError ||
         error instanceof SimulatorDriverError || error instanceof SimulatorObservationError ||
         error instanceof SimulatorInputError || error instanceof SimulatorStateControlError ||
+        error instanceof SimulatorAppBuildError ||
         error instanceof SimulatorScreenMapError ||
         error instanceof WdaClientError;
       const code = known ? error.code : error instanceof OperationInProgressError
         ? "MUTATION_IN_PROGRESS" : signal?.aborted ? "PROBE_ABORTED" : "SIMULATOR_HOST_ERROR";
       const message = known ? error.message : error instanceof OperationInProgressError
         ? "Simulator operation is already in progress." : signal?.aborted ? "Simulator probe was cancelled." : "Simulator host call failed.";
-      return response({ ok: false, errorCode: code, message }, true);
+      return response({ ok: false, errorCode: code, message,
+        ...(error instanceof SimulatorAppBuildError && error.diagnostics
+          ? { data: { diagnostics: error.diagnostics } } : {}) }, true);
     }
   }
 
@@ -589,6 +630,38 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#requireScope(context);
     return response({ ok: true, data: { ...result.receipt, replayed: result.replayed,
       screenMapInvalidated: true } }, false);
+  }
+
+  async #callProjectBuild(args: Record<string, unknown>, signal: AbortSignal | undefined,
+    context: BridgeToolCallContext): Promise<McpCallResult> {
+    if (!this.#projectBuild) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator project build is unavailable.");
+    onlyKeys(args, ["instanceId", "generation", "leaseId", "containerPath", "scheme"]);
+    const route = requiredRoute(args);
+    const containerPath = args["containerPath"];
+    const scheme = args["scheme"];
+    if (containerPath !== undefined && (typeof containerPath !== "string" ||
+        !containerPath.trim() || containerPath.length > 4_096) ||
+        scheme !== undefined && (typeof scheme !== "string" || !scheme.trim() || scheme.length > 256)) {
+      throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator project selection is invalid.");
+    }
+    const authority = { effectIdentity: context.effectIdentity, requestBodyHash: context.requestBodyHash,
+      providerGeneration: context.providerGeneration };
+    if (!DIGEST.test(authority.effectIdentity ?? "") || !BODY_HASH.test(authority.requestBodyHash ?? "") ||
+        !Number.isSafeInteger(authority.providerGeneration) || (authority.providerGeneration ?? 0) < 1) {
+      throw new SimulatorToolError("STALE_SCOPE", "Simulator mutation authority is unavailable.");
+    }
+    const environment = await this.#runtime.inspect(signal);
+    signal?.throwIfAborted();
+    this.#requireScope(context);
+    if (!environment.ready) return response({ ok: false, errorCode: environment.issue,
+      message: environment.error, data: { environment } }, true);
+    const result = await this.#projectBuild.execute(context, route,
+      { ...(containerPath === undefined ? {} : { containerPath: containerPath as string }),
+        ...(scheme === undefined ? {} : { scheme: scheme as string }) },
+      { effectIdentity: authority.effectIdentity!, requestBodyHash: authority.requestBodyHash!,
+        providerGeneration: authority.providerGeneration! }, signal);
+    this.#requireScope(context);
+    return response({ ok: true, data: { ...result.receipt, replayed: result.replayed } }, false);
   }
 
   async #diagnoseResources(environment: SimulatorEnvironmentReport, signal: AbortSignal | undefined,
