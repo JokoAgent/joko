@@ -1,5 +1,6 @@
 import { assessSimulatorResourceAdmission, collectSimulatorMemorySnapshot, createSimulatorEnvironmentRuntime,
-  type SimulatorEnvironmentReport, type SimulatorEnvironmentRuntime, type SimulatorMemorySnapshot } from "@joko/tool-ios-simulator";
+  type SimulatorEnvironmentReport, type SimulatorEnvironmentRuntime, type SimulatorMemorySnapshot,
+  type SimulatorStatusBarOverrides } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import { SimulatorOwnershipError, type SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
@@ -21,12 +22,20 @@ const CATEGORY = "ios_simulator";
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 const DIGEST = /^[0-9a-f]{64}$/u;
 const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
+const PRIVACY_SERVICE = /^[a-z][a-z0-9-]{0,63}$/u;
+const BUNDLE_ID = /^[A-Za-z0-9][A-Za-z0-9.-]{1,254}$/u;
 const INPUT_KEYS = ["return", "tab", "escape", "delete", "arrow_up", "arrow_down",
   "arrow_left", "arrow_right"] as const satisfies readonly SimulatorInputKey[];
 const CONTENT_SIZES = ["extra-small", "small", "medium", "large", "extra-large",
   "extra-extra-large", "extra-extra-extra-large", "accessibility-medium",
   "accessibility-large", "accessibility-extra-large", "accessibility-extra-extra-large",
   "accessibility-extra-extra-extra-large"] as const;
+const STATUS_BAR_DATA_NETWORKS = [
+  "hide", "wifi", "3g", "4g", "lte", "lte-a", "lte+", "5g", "5g+", "5g-uwb", "5g-uc"
+] as const;
+const STATUS_BAR_WIFI_MODES = ["searching", "failed", "active"] as const;
+const STATUS_BAR_CELLULAR_MODES = ["notSupported", "searching", "failed", "active"] as const;
+const STATUS_BAR_BATTERY_STATES = ["charging", "charged", "discharging"] as const;
 
 const TOOLS = Object.freeze([
   { name: "check_environment", description: "Check the local macOS Xcode and iOS Simulator environment without opening Simulator.app.", readOnly: true },
@@ -68,7 +77,10 @@ const STATE_TOOLS = Object.freeze([
   { name: "set_content_size", description: "Set the simulated Dynamic Type content-size category.", readOnly: false },
   { name: "set_location", description: "Set one bounded simulated latitude and longitude.", readOnly: false },
   { name: "start_location_route", description: "Start a bounded simulated route through explicit waypoints.", readOnly: false },
-  { name: "clear_location", description: "Clear the simulated location or active route.", readOnly: false }
+  { name: "clear_location", description: "Clear the simulated location or active route.", readOnly: false },
+  { name: "set_privacy", description: "Grant, revoke or reset one simulated app privacy permission.", readOnly: false },
+  { name: "set_status_bar", description: "Apply bounded deterministic Simulator status-bar overrides.", readOnly: false },
+  { name: "clear_status_bar", description: "Clear all Simulator status-bar overrides.", readOnly: false }
 ] as const);
 
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
@@ -521,6 +533,28 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     } else if (name === "clear_location") {
       onlyKeys(args, ["instanceId", "generation", "leaseId"]);
       action = { type: "clear_location" };
+    } else if (name === "set_privacy") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "action", "service", "bundleId"]);
+      const privacyAction = args["action"];
+      if (privacyAction !== "grant" && privacyAction !== "revoke" && privacyAction !== "reset" ||
+          typeof args["service"] !== "string" || !PRIVACY_SERVICE.test(args["service"])) {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator privacy control is invalid.");
+      }
+      const bundleId = args["bundleId"];
+      if (bundleId !== undefined && (typeof bundleId !== "string" || !BUNDLE_ID.test(bundleId)) ||
+          privacyAction !== "reset" && bundleId === undefined) {
+        throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator privacy bundle identity is invalid.");
+      }
+      action = { type: "set_privacy", action: privacyAction, service: args["service"],
+        ...(bundleId === undefined ? {} : { bundleId }) };
+    } else if (name === "set_status_bar") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "time", "dataNetwork",
+        "wifiMode", "wifiBars", "cellularMode", "cellularBars", "operatorName",
+        "batteryState", "batteryLevel"]);
+      action = { type: "set_status_bar", overrides: requiredStatusBarOverrides(args) };
+    } else if (name === "clear_status_bar") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId"]);
+      action = { type: "clear_status_bar" };
     } else {
       throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator state control is unavailable.");
     }
@@ -668,6 +702,67 @@ function requiredLocationWaypoints(value: unknown): readonly {
         `location waypoint ${index} longitude`)
     };
   });
+}
+
+function optionalEnum<T extends string>(value: unknown, values: readonly T[], label: string): T | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !values.includes(value as T)) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", `Simulator ${label} is invalid.`);
+  }
+  return value as T;
+}
+
+function optionalBoundedInteger(value: unknown, minimum: number, maximum: number,
+  label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) ||
+      value < minimum || value > maximum) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", `Simulator ${label} is invalid.`);
+  }
+  return value;
+}
+
+function requiredStatusBarOverrides(value: Readonly<Record<string, unknown>>): SimulatorStatusBarOverrides {
+  const time = value["time"];
+  if (time !== undefined && (typeof time !== "string" || !time.trim() ||
+      time.length > 128 || /[\0\r\n]/u.test(time))) {
+    throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator status-bar time is invalid.");
+  }
+  const operatorName = value["operatorName"];
+  if (operatorName !== undefined && (typeof operatorName !== "string" ||
+      operatorName.length > 128 || /[\0\r\n]/u.test(operatorName))) {
+    throw new SimulatorToolError("INVALID_ARGUMENT",
+      "Simulator status-bar operator name is invalid.");
+  }
+  const dataNetwork = optionalEnum(value["dataNetwork"], STATUS_BAR_DATA_NETWORKS,
+    "status-bar data network");
+  const wifiMode = optionalEnum(value["wifiMode"], STATUS_BAR_WIFI_MODES,
+    "status-bar Wi-Fi mode");
+  const cellularMode = optionalEnum(value["cellularMode"], STATUS_BAR_CELLULAR_MODES,
+    "status-bar cellular mode");
+  const batteryState = optionalEnum(value["batteryState"], STATUS_BAR_BATTERY_STATES,
+    "status-bar battery state");
+  const wifiBars = optionalBoundedInteger(value["wifiBars"], 0, 3, "status-bar Wi-Fi bars");
+  const cellularBars = optionalBoundedInteger(value["cellularBars"], 0, 4,
+    "status-bar cellular bars");
+  const batteryLevel = optionalBoundedInteger(value["batteryLevel"], 0, 100,
+    "status-bar battery level");
+  const overrides = {
+    ...(time === undefined ? {} : { time }),
+    ...(dataNetwork === undefined ? {} : { dataNetwork }),
+    ...(wifiMode === undefined ? {} : { wifiMode }),
+    ...(wifiBars === undefined ? {} : { wifiBars }),
+    ...(cellularMode === undefined ? {} : { cellularMode }),
+    ...(cellularBars === undefined ? {} : { cellularBars }),
+    ...(operatorName === undefined ? {} : { operatorName }),
+    ...(batteryState === undefined ? {} : { batteryState }),
+    ...(batteryLevel === undefined ? {} : { batteryLevel })
+  } satisfies SimulatorStatusBarOverrides;
+  if (Object.keys(overrides).length === 0) {
+    throw new SimulatorToolError("INVALID_ARGUMENT",
+      "At least one Simulator status-bar override is required.");
+  }
+  return overrides;
 }
 
 function requiredSnapshotId(value: unknown): string {

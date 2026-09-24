@@ -210,3 +210,57 @@ it("rejects invalid location controls before dispatch and fences uncertain outco
   await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner })
     .setLocation!(UDID, 0, 0)).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
 });
+
+it("uses exact simctl privacy and ordered status-bar routes", async () => {
+  const controls = scripted(
+    { args: ["simctl", "privacy", UDID, "grant", "camera", "app.joko.fixture"], result: ok() },
+    { args: ["simctl", "privacy", UDID, "reset", "all"], result: ok() },
+    { args: ["simctl", "status_bar", UDID, "override",
+      "--time", "09:41", "--dataNetwork", "5g", "--wifiMode", "active",
+      "--cellularMode", "searching", "--wifiBars", "3", "--cellularBars", "4",
+      "--operatorName", "Joko", "--batteryState", "charged", "--batteryLevel", "100"],
+    result: ok() },
+    { args: ["simctl", "status_bar", UDID, "clear"], result: ok() }
+  );
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner: controls.runner });
+  await runtime.setPrivacy!(UDID.toLowerCase(), "grant", "camera", "app.joko.fixture");
+  await runtime.setPrivacy!(UDID, "reset", "all");
+  await runtime.setStatusBar!(UDID, { time: "09:41", dataNetwork: "5g", wifiMode: "active",
+    wifiBars: 3, cellularMode: "searching", cellularBars: 4, operatorName: "Joko",
+    batteryState: "charged", batteryLevel: 100 });
+  await runtime.clearStatusBar!(UDID);
+  expect(controls.remaining()).toBe(0);
+});
+
+it("rejects invalid privacy/status-bar controls before dispatch and fences unknown results", async () => {
+  const unused = scripted();
+  const runtime = createSimulatorLifecycleRuntime({ platform: "darwin", runner: unused.runner });
+  await expect(runtime.setPrivacy!(UDID, "grant", "camera"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setPrivacy!(UDID, "reset", "Camera"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setPrivacy!(UDID, "reset", "all", "invalid bundle"))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setStatusBar!(UDID, {}))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setStatusBar!(UDID, { wifiBars: 4 }))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  await expect(runtime.setStatusBar!(UDID, { time: "\n" }))
+    .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  expect(unused.calls).toEqual([]);
+
+  await expect(createSimulatorLifecycleRuntime({ platform: "win32", runner: unused.runner })
+    .clearStatusBar!(UDID)).rejects.toMatchObject({ code: "UNSUPPORTED_PLATFORM" });
+  expect(unused.calls).toEqual([]);
+
+  const rejected = scripted({ args: ["simctl", "privacy", UDID, "revoke", "camera", "app.joko.fixture"],
+    result: { stdout: "", stderr: "/private/secret", exitCode: 1 } });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: rejected.runner })
+    .setPrivacy!(UDID, "revoke", "camera", "app.joko.fixture"))
+    .rejects.toMatchObject({ code: "SIMULATOR_CONTROL_FAILED" });
+
+  const unknown = scripted({ args: ["simctl", "status_bar", UDID, "clear"],
+    result: { stdout: "", stderr: "/private/secret", exitCode: null, timedOut: true } });
+  await expect(createSimulatorLifecycleRuntime({ platform: "darwin", runner: unknown.runner })
+    .clearStatusBar!(UDID)).rejects.toMatchObject({ code: "SIMULATOR_CONTROL_UNKNOWN" });
+});

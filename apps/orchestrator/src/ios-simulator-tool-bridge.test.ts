@@ -371,7 +371,10 @@ it("publishes strict Simulator presentation and accessibility controls only with
       ...(action["type"] === "set_location" ? { latitude: action["latitude"],
         longitude: action["longitude"] } : {}),
       ...(action["type"] === "start_location_route" ? {
-        waypointCount: (action["waypoints"] as readonly unknown[]).length } : {}) } };
+        waypointCount: (action["waypoints"] as readonly unknown[]).length } : {}),
+      ...(action["type"] === "set_privacy" ? { action: action["action"],
+        service: action["service"], bundleId: action["bundleId"] ?? null } : {}),
+      ...(action["type"] === "set_status_bar" ? { overrides: action["overrides"] } : {}) } };
   } };
   const provider = new IosSimulatorToolBridgeProvider({
     store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
@@ -404,7 +407,10 @@ it("publishes strict Simulator presentation and accessibility controls only with
       expect.objectContaining({ name: "set_content_size", readOnly: false, via: "control_tool" }),
       expect.objectContaining({ name: "set_location", readOnly: false, via: "control_tool" }),
       expect.objectContaining({ name: "start_location_route", readOnly: false, via: "control_tool" }),
-      expect.objectContaining({ name: "clear_location", readOnly: false, via: "control_tool" })
+      expect.objectContaining({ name: "clear_location", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "set_privacy", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "set_status_bar", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "clear_status_bar", readOnly: false, via: "control_tool" })
     ]) });
   expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "LANDSCAPE" }))
     .toMatchObject({ ok: true, data: { interaction: "set_orientation", backend: "wda",
@@ -425,6 +431,18 @@ it("publishes strict Simulator presentation and accessibility controls only with
       data: { interaction: "start_location_route", waypointCount: 2 } });
   expect(await invoke("clear_location", route)).toMatchObject({ ok: true,
     data: { interaction: "clear_location", backend: "simctl" } });
+  expect(await invoke("set_privacy", { ...route, action: "grant", service: "camera",
+    bundleId: "app.joko.fixture" })).toMatchObject({ ok: true, data: {
+      interaction: "set_privacy", action: "grant", service: "camera",
+      bundleId: "app.joko.fixture" } });
+  const statusOverrides = { time: "09:41", dataNetwork: "5g", wifiMode: "active",
+    wifiBars: 3, cellularMode: "searching", cellularBars: 4, operatorName: "Joko",
+    batteryState: "charged", batteryLevel: 100 };
+  expect(await invoke("set_status_bar", { ...route, ...statusOverrides }))
+    .toMatchObject({ ok: true, data: { interaction: "set_status_bar",
+      overrides: statusOverrides } });
+  expect(await invoke("clear_status_bar", route)).toMatchObject({ ok: true,
+    data: { interaction: "clear_status_bar", backend: "simctl" } });
   expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "UPSIDE_DOWN" }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_appearance", { ...route, appearance: "blue" }))
@@ -441,9 +459,16 @@ it("publishes strict Simulator presentation and accessibility controls only with
   expect(await invoke("start_location_route", { ...route, waypoints: [
     { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
   ], intervalSeconds: 1, distanceMeters: 1 })).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_privacy", { ...route, action: "grant", service: "camera" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_privacy", { ...route, action: "reset", service: "Camera" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_status_bar", route)).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("set_status_bar", { ...route, wifiBars: 4 }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_appearance", { ...route, appearance: "light" }, scope))
     .toMatchObject({ errorCode: "STALE_SCOPE" });
-  expect(calls).toHaveLength(7);
+  expect(calls).toHaveLength(10);
   expect(calls.map(call => call.action)).toEqual([
     { type: "set_orientation", snapshotId, orientation: "LANDSCAPE" },
     { type: "set_appearance", appearance: "dark" },
@@ -453,17 +478,22 @@ it("publishes strict Simulator presentation and accessibility controls only with
     { type: "start_location_route", waypoints: [
       { latitude: 31.2304, longitude: 121.4737 }, { latitude: 31.233, longitude: 121.48 }
     ], speedMetersPerSecond: 12, intervalSeconds: 0.5 },
-    { type: "clear_location" }
+    { type: "clear_location" },
+    { type: "set_privacy", action: "grant", service: "camera", bundleId: "app.joko.fixture" },
+    { type: "set_status_bar", overrides: statusOverrides },
+    { type: "clear_status_bar" }
   ]);
   expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
     .structuredContent).toMatchObject({ data: { availability: {
       set_orientation: { state: "available", backend: "wda" },
       set_appearance: { state: "available", backend: "simctl" },
       set_location: { state: "available", backend: "simctl" },
-      clear_location: { state: "available", backend: "simctl" }
+      clear_location: { state: "available", backend: "simctl" },
+      set_privacy: { state: "available", backend: "simctl" },
+      clear_status_bar: { state: "available", backend: "simctl" }
     } } });
   ready = false;
   expect(await invoke("set_appearance", { ...route, appearance: "light" }))
     .toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
-  expect(calls).toHaveLength(7);
+  expect(calls).toHaveLength(10);
 });

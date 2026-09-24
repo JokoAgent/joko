@@ -199,6 +199,24 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
         stateChanges.push({ action: "clear_location", value: null,
           claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      setPrivacy: async (value, action, service, bundleId) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "set_privacy", value: { action, service, bundleId },
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      setStatusBar: async (value, overrides) => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "set_status_bar", value: overrides,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
+      },
+      clearStatusBar: async value => {
+        expect(value).toBe(udid);
+        stateChanges.push({ action: "clear_status_bar", value: null,
+          claimed: application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_state_control") });
       } },
     driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
       manager: { get: () => active,
@@ -295,6 +313,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
           action?: string; backend?: string; screenMapInvalidated?: boolean;
           interaction?: string; appearance?: string; enabled?: boolean; contentSize?: string;
           latitude?: number; longitude?: number; waypointCount?: number;
+          service?: string; bundleId?: string | null; overrides?: Record<string, unknown>;
           mode?: string; replayed?: boolean;
           viewport?: { width: number; height: number; orientation: string };
           audit?: { violationCount: number }; diff?: { baselineSnapshotId: string;
@@ -316,7 +335,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       tap: { state: "available", backend: "wda" }, press_home: { state: "available" },
       set_orientation: { state: "available", backend: "wda" },
       set_appearance: { state: "available", backend: "simctl" },
-      set_location: { state: "available", backend: "simctl" }
+      set_location: { state: "available", backend: "simctl" },
+      set_privacy: { state: "available", backend: "simctl" }
     } });
     const route = { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
     const mapped = await call("control_tool", "get_screen_map", route);
@@ -454,6 +474,20 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(await call("control_tool", "clear_location", route)).toMatchObject({ isError: false,
       details: { mcpStructuredContent: { data: { interaction: "clear_location",
         backend: "simctl", screenMapInvalidated: true } } } });
+    expect(await call("control_tool", "set_privacy", { ...route, action: "grant",
+      service: "camera", bundleId: "app.joko.fixture" })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { interaction: "set_privacy", action: "grant",
+          service: "camera", bundleId: "app.joko.fixture", screenMapInvalidated: true } } } });
+    const statusOverrides = { time: "09:41", dataNetwork: "5g", wifiMode: "active",
+      wifiBars: 3, cellularMode: "searching", cellularBars: 4, operatorName: "Joko",
+      batteryState: "charged", batteryLevel: 100 };
+    expect(await call("control_tool", "set_status_bar", { ...route, ...statusOverrides }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        interaction: "set_status_bar", overrides: statusOverrides, screenMapInvalidated: true
+      } } } });
+    expect(await call("control_tool", "clear_status_bar", route)).toMatchObject({ isError: false,
+      details: { mcpStructuredContent: { data: { interaction: "clear_status_bar",
+        backend: "simctl", screenMapInvalidated: true } } } });
     expect(inputs.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/actions",
@@ -472,7 +506,11 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
         { latitude: 31.2304, longitude: 121.4737 },
         { latitude: 31.233, longitude: 121.48 }
       ], speedMetersPerSecond: 12, intervalSeconds: 0.5 }, claimed: true },
-      { action: "clear_location", value: null, claimed: true }
+      { action: "clear_location", value: null, claimed: true },
+      { action: "set_privacy", value: { action: "grant", service: "camera",
+        bundleId: "app.joko.fixture" }, claimed: true },
+      { action: "set_status_bar", value: statusOverrides, claimed: true },
+      { action: "clear_status_bar", value: null, claimed: true }
     ]);
     const inputOperations = application.store.listOperations({ sessionId: "simulator-task" })
       .filter(operation => operation.kind === "ios_simulator_input")
@@ -482,7 +520,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(JSON.stringify(inputOperations)).not.toContain(secret);
     expect(JSON.stringify(inputOperations)).not.toContain(batchSecret);
     expect(application.store.listOperations({ sessionId: "simulator-task" })
-      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(7);
+      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(10);
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,
       generation: instance.generation, leaseId: instance.lease.id });
     expect(detached).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {

@@ -4,7 +4,8 @@ import { JokoError } from "@joko/core";
 import { createSimulatorLifecycleRuntime, SimulatorLifecycleError, SimulatorScreenMapError,
   WdaClientError, type SimulatorAppearance, type SimulatorContentSize,
   type SimulatorLifecycleRuntime, type SimulatorLocationRouteOptions,
-  type SimulatorLocationWaypoint, type WdaViewport } from "@joko/tool-ios-simulator";
+  type SimulatorLocationWaypoint, type SimulatorPrivacyAction,
+  type SimulatorStatusBarOverrides, type WdaViewport } from "@joko/tool-ios-simulator";
 import { SimulatorDriverError, type SimulatorDriverCoordinator } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorObservationError,
   type SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
@@ -22,6 +23,18 @@ const CONTENT_SIZES = new Set<SimulatorContentSize>([
   "accessibility-extra-large", "accessibility-extra-extra-large",
   "accessibility-extra-extra-extra-large"
 ]);
+const PRIVACY_SERVICE = /^[a-z][a-z0-9-]{0,63}$/u;
+const BUNDLE_ID = /^[A-Za-z0-9][A-Za-z0-9.-]{1,254}$/u;
+const STATUS_BAR_KEYS = new Set([
+  "time", "dataNetwork", "wifiMode", "wifiBars", "cellularMode", "cellularBars",
+  "operatorName", "batteryState", "batteryLevel"
+]);
+const STATUS_BAR_DATA_NETWORKS = new Set([
+  "hide", "wifi", "3g", "4g", "lte", "lte-a", "lte+", "5g", "5g+", "5g-uwb", "5g-uc"
+]);
+const STATUS_BAR_WIFI_MODES = new Set(["searching", "failed", "active"]);
+const STATUS_BAR_CELLULAR_MODES = new Set(["notSupported", "searching", "failed", "active"]);
+const STATUS_BAR_BATTERY_STATES = new Set(["charging", "charged", "discharging"]);
 const CONFLICTING_KINDS = new Set([
   KIND, "ios_simulator_instance_control", "ios_simulator_create", "ios_simulator_lifecycle",
   "ios_simulator_driver", "ios_simulator_input", "ios_simulator_grace_cleanup",
@@ -33,7 +46,8 @@ type StateScreen = Pick<SimulatorScreenObservationCoordinator,
   "requireInteractionSnapshot" | "invalidateInteraction" | "invalidateRoute">;
 type StateLifecycle = Pick<SimulatorLifecycleRuntime,
   "setAppearance" | "setIncreaseContrast" | "setContentSize" | "setLocation" |
-  "startLocationRoute" | "clearLocation">;
+  "startLocationRoute" | "clearLocation" | "setPrivacy" | "setStatusBar" |
+  "clearStatusBar">;
 
 export type SimulatorStateControlAction =
   | { readonly type: "set_orientation"; readonly snapshotId: string;
@@ -45,7 +59,11 @@ export type SimulatorStateControlAction =
   | { readonly type: "start_location_route"; readonly waypoints: readonly SimulatorLocationWaypoint[];
       readonly speedMetersPerSecond?: number; readonly intervalSeconds?: number;
       readonly distanceMeters?: number }
-  | { readonly type: "clear_location" };
+  | { readonly type: "clear_location" }
+  | { readonly type: "set_privacy"; readonly action: SimulatorPrivacyAction;
+      readonly service: string; readonly bundleId?: string }
+  | { readonly type: "set_status_bar"; readonly overrides: SimulatorStatusBarOverrides }
+  | { readonly type: "clear_status_bar" };
 
 export interface SimulatorStateControlReceipt {
   readonly interaction: SimulatorStateControlAction["type"];
@@ -62,6 +80,10 @@ export interface SimulatorStateControlReceipt {
   readonly latitude?: number;
   readonly longitude?: number;
   readonly waypointCount?: number;
+  readonly action?: SimulatorPrivacyAction;
+  readonly service?: string;
+  readonly bundleId?: string | null;
+  readonly overrides?: SimulatorStatusBarOverrides;
 }
 
 export interface SimulatorStateControlExecution {
@@ -153,7 +175,10 @@ export class SimulatorStateControlCoordinator {
             action.type === "set_content_size" && !this.#lifecycle.setContentSize ||
             action.type === "set_location" && !this.#lifecycle.setLocation ||
             action.type === "start_location_route" && !this.#lifecycle.startLocationRoute ||
-            action.type === "clear_location" && !this.#lifecycle.clearLocation) {
+            action.type === "clear_location" && !this.#lifecycle.clearLocation ||
+            action.type === "set_privacy" && !this.#lifecycle.setPrivacy ||
+            action.type === "set_status_bar" && !this.#lifecycle.setStatusBar ||
+            action.type === "clear_status_bar" && !this.#lifecycle.clearStatusBar) {
           throw new SimulatorStateControlError("CONTROL_UNAVAILABLE",
             "Simulator system setting control is unavailable.");
         }
@@ -222,9 +247,23 @@ export class SimulatorStateControlCoordinator {
         };
         await this.#lifecycle.startLocationRoute!(instance.simulatorUdid, options, signal);
         result = { backend: "simctl", waypointCount: action.waypoints.length };
-      } else {
+      } else if (action.type === "clear_location") {
         attempted = true;
         await this.#lifecycle.clearLocation!(instance.simulatorUdid, signal);
+        result = { backend: "simctl" };
+      } else if (action.type === "set_privacy") {
+        attempted = true;
+        await this.#lifecycle.setPrivacy!(instance.simulatorUdid, action.action,
+          action.service, action.bundleId, signal);
+        result = { backend: "simctl", action: action.action, service: action.service,
+          bundleId: action.bundleId ?? null };
+      } else if (action.type === "set_status_bar") {
+        attempted = true;
+        await this.#lifecycle.setStatusBar!(instance.simulatorUdid, action.overrides, signal);
+        result = { backend: "simctl", overrides: action.overrides };
+      } else {
+        attempted = true;
+        await this.#lifecycle.clearStatusBar!(instance.simulatorUdid, signal);
         result = { backend: "simctl" };
       }
       const current = this.#ownership.requireRoute(scope, route);
@@ -303,6 +342,19 @@ export class SimulatorStateControlCoordinator {
       }
     } else if (action.type === "clear_location") {
       // The exact route and effect authority are the complete request shape.
+    } else if (action.type === "set_privacy") {
+      if (action.action !== "grant" && action.action !== "revoke" && action.action !== "reset" ||
+          typeof action.service !== "string" || !PRIVACY_SERVICE.test(action.service) ||
+          action.bundleId !== undefined && (typeof action.bundleId !== "string" ||
+            !BUNDLE_ID.test(action.bundleId)) ||
+          action.action !== "reset" && action.bundleId === undefined) {
+        throw new SimulatorStateControlError("INVALID_ARGUMENT",
+          "Simulator privacy control is invalid.");
+      }
+    } else if (action.type === "set_status_bar") {
+      this.#validateStatusBar(action.overrides);
+    } else if (action.type === "clear_status_bar") {
+      // The exact route and effect authority are the complete request shape.
     } else {
       throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator state control is invalid.");
     }
@@ -312,6 +364,32 @@ export class SimulatorStateControlCoordinator {
     if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
         !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
       throw new SimulatorStateControlError("INVALID_ARGUMENT", `${label} is invalid.`);
+    }
+  }
+
+  #validateStatusBar(overrides: SimulatorStatusBarOverrides): void {
+    if (!overrides || typeof overrides !== "object" || Array.isArray(overrides) ||
+        Object.keys(overrides).some(key => !STATUS_BAR_KEYS.has(key))) {
+      throw new SimulatorStateControlError("INVALID_ARGUMENT",
+        "Simulator status-bar overrides are invalid.");
+    }
+    if (overrides.time !== undefined && (typeof overrides.time !== "string" ||
+        !overrides.time.trim() || overrides.time.length > 128 || /[\0\r\n]/u.test(overrides.time)) ||
+        overrides.dataNetwork !== undefined && !STATUS_BAR_DATA_NETWORKS.has(overrides.dataNetwork) ||
+        overrides.wifiMode !== undefined && !STATUS_BAR_WIFI_MODES.has(overrides.wifiMode) ||
+        overrides.wifiBars !== undefined && (!Number.isInteger(overrides.wifiBars) ||
+          overrides.wifiBars < 0 || overrides.wifiBars > 3) ||
+        overrides.cellularMode !== undefined && !STATUS_BAR_CELLULAR_MODES.has(overrides.cellularMode) ||
+        overrides.cellularBars !== undefined && (!Number.isInteger(overrides.cellularBars) ||
+          overrides.cellularBars < 0 || overrides.cellularBars > 4) ||
+        overrides.operatorName !== undefined && (typeof overrides.operatorName !== "string" ||
+          overrides.operatorName.length > 128 || /[\0\r\n]/u.test(overrides.operatorName)) ||
+        overrides.batteryState !== undefined && !STATUS_BAR_BATTERY_STATES.has(overrides.batteryState) ||
+        overrides.batteryLevel !== undefined && (!Number.isInteger(overrides.batteryLevel) ||
+          overrides.batteryLevel < 0 || overrides.batteryLevel > 100) ||
+        !Object.values(overrides).some(value => value !== undefined)) {
+      throw new SimulatorStateControlError("INVALID_ARGUMENT",
+        "Simulator status-bar overrides are invalid.");
     }
   }
 

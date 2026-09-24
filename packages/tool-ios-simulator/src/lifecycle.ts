@@ -28,6 +28,11 @@ export interface SimulatorLifecycleRuntime {
   startLocationRoute?(udid: string, options: SimulatorLocationRouteOptions,
     signal?: AbortSignal): Promise<void>;
   clearLocation?(udid: string, signal?: AbortSignal): Promise<void>;
+  setPrivacy?(udid: string, action: SimulatorPrivacyAction, service: string,
+    bundleId?: string, signal?: AbortSignal): Promise<void>;
+  setStatusBar?(udid: string, overrides: SimulatorStatusBarOverrides,
+    signal?: AbortSignal): Promise<void>;
+  clearStatusBar?(udid: string, signal?: AbortSignal): Promise<void>;
 }
 
 export type SimulatorAppearance = "light" | "dark";
@@ -45,6 +50,23 @@ export interface SimulatorLocationRouteOptions {
   readonly intervalSeconds?: number;
   readonly distanceMeters?: number;
 }
+export type SimulatorPrivacyAction = "grant" | "revoke" | "reset";
+export type SimulatorStatusBarDataNetwork = "hide" | "wifi" | "3g" | "4g" | "lte" |
+  "lte-a" | "lte+" | "5g" | "5g+" | "5g-uwb" | "5g-uc";
+export type SimulatorStatusBarWifiMode = "searching" | "failed" | "active";
+export type SimulatorStatusBarCellularMode = "notSupported" | "searching" | "failed" | "active";
+export type SimulatorStatusBarBatteryState = "charging" | "charged" | "discharging";
+export interface SimulatorStatusBarOverrides {
+  readonly time?: string;
+  readonly dataNetwork?: SimulatorStatusBarDataNetwork;
+  readonly wifiMode?: SimulatorStatusBarWifiMode;
+  readonly wifiBars?: number;
+  readonly cellularMode?: SimulatorStatusBarCellularMode;
+  readonly cellularBars?: number;
+  readonly operatorName?: string;
+  readonly batteryState?: SimulatorStatusBarBatteryState;
+  readonly batteryLevel?: number;
+}
 
 const CONTENT_SIZES = new Set<SimulatorContentSize>([
   "extra-small", "small", "medium", "large", "extra-large", "extra-extra-large",
@@ -57,6 +79,24 @@ const LOCATION_ROUTE_LIMITS = Object.freeze({
   intervalSeconds: 86_400,
   distanceMeters: 10_000_000
 });
+const PRIVACY_SERVICE = /^[a-z][a-z0-9-]{0,63}$/u;
+const BUNDLE_ID = /^[A-Za-z0-9][A-Za-z0-9.-]{1,254}$/u;
+const STATUS_BAR_KEYS = new Set([
+  "time", "dataNetwork", "wifiMode", "wifiBars", "cellularMode", "cellularBars",
+  "operatorName", "batteryState", "batteryLevel"
+]);
+const STATUS_BAR_DATA_NETWORKS = new Set<SimulatorStatusBarDataNetwork>([
+  "hide", "wifi", "3g", "4g", "lte", "lte-a", "lte+", "5g", "5g+", "5g-uwb", "5g-uc"
+]);
+const STATUS_BAR_WIFI_MODES = new Set<SimulatorStatusBarWifiMode>([
+  "searching", "failed", "active"
+]);
+const STATUS_BAR_CELLULAR_MODES = new Set<SimulatorStatusBarCellularMode>([
+  "notSupported", "searching", "failed", "active"
+]);
+const STATUS_BAR_BATTERY_STATES = new Set<SimulatorStatusBarBatteryState>([
+  "charging", "charged", "discharging"
+]);
 
 export interface SimulatorLifecycleClock {
   now(): number;
@@ -86,6 +126,76 @@ function cancelled(signal?: AbortSignal): void {
 
 function commandUnknown(result: SimulatorCommandResult): boolean {
   return result.timedOut === true || result.aborted === true || result.outputTruncated === true;
+}
+
+function statusBarArguments(overrides: SimulatorStatusBarOverrides): string[] {
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides) ||
+      Object.keys(overrides).some(key => !STATUS_BAR_KEYS.has(key))) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator status-bar overrides are invalid.");
+  }
+  const args: string[] = [];
+  const add = (key: string, value: string | number | undefined): void => {
+    if (value !== undefined) args.push(`--${key}`, String(value));
+  };
+  if (overrides.time !== undefined) {
+    if (typeof overrides.time !== "string" || !overrides.time.trim() ||
+        overrides.time.length > 128 || /[\0\r\n]/u.test(overrides.time)) {
+      throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator status-bar time is invalid.");
+    }
+    add("time", overrides.time);
+  }
+  if (overrides.dataNetwork !== undefined &&
+      !STATUS_BAR_DATA_NETWORKS.has(overrides.dataNetwork)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+      "Simulator status-bar data network is invalid.");
+  }
+  add("dataNetwork", overrides.dataNetwork);
+  if (overrides.wifiMode !== undefined && !STATUS_BAR_WIFI_MODES.has(overrides.wifiMode)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator status-bar Wi-Fi mode is invalid.");
+  }
+  add("wifiMode", overrides.wifiMode);
+  if (overrides.cellularMode !== undefined &&
+      !STATUS_BAR_CELLULAR_MODES.has(overrides.cellularMode)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+      "Simulator status-bar cellular mode is invalid.");
+  }
+  add("cellularMode", overrides.cellularMode);
+  if (overrides.wifiBars !== undefined && (!Number.isInteger(overrides.wifiBars) ||
+      overrides.wifiBars < 0 || overrides.wifiBars > 3)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator status-bar Wi-Fi bars are invalid.");
+  }
+  add("wifiBars", overrides.wifiBars);
+  if (overrides.cellularBars !== undefined && (!Number.isInteger(overrides.cellularBars) ||
+      overrides.cellularBars < 0 || overrides.cellularBars > 4)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+      "Simulator status-bar cellular bars are invalid.");
+  }
+  add("cellularBars", overrides.cellularBars);
+  if (overrides.operatorName !== undefined) {
+    if (typeof overrides.operatorName !== "string" || overrides.operatorName.length > 128 ||
+        /[\0\r\n]/u.test(overrides.operatorName)) {
+      throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+        "Simulator status-bar operator name is invalid.");
+    }
+    add("operatorName", overrides.operatorName);
+  }
+  if (overrides.batteryState !== undefined &&
+      !STATUS_BAR_BATTERY_STATES.has(overrides.batteryState)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+      "Simulator status-bar battery state is invalid.");
+  }
+  add("batteryState", overrides.batteryState);
+  if (overrides.batteryLevel !== undefined && (!Number.isInteger(overrides.batteryLevel) ||
+      overrides.batteryLevel < 0 || overrides.batteryLevel > 100)) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+      "Simulator status-bar battery level is invalid.");
+  }
+  add("batteryLevel", overrides.batteryLevel);
+  if (args.length === 0) {
+    throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+      "At least one Simulator status-bar override is required.");
+  }
+  return args;
 }
 
 /** Exact-UDID simctl lifecycle I/O. External effects are admitted by the caller. */
@@ -157,11 +267,12 @@ export function createSimulatorLifecycleRuntime(options: {
     }
   }
 
-  async function runLocationControl(udid: string, args: readonly string[],
+  async function runSimctlControl(udid: string, family: "location" | "privacy" | "status_bar",
+    args: readonly string[],
     failureMessage: string, signal?: AbortSignal): Promise<void> {
     requirePlatform();
     const normalized = exactUdid(udid);
-    const result = await runMutation(["simctl", "location", normalized, ...args], 15_000,
+    const result = await runMutation(["simctl", family, normalized, ...args], 15_000,
       "SIMULATOR_CONTROL_UNKNOWN", signal);
     if (result.exitCode !== 0 || result.failed) {
       throw new SimulatorLifecycleError("SIMULATOR_CONTROL_FAILED", failureMessage);
@@ -308,7 +419,7 @@ export function createSimulatorLifecycleRuntime(options: {
     },
     async setLocation(udid, latitude, longitude, signal) {
       const point = locationWaypoint(latitude, longitude);
-      await runLocationControl(udid, ["set", `${point.latitude},${point.longitude}`],
+      await runSimctlControl(udid, "location", ["set", `${point.latitude},${point.longitude}`],
         "Simulator location could not be changed.", signal);
     },
     async startLocationRoute(udid, options, signal) {
@@ -323,12 +434,38 @@ export function createSimulatorLifecycleRuntime(options: {
         args.push(`--interval=${route.intervalSeconds}`);
       }
       args.push(...route.waypoints.map(point => `${point.latitude},${point.longitude}`));
-      await runLocationControl(udid, args,
+      await runSimctlControl(udid, "location", args,
         "Simulator location route could not be started.", signal);
     },
     async clearLocation(udid, signal) {
-      await runLocationControl(udid, ["clear"],
+      await runSimctlControl(udid, "location", ["clear"],
         "Simulator location could not be cleared.", signal);
+    },
+    async setPrivacy(udid, action, service, bundleId, signal) {
+      if (action !== "grant" && action !== "revoke" && action !== "reset") {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator privacy action is invalid.");
+      }
+      if (typeof service !== "string" || !PRIVACY_SERVICE.test(service)) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator privacy service is invalid.");
+      }
+      if (bundleId !== undefined && (typeof bundleId !== "string" || !BUNDLE_ID.test(bundleId))) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT", "Simulator bundle identity is invalid.");
+      }
+      if (action !== "reset" && bundleId === undefined) {
+        throw new SimulatorLifecycleError("INVALID_ARGUMENT",
+          "Simulator privacy grant and revoke require a bundle identity.");
+      }
+      await runSimctlControl(udid, "privacy", [action, service,
+        ...(bundleId === undefined ? [] : [bundleId])],
+        "Simulator privacy setting could not be changed.", signal);
+    },
+    async setStatusBar(udid, overrides, signal) {
+      await runSimctlControl(udid, "status_bar", ["override", ...statusBarArguments(overrides)],
+        "Simulator status bar could not be overridden.", signal);
+    },
+    async clearStatusBar(udid, signal) {
+      await runSimctlControl(udid, "status_bar", ["clear"],
+        "Simulator status bar override could not be cleared.", signal);
     }
   };
 }

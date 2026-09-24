@@ -1,7 +1,8 @@
 import { OperationalStore } from "@joko/store";
 import { SimulatorLifecycleError, WdaClientError,
   type SimulatorAppearance, type SimulatorContentSize,
-  type SimulatorLocationRouteOptions } from "@joko/tool-ios-simulator";
+  type SimulatorLocationRouteOptions, type SimulatorPrivacyAction,
+  type SimulatorStatusBarOverrides } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance } from "./ios-simulator-ownership.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
@@ -47,6 +48,9 @@ function fixture() {
   let location = async (latitude: number, longitude: number) => {
     calls.push({ type: "location", value: { latitude, longitude }, claimed: hasClaim(store) });
   };
+  let privacy = async (action: SimulatorPrivacyAction, service: string, bundleId?: string) => {
+    calls.push({ type: "privacy", value: { action, service, bundleId }, claimed: hasClaim(store) });
+  };
   const driver = {
     isReady: () => true,
     observeAccessibilityTree: async () => ({ capturedAt: new Date().toISOString(),
@@ -72,6 +76,14 @@ function fixture() {
     },
     clearLocation: async () => {
       calls.push({ type: "clear_location", value: null, claimed: hasClaim(store) });
+    },
+    setPrivacy: (_udid: string, action: SimulatorPrivacyAction, service: string, bundleId?: string) =>
+      privacy(action, service, bundleId),
+    setStatusBar: async (_udid: string, overrides: SimulatorStatusBarOverrides) => {
+      calls.push({ type: "status_bar", value: overrides, claimed: hasClaim(store) });
+    },
+    clearStatusBar: async () => {
+      calls.push({ type: "clear_status_bar", value: null, claimed: hasClaim(store) });
     }
   };
   const state = new SimulatorStateControlCoordinator(store, ownership, driver, screen, lifecycle,
@@ -79,7 +91,8 @@ function fixture() {
   return { store, ownership, instance, screen, state, calls,
     setOrientation: (value: typeof orientation) => { orientation = value; },
     setAppearance: (value: typeof appearance) => { appearance = value; },
-    setLocation: (value: typeof location) => { location = value; } };
+    setLocation: (value: typeof location) => { location = value; },
+    setPrivacy: (value: typeof privacy) => { privacy = value; } };
 }
 
 function hasClaim(store: OperationalStore): boolean {
@@ -119,6 +132,15 @@ it("claims each state change, rotates from the current snapshot and does not rep
     ], speedMetersPerSecond: 12, intervalSeconds: 0.5 };
     await h.state.execute(SCOPE, route(h.instance), routeAction, authority("7"));
     await h.state.execute(SCOPE, route(h.instance), { type: "clear_location" }, authority("8"));
+    await h.state.execute(SCOPE, route(h.instance), { type: "set_privacy", action: "grant",
+      service: "camera", bundleId: "app.joko.fixture" }, authority("9"));
+    const statusOverrides = { time: "09:41", dataNetwork: "5g" as const,
+      wifiMode: "active" as const, wifiBars: 3, cellularMode: "searching" as const,
+      cellularBars: 4, operatorName: "Joko", batteryState: "charged" as const,
+      batteryLevel: 100 };
+    await h.state.execute(SCOPE, route(h.instance),
+      { type: "set_status_bar", overrides: statusOverrides }, authority("0"));
+    await h.state.execute(SCOPE, route(h.instance), { type: "clear_status_bar" }, authority("6"));
     expect(h.calls.slice(1)).toEqual([
       { type: "appearance", value: "dark", claimed: true },
       { type: "contrast", value: true, claimed: true },
@@ -129,16 +151,26 @@ it("claims each state change, rotates from the current snapshot and does not rep
           { latitude: 31.233, longitude: 121.48 }],
         speedMetersPerSecond: 12, intervalSeconds: 0.5, distanceMeters: undefined
       }, claimed: true },
-      { type: "clear_location", value: null, claimed: true }
+      { type: "clear_location", value: null, claimed: true },
+      { type: "privacy", value: { action: "grant", service: "camera",
+        bundleId: "app.joko.fixture" }, claimed: true },
+      { type: "status_bar", value: statusOverrides, claimed: true },
+      { type: "clear_status_bar", value: null, claimed: true }
     ]);
     expect(h.store.listOperations({ sessionId: SCOPE.sessionId })
-      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(8);
+      .filter(operation => operation.kind === "ios_simulator_state_control")).toHaveLength(11);
     await expect(h.state.execute(SCOPE, route(h.instance), {
       type: "start_location_route", waypoints: [
         { latitude: 0, longitude: 0 }, { latitude: 1, longitude: 1 }
       ], intervalSeconds: 1, distanceMeters: 1
-    }, authority("9"))).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
-    expect(h.calls).toHaveLength(7);
+    }, authority("3"))).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await expect(h.state.execute(SCOPE, route(h.instance),
+      { type: "set_status_bar", overrides: {} }, authority("4")))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await expect(h.state.execute(SCOPE, route(h.instance),
+      { type: "set_privacy", action: "grant", service: "camera" }, authority("2")))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(h.calls).toHaveLength(10);
   } finally { h.store.close(); }
 });
 
@@ -154,9 +186,10 @@ it("serializes with input and fences an uncertain simctl result from replay", as
       new Error("Controlled input interruption."));
 
     let calls = 0;
-    h.setLocation(async () => { calls += 1;
+    h.setPrivacy(async () => { calls += 1;
       throw new SimulatorLifecycleError("SIMULATOR_CONTROL_UNKNOWN", "private host detail"); });
-    const action = { type: "set_location" as const, latitude: 0, longitude: 0 };
+    const action = { type: "set_privacy" as const, action: "revoke" as const,
+      service: "camera", bundleId: "app.joko.fixture" };
     await expect(h.state.execute(SCOPE, route(h.instance), action, authority("1")))
       .rejects.toMatchObject({ code: "STATE_OUTCOME_UNKNOWN" });
     await expect(h.state.execute(SCOPE, route(h.instance), action, authority("1")))
