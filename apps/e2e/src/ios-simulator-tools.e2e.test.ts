@@ -661,6 +661,8 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
           drivers?: { state: string; instances: readonly { state: string }[] };
           screenMap?: Record<string, unknown> & { snapshotId: string;
             elements?: readonly { elementId: string; label: string }[] };
+          diagnosticsId?: string; diagnostics?: { diagnosticsId: string; data: Record<string, unknown> };
+          health?: { ready: boolean }; orientation?: string; stream?: unknown;
           observation?: { mode: string; screenMap: Record<string, unknown> & {
             snapshotId: string; elements: readonly { elementId: string; label: string }[] } } | null;
           action?: string; backend?: string; screenMapInvalidated?: boolean;
@@ -702,6 +704,43 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       viewport: { width: 393, height: 852, orientation: "PORTRAIT" }
     } } } });
     expect(JSON.stringify(mapped)).not.toContain("driver-only");
+    const state = await call("control_tool", "capture_state", route);
+    expect(state).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      instance: { instanceId: instance.instanceId }, health: { ready: true },
+      orientation: "PORTRAIT", screenMap: { elements: [{ label: "Continue" }] },
+      stream: null, driverDiagnostics: { running: true, logTail: "" },
+      diagnosticsId: expect.any(String)
+    } } } });
+    const stateDiagnosticsId = state.details.mcpStructuredContent.data!.diagnosticsId!;
+    const stateReadback = await call("call_tool", "get_diagnostics", { diagnosticsId: stateDiagnosticsId });
+    expect(stateReadback).toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+      diagnostics: { diagnosticsId: stateDiagnosticsId, data: {
+        screenMap: { elementCount: 1 }, health: { ready: true }, stream: null
+      } }
+    } } } });
+    expect(JSON.stringify(stateReadback)).not.toContain("Continue");
+    expect(await call("call_tool", "get_diagnostics", { diagnosticsId: randomUUID() }))
+      .toMatchObject({ isError: true, details: { mcpStructuredContent: {
+        errorCode: "INVALID_ARGUMENT" } } });
+    application.store.createSession({ id: "other-simulator-task", backendId: target.backendId,
+      targetId: target.id, title: "Other Simulator task",
+      binding: { opaqueRef: "other-simulator-task-native", generation: 1 }, pinned: false,
+      archived: false, permissionMode: "ask", planMode: false, fastMode: false,
+      createdAt: Date.now(), updatedAt: Date.now() });
+    const otherSnapshot = application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${url}/internal/mcp`,
+      sessionId: "other-simulator-task", targetId: target.id, expectedPiGeneration: 1 });
+    try {
+      const response = await fetch(`${url}/internal/mcp`, { method: "POST", headers: {
+        authorization: `Bearer ${otherSnapshot.mcpBridge.token}`, "content-type": "application/json",
+        "x-joko-pi-generation": "1"
+      }, body: JSON.stringify({ requestId: randomUUID(), sessionId: "other-simulator-task",
+        targetId: target.id, generation: 1, serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
+        toolName: "call_tool", arguments: { name: "get_diagnostics",
+          args: { diagnosticsId: stateDiagnosticsId } } }) });
+      expect(response.ok).toBe(true);
+      expect(await response.json()).toMatchObject({ isError: true, details: {
+        mcpStructuredContent: { errorCode: "INVALID_ARGUMENT" } } });
+    } finally { otherSnapshot.revoke(); }
     const baseline = mapped.details.mcpStructuredContent.data!.screenMap!;
     expect(await call("control_tool", "audit_accessibility", { ...route })).toMatchObject({
       isError: false, details: { mcpStructuredContent: { data: {
@@ -912,6 +951,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       instance: { viewerState: "detached", graceExpiresAt: null }
     } } } });
     expect((await call("control_tool", "get_screen_map", route)).isError).toBe(true);
+    expect(await call("call_tool", "get_diagnostics", { diagnosticsId: stateDiagnosticsId }))
+      .toMatchObject({ isError: true, details: { mcpStructuredContent: {
+        errorCode: "INVALID_ARGUMENT" } } });
     expect(events).toEqual(["retry-cleanup", "orphan-cleanup", "driver-start", "driver-stop",
       "retry-cleanup", "orphan-cleanup"]);
     expect((await call("call_tool", "list_instances", {})).details.mcpStructuredContent.data)

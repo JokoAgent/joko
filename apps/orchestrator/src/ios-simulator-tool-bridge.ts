@@ -24,6 +24,7 @@ import { SimulatorAppControlError, type SimulatorAppControlCoordinator,
 import { SimulatorUrlControlError, type SimulatorUrlControlCoordinator } from "./ios-simulator-url-control.js";
 import { SimulatorScreenshotError, type SimulatorScreenshotCoordinator } from "./ios-simulator-screenshot.js";
 import { SimulatorVisualComparisonError, type SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
+import { SimulatorStateDiagnosticsError, type SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
 
 export const IOS_SIMULATOR_TOOL_PROVIDER_ID = "joko_ios_simulator";
 const CATEGORY = "ios_simulator";
@@ -54,6 +55,14 @@ const TOOLS = Object.freeze([
 
 const BUILD_READ_TOOLS = Object.freeze([
   { name: "read_build_diagnostics", description: "Read a bounded task-owned build log or Xcode result chunk.", readOnly: true }
+] as const);
+
+const STATE_READ_TOOLS = Object.freeze([
+  { name: "get_diagnostics", description: "Read a bounded task-owned Simulator state diagnostics entry.", readOnly: true }
+] as const);
+
+const STATE_OBSERVATION_TOOLS = Object.freeze([
+  { name: "capture_state", description: "Capture current driver health, orientation, screen map and stream availability for the exact Simulator.", readOnly: true }
 ] as const);
 
 const BUILD_TOOLS = Object.freeze([
@@ -127,7 +136,7 @@ const STATE_TOOLS = Object.freeze([
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
   stateControl: boolean, projectBuild: boolean, appInstall: boolean,
   appControl: boolean, urlControl: boolean, screenshot: boolean,
-  visual: boolean): readonly McpToolDescriptor[] {
+  visual: boolean, stateDiagnostics: boolean): readonly McpToolDescriptor[] {
   const tools: McpToolDescriptor[] = [{
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "list_tools",
@@ -139,12 +148,13 @@ function bridgeTools(control: boolean, screen: boolean, input: boolean,
     name: "call_tool",
     description: "Call one validated read-only task-local iOS Simulator tool.",
     inputSchema: { type: "object", properties: {
-      name: { type: "string", enum: [...TOOLS, ...(projectBuild ? BUILD_READ_TOOLS : [])].map(tool => tool.name) },
+      name: { type: "string", enum: [...TOOLS, ...(projectBuild ? BUILD_READ_TOOLS : []),
+        ...(stateDiagnostics ? STATE_READ_TOOLS : [])].map(tool => tool.name) },
       args: { type: "object", additionalProperties: true }
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: false
   }];
-  if (control || screen || input || stateControl || projectBuild || appInstall || appControl || urlControl || screenshot || visual) tools.push({
+  if (control || screen || input || stateControl || projectBuild || appInstall || appControl || urlControl || screenshot || visual || stateDiagnostics) tools.push({
     serverId: IOS_SIMULATOR_TOOL_PROVIDER_ID,
     name: "control_tool",
     description: "Call one validated task-local iOS Simulator control or screen observation with the current task's permission.",
@@ -154,7 +164,8 @@ function bridgeTools(control: boolean, screen: boolean, input: boolean,
         ...(stateControl ? STATE_TOOLS : []), ...(projectBuild ? BUILD_TOOLS : []),
         ...(appInstall ? INSTALL_TOOLS : []), ...(appControl ? APP_CONTROL_TOOLS : []),
         ...(urlControl ? URL_TOOLS : []), ...(screenshot ? SCREENSHOT_TOOLS : []),
-        ...(visual ? VISUAL_TOOLS : [])].map(tool => tool.name) },
+        ...(visual ? VISUAL_TOOLS : []),
+        ...(stateDiagnostics ? STATE_OBSERVATION_TOOLS : [])].map(tool => tool.name) },
       args: { type: "object", additionalProperties: true }
     }, required: ["name", "args"], additionalProperties: false },
     requiresPermission: true
@@ -186,6 +197,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly #urlControl: SimulatorUrlControlCoordinator | undefined;
   readonly #screenshot: SimulatorScreenshotCoordinator | undefined;
   readonly #visual: SimulatorVisualComparisonCoordinator | undefined;
+  readonly #stateDiagnostics: SimulatorStateDiagnosticsCoordinator | undefined;
   readonly #memoryProbe: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
 
   constructor(options: {
@@ -201,6 +213,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     readonly urlControl?: SimulatorUrlControlCoordinator;
     readonly screenshot?: SimulatorScreenshotCoordinator;
     readonly visual?: SimulatorVisualComparisonCoordinator;
+    readonly stateDiagnostics?: SimulatorStateDiagnosticsCoordinator;
     readonly runtime?: SimulatorEnvironmentRuntime;
     readonly memoryProbe?: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
   }) {
@@ -216,11 +229,13 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#urlControl = options.urlControl;
     this.#screenshot = options.screenshot;
     this.#visual = options.visual;
+    this.#stateDiagnostics = options.stateDiagnostics;
     this.tools = bridgeTools(options.control !== undefined, options.screen !== undefined,
       options.input !== undefined, options.stateControl !== undefined,
       options.projectBuild !== undefined, options.appInstall !== undefined,
       options.appControl !== undefined, options.urlControl !== undefined,
-      options.screenshot !== undefined, options.visual !== undefined);
+      options.screenshot !== undefined, options.visual !== undefined,
+      options.stateDiagnostics !== undefined);
     this.#runtime = options.runtime ?? createSimulatorEnvironmentRuntime();
     this.#memoryProbe = options.memoryProbe ?? (signal => collectSimulatorMemorySnapshot({ signal }));
   }
@@ -240,15 +255,17 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         onlyKeys(arguments_, ["category"]);
         if (arguments_["category"] !== undefined && arguments_["category"] !== CATEGORY) throw new SimulatorToolError("INVALID_ARGUMENT", "Unknown Simulator tool category.");
         const tools = [...TOOLS, ...(this.#projectBuild ? BUILD_READ_TOOLS : []),
+          ...(this.#stateDiagnostics ? STATE_READ_TOOLS : []),
           ...(this.#control ? CONTROL_TOOLS : []),
           ...(this.#screen ? OBSERVATION_TOOLS : []), ...(this.#input ? INPUT_TOOLS : []),
           ...(this.#stateControl ? STATE_TOOLS : []), ...(this.#projectBuild ? BUILD_TOOLS : []),
           ...(this.#appInstall ? INSTALL_TOOLS : []),
           ...(this.#appControl ? APP_CONTROL_TOOLS : []),
           ...(this.#urlControl ? URL_TOOLS : []), ...(this.#screenshot ? SCREENSHOT_TOOLS : []),
-          ...(this.#visual ? VISUAL_TOOLS : [])]
+          ...(this.#visual ? VISUAL_TOOLS : []),
+          ...(this.#stateDiagnostics ? STATE_OBSERVATION_TOOLS : [])]
           .map(tool => ({ name: tool.name, category: CATEGORY, description: tool.description,
-            readOnly: tool.readOnly, via: [...TOOLS, ...BUILD_READ_TOOLS].some(item => item.name === tool.name)
+            readOnly: tool.readOnly, via: [...TOOLS, ...BUILD_READ_TOOLS, ...STATE_READ_TOOLS].some(item => item.name === tool.name)
               ? "call_tool" : "control_tool" }));
         return response(arguments_["category"] === CATEGORY
           ? { ok: true, category: CATEGORY, tools, workflow: "Call doctor or check_environment, then list_simulator_devices. Use exact UDIDs for later instance actions." }
@@ -257,23 +274,27 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       if (name !== "call_tool" &&
           (name !== "control_tool" || !this.#control && !this.#screen && !this.#input &&
             !this.#stateControl && !this.#projectBuild && !this.#appInstall &&
-            !this.#appControl && !this.#urlControl && !this.#screenshot && !this.#visual)) {
+            !this.#appControl && !this.#urlControl && !this.#screenshot && !this.#visual &&
+            !this.#stateDiagnostics)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator bridge tool is unavailable.");
       }
       onlyKeys(arguments_, ["name", "args"]);
       const selected = arguments_["name"];
       const args = arguments_["args"];
-      const available = name === "call_tool" ? [...TOOLS, ...(this.#projectBuild ? BUILD_READ_TOOLS : [])] : [
+      const available = name === "call_tool" ? [...TOOLS, ...(this.#projectBuild ? BUILD_READ_TOOLS : []),
+        ...(this.#stateDiagnostics ? STATE_READ_TOOLS : [])] : [
         ...(this.#control ? CONTROL_TOOLS : []), ...(this.#screen ? OBSERVATION_TOOLS : []),
         ...(this.#input ? INPUT_TOOLS : []), ...(this.#stateControl ? STATE_TOOLS : []),
         ...(this.#projectBuild ? BUILD_TOOLS : []), ...(this.#appInstall ? INSTALL_TOOLS : []),
         ...(this.#appControl ? APP_CONTROL_TOOLS : []), ...(this.#urlControl ? URL_TOOLS : []),
-        ...(this.#screenshot ? SCREENSHOT_TOOLS : []), ...(this.#visual ? VISUAL_TOOLS : []) ];
+        ...(this.#screenshot ? SCREENSHOT_TOOLS : []), ...(this.#visual ? VISUAL_TOOLS : []),
+        ...(this.#stateDiagnostics ? STATE_OBSERVATION_TOOLS : []) ];
       if (typeof selected !== "string" || !available.some(tool => tool.name === selected)) {
         throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator tool is unavailable in this runtime.");
       }
       if (!isRecord(args)) throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator tool arguments must be an object.");
       if (name === "control_tool") {
+        if (selected === "capture_state") return await this.#callCaptureState(args, signal, context);
         if (OBSERVATION_TOOLS.some(tool => tool.name === selected)) {
           return await this.#callScreenObservation(selected, args, signal, context);
         }
@@ -310,6 +331,17 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         this.#requireScope(context);
         return response({ ok: true, data: result }, false);
       }
+      if (selected === "get_diagnostics") {
+        onlyKeys(args, ["diagnosticsId"]);
+        const diagnosticsId = args["diagnosticsId"];
+        if (typeof diagnosticsId !== "string" || !UUID.test(diagnosticsId)) {
+          throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator diagnostics request is invalid.");
+        }
+        const diagnostics = this.#stateDiagnostics!.get(context, diagnosticsId);
+        signal?.throwIfAborted();
+        this.#requireScope(context);
+        return response({ ok: true, data: { diagnostics } }, false);
+      }
       if (Object.keys(args).length !== 0) throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator tool arguments must be an empty object.");
       if (selected === "list_instances") {
         const instances = this.#ownership.listForTask(context);
@@ -336,6 +368,12 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
             : { state: "unavailable", reasonCode: environment.ready
               ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
         );
+        const stateDiagnosticsAvailability = this.#stateDiagnostics === undefined ? {} : {
+          capture_state: readyScreen ? { state: "available", backend: "wda" }
+            : { state: "unavailable", reasonCode: environment.ready
+              ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" },
+          get_diagnostics: { state: "available", backend: "host" }
+        };
         const inputAvailability = this.#input === undefined ? {} : Object.fromEntries(
           INPUT_TOOLS.map(tool => [tool.name, readyScreen
             ? { state: "available", backend: "wda" }
@@ -413,7 +451,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
             list_instances: { state: "available", backend: "host" },
             ...controlAvailability, ...screenAvailability, ...inputAvailability, ...stateAvailability,
             ...buildAvailability, ...installAvailability, ...appControlAvailability, ...urlAvailability,
-            ...screenshotAvailability, ...visualAvailability
+            ...screenshotAvailability, ...visualAvailability, ...stateDiagnosticsAvailability
           },
           instances, resources,
           instanceControl: controlAvailable ? { state: "available" }
@@ -438,6 +476,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         error instanceof SimulatorAppBuildError || error instanceof SimulatorAppInstallError ||
         error instanceof SimulatorAppControlError || error instanceof SimulatorUrlControlError ||
         error instanceof SimulatorScreenshotError || error instanceof SimulatorVisualComparisonError ||
+        error instanceof SimulatorStateDiagnosticsError ||
         error instanceof SimulatorScreenMapError ||
         error instanceof WdaClientError;
       const code = known ? error.code : error instanceof OperationInProgressError
@@ -487,6 +526,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     const result = await execute();
     this.#screen?.clear(result.instance.instanceId);
     this.#visual?.clear(result.instance.instanceId);
+    this.#stateDiagnostics?.clear(result.instance.instanceId);
     this.#requireScope(context);
     return response({ ok: true, data: { instance: result.instance, replayed: result.replayed } }, false);
   }
@@ -528,6 +568,22 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     if (signal?.aborted) throw new SimulatorObservationError("OBSERVATION_CANCELLED", "Simulator observation was cancelled.");
     this.#requireScope(context);
     return response({ ok: true, data: data as Readonly<Record<string, unknown>> }, false);
+  }
+
+  async #callCaptureState(args: Record<string, unknown>, signal: AbortSignal | undefined,
+    context: BridgeToolCallContext): Promise<McpCallResult> {
+    if (!this.#stateDiagnostics) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator state observation is unavailable.");
+    onlyKeys(args, ["instanceId", "generation", "leaseId"]);
+    const route = requiredRoute(args);
+    const environment = await this.#runtime.inspect(signal);
+    signal?.throwIfAborted();
+    this.#requireScope(context);
+    if (!environment.ready) return response({ ok: false, errorCode: environment.issue,
+      message: environment.error, data: { environment } }, true);
+    const data = await this.#stateDiagnostics.capture(context, route, signal);
+    if (signal?.aborted) throw new SimulatorObservationError("OBSERVATION_CANCELLED", "Simulator observation was cancelled.");
+    this.#requireScope(context);
+    return response({ ok: true, data }, false);
   }
 
   async #callInput(name: string, args: Record<string, unknown>, signal: AbortSignal | undefined,

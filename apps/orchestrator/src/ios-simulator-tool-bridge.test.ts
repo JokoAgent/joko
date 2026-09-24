@@ -214,6 +214,48 @@ it("routes Simulator screenshot only through permissioned control and trusted im
   expect(calls).toHaveLength(1);
 });
 
+it("routes state capture through permission and diagnostics readback through the task-only read channel", async () => {
+  const diagnosticsId = randomUUID();
+  const calls: string[] = [];
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: { listForTask: () => [], listForResourceAdmission: () => [] } as never,
+    stateDiagnostics: {
+      capture: async () => { calls.push("capture"); return { diagnosticsId, stream: null,
+        health: { ready: true } }; },
+      get: (_scope: unknown, id: string) => { calls.push(`get:${id}`); return { diagnosticsId: id,
+        kind: "capture_state", data: { health: { ready: true } } }; }
+    } as never,
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: null,
+      error: null, setupSteps: [] }) }
+  });
+  const scope = { sessionId: "task", targetId: "target", generation: 1 };
+  const route = { instanceId: "owned", generation: 2, leaseId: "lease" };
+  const tools = (await provider.callTool("list_tools", { category: "ios_simulator" },
+    undefined, scope)).structuredContent;
+  expect(tools).toMatchObject({ tools: expect.arrayContaining([
+    expect.objectContaining({ name: "capture_state", readOnly: true, via: "control_tool" }),
+    expect.objectContaining({ name: "get_diagnostics", readOnly: true, via: "call_tool" })
+  ]) });
+  expect((await provider.callTool("call_tool", { name: "capture_state", args: route },
+    undefined, scope)).structuredContent).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await provider.callTool("control_tool", { name: "get_diagnostics",
+    args: { diagnosticsId } }, undefined, scope)).structuredContent)
+    .toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+  expect((await provider.callTool("control_tool", { name: "capture_state",
+    args: { ...route, hostPath: "/private/secret" } }, undefined, scope)).structuredContent)
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect((await provider.callTool("control_tool", { name: "capture_state", args: route },
+    undefined, scope)).structuredContent).toMatchObject({ ok: true, data: { diagnosticsId, stream: null } });
+  expect((await provider.callTool("call_tool", { name: "get_diagnostics",
+    args: { diagnosticsId } }, undefined, scope)).structuredContent)
+    .toMatchObject({ ok: true, data: { diagnostics: { diagnosticsId, kind: "capture_state" } } });
+  expect(calls).toEqual(["capture", `get:${diagnosticsId}`]);
+});
+
 it("advertises visual baseline and read-only diff through the permissioned task route", async () => {
   const baselineId = randomUUID();
   const calls: string[] = [];

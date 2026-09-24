@@ -186,6 +186,7 @@ it("routes input through the exact ready driver session and rechecks its lease",
     const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
     ownerFingerprint = createWdaOwnerFingerprint({ cacheRoot: "/private/joko/driver-cache",
       instanceId: started.instance.instanceId, simulatorUdid: UDID });
+    await expect(h.coordinator.observeHealth(started.instance)).resolves.toMatchObject({ ready: true });
     await h.coordinator.tap(started.instance, { x: 10, y: 20 });
     await h.coordinator.swipe(started.instance, { x: 1, y: 2 }, { x: 3, y: 4 }, 300);
     await h.coordinator.typeText(started.instance, "hello");
@@ -213,6 +214,8 @@ it("routes input through the exact ready driver session and rechecks its lease",
     retireOnReply = true;
     await expect(h.coordinator.lockScreen(started.instance))
       .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    await expect(h.coordinator.observeHealth(started.instance))
+      .rejects.toMatchObject({ code: "DRIVER_RUNTIME_LOST" });
   } finally {
     store.close();
     server.closeAllConnections();
