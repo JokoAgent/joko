@@ -82,7 +82,9 @@ const STATE_TOOLS = Object.freeze([
   { name: "set_privacy", description: "Grant, revoke or reset one simulated app privacy permission.", readOnly: false },
   { name: "set_status_bar", description: "Apply bounded deterministic Simulator status-bar overrides.", readOnly: false },
   { name: "clear_status_bar", description: "Clear all Simulator status-bar overrides.", readOnly: false },
-  { name: "push_notification", description: "Send one bounded APNs payload to an installed app on the exact Simulator.", readOnly: false }
+  { name: "push_notification", description: "Send one bounded APNs payload to an installed app on the exact Simulator.", readOnly: false },
+  { name: "lock_screen", description: "Lock the exact Simulator after validating its screen snapshot.", readOnly: false },
+  { name: "unlock_screen", description: "Unlock the exact Simulator after validating its screen snapshot.", readOnly: false }
 ] as const);
 
 function bridgeTools(control: boolean, screen: boolean, input: boolean,
@@ -245,7 +247,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         );
         const stateAvailability = this.#stateControl === undefined ? {} : Object.fromEntries(
           STATE_TOOLS.map(tool => [tool.name, readyScreen
-            ? { state: "available", backend: tool.name === "set_orientation" ? "wda" : "simctl" }
+            ? { state: "available", backend: tool.name === "set_orientation" ||
+                tool.name === "lock_screen" || tool.name === "unlock_screen" ? "wda" : "simctl" }
             : { state: "unavailable", reasonCode: environment.ready
               ? "DRIVER_RUNTIME_LOST" : environment.issue ?? "ENVIRONMENT_NOT_READY" }])
         );
@@ -568,6 +571,9 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       catch { throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator push payload is invalid."); }
       action = { type: "push_notification", bundleId,
         payload: payload as Readonly<Record<string, unknown>> };
+    } else if (name === "lock_screen" || name === "unlock_screen") {
+      onlyKeys(args, ["instanceId", "generation", "leaseId", "snapshotId"]);
+      action = { type: name, snapshotId: requiredSnapshotId(args["snapshotId"]) };
     } else {
       throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator state control is unavailable.");
     }

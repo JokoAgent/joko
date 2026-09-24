@@ -258,6 +258,20 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       });
       return;
     }
+    if (request.method === "POST" && (request.url === "/session/SESSION-1/wda/lock" ||
+        request.url === "/session/SESSION-1/wda/unlock")) {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        const action = request.url!.endsWith("/lock") ? "lock_screen" : "unlock_screen";
+        const claimed = application.store.listOperations({ sessionId: "simulator-task", status: "started" })
+          .some(operation => operation.kind === "ios_simulator_state_control");
+        stateChanges.push({ action, value: JSON.parse(Buffer.concat(chunks).toString("utf8")), claimed });
+        screenLabel = action === "lock_screen" ? "Locked" : "Unlocked";
+        send(null);
+      });
+      return;
+    }
     if (request.method === "POST" && request.url && [
       "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
       "/session/SESSION-1/wda/pressButton"
@@ -344,7 +358,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       set_appearance: { state: "available", backend: "simctl" },
       set_location: { state: "available", backend: "simctl" },
        set_privacy: { state: "available", backend: "simctl" },
-       push_notification: { state: "available", backend: "simctl" }
+       push_notification: { state: "available", backend: "simctl" },
+       lock_screen: { state: "available", backend: "wda" },
+       unlock_screen: { state: "available", backend: "wda" }
     } });
     const route = { instanceId: instance.instanceId, generation: instance.generation, leaseId: instance.lease.id };
     const mapped = await call("control_tool", "get_screen_map", route);
@@ -503,6 +519,20 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       interaction: "push_notification", backend: "simctl", bundleId: "app.joko.fixture",
       delivered: true, screenMapInvalidated: true } } } });
     expect(JSON.stringify(pushed)).not.toContain("private push body");
+    const beforeLock = await call("control_tool", "get_screen_map", route);
+    const lockSnapshotId = beforeLock.details.mcpStructuredContent.data!.screenMap!.snapshotId;
+    expect(await call("control_tool", "lock_screen", { ...route,
+      snapshotId: lockSnapshotId })).toMatchObject({ isError: false,
+        details: { mcpStructuredContent: { data: { interaction: "lock_screen",
+          backend: "wda", screenMapInvalidated: true } } } });
+    const beforeUnlock = await call("control_tool", "get_screen_map", route);
+    expect(beforeUnlock.details.mcpStructuredContent.data!.screenMap!.snapshotId).not.toBe(lockSnapshotId);
+    expect(beforeUnlock).toMatchObject({ details: { mcpStructuredContent: { data: {
+      screenMap: { elements: [{ label: "Locked" }] } } } } });
+    expect(await call("control_tool", "unlock_screen", { ...route,
+      snapshotId: beforeUnlock.details.mcpStructuredContent.data!.screenMap!.snapshotId }))
+      .toMatchObject({ isError: false, details: { mcpStructuredContent: { data: {
+        interaction: "unlock_screen", backend: "wda", screenMapInvalidated: true } } } });
     expect(inputs.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/actions",
@@ -527,7 +557,9 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
       { action: "set_status_bar", value: statusOverrides, claimed: true },
       { action: "clear_status_bar", value: null, claimed: true },
       { action: "push_notification", value: { bundleId: "app.joko.fixture",
-        payload: pushPayload }, claimed: true }
+        payload: pushPayload }, claimed: true },
+      { action: "lock_screen", value: {}, claimed: true },
+      { action: "unlock_screen", value: {}, claimed: true }
     ]);
     const inputOperations = application.store.listOperations({ sessionId: "simulator-task" })
       .filter(operation => operation.kind === "ios_simulator_input")
@@ -538,7 +570,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     expect(JSON.stringify(inputOperations)).not.toContain(batchSecret);
     const stateOperations = application.store.listOperations({ sessionId: "simulator-task" })
       .filter(operation => operation.kind === "ios_simulator_state_control");
-    expect(stateOperations).toHaveLength(11);
+    expect(stateOperations).toHaveLength(13);
     expect(JSON.stringify(stateOperations, (_key, value: unknown) =>
       typeof value === "bigint" ? value.toString() : value)).not.toContain("private push body");
     const detached = await call("control_tool", "detach_device", { instanceId: instance.instanceId,

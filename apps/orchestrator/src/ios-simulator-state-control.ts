@@ -42,7 +42,8 @@ const CONFLICTING_KINDS = new Set([
   "ios_simulator_removed_cleanup"
 ]);
 
-type StateDriver = Pick<SimulatorDriverCoordinator, "isReady" | "setOrientation">;
+type StateDriver = Pick<SimulatorDriverCoordinator,
+  "isReady" | "setOrientation" | "lockScreen" | "unlockScreen">;
 type StateScreen = Pick<SimulatorScreenObservationCoordinator,
   "requireInteractionSnapshot" | "invalidateInteraction" | "invalidateRoute">;
 type StateLifecycle = Pick<SimulatorLifecycleRuntime,
@@ -66,7 +67,9 @@ export type SimulatorStateControlAction =
   | { readonly type: "set_status_bar"; readonly overrides: SimulatorStatusBarOverrides }
   | { readonly type: "clear_status_bar" }
   | { readonly type: "push_notification"; readonly bundleId: string;
-      readonly payload: Readonly<Record<string, unknown>> };
+      readonly payload: Readonly<Record<string, unknown>> }
+  | { readonly type: "lock_screen"; readonly snapshotId: string }
+  | { readonly type: "unlock_screen"; readonly snapshotId: string };
 
 export interface SimulatorStateControlReceipt {
   readonly interaction: SimulatorStateControlAction["type"];
@@ -162,7 +165,8 @@ export class SimulatorStateControlCoordinator {
         body: { action: action.type, sessionId: scope.sessionId, targetId: scope.targetId,
           bindingGeneration: scope.generation, instanceId: route.instanceId,
           instanceGeneration: route.generation, leaseId: route.leaseId,
-          ...(action.type === "set_orientation" ? { snapshotId: action.snapshotId } : {}),
+          ...(action.type === "set_orientation" || action.type === "lock_screen" ||
+            action.type === "unlock_screen" ? { snapshotId: action.snapshotId } : {}),
           requestBodyHash: authority.requestBodyHash,
           providerGeneration: authority.providerGeneration }
       }, () => {
@@ -172,7 +176,8 @@ export class SimulatorStateControlCoordinator {
           throw new SimulatorDriverError("DRIVER_RUNTIME_LOST",
             "Simulator driver is not ready for state control.");
         }
-        if (action.type === "set_orientation") {
+        if (action.type === "set_orientation" || action.type === "lock_screen" ||
+            action.type === "unlock_screen") {
           this.#screen.requireInteractionSnapshot(scope, route, action.snapshotId);
         } else if (action.type === "set_appearance" && !this.#lifecycle.setAppearance ||
             action.type === "set_increase_contrast" && !this.#lifecycle.setIncreaseContrast ||
@@ -225,6 +230,12 @@ export class SimulatorStateControlCoordinator {
         attempted = true;
         const viewport = await this.#driver.setOrientation(instance, action.orientation, signal);
         result = { backend: "wda", orientation: action.orientation, mode: "device", viewport };
+      } else if (action.type === "lock_screen" || action.type === "unlock_screen") {
+        this.#screen.invalidateInteraction(scope, route, action.snapshotId);
+        attempted = true;
+        if (action.type === "lock_screen") await this.#driver.lockScreen(instance, signal);
+        else await this.#driver.unlockScreen(instance, signal);
+        result = { backend: "wda" };
       } else if (action.type === "set_appearance") {
         attempted = true;
         await this.#lifecycle.setAppearance!(instance.simulatorUdid, action.appearance, signal);
@@ -374,6 +385,11 @@ export class SimulatorStateControlCoordinator {
       catch {
         throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator push payload is invalid.");
       }
+    } else if (action.type === "lock_screen" || action.type === "unlock_screen") {
+      if (!UUID.test(action.snapshotId)) {
+        throw new SimulatorStateControlError("INVALID_ARGUMENT",
+          "Simulator screen snapshot identity is invalid.");
+      }
     } else {
       throw new SimulatorStateControlError("INVALID_ARGUMENT", "Simulator state control is invalid.");
     }
@@ -415,6 +431,10 @@ export class SimulatorStateControlCoordinator {
   #failure(error: unknown, attempted: boolean, signal?: AbortSignal): Error {
     if (error instanceof WdaClientError && error.code === "ORIENTATION_UNSUPPORTED") {
       return new SimulatorStateControlError("ORIENTATION_UNSUPPORTED", error.message);
+    }
+    if (error instanceof WdaClientError && error.code === "CANCELLED") {
+      return new SimulatorStateControlError("MUTATION_CANCELLED",
+        "Simulator state control was cancelled before dispatch.");
     }
     if (error instanceof SimulatorLifecycleError && error.code === "SIMULATOR_CONTROL_FAILED") {
       return new SimulatorStateControlError(error.code, error.message);

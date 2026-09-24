@@ -320,4 +320,12 @@ export class WdaLoopbackClient {
   async home(id: string, signal?: AbortSignal): Promise<void> {
     await this.#input(id, "/wda/pressButton", { name: "home" }, signal);
   }
+
+  async lock(id: string, signal?: AbortSignal): Promise<void> {
+    await this.#input(id, "/wda/lock", {}, signal);
+  }
+
+  async unlock(id: string, signal?: AbortSignal): Promise<void> {
+    await this.#input(id, "/wda/unlock", {}, signal);
+  }
 }

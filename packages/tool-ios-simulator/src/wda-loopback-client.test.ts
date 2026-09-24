@@ -164,11 +164,15 @@ it("sends bounded device input only to the exact owned WDA session", async () =>
   await driver.swipe("SESSION-1", { x: 12, y: 25 }, { x: 150, y: 300 }, 300);
   await driver.typeText("SESSION-1", "A😀");
   await driver.home("SESSION-1");
+  await driver.lock("SESSION-1");
+  await driver.unlock("SESSION-1");
   expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
     "GET /status", "POST /session/SESSION-1/actions",
     "GET /status", "POST /session/SESSION-1/actions",
     "GET /status", "POST /session/SESSION-1/wda/keys",
-    "GET /status", "POST /session/SESSION-1/wda/pressButton"
+    "GET /status", "POST /session/SESSION-1/wda/pressButton",
+    "GET /status", "POST /session/SESSION-1/wda/lock",
+    "GET /status", "POST /session/SESSION-1/wda/unlock"
   ]);
   expect(calls[1]?.body).toMatchObject({ actions: [{ type: "pointer", id: "finger",
     parameters: { pointerType: "touch" }, actions: [
@@ -182,13 +186,16 @@ it("sends bounded device input only to the exact owned WDA session", async () =>
   ] }] });
   expect(calls[5]?.body).toEqual({ value: ["A", "😀"] });
   expect(calls[7]?.body).toEqual({ name: "home" });
+  expect(calls[9]?.body).toEqual({});
+  expect(calls[11]?.body).toEqual({});
   await expect(driver.tap("SESSION-1", { x: -1, y: 0 })).rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
   await expect(driver.swipe("SESSION-1", { x: 0, y: 0 }, { x: 1, y: 1 }, 60_001))
     .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
   await expect(driver.typeText("SESSION-1", "x".repeat(10_001)))
     .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
   await expect(driver.home("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
-  expect(calls).toHaveLength(8);
+  await expect(driver.lock("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(calls).toHaveLength(12);
   ready = false;
   await expect(driver.tap("SESSION-1", { x: 0, y: 0 })).rejects.toMatchObject({ code: "NOT_READY" });
   fingerprint = "foreign";
@@ -197,7 +204,7 @@ it("sends bounded device input only to the exact owned WDA session", async () =>
   ready = true;
   rejectSession = true;
   await expect(driver.home("SESSION-1")).rejects.toMatchObject({ code: "INVALID_SESSION" });
-  expect(calls.filter(call => call.method === "POST")).toHaveLength(5);
+  expect(calls.filter(call => call.method === "POST")).toHaveLength(7);
 });
 
 it("marks dispatched input as outcome-unknown when the response times out or caller cancels", async () => {
@@ -226,7 +233,17 @@ it("marks dispatched input as outcome-unknown when the response times out or cal
   await entered;
   controller.abort();
   await expect(cancelled).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
-  expect(posts).toBe(2);
+  entered = new Promise<void>(resolve => { started = resolve; });
+  const locked = driver.lock("SESSION-1");
+  await entered;
+  await expect(locked).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  entered = new Promise<void>(resolve => { started = resolve; });
+  const unlockController = new AbortController();
+  const unlocked = driver.unlock("SESSION-1", unlockController.signal);
+  await entered;
+  unlockController.abort();
+  await expect(unlocked).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  expect(posts).toBe(4);
 });
 
 it("sets orientation through the exact owned WDA session with a bounded payload", async () => {

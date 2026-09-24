@@ -142,6 +142,14 @@ export class SimulatorDriverCoordinator {
     return this.#input(instance, (client, sessionId) => client.home(sessionId, signal));
   }
 
+  lockScreen(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<void> {
+    return this.#input(instance, (client, sessionId) => client.lock(sessionId, signal));
+  }
+
+  unlockScreen(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<void> {
+    return this.#input(instance, (client, sessionId) => client.unlock(sessionId, signal));
+  }
+
   async setOrientation(instance: PublicSimulatorInstance, orientation: WdaViewport["orientation"],
     signal?: AbortSignal): Promise<WdaViewport> {
     const active = this.#manager.get(instance.instanceId);

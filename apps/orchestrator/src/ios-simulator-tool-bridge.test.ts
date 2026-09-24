@@ -361,7 +361,8 @@ it("publishes strict Simulator presentation and accessibility controls only with
     calls.push({ action, authority });
     return { replayed: false, receipt: { interaction: action["type"],
       instanceId: route.instanceId, generation: route.generation,
-      backend: action["type"] === "set_orientation" ? "wda" : "simctl",
+      backend: action["type"] === "set_orientation" || action["type"] === "lock_screen" ||
+        action["type"] === "unlock_screen" ? "wda" : "simctl",
       completedAt: new Date().toISOString(),
       ...(action["type"] === "set_orientation" ? { orientation: action["orientation"], mode: "device",
         viewport: { width: 852, height: 393, orientation: action["orientation"] } } : {}),
@@ -413,7 +414,9 @@ it("publishes strict Simulator presentation and accessibility controls only with
       expect.objectContaining({ name: "set_privacy", readOnly: false, via: "control_tool" }),
       expect.objectContaining({ name: "set_status_bar", readOnly: false, via: "control_tool" }),
       expect.objectContaining({ name: "clear_status_bar", readOnly: false, via: "control_tool" }),
-      expect.objectContaining({ name: "push_notification", readOnly: false, via: "control_tool" })
+      expect.objectContaining({ name: "push_notification", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "lock_screen", readOnly: false, via: "control_tool" }),
+      expect.objectContaining({ name: "unlock_screen", readOnly: false, via: "control_tool" })
     ]) });
   expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "LANDSCAPE" }))
     .toMatchObject({ ok: true, data: { interaction: "set_orientation", backend: "wda",
@@ -450,6 +453,10 @@ it("publishes strict Simulator presentation and accessibility controls only with
   expect(await invoke("push_notification", { ...route, bundleId: "app.joko.fixture",
     payload: pushPayload })).toMatchObject({ ok: true, data: {
       interaction: "push_notification", bundleId: "app.joko.fixture", delivered: true } });
+  expect(await invoke("lock_screen", { ...route, snapshotId })).toMatchObject({ ok: true,
+    data: { interaction: "lock_screen", backend: "wda", screenMapInvalidated: true } });
+  expect(await invoke("unlock_screen", { ...route, snapshotId })).toMatchObject({ ok: true,
+    data: { interaction: "unlock_screen", backend: "wda", screenMapInvalidated: true } });
   expect(await invoke("set_orientation", { ...route, snapshotId, orientation: "UPSIDE_DOWN" }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_appearance", { ...route, appearance: "blue" }))
@@ -480,9 +487,12 @@ it("publishes strict Simulator presentation and accessibility controls only with
   expect(await invoke("push_notification", { ...route, bundleId: "app.joko.fixture",
     payload: { aps: {}, alert: "界".repeat(1_400) } }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("lock_screen", route)).toMatchObject({ errorCode: "INVALID_ARGUMENT" });
+  expect(await invoke("unlock_screen", { ...route, snapshotId: "bad" }))
+    .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("set_appearance", { ...route, appearance: "light" }, scope))
     .toMatchObject({ errorCode: "STALE_SCOPE" });
-  expect(calls).toHaveLength(11);
+  expect(calls).toHaveLength(13);
   expect(calls.map(call => call.action)).toEqual([
     { type: "set_orientation", snapshotId, orientation: "LANDSCAPE" },
     { type: "set_appearance", appearance: "dark" },
@@ -496,7 +506,9 @@ it("publishes strict Simulator presentation and accessibility controls only with
     { type: "set_privacy", action: "grant", service: "camera", bundleId: "app.joko.fixture" },
     { type: "set_status_bar", overrides: statusOverrides },
     { type: "clear_status_bar" },
-    { type: "push_notification", bundleId: "app.joko.fixture", payload: pushPayload }
+    { type: "push_notification", bundleId: "app.joko.fixture", payload: pushPayload },
+    { type: "lock_screen", snapshotId },
+    { type: "unlock_screen", snapshotId }
   ]);
   expect((await provider.callTool("call_tool", { name: "doctor", args: {} }, undefined, scope))
     .structuredContent).toMatchObject({ data: { availability: {
@@ -506,10 +518,12 @@ it("publishes strict Simulator presentation and accessibility controls only with
       clear_location: { state: "available", backend: "simctl" },
       set_privacy: { state: "available", backend: "simctl" },
       clear_status_bar: { state: "available", backend: "simctl" },
-      push_notification: { state: "available", backend: "simctl" }
+      push_notification: { state: "available", backend: "simctl" },
+      lock_screen: { state: "available", backend: "wda" },
+      unlock_screen: { state: "available", backend: "wda" }
     } } });
   ready = false;
   expect(await invoke("set_appearance", { ...route, appearance: "light" }))
     .toMatchObject({ errorCode: "XCODE_NOT_FOUND" });
-  expect(calls).toHaveLength(11);
+  expect(calls).toHaveLength(13);
 });

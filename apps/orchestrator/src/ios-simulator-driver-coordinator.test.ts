@@ -193,10 +193,13 @@ it("routes input through the exact ready driver session and rechecks its lease",
     await expect(h.coordinator.setOrientation(started.instance, "LANDSCAPE")).resolves.toEqual({
       width: 393, height: 852, orientation: "LANDSCAPE"
     });
+    await h.coordinator.lockScreen(started.instance);
+    await h.coordinator.unlockScreen(started.instance);
     expect(requests.map(item => item.url)).toEqual([
       "/session/SESSION-1/actions", "/session/SESSION-1/actions",
       "/session/SESSION-1/wda/keys", "/session/SESSION-1/wda/pressButton",
-      "/session/SESSION-1/orientation"
+      "/session/SESSION-1/orientation", "/session/SESSION-1/wda/lock",
+      "/session/SESSION-1/wda/unlock"
     ]);
     const tapBody = requests[0]?.body as { actions: Array<{ id: string;
       actions: Array<Record<string, unknown>> }> };
@@ -205,8 +208,10 @@ it("routes input through the exact ready driver session and rechecks its lease",
     expect(requests[2]?.body).toEqual({ value: ["h", "e", "l", "l", "o"] });
     expect(requests[3]?.body).toEqual({ name: "home" });
     expect(requests[4]?.body).toEqual({ orientation: "LANDSCAPE" });
+    expect(requests[5]?.body).toEqual({});
+    expect(requests[6]?.body).toEqual({});
     retireOnReply = true;
-    await expect(h.coordinator.tap(started.instance, { x: 1, y: 1 }))
+    await expect(h.coordinator.lockScreen(started.instance))
       .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
   } finally {
     store.close();

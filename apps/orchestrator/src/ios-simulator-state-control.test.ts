@@ -54,6 +54,9 @@ function fixture() {
   let push = async (bundleId: string, payload: Readonly<Record<string, unknown>>) => {
     calls.push({ type: "push_notification", value: { bundleId, payload }, claimed: hasClaim(store) });
   };
+  let screenLock = async (type: "lock_screen" | "unlock_screen") => {
+    calls.push({ type, value: null, claimed: hasClaim(store) });
+  };
   const driver = {
     isReady: () => true,
     observeAccessibilityTree: async () => ({ capturedAt: new Date().toISOString(),
@@ -61,7 +64,9 @@ function fixture() {
         visible: true, rect: { x: 10, y: 20, width: 100, height: 40 } } }),
     observeViewport: async () => ({ width: 393, height: 852, orientation: "PORTRAIT" as const }),
     setOrientation: (_instance: PublicSimulatorInstance, value: "PORTRAIT" | "LANDSCAPE") =>
-      orientation(value)
+      orientation(value),
+    lockScreen: () => screenLock("lock_screen"),
+    unlockScreen: () => screenLock("unlock_screen")
   };
   const screen = new SimulatorScreenObservationCoordinator(ownership, driver);
   const lifecycle = {
@@ -98,7 +103,8 @@ function fixture() {
     setAppearance: (value: typeof appearance) => { appearance = value; },
     setLocation: (value: typeof location) => { location = value; },
     setPrivacy: (value: typeof privacy) => { privacy = value; },
-    setPush: (value: typeof push) => { push = value; } };
+    setPush: (value: typeof push) => { push = value; },
+    setScreenLock: (value: typeof screenLock) => { screenLock = value; } };
 }
 
 function hasClaim(store: OperationalStore): boolean {
@@ -157,6 +163,18 @@ it("claims each state change, rotates from the current snapshot and does not rep
     expect(await h.state.execute(SCOPE, route(h.instance), {
       type: "push_notification", bundleId: "app.joko.fixture", payload: pushPayload
     }, authority("5"))).toMatchObject({ replayed: true });
+    const beforeLock = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    const lockAction = { type: "lock_screen" as const, snapshotId: beforeLock.snapshotId };
+    expect(await h.state.execute(SCOPE, route(h.instance), lockAction, authority("1")))
+      .toMatchObject({ replayed: false, receipt: { interaction: "lock_screen", backend: "wda" } });
+    expect(await h.state.execute(SCOPE, route(h.instance), lockAction, authority("1")))
+      .toMatchObject({ replayed: true });
+    await expect(h.state.execute(SCOPE, route(h.instance), lockAction, authority("2")))
+      .rejects.toMatchObject({ code: "STALE_UI_SNAPSHOT" });
+    const beforeUnlock = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    expect(await h.state.execute(SCOPE, route(h.instance), { type: "unlock_screen",
+      snapshotId: beforeUnlock.snapshotId }, authority("3"))).toMatchObject({ replayed: false,
+        receipt: { interaction: "unlock_screen", backend: "wda" } });
     expect(h.calls.slice(1)).toEqual([
       { type: "appearance", value: "dark", claimed: true },
       { type: "contrast", value: true, claimed: true },
@@ -173,11 +191,13 @@ it("claims each state change, rotates from the current snapshot and does not rep
       { type: "status_bar", value: statusOverrides, claimed: true },
       { type: "clear_status_bar", value: null, claimed: true },
       { type: "push_notification", value: { bundleId: "app.joko.fixture",
-        payload: pushPayload }, claimed: true }
+        payload: pushPayload }, claimed: true },
+      { type: "lock_screen", value: null, claimed: true },
+      { type: "unlock_screen", value: null, claimed: true }
     ]);
     const stateOperations = h.store.listOperations({ sessionId: SCOPE.sessionId })
       .filter(operation => operation.kind === "ios_simulator_state_control");
-    expect(stateOperations).toHaveLength(12);
+    expect(stateOperations).toHaveLength(15);
     expect(JSON.stringify(stateOperations, (_key, value: unknown) =>
       typeof value === "bigint" ? value.toString() : value)).not.toContain("private push body");
     await expect(h.state.execute(SCOPE, route(h.instance), {
@@ -194,7 +214,7 @@ it("claims each state change, rotates from the current snapshot and does not rep
     await expect(h.state.execute(SCOPE, route(h.instance),
       { type: "push_notification", bundleId: "app.joko.fixture", payload: {} }, authority("a")))
       .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
-    expect(h.calls).toHaveLength(11);
+    expect(h.calls).toHaveLength(13);
   } finally { h.store.close(); }
 });
 
@@ -222,6 +242,28 @@ it("serializes with input and fences an uncertain simctl result from replay", as
     expect(JSON.stringify(h.store.listOperations({ sessionId: SCOPE.sessionId }),
       (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value))
       .not.toContain("private push body");
+  } finally { h.store.close(); }
+});
+
+it("fences an uncertain lock and preserves a definite pre-dispatch cancellation", async () => {
+  const h = fixture();
+  try {
+    const first = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    let dispatched = 0;
+    h.setScreenLock(async () => { dispatched += 1;
+      throw new WdaClientError("INPUT_OUTCOME_UNKNOWN", "private WDA response"); });
+    const lock = { type: "lock_screen" as const, snapshotId: first.snapshotId };
+    await expect(h.state.execute(SCOPE, route(h.instance), lock, authority("1")))
+      .rejects.toMatchObject({ code: "STATE_OUTCOME_UNKNOWN" });
+    await expect(h.state.execute(SCOPE, route(h.instance), lock, authority("1")))
+      .rejects.toMatchObject({ code: "STATE_OUTCOME_UNKNOWN" });
+    expect(dispatched).toBe(1);
+    const current = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    h.setScreenLock(async () => {
+      throw new WdaClientError("CANCELLED", "Cancelled before WDA dispatch."); });
+    await expect(h.state.execute(SCOPE, route(h.instance), {
+      type: "unlock_screen", snapshotId: current.snapshotId }, authority("2")))
+      .rejects.toMatchObject({ code: "MUTATION_CANCELLED" });
   } finally { h.store.close(); }
 });
 
