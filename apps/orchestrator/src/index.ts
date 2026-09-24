@@ -30,6 +30,8 @@ export * from "./ios-simulator-ownership.js";
 export * from "./ios-simulator-lifecycle-coordinator.js";
 export * from "./ios-simulator-pending-create.js";
 export * from "./ios-simulator-create-coordinator.js";
+export * from "./ios-simulator-driver-state.js";
+export * from "./ios-simulator-driver-coordinator.js";
 export * from "./document-electron-pdf-renderer.js";
 export * from "./event-hub.js";
 export * from "./extension-catalog.js";

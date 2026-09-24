@@ -172,7 +172,7 @@ export class SimulatorOwnershipRegistry {
     for (;;) {
       const page = this.#store.listOperations({ sessionId: scope.sessionId, status: "failed", limit: 500, offset });
       for (const operation of page) {
-        if (operation.kind !== "ios_simulator_lifecycle" || !record(operation.error)
+        if ((operation.kind !== "ios_simulator_lifecycle" && operation.kind !== "ios_simulator_driver") || !record(operation.error)
           || operation.error["code"] !== "EFFECT_OUTCOME_UNKNOWN" || !record(operation.body)) continue;
         const body = operation.body;
         if (body["sessionId"] !== scope.sessionId || body["targetId"] !== scope.targetId
@@ -180,9 +180,11 @@ export class SimulatorOwnershipRegistry {
           || !bounded(body["instanceId"], 128) || !positive(body["instanceGeneration"])
           || !bounded(body["leaseId"], 128)) continue;
         try {
-          this.failLifecycle(scope, {
+          const route = {
             instanceId: body["instanceId"], generation: body["instanceGeneration"], leaseId: body["leaseId"]
-          }, "EFFECT_OUTCOME_UNKNOWN");
+          };
+          if (operation.kind === "ios_simulator_driver") this.failDriver(scope, route, "EFFECT_OUTCOME_UNKNOWN");
+          else this.failLifecycle(scope, route, "EFFECT_OUTCOME_UNKNOWN");
         } catch (error) {
           if (!(error instanceof SimulatorOwnershipError) || error.code !== "STALE_SCOPE") throw error;
         }
@@ -321,6 +323,22 @@ export class SimulatorOwnershipRegistry {
       errorCode: code,
       lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS },
       updatedAt: now
+    }));
+  }
+
+  /** A driver effect may change its route without claiming that a Viewer is attached. */
+  completeDriver(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): PublicSimulatorInstance {
+    return this.#replaceRouted(scope, route, (instance, now) => ({
+      ...instance, generation: instance.generation + 1, healthState: "healthy", errorCode: null,
+      lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now
+    }));
+  }
+
+  failDriver(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, code: string): PublicSimulatorInstance {
+    if (!bounded(code, 128)) throw new SimulatorOwnershipError("INVALID_ARGUMENT", "Simulator driver failure code is invalid.");
+    return this.#replaceRouted(scope, route, (instance, now) => ({
+      ...instance, generation: instance.generation + 1, healthState: "degraded", errorCode: code,
+      lease: { id: this.#createId(), issuedAt: now, expiresAt: now + LEASE_MS }, updatedAt: now
     }));
   }
 

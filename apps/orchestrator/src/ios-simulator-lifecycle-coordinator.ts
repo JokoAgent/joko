@@ -85,7 +85,8 @@ export class SimulatorLifecycleCoordinator {
       let offset = 0;
       for (;;) {
         const page = this.#store.listOperations({ sessionId: scope.sessionId, status: "started", limit: 500, offset });
-        const conflicting = page.find(operation => operation.kind === KIND && operation.id !== operationId);
+        const conflicting = page.find(operation =>
+          (operation.kind === KIND || operation.kind === "ios_simulator_driver") && operation.id !== operationId);
         if (conflicting !== undefined) throw new OperationInProgressError(conflicting.id);
         if (page.length < 500) break;
         offset += page.length;
