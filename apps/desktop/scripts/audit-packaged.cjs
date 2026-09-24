@@ -1,3 +1,4 @@
+const { createHash } = require("node:crypto");
 const { lstat, readFile, readdir, realpath } = require("node:fs/promises");
 const { basename, extname, isAbsolute, join, relative, resolve, sep } = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -78,6 +79,7 @@ module.exports = async function auditPackaged(context) {
     throw new Error("The packaged app-update.yml must contain only the audited updater cache name.");
   }
   await auditNativeTaskStatusSounds(resolve(resourcesRoot, "native-task-status-sounds"));
+  await auditWdaSourceAssets(resolve(resourcesRoot, "ios-simulator"), context.electronPlatformName);
   const nativeVoiceShortcut = await auditNativeVoiceShortcut(
     nativeVoiceShortcutRoot,
     context.electronPlatformName,
@@ -356,6 +358,46 @@ async function auditNativeTaskStatusSounds(root) {
     bytes += (await lstat(path)).size;
   }
   if (bytes <= 0 || bytes > 2 * 1024 * 1024) throw new Error("The packaged native task-status sounds exceed the audited size boundary.");
+}
+
+async function auditWdaSourceAssets(root, platform) {
+  const manifestPath = resolve(root, "manifest.json");
+  const licensePath = resolve(root, "LICENSE.appium-webdriveragent");
+  await assertCanonicalRegularFile(manifestPath, "The packaged driver source manifest is missing or unsafe.");
+  await assertCanonicalRegularFile(licensePath, "The packaged driver source license is missing or unsafe.");
+  const manifest = await readJsonManifest(manifestPath, "driver source");
+  if (Object.keys(manifest).sort().join(",") !==
+      "archiveFileName,archiveSha256,archiveUrl,license,licenseSha256,name,revision,tag" ||
+      manifest.name !== "WebDriverAgent" || manifest.tag !== "v15.1.6" ||
+      manifest.revision !== "5f8280e761dc0b5b9b28368e63a8f0cc8d868346" ||
+      manifest.archiveFileName !== "WebDriverAgent-v15.1.6.tar.gz" ||
+      manifest.archiveUrl !== "https://codeload.github.com/appium/WebDriverAgent/tar.gz/refs/tags/v15.1.6" ||
+      manifest.archiveSha256 !== "98c8f7102768aa10530c9b124be39d66a06a146631708416348b88f2db1a56c3" ||
+      manifest.license !== "BSD-3-Clause" ||
+      manifest.licenseSha256 !== "d9910c6ba5e4c29ae415ee3ce875c9e18a60d8bc4d7fe2c2d104db2a718b1bb4") {
+    throw new Error("The packaged driver source manifest differs from the pinned release.");
+  }
+  const license = await readFile(licensePath);
+  if (createHash("sha256").update(license).digest("hex") !== manifest.licenseSha256) {
+    throw new Error("The packaged driver source license failed integrity verification.");
+  }
+  const expected = ["LICENSE.appium-webdriveragent", "manifest.json"];
+  if (platform === "darwin") expected.push(manifest.archiveFileName);
+  expected.sort();
+  const entries = await readdir(root, { withFileTypes: true });
+  const names = entries.map(entry => entry.name).sort();
+  if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
+    throw new Error("The packaged driver source assets are incomplete or unexpected.");
+  }
+  if (platform !== "darwin") return;
+  const archivePath = resolve(root, manifest.archiveFileName);
+  await assertCanonicalRegularFile(archivePath, "The packaged driver source archive is missing or unsafe.");
+  const info = await lstat(archivePath);
+  if (info.size <= 0 || info.size > 8 * 1024 * 1024) throw new Error("The packaged driver source archive exceeds its size limit.");
+  const archive = await readFile(archivePath);
+  if (createHash("sha256").update(archive).digest("hex") !== manifest.archiveSha256) {
+    throw new Error("The packaged driver source archive failed integrity verification.");
+  }
 }
 
 async function auditNativeVoiceShortcut(root, platform, targetArch) {

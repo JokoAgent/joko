@@ -45,6 +45,15 @@
   ],
   "extraResources": [
     {
+      "from": "resources/ios-simulator",
+      "to": "ios-simulator",
+      "filter": [
+        "manifest.json",
+        "LICENSE.appium-webdriveragent",
+        "WebDriverAgent-v15.1.6.tar.gz"
+      ]
+    },
+    {
       "from": "resources/app-update.yml",
       "to": "app-update.yml"
     },
