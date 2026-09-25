@@ -44,6 +44,7 @@ it("shows actual JPEG frames only for the visible route, revokes old URLs and st
   const render = async (enabled: boolean) => act(async () => root.render(
     <SimulatorViewerScreen controller={controller} sessionId="task" route={route}
       enabled={enabled} ownerDocument={document}
+      onReconcile={async () => undefined}
       t={(key, values) => translate("en", key, values)} />));
   await render(true);
   expect(watch).toHaveBeenCalledWith("task", route, expect.any(AbortSignal),
@@ -79,6 +80,7 @@ it("requires an explicit retry after finite stream loss and does not retain the 
   await act(async () => root.render(<SimulatorViewerScreen
     controller={{ watchSimulatorFrames: watch } as unknown as AppController}
     sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={async () => undefined}
     t={(key, values) => translate("en", key, values)} />));
   expect(container.querySelector("img")).toBeNull();
   expect(container.textContent).toContain("disconnected");
@@ -119,6 +121,7 @@ it("renders current H.264 output to a canvas and falls back to JPEG when decodin
   await act(async () => root.render(<SimulatorViewerScreen
     controller={{ watchSimulatorFrames: watch } as unknown as AppController}
     sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={async () => undefined}
     t={(key, values) => translate("en", key, values)} />));
   expect(called).toBe(1);
   expect(drawImage).toHaveBeenCalledOnce();
@@ -138,3 +141,135 @@ it("renders current H.264 output to a canvas and falls back to JPEG when decodin
   expect(container.querySelector("canvas")).toBeNull();
   vi.unstubAllGlobals();
 });
+
+it("maps captured pointer gestures and IME-safe text to the exact visible route", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:interactive",
+    revokeObjectURL: vi.fn() });
+  const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  };
+  const control = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerInput"]>) =>
+    ({ replayed: false }));
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen
+    controller={{ watchSimulatorFrames: watch,
+      controlSimulatorViewerInput: control } as unknown as AppController}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={async () => undefined}
+    t={(key, values) => translate("en", key, values)} />));
+  const image = container.querySelector("img")!;
+  let captured = false;
+  Object.defineProperties(image, {
+    setPointerCapture: { configurable: true, value: vi.fn(() => { captured = true; }) },
+    hasPointerCapture: { configurable: true, value: vi.fn(() => captured) },
+    releasePointerCapture: { configurable: true, value: vi.fn(() => { captured = false; }) },
+    getBoundingClientRect: { configurable: true,
+      value: () => ({ left: 0, top: 0, width: 200, height: 400 }) }
+  });
+  await act(async () => {
+    dispatchPointer(image, "pointerdown", { pointerId: 1, clientX: 50, clientY: 100,
+      button: 0, buttons: 1 });
+    dispatchPointer(image, "pointerup", { pointerId: 1, clientX: 52, clientY: 102,
+      button: 0, buttons: 0 });
+    await Promise.resolve();
+  });
+  expect(control).toHaveBeenNthCalledWith(1, "task", expect.stringMatching(/^[0-9a-f-]{36}$/u),
+    route, { action: "tap", xRatio: 0.26, yRatio: 0.255 }, expect.any(AbortSignal));
+
+  await act(async () => {
+    dispatchPointer(image, "pointerdown", { pointerId: 2, clientX: 20, clientY: 40,
+      button: 0, buttons: 1 });
+    dispatchPointer(image, "pointermove", { pointerId: 2, clientX: 100, clientY: 200,
+      button: 0, buttons: 1 });
+    dispatchPointer(image, "pointerup", { pointerId: 2, clientX: 180, clientY: 360,
+      button: 0, buttons: 0 });
+    await Promise.resolve();
+  });
+  expect(control.mock.calls[1]?.[3]).toMatchObject({ action: "swipe",
+    startXRatio: 0.1, startYRatio: 0.1, endXRatio: 0.9, endYRatio: 0.9,
+    durationMs: expect.any(Number) });
+
+  const text = container.querySelector<HTMLInputElement>(".simulator-viewer__keyboard input")!;
+  await act(async () => {
+    setInputValue(text, "hello");
+    text.dispatchEvent(new Event("input", { bubbles: true }));
+    text.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+    await Promise.resolve();
+  });
+  expect(control.mock.calls[2]?.[3]).toEqual({ action: "typeText", text: "hello" });
+  expect(text.value).toBe("");
+
+  await act(async () => {
+    dispatchPointer(image, "pointerdown", { pointerId: 3, clientX: 40, clientY: 80,
+      button: 0, buttons: 1 });
+    dispatchPointer(image, "pointercancel", { pointerId: 3, clientX: 40, clientY: 80,
+      button: 0, buttons: 0 });
+  });
+  expect(control).toHaveBeenCalledTimes(3);
+});
+
+it("keeps typed text and locks input after an unconfirmed result until explicit reconciliation", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:failure",
+    revokeObjectURL: vi.fn() });
+  const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  };
+  const control = vi.fn()
+    .mockRejectedValueOnce(new Error("outcome unknown"))
+    .mockResolvedValue({ replayed: false });
+  const reconcile = vi.fn(async () => undefined);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen
+    controller={{ watchSimulatorFrames: watch,
+      controlSimulatorViewerInput: control } as unknown as AppController}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={reconcile}
+    t={(key, values) => translate("en", key, values)} />));
+  const text = container.querySelector<HTMLInputElement>(".simulator-viewer__keyboard input")!;
+  await act(async () => {
+    setInputValue(text, "keep me");
+    text.dispatchEvent(new Event("input", { bubbles: true }));
+    text.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+  });
+  expect(container.querySelector("[role=alert]")?.textContent).toContain("outcome unknown");
+  expect(text.value).toBe("keep me");
+  expect(text.disabled).toBe(true);
+  expect(reconcile).toHaveBeenCalledOnce();
+  const recover = [...container.querySelectorAll("button")]
+    .find(button => button.textContent === "Refresh controls")!;
+  await act(async () => { recover.click(); await Promise.resolve(); });
+  expect(reconcile).toHaveBeenCalledTimes(2);
+  expect(text.disabled).toBe(false);
+  await act(async () => {
+    text.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+  });
+  expect(control).toHaveBeenCalledTimes(2);
+  expect(text.value).toBe("");
+});
+
+function dispatchPointer(target: Element, type: string, input: {
+  readonly pointerId: number; readonly clientX: number; readonly clientY: number;
+  readonly button: number; readonly buttons: number }): void {
+  const event = new MouseEvent(type, { bubbles: true, cancelable: true,
+    clientX: input.clientX, clientY: input.clientY,
+    button: input.button, buttons: input.buttons });
+  Object.defineProperty(event, "pointerId", { configurable: true, value: input.pointerId });
+  target.dispatchEvent(event);
+}
+
+function setInputValue(input: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  setter?.call(input, value);
+}

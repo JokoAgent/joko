@@ -18,6 +18,7 @@ interface FrameSubscription {
   sequence: number;
   lastFrameAt: string | null;
   encoding: "jpeg" | "h264";
+  viewerOrientation: SimulatorNativeH264Profile["orientation"] | null;
 }
 export interface SimulatorViewerFrameSnapshot {
   readonly adapter: "wda-mjpeg" | "native-h264";
@@ -68,6 +69,21 @@ export class SimulatorViewerFrameCoordinator {
       sequence: preferred.sequence, lastFrameAt: preferred.lastFrameAt } : null;
   }
 
+  inputView(scope: SimulatorTaskScope, route: SimulatorInstanceRoute): {
+    readonly state: FrameState;
+    readonly encoding: "jpeg" | "h264";
+    readonly viewerOrientation: SimulatorNativeH264Profile["orientation"] | null;
+    readonly lastFrameAt: string | null;
+  } | null {
+    this.#requireReady(scope, route);
+    const current = [...(this.#subscriptions.get(route.instanceId) ?? [])]
+      .filter(item => !item.controller.signal.aborted && item.route.generation === route.generation &&
+        item.route.leaseId === route.leaseId);
+    const preferred = current.find(item => item.state === "streaming") ?? current[0];
+    return preferred ? { state: preferred.state, encoding: preferred.encoding,
+      viewerOrientation: preferred.viewerOrientation, lastFrameAt: preferred.lastFrameAt } : null;
+  }
+
   async *watch(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
     signal?: AbortSignal, preference?: SimulatorViewerVideoPreference): AsyncGenerator<SimulatorViewerFrameEvent> {
     const instance = this.#requireReady(scope, route);
@@ -76,7 +92,7 @@ export class SimulatorViewerFrameCoordinator {
       "SUBSCRIPTION_LIMIT", "Simulator Viewer subscription limit reached.");
     const controller = new AbortController();
     const subscription: FrameSubscription = { controller, route, state: "connecting",
-      sequence: 0, lastFrameAt: null, encoding: "jpeg" };
+      sequence: 0, lastFrameAt: null, encoding: "jpeg", viewerOrientation: null };
     subscriptions.add(subscription);
     this.#subscriptions.set(instance.instanceId, subscriptions);
     const abort = (): void => controller.abort();
@@ -106,6 +122,7 @@ export class SimulatorViewerFrameCoordinator {
         if (stale) throw stale;
       }
       subscription.encoding = useNative ? "h264" : "jpeg";
+      subscription.viewerOrientation = useNative ? preference!.profile.orientation : null;
       for (let attempt = 0; attempt <= 3 && !controller.signal.aborted; attempt += 1) {
         check();
         if (stale) throw stale;
@@ -126,6 +143,7 @@ export class SimulatorViewerFrameCoordinator {
             }
             useNative = false;
             subscription.encoding = "jpeg";
+            subscription.viewerOrientation = null;
           } else {
             for await (const frame of this.#driver.streamMjpegFrames(instance, controller.signal)) {
               check();
@@ -142,7 +160,11 @@ export class SimulatorViewerFrameCoordinator {
           if (stale) throw stale;
           if (controller.signal.aborted) return;
           if (error instanceof SimulatorDriverError && error.code === "STALE_DRIVER") throw error;
-          if (useNative) { useNative = false; subscription.encoding = "jpeg"; }
+          if (useNative) {
+            useNative = false;
+            subscription.encoding = "jpeg";
+            subscription.viewerOrientation = null;
+          }
           if (attempt === 3) break;
           await this.#delay([250, 1_000, 2_000][attempt]!, controller.signal);
           continue;

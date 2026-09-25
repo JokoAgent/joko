@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
+  ControlSimulatorViewerInputResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
   SimulatorViewerInstanceSchema, SimulatorViewerStreamState,
   WatchSimulatorFramesResponseSchema } from "@joko/contracts";
@@ -25,7 +26,9 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
       ? create(GetSimulatorViewerStateResponseSchema, {
         support: CapabilitySupport.SUPPORTED, devices: [], instances: [instance]
       })
-      : create(ControlSimulatorInstanceResponseSchema, { instance, deleted: true });
+      : method.localName === "controlSimulatorViewerInput"
+        ? create(ControlSimulatorViewerInputResponseSchema, { replayed: false })
+        : create(ControlSimulatorInstanceResponseSchema, { instance, deleted: true });
     return { service: method.parent, method, stream: false,
       header: new Headers(), trailer: new Headers(), message };
   }) } as unknown as Transport;
@@ -39,6 +42,13 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
   expect(deleted).toMatchObject({ deleted: true, instance: { route } });
   expect(requests.at(-1)).toMatchObject({ name: "controlSimulatorInstance",
     input: { sessionId: "task", requestId: "request", action: SimulatorViewerAction.DELETE, route } });
+  await gateway.controlSimulatorViewerInput("task", "input-request", route,
+    { action: "swipe", startXRatio: 0.1, startYRatio: 0.2,
+      endXRatio: 0.8, endYRatio: 0.9, durationMs: 450 });
+  expect(requests.at(-1)).toMatchObject({ name: "controlSimulatorViewerInput",
+    input: { sessionId: "task", requestId: "input-request", route,
+      input: { case: "swipe", value: { start: { xRatio: 0.1, yRatio: 0.2 },
+        end: { xRatio: 0.8, yRatio: 0.9 }, durationMs: 450 } } } });
   failControl = true;
   await expect(gateway.controlSimulatorInstance("task", "uncertain", { action: "stop", route }))
     .rejects.toThrow("Outcome unknown");

@@ -109,6 +109,28 @@ it("claims public input before dispatch, resolves the current element and never 
   } finally { h.store.close(); }
 });
 
+it("replays request-bound Viewer input across a refreshed private snapshot without redispatch", async () => {
+  const h = fixture();
+  try {
+    const first = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    const secret = "viewer text stays outside the operation";
+    await expect(h.input.execute(SCOPE, route(h.instance),
+      { type: "type_text", snapshotId: first.snapshotId, text: secret },
+      OBSERVE_NONE, authority("0"), undefined, { bindSnapshotToOperation: false }))
+      .resolves.toMatchObject({ replayed: false });
+    const second = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    await expect(h.input.execute(SCOPE, route(h.instance),
+      { type: "type_text", snapshotId: second.snapshotId, text: secret },
+      OBSERVE_NONE, authority("0"), undefined, { bindSnapshotToOperation: false }))
+      .resolves.toMatchObject({ replayed: true, observation: null });
+    expect(h.calls.filter(call => call.type === "type_text" && call.value === secret)).toHaveLength(1);
+    const operation = h.store.findOperation(`ios-simulator-input:${"0".repeat(64)}`);
+    expect(operation?.body).not.toHaveProperty("snapshotId");
+    expect(JSON.stringify({ body: operation?.body,
+      response: operation && "response" in operation ? operation.response : null })).not.toContain(secret);
+  } finally { h.store.close(); }
+});
+
 it("serializes input effects and fences an unknown dispatch without reusing its snapshot", async () => {
   const h = fixture();
   try {

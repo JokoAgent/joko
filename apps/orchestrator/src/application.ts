@@ -910,7 +910,7 @@ export async function createOrchestratorApplication(
       Date.now, simulatorViewerFrames);
   const simulatorViewer: SimulatorViewerServiceOwner | undefined = simulatorControl === undefined ? undefined : {
     ownership: simulatorOwnership, control: simulatorControl, environment: simulatorEnvironment,
-    frames: simulatorViewerFrames,
+    frames: simulatorViewerFrames, input: simulatorInput, screen: simulatorScreen,
     clearInstance: async instanceId => {
       simulatorViewerFrames?.clear(instanceId);
       simulatorScreen?.clear(instanceId);

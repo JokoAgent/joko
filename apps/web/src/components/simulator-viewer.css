@@ -10,16 +10,27 @@
 .simulator-viewer__card-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
 .simulator-viewer__card-header h4 { margin: 0; font-size: var(--text-15); }
 .simulator-viewer__card-header span { color: var(--text-muted); font-size: var(--text-12); }
+.simulator-viewer__interaction { display: grid; gap: 8px; min-width: 0; }
 .simulator-viewer__screen { display: grid; place-content: center; justify-items: center; gap: 8px; min-height: 175px; padding: 16px; border: 1px dashed var(--line-strong); border-radius: 10px; background: var(--surface-sunken); color: var(--text-muted); text-align: center; }
 .simulator-viewer__screen svg { width: 30px; height: 30px; }
 .simulator-viewer__screen img, .simulator-viewer__screen canvas { display: block; max-width: 100%; max-height: min(65vh, 680px); object-fit: contain; }
+.simulator-viewer__frame { touch-action: none; user-select: none; cursor: crosshair; }
+.simulator-viewer__frame[aria-disabled="true"] { pointer-events: none; cursor: default; opacity: .8; }
 .simulator-viewer__screen .button { margin-top: 4px; }
 .simulator-viewer__quality { display: flex; align-items: center; gap: 8px; max-width: 100%; font-size: var(--text-12); }
 .simulator-viewer__quality select { min-width: 0; max-width: 100%; }
+.simulator-viewer__keyboard { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.simulator-viewer__keyboard label { position: relative; flex: 1; min-width: 0; }
+.simulator-viewer__keyboard label > svg { position: absolute; top: 50%; left: 10px; width: 15px; height: 15px; color: var(--text-muted); transform: translateY(-50%); pointer-events: none; }
+.simulator-viewer__keyboard input { width: 100%; min-width: 0; min-height: 36px; padding: 6px 10px 6px 34px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--text); }
+.simulator-viewer__input-error { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--red) 30%, var(--line)); border-radius: 10px; background: var(--red-soft); color: var(--red); font-size: var(--text-12); }
+.simulator-viewer__input-error > svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.simulator-viewer__input-error > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.simulator-viewer__hint { margin: 0; color: var(--text-muted); font-size: var(--text-12); }
 .simulator-viewer__metadata { margin: 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
 .simulator-viewer__actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .simulator-viewer__forms label { display: grid; gap: 5px; min-width: 0; }
 .simulator-viewer__forms input, .simulator-viewer__forms select { width: 100%; min-width: 0; min-height: 36px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
 .simulator-viewer__delete { display: grid; gap: 10px; }
 .simulator-viewer__delete p { margin: 0; }
-@container (max-width: 340px) { .simulator-viewer { padding: 12px; } .simulator-viewer__header .button { width: 100%; } }
+@container (max-width: 340px) { .simulator-viewer { padding: 12px; } .simulator-viewer__header .button { width: 100%; } .simulator-viewer__keyboard { align-items: stretch; flex-direction: column; } .simulator-viewer__keyboard .button { width: 100%; } .simulator-viewer__input-error { align-items: stretch; flex-direction: column; } }

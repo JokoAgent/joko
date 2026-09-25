@@ -8,6 +8,7 @@ import "joko/v1/capability.proto";
 service SimulatorViewerService {
   rpc GetSimulatorViewerState(GetSimulatorViewerStateRequest) returns (GetSimulatorViewerStateResponse);
   rpc ControlSimulatorInstance(ControlSimulatorInstanceRequest) returns (ControlSimulatorInstanceResponse);
+  rpc ControlSimulatorViewerInput(ControlSimulatorViewerInputRequest) returns (ControlSimulatorViewerInputResponse);
   rpc WatchSimulatorFrames(WatchSimulatorFramesRequest) returns (stream WatchSimulatorFramesResponse);
 }
 
@@ -78,6 +79,40 @@ message ControlSimulatorInstanceResponse {
   SimulatorViewerInstance instance = 1;
   bool deleted = 2;
   bool replayed = 3;
+}
+
+message SimulatorViewerPoint {
+  double x_ratio = 1;
+  double y_ratio = 2;
+}
+
+message SimulatorViewerTap {
+  SimulatorViewerPoint point = 1;
+}
+
+message SimulatorViewerSwipe {
+  SimulatorViewerPoint start = 1;
+  SimulatorViewerPoint end = 2;
+  uint32 duration_ms = 3;
+}
+
+message SimulatorViewerTextInput {
+  string text = 1;
+}
+
+message ControlSimulatorViewerInputRequest {
+  string session_id = 1;
+  string request_id = 2;
+  SimulatorViewerRoute route = 3;
+  oneof input {
+    SimulatorViewerTap tap = 4;
+    SimulatorViewerSwipe swipe = 5;
+    SimulatorViewerTextInput text = 6;
+  }
+}
+
+message ControlSimulatorViewerInputResponse {
+  bool replayed = 1;
 }
 
 enum SimulatorViewerStreamState {

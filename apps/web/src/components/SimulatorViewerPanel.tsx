@@ -33,13 +33,15 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
   const profileId = controller.state.activeProfile?.id;
   const enabled = active && connected;
 
-  const refresh = useCallback(async (signal: AbortSignal): Promise<void> => {
+  const refresh = useCallback(async (signal: AbortSignal): Promise<boolean> => {
     setLoading(true);
     try {
       const next = await controllerRef.current.getSimulatorViewerState(sessionId, signal);
       if (!signal.aborted) { setState(next); setError(undefined); }
+      return !signal.aborted;
     } catch (cause) {
       if (!signal.aborted) setError(messageOf(cause));
+      return false;
     } finally {
       if (!signal.aborted) setLoading(false);
     }
@@ -113,6 +115,12 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
             <SimulatorViewerScreen key={`${instance.route.instanceId}:${instance.route.generation}:${instance.route.leaseId}`}
               controller={controller} sessionId={sessionId} route={instance.route}
               enabled={canMutate && instance.lifecycleState === "ready" && instance.viewerState === "attached"}
+              onReconcile={async () => {
+                const signal = owner.current?.signal;
+                if (!signal || signal.aborted || !enabled || !await refresh(signal)) {
+                  throw new Error("Simulator state could not be refreshed.");
+                }
+              }}
               ownerDocument={ownerDocument} t={t} />
             <p className="simulator-viewer__metadata">{instance.simulatorUdid}</p>
             <p className="simulator-viewer__metadata">{t("simulator.state", {

@@ -1,14 +1,14 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Code } from "@connectrpc/connect";
 import { CapabilitySupport, SimulatorViewerAction } from "@joko/contracts";
 import { createOrchestratorApplication, createPublicServer,
   type OrchestratorConfig } from "@joko/orchestrator";
 import { chromium, type Browser } from "playwright-core";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
 
 it("serves authenticated task-owned Simulator inventory and durable exact deletion over public Connect", { timeout: 30_000 }, async () => {
@@ -157,6 +157,10 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
   let jpeg: Buffer | undefined;
   let h264: Uint8Array | undefined;
   let stopNative = false;
+  let wdaPort = 0;
+  let ownerFingerprint = "";
+  const viewerInputs: Array<{ readonly url: string; readonly body: unknown;
+    readonly claimed: boolean }> = [];
   let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -209,8 +213,12 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     }, manager: {
       get: instanceId => activeDriver?.instanceId === instanceId ? activeDriver : null,
       start: async options => {
+        ownerFingerprint = createHash("sha256").update([
+          resolve(join(dataDirectory, "driver-cache")), options.instanceId,
+          options.simulatorUdid.toUpperCase()
+        ].join("\0")).digest("hex");
         activeDriver = { instanceId: options.instanceId, simulatorUdid: udid,
-          leaseId: randomUUID(), pid: process.pid, controlPort: 18100,
+          leaseId: randomUUID(), pid: process.pid, controlPort: wdaPort,
           mjpegPort: address.port, sourceRevision: "fixture", buildCacheKey: "a".repeat(64),
           driverSessionId: "SESSION-1", health: { ready: true, message: null,
             osName: "iOS", osVersion: "19.0", sdkVersion: "19.0", deviceIp: null }, state: "ready" };
@@ -220,9 +228,46 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       retryOwnedCleanup: async () => {}
     }, cleanupOrphans: async () => {} }
   } });
+  const wdaServer: Server = createServer((request, response) => {
+    const send = (value: unknown): void => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ value }));
+    };
+    if (request.method === "POST" && request.url && [
+      "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys"
+    ].includes(request.url)) {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        viewerInputs.push({ url: request.url!,
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+          claimed: application.store.listOperations({ sessionId: "viewer-web-task", status: "started" })
+            .some(operation => operation.kind === "ios_simulator_input") });
+        send(null);
+      });
+      return;
+    }
+    if (request.method !== "GET") { response.writeHead(405); response.end(); return; }
+    if (request.url === "/status") send({ ready: true, build: { upgradedAt: ownerFingerprint } });
+    else if (request.url === "/session/SESSION-1/source?format=json") send({
+      type: "XCUIElementTypeOther", children: [{ type: "XCUIElementTypeTextField",
+        label: "Viewer input", enabled: true, visible: true,
+        rect: { x: 10, y: 20, width: 160, height: 44 } }]
+    });
+    else if (request.url === "/session/SESSION-1/window/size") send({ width: 393, height: 852 });
+    else if (request.url === "/session/SESSION-1/orientation") send("PORTRAIT");
+    else { response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ value: { error: "invalid session id" } })); }
+  });
   let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
   let browser: Browser | undefined;
   try {
+    await new Promise<void>(resolveWda => wdaServer.listen(0, "127.0.0.1", resolveWda));
+    const wdaAddress = wdaServer.address();
+    if (!wdaAddress || typeof wdaAddress === "string") {
+      throw new Error("WDA loopback port was not allocated.");
+    }
+    wdaPort = wdaAddress.port;
     const target = application.store.getTarget("workspace").descriptor;
     application.store.createSession({ id: "viewer-web-task", backendId: target.backendId,
       targetId: target.id, title: "Viewer Web task",
@@ -296,6 +341,33 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         const image = document.querySelector<HTMLImageElement>(".simulator-viewer__screen img");
         return image?.complete && image.naturalWidth === 16 && image.naturalHeight === 12;
       });
+      const textInput = panel.getByRole("textbox", { name: "Text to type in the Simulator" });
+      await textInput.fill("mounted-private-text");
+      await textInput.press("Enter");
+      await vi.waitFor(() => expect(viewerInputs).toHaveLength(1), { timeout: 5_000 });
+      expect(viewerInputs[0]).toMatchObject({ url: "/session/SESSION-1/wda/keys", claimed: true });
+      expect(await textInput.inputValue()).toBe("");
+
+      const interactiveFrame = panel.locator(".simulator-viewer__screen img");
+      await interactiveFrame.click({ position: { x: 8, y: 6 } });
+      await vi.waitFor(() => expect(viewerInputs).toHaveLength(2), { timeout: 5_000 });
+      expect(viewerInputs[1]).toMatchObject({ url: "/session/SESSION-1/actions", claimed: true });
+      const frameBox = await interactiveFrame.boundingBox();
+      if (!frameBox) throw new Error("Visible Simulator frame has no pointer bounds.");
+      await page.mouse.move(frameBox.x + 2, frameBox.y + 2);
+      await page.mouse.down();
+      await page.mouse.move(frameBox.x + frameBox.width - 2,
+        frameBox.y + frameBox.height - 2, { steps: 4 });
+      await page.mouse.up();
+      await vi.waitFor(() => expect(viewerInputs).toHaveLength(3), { timeout: 5_000 });
+      expect(viewerInputs[2]).toMatchObject({ url: "/session/SESSION-1/actions", claimed: true });
+      const inputOperations = application.store.listOperations({ sessionId: "viewer-web-task",
+        status: "completed" }).filter(operation => operation.kind === "ios_simulator_input");
+      expect(inputOperations).toHaveLength(3);
+      expect(JSON.stringify(inputOperations.map(operation => ({ body: operation.body,
+        response: "response" in operation ? operation.response : null })),
+      (_key, value) => typeof value === "bigint" ? value.toString() : value))
+        .not.toContain("mounted-private-text");
       await page.setViewportSize({ width: 390, height: 844 });
       await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       const deleteButton = panel.getByRole("button", { name: "Delete", exact: true });
@@ -319,6 +391,8 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     await browser?.close();
     await server?.close();
     await application.close();
+    wdaServer.closeAllConnections();
+    await new Promise<void>(resolveWda => wdaServer.close(() => resolveWda()));
     mjpegServer.closeAllConnections();
     await new Promise<void>(resolve => mjpegServer.close(() => resolve()));
     await rm(root, { recursive: true, force: true });

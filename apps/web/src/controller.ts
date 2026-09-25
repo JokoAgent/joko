@@ -1831,6 +1831,7 @@ export function useAppController(): AppController {
     return {
       getSimulatorViewerState: (...args: Parameters<OperationApi["getSimulatorViewerState"]>) => original().getSimulatorViewerState(...args),
       controlSimulatorInstance: (...args: Parameters<OperationApi["controlSimulatorInstance"]>) => original().controlSimulatorInstance(...args),
+      controlSimulatorViewerInput: (...args: Parameters<OperationApi["controlSimulatorViewerInput"]>) => original().controlSimulatorViewerInput(...args),
       watchSimulatorFrames: (...args: Parameters<OperationApi["watchSimulatorFrames"]>) => original().watchSimulatorFrames(...args)
     };
   }, [artifactGateway]);

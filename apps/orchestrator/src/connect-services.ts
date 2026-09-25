@@ -7,7 +7,7 @@ import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./r
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import { SimulatorCreateError, SimulatorDeleteError, SimulatorLifecycleError, SimulatorMjpegError,
-  SimulatorResourceError } from "@joko/tool-ios-simulator";
+  SimulatorResourceError, SimulatorScreenMapError } from "@joko/tool-ios-simulator";
 import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM,
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM,
@@ -399,6 +399,8 @@ import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
 import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
 import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
+import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
+import { SimulatorObservationError } from "./ios-simulator-screen-observation.js";
 import { SimulatorViewerFrameError } from "./ios-simulator-viewer-frames.js";
 import { SimulatorInstanceControlError } from "./ios-simulator-instance-control.js";
 import { SimulatorOwnershipError } from "./ios-simulator-ownership.js";
@@ -752,6 +754,17 @@ function toConnectError(error: unknown): ConnectError {
       : error.code === "STREAM_TOO_LARGE" ? Code.ResourceExhausted
         : error.code === "STREAM_TIMEOUT" ? Code.DeadlineExceeded
           : error.code === "STREAM_INVALID" ? Code.DataLoss : Code.Unavailable);
+  if (error instanceof SimulatorInputError) return new ConnectError(redactSecrets(error.message),
+    error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
+      : error.code === "MUTATION_CANCELLED" ? Code.Canceled
+        : error.code === "MUTATION_CONFLICT" ? Code.AlreadyExists
+          : error.code === "MUTATION_IN_PROGRESS" ? Code.Aborted : Code.FailedPrecondition);
+  if (error instanceof SimulatorObservationError || error instanceof SimulatorScreenMapError) {
+    return new ConnectError(redactSecrets(error.message),
+      error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
+        : error.code === "OBSERVATION_CANCELLED" ? Code.Canceled
+          : error.code === "UI_WAIT_TIMEOUT" ? Code.DeadlineExceeded : Code.Aborted);
+  }
   if (error instanceof SimulatorOwnershipError || error instanceof SimulatorInstanceControlError ||
       error instanceof SimulatorCreateError || error instanceof SimulatorDeleteError ||
       error instanceof SimulatorLifecycleError || error instanceof SimulatorResourceError ||

@@ -42,6 +42,8 @@ it("streams only the exact ready task route without persisting frame bytes", asy
     expect((await watch.next()).value).toMatchObject({ kind: "frame", sequence: 1, bytes: jpeg });
     expect(h.frames.snapshot(SCOPE, h.route)).toMatchObject({ adapter: "wda-mjpeg",
       encoding: "jpeg", state: "streaming", sequence: 1 });
+    expect(h.frames.inputView(SCOPE, h.route)).toMatchObject({ state: "streaming",
+      encoding: "jpeg", viewerOrientation: null, lastFrameAt: expect.any(String) });
     expect(h.store.listOperations({ sessionId: SCOPE.sessionId })).toEqual([]);
     await watch.return(undefined);
     expect(h.frames.snapshot(SCOPE, h.route)).toBeNull();
@@ -74,11 +76,15 @@ it("prefers owned H.264 frames and falls back to MJPEG after native loss", async
       bytes: h264, keyFrame: true });
     expect(h.frames.snapshot(SCOPE, h.route)).toMatchObject({ adapter: "native-h264",
       encoding: "h264", state: "streaming", sequence: 1 });
+    expect(h.frames.inputView(SCOPE, h.route)).toMatchObject({ state: "streaming",
+      encoding: "h264", viewerOrientation: "PORTRAIT", lastFrameAt: expect.any(String) });
     expect((await watch.next()).value).toEqual({ kind: "reconnecting", attempt: 1 });
     expect((await watch.next()).value).toMatchObject({ kind: "frame", sequence: 2,
       bytes: jpeg });
     expect(h.frames.snapshot(SCOPE, h.route)).toMatchObject({ adapter: "wda-mjpeg",
       encoding: "jpeg", sequence: 2 });
+    expect(h.frames.inputView(SCOPE, h.route)).toMatchObject({ state: "streaming",
+      encoding: "jpeg", viewerOrientation: null, lastFrameAt: expect.any(String) });
     expect(native.probeNativeH264).toHaveBeenCalledOnce();
     expect(native.streamNativeH264Frames).toHaveBeenCalledOnce();
     await watch.return(undefined);

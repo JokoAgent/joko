@@ -9,7 +9,7 @@ import type {
 } from "./model.js";
 
 type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance" |
-  "watchSimulatorFrames">;
+  "controlSimulatorViewerInput" | "watchSimulatorFrames">;
 
 export function createSimulatorViewerGateway(transport: Transport, ownerSignal?: AbortSignal): ViewerApi {
   const client = createClient(SimulatorViewerService, transport);
@@ -46,6 +46,20 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
             : { route: input.route })
       }, options(signal));
       return { instance: instanceView(response.instance), deleted: response.deleted, replayed: response.replayed };
+    },
+    async controlSimulatorViewerInput(sessionId, requestId, route, input, signal) {
+      const action = input.action === "tap"
+        ? { case: "tap" as const, value: { point: { xRatio: input.xRatio, yRatio: input.yRatio } } }
+        : input.action === "swipe"
+          ? { case: "swipe" as const, value: {
+            start: { xRatio: input.startXRatio, yRatio: input.startYRatio },
+            end: { xRatio: input.endXRatio, yRatio: input.endYRatio },
+            durationMs: input.durationMs
+          } }
+          : { case: "text" as const, value: { text: input.text } };
+      const response = await client.controlSimulatorViewerInput({ sessionId, requestId, route,
+        input: action }, options(signal));
+      return { replayed: response.replayed };
     },
     async *watchSimulatorFrames(sessionId, route, signal, preference) {
       let sequence = 0n;

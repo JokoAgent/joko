@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/simulator_viewer.proto.
  */
 export const file_joko_v1_simulator_viewer: GenFile = /*@__PURE__*/
-  fileDesc("Ch5qb2tvL3YxL3NpbXVsYXRvcl92aWV3ZXIucHJvdG8SB2pva28udjEiUQoUU2ltdWxhdG9yVmlld2VyUm91dGUSEwoLaW5zdGFuY2VfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBIQCghsZWFzZV9pZBgDIAEoCSKnAQoVU2ltdWxhdG9yVmlld2VyRGV2aWNlEgwKBHVkaWQYASABKAkSDAoEbmFtZRgCIAEoCRINCgVzdGF0ZRgDIAEoCRIaChJydW50aW1lX2lkZW50aWZpZXIYBCABKAkSFAoMcnVudGltZV9uYW1lGAUgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBiABKAkSEQoJYXZhaWxhYmxlGAcgASgIIvwCChdTaW11bGF0b3JWaWV3ZXJJbnN0YW5jZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSFgoOc2ltdWxhdG9yX3VkaWQYAiABKAkSFgoOc2ltdWxhdG9yX25hbWUYAyABKAkSGgoScnVudGltZV9pZGVudGlmaWVyGAQgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBSABKAkSGwoTY3JlYXRpb25fcHJvdmVuYW5jZRgGIAEoCRIXCg9ib290X3Byb3ZlbmFuY2UYByABKAkSFwoPbGlmZWN5Y2xlX3N0YXRlGAggASgJEhQKDHZpZXdlcl9zdGF0ZRgJIAEoCRIUCgxoZWFsdGhfc3RhdGUYCiABKAkSEgoKZXJyb3JfY29kZRgLIAEoCRIbChNncmFjZV9leHBpcmVzX2F0X21zGAwgASgEEhsKE2xlYXNlX2V4cGlyZXNfYXRfbXMYDSABKAQiNAoeR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiyQEKH0dldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USKwoHc3VwcG9ydBgBIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQSEwoLcmVhc29uX2NvZGUYAiABKAkSLwoHZGV2aWNlcxgDIAMoCzIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyRGV2aWNlEjMKCWluc3RhbmNlcxgEIAMoCzIgLmpva28udjEuU2ltdWxhdG9yVmlld2VySW5zdGFuY2Ui4QEKH0NvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEi4KBmFjdGlvbhgDIAEoDjIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyQWN0aW9uEiwKBXJvdXRlGAQgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIVCg10ZW1wbGF0ZV91ZGlkGAUgASgJEgwKBG5hbWUYBiABKAkSEwoLZGV2aWNlX3VkaWQYByABKAkieQogQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USMgoIaW5zdGFuY2UYASABKAsyIC5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckluc3RhbmNlEg8KB2RlbGV0ZWQYAiABKAgSEAoIcmVwbGF5ZWQYAyABKAgixAEKG1dhdGNoU2ltdWxhdG9yRnJhbWVzUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEiwKBXJvdXRlGAIgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIaChJwcmVmZXJfbmF0aXZlX2gyNjQYAyABKAgSGQoRZnJhbWVzX3Blcl9zZWNvbmQYBCABKA0SFwoPc2NhbGluZ19wZXJjZW50GAUgASgNEhMKC29yaWVudGF0aW9uGAYgASgJIsICChxXYXRjaFNpbXVsYXRvckZyYW1lc1Jlc3BvbnNlEiwKBXJvdXRlGAEgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIyCgVzdGF0ZRgCIAEoDjIjLmpva28udjEuU2ltdWxhdG9yVmlld2VyU3RyZWFtU3RhdGUSEAoIc2VxdWVuY2UYAyABKAQSFgoOcmVjZWl2ZWRfYXRfbXMYBCABKAMSDAoEanBlZxgFIAEoDBIZChFyZWNvbm5lY3RfYXR0ZW1wdBgGIAEoDRIMCgRoMjY0GAcgASgMEg0KBXdpZHRoGAggASgNEg4KBmhlaWdodBgJIAEoDRIYChB0aW1lc3RhbXBfbWljcm9zGAogASgEEhEKCWtleV9mcmFtZRgLIAEoCBITCgtoMjY0X2Zvcm1hdBgMIAEoCSqVAgoVU2ltdWxhdG9yVmlld2VyQWN0aW9uEicKI1NJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX1VOU1BFQ0lGSUVEEAASIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fQ1JFQVRFEAESIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fQVRUQUNIEAISIQodU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fU1RBUlQQAxIgChxTSU1VTEFUT1JfVklFV0VSX0FDVElPTl9TVE9QEAQSIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fREVUQUNIEAUSIgoeU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fREVMRVRFEAYqggIKGlNpbXVsYXRvclZpZXdlclN0cmVhbVN0YXRlEi0KKVNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX1VOU1BFQ0lGSUVEEAASLAooU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfQ09OTkVDVElORxABEi4KKlNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX1JFQ09OTkVDVElORxACEicKI1NJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX0ZSQU1FEAMSLgoqU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfRElTQ09OTkVDVEVEEAQy3gIKFlNpbXVsYXRvclZpZXdlclNlcnZpY2USbAoXR2V0U2ltdWxhdG9yVmlld2VyU3RhdGUSJy5qb2tvLnYxLkdldFNpbXVsYXRvclZpZXdlclN0YXRlUmVxdWVzdBooLmpva28udjEuR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXNwb25zZRJvChhDb250cm9sU2ltdWxhdG9ySW5zdGFuY2USKC5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QaKS5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlc3BvbnNlEmUKFFdhdGNoU2ltdWxhdG9yRnJhbWVzEiQuam9rby52MS5XYXRjaFNpbXVsYXRvckZyYW1lc1JlcXVlc3QaJS5qb2tvLnYxLldhdGNoU2ltdWxhdG9yRnJhbWVzUmVzcG9uc2UwAWIGcHJvdG8z", [file_joko_v1_capability]);
+  fileDesc("Ch5qb2tvL3YxL3NpbXVsYXRvcl92aWV3ZXIucHJvdG8SB2pva28udjEiUQoUU2ltdWxhdG9yVmlld2VyUm91dGUSEwoLaW5zdGFuY2VfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBIQCghsZWFzZV9pZBgDIAEoCSKnAQoVU2ltdWxhdG9yVmlld2VyRGV2aWNlEgwKBHVkaWQYASABKAkSDAoEbmFtZRgCIAEoCRINCgVzdGF0ZRgDIAEoCRIaChJydW50aW1lX2lkZW50aWZpZXIYBCABKAkSFAoMcnVudGltZV9uYW1lGAUgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBiABKAkSEQoJYXZhaWxhYmxlGAcgASgIIvwCChdTaW11bGF0b3JWaWV3ZXJJbnN0YW5jZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSFgoOc2ltdWxhdG9yX3VkaWQYAiABKAkSFgoOc2ltdWxhdG9yX25hbWUYAyABKAkSGgoScnVudGltZV9pZGVudGlmaWVyGAQgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBSABKAkSGwoTY3JlYXRpb25fcHJvdmVuYW5jZRgGIAEoCRIXCg9ib290X3Byb3ZlbmFuY2UYByABKAkSFwoPbGlmZWN5Y2xlX3N0YXRlGAggASgJEhQKDHZpZXdlcl9zdGF0ZRgJIAEoCRIUCgxoZWFsdGhfc3RhdGUYCiABKAkSEgoKZXJyb3JfY29kZRgLIAEoCRIbChNncmFjZV9leHBpcmVzX2F0X21zGAwgASgEEhsKE2xlYXNlX2V4cGlyZXNfYXRfbXMYDSABKAQiNAoeR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiyQEKH0dldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USKwoHc3VwcG9ydBgBIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQSEwoLcmVhc29uX2NvZGUYAiABKAkSLwoHZGV2aWNlcxgDIAMoCzIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyRGV2aWNlEjMKCWluc3RhbmNlcxgEIAMoCzIgLmpva28udjEuU2ltdWxhdG9yVmlld2VySW5zdGFuY2Ui4QEKH0NvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEi4KBmFjdGlvbhgDIAEoDjIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyQWN0aW9uEiwKBXJvdXRlGAQgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIVCg10ZW1wbGF0ZV91ZGlkGAUgASgJEgwKBG5hbWUYBiABKAkSEwoLZGV2aWNlX3VkaWQYByABKAkieQogQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USMgoIaW5zdGFuY2UYASABKAsyIC5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckluc3RhbmNlEg8KB2RlbGV0ZWQYAiABKAgSEAoIcmVwbGF5ZWQYAyABKAgiOAoUU2ltdWxhdG9yVmlld2VyUG9pbnQSDwoHeF9yYXRpbxgBIAEoARIPCgd5X3JhdGlvGAIgASgBIkIKElNpbXVsYXRvclZpZXdlclRhcBIsCgVwb2ludBgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUG9pbnQihQEKFFNpbXVsYXRvclZpZXdlclN3aXBlEiwKBXN0YXJ0GAEgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJQb2ludBIqCgNlbmQYAiABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclBvaW50EhMKC2R1cmF0aW9uX21zGAMgASgNIigKGFNpbXVsYXRvclZpZXdlclRleHRJbnB1dBIMCgR0ZXh0GAEgASgJIpICCiJDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCRIsCgVyb3V0ZRgDIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSKgoDdGFwGAQgASgLMhsuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUYXBIABIuCgVzd2lwZRgFIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyU3dpcGVIABIxCgR0ZXh0GAYgASgLMiEuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUZXh0SW5wdXRIAEIHCgVpbnB1dCI3CiNDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXNwb25zZRIQCghyZXBsYXllZBgBIAEoCCLEAQobV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSLAoFcm91dGUYAiABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclJvdXRlEhoKEnByZWZlcl9uYXRpdmVfaDI2NBgDIAEoCBIZChFmcmFtZXNfcGVyX3NlY29uZBgEIAEoDRIXCg9zY2FsaW5nX3BlcmNlbnQYBSABKA0SEwoLb3JpZW50YXRpb24YBiABKAkiwgIKHFdhdGNoU2ltdWxhdG9yRnJhbWVzUmVzcG9uc2USLAoFcm91dGUYASABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclJvdXRlEjIKBXN0YXRlGAIgASgOMiMuam9rby52MS5TaW11bGF0b3JWaWV3ZXJTdHJlYW1TdGF0ZRIQCghzZXF1ZW5jZRgDIAEoBBIWCg5yZWNlaXZlZF9hdF9tcxgEIAEoAxIMCgRqcGVnGAUgASgMEhkKEXJlY29ubmVjdF9hdHRlbXB0GAYgASgNEgwKBGgyNjQYByABKAwSDQoFd2lkdGgYCCABKA0SDgoGaGVpZ2h0GAkgASgNEhgKEHRpbWVzdGFtcF9taWNyb3MYCiABKAQSEQoJa2V5X2ZyYW1lGAsgASgIEhMKC2gyNjRfZm9ybWF0GAwgASgJKpUCChVTaW11bGF0b3JWaWV3ZXJBY3Rpb24SJwojU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fVU5TUEVDSUZJRUQQABIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9DUkVBVEUQARIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9BVFRBQ0gQAhIhCh1TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9TVEFSVBADEiAKHFNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX1NUT1AQBBIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9ERVRBQ0gQBRIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9ERUxFVEUQBiqCAgoaU2ltdWxhdG9yVmlld2VyU3RyZWFtU3RhdGUSLQopU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfVU5TUEVDSUZJRUQQABIsCihTSU1VTEFUT1JfVklFV0VSX1NUUkVBTV9TVEFURV9DT05ORUNUSU5HEAESLgoqU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfUkVDT05ORUNUSU5HEAISJwojU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfRlJBTUUQAxIuCipTSU1VTEFUT1JfVklFV0VSX1NUUkVBTV9TVEFURV9ESVNDT05ORUNURUQQBDLYAwoWU2ltdWxhdG9yVmlld2VyU2VydmljZRJsChdHZXRTaW11bGF0b3JWaWV3ZXJTdGF0ZRInLmpva28udjEuR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0Giguam9rby52MS5HZXRTaW11bGF0b3JWaWV3ZXJTdGF0ZVJlc3BvbnNlEm8KGENvbnRyb2xTaW11bGF0b3JJbnN0YW5jZRIoLmpva28udjEuQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVxdWVzdBopLmpva28udjEuQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USeAobQ29udHJvbFNpbXVsYXRvclZpZXdlcklucHV0Eisuam9rby52MS5Db250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXF1ZXN0Giwuam9rby52MS5Db250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXNwb25zZRJlChRXYXRjaFNpbXVsYXRvckZyYW1lcxIkLmpva28udjEuV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXF1ZXN0GiUuam9rby52MS5XYXRjaFNpbXVsYXRvckZyYW1lc1Jlc3BvbnNlMAFiBnByb3RvMw", [file_joko_v1_capability]);
 
 /**
  * @generated from message joko.v1.SimulatorViewerRoute
@@ -289,6 +289,156 @@ export const ControlSimulatorInstanceResponseSchema: GenMessage<ControlSimulator
   messageDesc(file_joko_v1_simulator_viewer, 6);
 
 /**
+ * @generated from message joko.v1.SimulatorViewerPoint
+ */
+export type SimulatorViewerPoint = Message<"joko.v1.SimulatorViewerPoint"> & {
+  /**
+   * @generated from field: double x_ratio = 1;
+   */
+  xRatio: number;
+
+  /**
+   * @generated from field: double y_ratio = 2;
+   */
+  yRatio: number;
+};
+
+/**
+ * Describes the message joko.v1.SimulatorViewerPoint.
+ * Use `create(SimulatorViewerPointSchema)` to create a new message.
+ */
+export const SimulatorViewerPointSchema: GenMessage<SimulatorViewerPoint> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 7);
+
+/**
+ * @generated from message joko.v1.SimulatorViewerTap
+ */
+export type SimulatorViewerTap = Message<"joko.v1.SimulatorViewerTap"> & {
+  /**
+   * @generated from field: joko.v1.SimulatorViewerPoint point = 1;
+   */
+  point?: SimulatorViewerPoint | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SimulatorViewerTap.
+ * Use `create(SimulatorViewerTapSchema)` to create a new message.
+ */
+export const SimulatorViewerTapSchema: GenMessage<SimulatorViewerTap> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 8);
+
+/**
+ * @generated from message joko.v1.SimulatorViewerSwipe
+ */
+export type SimulatorViewerSwipe = Message<"joko.v1.SimulatorViewerSwipe"> & {
+  /**
+   * @generated from field: joko.v1.SimulatorViewerPoint start = 1;
+   */
+  start?: SimulatorViewerPoint | undefined;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerPoint end = 2;
+   */
+  end?: SimulatorViewerPoint | undefined;
+
+  /**
+   * @generated from field: uint32 duration_ms = 3;
+   */
+  durationMs: number;
+};
+
+/**
+ * Describes the message joko.v1.SimulatorViewerSwipe.
+ * Use `create(SimulatorViewerSwipeSchema)` to create a new message.
+ */
+export const SimulatorViewerSwipeSchema: GenMessage<SimulatorViewerSwipe> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 9);
+
+/**
+ * @generated from message joko.v1.SimulatorViewerTextInput
+ */
+export type SimulatorViewerTextInput = Message<"joko.v1.SimulatorViewerTextInput"> & {
+  /**
+   * @generated from field: string text = 1;
+   */
+  text: string;
+};
+
+/**
+ * Describes the message joko.v1.SimulatorViewerTextInput.
+ * Use `create(SimulatorViewerTextInputSchema)` to create a new message.
+ */
+export const SimulatorViewerTextInputSchema: GenMessage<SimulatorViewerTextInput> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 10);
+
+/**
+ * @generated from message joko.v1.ControlSimulatorViewerInputRequest
+ */
+export type ControlSimulatorViewerInputRequest = Message<"joko.v1.ControlSimulatorViewerInputRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string request_id = 2;
+   */
+  requestId: string;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerRoute route = 3;
+   */
+  route?: SimulatorViewerRoute | undefined;
+
+  /**
+   * @generated from oneof joko.v1.ControlSimulatorViewerInputRequest.input
+   */
+  input: {
+    /**
+     * @generated from field: joko.v1.SimulatorViewerTap tap = 4;
+     */
+    value: SimulatorViewerTap;
+    case: "tap";
+  } | {
+    /**
+     * @generated from field: joko.v1.SimulatorViewerSwipe swipe = 5;
+     */
+    value: SimulatorViewerSwipe;
+    case: "swipe";
+  } | {
+    /**
+     * @generated from field: joko.v1.SimulatorViewerTextInput text = 6;
+     */
+    value: SimulatorViewerTextInput;
+    case: "text";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message joko.v1.ControlSimulatorViewerInputRequest.
+ * Use `create(ControlSimulatorViewerInputRequestSchema)` to create a new message.
+ */
+export const ControlSimulatorViewerInputRequestSchema: GenMessage<ControlSimulatorViewerInputRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 11);
+
+/**
+ * @generated from message joko.v1.ControlSimulatorViewerInputResponse
+ */
+export type ControlSimulatorViewerInputResponse = Message<"joko.v1.ControlSimulatorViewerInputResponse"> & {
+  /**
+   * @generated from field: bool replayed = 1;
+   */
+  replayed: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ControlSimulatorViewerInputResponse.
+ * Use `create(ControlSimulatorViewerInputResponseSchema)` to create a new message.
+ */
+export const ControlSimulatorViewerInputResponseSchema: GenMessage<ControlSimulatorViewerInputResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 12);
+
+/**
  * @generated from message joko.v1.WatchSimulatorFramesRequest
  */
 export type WatchSimulatorFramesRequest = Message<"joko.v1.WatchSimulatorFramesRequest"> & {
@@ -328,7 +478,7 @@ export type WatchSimulatorFramesRequest = Message<"joko.v1.WatchSimulatorFramesR
  * Use `create(WatchSimulatorFramesRequestSchema)` to create a new message.
  */
 export const WatchSimulatorFramesRequestSchema: GenMessage<WatchSimulatorFramesRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_simulator_viewer, 7);
+  messageDesc(file_joko_v1_simulator_viewer, 13);
 
 /**
  * @generated from message joko.v1.WatchSimulatorFramesResponse
@@ -400,7 +550,7 @@ export type WatchSimulatorFramesResponse = Message<"joko.v1.WatchSimulatorFrames
  * Use `create(WatchSimulatorFramesResponseSchema)` to create a new message.
  */
 export const WatchSimulatorFramesResponseSchema: GenMessage<WatchSimulatorFramesResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_simulator_viewer, 8);
+  messageDesc(file_joko_v1_simulator_viewer, 14);
 
 /**
  * @generated from enum joko.v1.SimulatorViewerAction
@@ -505,6 +655,14 @@ export const SimulatorViewerService: GenService<{
     methodKind: "unary";
     input: typeof ControlSimulatorInstanceRequestSchema;
     output: typeof ControlSimulatorInstanceResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SimulatorViewerService.ControlSimulatorViewerInput
+   */
+  controlSimulatorViewerInput: {
+    methodKind: "unary";
+    input: typeof ControlSimulatorViewerInputRequestSchema;
+    output: typeof ControlSimulatorViewerInputResponseSchema;
   },
   /**
    * @generated from rpc joko.v1.SimulatorViewerService.WatchSimulatorFrames

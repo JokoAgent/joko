@@ -92,6 +92,11 @@ export interface SimulatorInputExecution {
   readonly observationError: { readonly code: string; readonly message: string } | null;
 }
 
+export interface SimulatorInputExecutionOptions {
+  /** UI requests already bind their full semantic input in requestBodyHash. */
+  readonly bindSnapshotToOperation?: boolean;
+}
+
 export class SimulatorInputError extends Error {
   constructor(readonly code: "INVALID_ARGUMENT" | "MUTATION_CANCELLED" |
     "MUTATION_IN_PROGRESS" | "MUTATION_CONFLICT" | "INPUT_OUTCOME_UNKNOWN" |
@@ -182,7 +187,7 @@ export class SimulatorInputCoordinator {
 
   async execute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute, action: SimulatorInputAction,
     observe: SimulatorInputObserveOptions, authority: SimulatorLifecycleEffectAuthority,
-    signal?: AbortSignal): Promise<SimulatorInputExecution> {
+    signal?: AbortSignal, options: SimulatorInputExecutionOptions = {}): Promise<SimulatorInputExecution> {
     this.#validate(action, observe, authority);
     if (signal?.aborted) {
       throw new SimulatorInputError("MUTATION_CANCELLED", "Simulator input was cancelled before admission.");
@@ -196,7 +201,8 @@ export class SimulatorInputCoordinator {
         body: { action: action.type, sessionId: scope.sessionId, targetId: scope.targetId,
           bindingGeneration: scope.generation, instanceId: route.instanceId,
           instanceGeneration: route.generation, leaseId: route.leaseId,
-          snapshotId: action.snapshotId, requestBodyHash: authority.requestBodyHash,
+          ...(options.bindSnapshotToOperation === false ? {} : { snapshotId: action.snapshotId }),
+          requestBodyHash: authority.requestBodyHash,
           providerGeneration: authority.providerGeneration }
       }, () => {
         instance = this.#ownership.requireRoute(scope, route);

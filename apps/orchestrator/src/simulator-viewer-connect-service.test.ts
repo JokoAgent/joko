@@ -15,7 +15,11 @@ const DEVICE = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "Joko iPhon
   runtimeName: "iOS 19.0", runtimeVersion: "19.0",
   deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null } as const;
 
-function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch">) {
+function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
+  Partial<Pick<SimulatorViewerFrameCoordinator, "inputView">>, viewerInput?: {
+    readonly execute: ReturnType<typeof vi.fn>;
+    readonly screenMap: ReturnType<typeof vi.fn>;
+  }) {
   const store = new OperationalStore(":memory:");
   store.upsertBackend({ id: "pi", displayName: "Pi", version: "fixture", health: "healthy",
     adapterKind: "fixture", instanceGeneration: 0, installationState: "installed",
@@ -42,7 +46,9 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch">) {
     owner: { ownership, control: { delete: remove } as never,
       environment: { inspect: async () => ({ platform: "darwin", ready: true,
         devices: [DEVICE], issue: null }) } as never,
-      clearInstance: clear, frames: frames as never },
+      clearInstance: clear, frames: frames as never,
+      input: viewerInput === undefined ? undefined : { execute: viewerInput.execute } as never,
+      screen: viewerInput === undefined ? undefined : { screenMap: viewerInput.screenMap } as never },
     authenticate: () => { if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated); }
   });
   return { store, ownership, instance, remove, clear, service, context,
@@ -109,6 +115,65 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
     await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
       { ...request, framesPerSecond: 61 }), h.context)[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ code: Code.InvalidArgument });
+  } finally { h.store.close(); }
+});
+
+it("maps current visible-frame input through a fresh snapshot and the durable input owner", async () => {
+  const snapshotId = randomUUID();
+  const execute = vi.fn(async (_scope, _route, action) => ({
+    receipt: { action: action.type }, replayed: action.type === "type_text",
+    observation: null, observationError: null
+  }));
+  const screenMap = vi.fn(async () => ({
+    screenMap: { snapshotId },
+    viewport: { width: 100, height: 200, orientation: "PORTRAIT" }
+  }));
+  const inputView = vi.fn(() => ({ state: "streaming" as const, encoding: "h264" as const,
+    viewerOrientation: "LANDSCAPE" as const, lastFrameAt: new Date().toISOString() }));
+  const h = fixture({ watch: async function* () { /* not consumed */ }, inputView },
+    { execute, screenMap });
+  try {
+    const route = { instanceId: h.instance.instanceId,
+      generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id };
+    const tap = create(contract.ControlSimulatorViewerInputRequestSchema, {
+      sessionId: SCOPE.sessionId, requestId: randomUUID(), route,
+      input: { case: "tap", value: { point: { xRatio: 0.3, yRatio: 0.2 } } }
+    });
+    expect(await h.service.controlSimulatorViewerInput(tap, h.context))
+      .toMatchObject({ replayed: false });
+    expect(screenMap).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
+      instanceId: h.instance.instanceId }), h.context.signal);
+    expect(execute).toHaveBeenNthCalledWith(1, SCOPE, expect.objectContaining({
+      instanceId: h.instance.instanceId }), {
+      type: "tap", snapshotId, target: { x: 20, y: 140 }
+    }, { mode: "none", timeoutMs: 5_000, stableForMs: 300 }, expect.objectContaining({
+      effectIdentity: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      requestBodyHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u), providerGeneration: 1
+    }), h.context.signal, { bindSnapshotToOperation: false });
+
+    const text = create(contract.ControlSimulatorViewerInputRequestSchema, {
+      sessionId: SCOPE.sessionId, requestId: randomUUID(), route,
+      input: { case: "text", value: { text: "private input" } }
+    });
+    expect(await h.service.controlSimulatorViewerInput(text, h.context))
+      .toMatchObject({ replayed: true });
+    expect(execute.mock.calls[1]?.[2]).toEqual({ type: "type_text", snapshotId,
+      text: "private input" });
+    const malformed = create(contract.ControlSimulatorViewerInputRequestSchema, {
+      ...tap, requestId: randomUUID(), input: { case: "tap", value: create(
+        contract.SimulatorViewerTapSchema, { point: create(contract.SimulatorViewerPointSchema,
+          { xRatio: Number.NaN, yRatio: 0.5 }) }) }
+    });
+    await expect(h.service.controlSimulatorViewerInput(malformed, h.context))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(inputView).toHaveBeenCalledTimes(4);
+    inputView.mockReturnValue({ state: "streaming", encoding: "h264",
+      viewerOrientation: "LANDSCAPE", lastFrameAt: new Date(Date.now() - 10_000).toISOString() });
+    await expect(h.service.controlSimulatorViewerInput(create(
+      contract.ControlSimulatorViewerInputRequestSchema, { ...tap, requestId: randomUUID() }),
+    h.context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(execute).toHaveBeenCalledTimes(2);
   } finally { h.store.close(); }
 });
 
