@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useRef, useState, type JSX, type RefObject } from "react";
 import { AlertTriangle, Play, RefreshCcw, ShieldCheck } from "lucide-react";
 import type { AppController } from "../controller.js";
 import type {
@@ -10,10 +10,11 @@ import { Button, Modal } from "./ui.js";
 import { SimulatorViewerScreen } from "./SimulatorViewerScreen.js";
 import "./simulator-viewer.css";
 
-export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
+export function SimulatorViewerPanel({ controller, sessionId, active, viewportRef, t }: {
   readonly controller: AppController;
   readonly sessionId: string;
   readonly active: boolean;
+  readonly viewportRef?: RefObject<HTMLElement | null>;
   readonly t: Translator;
 }): JSX.Element {
   const [state, setState] = useState<SimulatorViewerStateView>();
@@ -189,6 +190,7 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
               controlEnabled={canMutate && !mutationPending && !instance.mutation.takeoverPending &&
                 instance.mutation.activeSource !== "agent" && instance.mutation.queuedAgentMutations === 0 &&
                 instance.lifecycleState === "ready" && instance.viewerState === "attached"}
+              viewportRef={viewportRef}
               onReconcile={async () => {
                 const signal = owner.current?.signal;
                 if (!signal || signal.aborted || !enabled || !await refresh(signal)) {

@@ -399,6 +399,41 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await inspector.getByRole("button", { name: "Add tab" }).click();
       await inspector.getByRole("menuitem", { name: "Simulator" }).click();
       const panel = inspector.locator('[data-tab-kind="simulator"]');
+      const expectFittedFrame = async (viewportWidth: number, viewportHeight: number): Promise<number> => {
+        const expectedRatio = viewportWidth / viewportHeight;
+        await page.waitForFunction(({ expectedRatio: ratio }) => {
+          const fitted = document.querySelector<HTMLElement>(
+            '[data-tab-kind="simulator"] .simulator-viewer__screen-frame.is-fitted');
+          const slot = fitted?.closest<HTMLElement>(".simulator-viewer__screen");
+          const card = fitted?.closest<HTMLElement>(".simulator-viewer__card");
+          const inspectorBody = fitted?.closest<HTMLElement>(".inspector__body");
+          if (!fitted || !slot || !card || !inspectorBody) return false;
+          const box = fitted.getBoundingClientRect();
+          const slotBox = slot.getBoundingClientRect();
+          const cardBox = card.getBoundingClientRect();
+          const availableHeight = Math.max(192,
+            inspectorBody.clientHeight - Math.max(0, slotBox.top - cardBox.top));
+          return box.width > 0 && box.height > 0 &&
+            Math.abs(box.width / box.height - ratio) < 0.01 &&
+            box.width <= slot.clientWidth + 1 && box.height <= availableHeight + 1;
+        }, { expectedRatio });
+        const metrics = await panel.locator(".simulator-viewer__screen-frame.is-fitted")
+          .evaluate(element => {
+            const box = element.getBoundingClientRect();
+            const slot = element.closest<HTMLElement>(".simulator-viewer__screen")!;
+            const frame = (element.querySelector("img") ?? element.querySelector("canvas"))
+              ?.getBoundingClientRect();
+            return { width: box.width, height: box.height, slotWidth: slot.clientWidth,
+              frameWidth: frame?.width, frameHeight: frame?.height };
+          });
+        expect(metrics.width).toBeGreaterThan(0);
+        expect(metrics.height).toBeGreaterThan(0);
+        expect(metrics.width / metrics.height).toBeCloseTo(expectedRatio, 2);
+        expect(metrics.width).toBeLessThanOrEqual(metrics.slotWidth + 1);
+        expect(metrics.frameWidth).toBeCloseTo(metrics.width, 0);
+        expect(metrics.frameHeight).toBeCloseTo(metrics.height, 0);
+        return metrics.width;
+      };
       await panel.getByRole("article", { name: "Joko iPhone" }).waitFor({ state: "visible" });
       await panel.getByText("paused").first().waitFor();
       await panel.getByRole("button", { name: "Start", exact: true }).click();
@@ -531,12 +566,24 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       (_key, value) => typeof value === "bigint" ? value.toString() : value))
         .not.toContain("mounted-private-text");
       await panel.getByText(/393×852 · Video: WDA MJPEG · Input: Native touch/u).waitFor();
+      await expectFittedFrame(393, 852);
       await panel.getByText("Multi-touch unavailable", { exact: true }).waitFor();
       await panel.getByRole("button", { name: "Rotate device" }).click();
       await vi.waitFor(() => expect(deviceCommands).toContainEqual({
         url: "/session/SESSION-1/orientation", body: { orientation: "LANDSCAPE" }, claimed: true
       }), { timeout: 5_000 });
       await panel.getByText(/852×393 · Video: WDA MJPEG · Input: Native touch/u).waitFor();
+      const narrowInspectorWidth = await expectFittedFrame(852, 393);
+      await inspector.getByRole("button", { name: "Maximize panel" }).click();
+      await page.waitForFunction(previousWidth => {
+        const frame = document.querySelector<HTMLElement>(
+          '[data-tab-kind="simulator"] .simulator-viewer__screen-frame.is-fitted');
+        return frame !== null && frame.getBoundingClientRect().width > previousWidth + 5;
+      }, narrowInspectorWidth);
+      const maximizedWidth = await expectFittedFrame(852, 393);
+      expect(maximizedWidth).toBeGreaterThan(narrowInspectorWidth);
+      await inspector.getByRole("button", { name: "Restore panel" }).click();
+      await expectFittedFrame(852, 393);
       await panel.getByRole("button", { name: "Lock screen", exact: true }).click();
       await panel.getByRole("button", { name: "Unlock screen", exact: true }).click();
       expect(deviceCommands.map(item => item.url)).toEqual([
@@ -570,6 +617,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       ]), { timeout: 5_000 });
       await page.setViewportSize({ width: 390, height: 844 });
       await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
+      await expectFittedFrame(852, 393);
       await panel.getByRole("button", { name: "Copy screenshot" }).waitFor({ state: "visible" });
       const deleteButton = panel.getByRole("button", { name: "Delete", exact: true });
       await deleteButton.focus();

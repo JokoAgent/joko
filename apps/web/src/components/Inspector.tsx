@@ -169,6 +169,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   const onDetachedChangeRef = useRef(onDetachedChange);
   onDetachedChangeRef.current = onDetachedChange;
   const inspectorRef = useRef<HTMLElement>(null);
+  const inspectorBodyRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
   const lastMainWindowInteractionRef = useRef(false);
   const lastDetachedWindowInteractionRef = useRef(false);
@@ -970,7 +971,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
         {!detached && <IconButton label={maximized ? t("inspector.restore") : t("inspector.maximize")} onClick={() => setMaximized((current) => !current)}>{maximized ? <Minimize2 aria-hidden="true" /> : <Maximize2 aria-hidden="true" />}</IconButton>}
         {!detached && <IconButton label={t("a11y.closeInspector")} onClick={closeInspector}><PanelRightClose className={panelSide === "left" ? "is-mirrored" : undefined} aria-hidden="true" /></IconButton>}
       </header>
-      <div className="inspector__body">
+      <div className="inspector__body" ref={inspectorBodyRef}>
         {terminalPending && <p role="status" className="muted">{t("common.working")}</p>}
         {terminalError !== undefined && <div role="alert" className="inline-error"><p>{terminalError}</p><Button disabled={terminalPending || terminalCatalogPending || controller.state.connectionState !== "connected"} onClick={() => { if (canTerminal && terminalCreationRef.current?.owner === terminalOwner) openTerminal(false); else setTerminalRefresh((value) => value + 1); }}>{t("common.retry")}</Button></div>}
         {terminalCapabilities !== undefined && !canTerminal && <div className="inline-error" role="status"><p>{terminalCapabilities.reason ?? t("terminal.unavailable")}</p><Button disabled={terminalCatalogPending || controller.state.connectionState !== "connected"} onClick={() => setTerminalRefresh((value) => value + 1)}>{t("common.retry")}</Button></div>}
@@ -994,7 +995,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
           {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.preferences.locale} t={t} runAction={runAction} />}
           {tab.kind === "shell" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
           {tab.kind === "terminal" && terminalCapabilities !== undefined && <Suspense fallback={<p role="status">{t("terminal.connecting")}</p>}><InteractiveTerminalPanel controller={controller} sessionId={session.id} terminalId={tab.id} active={open && tab.id === bucket.activeTabId} capabilities={terminalCapabilities} t={t} onState={(value) => setTerminalRecords((current) => current[value.id]?.generation === value.generation && current[value.id]?.status === value.status && current[value.id]?.shellLabel === value.shellLabel ? current : { ...current, [value.id]: value })} /></Suspense>}
-          {tab.kind === "simulator" && <SimulatorViewerPanel controller={controller} sessionId={session.id} active={open && tab.id === bucket.activeTabId} t={t} />}
+          {tab.kind === "simulator" && <SimulatorViewerPanel controller={controller} sessionId={session.id} active={open && tab.id === bucket.activeTabId} viewportRef={inspectorBodyRef} t={t} />}
           {tab.kind === "tools" && <ToolPanel
             toolItems={toolItems}
             resources={snapshot.resources}

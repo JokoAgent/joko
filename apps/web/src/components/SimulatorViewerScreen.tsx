@@ -1,5 +1,5 @@
 import {
-  useCallback, useEffect, useRef, useState, type JSX,
+  useCallback, useEffect, useLayoutEffect, useRef, useState, type JSX,
   type PointerEvent as ReactPointerEvent
 } from "react";
 import { AlertTriangle, Camera, House, Keyboard, LockKeyhole, MonitorSmartphone,
@@ -59,16 +59,33 @@ const MJPEG_PROFILES: Record<Exclude<VideoQuality, "experimental60">, {
   high: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 }
 };
 const INTERACTION_PROFILE_RESTORE_DELAY_MS = 250;
+const MIN_FITTED_SCREEN_HEIGHT_PX = 192;
+
+export interface SimulatorScreenSize {
+  readonly width: number;
+  readonly height: number;
+}
+
+export function fitSimulatorScreenSize(viewport: {
+  readonly width: number;
+  readonly height: number;
+} | null, availableWidth: number, availableHeight: number): SimulatorScreenSize | null {
+  if (!viewport || viewport.width <= 0 || viewport.height <= 0 ||
+      availableWidth <= 0 || availableHeight <= 0) return null;
+  const scale = Math.min(availableWidth / viewport.width, availableHeight / viewport.height);
+  return { width: viewport.width * scale, height: viewport.height * scale };
+}
 
 /** One visible, current-route subscription and its exact task-owned input surface. */
 export function SimulatorViewerScreen({ controller, sessionId, route, enabled, controlEnabled = true, ownerDocument,
-  onReconcile, t }: {
+  viewportRef, onReconcile, t }: {
   readonly controller: AppController;
   readonly sessionId: string;
   readonly route: SimulatorViewerRouteView;
   readonly enabled: boolean;
   readonly controlEnabled?: boolean;
   readonly ownerDocument: Document;
+  readonly viewportRef?: { readonly current: HTMLElement | null };
   readonly onReconcile: () => Promise<void>;
   readonly t: Translator;
 }): JSX.Element {
@@ -93,7 +110,14 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, c
   const [nativeRecoveryPending, setNativeRecoveryPending] = useState(false);
   const [nativeRecoveryOutcome, setNativeRecoveryOutcome] = useState<"failed" | "restored">();
   const [textInput, setTextInput] = useState("");
+  const [layoutViewport, setLayoutViewport] = useState<{
+    readonly ownerKey: string;
+    readonly width: number;
+    readonly height: number;
+  }>();
+  const [fittedScreenSize, setFittedScreenSize] = useState<SimulatorScreenSize | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const screenSlotRef = useRef<HTMLDivElement>(null);
   const pointerGestureRef = useRef<PointerGesture | undefined>(undefined);
   const inputRequestRef = useRef<AbortController | undefined>(undefined);
   const commandRequestRef = useRef<AbortController | undefined>(undefined);
@@ -120,6 +144,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, c
     frameRateRef.current = { startedAt: 0, frames: 0 };
     setStreamFps(0);
     setControls(undefined);
+    setLayoutViewport(undefined);
     setInputFallback(false);
     setNativeRoute("inactive");
     setNativeRecoveryOutcome(undefined);
@@ -357,13 +382,77 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, c
     const read = async (): Promise<void> => {
       try {
         const next = await controllerRef.current.getSimulatorViewerControls(sessionId, route, request.signal);
-        if (!request.signal.aborted && ownerKeyRef.current === ownerKey) setControls(next);
+        if (!request.signal.aborted && ownerKeyRef.current === ownerKey) {
+          setControls(next);
+          setLayoutViewport(current => current?.ownerKey === ownerKey &&
+            current.width === next.viewportWidth && current.height === next.viewportHeight
+            ? current : { ownerKey, width: next.viewportWidth, height: next.viewportHeight });
+        }
       } catch { if (!request.signal.aborted) setControls(undefined); }
     };
     void read();
     const timer = setInterval(() => { if (!commandRequestRef.current && !pointerGestureRef.current) void read(); }, 4_000);
     return () => { request.abort(); clearInterval(timer); setControls(undefined); };
   }, [interactive, ownerKey, route, sessionId]);
+
+  useLayoutEffect(() => {
+    const viewport = layoutViewport?.ownerKey === ownerKey ? layoutViewport : null;
+    if (!enabled || !documentVisible || state !== "streaming" || presentation === null ||
+        !viewport || viewport.width <= 0 || viewport.height <= 0) {
+      setFittedScreenSize(null);
+      return;
+    }
+    const screenSlot = screenSlotRef.current;
+    const panelViewport = viewportRef?.current ??
+      screenSlot?.closest<HTMLElement>(".inspector__body") ??
+      screenSlot?.closest<HTMLElement>(".simulator-viewer");
+    const viewerSection = screenSlot?.closest<HTMLElement>(".simulator-viewer__card") ??
+      screenSlot?.closest<HTMLElement>(".simulator-viewer__interaction");
+    if (!screenSlot || !panelViewport || !viewerSection) {
+      setFittedScreenSize(null);
+      return;
+    }
+    const ownerWindow = ownerDocument.defaultView;
+    const update = (): void => {
+      const panelHeight = panelViewport.clientHeight;
+      const slotWidth = screenSlot.clientWidth;
+      if (panelHeight <= 0 || slotWidth <= 0) {
+        setFittedScreenSize(null);
+        return;
+      }
+      const sectionRect = viewerSection.getBoundingClientRect();
+      const slotRect = screenSlot.getBoundingClientRect();
+      const deviceHeaderHeight = Math.max(0, slotRect.top - sectionRect.top);
+      const availableHeight = Math.max(MIN_FITTED_SCREEN_HEIGHT_PX,
+        panelHeight - deviceHeaderHeight);
+      const next = fitSimulatorScreenSize(viewport, slotWidth, availableHeight);
+      setFittedScreenSize(current => current && next &&
+        Math.abs(current.width - next.width) < 0.5 &&
+        Math.abs(current.height - next.height) < 0.5 ? current : next);
+    };
+    let animationFrame: number | null = null;
+    const scheduleUpdate = (): void => {
+      if (animationFrame !== null) ownerWindow?.cancelAnimationFrame(animationFrame);
+      if (!ownerWindow) { update(); return; }
+      animationFrame = ownerWindow.requestAnimationFrame(() => {
+        animationFrame = null;
+        update();
+      });
+    };
+    update();
+    const ResizeObserverCtor = ownerWindow?.ResizeObserver;
+    const observer = ResizeObserverCtor ? new ResizeObserverCtor(scheduleUpdate) : null;
+    observer?.observe(panelViewport);
+    observer?.observe(viewerSection);
+    observer?.observe(screenSlot);
+    ownerWindow?.addEventListener("resize", scheduleUpdate);
+    return () => {
+      observer?.disconnect();
+      ownerWindow?.removeEventListener("resize", scheduleUpdate);
+      if (animationFrame !== null) ownerWindow?.cancelAnimationFrame(animationFrame);
+    };
+  }, [documentVisible, enabled, layoutViewport, ownerDocument, ownerKey, presentation, state,
+    viewportRef]);
 
   useEffect(() => {
     if (!enabled || !documentVisible) {
@@ -763,20 +852,23 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, c
 
   return <div className="simulator-viewer__interaction" role="group"
     aria-label={t("simulator.liveScreen")}>
-    <div className="simulator-viewer__screen">
-      <canvas ref={canvasRef} role="img" aria-label={t("simulator.liveScreen")}
-        title={t("simulator.gestureHint")} aria-disabled={controlsDisabled}
-        className="simulator-viewer__frame"
-        style={{ display: presentation === "h264" && state === "streaming" ? undefined : "none" }}
-        {...pointerProps} />
-      {frameUrl && presentation === "jpeg" && state === "streaming"
-        ? <img src={frameUrl} alt={t("simulator.liveScreen")} draggable={false}
+    <div className="simulator-viewer__screen" ref={screenSlotRef}>
+      <div className={`simulator-viewer__screen-frame${fittedScreenSize ? " is-fitted" : ""}`}
+        style={fittedScreenSize ?? undefined}>
+        <canvas ref={canvasRef} role="img" aria-label={t("simulator.liveScreen")}
           title={t("simulator.gestureHint")} aria-disabled={controlsDisabled}
-          className="simulator-viewer__frame" {...pointerProps} />
-        : presentation === "h264" && state === "streaming" ? null
-          : <><MonitorSmartphone aria-hidden="true" /><span role="status">{notice || t("simulator.screenUnavailable")}</span></>}
-      {state === "disconnected" && enabled && documentVisible &&
-        <Button tone="ghost" onClick={() => setRetry(value => value + 1)}>{t("simulator.streamRetry")}</Button>}
+          className="simulator-viewer__frame"
+          style={{ display: presentation === "h264" && state === "streaming" ? undefined : "none" }}
+          {...pointerProps} />
+        {frameUrl && presentation === "jpeg" && state === "streaming"
+          ? <img src={frameUrl} alt={t("simulator.liveScreen")} draggable={false}
+            title={t("simulator.gestureHint")} aria-disabled={controlsDisabled}
+            className="simulator-viewer__frame" {...pointerProps} />
+          : presentation === "h264" && state === "streaming" ? null
+            : <><MonitorSmartphone aria-hidden="true" /><span role="status">{notice || t("simulator.screenUnavailable")}</span></>}
+        {state === "disconnected" && enabled && documentVisible &&
+          <Button tone="ghost" onClick={() => setRetry(value => value + 1)}>{t("simulator.streamRetry")}</Button>}
+      </div>
       {presentation !== null && state === "streaming" && enabled && documentVisible &&
         <label className="simulator-viewer__quality">
         {t("simulator.videoQuality")}

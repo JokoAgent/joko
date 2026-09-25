@@ -22,9 +22,12 @@
 .simulator-viewer__feedback { color: var(--green); }
 .simulator-viewer__native-recovery { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-subtle); color: var(--text-muted); font-size: var(--text-12); }
 .simulator-viewer__native-recovery > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.simulator-viewer__screen { display: grid; place-content: center; justify-items: center; gap: 8px; min-height: 175px; padding: 16px; border: 1px dashed var(--line-strong); border-radius: 10px; background: var(--surface-sunken); color: var(--text-muted); text-align: center; }
-.simulator-viewer__screen svg { width: 30px; height: 30px; }
-.simulator-viewer__screen img, .simulator-viewer__screen canvas { display: block; max-width: 100%; max-height: min(65vh, 680px); object-fit: contain; }
+.simulator-viewer__screen { display: grid; justify-items: center; gap: 8px; min-width: 0; min-height: 175px; color: var(--text-muted); text-align: center; }
+.simulator-viewer__screen-frame { width: 100%; min-width: 0; min-height: 175px; display: grid; place-content: center; justify-items: center; gap: 8px; overflow: hidden; border-radius: 10px; padding: 16px; outline: 1px dashed var(--line-strong); outline-offset: -1px; background: var(--surface-sunken); }
+.simulator-viewer__screen-frame.is-fitted { min-height: 0; display: block; padding: 0; }
+.simulator-viewer__screen-frame svg { width: 30px; height: 30px; }
+.simulator-viewer__screen-frame:not(.is-fitted) img, .simulator-viewer__screen-frame:not(.is-fitted) canvas { display: block; width: 100%; height: auto; max-height: min(65vh, 680px); object-fit: contain; }
+.simulator-viewer__screen-frame.is-fitted img, .simulator-viewer__screen-frame.is-fitted canvas { display: block; width: 100%; height: 100%; object-fit: contain; }
 .simulator-viewer__frame { touch-action: none; user-select: none; cursor: crosshair; }
 .simulator-viewer__frame[aria-disabled="true"] { pointer-events: none; cursor: default; opacity: .8; }
 .simulator-viewer__screen .button { margin-top: 4px; }

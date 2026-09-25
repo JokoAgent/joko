@@ -6,7 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import { SimulatorViewerScreen } from "./SimulatorViewerScreen.js";
+import { fitSimulatorScreenSize, SimulatorViewerScreen } from "./SimulatorViewerScreen.js";
 import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
@@ -24,6 +24,79 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   Reflect.deleteProperty(window.navigator, "clipboard");
   Reflect.deleteProperty(window, "ClipboardItem");
+});
+
+it("fits the Simulator viewport within both available width and panel height", () => {
+  expect(fitSimulatorScreenSize({ width: 400, height: 800 }, 700, 900)).toEqual({
+    width: 450, height: 900
+  });
+  expect(fitSimulatorScreenSize({ width: 400, height: 800 }, 300, 900)).toEqual({
+    width: 300, height: 600
+  });
+  expect(fitSimulatorScreenSize({ width: 800, height: 400 }, 700, 900)).toEqual({
+    width: 700, height: 350
+  });
+  expect(fitSimulatorScreenSize({ width: 0, height: 800 }, 700, 900)).toBeNull();
+});
+
+it("fits the current frame to its owning Inspector viewport and clears the size when hidden", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:fitted-frame",
+    revokeObjectURL: vi.fn() });
+  vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
+    queueMicrotask(() => callback(0));
+    return 1;
+  }));
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: Date.now(),
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  };
+  const controller = { watchSimulatorFrames: watch,
+    getSimulatorViewerControls: async () => ({ viewportWidth: 393, viewportHeight: 852,
+      orientation: "PORTRAIT", nativeTouchAvailable: false,
+      multiTouchAvailable: false }) } as unknown as AppController;
+  const viewport = document.createElement("div");
+  viewport.className = "inspector__body";
+  const card = document.createElement("article");
+  card.className = "simulator-viewer__card";
+  const container = document.createElement("div");
+  card.append(container);
+  viewport.append(card);
+  document.body.append(viewport);
+  Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 1_000 });
+  vi.spyOn(card, "getBoundingClientRect").mockReturnValue({ top: 80 } as DOMRect);
+  const root = createRoot(container);
+  roots.push(root);
+  const render = async (enabled: boolean, controlEnabled = true) => act(async () => root.render(
+    <SimulatorViewerScreen controller={controller} sessionId="task" route={route}
+      enabled={enabled} controlEnabled={controlEnabled} ownerDocument={document}
+      viewportRef={{ current: viewport }}
+      onReconcile={async () => undefined}
+      t={(key, values) => translate("en", key, values)} />));
+  await render(true);
+  await vi.waitFor(() => expect(container.textContent).toContain("393×852"));
+  const slot = container.querySelector<HTMLElement>(".simulator-viewer__screen")!;
+  const fitted = container.querySelector<HTMLElement>(".simulator-viewer__screen-frame")!;
+  let slotWidth = 700;
+  Object.defineProperty(slot, "clientWidth", { configurable: true, get: () => slotWidth });
+  vi.spyOn(slot, "getBoundingClientRect").mockReturnValue({ top: 150 } as DOMRect);
+  await act(async () => { window.dispatchEvent(new Event("resize")); await Promise.resolve(); });
+  expect(Number.parseFloat(fitted.style.height)).toBeCloseTo(930);
+  expect(Number.parseFloat(fitted.style.width)).toBeCloseTo(429.01, 1);
+  slotWidth = 250;
+  await act(async () => { window.dispatchEvent(new Event("resize")); await Promise.resolve(); });
+  expect(Number.parseFloat(fitted.style.width)).toBeCloseTo(250);
+  expect(Number.parseFloat(fitted.style.height)).toBeCloseTo(541.98, 1);
+  await render(true, false);
+  expect(fitted.classList.contains("is-fitted")).toBe(true);
+  slotWidth = 300;
+  await act(async () => { window.dispatchEvent(new Event("resize")); await Promise.resolve(); });
+  expect(Number.parseFloat(fitted.style.width)).toBeCloseTo(300);
+  expect(Number.parseFloat(fitted.style.height)).toBeCloseTo(650.38, 1);
+  await render(false);
+  expect(fitted.style.width).toBe("");
+  expect(fitted.style.height).toBe("");
 });
 
 it("shows current route telemetry, rotates from a fresh viewport and copies an exact PNG", async () => {
