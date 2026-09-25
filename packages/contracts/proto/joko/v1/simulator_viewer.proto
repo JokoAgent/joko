@@ -1,0 +1,278 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/capability.proto";
+
+// Visible Viewer controls use authenticated task authority, never an agent Tool call.
+service SimulatorViewerService {
+  rpc GetSimulatorViewerState(GetSimulatorViewerStateRequest) returns (GetSimulatorViewerStateResponse);
+  rpc ControlSimulatorInstance(ControlSimulatorInstanceRequest) returns (ControlSimulatorInstanceResponse);
+  rpc ControlSimulatorViewerInput(ControlSimulatorViewerInputRequest) returns (ControlSimulatorViewerInputResponse);
+  rpc ControlSimulatorViewerTouch(ControlSimulatorViewerTouchRequest) returns (ControlSimulatorViewerTouchResponse);
+  rpc SetSimulatorViewerInteractionProfile(SetSimulatorViewerInteractionProfileRequest) returns (SetSimulatorViewerInteractionProfileResponse);
+  rpc GetSimulatorViewerMutationState(GetSimulatorViewerMutationStateRequest) returns (GetSimulatorViewerMutationStateResponse);
+  rpc SetSimulatorViewerMutationControl(SetSimulatorViewerMutationControlRequest) returns (SetSimulatorViewerMutationControlResponse);
+  rpc GetSimulatorViewerControls(GetSimulatorViewerControlsRequest) returns (GetSimulatorViewerControlsResponse);
+  rpc ControlSimulatorViewerCommand(ControlSimulatorViewerCommandRequest) returns (ControlSimulatorViewerCommandResponse);
+  rpc WatchSimulatorFrames(WatchSimulatorFramesRequest) returns (stream WatchSimulatorFramesResponse);
+}
+
+enum SimulatorViewerAction {
+  SIMULATOR_VIEWER_ACTION_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_ACTION_CREATE = 1;
+  SIMULATOR_VIEWER_ACTION_ATTACH = 2;
+  SIMULATOR_VIEWER_ACTION_START = 3;
+  SIMULATOR_VIEWER_ACTION_STOP = 4;
+  SIMULATOR_VIEWER_ACTION_DETACH = 5;
+  SIMULATOR_VIEWER_ACTION_DELETE = 6;
+}
+
+message SimulatorViewerRoute {
+  string instance_id = 1;
+  uint64 generation = 2;
+  string lease_id = 3;
+}
+
+message SimulatorViewerDevice {
+  string udid = 1;
+  string name = 2;
+  string state = 3;
+  string runtime_identifier = 4;
+  string runtime_name = 5;
+  string device_type_identifier = 6;
+  bool available = 7;
+}
+
+message SimulatorViewerInstance {
+  SimulatorViewerRoute route = 1;
+  string simulator_udid = 2;
+  string simulator_name = 3;
+  string runtime_identifier = 4;
+  string device_type_identifier = 5;
+  string creation_provenance = 6;
+  string boot_provenance = 7;
+  string lifecycle_state = 8;
+  string viewer_state = 9;
+  string health_state = 10;
+  string error_code = 11;
+  uint64 grace_expires_at_ms = 12;
+  uint64 lease_expires_at_ms = 13;
+  SimulatorViewerMutationState mutation = 14;
+}
+
+enum SimulatorViewerMutationSource {
+  SIMULATOR_VIEWER_MUTATION_SOURCE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_MUTATION_SOURCE_AGENT = 1;
+  SIMULATOR_VIEWER_MUTATION_SOURCE_USER = 2;
+}
+
+message SimulatorViewerMutationState {
+  string instance_id = 1;
+  SimulatorViewerMutationSource active_source = 2;
+  SimulatorViewerMutationSource last_source = 3;
+  uint32 queued_agent_mutations = 4;
+  bool agent_paused = 5;
+  bool takeover_pending = 6;
+}
+
+message GetSimulatorViewerStateRequest {
+  string session_id = 1;
+}
+
+message GetSimulatorViewerStateResponse {
+  CapabilitySupport support = 1;
+  string reason_code = 2;
+  repeated SimulatorViewerDevice devices = 3;
+  repeated SimulatorViewerInstance instances = 4;
+}
+
+message ControlSimulatorInstanceRequest {
+  string session_id = 1;
+  string request_id = 2;
+  SimulatorViewerAction action = 3;
+  SimulatorViewerRoute route = 4;
+  string template_udid = 5;
+  string name = 6;
+  string device_udid = 7;
+}
+
+message ControlSimulatorInstanceResponse {
+  SimulatorViewerInstance instance = 1;
+  bool deleted = 2;
+  bool replayed = 3;
+}
+
+message SimulatorViewerPoint {
+  double x_ratio = 1;
+  double y_ratio = 2;
+}
+
+message SimulatorViewerTap {
+  SimulatorViewerPoint point = 1;
+}
+
+message SimulatorViewerSwipe {
+  SimulatorViewerPoint start = 1;
+  SimulatorViewerPoint end = 2;
+  uint32 duration_ms = 3;
+}
+
+message SimulatorViewerTextInput {
+  string text = 1;
+}
+
+message ControlSimulatorViewerInputRequest {
+  string session_id = 1;
+  string request_id = 2;
+  SimulatorViewerRoute route = 3;
+  oneof input {
+    SimulatorViewerTap tap = 4;
+    SimulatorViewerSwipe swipe = 5;
+    SimulatorViewerTextInput text = 6;
+  }
+}
+
+message ControlSimulatorViewerInputResponse {
+  bool replayed = 1;
+}
+
+enum SimulatorViewerTouchPhase {
+  SIMULATOR_VIEWER_TOUCH_PHASE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_TOUCH_PHASE_BEGIN = 1;
+  SIMULATOR_VIEWER_TOUCH_PHASE_MOVE = 2;
+  SIMULATOR_VIEWER_TOUCH_PHASE_END = 3;
+  SIMULATOR_VIEWER_TOUCH_PHASE_CANCEL = 4;
+}
+
+message ControlSimulatorViewerTouchRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  string gesture_id = 3;
+  uint32 sequence = 4;
+  SimulatorViewerTouchPhase phase = 5;
+  SimulatorViewerPoint point = 6;
+}
+
+message ControlSimulatorViewerTouchResponse {
+  // False is returned only when begin was certainly not dispatched to the native helper.
+  bool accepted = 1;
+}
+
+message SetSimulatorViewerInteractionProfileRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  // Ephemeral identity of one exact active WatchSimulatorFrames subscription.
+  string subscription_id = 3;
+  bool active = 4;
+}
+
+message SetSimulatorViewerInteractionProfileResponse {
+  // False means no profile change was needed because the requested state was already effective.
+  bool applied = 1;
+}
+
+message GetSimulatorViewerMutationStateRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+}
+
+message GetSimulatorViewerMutationStateResponse {
+  SimulatorViewerMutationState mutation = 1;
+}
+
+message SetSimulatorViewerMutationControlRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  bool agent_paused = 3;
+}
+
+message SetSimulatorViewerMutationControlResponse {
+  SimulatorViewerMutationState mutation = 1;
+}
+
+message GetSimulatorViewerControlsRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+}
+
+message GetSimulatorViewerControlsResponse {
+  uint32 viewport_width = 1;
+  uint32 viewport_height = 2;
+  string orientation = 3;
+  bool native_touch_available = 4;
+  bool multi_touch_available = 5;
+}
+
+enum SimulatorViewerCommand {
+  SIMULATOR_VIEWER_COMMAND_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_COMMAND_HOME = 1;
+  SIMULATOR_VIEWER_COMMAND_ROTATE = 2;
+  SIMULATOR_VIEWER_COMMAND_LOCK = 3;
+  SIMULATOR_VIEWER_COMMAND_UNLOCK = 4;
+  SIMULATOR_VIEWER_COMMAND_COPY_SCREENSHOT = 5;
+}
+
+message ControlSimulatorViewerCommandRequest {
+  string session_id = 1;
+  string request_id = 2;
+  SimulatorViewerRoute route = 3;
+  SimulatorViewerCommand command = 4;
+  // ROTATE carries its target so a replay cannot reverse a completed rotation.
+  string orientation = 5;
+}
+
+message ControlSimulatorViewerCommandResponse {
+  bool replayed = 1;
+  // Only COPY_SCREENSHOT returns an authenticated artifact identity; never PNG bytes.
+  string screenshot_blob_id = 2;
+}
+
+enum SimulatorViewerStreamState {
+  SIMULATOR_VIEWER_STREAM_STATE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_STREAM_STATE_CONNECTING = 1;
+  SIMULATOR_VIEWER_STREAM_STATE_RECONNECTING = 2;
+  SIMULATOR_VIEWER_STREAM_STATE_FRAME = 3;
+  SIMULATOR_VIEWER_STREAM_STATE_DISCONNECTED = 4;
+}
+
+enum SimulatorViewerNativeRouteState {
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_INACTIVE = 1;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_ACTIVE = 2;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_FALLBACK_UNAVAILABLE = 3;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_FALLBACK_LOST = 4;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_FALLBACK_DECODE = 5;
+}
+
+message WatchSimulatorFramesRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  bool prefer_native_h264 = 3;
+  uint32 frames_per_second = 4;
+  uint32 scaling_percent = 5;
+  string orientation = 6;
+  uint32 jpeg_quality = 7;
+  uint32 mjpeg_frames_per_second = 8;
+  uint32 mjpeg_scaling_percent = 9;
+  // Only a client that attempted native decode may report this bounded local failure.
+  string client_fallback_reason = 10;
+  // Ephemeral identity used only to target interaction-time profile changes.
+  string subscription_id = 11;
+}
+
+message WatchSimulatorFramesResponse {
+  SimulatorViewerRoute route = 1;
+  SimulatorViewerStreamState state = 2;
+  uint64 sequence = 3;
+  int64 received_at_ms = 4;
+  bytes jpeg = 5;
+  uint32 reconnect_attempt = 6;
+  bytes h264 = 7;
+  uint32 width = 8;
+  uint32 height = 9;
+  uint64 timestamp_micros = 10;
+  bool key_frame = 11;
+  string h264_format = 12;
+  SimulatorViewerNativeRouteState native_route_state = 13;
+}

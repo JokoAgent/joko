@@ -98,6 +98,9 @@ export class PiEventTranslator {
       const bridgedImages = isToolResult && isManagedMcpToolName(toolName)
         ? trustedMcpImageOutputs(details, this.#artifactCapacityBytes())
         : [];
+      const bridgedArtifacts = isToolResult && isManagedMcpToolName(toolName)
+        ? trustedMcpArtifactOutputs(details, this.#artifactCapacityBytes())
+        : [];
       const bridgedArtifact = isToolResult && isManagedMcpToolName(toolName)
         ? trustedMcpCompleteOutput(details, this.#artifactCapacityBytes())
         : undefined;
@@ -111,7 +114,7 @@ export class PiEventTranslator {
       const materializedContent = await this.#materializeNativeContent(message.content);
       data.message = {
         ...message,
-        content: nativeContentWithImages(materializedContent, bridgedImages),
+        content: nativeContentWithManagedOutputs(materializedContent, [...bridgedImages, ...bridgedArtifacts]),
         ...(details === undefined ? {} : { details: safeDetails }),
         ...(fullOutputArtifact === undefined ? {} : { fullOutputArtifact }),
         ...(materialized.unavailable === true ? { fullOutputUnavailable: true } : {})
@@ -591,7 +594,10 @@ export class PiEventTranslator {
       projection = await this.#projectToolContent(result);
       if (isManagedMcpToolName(toolName)) {
         const images = trustedMcpImageOutputs(details, this.#artifactCapacityBytes());
-        if (images.length > 0) projection = { ...projection, parts: [...projection.parts, ...images] };
+        const artifacts = trustedMcpArtifactOutputs(details, this.#artifactCapacityBytes());
+        if (images.length > 0 || artifacts.length > 0) projection = {
+          ...projection, parts: [...projection.parts, ...images, ...artifacts]
+        };
       }
     } catch (error) {
       await this.#emitError(
@@ -1631,19 +1637,55 @@ function trustedMcpImageOutputs(
   });
 }
 
-function nativeContentWithImages(
+function trustedMcpArtifactOutputs(
+  details: Record<string, unknown> | undefined,
+  artifactCapacityBytes: number
+): readonly ToolResultContentPart[] {
+  const envelope = details === undefined || !isRecord(details.jokoMcpBridge)
+    ? undefined
+    : details.jokoMcpBridge;
+  if (envelope?.format !== 1 || envelope.artifactOutputs === undefined) return [];
+  if (!Array.isArray(envelope.artifactOutputs) || envelope.artifactOutputs.length > 8) {
+    throw piError("PI_MCP_ARTIFACT_OUTPUT_INVALID", "Managed MCP Artifact-output envelope is invalid", "stream");
+  }
+  return envelope.artifactOutputs.map((value): ToolResultContentPart => {
+    if (!isRecord(value) || !isBlobRef(value.blob) || typeof value.label !== "string") {
+      throw piError("PI_MCP_ARTIFACT_OUTPUT_INVALID", "Managed MCP Artifact identity is invalid", "stream");
+    }
+    const blob = value.blob;
+    const label = value.label;
+    if (Buffer.byteLength(blob.id, "utf8") > 512 || /[\u0000-\u001f\u007f]/u.test(blob.id) ||
+        !/^[a-f0-9]{64}$/u.test(blob.sha256) || blob.byteLength < 1 ||
+        blob.byteLength > artifactCapacityBytes ||
+        !/^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/u.test(blob.mimeType) ||
+        (blob.fileName !== undefined && (blob.fileName.length === 0 ||
+          Buffer.byteLength(blob.fileName, "utf8") > 512 || /[\u0000-\u001f\u007f]/u.test(blob.fileName))) ||
+        label.length === 0 || Buffer.byteLength(label, "utf8") > 4_096 ||
+        /[\u0000-\u001f\u007f]/u.test(label)) {
+      throw piError(
+        blob.byteLength > artifactCapacityBytes ? "PI_ARTIFACT_CAPACITY_EXCEEDED" : "PI_MCP_ARTIFACT_OUTPUT_INVALID",
+        blob.byteLength > artifactCapacityBytes
+          ? "Managed MCP Artifact output exceeds the host Artifact capacity"
+          : "Managed MCP Artifact identity is invalid",
+        "stream"
+      );
+    }
+    return { kind: "artifact", blob, label };
+  });
+}
+
+function nativeContentWithManagedOutputs(
   content: unknown,
-  images: readonly ToolResultContentPart[]
+  outputs: readonly ToolResultContentPart[]
 ): unknown {
-  const imageParts = images.flatMap((part) => part.kind !== "image" ? [] : [{
-    type: "image",
-    blob: part.blob,
+  const parts = outputs.flatMap((part) => part.kind === "image" ? [{
+    type: "image", blob: part.blob,
     ...(part.alt === undefined ? {} : { alt: part.alt })
-  }]);
-  if (imageParts.length === 0) return content;
-  if (Array.isArray(content)) return [...content, ...imageParts];
-  if (typeof content === "string") return [{ type: "text", text: content }, ...imageParts];
-  return imageParts;
+  }] : part.kind === "artifact" ? [{ type: "artifact", blob: part.blob, label: part.label }] : []);
+  if (parts.length === 0) return content;
+  if (Array.isArray(content)) return [...content, ...parts];
+  if (typeof content === "string") return [{ type: "text", text: content }, ...parts];
+  return parts;
 }
 
 function isManagedMcpToolName(value: string): boolean {
