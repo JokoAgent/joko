@@ -29,6 +29,12 @@ const VIDEO_PROFILES: Record<VideoQuality, { framesPerSecond: number; scalingPer
   high: { framesPerSecond: 30, scalingPercent: 100 },
   experimental60: { framesPerSecond: 60, scalingPercent: 70 }
 };
+const MJPEG_PROFILES: Record<Exclude<VideoQuality, "experimental60">, {
+  framesPerSecond: number; jpegQuality: number; scalingPercent: number }> = {
+  low: { framesPerSecond: 5, jpegQuality: 25, scalingPercent: 50 },
+  balanced: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 },
+  high: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 }
+};
 
 /** One visible, current-route subscription and its exact task-owned input surface. */
 export function SimulatorViewerScreen({ controller, sessionId, route, enabled, ownerDocument,
@@ -112,6 +118,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     const watch = async (native: boolean): Promise<void> => {
       subscription = new AbortController();
       const current = subscription;
+      const mjpeg = MJPEG_PROFILES[quality === "experimental60" ? "high" : quality];
       let fallback = false;
       const decoder = native ? new SimulatorH264Decoder({ runtime,
         renderFrame(frame, width, height) {
@@ -135,7 +142,8 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
           current.signal, { preferNativeH264: native,
             framesPerSecond: VIDEO_PROFILES[quality].framesPerSecond,
             scalingPercent: VIDEO_PROFILES[quality].scalingPercent,
-            orientation: "PORTRAIT" })) {
+            orientation: "PORTRAIT", mjpegFramesPerSecond: mjpeg.framesPerSecond,
+            jpegQuality: mjpeg.jpegQuality, mjpegScalingPercent: mjpeg.scalingPercent })) {
           if (!active || current.signal.aborted) break;
           if (event.kind === "frame") {
             decoder?.close();
@@ -327,14 +335,16 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
           : <><MonitorSmartphone aria-hidden="true" /><span role="status">{notice || t("simulator.screenUnavailable")}</span></>}
       {state === "disconnected" && enabled && documentVisible &&
         <Button tone="ghost" onClick={() => setRetry(value => value + 1)}>{t("simulator.streamRetry")}</Button>}
-      {nativeAvailable && enabled && documentVisible && <label className="simulator-viewer__quality">
+      {presentation !== null && state === "streaming" && enabled && documentVisible &&
+        <label className="simulator-viewer__quality">
         {t("simulator.videoQuality")}
-        <select value={quality} disabled={inputBusy}
+        <select value={!nativeAvailable && quality === "experimental60" ? "high" : quality}
+          disabled={inputBusy}
           onChange={event => setQuality(event.target.value as VideoQuality)}>
           <option value="low">{t("simulator.videoLow")}</option>
           <option value="balanced">{t("simulator.videoBalanced")}</option>
           <option value="high">{t("simulator.videoHigh")}</option>
-          <option value="experimental60">{t("simulator.videoExperimental60")}</option>
+          {nativeAvailable && <option value="experimental60">{t("simulator.videoExperimental60")}</option>}
         </select>
       </label>}
     </div>

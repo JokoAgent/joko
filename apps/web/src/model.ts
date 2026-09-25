@@ -5346,6 +5346,9 @@ export interface SimulatorViewerVideoPreferenceView {
   readonly framesPerSecond: number;
   readonly scalingPercent: number;
   readonly orientation: "PORTRAIT" | "LANDSCAPE";
+  readonly mjpegFramesPerSecond: number;
+  readonly jpegQuality: number;
+  readonly mjpegScalingPercent: number;
 }
 
 export interface OperationApi {

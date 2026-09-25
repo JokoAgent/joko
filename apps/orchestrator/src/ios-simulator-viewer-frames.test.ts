@@ -28,9 +28,12 @@ function fixture(streamMjpegFrames: SimulatorDriverCoordinator["streamMjpegFrame
     { instanceId: bound.instanceId, generation: bound.generation, leaseId: bound.lease.id });
   const route = { instanceId: instance.instanceId, generation: instance.generation,
     leaseId: instance.lease.id };
-  const driver = { isReady: vi.fn(() => true), streamMjpegFrames, ...native } as Pick<
-    SimulatorDriverCoordinator, "isReady" | "streamMjpegFrames"> & typeof native;
-  return { store, ownership, instance, route, frames: new SimulatorViewerFrameCoordinator(ownership, driver) };
+  const driver = { isReady: vi.fn(() => true), mjpegConfigurationLease: vi.fn(() => "driver-lease"),
+    configureMjpegProfile: vi.fn(async () => undefined),
+    streamMjpegFrames, ...native } as Pick<SimulatorDriverCoordinator,
+    "isReady" | "mjpegConfigurationLease" | "configureMjpegProfile" | "streamMjpegFrames"> & typeof native;
+  return { store, ownership, instance, route, driver,
+    frames: new SimulatorViewerFrameCoordinator(ownership, driver) };
 }
 
 it("streams only the exact ready task route without persisting frame bytes", async () => {
@@ -44,6 +47,8 @@ it("streams only the exact ready task route without persisting frame bytes", asy
       encoding: "jpeg", state: "streaming", sequence: 1 });
     expect(h.frames.inputView(SCOPE, h.route)).toMatchObject({ state: "streaming",
       encoding: "jpeg", viewerOrientation: null, lastFrameAt: expect.any(String) });
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledWith(h.instance,
+      { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 }, expect.any(AbortSignal));
     expect(h.store.listOperations({ sessionId: SCOPE.sessionId })).toEqual([]);
     await watch.return(undefined);
     expect(h.frames.snapshot(SCOPE, h.route)).toBeNull();
@@ -87,7 +92,57 @@ it("prefers owned H.264 frames and falls back to MJPEG after native loss", async
       encoding: "jpeg", viewerOrientation: null, lastFrameAt: expect.any(String) });
     expect(native.probeNativeH264).toHaveBeenCalledOnce();
     expect(native.streamNativeH264Frames).toHaveBeenCalledOnce();
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledOnce();
     await watch.return(undefined);
+  } finally { h.store.close(); }
+});
+
+it("does not let a second MJPEG subscription silently replace the active profile", async () => {
+  const h = fixture(async function* (_instance, signal) {
+    yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+      receivedAt: new Date().toISOString() };
+    await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  try {
+    const first = h.frames.watch(SCOPE, h.route);
+    await first.next();
+    await first.next();
+    const second = h.frames.watch(SCOPE, h.route, undefined, { preferNativeH264: false,
+      profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" },
+      mjpegProfile: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 } });
+    expect((await second.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+    await expect(second.next()).rejects.toMatchObject({ code: "PROFILE_CONFLICT" });
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledOnce();
+    await first.return(undefined);
+  } finally { h.store.close(); }
+});
+
+it("fails closed after an uncertain WDA profile response instead of publishing a frame", async () => {
+  const h = fixture(async function* () {
+    yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+      receivedAt: new Date().toISOString() };
+  });
+  try {
+    vi.spyOn(h.driver, "configureMjpegProfile").mockRejectedValue(new Error("settings response lost"));
+    const first = h.frames.watch(SCOPE, h.route);
+    expect((await first.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+    expect((await first.next()).value).toEqual({ kind: "reconnecting", attempt: 1 });
+    await expect(first.next()).rejects.toMatchObject({ code: "PROFILE_UNCERTAIN" });
+    const second = h.frames.watch(SCOPE, h.route);
+    await second.next();
+    await expect(second.next()).rejects.toMatchObject({ code: "PROFILE_UNCERTAIN" });
+    h.frames.clear(h.instance.instanceId);
+    const third = h.frames.watch(SCOPE, h.route);
+    await third.next();
+    await expect(third.next()).rejects.toMatchObject({ code: "PROFILE_UNCERTAIN" });
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledOnce();
+    vi.mocked(h.driver.mjpegConfigurationLease).mockReturnValue("replacement-lease");
+    vi.mocked(h.driver.configureMjpegProfile).mockResolvedValue(undefined);
+    const fourth = h.frames.watch(SCOPE, h.route);
+    await fourth.next();
+    expect((await fourth.next()).value).toMatchObject({ kind: "frame" });
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledTimes(2);
+    await fourth.return(undefined);
   } finally { h.store.close(); }
 });
 

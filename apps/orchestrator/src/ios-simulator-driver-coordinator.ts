@@ -6,7 +6,8 @@ import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSim
   type SimulatorNativeH264Profile, type SimulatorNativeH264Frame,
   type SimulatorNormalizedTouchSample,
   type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
-  type WdaDriverHealth, type WdaPoint, type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
+  type WdaDriverHealth, type WdaMjpegProfile, type WdaPoint, type WdaRunningDriver,
+  type WdaViewport } from "@joko/tool-ios-simulator";
 import type { SimulatorMjpegFrame } from "@joko/tool-ios-simulator";
 import { OperationInProgressError, type OperationalStore } from "@joko/store";
 import { SimulatorDriverStateRegistry } from "./ios-simulator-driver-state.js";
@@ -107,6 +108,28 @@ export class SimulatorDriverCoordinator {
     const active = this.#manager.get(instance.instanceId);
     return active?.state === "ready" && active.simulatorUdid === instance.simulatorUdid &&
       this.#state.isCurrentReady(instance.instanceId, instance.generation, active.leaseId);
+  }
+
+  /** Process-owned WDA lease, independent of a Viewer route generation. */
+  mjpegConfigurationLease(instanceId: string): string | null {
+    const active = this.#manager.get(instanceId);
+    return active?.state === "ready" ? active.leaseId : null;
+  }
+
+  /** WDA stream settings are transient, exact-session state and precede frame publication. */
+  async configureMjpegProfile(instance: PublicSimulatorInstance, profile: WdaMjpegProfile,
+    signal?: AbortSignal): Promise<void> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) throw new SimulatorDriverError(
+      "DRIVER_RUNTIME_LOST", "Simulator driver is not ready for stream configuration.");
+    const client = new WdaLoopbackClient({ controlPort: active.controlPort, cacheRoot: this.#cacheRoot,
+      instanceId: instance.instanceId, simulatorUdid: instance.simulatorUdid });
+    await client.configureMjpegStream(active.driverSessionId, profile, signal);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort ||
+        signal?.aborted) throw new SimulatorDriverError(
+      "STALE_DRIVER", "Simulator driver changed during stream configuration.");
   }
 
   /** A transient frame subscription to this exact ready driver; no frame enters Store. */

@@ -130,6 +130,9 @@ message WatchSimulatorFramesRequest {
   uint32 frames_per_second = 4;
   uint32 scaling_percent = 5;
   string orientation = 6;
+  uint32 jpeg_quality = 7;
+  uint32 mjpeg_frames_per_second = 8;
+  uint32 mjpeg_scaling_percent = 9;
 }
 
 message WatchSimulatorFramesResponse {

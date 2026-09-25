@@ -133,6 +133,53 @@ it("reads MJPEG only from the current owned driver port and rejects a changed ma
   } finally { store.close(); }
 });
 
+it("configures MJPEG only on the exact WDA session and fences a changed driver after POST", async () => {
+  const store = new OperationalStore(":memory:");
+  let fingerprint = "";
+  let retire = (): void => undefined;
+  let changeLease = false;
+  const profiles: unknown[] = [];
+  const server = createServer((request, response) => {
+    const send = (value: unknown): void => { response.writeHead(200,
+      { "content-type": "application/json" }); response.end(JSON.stringify({ value })); };
+    if (request.url === "/status") { send({ ready: true, build: { upgradedAt: fingerprint } }); return; }
+    if (request.method === "POST" && request.url === "/session/SESSION-1/appium/settings") {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => { profiles.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        if (changeLease) retire();
+        send(null); });
+      return;
+    }
+    response.writeHead(404); response.end();
+  });
+  try {
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("WDA loopback port was not allocated.");
+    seed(store);
+    const ownership = new SimulatorOwnershipRegistry(store);
+    const initial = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const h = harness(store, ownership, { controlPort: address.port });
+    retire = h.loseActive;
+    const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    fingerprint = createWdaOwnerFingerprint({ cacheRoot: "/private/joko/driver-cache",
+      instanceId: started.instance.instanceId, simulatorUdid: UDID });
+    const profile = { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 };
+    await h.coordinator.configureMjpegProfile(started.instance, profile);
+    expect(profiles).toEqual([{ settings: { mjpegServerFramerate: 10,
+      mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70 } }]);
+    changeLease = true;
+    await expect(h.coordinator.configureMjpegProfile(started.instance, profile))
+      .rejects.toMatchObject({ code: "STALE_DRIVER" });
+    expect(profiles).toHaveLength(2);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    store.close();
+  }
+});
+
 it("probes and streams native H.264 only for the exact ready driver lease", async () => {
   const store = new OperationalStore(":memory:");
   try {

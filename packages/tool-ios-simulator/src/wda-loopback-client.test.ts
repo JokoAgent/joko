@@ -88,6 +88,34 @@ it("reads only the exact owned session's bounded accessibility tree", async () =
   await expect(driver.getAccessibilityTree("SESSION-1")).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
 });
 
+it("configures only the owned WDA session with bounded MJPEG settings", async () => {
+  let fingerprint = "";
+  const settings: unknown[] = [];
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") {
+      json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+    } else if (request.method === "POST" && request.url === "/session/SESSION-1/appium/settings") {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => { settings.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        json(response, { value: null }); });
+    } else json(response, { value: null }, 404);
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  await driver.configureMjpegStream("SESSION-1",
+    { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 });
+  expect(settings).toEqual([{ settings: { mjpegServerFramerate: 10,
+    mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70 } }]);
+  await expect(driver.configureMjpegStream("SESSION-1",
+    { framesPerSecond: 0, jpegQuality: 45, scalingPercent: 70 }))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.configureMjpegStream("bad/id",
+    { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 }))
+    .rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(settings).toHaveLength(1);
+});
+
 it("fails closed on foreign ownership, non-ready status, invalid session and unsafe local port", async () => {
   let status: unknown = { value: { ready: true, build: { upgradedAt: "foreign" } } };
   let postCount = 0;

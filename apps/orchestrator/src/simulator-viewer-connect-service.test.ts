@@ -65,7 +65,8 @@ it("streams task-bound frame messages and fences authentication between yields",
   try {
     const request = create(contract.WatchSimulatorFramesRequestSchema, {
       sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
-        generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id }
+        generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
+      mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70
     });
     const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
     expect((await stream.next()).value).toMatchObject({
@@ -99,7 +100,8 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
       sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
         generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
       preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
-      orientation: "PORTRAIT"
+      orientation: "PORTRAIT", mjpegFramesPerSecond: 10, jpegQuality: 45,
+      mjpegScalingPercent: 70
     });
     const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
     expect((await stream.next()).value).toMatchObject({ state: contract.SimulatorViewerStreamState.FRAME,
@@ -109,11 +111,15 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
     expect(watch).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
       instanceId: h.instance.instanceId }), h.context.signal,
     expect.objectContaining({ preferNativeH264: true,
-      profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" } }));
+      profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" },
+      mjpegProfile: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 } }));
     expect(h.store.listOperations({ sessionId: SCOPE.sessionId })).toEqual([]);
     await stream.return?.();
     await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
       { ...request, framesPerSecond: 61 }), h.context)[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
+      { ...request, jpegQuality: 0 }), h.context)[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ code: Code.InvalidArgument });
   } finally { h.store.close(); }
 });

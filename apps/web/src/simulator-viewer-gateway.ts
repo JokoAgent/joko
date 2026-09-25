@@ -63,10 +63,15 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
     },
     async *watchSimulatorFrames(sessionId, route, signal, preference) {
       let sequence = 0n;
+      const profile = preference ?? { preferNativeH264: false, framesPerSecond: 20,
+        scalingPercent: 70, orientation: "PORTRAIT" as const,
+        mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 };
       for await (const response of client.watchSimulatorFrames({ sessionId, route,
-        ...(preference === undefined ? {} : { preferNativeH264: preference.preferNativeH264,
-          framesPerSecond: preference.framesPerSecond, scalingPercent: preference.scalingPercent,
-          orientation: preference.orientation }) }, options(signal))) {
+        preferNativeH264: profile.preferNativeH264,
+        framesPerSecond: profile.framesPerSecond, scalingPercent: profile.scalingPercent,
+        orientation: profile.orientation, mjpegFramesPerSecond: profile.mjpegFramesPerSecond,
+        jpegQuality: profile.jpegQuality, mjpegScalingPercent: profile.mjpegScalingPercent
+      }, options(signal))) {
         if (response.route?.instanceId !== route.instanceId ||
             response.route.generation !== route.generation || response.route.leaseId !== route.leaseId) {
           throw new Error("Simulator frame belongs to another instance route.");

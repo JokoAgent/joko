@@ -61,6 +61,37 @@ it("shows actual JPEG frames only for the visible route, revokes old URLs and st
   vi.unstubAllGlobals();
 });
 
+it("keeps MJPEG quality available on fallback and resubscribes the current route", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:quality",
+    revokeObjectURL: vi.fn() });
+  const watch = vi.fn(async function* (_task: string, _route: typeof route, signal: AbortSignal,
+    _profile: { mjpegFramesPerSecond: number; jpegQuality: number; mjpegScalingPercent: number }) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen
+    controller={{ watchSimulatorFrames: watch } as unknown as AppController}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={async () => undefined}
+    t={(key, values) => translate("en", key, values)} />));
+  const quality = container.querySelector<HTMLSelectElement>(".simulator-viewer__quality select")!;
+  expect(quality.value).toBe("balanced");
+  expect(quality.querySelector('option[value="experimental60"]')).toBeNull();
+  expect(watch.mock.calls[0]?.[3]).toMatchObject({ preferNativeH264: false,
+    mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 });
+  await act(async () => { quality.value = "high";
+    quality.dispatchEvent(new Event("change", { bubbles: true })); });
+  expect(watch).toHaveBeenCalledTimes(2);
+  expect(watch.mock.calls[1]?.[3]).toMatchObject({ preferNativeH264: false,
+    mjpegFramesPerSecond: 20, jpegQuality: 70, mjpegScalingPercent: 100 });
+  expect(container.querySelector("img")).not.toBeNull();
+});
+
 it("requires an explicit retry after finite stream loss and does not retain the old picture", async () => {
   Object.defineProperty(document, "hidden", { configurable: true, value: false });
   vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:recovered",

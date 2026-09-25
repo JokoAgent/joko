@@ -183,6 +183,14 @@ export function createSimulatorViewerConnectService(input: {
       if (!currentOwner.frames) throw new ConnectError(
         "Simulator Viewer frames are unavailable.", Code.Unimplemented);
       const route = requiredRoute(request.route);
+      if (!Number.isSafeInteger(request.mjpegFramesPerSecond) ||
+          request.mjpegFramesPerSecond < 1 || request.mjpegFramesPerSecond > 60 ||
+          !Number.isSafeInteger(request.jpegQuality) || request.jpegQuality < 1 ||
+          request.jpegQuality > 100 ||
+          !Number.isSafeInteger(request.mjpegScalingPercent) || request.mjpegScalingPercent < 1 ||
+          request.mjpegScalingPercent > 100) {
+        throw new ConnectError("Simulator MJPEG profile is invalid.", Code.InvalidArgument);
+      }
       if (request.preferNativeH264 && (!Number.isSafeInteger(request.framesPerSecond) ||
           request.framesPerSecond < 1 || request.framesPerSecond > 60 ||
           !Number.isSafeInteger(request.scalingPercent) || request.scalingPercent < 1 ||
@@ -197,7 +205,8 @@ export function createSimulatorViewerConnectService(input: {
           scalingPercent: request.preferNativeH264 ? request.scalingPercent : 70,
           orientation: request.preferNativeH264 ? request.orientation as "PORTRAIT" | "LANDSCAPE"
             : "PORTRAIT"
-        } })) {
+        }, mjpegProfile: { framesPerSecond: request.mjpegFramesPerSecond,
+          jpegQuality: request.jpegQuality, scalingPercent: request.mjpegScalingPercent } })) {
         fence(context, task, false);
         yield create(contract.WatchSimulatorFramesResponseSchema, {
           route: create(contract.SimulatorViewerRouteSchema, { instanceId: route.instanceId,

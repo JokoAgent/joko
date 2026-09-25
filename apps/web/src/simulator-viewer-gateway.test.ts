@@ -82,7 +82,8 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
   const gateway = createSimulatorViewerGateway({ stream } as unknown as Transport);
   const iterator = gateway.watchSimulatorFrames("task", route, undefined,
     { preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
-      orientation: "PORTRAIT" })[Symbol.asyncIterator]();
+      orientation: "PORTRAIT", mjpegFramesPerSecond: 10, jpegQuality: 45,
+      mjpegScalingPercent: 70 })[Symbol.asyncIterator]();
   expect((await iterator.next()).value).toEqual({ kind: "connecting", attempt: 0 });
   expect((await iterator.next()).value).toMatchObject({ kind: "frame", sequence: 1n });
   expect((await iterator.next()).value).toMatchObject({ kind: "h264", sequence: 2n,
@@ -91,5 +92,6 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
   expect(stream).toHaveBeenCalledOnce();
   const sent = await stream.mock.calls[0]?.[4][Symbol.asyncIterator]().next();
   expect(sent?.value).toMatchObject({ preferNativeH264: true,
-    framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" });
+    framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT",
+    mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 });
 });

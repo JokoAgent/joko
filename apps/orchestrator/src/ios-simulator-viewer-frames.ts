@@ -1,15 +1,20 @@
-import type { SimulatorMjpegFrame, SimulatorNativeH264Frame,
+import type { SimulatorMjpegFrame, SimulatorNativeH264Frame, WdaMjpegProfile,
   SimulatorNativeH264Profile } from "@joko/tool-ios-simulator";
 import { SimulatorDriverError, type SimulatorDriverCoordinator } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance,
   type SimulatorInstanceRoute, type SimulatorTaskScope } from "./ios-simulator-ownership.js";
 
-type FrameDriver = Pick<SimulatorDriverCoordinator, "isReady" | "streamMjpegFrames"> &
+type FrameDriver = Pick<SimulatorDriverCoordinator,
+  "isReady" | "mjpegConfigurationLease" | "configureMjpegProfile" | "streamMjpegFrames"> &
   Partial<Pick<SimulatorDriverCoordinator, "probeNativeH264" | "streamNativeH264Frames">>;
 type FrameState = "connecting" | "streaming" | "reconnecting" | "disconnected";
+const DEFAULT_MJPEG_PROFILE: WdaMjpegProfile = {
+  framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70
+};
 export interface SimulatorViewerVideoPreference {
   readonly preferNativeH264: boolean;
   readonly profile: SimulatorNativeH264Profile;
+  readonly mjpegProfile?: WdaMjpegProfile;
 }
 interface FrameSubscription {
   readonly controller: AbortController;
@@ -19,6 +24,12 @@ interface FrameSubscription {
   lastFrameAt: string | null;
   encoding: "jpeg" | "h264";
   viewerOrientation: SimulatorNativeH264Profile["orientation"] | null;
+  readonly mjpegProfile: WdaMjpegProfile;
+}
+interface MjpegConfigurationState {
+  readonly leaseId: string;
+  tail: Promise<void>;
+  uncertain: boolean;
 }
 export interface SimulatorViewerFrameSnapshot {
   readonly adapter: "wda-mjpeg" | "native-h264";
@@ -37,7 +48,8 @@ export type SimulatorViewerFrameEvent =
     readonly timestampMicros: number; readonly keyFrame: boolean; readonly format: "annex-b" };
 
 export class SimulatorViewerFrameError extends Error {
-  constructor(readonly code: "SUBSCRIPTION_LIMIT", message: string) { super(message); }
+  constructor(readonly code: "SUBSCRIPTION_LIMIT" | "PROFILE_CONFLICT" | "PROFILE_UNCERTAIN",
+    message: string) { super(message); }
 }
 
 /** Visibility-scoped subscriptions. Encoded frames never enter durable task state. */
@@ -45,6 +57,7 @@ export class SimulatorViewerFrameCoordinator {
   readonly #ownership: SimulatorOwnershipRegistry;
   readonly #driver: FrameDriver;
   readonly #subscriptions = new Map<string, Set<FrameSubscription>>();
+  readonly #mjpegConfiguration = new Map<string, MjpegConfigurationState>();
 
   constructor(ownership: SimulatorOwnershipRegistry, driver: FrameDriver) {
     this.#ownership = ownership;
@@ -55,6 +68,9 @@ export class SimulatorViewerFrameCoordinator {
     const subscriptions = this.#subscriptions.get(instanceId);
     for (const subscription of subscriptions ?? []) subscription.controller.abort();
     this.#subscriptions.delete(instanceId);
+    if (this.#driver.mjpegConfigurationLease(instanceId) === null) {
+      this.#mjpegConfiguration.delete(instanceId);
+    }
   }
 
   snapshot(scope: SimulatorTaskScope,
@@ -88,11 +104,15 @@ export class SimulatorViewerFrameCoordinator {
     signal?: AbortSignal, preference?: SimulatorViewerVideoPreference): AsyncGenerator<SimulatorViewerFrameEvent> {
     const instance = this.#requireReady(scope, route);
     const subscriptions = this.#subscriptions.get(instance.instanceId) ?? new Set<FrameSubscription>();
-    if (subscriptions.size >= 2) throw new SimulatorViewerFrameError(
+    if (subscriptions.size >= 16 ||
+        [...subscriptions].filter(item => !item.controller.signal.aborted).length >= 2) {
+      throw new SimulatorViewerFrameError(
       "SUBSCRIPTION_LIMIT", "Simulator Viewer subscription limit reached.");
+    }
     const controller = new AbortController();
     const subscription: FrameSubscription = { controller, route, state: "connecting",
-      sequence: 0, lastFrameAt: null, encoding: "jpeg", viewerOrientation: null };
+      sequence: 0, lastFrameAt: null, encoding: "jpeg", viewerOrientation: null,
+      mjpegProfile: preference?.mjpegProfile ?? DEFAULT_MJPEG_PROFILE };
     subscriptions.add(subscription);
     this.#subscriptions.set(instance.instanceId, subscriptions);
     const abort = (): void => controller.abort();
@@ -145,6 +165,18 @@ export class SimulatorViewerFrameCoordinator {
             subscription.encoding = "jpeg";
             subscription.viewerOrientation = null;
           } else {
+            const peers = [...subscriptions].filter(item => item !== subscription &&
+              !item.controller.signal.aborted && item.encoding === "jpeg");
+            const older = [...subscriptions].slice(0, [...subscriptions].indexOf(subscription));
+            if (peers.some(item => (item.state === "streaming" || older.includes(item)) &&
+                !sameMjpegProfile(item.mjpegProfile, subscription.mjpegProfile))) {
+              throw new SimulatorViewerFrameError("PROFILE_CONFLICT",
+                "Another Viewer is using a different MJPEG stream profile.");
+            }
+            await this.#configureMjpeg(instance, subscription);
+            check();
+            if (stale) throw stale;
+            if (controller.signal.aborted) return;
             for await (const frame of this.#driver.streamMjpegFrames(instance, controller.signal)) {
               check();
               if (stale) throw stale;
@@ -159,6 +191,7 @@ export class SimulatorViewerFrameCoordinator {
         } catch (error) {
           if (stale) throw stale;
           if (controller.signal.aborted) return;
+          if (error instanceof SimulatorViewerFrameError) throw error;
           if (error instanceof SimulatorDriverError && error.code === "STALE_DRIVER") throw error;
           if (useNative) {
             useNative = false;
@@ -198,6 +231,34 @@ export class SimulatorViewerFrameCoordinator {
     return instance;
   }
 
+  async #configureMjpeg(instance: PublicSimulatorInstance,
+    subscription: FrameSubscription): Promise<void> {
+    const key = instance.instanceId;
+    const leaseId = this.#driver.mjpegConfigurationLease(key);
+    if (leaseId === null) throw new SimulatorDriverError("STALE_DRIVER",
+      "Simulator driver changed before stream configuration.");
+    let state = this.#mjpegConfiguration.get(key);
+    if (state?.leaseId !== leaseId) {
+      state = { leaseId, tail: Promise.resolve(), uncertain: false };
+      this.#mjpegConfiguration.set(key, state);
+    }
+    const configuration = state;
+    const current = configuration.tail.then(async () => {
+      if (subscription.controller.signal.aborted) return;
+      if (configuration.uncertain) throw new SimulatorViewerFrameError(
+        "PROFILE_UNCERTAIN", "The previous MJPEG profile outcome is unknown; restart the Viewer driver.");
+      try {
+        await this.#driver.configureMjpegProfile(instance, subscription.mjpegProfile,
+          subscription.controller.signal);
+      } catch (error) {
+        if (!subscription.controller.signal.aborted) configuration.uncertain = true;
+        throw error;
+      }
+    });
+    configuration.tail = current.catch(() => undefined);
+    await current;
+  }
+
   #frame(sequence: number, frame: SimulatorMjpegFrame): SimulatorViewerFrameEvent {
     return { kind: "frame", sequence, receivedAt: frame.receivedAt, bytes: frame.bytes };
   }
@@ -217,4 +278,9 @@ export class SimulatorViewerFrameCoordinator {
       if (signal.aborted) stop();
     });
   }
+}
+
+function sameMjpegProfile(left: WdaMjpegProfile, right: WdaMjpegProfile): boolean {
+  return left.framesPerSecond === right.framesPerSecond &&
+    left.jpegQuality === right.jpegQuality && left.scalingPercent === right.scalingPercent;
 }

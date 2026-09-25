@@ -97,7 +97,8 @@ it("serves authenticated task-owned Simulator inventory and durable exact deleti
     expect(state).toMatchObject({ support: CapabilitySupport.SUPPORTED,
       devices: [{ udid }], instances: [{ simulatorUdid: udid, creationProvenance: "joko" }] });
     const watchRequest = { sessionId: "viewer-task", route: { instanceId: owned.instanceId,
-      generation: BigInt(owned.generation), leaseId: owned.lease.id } };
+      generation: BigInt(owned.generation), leaseId: owned.lease.id },
+      mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 };
     await expect(anonymous.simulatorViewer.watchSimulatorFrames(watchRequest)[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ code: Code.Unauthenticated });
     await expect(clients.simulatorViewer.watchSimulatorFrames({ ...watchRequest,
@@ -161,6 +162,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
   let ownerFingerprint = "";
   const viewerInputs: Array<{ readonly url: string; readonly body: unknown;
     readonly claimed: boolean }> = [];
+  const viewerProfiles: unknown[] = [];
   let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -234,13 +236,15 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       response.end(JSON.stringify({ value }));
     };
     if (request.method === "POST" && request.url && [
-      "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys"
+      "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
+      "/session/SESSION-1/appium/settings"
     ].includes(request.url)) {
       const chunks: Buffer[] = [];
       request.on("data", chunk => chunks.push(Buffer.from(chunk)));
       request.on("end", () => {
-        viewerInputs.push({ url: request.url!,
-          body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (request.url === "/session/SESSION-1/appium/settings") viewerProfiles.push(body);
+        else viewerInputs.push({ url: request.url!, body,
           claimed: application.store.listOperations({ sessionId: "viewer-web-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_input") });
         send(null);
@@ -341,6 +345,14 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         const image = document.querySelector<HTMLImageElement>(".simulator-viewer__screen img");
         return image?.complete && image.naturalWidth === 16 && image.naturalHeight === 12;
       });
+      await vi.waitFor(() => expect(viewerProfiles).toContainEqual({ settings: {
+        mjpegServerFramerate: 10, mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70
+      } }), { timeout: 5_000 });
+      await panel.getByLabel("Video quality").selectOption("high");
+      await vi.waitFor(() => expect(viewerProfiles).toContainEqual({ settings: {
+        mjpegServerFramerate: 20, mjpegServerScreenshotQuality: 70, mjpegScalingFactor: 100
+      } }), { timeout: 5_000 });
+      await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       const textInput = panel.getByRole("textbox", { name: "Text to type in the Simulator" });
       await textInput.fill("mounted-private-text");
       await textInput.press("Enter");

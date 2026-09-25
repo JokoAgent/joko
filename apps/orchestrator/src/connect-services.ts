@@ -748,7 +748,8 @@ function toConnectError(error: unknown): ConnectError {
     return new ConnectError(redactSecrets(storedMessage ?? error.message), Code.FailedPrecondition);
   }
   if (error instanceof OperationInProgressError) return new ConnectError(error.message, Code.Aborted);
-  if (error instanceof SimulatorViewerFrameError) return new ConnectError(error.message, Code.ResourceExhausted);
+  if (error instanceof SimulatorViewerFrameError) return new ConnectError(error.message,
+    error.code === "SUBSCRIPTION_LIMIT" ? Code.ResourceExhausted : Code.FailedPrecondition);
   if (error instanceof SimulatorMjpegError) return new ConnectError(error.message,
     error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
       : error.code === "STREAM_TOO_LARGE" ? Code.ResourceExhausted

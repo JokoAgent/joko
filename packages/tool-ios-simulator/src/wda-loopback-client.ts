@@ -36,6 +36,12 @@ export interface WdaViewport {
 
 export interface WdaPoint { readonly x: number; readonly y: number }
 
+export interface WdaMjpegProfile {
+  readonly framesPerSecond: number;
+  readonly jpegQuality: number;
+  readonly scalingPercent: number;
+}
+
 export interface WdaLoopbackClientOptions {
   readonly controlPort: number;
   readonly cacheRoot: string;
@@ -244,6 +250,25 @@ export class WdaLoopbackClient {
     }
     return { width: size.value["width"], height: size.value["height"],
       orientation: direction.value };
+  }
+
+  /** Viewer-only transient WDA stream settings for this exact driver session. */
+  async configureMjpegStream(id: string, profile: WdaMjpegProfile,
+    signal?: AbortSignal): Promise<void> {
+    const exactId = sessionId(id);
+    const framesPerSecond = integer(profile.framesPerSecond, "framesPerSecond", 1, 60);
+    const jpegQuality = integer(profile.jpegQuality, "jpegQuality", 1, 100);
+    const scalingPercent = integer(profile.scalingPercent, "scalingPercent", 1, 100);
+    const health = await this.probe(signal);
+    if (!health.ready) throw new WdaClientError("NOT_READY", "Driver is not ready for stream configuration.");
+    if (signal?.aborted) throw new WdaClientError("CANCELLED", "Stream configuration was cancelled.");
+    // Once dispatched, await its bounded outcome even if the Viewer unsubscribes. A later
+    // profile must not race ahead of a cancelled-but-still-running WDA settings request.
+    await this.#request(`/session/${exactId}/appium/settings`, "POST", JSON.stringify({ settings: {
+      mjpegServerFramerate: framesPerSecond,
+      mjpegServerScreenshotQuality: jpegQuality,
+      mjpegScalingFactor: scalingPercent
+    } }));
   }
 
   async setOrientation(id: string, orientation: WdaViewport["orientation"],
