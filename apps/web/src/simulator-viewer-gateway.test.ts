@@ -6,7 +6,7 @@ import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
   ControlSimulatorViewerTouchResponseSchema,
   GetSimulatorViewerControlsResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
-  SimulatorViewerCommand, SimulatorViewerInstanceSchema,
+  SimulatorViewerCommand, SimulatorViewerInstanceSchema, SimulatorViewerNativeRouteState,
   SimulatorViewerStreamState, SimulatorViewerTouchPhase,
   WatchSimulatorFramesResponseSchema } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
@@ -92,18 +92,22 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
   const route = { instanceId: "owned", generation: 4n, leaseId: "lease" };
   const responses = [
     create(WatchSimulatorFramesResponseSchema,
-      { route, state: SimulatorViewerStreamState.CONNECTING }),
+      { route, state: SimulatorViewerStreamState.CONNECTING,
+        nativeRouteState: SimulatorViewerNativeRouteState.ACTIVE }),
     create(WatchSimulatorFramesResponseSchema,
       { route, state: SimulatorViewerStreamState.FRAME, sequence: 1n,
-        receivedAtMs: 1_000n, jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) }),
+        receivedAtMs: 1_000n, jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]),
+        nativeRouteState: SimulatorViewerNativeRouteState.FALLBACK_UNAVAILABLE }),
     create(WatchSimulatorFramesResponseSchema,
       { route, state: SimulatorViewerStreamState.FRAME, sequence: 2n,
         receivedAtMs: 1_500n, h264: new Uint8Array([0, 0, 0, 1, 0x65, 0x88]),
         width: 16, height: 12, timestampMicros: 3_000n,
-        keyFrame: true, h264Format: "annex-b" }),
+        keyFrame: true, h264Format: "annex-b",
+        nativeRouteState: SimulatorViewerNativeRouteState.ACTIVE }),
     create(WatchSimulatorFramesResponseSchema,
       { route: { ...route, generation: 5n }, state: SimulatorViewerStreamState.FRAME,
-        sequence: 3n, receivedAtMs: 2_000n, jpeg: new Uint8Array([0xff, 0xd8, 2, 0xff, 0xd9]) })
+        sequence: 3n, receivedAtMs: 2_000n, jpeg: new Uint8Array([0xff, 0xd8, 2, 0xff, 0xd9]),
+        nativeRouteState: SimulatorViewerNativeRouteState.ACTIVE })
   ];
   const stream = vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown,
     _headers: unknown, input: any) => ({ service: method.parent, method, stream: true,
@@ -115,7 +119,8 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
     { preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
       orientation: "PORTRAIT", mjpegFramesPerSecond: 10, jpegQuality: 45,
       mjpegScalingPercent: 70 })[Symbol.asyncIterator]();
-  expect((await iterator.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+  expect((await iterator.next()).value).toEqual({ kind: "connecting", attempt: 0,
+    nativeRoute: "active" });
   expect((await iterator.next()).value).toMatchObject({ kind: "frame", sequence: 1n });
   expect((await iterator.next()).value).toMatchObject({ kind: "h264", sequence: 2n,
     width: 16, height: 12, keyFrame: true });
@@ -125,4 +130,26 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
   expect(sent?.value).toMatchObject({ preferNativeH264: true,
     framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT",
     mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 });
+});
+
+it("passes a decoder failure only on a fallback subscription and reports its exact route state", async () => {
+  const route = { instanceId: "owned", generation: 4n, leaseId: "lease" };
+  const stream = vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown,
+    _headers: unknown, input: any) => ({ service: method.parent, method, stream: true,
+      header: new Headers(), trailer: new Headers(), message: (async function* () {
+        yield create(WatchSimulatorFramesResponseSchema, { route,
+          state: SimulatorViewerStreamState.FRAME, sequence: 1n, receivedAtMs: 1_000n,
+          jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]),
+          nativeRouteState: SimulatorViewerNativeRouteState.FALLBACK_DECODE });
+      })(), signal, input }));
+  const gateway = createSimulatorViewerGateway({ stream } as unknown as Transport);
+  const profile = { preferNativeH264: false, framesPerSecond: 20, scalingPercent: 70,
+    orientation: "PORTRAIT" as const, mjpegFramesPerSecond: 10, jpegQuality: 45,
+    mjpegScalingPercent: 70, clientFallbackReason: "decode_failed" as const };
+  const events = gateway.watchSimulatorFrames("task", route, undefined, profile);
+  expect((await events[Symbol.asyncIterator]().next()).value).toMatchObject({ kind: "frame",
+    nativeRoute: "fallbackDecode" });
+  const sent = await stream.mock.calls[0]?.[4][Symbol.asyncIterator]().next();
+  expect(sent?.value).toMatchObject({ clientFallbackReason: "decode_failed",
+    preferNativeH264: false, route });
 });

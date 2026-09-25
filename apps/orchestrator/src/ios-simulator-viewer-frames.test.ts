@@ -41,7 +41,8 @@ it("streams only the exact ready task route without persisting frame bytes", asy
   const h = fixture(async function* () { yield { bytes: jpeg, receivedAt: new Date().toISOString() }; });
   try {
     const watch = h.frames.watch(SCOPE, h.route);
-    expect((await watch.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+    expect((await watch.next()).value).toEqual({ kind: "connecting", attempt: 0,
+      nativeRoute: "inactive" });
     expect((await watch.next()).value).toMatchObject({ kind: "frame", sequence: 1, bytes: jpeg });
     expect(h.frames.snapshot(SCOPE, h.route)).toMatchObject({ adapter: "wda-mjpeg",
       encoding: "jpeg", state: "streaming", sequence: 1 });
@@ -76,16 +77,18 @@ it("prefers owned H.264 frames and falls back to MJPEG after native loss", async
     const watch = h.frames.watch(SCOPE, h.route, undefined,
       { preferNativeH264: true, profile: { framesPerSecond: 20,
         scalingPercent: 70, orientation: "PORTRAIT" } });
-    expect((await watch.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+    expect((await watch.next()).value).toEqual({ kind: "connecting", attempt: 0,
+      nativeRoute: "active" });
     expect((await watch.next()).value).toMatchObject({ kind: "h264", sequence: 1,
       bytes: h264, keyFrame: true });
     expect(h.frames.snapshot(SCOPE, h.route)).toMatchObject({ adapter: "native-h264",
       encoding: "h264", state: "streaming", sequence: 1 });
     expect(h.frames.inputView(SCOPE, h.route)).toMatchObject({ state: "streaming",
       encoding: "h264", viewerOrientation: "PORTRAIT", lastFrameAt: expect.any(String) });
-    expect((await watch.next()).value).toEqual({ kind: "reconnecting", attempt: 1 });
+    expect((await watch.next()).value).toEqual({ kind: "reconnecting", attempt: 1,
+      nativeRoute: "fallback_lost" });
     expect((await watch.next()).value).toMatchObject({ kind: "frame", sequence: 2,
-      bytes: jpeg });
+      bytes: jpeg, nativeRoute: "fallback_lost" });
     expect(h.frames.snapshot(SCOPE, h.route)).toMatchObject({ adapter: "wda-mjpeg",
       encoding: "jpeg", sequence: 2 });
     expect(h.frames.inputView(SCOPE, h.route)).toMatchObject({ state: "streaming",
@@ -94,6 +97,48 @@ it("prefers owned H.264 frames and falls back to MJPEG after native loss", async
     expect(native.streamNativeH264Frames).toHaveBeenCalledOnce();
     expect(h.driver.configureMjpegProfile).toHaveBeenCalledOnce();
     await watch.return(undefined);
+  } finally { h.store.close(); }
+});
+
+it("reports native fallback per subscription and re-probes only on a new explicit watch", async () => {
+  let nativeReady = false;
+  const native = { probeNativeH264: vi.fn(async () => nativeReady),
+    streamNativeH264Frames: vi.fn(async function* (_instance, _profile, signal?: AbortSignal) {
+      yield { sequence: 1, width: 16, height: 12, timestampMicros: 1_000,
+        keyFrame: true, format: "annex-b" as const,
+        bytes: new Uint8Array([0, 0, 0, 1, 0x65, 0x88]),
+        receivedAt: new Date().toISOString() };
+      await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+    }) };
+  const h = fixture(async function* (_instance, signal) {
+    yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+      receivedAt: new Date().toISOString() };
+    await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+  }, native);
+  const profile = { preferNativeH264: true, profile: { framesPerSecond: 20,
+    scalingPercent: 70, orientation: "PORTRAIT" as const } };
+  try {
+    const first = h.frames.watch(SCOPE, h.route, undefined, profile);
+    expect((await first.next()).value).toMatchObject({ kind: "connecting",
+      nativeRoute: "fallback_unavailable" });
+    expect((await first.next()).value).toMatchObject({ kind: "frame",
+      nativeRoute: "fallback_unavailable" });
+    nativeReady = true;
+    expect(native.probeNativeH264).toHaveBeenCalledTimes(1);
+    await first.return(undefined);
+    const second = h.frames.watch(SCOPE, h.route, undefined, profile);
+    expect((await second.next()).value).toMatchObject({ kind: "connecting", nativeRoute: "active" });
+    expect((await second.next()).value).toMatchObject({ kind: "h264", nativeRoute: "active" });
+    expect(native.probeNativeH264).toHaveBeenCalledTimes(2);
+    await second.return(undefined);
+    const decoderFallback = h.frames.watch(SCOPE, h.route, undefined, {
+      ...profile, preferNativeH264: false, clientFallbackReason: "decode_failed" });
+    expect((await decoderFallback.next()).value).toMatchObject({ kind: "connecting",
+      nativeRoute: "fallback_decode" });
+    expect((await decoderFallback.next()).value).toMatchObject({ kind: "frame",
+      nativeRoute: "fallback_decode" });
+    expect(native.probeNativeH264).toHaveBeenCalledTimes(2);
+    await decoderFallback.return(undefined);
   } finally { h.store.close(); }
 });
 
@@ -110,7 +155,8 @@ it("does not let a second MJPEG subscription silently replace the active profile
     const second = h.frames.watch(SCOPE, h.route, undefined, { preferNativeH264: false,
       profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" },
       mjpegProfile: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 } });
-    expect((await second.next()).value).toEqual({ kind: "connecting", attempt: 0 });
+    expect((await second.next()).value).toEqual({ kind: "connecting", attempt: 0,
+      nativeRoute: "inactive" });
     await expect(second.next()).rejects.toMatchObject({ code: "PROFILE_CONFLICT" });
     expect(h.driver.configureMjpegProfile).toHaveBeenCalledOnce();
     await first.return(undefined);
@@ -125,8 +171,10 @@ it("fails closed after an uncertain WDA profile response instead of publishing a
   try {
     vi.spyOn(h.driver, "configureMjpegProfile").mockRejectedValue(new Error("settings response lost"));
     const first = h.frames.watch(SCOPE, h.route);
-    expect((await first.next()).value).toEqual({ kind: "connecting", attempt: 0 });
-    expect((await first.next()).value).toEqual({ kind: "reconnecting", attempt: 1 });
+    expect((await first.next()).value).toEqual({ kind: "connecting", attempt: 0,
+      nativeRoute: "inactive" });
+    expect((await first.next()).value).toEqual({ kind: "reconnecting", attempt: 1,
+      nativeRoute: "inactive" });
     await expect(first.next()).rejects.toMatchObject({ code: "PROFILE_UNCERTAIN" });
     const second = h.frames.watch(SCOPE, h.route);
     await second.next();

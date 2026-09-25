@@ -55,7 +55,7 @@ it("shows current route telemetry, rotates from a fresh viewport and copies an e
   const release = vi.fn();
   const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
     yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   };
   const controller = { watchSimulatorFrames: watch, getSimulatorViewerControls: getControls,
@@ -103,9 +103,9 @@ it("shows actual JPEG frames only for the visible route, revokes old URLs and st
   let stopped = false;
   const watch = vi.fn(async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
     try {
-      yield { kind: "connecting", attempt: 0 } as const;
+      yield { kind: "connecting", attempt: 0, nativeRoute: "inactive" } as const;
       yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-        jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+        jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
       await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
     } finally { stopped = true; }
   });
@@ -140,7 +140,7 @@ it("keeps MJPEG quality available on fallback and resubscribes the current route
   const watch = vi.fn(async function* (_task: string, _route: typeof route, signal: AbortSignal,
     _profile: { mjpegFramesPerSecond: number; jpegQuality: number; mjpegScalingPercent: number }) {
     yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   });
   const container = document.createElement("div");
@@ -165,6 +165,50 @@ it("keeps MJPEG quality available on fallback and resubscribes the current route
   expect(container.querySelector("img")).not.toBeNull();
 });
 
+it("retries a current native fallback only on user action and retains MJPEG on failed recovery", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:native-fallback",
+    revokeObjectURL: vi.fn() });
+  vi.stubGlobal("VideoDecoder", class {
+    static async isConfigSupported() { return { supported: true }; }
+    configure() {}
+    decode() {}
+    close() {}
+  });
+  vi.stubGlobal("EncodedVideoChunk", class { constructor(_input: unknown) {} });
+  const watch = vi.fn(async function* (_session: string, _route: typeof route, signal: AbortSignal,
+    profile: { preferNativeH264: boolean }) {
+    expect(profile.preferNativeH264).toBe(true);
+    yield { kind: "frame", sequence: 1n, receivedAtMs: Date.now(),
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]),
+      nativeRoute: "fallbackUnavailable" } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen
+    controller={{ watchSimulatorFrames: watch,
+      getSimulatorViewerControls: async () => ({ viewportWidth: 393, viewportHeight: 852,
+        orientation: "PORTRAIT", nativeTouchAvailable: false }) } as unknown as AppController}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={async () => undefined}
+    t={(key, values) => translate("en", key, values)} />));
+  expect(container.textContent).toContain("Native video is unavailable; showing WDA video.");
+  expect(watch).toHaveBeenCalledTimes(1);
+  const retry = [...container.querySelectorAll<HTMLButtonElement>("button")]
+    .find(button => button.textContent === "Retry native video")!;
+  await act(async () => retry.click());
+  expect(watch).toHaveBeenCalledTimes(2);
+  expect(watch.mock.calls.every(call => call[1] === route)).toBe(true);
+  expect(container.textContent).toContain("Native video is still unavailable.");
+  expect(container.querySelector(".simulator-viewer__screen img")).not.toBeNull();
+  Object.defineProperty(document, "hidden", { configurable: true, value: true });
+  await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+  expect(container.textContent).not.toContain("Native video is unavailable; showing WDA video.");
+  expect(container.textContent).not.toContain("Native video is still unavailable.");
+});
+
 it("requires an explicit retry after finite stream loss and does not retain the old picture", async () => {
   Object.defineProperty(document, "hidden", { configurable: true, value: false });
   vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:recovered",
@@ -172,9 +216,10 @@ it("requires an explicit retry after finite stream loss and does not retain the 
   let calls = 0;
   const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
     calls += 1;
-    if (calls === 1) { yield { kind: "disconnected", attempt: 3 } as const; return; }
+    if (calls === 1) { yield { kind: "disconnected", attempt: 3,
+      nativeRoute: "inactive" } as const; return; }
     yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   };
   const container = document.createElement("div");
@@ -215,7 +260,7 @@ it("renders current H.264 output to a canvas and falls back to JPEG when decodin
       h264: new Uint8Array([0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x1f,
         0, 0, 0, 1, 0x68, 1, 0, 0, 0, 1, 0x65, 1]),
       width: 16, height: 12, timestampMicros: 1_000, keyFrame: true,
-      format: "annex-b" } as const;
+      format: "annex-b", nativeRoute: "active" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   });
   const container = document.createElement("div");
@@ -251,7 +296,7 @@ it("keeps captured touch begin/move/end on one route and sends IME-safe text sep
     revokeObjectURL: vi.fn() });
   const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
     yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   };
   const control = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerInput"]>) =>
@@ -334,7 +379,7 @@ it("falls back only after a definitely undispatched begin and locks unknown nati
     revokeObjectURL: vi.fn() });
   const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
     yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   };
   const live = vi.fn().mockResolvedValueOnce({ accepted: false })
@@ -388,7 +433,7 @@ it("keeps typed text and locks input after an unconfirmed result until explicit 
     revokeObjectURL: vi.fn() });
   const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
     yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
-      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
   };
   const control = vi.fn()

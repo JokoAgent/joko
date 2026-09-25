@@ -1,6 +1,7 @@
 import { createClient, type Transport } from "@connectrpc/connect";
 import {
-  CapabilitySupport, SimulatorViewerAction, SimulatorViewerCommand, SimulatorViewerService, SimulatorViewerStreamState,
+  CapabilitySupport, SimulatorViewerAction, SimulatorViewerCommand, SimulatorViewerNativeRouteState,
+  SimulatorViewerService, SimulatorViewerStreamState,
   SimulatorViewerTouchPhase,
   type SimulatorViewerInstance
 } from "@joko/contracts";
@@ -109,12 +110,14 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
         preferNativeH264: profile.preferNativeH264,
         framesPerSecond: profile.framesPerSecond, scalingPercent: profile.scalingPercent,
         orientation: profile.orientation, mjpegFramesPerSecond: profile.mjpegFramesPerSecond,
-        jpegQuality: profile.jpegQuality, mjpegScalingPercent: profile.mjpegScalingPercent
+        jpegQuality: profile.jpegQuality, mjpegScalingPercent: profile.mjpegScalingPercent,
+        clientFallbackReason: profile.clientFallbackReason ?? ""
       }, options(signal))) {
         if (response.route?.instanceId !== route.instanceId ||
             response.route.generation !== route.generation || response.route.leaseId !== route.leaseId) {
           throw new Error("Simulator frame belongs to another instance route.");
         }
+        const nativeRoute = mapNativeRoute(response.nativeRouteState);
         if (response.state === SimulatorViewerStreamState.FRAME) {
           if (response.sequence <= sequence || response.receivedAtMs <= 0n ||
               response.receivedAtMs > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -131,7 +134,7 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
                 response.jpeg[response.jpeg.length - 1] !== 0xd9)
               throw new Error("Simulator JPEG frame is invalid.");
             yield { kind: "frame", sequence, receivedAtMs: Number(response.receivedAtMs),
-              jpeg: response.jpeg };
+              jpeg: response.jpeg, nativeRoute };
           } else if (response.h264.length >= 5 && response.h264.length <= 16 * 1024 * 1024 &&
               response.jpeg.length === 0 && response.width >= 1 && response.width <= 8_192 &&
               response.height >= 1 && response.height <= 8_192 &&
@@ -142,7 +145,7 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
             yield { kind: "h264", sequence, receivedAtMs: Number(response.receivedAtMs),
               h264: response.h264, width: response.width, height: response.height,
               timestampMicros: Number(response.timestampMicros), keyFrame: response.keyFrame,
-              format: "annex-b" };
+              format: "annex-b", nativeRoute };
           } else throw new Error("Simulator H.264 frame is invalid.");
           continue;
         }
@@ -157,10 +160,22 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
           : response.state === SimulatorViewerStreamState.RECONNECTING ? "reconnecting"
             : response.state === SimulatorViewerStreamState.DISCONNECTED ? "disconnected"
               : (() => { throw new Error("Simulator frame state is invalid."); })(),
-        attempt: response.reconnectAttempt };
+        attempt: response.reconnectAttempt, nativeRoute };
       }
     }
   };
+}
+
+function mapNativeRoute(value: SimulatorViewerNativeRouteState):
+  "inactive" | "active" | "fallbackUnavailable" | "fallbackLost" | "fallbackDecode" {
+  switch (value) {
+    case SimulatorViewerNativeRouteState.INACTIVE: return "inactive";
+    case SimulatorViewerNativeRouteState.ACTIVE: return "active";
+    case SimulatorViewerNativeRouteState.FALLBACK_UNAVAILABLE: return "fallbackUnavailable";
+    case SimulatorViewerNativeRouteState.FALLBACK_LOST: return "fallbackLost";
+    case SimulatorViewerNativeRouteState.FALLBACK_DECODE: return "fallbackDecode";
+    default: throw new Error("Simulator native route state is invalid.");
+  }
 }
 
 function instanceView(value: SimulatorViewerInstance | undefined): SimulatorViewerInstanceView {

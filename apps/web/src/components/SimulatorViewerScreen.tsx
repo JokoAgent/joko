@@ -3,9 +3,10 @@ import {
   type PointerEvent as ReactPointerEvent
 } from "react";
 import { AlertTriangle, Camera, House, Keyboard, LockKeyhole, MonitorSmartphone,
-  RotateCw, Send, UnlockKeyhole } from "lucide-react";
+  RefreshCw, RotateCw, Send, UnlockKeyhole } from "lucide-react";
 import type { AppController } from "../controller.js";
 import type { SimulatorViewerCommandView, SimulatorViewerControlsView,
+  SimulatorViewerNativeRouteView,
   SimulatorViewerInputView, SimulatorViewerRouteView } from "../model.js";
 import { createBrowserSimulatorH264DecoderRuntime, SimulatorH264Decoder
 } from "../simulator-h264-decoder.js";
@@ -80,12 +81,16 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   const [controls, setControls] = useState<SimulatorViewerControlsView>();
   const [inputFallback, setInputFallback] = useState(false);
   const [streamFps, setStreamFps] = useState(0);
+  const [nativeRoute, setNativeRoute] = useState<SimulatorViewerNativeRouteView>("inactive");
+  const [nativeRecoveryPending, setNativeRecoveryPending] = useState(false);
+  const [nativeRecoveryOutcome, setNativeRecoveryOutcome] = useState<"failed" | "restored">();
   const [textInput, setTextInput] = useState("");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pointerGestureRef = useRef<PointerGesture | undefined>(undefined);
   const inputRequestRef = useRef<AbortController | undefined>(undefined);
   const commandRequestRef = useRef<AbortController | undefined>(undefined);
   const frameRateRef = useRef({ startedAt: 0, frames: 0 });
+  const nativeRecoveryRef = useRef(false);
   const ownerKey = `${sessionId}:${route.instanceId}:${route.generation}:${route.leaseId}`;
   const ownerKeyRef = useRef(ownerKey);
   ownerKeyRef.current = ownerKey;
@@ -102,6 +107,8 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     setStreamFps(0);
     setControls(undefined);
     setInputFallback(false);
+    setNativeRoute("inactive");
+    setNativeRecoveryOutcome(undefined);
   }, []);
   const recordFrame = useCallback((): void => {
     const now = performance.now();
@@ -146,6 +153,9 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       setPresentation(null);
       setNativeAvailable(false);
       resetTelemetry();
+      nativeRecoveryRef.current = false;
+      setNativeRecoveryPending(false);
+      setNativeRecoveryOutcome(undefined);
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; }
       return;
     }
@@ -164,11 +174,13 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       resetTelemetry();
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; }
     };
-    const watch = async (native: boolean): Promise<void> => {
+    const watch = async (native: boolean,
+      clientFallbackReason?: "decode_failed"): Promise<void> => {
       subscription = new AbortController();
       const current = subscription;
       const mjpeg = MJPEG_PROFILES[quality === "experimental60" ? "high" : quality];
       let fallback = false;
+      let decoderFallback = false;
       const decoder = native ? new SimulatorH264Decoder({ runtime,
         renderFrame(frame, width, height) {
           const canvas = canvasRef.current;
@@ -182,10 +194,16 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         },
         onFrameRendered() { if (active && !current.signal.aborted) {
           setFrameUrl(undefined); setPresentation("h264"); setState("streaming");
+          setNativeRoute("active");
+          if (nativeRecoveryRef.current) {
+            nativeRecoveryRef.current = false;
+            setNativeRecoveryPending(false);
+            setNativeRecoveryOutcome("restored");
+          }
           recordFrame();
           markFrameFresh();
         } },
-        onFallback() { fallback = true; current.abort(); }
+        onFallback() { fallback = true; decoderFallback = true; current.abort(); }
       }) : null;
       try {
         for await (const event of controllerRef.current.watchSimulatorFrames(sessionId, route,
@@ -193,7 +211,8 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
             framesPerSecond: VIDEO_PROFILES[quality].framesPerSecond,
             scalingPercent: VIDEO_PROFILES[quality].scalingPercent,
             orientation: "PORTRAIT", mjpegFramesPerSecond: mjpeg.framesPerSecond,
-            jpegQuality: mjpeg.jpegQuality, mjpegScalingPercent: mjpeg.scalingPercent })) {
+            jpegQuality: mjpeg.jpegQuality, mjpegScalingPercent: mjpeg.scalingPercent,
+            ...(clientFallbackReason ? { clientFallbackReason } : {}) })) {
           if (!active || current.signal.aborted) break;
           if (event.kind === "frame") {
             decoder?.close();
@@ -202,6 +221,14 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
               { type: "image/jpeg" })));
             setPresentation("jpeg");
             setState("streaming");
+            setNativeRoute(event.nativeRoute);
+            if (event.nativeRoute !== "active") setNativeRecoveryOutcome(previous =>
+              previous === "restored" ? undefined : previous);
+            if (nativeRecoveryRef.current) {
+              nativeRecoveryRef.current = false;
+              setNativeRecoveryPending(false);
+              setNativeRecoveryOutcome("failed");
+            }
             recordFrame();
             markFrameFresh();
           } else if (event.kind === "h264") {
@@ -214,11 +241,29 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
           } else {
             clear();
             setState(event.kind);
+            setNativeRoute(event.kind === "disconnected" ? "inactive" : event.nativeRoute);
+            if (event.kind === "disconnected" && nativeRecoveryRef.current) {
+              nativeRecoveryRef.current = false;
+              setNativeRecoveryPending(false);
+              setNativeRecoveryOutcome("failed");
+            }
           }
         }
-        if (active && !current.signal.aborted) { clear(); setState("disconnected"); }
+        if (active && !current.signal.aborted) { clear(); setState("disconnected");
+          if (nativeRecoveryRef.current) {
+            nativeRecoveryRef.current = false;
+            setNativeRecoveryPending(false);
+            setNativeRecoveryOutcome("failed");
+          }
+        }
       } catch {
-        if (active && !current.signal.aborted) { clear(); setState("disconnected"); }
+        if (active && !current.signal.aborted) { clear(); setState("disconnected");
+          if (nativeRecoveryRef.current) {
+            nativeRecoveryRef.current = false;
+            setNativeRecoveryPending(false);
+            setNativeRecoveryOutcome("failed");
+          }
+        }
       } finally {
         decoder?.close();
       }
@@ -226,7 +271,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         clear();
         setNativeAvailable(false);
         setState("reconnecting");
-        await watch(false);
+        await watch(false, decoderFallback ? "decode_failed" : undefined);
       }
     };
     void watch(runtime !== null);
@@ -514,6 +559,16 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
 
   const commandUnavailable = !enabled || !documentVisible || inputBusy || commandBusy ||
     inputError !== undefined || commandError !== undefined || pointerGestureRef.current !== undefined;
+  const nativeRecoverable = nativeRoute === "fallbackUnavailable" ||
+    nativeRoute === "fallbackLost" || nativeRoute === "fallbackDecode";
+  const nativeFallbackVisible = nativeRecoverable && interactive && presentation === "jpeg";
+  const retryNativeRoute = (): void => {
+    if (!nativeRecoverable || !interactive || commandUnavailable || nativeRecoveryRef.current) return;
+    nativeRecoveryRef.current = true;
+    setNativeRecoveryPending(true);
+    setNativeRecoveryOutcome(undefined);
+    setRetry(value => value + 1);
+  };
   const runCommand = async (command: SimulatorViewerCommandView): Promise<void> => {
     if (commandUnavailable || !interactive || commandRequestRef.current) return;
     const request = new AbortController();
@@ -642,7 +697,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         <label className="simulator-viewer__quality">
         {t("simulator.videoQuality")}
         <select value={!nativeAvailable && quality === "experimental60" ? "high" : quality}
-          disabled={inputBusy}
+          disabled={inputBusy || nativeRecoveryPending}
           onChange={event => setQuality(event.target.value as VideoQuality)}>
           <option value="low">{t("simulator.videoLow")}</option>
           <option value="balanced">{t("simulator.videoBalanced")}</option>
@@ -674,6 +729,21 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       input: controls ? controls.nativeTouchAvailable && !inputFallback ? t("simulator.routeNativeTouch")
         : t("simulator.routeWdaInput") : t("simulator.routeUnknown")
     })}</p>
+    {nativeFallbackVisible && <p className="simulator-viewer__telemetry" role="status">
+      {t(`simulator.nativeRoute.${nativeRoute}`)}</p>}
+    {(nativeFallbackVisible || nativeRecoveryPending) &&
+      <div className="simulator-viewer__native-recovery">
+        <span role={nativeRecoveryOutcome === "failed" ? "alert" : "status"}>
+          {nativeRecoveryPending ? t("simulator.nativeRecoveryPending")
+            : nativeRecoveryOutcome === "failed" ? t("simulator.nativeRecoveryFailed")
+              : t("simulator.nativeRecoveryAvailable")}</span>
+        <Button tone="ghost" disabled={nativeRecoveryPending || !interactive || commandUnavailable}
+          onClick={retryNativeRoute}><RefreshCw aria-hidden="true" />{t("simulator.nativeRecoveryAction")}</Button>
+      </div>}
+    {nativeRecoveryOutcome === "restored" &&
+      <p className="simulator-viewer__feedback" role="status">{t("simulator.nativeRecoveryRestored")}</p>}
+    {nativeRecoveryOutcome === "failed" && !nativeFallbackVisible &&
+      <p className="simulator-viewer__input-error" role="alert">{t("simulator.nativeRecoveryFailed")}</p>}
     {copied && <p className="simulator-viewer__feedback" role="status">{t("simulator.copied")}</p>}
     {clipboardError && <p className="simulator-viewer__input-error" role="alert">{clipboardError}</p>}
     {(inputError || commandError) && <div className="simulator-viewer__input-error" role="alert">

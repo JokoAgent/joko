@@ -5357,13 +5357,16 @@ export interface SimulatorViewerCommandResultView {
 
 export type SimulatorViewerFrameEventView =
   | { readonly kind: "connecting" | "reconnecting" | "disconnected";
-    readonly attempt: number }
+    readonly attempt: number; readonly nativeRoute: SimulatorViewerNativeRouteView }
   | { readonly kind: "frame"; readonly sequence: bigint; readonly receivedAtMs: number;
-    readonly jpeg: Uint8Array }
+    readonly jpeg: Uint8Array; readonly nativeRoute: SimulatorViewerNativeRouteView }
   | { readonly kind: "h264"; readonly sequence: bigint; readonly receivedAtMs: number;
     readonly h264: Uint8Array; readonly width: number; readonly height: number;
     readonly timestampMicros: number; readonly keyFrame: boolean;
-    readonly format: "annex-b" };
+    readonly format: "annex-b"; readonly nativeRoute: SimulatorViewerNativeRouteView };
+
+export type SimulatorViewerNativeRouteView = "inactive" | "active" |
+  "fallbackUnavailable" | "fallbackLost" | "fallbackDecode";
 
 export interface SimulatorViewerVideoPreferenceView {
   readonly preferNativeH264: boolean;
@@ -5373,6 +5376,7 @@ export interface SimulatorViewerVideoPreferenceView {
   readonly mjpegFramesPerSecond: number;
   readonly jpegQuality: number;
   readonly mjpegScalingPercent: number;
+  readonly clientFallbackReason?: "decode_failed";
 }
 
 export interface OperationApi {

@@ -136,8 +136,9 @@ it("routes visible Viewer commands through exact durable owners without binding 
 it("streams task-bound frame messages and fences authentication between yields", async () => {
   const jpeg = new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]);
   const watch = vi.fn(async function* () {
-    yield { kind: "connecting", attempt: 0 } as const;
-    yield { kind: "frame", sequence: 1, receivedAt: new Date(1_000).toISOString(), bytes: jpeg } as const;
+    yield { kind: "connecting", attempt: 0, nativeRoute: "fallback_unavailable" } as const;
+    yield { kind: "frame", sequence: 1, receivedAt: new Date(1_000).toISOString(),
+      bytes: jpeg, nativeRoute: "fallback_unavailable" } as const;
   });
   const h = fixture({ watch });
   try {
@@ -149,6 +150,7 @@ it("streams task-bound frame messages and fences authentication between yields",
     const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
     expect((await stream.next()).value).toMatchObject({
       state: contract.SimulatorViewerStreamState.CONNECTING,
+      nativeRouteState: contract.SimulatorViewerNativeRouteState.FALLBACK_UNAVAILABLE,
       route: { instanceId: h.instance.instanceId }
     });
     h.revoke();
@@ -159,7 +161,8 @@ it("streams task-bound frame messages and fences authentication between yields",
     await second.next();
     expect((await second.next()).value).toMatchObject({
       state: contract.SimulatorViewerStreamState.FRAME, sequence: 1n,
-      receivedAtMs: 1_000n, jpeg
+      receivedAtMs: 1_000n, jpeg,
+      nativeRouteState: contract.SimulatorViewerNativeRouteState.FALLBACK_UNAVAILABLE
     });
     await second.return?.();
   } finally { h.store.close(); }
@@ -225,7 +228,7 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
   const watch = vi.fn(async function* () {
     yield { kind: "h264", sequence: 1, receivedAt: new Date(2_000).toISOString(),
       bytes, width: 16, height: 12, timestampMicros: 3_000,
-      keyFrame: true, format: "annex-b" } as const;
+      keyFrame: true, format: "annex-b", nativeRoute: "active" } as const;
   });
   const h = fixture({ watch });
   try {
@@ -240,7 +243,8 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
     expect((await stream.next()).value).toMatchObject({ state: contract.SimulatorViewerStreamState.FRAME,
       sequence: 1n, receivedAtMs: 2_000n, h264: bytes, jpeg: new Uint8Array(),
       width: 16, height: 12, timestampMicros: 3_000n,
-      keyFrame: true, h264Format: "annex-b" });
+      keyFrame: true, h264Format: "annex-b",
+      nativeRouteState: contract.SimulatorViewerNativeRouteState.ACTIVE });
     expect(watch).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
       instanceId: h.instance.instanceId }), h.context.signal,
     expect.objectContaining({ preferNativeH264: true,
@@ -253,6 +257,38 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
       .rejects.toMatchObject({ code: Code.InvalidArgument });
     await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
       { ...request, jpegQuality: 0 }), h.context)[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+  } finally { h.store.close(); }
+});
+
+it("projects an explicit decoder fallback without accepting arbitrary route reasons", async () => {
+  const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+  const watch = vi.fn(async function* () {
+    yield { kind: "frame", sequence: 1, receivedAt: new Date(2_000).toISOString(),
+      bytes: jpeg, nativeRoute: "fallback_decode" } as const;
+  });
+  const h = fixture({ watch });
+  const request = create(contract.WatchSimulatorFramesRequestSchema, {
+    sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
+      generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
+    mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70,
+    clientFallbackReason: "decode_failed"
+  });
+  try {
+    const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
+    expect((await stream.next()).value).toMatchObject({
+      nativeRouteState: contract.SimulatorViewerNativeRouteState.FALLBACK_DECODE,
+      jpeg
+    });
+    expect(watch).toHaveBeenCalledWith(SCOPE, expect.anything(), h.context.signal,
+      expect.objectContaining({ preferNativeH264: false,
+        clientFallbackReason: "decode_failed" }));
+    await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
+      { ...request, clientFallbackReason: "arbitrary" }),
+    h.context)[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
+      { ...request, preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
+        orientation: "PORTRAIT" }), h.context)[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ code: Code.InvalidArgument });
   } finally { h.store.close(); }
 });

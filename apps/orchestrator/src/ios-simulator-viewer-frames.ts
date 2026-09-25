@@ -15,7 +15,10 @@ export interface SimulatorViewerVideoPreference {
   readonly preferNativeH264: boolean;
   readonly profile: SimulatorNativeH264Profile;
   readonly mjpegProfile?: WdaMjpegProfile;
+  readonly clientFallbackReason?: "decode_failed";
 }
+export type SimulatorViewerNativeRouteState = "inactive" | "active" |
+  "fallback_unavailable" | "fallback_lost" | "fallback_decode";
 interface FrameSubscription {
   readonly controller: AbortController;
   readonly route: SimulatorInstanceRoute;
@@ -24,6 +27,7 @@ interface FrameSubscription {
   lastFrameAt: string | null;
   encoding: "jpeg" | "h264";
   viewerOrientation: SimulatorNativeH264Profile["orientation"] | null;
+  nativeRoute: SimulatorViewerNativeRouteState;
   readonly mjpegProfile: WdaMjpegProfile;
 }
 interface MjpegConfigurationState {
@@ -40,12 +44,13 @@ export interface SimulatorViewerFrameSnapshot {
 }
 export type SimulatorViewerFrameEvent =
   | { readonly kind: "connecting" | "reconnecting" | "disconnected";
-    readonly attempt: number }
+    readonly attempt: number; readonly nativeRoute: SimulatorViewerNativeRouteState }
   | { readonly kind: "frame"; readonly sequence: number; readonly receivedAt: string;
-    readonly bytes: Uint8Array }
+    readonly bytes: Uint8Array; readonly nativeRoute: SimulatorViewerNativeRouteState }
   | { readonly kind: "h264"; readonly sequence: number; readonly receivedAt: string;
     readonly bytes: Uint8Array; readonly width: number; readonly height: number;
-    readonly timestampMicros: number; readonly keyFrame: boolean; readonly format: "annex-b" };
+    readonly timestampMicros: number; readonly keyFrame: boolean; readonly format: "annex-b";
+    readonly nativeRoute: SimulatorViewerNativeRouteState };
 
 export class SimulatorViewerFrameError extends Error {
   constructor(readonly code: "SUBSCRIPTION_LIMIT" | "PROFILE_CONFLICT" | "PROFILE_UNCERTAIN",
@@ -112,6 +117,7 @@ export class SimulatorViewerFrameCoordinator {
     const controller = new AbortController();
     const subscription: FrameSubscription = { controller, route, state: "connecting",
       sequence: 0, lastFrameAt: null, encoding: "jpeg", viewerOrientation: null,
+      nativeRoute: preference?.clientFallbackReason === "decode_failed" ? "fallback_decode" : "inactive",
       mjpegProfile: preference?.mjpegProfile ?? DEFAULT_MJPEG_PROFILE };
     subscriptions.add(subscription);
     this.#subscriptions.set(instance.instanceId, subscriptions);
@@ -141,6 +147,8 @@ export class SimulatorViewerFrameCoordinator {
         check();
         if (stale) throw stale;
       }
+      if (preference?.preferNativeH264) subscription.nativeRoute = useNative
+        ? "active" : "fallback_unavailable";
       subscription.encoding = useNative ? "h264" : "jpeg";
       subscription.viewerOrientation = useNative ? preference!.profile.orientation : null;
       for (let attempt = 0; attempt <= 3 && !controller.signal.aborted; attempt += 1) {
@@ -148,7 +156,8 @@ export class SimulatorViewerFrameCoordinator {
         if (stale) throw stale;
         subscription.state = attempt === 0 ? "connecting" : "reconnecting";
         subscription.lastFrameAt = null;
-        yield { kind: attempt === 0 ? "connecting" : "reconnecting", attempt };
+        yield { kind: attempt === 0 ? "connecting" : "reconnecting", attempt,
+          nativeRoute: subscription.nativeRoute };
         try {
           if (useNative) {
             for await (const frame of this.#driver.streamNativeH264Frames!(instance,
@@ -159,11 +168,12 @@ export class SimulatorViewerFrameCoordinator {
               subscription.state = "streaming";
               subscription.sequence += 1;
               subscription.lastFrameAt = frame.receivedAt;
-              yield this.#h264Frame(subscription.sequence, frame);
+              yield this.#h264Frame(subscription, frame);
             }
             useNative = false;
             subscription.encoding = "jpeg";
             subscription.viewerOrientation = null;
+            subscription.nativeRoute = "fallback_lost";
           } else {
             const peers = [...subscriptions].filter(item => item !== subscription &&
               !item.controller.signal.aborted && item.encoding === "jpeg");
@@ -184,7 +194,7 @@ export class SimulatorViewerFrameCoordinator {
               subscription.state = "streaming";
               subscription.sequence += 1;
               subscription.lastFrameAt = frame.receivedAt;
-              yield this.#frame(subscription.sequence, frame);
+              yield this.#frame(subscription, frame);
             }
           }
           if (stale) throw stale;
@@ -197,6 +207,7 @@ export class SimulatorViewerFrameCoordinator {
             useNative = false;
             subscription.encoding = "jpeg";
             subscription.viewerOrientation = null;
+            subscription.nativeRoute = "fallback_lost";
           }
           if (attempt === 3) break;
           await this.#delay([250, 1_000, 2_000][attempt]!, controller.signal);
@@ -210,7 +221,7 @@ export class SimulatorViewerFrameCoordinator {
       if (!controller.signal.aborted) {
         subscription.state = "disconnected";
         subscription.lastFrameAt = null;
-        yield { kind: "disconnected", attempt: 3 };
+        yield { kind: "disconnected", attempt: 3, nativeRoute: subscription.nativeRoute };
       }
     } finally {
       clearInterval(fencer);
@@ -259,14 +270,15 @@ export class SimulatorViewerFrameCoordinator {
     await current;
   }
 
-  #frame(sequence: number, frame: SimulatorMjpegFrame): SimulatorViewerFrameEvent {
-    return { kind: "frame", sequence, receivedAt: frame.receivedAt, bytes: frame.bytes };
+  #frame(subscription: FrameSubscription, frame: SimulatorMjpegFrame): SimulatorViewerFrameEvent {
+    return { kind: "frame", sequence: subscription.sequence, receivedAt: frame.receivedAt,
+      bytes: frame.bytes, nativeRoute: subscription.nativeRoute };
   }
 
-  #h264Frame(sequence: number, frame: SimulatorNativeH264Frame): SimulatorViewerFrameEvent {
-    return { kind: "h264", sequence, receivedAt: frame.receivedAt, bytes: frame.bytes,
+  #h264Frame(subscription: FrameSubscription, frame: SimulatorNativeH264Frame): SimulatorViewerFrameEvent {
+    return { kind: "h264", sequence: subscription.sequence, receivedAt: frame.receivedAt, bytes: frame.bytes,
       width: frame.width, height: frame.height, timestampMicros: frame.timestampMicros,
-      keyFrame: frame.keyFrame, format: frame.format };
+      keyFrame: frame.keyFrame, format: frame.format, nativeRoute: subscription.nativeRoute };
   }
 
   async #delay(milliseconds: number, signal: AbortSignal): Promise<void> {

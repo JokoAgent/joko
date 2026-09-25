@@ -184,6 +184,15 @@ enum SimulatorViewerStreamState {
   SIMULATOR_VIEWER_STREAM_STATE_DISCONNECTED = 4;
 }
 
+enum SimulatorViewerNativeRouteState {
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_INACTIVE = 1;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_ACTIVE = 2;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_FALLBACK_UNAVAILABLE = 3;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_FALLBACK_LOST = 4;
+  SIMULATOR_VIEWER_NATIVE_ROUTE_STATE_FALLBACK_DECODE = 5;
+}
+
 message WatchSimulatorFramesRequest {
   string session_id = 1;
   SimulatorViewerRoute route = 2;
@@ -194,6 +203,8 @@ message WatchSimulatorFramesRequest {
   uint32 jpeg_quality = 7;
   uint32 mjpeg_frames_per_second = 8;
   uint32 mjpeg_scaling_percent = 9;
+  // Only a client that attempted native decode may report this bounded local failure.
+  string client_fallback_reason = 10;
 }
 
 message WatchSimulatorFramesResponse {
@@ -209,4 +220,5 @@ message WatchSimulatorFramesResponse {
   uint64 timestamp_micros = 10;
   bool key_frame = 11;
   string h264_format = 12;
+  SimulatorViewerNativeRouteState native_route_state = 13;
 }

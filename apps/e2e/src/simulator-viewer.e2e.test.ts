@@ -465,8 +465,18 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         const blob = await item!.getType("image/png");
         return { type: blob.type, signature: [...new Uint8Array(await blob.slice(0, 8).arrayBuffer())] };
       })).toEqual({ type: "image/png", signature: [137, 80, 78, 71, 13, 10, 26, 10] });
+      await panel.getByText("Native video stopped; showing WDA video.").waitFor();
+      stopNative = false;
+      await panel.getByRole("button", { name: "Retry native video" }).click();
+      await panel.getByText("Native video is restored.").waitFor();
+      await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
+      await page.waitForFunction(() => {
+        const canvas = document.querySelector<HTMLCanvasElement>(".simulator-viewer__screen canvas");
+        return canvas?.width === 64 && canvas.height === 64 &&
+          (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
+      });
       await page.setViewportSize({ width: 390, height: 844 });
-      await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
+      await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
       await panel.getByRole("button", { name: "Copy screenshot" }).waitFor({ state: "visible" });
       const deleteButton = panel.getByRole("button", { name: "Delete", exact: true });
       await deleteButton.focus();

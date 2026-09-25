@@ -12,7 +12,8 @@ import type { SimulatorInstanceControlCoordinator } from "./ios-simulator-instan
 import type { PublicSimulatorInstance, SimulatorInstanceRoute,
   SimulatorOwnershipRegistry, SimulatorTaskScope } from "./ios-simulator-ownership.js";
 import type { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
-import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
+import type { SimulatorViewerFrameCoordinator, SimulatorViewerNativeRouteState
+} from "./ios-simulator-viewer-frames.js";
 import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
 import type { SimulatorViewerLiveTouchCoordinator } from "./ios-simulator-viewer-live-touch.js";
 
@@ -344,6 +345,10 @@ export function createSimulatorViewerConnectService(input: {
           request.mjpegScalingPercent > 100) {
         throw new ConnectError("Simulator MJPEG profile is invalid.", Code.InvalidArgument);
       }
+      if (request.clientFallbackReason !== "" &&
+          (request.clientFallbackReason !== "decode_failed" || request.preferNativeH264)) {
+        throw new ConnectError("Simulator client fallback reason is invalid.", Code.InvalidArgument);
+      }
       if (request.preferNativeH264 && (!Number.isSafeInteger(request.framesPerSecond) ||
           request.framesPerSecond < 1 || request.framesPerSecond > 60 ||
           !Number.isSafeInteger(request.scalingPercent) || request.scalingPercent < 1 ||
@@ -359,7 +364,9 @@ export function createSimulatorViewerConnectService(input: {
           orientation: request.preferNativeH264 ? request.orientation as "PORTRAIT" | "LANDSCAPE"
             : "PORTRAIT"
         }, mjpegProfile: { framesPerSecond: request.mjpegFramesPerSecond,
-          jpegQuality: request.jpegQuality, scalingPercent: request.mjpegScalingPercent } })) {
+          jpegQuality: request.jpegQuality, scalingPercent: request.mjpegScalingPercent },
+        ...(request.clientFallbackReason === "decode_failed"
+          ? { clientFallbackReason: "decode_failed" as const } : {}) })) {
         fence(context, task, false);
         yield create(contract.WatchSimulatorFramesResponseSchema, {
           route: create(contract.SimulatorViewerRouteSchema, { instanceId: route.instanceId,
@@ -369,6 +376,7 @@ export function createSimulatorViewerConnectService(input: {
             : event.kind === "connecting" ? contract.SimulatorViewerStreamState.CONNECTING
               : event.kind === "reconnecting" ? contract.SimulatorViewerStreamState.RECONNECTING
                 : contract.SimulatorViewerStreamState.DISCONNECTED,
+          nativeRouteState: nativeRouteState(event.nativeRoute),
           ...(event.kind === "frame" ? { sequence: BigInt(event.sequence),
             receivedAtMs: BigInt(Date.parse(event.receivedAt)), jpeg: event.bytes }
             : event.kind === "h264" ? { sequence: BigInt(event.sequence),
@@ -381,6 +389,16 @@ export function createSimulatorViewerConnectService(input: {
       }
     }
   };
+}
+
+function nativeRouteState(value: SimulatorViewerNativeRouteState): contract.SimulatorViewerNativeRouteState {
+  switch (value) {
+    case "inactive": return contract.SimulatorViewerNativeRouteState.INACTIVE;
+    case "active": return contract.SimulatorViewerNativeRouteState.ACTIVE;
+    case "fallback_unavailable": return contract.SimulatorViewerNativeRouteState.FALLBACK_UNAVAILABLE;
+    case "fallback_lost": return contract.SimulatorViewerNativeRouteState.FALLBACK_LOST;
+    case "fallback_decode": return contract.SimulatorViewerNativeRouteState.FALLBACK_DECODE;
+  }
 }
 
 function freshInputView(view: ReturnType<SimulatorViewerFrameCoordinator["inputView"]>): boolean {
