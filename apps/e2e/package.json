@@ -12,6 +12,7 @@
     "@connectrpc/connect": "2.1.2",
     "@connectrpc/connect-node": "2.1.2",
     "@joko/adapter-claude-code": "workspace:*",
+    "@joko/adapter-codex": "workspace:*",
     "@joko/adapter-pi": "workspace:*",
     "@joko/contracts": "workspace:*",
     "@joko/core": "workspace:*",

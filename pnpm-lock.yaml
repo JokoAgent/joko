@@ -93,6 +93,9 @@ importers:
       '@joko/adapter-claude-code':
         specifier: workspace:*
         version: link:../../packages/adapter-claude-code
+      '@joko/adapter-codex':
+        specifier: workspace:*
+        version: link:../../packages/adapter-codex
       '@joko/adapter-pi':
         specifier: workspace:*
         version: link:../../packages/adapter-pi
