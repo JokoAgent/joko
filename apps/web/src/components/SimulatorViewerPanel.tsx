@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
-import { AlertTriangle, RefreshCcw } from "lucide-react";
+import { AlertTriangle, Play, RefreshCcw, ShieldCheck } from "lucide-react";
 import type { AppController } from "../controller.js";
 import type {
   SimulatorViewerControlView, SimulatorViewerInstanceView, SimulatorViewerStateView
@@ -20,6 +20,8 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string>();
+  const [mutationError, setMutationError] = useState<string>();
+  const [mutationPending, setMutationPending] = useState(false);
   const [name, setName] = useState("");
   const [templateUdid, setTemplateUdid] = useState("");
   const [attachUdid, setAttachUdid] = useState("");
@@ -37,7 +39,7 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
     setLoading(true);
     try {
       const next = await controllerRef.current.getSimulatorViewerState(sessionId, signal);
-      if (!signal.aborted) { setState(next); setError(undefined); }
+      if (!signal.aborted) { setState(next); setError(undefined); setMutationError(undefined); }
       return !signal.aborted;
     } catch (cause) {
       if (!signal.aborted) setError(messageOf(cause));
@@ -54,10 +56,43 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
     setState(undefined);
     setError(undefined);
     setPending(false);
+    setMutationPending(false);
+    setMutationError(undefined);
     setDeleteCandidate(undefined);
     if (enabled) void refresh(next.signal);
     return () => { next.abort(); if (owner.current === next) owner.current = undefined; };
   }, [enabled, profileId, refresh, sessionId]);
+
+  const observedInstance = state?.instances[0];
+  const observedRouteKey = observedInstance === undefined ? "" : `${observedInstance.route.instanceId}:` +
+    `${observedInstance.route.generation}:${observedInstance.route.leaseId}`;
+  useEffect(() => {
+    if (!enabled || !observedInstance) return;
+    const polling = new AbortController();
+    let reading = false;
+    const read = async (): Promise<void> => {
+      if (reading || polling.signal.aborted) return;
+      reading = true;
+      try {
+        const mutation = await controllerRef.current.getSimulatorViewerMutationState(
+          sessionId, observedInstance.route, polling.signal);
+        if (polling.signal.aborted) return;
+        setState(previous => previous === undefined ? previous : {
+          ...previous,
+          instances: previous.instances.map(instance =>
+            instance.route.instanceId !== mutation.instanceId ||
+            instance.route.generation !== observedInstance.route.generation ||
+            instance.route.leaseId !== observedInstance.route.leaseId ||
+            sameMutation(instance.mutation, mutation)
+              ? instance : { ...instance, mutation })
+        });
+      } catch { /* Lifecycle refresh owns stale routes; polling never replaces visible state. */ }
+      finally { reading = false; }
+    };
+    void read();
+    const timer = setInterval(() => void read(), 400);
+    return () => { polling.abort(); clearInterval(timer); };
+  }, [enabled, observedRouteKey, sessionId]);
 
   const run = async (input: SimulatorViewerControlView): Promise<void> => {
     const signal = owner.current?.signal;
@@ -93,6 +128,26 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
     instance.route.generation === deleteCandidate?.route.generation &&
     instance.route.leaseId === deleteCandidate?.route.leaseId && instance.creationProvenance === "joko");
 
+  const setMutationControl = async (instance: SimulatorViewerInstanceView,
+    agentPaused: boolean): Promise<void> => {
+    const signal = owner.current?.signal;
+    if (!signal || signal.aborted || !enabled || mutationPending || pending || loading ||
+        state?.support !== "supported") return;
+    setMutationPending(true);
+    setMutationError(undefined);
+    try {
+      const mutation = await controllerRef.current.setSimulatorViewerMutationControl(
+        sessionId, instance.route, agentPaused, signal);
+      if (!signal.aborted) setState(previous => previous === undefined ? previous : {
+        ...previous,
+        instances: previous.instances.map(current => current.route.instanceId === mutation.instanceId
+          ? { ...current, mutation } : current)
+      });
+    } catch (cause) {
+      if (!signal.aborted) setMutationError(`${t("simulator.mutationControlFailed")} ${messageOf(cause)}`);
+    } finally { if (!signal.aborted) setMutationPending(false); }
+  };
+
   return <div className="simulator-viewer" ref={(node) => {
     panel.current = node;
     if (node && node.ownerDocument !== ownerDocument) setOwnerDocument(node.ownerDocument);
@@ -112,9 +167,28 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
         <div className="simulator-viewer__grid">
           {state.instances.map(instance => <article className="simulator-viewer__card" key={instance.route.instanceId} aria-label={instance.simulatorName}>
             <div className="simulator-viewer__card-header"><h4>{instance.simulatorName}</h4><span>{instance.creationProvenance === "joko" ? t("simulator.createdHere") : t("simulator.external")}</span></div>
+            {(instance.mutation.activeSource === "agent" || instance.mutation.queuedAgentMutations > 0 ||
+              instance.mutation.agentPaused) && <div className="simulator-viewer__mutation" role="status">
+              <div><strong>{instance.mutation.takeoverPending
+                ? t("simulator.takeoverPendingTitle")
+                : instance.mutation.agentPaused ? t("simulator.manualControlTitle")
+                  : t("simulator.agentBusyTitle")}</strong>
+              <p>{instance.mutation.takeoverPending
+                ? t("simulator.takeoverPendingDescription")
+                : instance.mutation.agentPaused ? t("simulator.manualControlDescription")
+                  : t("simulator.agentBusyDescription")}</p></div>
+              <Button tone="ghost" disabled={mutationPending || instance.mutation.takeoverPending || pending}
+                onClick={() => void setMutationControl(instance, !instance.mutation.agentPaused)}>
+                {instance.mutation.agentPaused ? <Play aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}
+                {t(instance.mutation.agentPaused ? "simulator.resumeAgentInput" : "simulator.takeControl")}
+              </Button>
+            </div>}
             <SimulatorViewerScreen key={`${instance.route.instanceId}:${instance.route.generation}:${instance.route.leaseId}`}
               controller={controller} sessionId={sessionId} route={instance.route}
               enabled={canMutate && instance.lifecycleState === "ready" && instance.viewerState === "attached"}
+              controlEnabled={canMutate && !mutationPending && !instance.mutation.takeoverPending &&
+                instance.mutation.activeSource !== "agent" && instance.mutation.queuedAgentMutations === 0 &&
+                instance.lifecycleState === "ready" && instance.viewerState === "attached"}
               onReconcile={async () => {
                 const signal = owner.current?.signal;
                 if (!signal || signal.aborted || !enabled || !await refresh(signal)) {
@@ -128,11 +202,12 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
               viewer: t(`simulator.viewer.${instance.viewerState}`)
             })}</p>
             {instance.errorCode && <p role="status" className="simulator-viewer__metadata">{instance.errorCode}</p>}
+            {mutationError && <p className="simulator-viewer__input-error" role="alert">{mutationError}</p>}
             <div className="simulator-viewer__actions">
-              {instance.lifecycleState !== "ready" && <Button disabled={!canMutate} onClick={() => void run({ action: "start", route: instance.route })}>{t("simulator.start")}</Button>}
-              {instance.lifecycleState === "ready" && <Button disabled={!canMutate} onClick={() => void run({ action: "stop", route: instance.route })}>{t("simulator.stop")}</Button>}
-              {instance.viewerState === "attached" && <Button disabled={!canMutate} onClick={() => void run({ action: "detach", route: instance.route })}>{t("simulator.detach")}</Button>}
-              {instance.creationProvenance === "joko" && <Button tone="danger" disabled={!canMutate} onClick={() => setDeleteCandidate(instance)}>{t("common.delete")}</Button>}
+              {instance.lifecycleState !== "ready" && <Button disabled={!canMutate || mutationPending || instance.mutation.takeoverPending || instance.mutation.activeSource === "agent" || instance.mutation.queuedAgentMutations > 0} onClick={() => void run({ action: "start", route: instance.route })}>{t("simulator.start")}</Button>}
+              {instance.lifecycleState === "ready" && <Button disabled={!canMutate || mutationPending || instance.mutation.takeoverPending || instance.mutation.activeSource === "agent" || instance.mutation.queuedAgentMutations > 0} onClick={() => void run({ action: "stop", route: instance.route })}>{t("simulator.stop")}</Button>}
+              {instance.viewerState === "attached" && <Button disabled={!canMutate || mutationPending || instance.mutation.takeoverPending || instance.mutation.activeSource === "agent" || instance.mutation.queuedAgentMutations > 0} onClick={() => void run({ action: "detach", route: instance.route })}>{t("simulator.detach")}</Button>}
+              {instance.creationProvenance === "joko" && <Button tone="danger" disabled={!canMutate || mutationPending || instance.mutation.takeoverPending || instance.mutation.activeSource === "agent" || instance.mutation.queuedAgentMutations > 0} onClick={() => setDeleteCandidate(instance)}>{t("common.delete")}</Button>}
             </div>
           </article>)}
         </div>
@@ -155,9 +230,16 @@ export function SimulatorViewerPanel({ controller, sessionId, active, t }: {
       </section>
     </>}
     <Modal open={currentDelete !== undefined} title={t("simulator.deleteTitle")} description={t("simulator.deleteWarning")} dialogRole="alertdialog" closeLabel={t("common.close")} onClose={() => setDeleteCandidate(undefined)} ownerDocument={ownerDocument} restoreFocusFallback={() => panel.current?.querySelector<HTMLButtonElement>(".simulator-viewer__header button") ?? null}>
-      {currentDelete && <div className="simulator-viewer__delete"><p><strong>{currentDelete.simulatorName}</strong></p><p className="simulator-viewer__metadata">{currentDelete.simulatorUdid}</p><div className="modal__actions"><Button onClick={() => setDeleteCandidate(undefined)}>{t("common.cancel")}</Button><Button tone="danger" disabled={!canMutate} onClick={() => void run({ action: "delete", route: currentDelete.route })}>{t("simulator.confirmDelete")}</Button></div></div>}
+      {currentDelete && <div className="simulator-viewer__delete"><p><strong>{currentDelete.simulatorName}</strong></p><p className="simulator-viewer__metadata">{currentDelete.simulatorUdid}</p><div className="modal__actions"><Button onClick={() => setDeleteCandidate(undefined)}>{t("common.cancel")}</Button><Button tone="danger" disabled={!canMutate || mutationPending || currentDelete.mutation.takeoverPending || currentDelete.mutation.activeSource === "agent" || currentDelete.mutation.queuedAgentMutations > 0} onClick={() => void run({ action: "delete", route: currentDelete.route })}>{t("simulator.confirmDelete")}</Button></div></div>}
     </Modal>
   </div>;
+}
+
+function sameMutation(left: SimulatorViewerInstanceView["mutation"],
+  right: SimulatorViewerInstanceView["mutation"]): boolean {
+  return left.instanceId === right.instanceId && left.activeSource === right.activeSource &&
+    left.lastSource === right.lastSource && left.queuedAgentMutations === right.queuedAgentMutations &&
+    left.agentPaused === right.agentPaused && left.takeoverPending === right.takeoverPending;
 }
 
 function messageOf(cause: unknown): string {

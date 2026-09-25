@@ -141,6 +141,7 @@ import { SimulatorRecordingCoordinator } from "./ios-simulator-recording.js";
 import { SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
 import { SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
 import { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
+import { SimulatorMutationArbiter } from "./ios-simulator-mutation-arbiter.js";
 import type { SimulatorViewerServiceOwner } from "./simulator-viewer-connect-service.js";
 import type { SimulatorProjectBuilder, SimulatorRecordingRuntime,
   SimulatorOwnedDeleteRuntime } from "@joko/tool-ios-simulator";
@@ -880,6 +881,13 @@ export async function createOrchestratorApplication(
     : new SimulatorInputCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen);
   const simulatorLiveTouch = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorViewerLiveTouchCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen);
+  const simulatorMutations = new SimulatorMutationArbiter(simulatorOwnership, {
+    onAgentMutationStart: instanceId => simulatorLiveTouch?.clearInstance(instanceId),
+    onTakeover: instanceId => {
+      simulatorLiveTouch?.clearInstance(instanceId);
+      simulatorScreen?.clear(instanceId);
+    }
+  });
   const simulatorStateControl = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorStateControlCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
@@ -913,6 +921,7 @@ export async function createOrchestratorApplication(
       Date.now, simulatorViewerFrames);
   const simulatorViewer: SimulatorViewerServiceOwner | undefined = simulatorControl === undefined ? undefined : {
     ownership: simulatorOwnership, control: simulatorControl, environment: simulatorEnvironment,
+    mutations: simulatorMutations,
     frames: simulatorViewerFrames, input: simulatorInput, liveTouch: simulatorLiveTouch,
     screen: simulatorScreen, driver: simulatorDriver,
     stateControl: simulatorStateControl, screenshot: simulatorScreenshot,
@@ -932,6 +941,7 @@ export async function createOrchestratorApplication(
       appControl: simulatorAppControl, urlControl: simulatorUrlControl,
       screenshot: simulatorScreenshot, recording: simulatorRecording, visual: simulatorVisual,
       stateDiagnostics: simulatorStateDiagnostics,
+      mutations: simulatorMutations,
       runtime: simulatorEnvironment })
   );
   const toolPolicies = new ToolPolicySettingsRepository({
@@ -2507,6 +2517,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());
         await attempt(() => unregisterIosSimulatorTools());
+        await attempt(() => simulatorMutations.close());
         await attempt(() => simulatorRecording?.close());
         simulatorControl?.dispose();
         await attempt(() => lspBridge.dispose());

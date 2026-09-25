@@ -4,10 +4,12 @@ import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
   ControlSimulatorViewerCommandResponseSchema,
   ControlSimulatorViewerInputResponseSchema,
   ControlSimulatorViewerTouchResponseSchema,
+  GetSimulatorViewerMutationStateResponseSchema,
   GetSimulatorViewerControlsResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
-  SetSimulatorViewerInteractionProfileResponseSchema,
-  SimulatorViewerCommand, SimulatorViewerInstanceSchema, SimulatorViewerNativeRouteState,
+  SetSimulatorViewerInteractionProfileResponseSchema, SetSimulatorViewerMutationControlResponseSchema,
+  SimulatorViewerCommand, SimulatorViewerInstanceSchema, SimulatorViewerMutationSource,
+  SimulatorViewerNativeRouteState,
   SimulatorViewerStreamState, SimulatorViewerTouchPhase,
   WatchSimulatorFramesResponseSchema } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
@@ -19,7 +21,9 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
     simulatorUdid: "A0123456-1234-1234-1234-123456789ABC", simulatorName: "Joko iPhone",
     runtimeIdentifier: "iOS-19", deviceTypeIdentifier: "iPhone-17",
     creationProvenance: "joko", lifecycleState: "stopped", viewerState: "attached",
-    healthState: "healthy"
+    healthState: "healthy", mutation: { instanceId: "owned",
+      activeSource: SimulatorViewerMutationSource.AGENT,
+      lastSource: SimulatorViewerMutationSource.USER, queuedAgentMutations: 2 }
   });
   let failControl = false;
   const requests: Array<{ name: string; input: any; signal: AbortSignal }> = [];
@@ -37,6 +41,13 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
           ? create(ControlSimulatorViewerTouchResponseSchema, { accepted: true })
           : method.localName === "setSimulatorViewerInteractionProfile"
             ? create(SetSimulatorViewerInteractionProfileResponseSchema, { applied: true })
+          : method.localName === "getSimulatorViewerMutationState"
+            ? create(GetSimulatorViewerMutationStateResponseSchema, { mutation: instance.mutation })
+          : method.localName === "setSimulatorViewerMutationControl"
+            ? create(SetSimulatorViewerMutationControlResponseSchema, { mutation: {
+              ...instance.mutation!, agentPaused: input.agentPaused,
+              takeoverPending: input.agentPaused
+            } })
           : method.localName === "getSimulatorViewerControls"
             ? create(GetSimulatorViewerControlsResponseSchema, { viewportWidth: 393,
               viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true })
@@ -52,7 +63,8 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
   const gateway = createSimulatorViewerGateway(transport, owner.signal);
   const state = await gateway.getSimulatorViewerState("task");
   expect(state.instances[0]).toMatchObject({ creationProvenance: "joko",
-    route: { instanceId: "owned", generation: 4n, leaseId: "lease" } });
+    route: { instanceId: "owned", generation: 4n, leaseId: "lease" },
+    mutation: { activeSource: "agent", lastSource: "user", queuedAgentMutations: 2 } });
   const route = state.instances[0]!.route;
   const deleted = await gateway.controlSimulatorInstance("task", "request", { action: "delete", route });
   expect(deleted).toMatchObject({ deleted: true, instance: { route } });
@@ -78,6 +90,14 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
   expect(requests.at(-1)).toMatchObject({ name: "setSimulatorViewerInteractionProfile",
     input: { sessionId: "task", route,
       subscriptionId: "A0123456-1234-4234-8234-123456789ABC", active: true } });
+  expect(await gateway.getSimulatorViewerMutationState("task", route)).toMatchObject({
+    instanceId: "owned", activeSource: "agent", queuedAgentMutations: 2
+  });
+  expect(await gateway.setSimulatorViewerMutationControl("task", route, true)).toMatchObject({
+    instanceId: "owned", agentPaused: true, takeoverPending: true
+  });
+  expect(requests.at(-1)).toMatchObject({ name: "setSimulatorViewerMutationControl",
+    input: { sessionId: "task", route, agentPaused: true } });
   expect(await gateway.getSimulatorViewerControls("task", route)).toEqual({
     viewportWidth: 393, viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true
   });

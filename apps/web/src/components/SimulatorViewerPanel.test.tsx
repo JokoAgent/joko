@@ -13,12 +13,15 @@ const route = { instanceId: "instance-one", generation: 2n, leaseId: "lease-one"
 const created: SimulatorViewerInstanceView = {
   route, simulatorUdid: "A0123456-1234-1234-1234-123456789ABC", simulatorName: "Joko iPhone",
   runtimeIdentifier: "iOS-19", deviceTypeIdentifier: "iPhone-17", creationProvenance: "joko",
-  lifecycleState: "ready", viewerState: "attached", healthState: "healthy"
+  lifecycleState: "ready", viewerState: "attached", healthState: "healthy",
+  mutation: { instanceId: route.instanceId, activeSource: null, lastSource: null,
+    queuedAgentMutations: 0, agentPaused: false, takeoverPending: false }
 };
 const external: SimulatorViewerInstanceView = {
   ...created, route: { instanceId: "external-one", generation: 1n, leaseId: "lease-two" },
   simulatorUdid: "B0123456-1234-1234-1234-123456789ABC", simulatorName: "Shared iPhone",
-  creationProvenance: "external"
+  creationProvenance: "external",
+  mutation: { ...created.mutation, instanceId: "external-one" }
 };
 const state: SimulatorViewerStateView = {
   support: "supported", devices: [{ udid: created.simulatorUdid, name: "Template iPhone",
@@ -96,6 +99,44 @@ it("keeps the same task observation across unrelated controller snapshots", asyn
   await render(2);
   expect(read).toHaveBeenCalledOnce();
   expect(container.querySelectorAll(".simulator-viewer__card")).toHaveLength(2);
+});
+
+it("keeps video mounted while Agent work gates controls and supports exact takeover and resume", async () => {
+  let mutation: SimulatorViewerInstanceView["mutation"] = { ...created.mutation, activeSource: "agent",
+    queuedAgentMutations: 1 };
+  const current = (): SimulatorViewerStateView => ({ ...state,
+    instances: [{ ...created, mutation }] });
+  const setMutation = vi.fn(async (_sessionId: string, receivedRoute: typeof route,
+    agentPaused: boolean) => {
+    expect(receivedRoute).toEqual(route);
+    mutation = { ...mutation, activeSource: null, queuedAgentMutations: 0,
+      agentPaused, takeoverPending: false, lastSource: "agent" as const };
+    return mutation;
+  });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  const controller = {
+    state: { connectionState: "connected" },
+    getSimulatorViewerState: vi.fn(async () => current()),
+    getSimulatorViewerMutationState: vi.fn(async () => mutation),
+    setSimulatorViewerMutationControl: setMutation,
+    controlSimulatorInstance: vi.fn(),
+    watchSimulatorFrames: async function* () { yield { kind: "disconnected", attempt: 3 } as const; }
+  } as unknown as AppController;
+  await act(async () => root.render(<SimulatorViewerPanel controller={controller}
+    sessionId="task-one" active t={(key, values) => translate("en", key, values)} />));
+  expect(container.textContent).toContain("Agent is using this device");
+  expect(button(container, "Stop").disabled).toBe(true);
+  expect(container.querySelector(".simulator-viewer__interaction")).not.toBeNull();
+  await act(async () => button(container, "Take control").click());
+  expect(setMutation).toHaveBeenCalledWith("task-one", route, true, expect.any(AbortSignal));
+  expect(container.textContent).toContain("Manual control active");
+  expect(button(container, "Stop").disabled).toBe(false);
+  await act(async () => button(container, "Resume Agent input").click());
+  expect(setMutation).toHaveBeenLastCalledWith("task-one", route, false, expect.any(AbortSignal));
+  expect(container.textContent).not.toContain("Manual control active");
 });
 
 async function mount(read: AppController["getSimulatorViewerState"],

@@ -130,6 +130,11 @@ it("serves authenticated task-owned Simulator inventory and durable exact deleti
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() &&
   process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 
+function deferredSignal(): { readonly promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  return { promise: new Promise<void>(next => { resolve = next; }), resolve };
+}
+
 mountedIt("shows the production Simulator task grid and confirms deletion in the mounted Web inspector",
   { timeout: 120_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-simulator-viewer-web-"));
@@ -174,6 +179,9 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
   const viewerProfiles: unknown[] = [];
   const nativeProfiles: Array<{ readonly framesPerSecond: number;
     readonly scalingPercent: number }> = [];
+  let holdNextHome = false;
+  let heldHomeCancelled = false;
+  const heldHomeStarted = deferredSignal();
   let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -282,6 +290,12 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       request.on("data", chunk => chunks.push(Buffer.from(chunk)));
       request.on("end", () => {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (request.url === "/session/SESSION-1/wda/pressButton" && holdNextHome) {
+          holdNextHome = false;
+          heldHomeStarted.resolve();
+          response.on("close", () => { if (!response.writableEnded) heldHomeCancelled = true; });
+          return;
+        }
         if (request.url === "/session/SESSION-1/appium/settings") viewerProfiles.push(body);
         else if (request.url === "/session/SESSION-1/wda/keys" ||
           request.url === "/session/SESSION-1/actions") viewerInputs.push({ url: request.url!, body,
@@ -410,6 +424,65 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await vi.waitFor(() => expect(viewerProfiles.at(-1)).toEqual({ settings: {
         mjpegServerFramerate: 10, mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70
       } }), { timeout: 5_000 });
+
+      const task = application.store.getSession("viewer-web-task").descriptor;
+      const instance = application.simulatorViewer!.ownership.listForTask({
+        sessionId: task.id, targetId: task.targetId, generation: task.binding.generation
+      })[0];
+      if (!instance) throw new Error("Mounted Viewer instance was not retained after start.");
+      const agentRoute = { instanceId: instance.instanceId, generation: instance.generation,
+        leaseId: instance.lease.id };
+      const bridge = application.mcpRouter!.createPiBridgeSnapshot({
+        endpoint: "http://127.0.0.1:4317/internal/mcp", sessionId: task.id,
+        targetId: task.targetId, expectedPiGeneration: task.binding.generation
+      });
+      expect(bridge.mcpBridge.tools).toContainEqual(expect.objectContaining({
+        serverId: "joko_ios_simulator", name: "control_tool"
+      }));
+      const callAgent = (name: string, args: Readonly<Record<string, unknown>>) =>
+        application.mcpRouter!.executeBridgeCall({
+          authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: randomUUID(),
+          generation: task.binding.generation, sessionId: task.id, targetId: task.targetId,
+          serverId: "joko_ios_simulator", toolName: "control_tool",
+          arguments: { name, args }
+      });
+      const observed = await callAgent("get_screen_map", agentRoute);
+      if (observed.isError) throw new Error(`Agent screen observation failed: ${JSON.stringify(observed)}`);
+      const observedContent = observed.details?.["mcpStructuredContent"] as {
+        readonly data?: { readonly screenMap?: { readonly snapshotId?: unknown } } } | undefined;
+      const snapshotId = observedContent?.data?.screenMap?.snapshotId;
+      if (typeof snapshotId !== "string") throw new Error("Agent screen map omitted its snapshot identity.");
+
+      holdNextHome = true;
+      const activeAgent = callAgent("press_home", { ...agentRoute, snapshotId });
+      await heldHomeStarted.promise;
+      const queuedAgent = callAgent("press_home", { ...agentRoute, snapshotId });
+      await panel.getByText("Agent is using this device").waitFor({ state: "visible" });
+      expect(await panel.getByRole("button", { name: "Home", exact: true }).isDisabled()).toBe(true);
+      await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
+      await panel.getByRole("button", { name: "Take control", exact: true }).click();
+      await panel.getByText("Manual control active").waitFor({ state: "visible" });
+      await vi.waitFor(() => expect(heldHomeCancelled).toBe(true), { timeout: 5_000 });
+      const [activeAgentResult, queuedAgentResult] = await Promise.all([activeAgent, queuedAgent]);
+      expect(activeAgentResult.isError).toBe(true);
+      expect(activeAgentResult.details?.["mcpStructuredContent"]).toMatchObject({
+        errorCode: "INPUT_OUTCOME_UNKNOWN"
+      });
+      expect(queuedAgentResult.isError).toBe(true);
+      expect(queuedAgentResult.details?.["mcpStructuredContent"]).toMatchObject({
+        errorCode: "MUTATION_CANCELLED"
+      });
+      expect((await callAgent("get_screen_map", agentRoute)).details?.["mcpStructuredContent"])
+        .toMatchObject({ errorCode: "AGENT_MUTATION_PAUSED" });
+      await panel.getByRole("button", { name: "Home", exact: true }).click();
+      await vi.waitFor(() => expect(deviceCommands).toContainEqual({
+        url: "/session/SESSION-1/wda/pressButton", body: { name: "home" }, claimed: true
+      }), { timeout: 5_000 });
+      await panel.getByRole("button", { name: "Resume Agent input", exact: true }).click();
+      await panel.getByText("Manual control active").waitFor({ state: "hidden" });
+      const resumedAgent = await callAgent("get_screen_map", agentRoute);
+      expect(resumedAgent.isError).toBe(false);
+
       await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       const textInput = panel.getByRole("textbox", { name: "Text to type in the Simulator" });
       await textInput.fill("mounted-private-text");
@@ -451,16 +524,12 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       expect(viewerInputs).toHaveLength(1);
       const inputOperations = application.store.listOperations({ sessionId: "viewer-web-task",
         status: "completed" }).filter(operation => operation.kind === "ios_simulator_input");
-      expect(inputOperations).toHaveLength(3);
+      expect(inputOperations).toHaveLength(4);
       expect(JSON.stringify(inputOperations.map(operation => ({ body: operation.body,
         response: "response" in operation ? operation.response : null })),
       (_key, value) => typeof value === "bigint" ? value.toString() : value))
         .not.toContain("mounted-private-text");
       await panel.getByText(/393×852 · Video: WDA MJPEG · Input: Native touch/u).waitFor();
-      await panel.getByRole("button", { name: "Home", exact: true }).click();
-      await vi.waitFor(() => expect(deviceCommands).toContainEqual({
-        url: "/session/SESSION-1/wda/pressButton", body: { name: "home" }, claimed: true
-      }), { timeout: 5_000 });
       await panel.getByRole("button", { name: "Rotate device" }).click();
       await vi.waitFor(() => expect(deviceCommands).toContainEqual({
         url: "/session/SESSION-1/orientation", body: { orientation: "LANDSCAPE" }, claimed: true

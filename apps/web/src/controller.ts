@@ -1834,6 +1834,8 @@ export function useAppController(): AppController {
       controlSimulatorViewerInput: (...args: Parameters<OperationApi["controlSimulatorViewerInput"]>) => original().controlSimulatorViewerInput(...args),
       controlSimulatorViewerTouch: (...args: Parameters<OperationApi["controlSimulatorViewerTouch"]>) => original().controlSimulatorViewerTouch(...args),
       setSimulatorViewerInteractionProfile: (...args: Parameters<OperationApi["setSimulatorViewerInteractionProfile"]>) => original().setSimulatorViewerInteractionProfile(...args),
+      getSimulatorViewerMutationState: (...args: Parameters<OperationApi["getSimulatorViewerMutationState"]>) => original().getSimulatorViewerMutationState(...args),
+      setSimulatorViewerMutationControl: (...args: Parameters<OperationApi["setSimulatorViewerMutationControl"]>) => original().setSimulatorViewerMutationControl(...args),
       getSimulatorViewerControls: (...args: Parameters<OperationApi["getSimulatorViewerControls"]>) => original().getSimulatorViewerControls(...args),
       controlSimulatorViewerCommand: (...args: Parameters<OperationApi["controlSimulatorViewerCommand"]>) => original().controlSimulatorViewerCommand(...args),
       watchSimulatorFrames: (...args: Parameters<OperationApi["watchSimulatorFrames"]>) => original().watchSimulatorFrames(...args)

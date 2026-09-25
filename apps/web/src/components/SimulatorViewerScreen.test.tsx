@@ -7,6 +7,7 @@ import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import { SimulatorViewerScreen } from "./SimulatorViewerScreen.js";
+import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
 const route = { instanceId: "owned", generation: 2n, leaseId: "lease" } as const;
@@ -395,6 +396,59 @@ it("keeps captured touch begin/move/end on one route and sends IME-safe text sep
   expect(profile.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/u);
   expect(profile.mock.calls[1]?.[2]).toBe(profile.mock.calls[0]?.[2]);
   expect(profile.mock.calls.map(call => call[3])).toEqual([true, false]);
+});
+
+it("releases an active gesture without stopping video or dispatching more touch when Agent control becomes busy", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:agent-busy",
+    revokeObjectURL: vi.fn() });
+  const watch = vi.fn(async function* (_sessionId: string, _route: typeof route,
+    signal: AbortSignal) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]), nativeRoute: "inactive" } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const live = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerTouch"]>) =>
+    ({ accepted: true }));
+  const profile = vi.fn(async (..._args: Parameters<AppController[
+    "setSimulatorViewerInteractionProfile"]>) => ({ applied: true }));
+  const controller = { watchSimulatorFrames: watch, controlSimulatorViewerTouch: live,
+    setSimulatorViewerInteractionProfile: profile } as unknown as AppController;
+  const t: Translator = (key, values) =>
+    translate("en", key, values);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  const render = (controlEnabled: boolean) => root.render(<SimulatorViewerScreen
+    controller={controller} sessionId="task" route={route} enabled
+    controlEnabled={controlEnabled} ownerDocument={document}
+    onReconcile={async () => undefined}
+    t={t} />);
+  await act(async () => render(true));
+  const image = container.querySelector("img")!;
+  let captured = false;
+  const release = vi.fn(() => { captured = false; });
+  Object.defineProperties(image, {
+    setPointerCapture: { configurable: true, value: () => { captured = true; } },
+    hasPointerCapture: { configurable: true, value: () => captured },
+    releasePointerCapture: { configurable: true, value: release },
+    getBoundingClientRect: { configurable: true,
+      value: () => ({ left: 0, top: 0, width: 200, height: 400 }) }
+  });
+  await act(async () => {
+    dispatchPointer(image, "pointerdown", { pointerId: 1, clientX: 50, clientY: 100,
+      button: 0, buttons: 1 });
+    await Promise.resolve();
+  });
+  expect(captured).toBe(true);
+  expect(live.mock.calls.map(call => call[2].phase)).toEqual(["begin"]);
+  await act(async () => render(false));
+  expect(captured).toBe(false);
+  expect(release).toHaveBeenCalledOnce();
+  expect(live.mock.calls.map(call => call[2].phase)).toEqual(["begin"]);
+  expect(watch).toHaveBeenCalledOnce();
+  expect(container.querySelector("img")?.getAttribute("aria-disabled")).toBe("true");
+  vi.unstubAllGlobals();
 });
 
 it("falls back only after a definitely undispatched begin and locks unknown native results", async () => {

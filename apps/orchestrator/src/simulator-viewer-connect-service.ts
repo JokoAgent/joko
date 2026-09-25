@@ -9,13 +9,15 @@ import type { SimulatorDriverCoordinator } from "./ios-simulator-driver-coordina
 import type { SimulatorScreenshotCoordinator } from "./ios-simulator-screenshot.js";
 import type { SimulatorStateControlCoordinator } from "./ios-simulator-state-control.js";
 import type { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
-import type { PublicSimulatorInstance, SimulatorInstanceRoute,
-  SimulatorOwnershipRegistry, SimulatorTaskScope } from "./ios-simulator-ownership.js";
+import { SimulatorOwnershipError, type PublicSimulatorInstance, type SimulatorInstanceRoute,
+  type SimulatorOwnershipRegistry, type SimulatorTaskScope } from "./ios-simulator-ownership.js";
 import type { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import { SimulatorViewerFrameError, type SimulatorViewerFrameCoordinator,
   type SimulatorViewerNativeRouteState } from "./ios-simulator-viewer-frames.js";
 import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
 import type { SimulatorViewerLiveTouchCoordinator } from "./ios-simulator-viewer-live-touch.js";
+import { SimulatorMutationArbitrationError, type SimulatorMutationArbiter,
+  type SimulatorMutationState } from "./ios-simulator-mutation-arbiter.js";
 
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 
@@ -23,6 +25,7 @@ export interface SimulatorViewerServiceOwner {
   readonly ownership: SimulatorOwnershipRegistry;
   readonly control: SimulatorInstanceControlCoordinator;
   readonly environment: SimulatorEnvironmentRuntime;
+  readonly mutations: SimulatorMutationArbiter;
   readonly frames?: SimulatorViewerFrameCoordinator;
   readonly input?: Pick<SimulatorInputCoordinator, "execute">;
   readonly driver?: Pick<SimulatorDriverCoordinator, "isReady" | "probeNativeLiveInput">;
@@ -78,7 +81,7 @@ export function createSimulatorViewerConnectService(input: {
       const instances = currentOwner?.ownership.listForTask(task) ?? [];
       if (!currentOwner) return create(contract.GetSimulatorViewerStateResponseSchema, {
         support: contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE,
-        reasonCode: "SIMULATOR_VIEWER_UNAVAILABLE", instances: instances.map(projectInstance)
+        reasonCode: "SIMULATOR_VIEWER_UNAVAILABLE", instances: instances.map(instance => projectInstance(instance))
       });
       const environment = await currentOwner.environment.inspect(context.signal);
       fence(context, task, false);
@@ -92,7 +95,8 @@ export function createSimulatorViewerConnectService(input: {
           runtimeIdentifier: device.runtimeIdentifier, runtimeName: device.runtimeName,
           deviceTypeIdentifier: device.deviceTypeIdentifier ?? "", available: device.isAvailable
         })),
-        instances: currentOwner.ownership.listForTask(task).map(projectInstance)
+        instances: currentOwner.ownership.listForTask(task).map(instance => projectInstance(instance,
+          currentOwner.mutations.state(task, instanceRoute(instance))))
       });
     },
     controlSimulatorInstance: async (request, context) => {
@@ -127,22 +131,31 @@ export function createSimulatorViewerConnectService(input: {
         providerGeneration: 1
       };
       fence(context, task, true);
+      const execute = async (signal: AbortSignal) => {
+        const execution = action === contract.SimulatorViewerAction.START
+          ? await currentOwner.control.start(task, route!, authority, signal)
+          : action === contract.SimulatorViewerAction.STOP
+            ? await currentOwner.control.stop(task, route!, authority, signal)
+            : action === contract.SimulatorViewerAction.DETACH
+              ? await currentOwner.control.detach(task, route!, authority, signal)
+              : await currentOwner.control.delete(task, route!, authority, signal);
+        await currentOwner.clearInstance(execution.instance.instanceId);
+        return execution;
+      };
       const result = action === contract.SimulatorViewerAction.CREATE
         ? await currentOwner.control.create(task,
           { templateUdid: request.templateUdid, name: request.name }, authority, context.signal)
         : action === contract.SimulatorViewerAction.ATTACH
           ? await currentOwner.control.attach(task, request.deviceUdid, authority, context.signal)
-          : action === contract.SimulatorViewerAction.START
-            ? await currentOwner.control.start(task, route!, authority, context.signal)
-            : action === contract.SimulatorViewerAction.STOP
-              ? await currentOwner.control.stop(task, route!, authority, context.signal)
-              : action === contract.SimulatorViewerAction.DETACH
-                ? await currentOwner.control.detach(task, route!, authority, context.signal)
-                : await currentOwner.control.delete(task, route!, authority, context.signal);
-      await currentOwner.clearInstance(result.instance.instanceId);
+          : await runViewerUserMutation(currentOwner, task, route!, context.signal, execute,
+            action === contract.SimulatorViewerAction.DETACH ||
+              action === contract.SimulatorViewerAction.DELETE);
+      if (!routeRequired) await currentOwner.clearInstance(result.instance.instanceId);
       fence(context, task, true);
       return create(contract.ControlSimulatorInstanceResponseSchema, {
-        instance: projectInstance(result.instance),
+        instance: projectInstance(result.instance, action === contract.SimulatorViewerAction.DELETE
+          ? emptyMutationState(result.instance.instanceId)
+          : currentOwner.mutations.state(task, instanceRoute(result.instance))),
         deleted: action === contract.SimulatorViewerAction.DELETE,
         replayed: result.replayed
       });
@@ -166,23 +179,26 @@ export function createSimulatorViewerConnectService(input: {
             generation: task.generation, route, semantic })).digest("hex")}`,
         providerGeneration: 1
       };
-      const view = currentOwner.frames.inputView(task, route);
-      if (!freshInputView(view)) throw new ConnectError(
-        "A current visible Simulator frame is required for input.", Code.FailedPrecondition);
-      fence(context, task, true);
-      const observed = await currentOwner.screen.screenMap(task, route, context.signal);
-      fence(context, task, true);
-      const currentView = currentOwner.frames.inputView(task, route);
-      if (!currentView || !freshInputView(currentView)) throw new ConnectError(
-        "The visible Simulator frame changed before input.", Code.Aborted);
-      const viewerOrientation = currentView.encoding === "h264"
-        ? currentView.viewerOrientation ?? observed.viewport.orientation
-        : observed.viewport.orientation;
-      const action = viewerInputAction(semantic, observed.screenMap.snapshotId,
-        viewerOrientation, observed.viewport);
-      const result = await currentOwner.input.execute(task, route, action,
-        { mode: "none", timeoutMs: 5_000, stableForMs: 300 }, authority,
-        context.signal, { bindSnapshotToOperation: false });
+      const result = await runViewerUserMutation(currentOwner, task, route, context.signal,
+        async signal => {
+          const view = currentOwner.frames!.inputView(task, route);
+          if (!freshInputView(view)) throw new ConnectError(
+            "A current visible Simulator frame is required for input.", Code.FailedPrecondition);
+          fence(context, task, true);
+          const observed = await currentOwner.screen!.screenMap(task, route, signal);
+          fence(context, task, true);
+          const currentView = currentOwner.frames!.inputView(task, route);
+          if (!currentView || !freshInputView(currentView)) throw new ConnectError(
+            "The visible Simulator frame changed before input.", Code.Aborted);
+          const viewerOrientation = currentView.encoding === "h264"
+            ? currentView.viewerOrientation ?? observed.viewport.orientation
+            : observed.viewport.orientation;
+          const action = viewerInputAction(semantic, observed.screenMap.snapshotId,
+            viewerOrientation, observed.viewport);
+          return currentOwner.input!.execute(task, route, action,
+            { mode: "none", timeoutMs: 5_000, stableForMs: 300 }, authority,
+            signal, { bindSnapshotToOperation: false });
+        });
       fence(context, task, true);
       return create(contract.ControlSimulatorViewerInputResponseSchema, { replayed: result.replayed });
     },
@@ -201,48 +217,52 @@ export function createSimulatorViewerConnectService(input: {
         throw new ConnectError("Simulator touch identity or sequence is invalid.", Code.InvalidArgument);
       }
       const phase = request.phase;
-      if (phase === contract.SimulatorViewerTouchPhase.BEGIN) {
-        if (request.sequence !== 0) throw new ConnectError(
-          "Simulator touch begin sequence is invalid.", Code.InvalidArgument);
-        const view = currentOwner.frames.inputView(task, route);
-        if (!freshInputView(view)) throw new ConnectError(
-          "A current visible Simulator frame is required for touch.", Code.FailedPrecondition);
-        fence(context, task, true);
-        const observed = await currentOwner.screen.screenMap(task, route, context.signal);
-        fence(context, task, true);
-        const currentView = currentOwner.frames.inputView(task, route);
-        if (!currentView || !freshInputView(currentView)) throw new ConnectError(
-          "The visible Simulator frame changed before touch.", Code.Aborted);
-        const viewerOrientation = currentView.encoding === "h264"
-          ? currentView.viewerOrientation ?? observed.viewport.orientation
-          : observed.viewport.orientation;
-        try {
-          await currentOwner.liveTouch.begin(task, route, gestureId, point,
-            observed.screenMap.snapshotId, observed.viewport, viewerOrientation, context.signal);
-        } catch (error) {
-          if (error instanceof SimulatorInputError && error.code === "NATIVE_INPUT_UNAVAILABLE") {
-            return create(contract.ControlSimulatorViewerTouchResponseSchema, { accepted: false });
+      const accepted = await runViewerUserMutation(currentOwner, task, route, context.signal,
+        async signal => {
+          if (phase === contract.SimulatorViewerTouchPhase.BEGIN) {
+            if (request.sequence !== 0) throw new ConnectError(
+              "Simulator touch begin sequence is invalid.", Code.InvalidArgument);
+            const view = currentOwner.frames!.inputView(task, route);
+            if (!freshInputView(view)) throw new ConnectError(
+              "A current visible Simulator frame is required for touch.", Code.FailedPrecondition);
+            fence(context, task, true);
+            const observed = await currentOwner.screen!.screenMap(task, route, signal);
+            fence(context, task, true);
+            const currentView = currentOwner.frames!.inputView(task, route);
+            if (!currentView || !freshInputView(currentView)) throw new ConnectError(
+              "The visible Simulator frame changed before touch.", Code.Aborted);
+            const viewerOrientation = currentView.encoding === "h264"
+              ? currentView.viewerOrientation ?? observed.viewport.orientation
+              : observed.viewport.orientation;
+            try {
+              await currentOwner.liveTouch!.begin(task, route, gestureId, point,
+                observed.screenMap.snapshotId, observed.viewport, viewerOrientation, signal);
+              return true;
+            } catch (error) {
+              if (error instanceof SimulatorInputError && error.code === "NATIVE_INPUT_UNAVAILABLE") {
+                return false;
+              }
+              throw error;
+            }
           }
-          throw error;
-        }
-      } else {
-        const step = phase === contract.SimulatorViewerTouchPhase.MOVE ? "move"
-          : phase === contract.SimulatorViewerTouchPhase.END ? "end"
-            : phase === contract.SimulatorViewerTouchPhase.CANCEL ? "cancel" : null;
-        if (!step || request.sequence < 1) throw new ConnectError(
-          "Simulator touch phase or sequence is invalid.", Code.InvalidArgument);
-        if (step !== "cancel" && !freshInputView(currentOwner.frames.inputView(task, route))) {
-          currentOwner.liveTouch.clearInstance(route.instanceId);
-          throw new ConnectError("Simulator touch lost its visible frame.", Code.FailedPrecondition);
-        }
-        try { fence(context, task, true); }
-        catch (error) { currentOwner.liveTouch.clearInstance(route.instanceId); throw error; }
-        await currentOwner.liveTouch.advance(task, route, gestureId, step,
-          request.sequence, point, context.signal);
-      }
+          const step = phase === contract.SimulatorViewerTouchPhase.MOVE ? "move"
+            : phase === contract.SimulatorViewerTouchPhase.END ? "end"
+              : phase === contract.SimulatorViewerTouchPhase.CANCEL ? "cancel" : null;
+          if (!step || request.sequence < 1) throw new ConnectError(
+            "Simulator touch phase or sequence is invalid.", Code.InvalidArgument);
+          if (step !== "cancel" && !freshInputView(currentOwner.frames!.inputView(task, route))) {
+            currentOwner.liveTouch!.clearInstance(route.instanceId);
+            throw new ConnectError("Simulator touch lost its visible frame.", Code.FailedPrecondition);
+          }
+          try { fence(context, task, true); }
+          catch (error) { currentOwner.liveTouch!.clearInstance(route.instanceId); throw error; }
+          await currentOwner.liveTouch!.advance(task, route, gestureId, step,
+            request.sequence, point, signal);
+          return true;
+        });
       try { fence(context, task, true); }
       catch (error) { currentOwner.liveTouch.clearInstance(route.instanceId); throw error; }
-      return create(contract.ControlSimulatorViewerTouchResponseSchema, { accepted: true });
+      return create(contract.ControlSimulatorViewerTouchResponseSchema, { accepted });
     },
     setSimulatorViewerInteractionProfile: async (request, context) => {
       input.authenticate(context);
@@ -265,6 +285,35 @@ export function createSimulatorViewerConnectService(input: {
         throw error;
       }
     },
+    getSimulatorViewerMutationState: async (request, context) => {
+      input.authenticate(context);
+      const task = scope(request.sessionId, false);
+      const currentOwner = owner();
+      const route = requiredRoute(request.route);
+      const mutation = currentOwner.mutations.state(task, route);
+      fence(context, task, false);
+      return create(contract.GetSimulatorViewerMutationStateResponseSchema, {
+        mutation: projectMutationState(mutation)
+      });
+    },
+    setSimulatorViewerMutationControl: async (request, context) => {
+      input.authenticate(context);
+      const task = scope(request.sessionId, true);
+      const currentOwner = owner();
+      const route = requiredRoute(request.route);
+      fence(context, task, true);
+      try {
+        const mutation = request.agentPaused
+          ? currentOwner.mutations.takeover(task, route)
+          : currentOwner.mutations.resume(task, route);
+        fence(context, task, true);
+        return create(contract.SetSimulatorViewerMutationControlResponseSchema, {
+          mutation: projectMutationState(mutation)
+        });
+      } catch (error) {
+        throw connectMutationError(error);
+      }
+    },
     getSimulatorViewerControls: async (request, context) => {
       input.authenticate(context);
       const task = scope(request.sessionId, false);
@@ -273,22 +322,25 @@ export function createSimulatorViewerConnectService(input: {
       currentOwner.ownership.requireRoute(task, route);
       if (!currentOwner.frames || !currentOwner.screen || !currentOwner.driver) throw new ConnectError(
         "Simulator Viewer controls are unavailable.", Code.Unimplemented);
-      if (!freshInputView(currentOwner.frames.inputView(task, route))) throw new ConnectError(
-        "A current visible Simulator frame is required for controls.", Code.FailedPrecondition);
-      const observed = await currentOwner.screen.screenMap(task, route, context.signal);
-      fence(context, task, false);
-      const instance = currentOwner.ownership.requireRoute(task, route);
-      if (!currentOwner.driver.isReady(instance) || !freshInputView(currentOwner.frames.inputView(task, route))) {
-        throw new ConnectError("The visible Simulator frame changed before controls were read.", Code.Aborted);
-      }
-      const nativeTouchAvailable = await currentOwner.driver.probeNativeLiveInput(instance, context.signal);
-      fence(context, task, false);
-      currentOwner.ownership.requireRoute(task, route);
-      if (!freshInputView(currentOwner.frames.inputView(task, route))) throw new ConnectError(
-        "The visible Simulator frame changed before controls were read.", Code.Aborted);
-      return create(contract.GetSimulatorViewerControlsResponseSchema, {
-        viewportWidth: observed.viewport.width, viewportHeight: observed.viewport.height,
-        orientation: observed.viewport.orientation, nativeTouchAvailable
+      return runViewerUserMutation(currentOwner, task, route, context.signal, async signal => {
+        if (!freshInputView(currentOwner.frames!.inputView(task, route))) throw new ConnectError(
+          "A current visible Simulator frame is required for controls.", Code.FailedPrecondition);
+        const observed = await currentOwner.screen!.screenMap(task, route, signal);
+        fence(context, task, false);
+        const instance = currentOwner.ownership.requireRoute(task, route);
+        if (!currentOwner.driver!.isReady(instance) ||
+            !freshInputView(currentOwner.frames!.inputView(task, route))) {
+          throw new ConnectError("The visible Simulator frame changed before controls were read.", Code.Aborted);
+        }
+        const nativeTouchAvailable = await currentOwner.driver!.probeNativeLiveInput(instance, signal);
+        fence(context, task, false);
+        currentOwner.ownership.requireRoute(task, route);
+        if (!freshInputView(currentOwner.frames!.inputView(task, route))) throw new ConnectError(
+          "The visible Simulator frame changed before controls were read.", Code.Aborted);
+        return create(contract.GetSimulatorViewerControlsResponseSchema, {
+          viewportWidth: observed.viewport.width, viewportHeight: observed.viewport.height,
+          orientation: observed.viewport.orientation, nativeTouchAvailable
+        });
       });
     },
     controlSimulatorViewerCommand: async (request, context) => {
@@ -315,41 +367,43 @@ export function createSimulatorViewerConnectService(input: {
         })).digest("hex")}`,
         providerGeneration: 1
       };
-      if (command === contract.SimulatorViewerCommand.COPY_SCREENSHOT) {
-        if (!currentOwner.screenshot) throw new ConnectError(
-          "Simulator screenshot is unavailable.", Code.Unimplemented);
+      return runViewerUserMutation(currentOwner, task, route, context.signal, async signal => {
+        if (command === contract.SimulatorViewerCommand.COPY_SCREENSHOT) {
+          if (!currentOwner.screenshot) throw new ConnectError(
+            "Simulator screenshot is unavailable.", Code.Unimplemented);
+          fence(context, task, true);
+          const result = await currentOwner.screenshot.execute(task, route, authority, signal);
+          fence(context, task, true);
+          return create(contract.ControlSimulatorViewerCommandResponseSchema, {
+            replayed: result.replayed, screenshotBlobId: result.receipt.image.id
+          });
+        }
+        if (!currentOwner.screen || !currentOwner.frames ||
+            command === contract.SimulatorViewerCommand.HOME && !currentOwner.input ||
+            command !== contract.SimulatorViewerCommand.HOME && !currentOwner.stateControl) {
+          throw new ConnectError("Simulator Viewer commands are unavailable.", Code.Unimplemented);
+        }
+        if (!freshInputView(currentOwner.frames.inputView(task, route))) throw new ConnectError(
+          "A current visible Simulator frame is required for commands.", Code.FailedPrecondition);
         fence(context, task, true);
-        const result = await currentOwner.screenshot.execute(task, route, authority, context.signal);
+        const observed = await currentOwner.screen.screenMap(task, route, signal);
         fence(context, task, true);
-        return create(contract.ControlSimulatorViewerCommandResponseSchema, {
-          replayed: result.replayed, screenshotBlobId: result.receipt.image.id
-        });
-      }
-      if (!currentOwner.screen || !currentOwner.frames ||
-          command === contract.SimulatorViewerCommand.HOME && !currentOwner.input ||
-          command !== contract.SimulatorViewerCommand.HOME && !currentOwner.stateControl) {
-        throw new ConnectError("Simulator Viewer commands are unavailable.", Code.Unimplemented);
-      }
-      if (!freshInputView(currentOwner.frames.inputView(task, route))) throw new ConnectError(
-        "A current visible Simulator frame is required for commands.", Code.FailedPrecondition);
-      fence(context, task, true);
-      const observed = await currentOwner.screen.screenMap(task, route, context.signal);
-      fence(context, task, true);
-      if (!freshInputView(currentOwner.frames.inputView(task, route))) throw new ConnectError(
-        "The visible Simulator frame changed before command dispatch.", Code.Aborted);
-      const snapshotId = observed.screenMap.snapshotId;
-      const result = command === contract.SimulatorViewerCommand.HOME
-        ? await currentOwner.input!.execute(task, route, { type: "press_home", snapshotId },
-          { mode: "none", timeoutMs: 5_000, stableForMs: 300 }, authority,
-          context.signal, { bindSnapshotToOperation: false })
-        : await currentOwner.stateControl!.execute(task, route,
-          isRotate ? { type: "set_orientation", snapshotId,
-            orientation: request.orientation as "PORTRAIT" | "LANDSCAPE" }
-            : { type: command === contract.SimulatorViewerCommand.LOCK
-              ? "lock_screen" : "unlock_screen", snapshotId },
-          authority, context.signal, { bindSnapshotToOperation: false });
-      fence(context, task, true);
-      return create(contract.ControlSimulatorViewerCommandResponseSchema, { replayed: result.replayed });
+        if (!freshInputView(currentOwner.frames.inputView(task, route))) throw new ConnectError(
+          "The visible Simulator frame changed before command dispatch.", Code.Aborted);
+        const snapshotId = observed.screenMap.snapshotId;
+        const result = command === contract.SimulatorViewerCommand.HOME
+          ? await currentOwner.input!.execute(task, route, { type: "press_home", snapshotId },
+            { mode: "none", timeoutMs: 5_000, stableForMs: 300 }, authority,
+            signal, { bindSnapshotToOperation: false })
+          : await currentOwner.stateControl!.execute(task, route,
+            isRotate ? { type: "set_orientation", snapshotId,
+              orientation: request.orientation as "PORTRAIT" | "LANDSCAPE" }
+              : { type: command === contract.SimulatorViewerCommand.LOCK
+                ? "lock_screen" : "unlock_screen", snapshotId },
+            authority, signal, { bindSnapshotToOperation: false });
+        fence(context, task, true);
+        return create(contract.ControlSimulatorViewerCommandResponseSchema, { replayed: result.replayed });
+      });
     },
     watchSimulatorFrames: async function* (request, context) {
       input.authenticate(context);
@@ -495,7 +549,32 @@ function requiredRoute(value: contract.SimulatorViewerRoute | undefined): Simula
   return { instanceId: value.instanceId, generation: Number(value.generation), leaseId: value.leaseId };
 }
 
-function projectInstance(instance: PublicSimulatorInstance): contract.SimulatorViewerInstance {
+function instanceRoute(instance: PublicSimulatorInstance): SimulatorInstanceRoute {
+  return { instanceId: instance.instanceId, generation: instance.generation,
+    leaseId: instance.lease.id };
+}
+
+function emptyMutationState(instanceId: string): SimulatorMutationState {
+  return { instanceId, activeSource: null, lastSource: null, queuedAgentMutations: 0,
+    agentPaused: false, takeoverPending: false };
+}
+
+function projectMutationState(value: SimulatorMutationState): contract.SimulatorViewerMutationState {
+  const source = (input: SimulatorMutationState["activeSource"]):
+    contract.SimulatorViewerMutationSource => input === "agent"
+      ? contract.SimulatorViewerMutationSource.AGENT
+      : input === "user" ? contract.SimulatorViewerMutationSource.USER
+        : contract.SimulatorViewerMutationSource.UNSPECIFIED;
+  return create(contract.SimulatorViewerMutationStateSchema, {
+    instanceId: value.instanceId, activeSource: source(value.activeSource),
+    lastSource: source(value.lastSource), queuedAgentMutations: value.queuedAgentMutations,
+    agentPaused: value.agentPaused, takeoverPending: value.takeoverPending
+  });
+}
+
+function projectInstance(instance: PublicSimulatorInstance,
+  mutation: SimulatorMutationState = emptyMutationState(instance.instanceId)):
+  contract.SimulatorViewerInstance {
   return create(contract.SimulatorViewerInstanceSchema, {
     route: create(contract.SimulatorViewerRouteSchema, {
       instanceId: instance.instanceId, generation: BigInt(instance.generation), leaseId: instance.lease.id
@@ -506,6 +585,29 @@ function projectInstance(instance: PublicSimulatorInstance): contract.SimulatorV
     lifecycleState: instance.lifecycleState, viewerState: instance.viewerState,
     healthState: instance.healthState, errorCode: instance.errorCode ?? "",
     graceExpiresAtMs: BigInt(instance.graceExpiresAt ?? 0),
-    leaseExpiresAtMs: BigInt(instance.lease.expiresAt)
+    leaseExpiresAtMs: BigInt(instance.lease.expiresAt), mutation: projectMutationState(mutation)
   });
+}
+
+async function runViewerUserMutation<T>(owner: SimulatorViewerServiceOwner,
+  task: SimulatorTaskScope, route: SimulatorInstanceRoute, signal: AbortSignal,
+  execute: (signal: AbortSignal) => Promise<T>, allowReleasedReplay = false): Promise<T> {
+  try { return await owner.mutations.runUser(task, route, execute, signal); }
+  catch (error) {
+    // Detach/delete release exact ownership only after their durable terminal commit. Let the
+    // owning coordinator distinguish that same-request replay from every stale or foreign route.
+    if (allowReleasedReplay && error instanceof SimulatorOwnershipError) return execute(signal);
+    throw connectMutationError(error);
+  }
+}
+
+function connectMutationError(error: unknown): Error {
+  if (!(error instanceof SimulatorMutationArbitrationError)) {
+    return error instanceof Error ? error
+      : new ConnectError("Simulator mutation arbitration failed.", Code.Internal);
+  }
+  const code = error.code === "DEVICE_BUSY" || error.code === "AGENT_MUTATION_PAUSED"
+    ? Code.FailedPrecondition : error.code === "MUTATION_CANCELLED" ? Code.Aborted
+      : Code.Unavailable;
+  return new ConnectError(error.message, code);
 }

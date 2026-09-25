@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { OperationInProgressError } from "@joko/store";
 import type { SimulatorEnvironmentRuntime } from "@joko/tool-ios-simulator";
 import { IosSimulatorToolBridgeProvider } from "./ios-simulator-tool-bridge.js";
+import { SimulatorMutationArbiter } from "./ios-simulator-mutation-arbiter.js";
+import { SimulatorOwnershipError } from "./ios-simulator-ownership.js";
 
 it("binds Simulator discovery and dispatch to an exact trusted local task", async () => {
   let generation = 3;
@@ -174,6 +176,50 @@ it("publishes instance mutations only with a composed control owner and requires
   expect((await invoke("start_instance", { instanceId: "owned", generation: 2, leaseId: "lease" }))
     .structuredContent).toMatchObject({ ok: false, errorCode: "XCODE_NOT_FOUND" });
   expect(calls).toHaveLength(5);
+});
+
+it("lets the instance coordinator authenticate only an exact detach replay after ownership is released", async () => {
+  const instance = { instanceId: "owned", simulatorUdid: "A0123456-1234-1234-1234-123456789ABC",
+    generation: 2, lease: { id: "lease", issuedAt: 1, expiresAt: 60_001 } };
+  let released = false;
+  const ownership = {
+    listForTask: () => released ? [] : [instance], listForResourceAdmission: () => [],
+    requireRoute: () => {
+      if (released) throw new SimulatorOwnershipError("STALE_SCOPE", "route released");
+      return instance;
+    }
+  };
+  const detach = vi.fn(async () => {
+    if (!released) { released = true; return { instance, replayed: false }; }
+    return { instance, replayed: true };
+  });
+  const start = vi.fn();
+  const provider = new IosSimulatorToolBridgeProvider({
+    store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
+      binding: { generation: 1 }, archived: false } }) as never,
+      getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
+    ownership: ownership as never,
+    control: { diagnoseDrivers: () => [], detach, start } as never,
+    mutations: new SimulatorMutationArbiter(ownership as never),
+    runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready: true,
+      xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: null,
+      error: null, setupSteps: [] }) }
+  });
+  const context = { sessionId: "task", targetId: "target", generation: 1,
+    effectIdentity: "a".repeat(64), requestBodyHash: `sha256:${"b".repeat(64)}`,
+    providerGeneration: 1 };
+  const route = { instanceId: instance.instanceId, generation: instance.generation,
+    leaseId: instance.lease.id };
+  const invoke = (name: string) => provider.callTool("control_tool", { name, args: route },
+    undefined, context);
+  expect((await invoke("detach_device")).structuredContent)
+    .toMatchObject({ ok: true, data: { replayed: false } });
+  expect((await invoke("detach_device")).structuredContent)
+    .toMatchObject({ ok: true, data: { replayed: true } });
+  expect((await invoke("start_instance")).structuredContent)
+    .toMatchObject({ errorCode: "STALE_SCOPE" });
+  expect(detach).toHaveBeenCalledTimes(2);
+  expect(start).not.toHaveBeenCalled();
 });
 
 it("routes Simulator screenshot only through permissioned control and trusted image output", async () => {
@@ -460,15 +506,18 @@ it("publishes bounded Simulator input only through permission authority and stri
       observationResult: { mode: "none", state: "not_requested" } }, replayed: false,
       observation: null, observationError: null };
   } };
+  const ownership = { listForTask: () => [{ instanceId: "owned" }],
+    listForResourceAdmission: () => [], requireRoute: () => ({ instanceId: "owned" }) };
+  const mutations = new SimulatorMutationArbiter(ownership as never);
   const provider = new IosSimulatorToolBridgeProvider({
     store: { getSession: () => ({ descriptor: { targetId: "target", backendId: "backend",
       binding: { generation: 1 }, archived } }) as never,
       getTarget: () => ({ descriptor: { backendId: "backend", trusted: true } }) as never },
-    ownership: { listForTask: () => [{ instanceId: "owned" }],
-      listForResourceAdmission: () => [] } as never,
+    ownership: ownership as never,
     control: { diagnoseDrivers: () => [{ state: "ready" }] } as never,
     screen: { clear: () => undefined } as never,
     input: input as never,
+    mutations,
     runtime: { inspect: async () => ({ platform: "darwin", supported: true, ready,
       xcodeVersion: "Xcode fixture", runtimes: [], devices: [], issue: ready ? null : "XCODE_NOT_FOUND",
       error: ready ? null : "Simulator unavailable", setupSteps: [] }) },
@@ -522,6 +571,10 @@ it("publishes bounded Simulator input only through permission authority and stri
     .toMatchObject({ ok: true, data: { action: "type_text" } });
   expect(await invoke("press_home", route)).toMatchObject({ ok: true,
     data: { action: "press_home" } });
+  expect(mutations.takeover(scope, route)).toMatchObject({ agentPaused: true });
+  expect(await invoke("press_home", route)).toMatchObject({ errorCode: "AGENT_MUTATION_PAUSED" });
+  expect(calls).toHaveLength(8);
+  mutations.resume(scope, route);
   expect(await invoke("press_simulator_key", { ...route, key: "space" }))
     .toMatchObject({ errorCode: "INVALID_ARGUMENT" });
   expect(await invoke("batch", { ...route, actions: [], observeAfter: "none" }))

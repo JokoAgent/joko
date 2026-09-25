@@ -61,12 +61,13 @@ const MJPEG_PROFILES: Record<Exclude<VideoQuality, "experimental60">, {
 const INTERACTION_PROFILE_RESTORE_DELAY_MS = 250;
 
 /** One visible, current-route subscription and its exact task-owned input surface. */
-export function SimulatorViewerScreen({ controller, sessionId, route, enabled, ownerDocument,
+export function SimulatorViewerScreen({ controller, sessionId, route, enabled, controlEnabled = true, ownerDocument,
   onReconcile, t }: {
   readonly controller: AppController;
   readonly sessionId: string;
   readonly route: SimulatorViewerRouteView;
   readonly enabled: boolean;
+  readonly controlEnabled?: boolean;
   readonly ownerDocument: Document;
   readonly onReconcile: () => Promise<void>;
   readonly t: Translator;
@@ -347,7 +348,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
 
   useEffect(() => () => { if (frameUrl) URL.revokeObjectURL(frameUrl); }, [frameUrl]);
 
-  const interactive = enabled && documentVisible && state === "streaming" &&
+  const interactive = enabled && controlEnabled && documentVisible && state === "streaming" &&
     presentation !== null && frameFresh;
 
   useEffect(() => {
@@ -506,12 +507,24 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     else if (gesture.beginState === "unavailable") finishGesture(gesture);
   }, [finishGesture, pumpGesture, unknownGesture]);
 
+  const abandonPointerGesture = useCallback((): void => {
+    const gesture = pointerGestureRef.current;
+    if (!gesture) return;
+    gesture.beginState = "failed";
+    gesture.terminal = { phase: "cancel", point: gesture.last };
+    gesture.pendingMove = undefined;
+    gesture.beginAbort.abort();
+    finishGesture(gesture);
+  }, [finishGesture]);
+
   useEffect(() => {
     if (!interactive) {
-      cancelPointerGesture();
-      inputRequestRef.current?.abort();
+      if (enabled && documentVisible && !controlEnabled) abandonPointerGesture();
+      else cancelPointerGesture();
+      if (!enabled || !documentVisible) inputRequestRef.current?.abort();
     }
-  }, [interactive, cancelPointerGesture]);
+  }, [interactive, enabled, controlEnabled, documentVisible, abandonPointerGesture,
+    cancelPointerGesture]);
 
   useEffect(() => {
     const ownerWindow = ownerDocument.defaultView;
@@ -616,7 +629,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   };
 
   const recoverInput = async (): Promise<void> => {
-    if (inputBusy || commandBusy || !enabled) return;
+    if (inputBusy || commandBusy || !enabled || !controlEnabled) return;
     setInputBusy(true);
     try {
       await reconcileRef.current();
@@ -628,7 +641,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     }
   };
 
-  const commandUnavailable = !enabled || !documentVisible || inputBusy || commandBusy ||
+  const commandUnavailable = !enabled || !controlEnabled || !documentVisible || inputBusy || commandBusy ||
     inputError !== undefined || commandError !== undefined || pointerGestureRef.current !== undefined;
   const nativeRecoverable = nativeRoute === "fallbackUnavailable" ||
     nativeRoute === "fallbackLost" || nativeRoute === "fallbackDecode";
@@ -819,7 +832,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     {clipboardError && <p className="simulator-viewer__input-error" role="alert">{clipboardError}</p>}
     {(inputError || commandError) && <div className="simulator-viewer__input-error" role="alert">
       <AlertTriangle aria-hidden="true" /><span>{inputError || commandError}</span>
-      <Button tone="ghost" disabled={inputBusy || commandBusy || !enabled}
+      <Button tone="ghost" disabled={inputBusy || commandBusy || !enabled || !controlEnabled}
         onClick={() => void recoverInput()}>{t("simulator.inputReview")}</Button>
     </div>}
     <form className="simulator-viewer__keyboard" onSubmit={event => {

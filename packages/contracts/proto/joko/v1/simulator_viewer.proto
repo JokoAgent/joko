@@ -11,6 +11,8 @@ service SimulatorViewerService {
   rpc ControlSimulatorViewerInput(ControlSimulatorViewerInputRequest) returns (ControlSimulatorViewerInputResponse);
   rpc ControlSimulatorViewerTouch(ControlSimulatorViewerTouchRequest) returns (ControlSimulatorViewerTouchResponse);
   rpc SetSimulatorViewerInteractionProfile(SetSimulatorViewerInteractionProfileRequest) returns (SetSimulatorViewerInteractionProfileResponse);
+  rpc GetSimulatorViewerMutationState(GetSimulatorViewerMutationStateRequest) returns (GetSimulatorViewerMutationStateResponse);
+  rpc SetSimulatorViewerMutationControl(SetSimulatorViewerMutationControlRequest) returns (SetSimulatorViewerMutationControlResponse);
   rpc GetSimulatorViewerControls(GetSimulatorViewerControlsRequest) returns (GetSimulatorViewerControlsResponse);
   rpc ControlSimulatorViewerCommand(ControlSimulatorViewerCommandRequest) returns (ControlSimulatorViewerCommandResponse);
   rpc WatchSimulatorFrames(WatchSimulatorFramesRequest) returns (stream WatchSimulatorFramesResponse);
@@ -56,6 +58,22 @@ message SimulatorViewerInstance {
   string error_code = 11;
   uint64 grace_expires_at_ms = 12;
   uint64 lease_expires_at_ms = 13;
+  SimulatorViewerMutationState mutation = 14;
+}
+
+enum SimulatorViewerMutationSource {
+  SIMULATOR_VIEWER_MUTATION_SOURCE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_MUTATION_SOURCE_AGENT = 1;
+  SIMULATOR_VIEWER_MUTATION_SOURCE_USER = 2;
+}
+
+message SimulatorViewerMutationState {
+  string instance_id = 1;
+  SimulatorViewerMutationSource active_source = 2;
+  SimulatorViewerMutationSource last_source = 3;
+  uint32 queued_agent_mutations = 4;
+  bool agent_paused = 5;
+  bool takeover_pending = 6;
 }
 
 message GetSimulatorViewerStateRequest {
@@ -152,6 +170,25 @@ message SetSimulatorViewerInteractionProfileRequest {
 message SetSimulatorViewerInteractionProfileResponse {
   // False means no profile change was needed because the requested state was already effective.
   bool applied = 1;
+}
+
+message GetSimulatorViewerMutationStateRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+}
+
+message GetSimulatorViewerMutationStateResponse {
+  SimulatorViewerMutationState mutation = 1;
+}
+
+message SetSimulatorViewerMutationControlRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  bool agent_paused = 3;
+}
+
+message SetSimulatorViewerMutationControlResponse {
+  SimulatorViewerMutationState mutation = 1;
 }
 
 message GetSimulatorViewerControlsRequest {

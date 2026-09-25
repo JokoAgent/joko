@@ -8,6 +8,7 @@ import { SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
 import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
 import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
+import { SimulatorMutationArbiter } from "./ios-simulator-mutation-arbiter.js";
 
 const SCOPE = { sessionId: "simulator-task", targetId: "local", generation: 1 } as const;
 const DEVICE = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "Joko iPhone",
@@ -42,16 +43,20 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
   const bound = ownership.bindCreatedDevice(SCOPE, DEVICE, DEVICE.name);
   const instance = ownership.attachViewer(SCOPE,
     { instanceId: bound.instanceId, generation: bound.generation, leaseId: bound.lease.id });
+  let removedInstance: typeof instance | undefined;
   const remove = vi.fn(async (_scope, route, authority) => {
     expect(authority.effectIdentity).toMatch(/^[0-9a-f]{64}$/u);
     expect(authority.requestBodyHash).toMatch(/^sha256:[0-9a-f]{64}$/u);
-    return { instance: ownership.releaseDeletedCreated(SCOPE, route), replayed: false };
+    if (removedInstance) return { instance: removedInstance, replayed: true };
+    removedInstance = ownership.releaseDeletedCreated(SCOPE, route);
+    return { instance: removedInstance, replayed: false };
   });
   const clear = vi.fn(async () => undefined);
+  const mutations = new SimulatorMutationArbiter(ownership);
   let authorized = true;
   const context = { signal: new AbortController().signal } as HandlerContext;
   const service = createSimulatorViewerConnectService({ store,
-    owner: { ownership, control: { delete: remove } as never,
+    owner: { ownership, mutations, control: { delete: remove } as never,
       environment: { inspect: async () => ({ platform: "darwin", ready: true,
         devices: [DEVICE], issue: null }) } as never,
       clearInstance: clear, frames: frames as never,
@@ -62,7 +67,7 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
       screenshot: commands?.screenshot as never },
     authenticate: () => { if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated); }
   });
-  return { store, ownership, instance, remove, clear, service, context,
+  return { store, ownership, mutations, instance, remove, clear, service, context,
     revoke: () => { authorized = false; }, authorize: () => { authorized = true; } };
 }
 
@@ -97,14 +102,14 @@ it("routes visible Viewer commands through exact durable owners without binding 
       instanceId: route.instanceId }), { type: "press_home", snapshotId },
     { mode: "none", timeoutMs: 5_000, stableForMs: 300 },
     expect.objectContaining({ requestBodyHash: expect.stringMatching(/^sha256:/u) }),
-    h.context.signal, { bindSnapshotToOperation: false });
+    expect.any(AbortSignal), { bindSnapshotToOperation: false });
     await h.service.controlSimulatorViewerCommand(create(
       contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
         requestId: randomUUID(), command: contract.SimulatorViewerCommand.ROTATE,
         orientation: "LANDSCAPE" }), h.context);
     expect(stateExecute).toHaveBeenCalledWith(SCOPE, expect.anything(),
       { type: "set_orientation", snapshotId, orientation: "LANDSCAPE" },
-      expect.anything(), h.context.signal, { bindSnapshotToOperation: false });
+      expect.anything(), expect.any(AbortSignal), { bindSnapshotToOperation: false });
     for (const [command, type] of [
       [contract.SimulatorViewerCommand.LOCK, "lock_screen"],
       [contract.SimulatorViewerCommand.UNLOCK, "unlock_screen"]
@@ -113,7 +118,7 @@ it("routes visible Viewer commands through exact durable owners without binding 
         contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
           requestId: randomUUID(), command }), h.context);
       expect(stateExecute).toHaveBeenLastCalledWith(SCOPE, expect.anything(),
-        { type, snapshotId }, expect.anything(), h.context.signal,
+        { type, snapshotId }, expect.anything(), expect.any(AbortSignal),
         { bindSnapshotToOperation: false });
     }
     expect(await h.service.controlSimulatorViewerCommand(create(
@@ -121,7 +126,7 @@ it("routes visible Viewer commands through exact durable owners without binding 
         requestId: randomUUID(), command: contract.SimulatorViewerCommand.COPY_SCREENSHOT }), h.context))
       .toMatchObject({ screenshotBlobId: "screenshot-blob" });
     expect(screenshotExecute).toHaveBeenCalledWith(SCOPE, expect.anything(),
-      expect.anything(), h.context.signal);
+      expect.anything(), expect.any(AbortSignal));
     await expect(h.service.controlSimulatorViewerCommand(create(
       contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
         route: { ...route, leaseId: "wrong" }, command: contract.SimulatorViewerCommand.COPY_SCREENSHOT }),
@@ -220,13 +225,13 @@ it("admits exact live touch from a fresh frame and distinguishes undispatched be
     expect(begin).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
       instanceId: route.instanceId }), gestureId, { xRatio: 0.3, yRatio: 0.2 },
     snapshotId, { width: 100, height: 200, orientation: "PORTRAIT" },
-    "LANDSCAPE", h.context.signal);
+    "LANDSCAPE", expect.any(AbortSignal));
     expect(await h.service.controlSimulatorViewerTouch(create(
       contract.ControlSimulatorViewerTouchRequestSchema, { ...request, sequence: 1,
         phase: contract.SimulatorViewerTouchPhase.MOVE }), h.context))
       .toMatchObject({ accepted: true });
     expect(advance).toHaveBeenCalledWith(SCOPE, expect.anything(), gestureId,
-      "move", 1, { xRatio: 0.3, yRatio: 0.2 }, h.context.signal);
+      "move", 1, { xRatio: 0.3, yRatio: 0.2 }, expect.any(AbortSignal));
     begin.mockRejectedValueOnce(new SimulatorInputError("NATIVE_INPUT_UNAVAILABLE", "Not dispatched."));
     expect(await h.service.controlSimulatorViewerTouch(create(
       contract.ControlSimulatorViewerTouchRequestSchema, { ...request, gestureId: randomUUID() }),
@@ -344,14 +349,14 @@ it("maps current visible-frame input through a fresh snapshot and the durable in
     expect(await h.service.controlSimulatorViewerInput(tap, h.context))
       .toMatchObject({ replayed: false });
     expect(screenMap).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
-      instanceId: h.instance.instanceId }), h.context.signal);
+      instanceId: h.instance.instanceId }), expect.any(AbortSignal));
     expect(execute).toHaveBeenNthCalledWith(1, SCOPE, expect.objectContaining({
       instanceId: h.instance.instanceId }), {
       type: "tap", snapshotId, target: { x: 20, y: 140 }
     }, { mode: "none", timeoutMs: 5_000, stableForMs: 300 }, expect.objectContaining({
       effectIdentity: expect.stringMatching(/^[0-9a-f]{64}$/u),
       requestBodyHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u), providerGeneration: 1
-    }), h.context.signal, { bindSnapshotToOperation: false });
+    }), expect.any(AbortSignal), { bindSnapshotToOperation: false });
 
     const text = create(contract.ControlSimulatorViewerInputRequestSchema, {
       sessionId: SCOPE.sessionId, requestId: randomUUID(), route,
@@ -379,6 +384,66 @@ it("maps current visible-frame input through a fresh snapshot and the durable in
   } finally { h.store.close(); }
 });
 
+it("projects Agent mutation ownership and gates Viewer input through takeover and resume", async () => {
+  const snapshotId = randomUUID();
+  const execute = vi.fn(async () => ({ receipt: { action: "tap" }, replayed: false,
+    observation: null, observationError: null }));
+  const screenMap = vi.fn(async () => ({ screenMap: { snapshotId },
+    viewport: { width: 100, height: 200, orientation: "PORTRAIT" } }));
+  const inputView = vi.fn(() => ({ state: "streaming" as const, encoding: "jpeg" as const,
+    viewerOrientation: null, lastFrameAt: new Date().toISOString() }));
+  const h = fixture({ watch: async function* () { /* not consumed */ }, inputView }, {
+    execute, screenMap
+  }, { driver: { isReady: vi.fn(() => true), probeNativeLiveInput: vi.fn(async () => true) } });
+  const route = { instanceId: h.instance.instanceId,
+    generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id };
+  const internalRoute = { ...route, generation: Number(route.generation) };
+  const tap = create(contract.ControlSimulatorViewerInputRequestSchema, {
+    sessionId: SCOPE.sessionId, requestId: randomUUID(), route,
+    input: { case: "tap", value: { point: { xRatio: 0.5, yRatio: 0.5 } } }
+  });
+  try {
+    const active = h.mutations.runAgent(SCOPE, internalRoute, async signal => {
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+      signal.throwIfAborted();
+    });
+    await vi.waitFor(() => expect(h.mutations.state(SCOPE, internalRoute).activeSource).toBe("agent"));
+    expect(await h.service.getSimulatorViewerMutationState(create(
+      contract.GetSimulatorViewerMutationStateRequestSchema,
+      { sessionId: SCOPE.sessionId, route }), h.context)).toMatchObject({
+      mutation: { instanceId: h.instance.instanceId,
+        activeSource: contract.SimulatorViewerMutationSource.AGENT,
+        queuedAgentMutations: 0, agentPaused: false, takeoverPending: false }
+    });
+    await expect(h.service.controlSimulatorViewerInput(tap, h.context))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(h.service.getSimulatorViewerControls(create(
+      contract.GetSimulatorViewerControlsRequestSchema,
+      { sessionId: SCOPE.sessionId, route }), h.context))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(screenMap).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    const takeover = await h.service.setSimulatorViewerMutationControl(create(
+      contract.SetSimulatorViewerMutationControlRequestSchema,
+      { sessionId: SCOPE.sessionId, route, agentPaused: true }), h.context);
+    expect(takeover).toMatchObject({ mutation: { agentPaused: true, takeoverPending: true } });
+    await expect(active).rejects.toThrow();
+    await vi.waitFor(() => expect(h.mutations.state(SCOPE, internalRoute).takeoverPending).toBe(false));
+    await expect(h.mutations.runAgent(SCOPE, internalRoute, async () => undefined))
+      .rejects.toMatchObject({ code: "AGENT_MUTATION_PAUSED" });
+    expect(await h.service.controlSimulatorViewerInput(create(
+      contract.ControlSimulatorViewerInputRequestSchema,
+      { ...tap, requestId: randomUUID() }), h.context)).toMatchObject({ replayed: false });
+    expect(execute).toHaveBeenCalledOnce();
+    const resumed = await h.service.setSimulatorViewerMutationControl(create(
+      contract.SetSimulatorViewerMutationControlRequestSchema,
+      { sessionId: SCOPE.sessionId, route, agentPaused: false }), h.context);
+    expect(resumed).toMatchObject({ mutation: { agentPaused: false, takeoverPending: false } });
+    await expect(h.mutations.runAgent(SCOPE, internalRoute, async () => "agent"))
+      .resolves.toBe("agent");
+  } finally { h.store.close(); }
+});
+
 it("projects only the authenticated task's exact instance and routes UI deletion outside the agent catalog", async () => {
   const h = fixture();
   try {
@@ -386,7 +451,9 @@ it("projects only the authenticated task's exact instance and routes UI deletion
       contract.GetSimulatorViewerStateRequestSchema, { sessionId: SCOPE.sessionId }), h.context);
     expect(state).toMatchObject({ support: contract.CapabilitySupport.SUPPORTED,
       devices: [{ udid: DEVICE.udid }], instances: [{ simulatorName: DEVICE.name,
-        creationProvenance: "joko", route: { instanceId: h.instance.instanceId } }] });
+        creationProvenance: "joko", route: { instanceId: h.instance.instanceId },
+        mutation: { instanceId: h.instance.instanceId, activeSource:
+          contract.SimulatorViewerMutationSource.UNSPECIFIED, agentPaused: false } }] });
     const request = create(contract.ControlSimulatorInstanceRequestSchema, {
       sessionId: SCOPE.sessionId, requestId: randomUUID(),
       action: contract.SimulatorViewerAction.DELETE,
@@ -399,6 +466,10 @@ it("projects only the authenticated task's exact instance and routes UI deletion
     expect(h.remove).toHaveBeenCalledOnce();
     expect(h.clear).toHaveBeenCalledWith(h.instance.instanceId);
     expect(h.ownership.listForTask(SCOPE)).toEqual([]);
+    expect(await h.service.controlSimulatorInstance(request, h.context))
+      .toMatchObject({ deleted: true, replayed: true });
+    expect(h.remove).toHaveBeenCalledTimes(2);
+    expect(h.clear).toHaveBeenCalledTimes(2);
   } finally { h.store.close(); }
 });
 

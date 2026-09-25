@@ -1,19 +1,21 @@
 import { createClient, type Transport } from "@connectrpc/connect";
 import {
-  CapabilitySupport, SimulatorViewerAction, SimulatorViewerCommand, SimulatorViewerNativeRouteState,
+  CapabilitySupport, SimulatorViewerAction, SimulatorViewerCommand, SimulatorViewerMutationSource,
+  SimulatorViewerNativeRouteState,
   SimulatorViewerService, SimulatorViewerStreamState,
   SimulatorViewerTouchPhase,
-  type SimulatorViewerInstance
+  type SimulatorViewerInstance, type SimulatorViewerMutationState
 } from "@joko/contracts";
 import type {
-  OperationApi, SimulatorViewerInstanceView, SimulatorViewerRouteView,
+  OperationApi, SimulatorViewerInstanceView, SimulatorViewerMutationStateView, SimulatorViewerRouteView,
   SimulatorViewerStateView
 } from "./model.js";
 import { randomUuid } from "./web-crypto.js";
 
 type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance" |
   "controlSimulatorViewerInput" | "controlSimulatorViewerTouch" |
-  "setSimulatorViewerInteractionProfile" | "getSimulatorViewerControls" |
+  "setSimulatorViewerInteractionProfile" | "getSimulatorViewerMutationState" |
+  "setSimulatorViewerMutationControl" | "getSimulatorViewerControls" |
   "controlSimulatorViewerCommand" | "watchSimulatorFrames">;
 
 export function createSimulatorViewerGateway(transport: Transport, ownerSignal?: AbortSignal): ViewerApi {
@@ -80,6 +82,15 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
       const response = await client.setSimulatorViewerInteractionProfile({ sessionId, route,
         subscriptionId, active }, options(signal));
       return { applied: response.applied };
+    },
+    async getSimulatorViewerMutationState(sessionId, route, signal) {
+      const response = await client.getSimulatorViewerMutationState({ sessionId, route }, options(signal));
+      return mutationView(response.mutation, route.instanceId);
+    },
+    async setSimulatorViewerMutationControl(sessionId, route, agentPaused, signal) {
+      const response = await client.setSimulatorViewerMutationControl({ sessionId, route,
+        agentPaused }, options(signal));
+      return mutationView(response.mutation, route.instanceId);
     },
     async getSimulatorViewerControls(sessionId, route, signal) {
       const response = await client.getSimulatorViewerControls({ sessionId, route }, options(signal));
@@ -202,10 +213,26 @@ function instanceView(value: SimulatorViewerInstance | undefined): SimulatorView
     creationProvenance: value.creationProvenance as SimulatorViewerInstanceView["creationProvenance"],
     lifecycleState: value.lifecycleState as SimulatorViewerInstanceView["lifecycleState"],
     viewerState: value.viewerState as SimulatorViewerInstanceView["viewerState"],
-    healthState: value.healthState,
+    healthState: value.healthState, mutation: mutationView(value.mutation, route.instanceId),
     ...(value.errorCode === "" ? {} : { errorCode: value.errorCode }),
     ...(value.graceExpiresAtMs === 0n ? {} : { graceExpiresAtMs: Number(value.graceExpiresAtMs) })
   };
+}
+
+function mutationView(value: SimulatorViewerMutationState | undefined,
+  instanceId: string): SimulatorViewerMutationStateView {
+  const source = (input: SimulatorViewerMutationSource): "agent" | "user" | null =>
+    input === SimulatorViewerMutationSource.AGENT ? "agent"
+      : input === SimulatorViewerMutationSource.USER ? "user"
+        : input === SimulatorViewerMutationSource.UNSPECIFIED ? null
+          : (() => { throw new Error("Simulator mutation source is invalid."); })();
+  if (!value || value.instanceId !== instanceId || !Number.isSafeInteger(value.queuedAgentMutations) ||
+      value.queuedAgentMutations < 0 || value.takeoverPending && !value.agentPaused) {
+    throw new Error("Simulator Viewer mutation state is invalid.");
+  }
+  return { instanceId, activeSource: source(value.activeSource), lastSource: source(value.lastSource),
+    queuedAgentMutations: value.queuedAgentMutations, agentPaused: value.agentPaused,
+    takeoverPending: value.takeoverPending };
 }
 
 function validRoute(value: SimulatorViewerRouteView): boolean {

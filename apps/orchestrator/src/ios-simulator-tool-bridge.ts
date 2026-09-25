@@ -28,6 +28,8 @@ import { SimulatorRecordingError, type SimulatorRecordingCoordinator,
   type SimulatorRecordingStopReceipt } from "./ios-simulator-recording.js";
 import { SimulatorVisualComparisonError, type SimulatorVisualComparisonCoordinator } from "./ios-simulator-visual-comparison.js";
 import { SimulatorStateDiagnosticsError, type SimulatorStateDiagnosticsCoordinator } from "./ios-simulator-state-diagnostics.js";
+import { SimulatorMutationArbitrationError, type SimulatorMutationArbiter
+} from "./ios-simulator-mutation-arbiter.js";
 
 export const IOS_SIMULATOR_TOOL_PROVIDER_ID = "joko_ios_simulator";
 const CATEGORY = "ios_simulator";
@@ -210,6 +212,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   readonly #recording: SimulatorRecordingCoordinator | undefined;
   readonly #visual: SimulatorVisualComparisonCoordinator | undefined;
   readonly #stateDiagnostics: SimulatorStateDiagnosticsCoordinator | undefined;
+  readonly #mutations: SimulatorMutationArbiter | undefined;
   readonly #memoryProbe: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
 
   constructor(options: {
@@ -227,6 +230,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     readonly recording?: SimulatorRecordingCoordinator;
     readonly visual?: SimulatorVisualComparisonCoordinator;
     readonly stateDiagnostics?: SimulatorStateDiagnosticsCoordinator;
+    readonly mutations?: SimulatorMutationArbiter;
     readonly runtime?: SimulatorEnvironmentRuntime;
     readonly memoryProbe?: (signal?: AbortSignal) => Promise<SimulatorMemorySnapshot>;
   }) {
@@ -244,6 +248,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     this.#recording = options.recording;
     this.#visual = options.visual;
     this.#stateDiagnostics = options.stateDiagnostics;
+    this.#mutations = options.mutations;
     this.tools = bridgeTools(options.control !== undefined, options.screen !== undefined,
       options.input !== undefined, options.stateControl !== undefined,
       options.projectBuild !== undefined, options.appInstall !== undefined,
@@ -311,30 +316,21 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
       }
       if (!isRecord(args)) throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator tool arguments must be an object.");
       if (name === "control_tool") {
-        if (selected === "capture_state") return await this.#callCaptureState(args, signal, context);
-        if (OBSERVATION_TOOLS.some(tool => tool.name === selected)) {
-          return await this.#callScreenObservation(selected, args, signal, context);
+        const dispatch = (currentSignal: AbortSignal | undefined) =>
+          this.#callControlTool(selected, args, currentSignal, context);
+        const route = mutationRouteForControl(selected, args);
+        if (this.#mutations && route) {
+          try { return await this.#mutations.runAgent(context, route, dispatch, signal); }
+          catch (error) {
+            // A completed external detach has no live actor. Its durable coordinator alone can
+            // authenticate an exact replay; all other stale/foreign routes still fail admission.
+            if (selected === "detach_device" && error instanceof SimulatorOwnershipError) {
+              return await dispatch(signal);
+            }
+            throw error;
+          }
         }
-        if (INPUT_TOOLS.some(tool => tool.name === selected)) {
-          return await this.#callInput(selected, args, signal, context);
-        }
-        if (STATE_TOOLS.some(tool => tool.name === selected)) {
-          return await this.#callStateControl(selected, args, signal, context);
-        }
-        if (selected === "build_app") return await this.#callProjectBuild(args, signal, context);
-        if (selected === "install_app") return await this.#callAppInstall(args, signal, context);
-        if (selected === "launch_app" || selected === "terminate_app") {
-          return await this.#callAppControl(selected, args, signal, context);
-        }
-        if (selected === "open_simulator_url") return await this.#callUrl(args, signal, context);
-        if (selected === "take_simulator_screenshot") return await this.#callScreenshot(args, signal, context);
-        if (selected === "start_recording" || selected === "stop_recording") {
-          return await this.#callRecording(selected, args, signal, context);
-        }
-        if (selected === "capture_visual_baseline" || selected === "visual_diff") {
-          return await this.#callVisual(selected, args, signal, context);
-        }
-        return await this.#callInstanceControl(selected, args, signal, context);
+        return await dispatch(signal);
       }
       if (selected === "read_build_diagnostics") {
         if (!this.#projectBuild) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator build diagnostics are unavailable.");
@@ -518,6 +514,7 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         error instanceof SimulatorScreenshotError || error instanceof SimulatorRecordingError ||
         error instanceof SimulatorVisualComparisonError ||
         error instanceof SimulatorStateDiagnosticsError ||
+        error instanceof SimulatorMutationArbitrationError ||
         error instanceof SimulatorScreenMapError ||
         error instanceof WdaClientError;
       const code = known ? error.code : error instanceof OperationInProgressError
@@ -528,6 +525,34 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
         ...(error instanceof SimulatorAppBuildError && error.diagnostics
           ? { data: { diagnostics: error.diagnostics } } : {}) }, true);
     }
+  }
+
+  async #callControlTool(selected: string, args: Record<string, unknown>,
+    signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
+    if (selected === "capture_state") return this.#callCaptureState(args, signal, context);
+    if (OBSERVATION_TOOLS.some(tool => tool.name === selected)) {
+      return this.#callScreenObservation(selected, args, signal, context);
+    }
+    if (INPUT_TOOLS.some(tool => tool.name === selected)) {
+      return this.#callInput(selected, args, signal, context);
+    }
+    if (STATE_TOOLS.some(tool => tool.name === selected)) {
+      return this.#callStateControl(selected, args, signal, context);
+    }
+    if (selected === "build_app") return this.#callProjectBuild(args, signal, context);
+    if (selected === "install_app") return this.#callAppInstall(args, signal, context);
+    if (selected === "launch_app" || selected === "terminate_app") {
+      return this.#callAppControl(selected, args, signal, context);
+    }
+    if (selected === "open_simulator_url") return this.#callUrl(args, signal, context);
+    if (selected === "take_simulator_screenshot") return this.#callScreenshot(args, signal, context);
+    if (selected === "start_recording" || selected === "stop_recording") {
+      return this.#callRecording(selected, args, signal, context);
+    }
+    if (selected === "capture_visual_baseline" || selected === "visual_diff") {
+      return this.#callVisual(selected, args, signal, context);
+    }
+    return this.#callInstanceControl(selected, args, signal, context);
   }
 
   async #callInstanceControl(name: string, args: Record<string, unknown>, signal: AbortSignal | undefined,
@@ -1151,6 +1176,13 @@ function requiredName(value: unknown): string {
     throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator name is invalid.");
   }
   return value;
+}
+
+function mutationRouteForControl(name: string,
+  value: Readonly<Record<string, unknown>>): ReturnType<typeof requiredRoute> | undefined {
+  // Builds intentionally remain independent so they can continue during manual control.
+  if (name === "build_app" || name === "create_instance" || name === "attach_device") return undefined;
+  return requiredRoute(value);
 }
 
 function requiredRoute(value: Readonly<Record<string, unknown>>): {

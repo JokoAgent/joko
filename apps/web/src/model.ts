@@ -5301,6 +5301,18 @@ export interface SimulatorViewerInstanceView {
   readonly healthState: string;
   readonly errorCode?: string;
   readonly graceExpiresAtMs?: number;
+  readonly mutation: SimulatorViewerMutationStateView;
+}
+
+export type SimulatorViewerMutationSourceView = "agent" | "user";
+
+export interface SimulatorViewerMutationStateView {
+  readonly instanceId: string;
+  readonly activeSource: SimulatorViewerMutationSourceView | null;
+  readonly lastSource: SimulatorViewerMutationSourceView | null;
+  readonly queuedAgentMutations: number;
+  readonly agentPaused: boolean;
+  readonly takeoverPending: boolean;
 }
 
 export interface SimulatorViewerStateView {
@@ -5389,6 +5401,10 @@ export interface OperationApi {
     touch: SimulatorViewerTouchView, signal?: AbortSignal): Promise<{ readonly accepted: boolean }>;
   setSimulatorViewerInteractionProfile(sessionId: string, route: SimulatorViewerRouteView,
     subscriptionId: string, active: boolean, signal?: AbortSignal): Promise<{ readonly applied: boolean }>;
+  getSimulatorViewerMutationState(sessionId: string, route: SimulatorViewerRouteView,
+    signal?: AbortSignal): Promise<SimulatorViewerMutationStateView>;
+  setSimulatorViewerMutationControl(sessionId: string, route: SimulatorViewerRouteView,
+    agentPaused: boolean, signal?: AbortSignal): Promise<SimulatorViewerMutationStateView>;
   getSimulatorViewerControls(sessionId: string, route: SimulatorViewerRouteView,
     signal?: AbortSignal): Promise<SimulatorViewerControlsView>;
   controlSimulatorViewerCommand(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
