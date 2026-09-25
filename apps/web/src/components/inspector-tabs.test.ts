@@ -15,7 +15,7 @@ import {
   type InspectorTabKind
 } from "./inspector-tabs.js";
 
-const ALL = new Set<InspectorTabKind>(["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "tools", "browser"]);
+const ALL = new Set<InspectorTabKind>(["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "simulator", "tools", "browser"]);
 const BUCKET: InspectorTabBucket = {
   tabs: [
     { id: "context", kind: "context" },

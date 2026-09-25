@@ -25,6 +25,7 @@ const runtimePackageRoots = [
   "packages/tool-browser",
   "packages/tool-computer",
   "packages/tool-document",
+  "packages/tool-ios-simulator",
   "packages/tool-lsp",
   "packages/voice-input",
   "packages/worktree"

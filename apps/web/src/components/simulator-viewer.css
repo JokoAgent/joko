@@ -1,0 +1,50 @@
+.simulator-viewer { container-type: inline-size; display: grid; gap: 24px; min-width: 0; padding: 20px; }
+.simulator-viewer__header { display: flex; flex-wrap: wrap; align-items: start; justify-content: space-between; gap: 12px; }
+.simulator-viewer__header h2 { margin: 0; font-size: var(--text-20); }
+.simulator-viewer__section { display: grid; gap: 12px; min-width: 0; }
+.simulator-viewer__section h3 { margin: 0; font-size: var(--text-15); }
+.simulator-viewer__section > p { margin: 0; }
+.simulator-viewer__notice { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-subtle); }
+.simulator-viewer__grid, .simulator-viewer__forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; }
+.simulator-viewer__card, .simulator-viewer__forms form { display: grid; align-content: start; gap: 12px; min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-raised); }
+.simulator-viewer__card-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.simulator-viewer__card-header h4 { margin: 0; font-size: var(--text-15); }
+.simulator-viewer__card-header span { color: var(--text-muted); font-size: var(--text-12); }
+.simulator-viewer__mutation { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-subtle); }
+.simulator-viewer__mutation > div { flex: 1 1 180px; min-width: 0; }
+.simulator-viewer__mutation strong { font-size: var(--text-13); }
+.simulator-viewer__mutation p { margin: 3px 0 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
+.simulator-viewer__interaction { display: grid; gap: 8px; min-width: 0; }
+.simulator-viewer__toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.simulator-viewer__toolbar .button { min-height: 36px; }
+.simulator-viewer__toolbar .button svg { width: 15px; height: 15px; }
+.simulator-viewer__telemetry, .simulator-viewer__feedback { margin: 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
+.simulator-viewer__feedback { color: var(--green); }
+.simulator-viewer__native-recovery { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-subtle); color: var(--text-muted); font-size: var(--text-12); }
+.simulator-viewer__native-recovery > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.simulator-viewer__screen { display: grid; justify-items: center; gap: 8px; min-width: 0; min-height: 175px; color: var(--text-muted); text-align: center; }
+.simulator-viewer__screen-frame { width: 100%; min-width: 0; min-height: 175px; display: grid; place-content: center; justify-items: center; gap: 8px; overflow: hidden; border-radius: 10px; padding: 16px; outline: 1px dashed var(--line-strong); outline-offset: -1px; background: var(--surface-sunken); }
+.simulator-viewer__screen-frame.is-fitted { min-height: 0; display: block; padding: 0; }
+.simulator-viewer__screen-frame svg { width: 30px; height: 30px; }
+.simulator-viewer__screen-frame:not(.is-fitted) img, .simulator-viewer__screen-frame:not(.is-fitted) canvas { display: block; width: 100%; height: auto; max-height: min(65vh, 680px); object-fit: contain; }
+.simulator-viewer__screen-frame.is-fitted img, .simulator-viewer__screen-frame.is-fitted canvas { display: block; width: 100%; height: 100%; object-fit: contain; }
+.simulator-viewer__frame { touch-action: none; user-select: none; cursor: crosshair; }
+.simulator-viewer__frame[aria-disabled="true"] { pointer-events: none; cursor: default; opacity: .8; }
+.simulator-viewer__screen .button { margin-top: 4px; }
+.simulator-viewer__quality { display: flex; align-items: center; gap: 8px; max-width: 100%; font-size: var(--text-12); }
+.simulator-viewer__quality select { min-width: 0; max-width: 100%; }
+.simulator-viewer__keyboard { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.simulator-viewer__keyboard label { position: relative; flex: 1; min-width: 0; }
+.simulator-viewer__keyboard label > svg { position: absolute; top: 50%; left: 10px; width: 15px; height: 15px; color: var(--text-muted); transform: translateY(-50%); pointer-events: none; }
+.simulator-viewer__keyboard input { width: 100%; min-width: 0; min-height: 36px; padding: 6px 10px 6px 34px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--text); }
+.simulator-viewer__input-error { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--red) 30%, var(--line)); border-radius: 10px; background: var(--red-soft); color: var(--red); font-size: var(--text-12); }
+.simulator-viewer__input-error > svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.simulator-viewer__input-error > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.simulator-viewer__hint { margin: 0; color: var(--text-muted); font-size: var(--text-12); }
+.simulator-viewer__metadata { margin: 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
+.simulator-viewer__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.simulator-viewer__forms label { display: grid; gap: 5px; min-width: 0; }
+.simulator-viewer__forms input, .simulator-viewer__forms select { width: 100%; min-width: 0; min-height: 36px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+.simulator-viewer__delete { display: grid; gap: 10px; }
+.simulator-viewer__delete p { margin: 0; }
+@container (max-width: 340px) { .simulator-viewer { padding: 12px; } .simulator-viewer__header .button { width: 100%; } .simulator-viewer__mutation .button { width: 100%; } .simulator-viewer__toolbar .button { flex: 1 1 calc(50% - 6px); } .simulator-viewer__keyboard { align-items: stretch; flex-direction: column; } .simulator-viewer__keyboard .button { width: 100%; } .simulator-viewer__input-error { align-items: stretch; flex-direction: column; } }

@@ -1,0 +1,326 @@
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { afterEach, expect, it } from "vitest";
+import { WdaLoopbackClient } from "./wda-loopback-client.js";
+
+const UDID = "A0123456-1234-1234-1234-123456789ABC";
+const servers: Server[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => {
+    server.closeAllConnections();
+    server.close(() => resolve());
+  })));
+});
+
+async function loopback(handler: (request: IncomingMessage, response: ServerResponse) => void): Promise<number> {
+  const server = createServer(handler);
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Loopback port was not allocated.");
+  return address.port;
+}
+
+function client(controlPort: number, options: { timeoutMs?: number; maxResponseBytes?: number } = {}): WdaLoopbackClient {
+  return new WdaLoopbackClient({ controlPort, cacheRoot: "/private/joko/wda-cache", instanceId: "instance-1",
+    simulatorUdid: UDID, ...options });
+}
+
+function json(response: ServerResponse, body: unknown, status = 200): void {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+it("uses exact loopback routes, verifies the device-bound process marker and manages a W3C session", async () => {
+  let fingerprint = "";
+  const calls: { method: string; path: string; body: string }[] = [];
+  const port = await loopback((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      calls.push({ method: request.method ?? "", path: request.url ?? "", body: Buffer.concat(chunks).toString("utf8") });
+      if (request.url === "/status") json(response, { value: { ready: true,
+        build: { upgradedAt: fingerprint }, os: { name: "iOS", version: "19.0", sdkVersion: "19.0" } } });
+      else if (request.method === "POST" && request.url === "/session") {
+        json(response, { value: { sessionId: "SESSION-1", capabilities: { device: "iphone" } } });
+      } else json(response, { value: null });
+    });
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  expect(await driver.probe()).toMatchObject({ ready: true, osName: "iOS", osVersion: "19.0" });
+  const session = await driver.createSession();
+  expect(session).toMatchObject({ id: "SESSION-1", capabilities: { device: "iphone" } });
+  await driver.deleteSession(session.id);
+  expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
+    "GET /status", "GET /status", "POST /session", "GET /status", "DELETE /session/SESSION-1"
+  ]);
+  expect(JSON.parse(calls[2]?.body ?? "")).toEqual({ capabilities: { alwaysMatch: {} } });
+});
+
+it("reads only the exact owned session's bounded accessibility tree", async () => {
+  let fingerprint = "";
+  let malformed = false;
+  const paths: string[] = [];
+  const port = await loopback((request, response) => {
+    paths.push(request.url ?? "");
+    if (request.url === "/status") json(response, { value: { ready: true,
+      build: { upgradedAt: fingerprint } } });
+    else if (request.url === "/session/SESSION-1/source?format=json") {
+      json(response, { value: malformed ? null : { type: "XCUIElementTypeButton", label: "Continue" } });
+    } else if (request.url === "/session/SESSION-1/window/size") {
+      json(response, { value: { width: 393, height: 852 } });
+    } else if (request.url === "/session/SESSION-1/orientation") {
+      json(response, { value: "PORTRAIT" });
+    } else json(response, { value: { error: "invalid session id" } }, 404);
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  expect(await driver.getAccessibilityTree("SESSION-1")).toMatchObject({
+    tree: { type: "XCUIElementTypeButton", label: "Continue" }
+  });
+  expect(paths).toEqual(["/status", "/session/SESSION-1/source?format=json"]);
+  expect(await driver.getViewport("SESSION-1")).toEqual({ width: 393, height: 852,
+    orientation: "PORTRAIT" });
+  await expect(driver.getAccessibilityTree("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(paths).toHaveLength(5);
+  malformed = true;
+  await expect(driver.getAccessibilityTree("SESSION-1")).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+});
+
+it("configures only the owned WDA session with bounded MJPEG settings", async () => {
+  let fingerprint = "";
+  const settings: unknown[] = [];
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") {
+      json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+    } else if (request.method === "POST" && request.url === "/session/SESSION-1/appium/settings") {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => { settings.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        json(response, { value: null }); });
+    } else json(response, { value: null }, 404);
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  await driver.configureMjpegStream("SESSION-1",
+    { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 });
+  expect(settings).toEqual([{ settings: { mjpegServerFramerate: 10,
+    mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70 } }]);
+  await expect(driver.configureMjpegStream("SESSION-1",
+    { framesPerSecond: 0, jpegQuality: 45, scalingPercent: 70 }))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.configureMjpegStream("bad/id",
+    { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 }))
+    .rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(settings).toHaveLength(1);
+});
+
+it("fails closed on foreign ownership, non-ready status, invalid session and unsafe local port", async () => {
+  let status: unknown = { value: { ready: true, build: { upgradedAt: "foreign" } } };
+  let postCount = 0;
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") json(response, status);
+    else { postCount += 1; json(response, { value: { error: "invalid session id", message: "private path" } }, 404); }
+  });
+  const driver = client(port);
+  await expect(driver.createSession()).rejects.toMatchObject({ code: "OWNER_MISMATCH" });
+  status = { value: { ready: false, build: { upgradedAt: driver.ownerFingerprint } } };
+  await expect(driver.createSession()).rejects.toMatchObject({ code: "NOT_READY" });
+  status = { value: { ready: true, build: { upgradedAt: driver.ownerFingerprint } } };
+  await expect(driver.deleteSession("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  await expect(driver.deleteSession("SESSION-1")).rejects.toMatchObject({ code: "INVALID_SESSION", statusCode: 404 });
+  expect(postCount).toBe(1);
+  expect(() => client(80)).toThrow(/controlPort/u);
+  expect(() => new WdaLoopbackClient({ controlPort: port, cacheRoot: "relative", instanceId: "instance-1",
+    simulatorUdid: UDID })).toThrow(/owner identity/u);
+});
+
+it("rejects redirects, malformed responses and streamed byte overflow without following targets", async () => {
+  let mode: "redirect" | "malformed" | "oversized" = "redirect";
+  const port = await loopback((_request, response) => {
+    if (mode === "redirect") { response.writeHead(302, { location: "http://example.invalid/private" }); response.end(); }
+    else if (mode === "malformed") { response.writeHead(200); response.end("{}"); }
+    else { response.writeHead(200, { "content-type": "application/json" }); response.write("{".repeat(30)); response.end("}".repeat(30)); }
+  });
+  const driver = client(port, { maxResponseBytes: 16 });
+  await expect(driver.probe()).rejects.toMatchObject({ code: "PROTOCOL_ERROR", statusCode: 302 });
+  mode = "malformed";
+  await expect(driver.probe()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+  mode = "oversized";
+  await expect(driver.probe()).rejects.toMatchObject({ code: "RESPONSE_TOO_LARGE" });
+});
+
+it("bounds stalled loopback reads and distinguishes timeout from caller cancellation", async () => {
+  let started!: () => void;
+  let requestStarted = new Promise<void>(resolve => { started = resolve; });
+  const port = await loopback((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write("{");
+    started();
+  });
+  const driver = client(port, { timeoutMs: 40 });
+  await expect(driver.probe()).rejects.toMatchObject({ code: "TIMEOUT" });
+  requestStarted = new Promise<void>(resolve => { started = resolve; });
+  const controller = new AbortController();
+  const pending = driver.probe(controller.signal);
+  await requestStarted;
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ code: "CANCELLED" });
+});
+
+it("sends bounded device input only to the exact owned WDA session", async () => {
+  let fingerprint = "";
+  let ready = true;
+  let rejectSession = false;
+  const calls: { path: string; method: string; body: unknown }[] = [];
+  const port = await loopback((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      calls.push({ path: request.url ?? "", method: request.method ?? "",
+        body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null });
+      if (request.url === "/status") json(response, { value: { ready,
+        build: { upgradedAt: fingerprint } } });
+      else if (rejectSession) json(response, { value: { error: "invalid session id" } }, 404);
+      else json(response, { value: null });
+    });
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  await driver.tap("SESSION-1", { x: 12, y: 25 });
+  await driver.swipe("SESSION-1", { x: 12, y: 25 }, { x: 150, y: 300 }, 300);
+  await driver.typeText("SESSION-1", "A😀");
+  await driver.home("SESSION-1");
+  await driver.lock("SESSION-1");
+  await driver.unlock("SESSION-1");
+  expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
+    "GET /status", "POST /session/SESSION-1/actions",
+    "GET /status", "POST /session/SESSION-1/actions",
+    "GET /status", "POST /session/SESSION-1/wda/keys",
+    "GET /status", "POST /session/SESSION-1/wda/pressButton",
+    "GET /status", "POST /session/SESSION-1/wda/lock",
+    "GET /status", "POST /session/SESSION-1/wda/unlock"
+  ]);
+  expect(calls[1]?.body).toMatchObject({ actions: [{ type: "pointer", id: "finger",
+    parameters: { pointerType: "touch" }, actions: [
+      { type: "pointerMove", x: 12, y: 25 }, { type: "pointerDown" },
+      { type: "pause", duration: 50 }, { type: "pointerUp" }
+    ] }] });
+  expect(calls[3]?.body).toMatchObject({ actions: [{ actions: [
+    { type: "pointerMove", x: 12, y: 25 }, { type: "pointerDown" },
+    { type: "pause" }, { type: "pointerMove", x: 150, y: 300, duration: 300 },
+    { type: "pointerUp" }
+  ] }] });
+  expect(calls[5]?.body).toEqual({ value: ["A", "😀"] });
+  expect(calls[7]?.body).toEqual({ name: "home" });
+  expect(calls[9]?.body).toEqual({});
+  expect(calls[11]?.body).toEqual({});
+  await expect(driver.tap("SESSION-1", { x: -1, y: 0 })).rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.swipe("SESSION-1", { x: 0, y: 0 }, { x: 1, y: 1 }, 60_001))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.typeText("SESSION-1", "x".repeat(10_001)))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  await expect(driver.home("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  await expect(driver.lock("bad/id")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(calls).toHaveLength(12);
+  ready = false;
+  await expect(driver.tap("SESSION-1", { x: 0, y: 0 })).rejects.toMatchObject({ code: "NOT_READY" });
+  fingerprint = "foreign";
+  await expect(driver.home("SESSION-1")).rejects.toMatchObject({ code: "OWNER_MISMATCH" });
+  fingerprint = driver.ownerFingerprint;
+  ready = true;
+  rejectSession = true;
+  await expect(driver.home("SESSION-1")).rejects.toMatchObject({ code: "INVALID_SESSION" });
+  expect(calls.filter(call => call.method === "POST")).toHaveLength(7);
+});
+
+it("marks dispatched input as outcome-unknown when the response times out or caller cancels", async () => {
+  let fingerprint = "";
+  let started!: () => void;
+  let entered = new Promise<void>(resolve => { started = resolve; });
+  let posts = 0;
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") {
+      json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+      return;
+    }
+    posts += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.write("{");
+    started();
+  });
+  const driver = client(port, { timeoutMs: 50 });
+  fingerprint = driver.ownerFingerprint;
+  const timed = driver.tap("SESSION-1", { x: 10, y: 10 });
+  await entered;
+  await expect(timed).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  entered = new Promise<void>(resolve => { started = resolve; });
+  const controller = new AbortController();
+  const cancelled = driver.typeText("SESSION-1", "private input", controller.signal);
+  await entered;
+  controller.abort();
+  await expect(cancelled).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  entered = new Promise<void>(resolve => { started = resolve; });
+  const locked = driver.lock("SESSION-1");
+  await entered;
+  await expect(locked).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  entered = new Promise<void>(resolve => { started = resolve; });
+  const unlockController = new AbortController();
+  const unlocked = driver.unlock("SESSION-1", unlockController.signal);
+  await entered;
+  unlockController.abort();
+  await expect(unlocked).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+  expect(posts).toBe(4);
+});
+
+it("sets orientation through the exact owned WDA session with a bounded payload", async () => {
+  let fingerprint = "";
+  const calls: { path: string; method: string; body: unknown }[] = [];
+  const port = await loopback((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      calls.push({ path: request.url ?? "", method: request.method ?? "",
+        body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null });
+      if (request.url === "/status") {
+        json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+      } else json(response, { value: null });
+    });
+  });
+  const driver = client(port);
+  fingerprint = driver.ownerFingerprint;
+  await driver.setOrientation("SESSION-1", "LANDSCAPE");
+  expect(calls).toEqual([
+    { path: "/status", method: "GET", body: null },
+    { path: "/session/SESSION-1/orientation", method: "POST",
+      body: { orientation: "LANDSCAPE" } }
+  ]);
+  await expect(driver.setOrientation("SESSION-1", "UPSIDE_DOWN" as "PORTRAIT"))
+    .rejects.toMatchObject({ code: "INVALID_CONFIGURATION" });
+  expect(calls).toHaveLength(2);
+});
+
+it("distinguishes unsupported orientation from an uncertain dispatched rotation", async () => {
+  let fingerprint = "";
+  let mode: "unsupported" | "stalled" = "unsupported";
+  const port = await loopback((request, response) => {
+    if (request.url === "/status") {
+      json(response, { value: { ready: true, build: { upgradedAt: fingerprint } } });
+    } else if (mode === "unsupported") {
+      json(response, { value: { error: "unknown error",
+        message: "Unable To Rotate Device: private application detail" } }, 500);
+    } else {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write("{");
+    }
+  });
+  const driver = client(port, { timeoutMs: 40 });
+  fingerprint = driver.ownerFingerprint;
+  await expect(driver.setOrientation("SESSION-1", "LANDSCAPE"))
+    .rejects.toMatchObject({ code: "ORIENTATION_UNSUPPORTED",
+      message: "The foreground app does not support the requested orientation." });
+  mode = "stalled";
+  await expect(driver.setOrientation("SESSION-1", "PORTRAIT"))
+    .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+});

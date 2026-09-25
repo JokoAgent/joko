@@ -614,6 +614,12 @@ function toolResultParts(value: unknown): readonly ToolResultContentPart[] {
         const alt = safeText(candidate["alt"]);
         parts.push({ kind: "image", blob, ...(alt === undefined ? {} : { alt }) });
       }
+    } else if (candidate?.["type"] === "artifact") {
+      const blob = blobRef(candidate["blob"]);
+      const label = safeText(candidate["label"]);
+      if (blob !== undefined && label !== undefined && label !== "") {
+        parts.push({ kind: "artifact", blob, label });
+      }
     }
   }
   return parts;
