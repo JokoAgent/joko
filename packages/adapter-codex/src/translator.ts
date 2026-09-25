@@ -512,7 +512,7 @@ export function interactionFromServerRequest(
     if (record["networkApprovalContext"] !== undefined && record["networkApprovalContext"] !== null) return undefined;
     const available = commandApprovalAvailability(record["availableDecisions"], record);
     if (available.malformed) return undefined;
-    const choices = commandApprovalChoices(available.decisions, available.explicit);
+    const choices = commandApprovalChoices(available.decisions);
     if (choices.length === 0) return undefined;
     const command = typeof record["command"] === "string" ? safeText(record["command"], 4_096) : "Command execution";
     const reason = typeof record["reason"] === "string" ? safeText(record["reason"], 1_024) : undefined;
@@ -539,7 +539,7 @@ export function interactionFromServerRequest(
         toolName: "file_change",
         summary: reason,
         risk: "high",
-        choices: ["approve_once", "approve_session", "decline"]
+        choices: ["allow_once", "deny_once"]
       },
       toResponse: (decision) => ({ decision: approvalDecision(decision) })
     };
@@ -555,12 +555,12 @@ export function interactionFromServerRequest(
         toolName: "permissions",
         summary,
         risk: "high",
-        choices: ["approve_once", "approve_session", "decline"]
+        choices: ["allow_once", "deny_once"]
       },
       toResponse: (decision) => {
         const selected = selectedDecision(decision);
-        return selected === "approve_once" || selected === "approve_session"
-          ? { permissions: requested, scope: selected === "approve_session" ? "session" : "turn" }
+        return selected === "allow_once"
+          ? { permissions: requested, scope: "turn" }
           : { permissions: {}, scope: "turn" };
       }
     };
@@ -836,15 +836,12 @@ function boundedAnswer(value: string): string | undefined {
 }
 
 function commandApprovalChoices(
-  decisions: readonly ScalarCommandApprovalDecision[],
-  explicit: boolean
+  decisions: readonly ScalarCommandApprovalDecision[]
 ): readonly string[] {
-  return decisions.flatMap((decision) => {
-    if (decision === "accept") return ["approve_once"];
-    if (decision === "acceptForSession") return ["approve_session"];
-    if (decision === "decline") return ["decline"];
-    return explicit ? ["cancel"] : [];
-  });
+  const choices: string[] = [];
+  if (decisions.includes("accept")) choices.push("allow_once");
+  if (decisions.includes("decline") || decisions.includes("cancel")) choices.push("deny_once");
+  return choices;
 }
 
 function commandApprovalDecision(
@@ -852,11 +849,11 @@ function commandApprovalDecision(
   available: readonly ScalarCommandApprovalDecision[]
 ): ScalarCommandApprovalDecision {
   const selected = selectedDecision(decision);
-  const candidate = selected === "approve_once"
+  const candidate = selected === "allow_once"
     ? "accept"
-    : selected === "approve_session"
-      ? "acceptForSession"
-      : selected === "cancel" || decision.kind === "cancelled"
+    : selected === "deny_once"
+      ? available.includes("decline") ? "decline" : "cancel"
+      : decision.kind === "cancelled"
         ? "cancel"
         : "decline";
   if (available.includes(candidate)) return candidate;
@@ -867,14 +864,13 @@ function commandApprovalDecision(
 
 function approvalDecision(decision: InteractionDecision): "accept" | "acceptForSession" | "decline" | "cancel" {
   const selected = selectedDecision(decision);
-  if (selected === "approve_once") return "accept";
-  if (selected === "approve_session") return "acceptForSession";
+  if (selected === "allow_once") return "accept";
   return decision.kind === "cancelled" ? "cancel" : "decline";
 }
 
 function selectedDecision(decision: InteractionDecision): string | undefined {
   if (decision.kind === "selected") return decision.value;
-  if (decision.kind === "confirmed") return decision.confirmed ? "approve_once" : "decline";
+  if (decision.kind === "confirmed") return decision.confirmed ? "allow_once" : "deny_once";
   return undefined;
 }
 

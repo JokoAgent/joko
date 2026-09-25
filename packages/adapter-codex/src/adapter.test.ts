@@ -839,7 +839,7 @@ describe("CodexBackendAdapter", () => {
     await started;
 
     Object.defineProperty(decisionContext, "backendInstanceGeneration", { value: 12 });
-    releaseDecision?.({ kind: "selected", value: "approve_once" });
+    releaseDecision?.({ kind: "selected", value: "allow_once" });
     await expect(approval).resolves.toEqual({ decision: "cancel" });
   });
 
@@ -912,7 +912,7 @@ describe("CodexBackendAdapter", () => {
     await expect(approval).resolves.toEqual({ decision: "cancel" });
     expect(interactionSignal?.aborted).toBe(true);
 
-    releaseDecision?.({ kind: "selected", value: "approve_once" });
+    releaseDecision?.({ kind: "selected", value: "allow_once" });
     await Promise.resolve();
     expect(setup.fake.transport?.lastServerRequestId).toBe(requestId);
   });
@@ -931,7 +931,7 @@ describe("CodexBackendAdapter", () => {
       operationId: "terminal-approval-turn",
       requestInteraction: async () => {
         interactionCount += 1;
-        return { kind: "selected", value: "approve_once" };
+        return { kind: "selected", value: "allow_once" };
       }
     });
     await setup.adapter.send({

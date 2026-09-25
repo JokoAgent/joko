@@ -189,10 +189,11 @@ describe("Codex interaction translation", () => {
     expect(command?.payload).toMatchObject({
       kind: "permission",
       toolName: "command",
-      choices: ["approve_once"]
+      choices: ["allow_once", "deny_once"]
     });
-    expect(command?.toResponse({ kind: "selected", value: "approve_once" })).toEqual({ decision: "accept" });
-    expect(command?.toResponse({ kind: "selected", value: "approve_session" })).toEqual({ decision: "cancel" });
+    expect(command?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ decision: "accept" });
+    expect(command?.toResponse({ kind: "selected", value: "deny_once" })).toEqual({ decision: "cancel" });
+    expect(command?.toResponse({ kind: "selected", value: "allow_for_session" })).toEqual({ decision: "cancel" });
 
     const file = interactionFromServerRequest(2, "item/fileChange/requestApproval", {
       threadId: "thread-one",
@@ -200,7 +201,9 @@ describe("Codex interaction translation", () => {
       itemId: "file-one",
       reason: "Update a source file"
     }, "D:\\workspace");
-    expect(file?.payload).toMatchObject({ kind: "permission", toolName: "file_change" });
+    expect(file?.payload).toMatchObject({ kind: "permission", toolName: "file_change", choices: ["allow_once", "deny_once"] });
+    expect(file?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ decision: "accept" });
+    expect(file?.toResponse({ kind: "selected", value: "allow_for_session" })).toEqual({ decision: "decline" });
     expect(file?.toResponse({ kind: "cancelled" })).toEqual({ decision: "cancel" });
   });
 
@@ -214,10 +217,10 @@ describe("Codex interaction translation", () => {
     }, "D:\\workspace");
     expect(interaction?.payload).toMatchObject({
       kind: "permission",
-      choices: ["approve_once", "decline"]
+      choices: ["allow_once", "deny_once"]
     });
-    expect(interaction?.toResponse({ kind: "selected", value: "approve_once" })).toEqual({ decision: "accept" });
-    expect(interaction?.toResponse({ kind: "selected", value: "approve_session" })).toEqual({ decision: "decline" });
+    expect(interaction?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ decision: "accept" });
+    expect(interaction?.toResponse({ kind: "selected", value: "allow_for_session" })).toEqual({ decision: "decline" });
     expect(interaction?.toResponse({ kind: "cancelled" })).toEqual({ decision: "decline" });
 
     expect(interactionFromServerRequest(12, "item/commandExecution/requestApproval", {
@@ -239,12 +242,16 @@ describe("Codex interaction translation", () => {
       itemId: "permission-one",
       permissions: requested
     }, "D:\\workspace");
-    expect(interaction?.payload).toMatchObject({ kind: "permission", toolName: "permissions" });
-    expect(interaction?.toResponse({ kind: "selected", value: "approve_session" })).toEqual({
+    expect(interaction?.payload).toMatchObject({ kind: "permission", toolName: "permissions", choices: ["allow_once", "deny_once"] });
+    expect(interaction?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({
       permissions: requested,
-      scope: "session"
+      scope: "turn"
     });
-    expect(interaction?.toResponse({ kind: "selected", value: "decline" })).toEqual({
+    expect(interaction?.toResponse({ kind: "selected", value: "allow_for_session" })).toEqual({
+      permissions: {},
+      scope: "turn"
+    });
+    expect(interaction?.toResponse({ kind: "selected", value: "deny_once" })).toEqual({
       permissions: {},
       scope: "turn"
     });

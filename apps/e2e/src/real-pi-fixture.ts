@@ -350,7 +350,7 @@ export class RealPiSystemFixture {
   }
 }
 
-async function startLocalProvider(
+export async function startLocalProvider(
   requests: CapturedProviderRequest[],
   responseGate?: ProviderResponseGate,
   usage: RealPiSystemFixtureOptions["providerUsage"] = { promptTokens: 7, completionTokens: 3 },
