@@ -401,6 +401,36 @@ describe("BackendInstanceRegistry", () => {
     expect(registry.adapter("backend")).toBe(runtime);
   });
 
+  it("reapplies Host descriptor composition before provision, refresh and replacement publication", async () => {
+    const projectDescriptor = vi.fn((value: BackendDescriptor): BackendDescriptor => ({
+      ...value,
+      diagnostics: [...value.diagnostics, "host-composed"]
+    }));
+    const { registry, store } = fixture({ projectDescriptor });
+    const previous = adapter("backend");
+    const replacement = adapter("backend");
+    const candidates = [previous, replacement];
+    await registry.provision([dynamicFactory("backend", () => candidates.shift()!)]);
+    expect(store.getBackend("backend").descriptor.diagnostics).toEqual(["host-composed"]);
+
+    vi.mocked(previous.describe).mockResolvedValueOnce({
+      ...descriptor("backend"),
+      version: "2.0.0"
+    });
+    await registry.refresh("backend");
+    expect(store.getBackend("backend").descriptor).toMatchObject({
+      version: "2.0.0",
+      diagnostics: ["host-composed"]
+    });
+
+    await registry.replace("backend");
+    expect(store.getBackend("backend").descriptor).toMatchObject({
+      instanceGeneration: 2,
+      diagnostics: ["host-composed"]
+    });
+    expect(projectDescriptor).toHaveBeenCalledTimes(4);
+  });
+
   it("does not let a delayed descriptor refresh overwrite a replacement", async () => {
     const { registry } = fixture();
     const refreshEntered = deferred<BackendDescriptor>();

@@ -47,6 +47,8 @@ interface UnavailableBackendInstance extends BackendInstanceSnapshot {
 type BackendInstance = AvailableBackendInstance | UnavailableBackendInstance;
 
 export interface BackendInstanceRegistryOptions {
+  /** Deterministic Host-owned capability composition applied before every durable descriptor publication. */
+  readonly projectDescriptor?: (descriptor: BackendDescriptor) => BackendDescriptor;
   /** Deadline for each graceful or hard old-generation cleanup step. */
   readonly retirementStepTimeoutMs?: number;
   /** Delay between detached exact-owner janitor attempts. */
@@ -104,11 +106,13 @@ export class BackendInstanceRegistry {
   readonly #retirementStepTimeoutMs: number;
   readonly #retirementRetryDelayMs: number;
   readonly #retirementAttempts: number;
+  readonly #projectDescriptor: (descriptor: BackendDescriptor) => BackendDescriptor;
 
   constructor(
     private readonly authority: BackendInstanceAuthority,
     options: BackendInstanceRegistryOptions = {}
   ) {
+    this.#projectDescriptor = options.projectDescriptor ?? ((descriptor) => descriptor);
     this.#retirementStepTimeoutMs = positiveSafeInteger(
       options.retirementStepTimeoutMs ?? 10_000,
       "Backend retirement step timeout"
@@ -210,7 +214,7 @@ export class BackendInstanceRegistry {
     }
     const refreshed: AvailableBackendInstance = {
       ...current,
-      descriptor: normalizeDescriptor(described, current.descriptor.adapterKind, current.generation)
+      descriptor: this.#normalizeDescriptor(described, current.descriptor.adapterKind, current.generation)
     };
     const publication = this.authority.publishBackendInstanceDescriptor({
       descriptor: refreshed.descriptor,
@@ -277,7 +281,7 @@ export class BackendInstanceRegistry {
       }
       candidate = {
         ...candidate,
-        descriptor: normalizeDescriptor(refreshedDescriptor, factory.adapterKind, candidate.generation)
+        descriptor: this.#normalizeDescriptor(refreshedDescriptor, factory.adapterKind, candidate.generation)
       };
       if (!replacementCandidateAccepted(candidate.descriptor)) {
         throw new Error(`Backend replacement candidate failed validation after preparation: ${instanceId}`);
@@ -433,7 +437,7 @@ export class BackendInstanceRegistry {
         instanceId: factory.instanceId,
         generation,
         state: "available",
-        descriptor: normalizeDescriptor(descriptor, factory.adapterKind, generation),
+        descriptor: this.#normalizeDescriptor(descriptor, factory.adapterKind, generation),
         adapter
       };
     } catch {
@@ -445,6 +449,15 @@ export class BackendInstanceRegistry {
         descriptor: unavailableDescriptor(factory, generation)
       };
     }
+  }
+
+  #normalizeDescriptor(descriptor: BackendDescriptor, adapterKind: string, generation: number): BackendDescriptor {
+    const normalized = normalizeDescriptor(descriptor, adapterKind, generation);
+    const projected = this.#projectDescriptor(normalized);
+    if (projected.id !== normalized.id) {
+      throw new Error("Backend descriptor projection changed its registered identity.");
+    }
+    return normalizeDescriptor(projected, adapterKind, generation);
   }
 }
 

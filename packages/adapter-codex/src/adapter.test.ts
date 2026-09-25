@@ -646,6 +646,41 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport?.requests.some((request) => request.method === "thread/read")).toBe(true);
   });
 
+  it("keeps native completion events on the active dispatch context after inspection and history reads", async () => {
+    const setup = await createSetup();
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target),
+      context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    const dispatchEvents: EventPayload[] = [];
+    const dispatchContext = context(setup.target, dispatchEvents, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "active-dispatch"
+    });
+    await setup.adapter.send(prompt("keep the dispatch owner"), dispatchContext);
+
+    const inspectEvents: EventPayload[] = [];
+    await expect(setup.adapter.inspectSession(binding, context(setup.target, inspectEvents, {
+      binding,
+      backendInstanceGeneration: 7
+    }))).resolves.toMatchObject({ streaming: true });
+    const historyEvents: EventPayload[] = [];
+    await setup.adapter.getNativeHistoryProjection(context(setup.target, historyEvents, {
+      binding,
+      backendInstanceGeneration: 7
+    }));
+
+    await setup.fake.completeTurn(binding.nativeSessionId!, "owned completion");
+
+    expect(dispatchEvents).toContainEqual(expect.objectContaining({ type: "text_delta", delta: "owned completion" }));
+    expect(dispatchEvents).toContainEqual(expect.objectContaining({ type: "message_complete", role: "assistant" }));
+    expect(dispatchEvents).toContainEqual(expect.objectContaining({ type: "usage" }));
+    expect(dispatchEvents.at(-1)).toEqual({ type: "done", outcome: "completed" });
+    expect(inspectEvents).toEqual([]);
+    expect(historyEvents).toEqual([]);
+  });
+
   it("keeps an accepted send unknown when its complete history lookup becomes stale without resending input", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];

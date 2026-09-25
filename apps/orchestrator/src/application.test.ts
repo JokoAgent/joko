@@ -265,6 +265,8 @@ describe("Orchestrator application composition", () => {
       instanceGeneration: 1,
       health: "healthy"
     });
+    expect(application.store.getBackend("pi").descriptor.capabilities.get("input.mention")?.options)
+      .toContain("session");
     expect(application.store.getBackend("codex").descriptor).toMatchObject({
       instanceGeneration: 1,
       health: "unavailable",
@@ -312,6 +314,8 @@ describe("Orchestrator application composition", () => {
     });
     await expect(application.refreshPiGeneration?.()).resolves.toBeUndefined();
     await expect(application.refreshPiGeneration?.()).resolves.toBeUndefined();
+    expect(application.store.getBackend("pi").descriptor.capabilities.get("input.mention")?.options)
+      .toContain("session");
     const generationRoots = await readdir(join(config.piAgentHome, "generations"), { withFileTypes: true });
     expect(generationRoots.filter((entry) => entry.isDirectory() && entry.name.startsWith("runtime-"))).toHaveLength(1);
     const generationFiles = await readdir(join(config.piAgentHome, "generations"), { recursive: true });

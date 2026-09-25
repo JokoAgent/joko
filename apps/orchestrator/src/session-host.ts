@@ -689,6 +689,7 @@ export class SessionHost {
   readonly #adapters = new Map<string, BackendAdapter>();
   readonly #adapterGenerations = new Map<string, number>();
   readonly #initialBackendDescriptors = new Map<string, BackendDescriptor>();
+  readonly #initialBackendDescriptorsAlreadyPublished: boolean;
   readonly #active = new Map<string, ActiveSession>();
   /** Ephemeral authority populated only by the formal task-scoped live read. */
   readonly #activeResourceCatalogs = new Map<string, ActiveResourceCatalog>();
@@ -892,6 +893,12 @@ export class SessionHost {
       }) => Promise<void> | void;
       /** Registry-probed descriptors, including unavailable instance shadows. */
       readonly backendDescriptors?: readonly BackendDescriptor[];
+      /**
+       * The Backend registry has already published these identities and owns
+       * subsequent same-generation descriptor refreshes. Initialization must
+       * validate that authority without reseeding its captured snapshot.
+       */
+      readonly backendDescriptorsAlreadyPublished?: boolean;
     } = {}
   ) {
     this.#store = store;
@@ -932,6 +939,7 @@ export class SessionHost {
     }
     this.#backendRetirementTimeoutMs = backendRetirementTimeoutMs;
     this.extraDirectories = new ExtraDirectoryManager(store);
+    this.#initialBackendDescriptorsAlreadyPublished = options.backendDescriptorsAlreadyPublished ?? false;
     for (const descriptor of options.backendDescriptors ?? []) {
       if (this.#initialBackendDescriptors.has(descriptor.id)) {
         throw new Error(`Duplicate Backend descriptor ID: ${descriptor.id}`);
@@ -1019,7 +1027,19 @@ export class SessionHost {
     this.#assertOpen();
     this.#store.recoverStartup();
     this.#store.recoverPendingContextRebuilds();
-    for (const descriptor of this.#initialBackendDescriptors.values()) this.#store.upsertBackend(descriptor);
+    for (const descriptor of this.#initialBackendDescriptors.values()) {
+      if (!this.#initialBackendDescriptorsAlreadyPublished) {
+        this.#store.upsertBackend(descriptor);
+        continue;
+      }
+      const published = this.#store.getBackend(descriptor.id).descriptor;
+      if (
+        published.adapterKind !== descriptor.adapterKind
+        || published.instanceGeneration !== descriptor.instanceGeneration
+      ) {
+        throw new Error(`Published Backend descriptor authority changed before Host initialization: ${descriptor.id}`);
+      }
+    }
     const unprobed = [...this.#adapters.values()]
       .filter((adapter) => !this.#initialBackendDescriptors.has(adapter.id));
     const probes = await Promise.allSettled(unprobed.map((adapter) => adapter.describe()));
@@ -13984,7 +14004,7 @@ function truncateUnicodeText(value: string, maximumCharacters: number): string {
 /** Session-reference hydration is Host-owned and reaches every text-capable
  * adapter as ordinary bounded text. Publish that composed behavior without
  * teaching individual adapters a Joko Queue concern. */
-function withSessionReferenceCapability(descriptor: BackendDescriptor): BackendDescriptor {
+export function withSessionReferenceCapability(descriptor: BackendDescriptor): BackendDescriptor {
   const mention = descriptor.capabilities.get("input.mention");
   if (mention?.supported !== true || descriptor.capabilities.get("input.text")?.supported !== true) return descriptor;
   const options = [...new Set([...(mention.options ?? []), "session"])];

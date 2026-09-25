@@ -21,6 +21,7 @@ import {
   RemoteWorkspaceService,
   ScheduleCoordinator,
   SessionHost,
+  withSessionReferenceCapability,
   SessionWorktreeCoordinator,
   WorkspaceChangeSetService,
   WorkspaceService,
@@ -185,7 +186,9 @@ export class OrchestratorE2eFixture {
     }));
     const adapters = new Map<string, InstrumentedFakeAdapter>();
     const store = new OperationalStore(databasePath);
-    const backendInstances = new BackendInstanceRegistry(store);
+    const backendInstances = new BackendInstanceRegistry(store, {
+      projectDescriptor: withSessionReferenceCapability
+    });
     const factories: readonly BackendInstanceFactory[] = [...profiles.map((profile) => ({
       instanceId: profile.id,
       adapterKind: "fake",
@@ -233,6 +236,7 @@ export class OrchestratorE2eFixture {
     await sessionWorktrees.initialize();
     const sessionHost = new SessionHost(store, artifacts, backendInstances.availableAdapters(), {
       backendDescriptors: backendInstances.descriptors(),
+      backendDescriptorsAlreadyPublished: true,
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
       worktrees: sessionWorktrees
     });

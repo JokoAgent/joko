@@ -1287,7 +1287,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && runtime.profileKey === inspected.profileKey
       && this.#matchesCoreFence(runtime, context)
       && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)) {
-      runtime.context = context;
+      if (runtime.state.activeTurnId === undefined) runtime.context = context;
       runtime.name = thread.name ?? runtime.name;
       return stateFromRuntime(runtime, thread);
     }
@@ -2610,7 +2610,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && this.#matchesCoreFence(runtime, context)
       && this.#isRuntimeCurrent(runtime, runtime.hostGeneration)
       && this.#mcpCanRemain(runtime, mcpRequirement === "allow_pending")) {
-      runtime.context = context;
+      if (runtime.state.activeTurnId === undefined) runtime.context = context;
       return runtime;
     }
     if (context.runtimePolicy === "review_read_only") throw invalidReviewProfile();

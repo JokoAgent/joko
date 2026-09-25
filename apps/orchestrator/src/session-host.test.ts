@@ -67,6 +67,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import {
   createPortableSessionManifest,
   decodePortableSessionPackage,
@@ -207,6 +208,52 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("retains a Registry-owned descriptor refresh performed before Host initialization", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-host-published-backend-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const repository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(directory, "artifacts"),
+      repository,
+      ingestRoots: [directory]
+    });
+    await artifacts.initialize();
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const described = await adapter.describe();
+    let diagnostics = ["provisioned"];
+    vi.spyOn(adapter, "describe").mockImplementation(async () => ({ ...described, diagnostics }));
+    const registry = new BackendInstanceRegistry(store);
+    await registry.provision([{
+      instanceId: adapter.id,
+      adapterKind: described.adapterKind,
+      displayName: described.displayName,
+      create: () => adapter
+    }]);
+    const host = new SessionHost(store, artifacts, registry.availableAdapters(), {
+      backendDescriptors: registry.descriptors(),
+      backendDescriptorsAlreadyPublished: true
+    });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    diagnostics = ["refreshed-before-host-initialize"];
+    await registry.refresh(adapter.id);
+    expect(registry.get(adapter.id).descriptor.diagnostics).toEqual(diagnostics);
+
+    await host.initialize();
+
+    expect(store.getBackend(adapter.id).descriptor.diagnostics).toEqual(diagnostics);
+    expect(store.getBackend(adapter.id).descriptor).toMatchObject({
+      id: registry.get(adapter.id).descriptor.id,
+      adapterKind: registry.get(adapter.id).descriptor.adapterKind,
+      instanceGeneration: registry.get(adapter.id).descriptor.instanceGeneration,
+      diagnostics: registry.get(adapter.id).descriptor.diagnostics
+    });
+  });
+
   it("publishes a fresh Task projection in its creation transaction for already-connected owners", async () => {
     const fixture = await createFixture();
     const observed: Array<{ readonly event: PersistedEvent; readonly visibleRevision: bigint }> = [];

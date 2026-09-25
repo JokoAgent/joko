@@ -10,12 +10,21 @@ import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import { createPiAdapter, type PiManagedProvider } from "@joko/adapter-pi";
 import { InteractionState, OperationMutationSchema, OperationState, RunState, StartReviewMutationSchema } from "@joko/contracts";
+import type { BackendAdapter } from "@joko/core";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, queueRunIdFrom, resolvePermissionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import {
+  createSessionMutation,
+  queueRunIdFrom,
+  resolvePermissionMutation,
+  restartBackendMutation,
+  sendInputMutation,
+  sessionIdFrom,
+  submit
+} from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, startLocalProvider } from "./real-pi-fixture.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
@@ -392,6 +401,460 @@ it("resumes three native tasks through service restart and isolates one missing 
   }
 });
 
+it("replaces three native Backend instances independently and rejects a busy replacement atomically", { timeout: 120_000 }, async () => {
+  const setup = await startPairedFixture();
+  try {
+    const fixture = setup.fixture;
+    const paired = await fixture.pair("Paired Backend replacement client");
+    const backendIds = ["pi", "codex-paired", "claude-paired"] as const;
+    const sessions = new Map<(typeof backendIds)[number], string>();
+    for (const backendId of backendIds) {
+      const created = await submit(paired.clients.operation, paired.connectionId,
+        createSessionMutation({ backendId, targetId: fixture.targetId(backendId), displayName: `${backendId} replacement task`,
+          ...(backendId === "pi" ? { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off" } : {}) }));
+      expect(created.state).toBe(OperationState.SUCCEEDED);
+      sessions.set(backendId, sessionIdFrom(created));
+    }
+    const send = async (backendId: (typeof backendIds)[number], text: string) => {
+      const sessionId = sessions.get(backendId)!;
+      const projected = (await paired.clients.session.getSession({ sessionId })).session;
+      const generation = projected?.version?.generation;
+      if (generation === undefined) throw new Error(`${backendId} replacement task has no public generation.`);
+      expect(projected?.nativeBinding?.runtimeGeneration).toBe(generation);
+      const accepted = await submit(paired.clients.operation, paired.connectionId,
+        sendInputMutation(sessionId, generation, text));
+      expect(accepted.state).toBe(OperationState.SUCCEEDED);
+      return queueRunIdFrom(accepted);
+    };
+    const waitForRun = (runId: string) => waitFor(
+      () => paired.clients.run.getRun({ runId }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      `${runId} to complete`
+    );
+    const codexSessionId = sessions.get("codex-paired")!;
+    const codexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
+    if (codexThreadId === undefined) throw new Error("Replacement fixture Codex task has no native thread.");
+
+    const initialRuns = new Map<(typeof backendIds)[number], string>();
+    for (const backendId of backendIds) initialRuns.set(backendId, await send(backendId, `${backendId} before replacement`));
+    await waitFor(async () => setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0,
+      (count) => count === 1, "Codex dispatch before Backend replacement");
+    await waitFor(async () => setup.claude.queries.filter((query) => query.receivedInputs.length > 0).length,
+      (count) => count === 1, "Claude dispatch before Backend replacement");
+    setup.claude.queries.find((query) => query.receivedInputs.length > 0)!.complete("Claude before replacement answer");
+    await setup.codex.completeTurn(codexThreadId, "Codex before replacement answer");
+    for (const runId of initialRuns.values()) await waitForRun(runId);
+
+    const nativeBindings = new Map(backendIds.map((backendId) => {
+      const binding = fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding;
+      if (binding.nativeSessionId === undefined) throw new Error(`${backendId} replacement task has no native identity.`);
+      return [backendId, { nativeSessionId: binding.nativeSessionId, opaqueRef: binding.opaqueRef }] as const;
+    }));
+
+    const busyRuns = new Map<(typeof backendIds)[number], string>();
+    for (const backendId of backendIds) busyRuns.set(backendId, await send(backendId, `${backendId} while Codex replacement is blocked`));
+    await waitFor(async () => setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0,
+      (count) => count === 2, "active Codex turn before rejected replacement");
+    await waitFor(async () => setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0),
+      (count) => count === 2, "independent Claude turn before rejected Codex replacement");
+    const busyCodexRunId = busyRuns.get("codex-paired")!;
+    const busyCodexQueue = fixture.application.store.findQueueItemByRunId(codexSessionId, busyCodexRunId);
+    expect(fixture.application.store.getRun(busyCodexRunId).descriptor.state).toBe("running");
+    expect(busyCodexQueue?.state).toBe("backend_accepted");
+    const backendBeforeBusyRestart = structuredClone(
+      fixture.application.store.getBackend("codex-paired").descriptor
+    );
+    const generationAuthorityBeforeBusyRestart = structuredClone(
+      fixture.application.store.getBackendInstanceGenerationAuthority("codex-paired")
+    );
+    const bindingsBeforeBusyRestart = new Map(backendIds.map((backendId) => [backendId, structuredClone(
+      fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding
+    )] as const));
+    const providerRequestsBeforeBusyRestart = setup.requests.length;
+    const codexRequestsBeforeBusyRestart = setup.codex.transport?.requests.length ?? 0;
+    const claudeQueriesBeforeBusyRestart = setup.claude.queries.length;
+    const lifecycleBeforeBusyRestart = setup.lifecycle.length;
+    const failedRestartOperationId = randomUUID();
+    const failedRestartMutation = restartBackendMutation("codex-paired");
+    const failedRestart = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      failedRestartMutation,
+      failedRestartOperationId
+    );
+    expect(failedRestart.state).toBe(OperationState.FAILED);
+    expect(failedRestart.error?.message)
+      .toBe("A Backend can be replaced only after every native side effect has settled.");
+    expect(fixture.application.store.getBackend("codex-paired").descriptor)
+      .toEqual(backendBeforeBusyRestart);
+    expect(fixture.application.store.getBackendInstanceGenerationAuthority("codex-paired"))
+      .toEqual(generationAuthorityBeforeBusyRestart);
+    expect(setup.requests).toHaveLength(providerRequestsBeforeBusyRestart);
+    expect(setup.codex.transport?.requests).toHaveLength(codexRequestsBeforeBusyRestart);
+    expect(setup.claude.queries).toHaveLength(claudeQueriesBeforeBusyRestart);
+    expect(setup.lifecycle).toHaveLength(lifecycleBeforeBusyRestart);
+    for (const backendId of backendIds) {
+      expect(fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding)
+        .toEqual(bindingsBeforeBusyRestart.get(backendId));
+    }
+    setup.claude.queries.findLast((query) => query.receivedInputs.length > 0)!
+      .complete("Claude completed while Codex replacement stayed blocked");
+    await setup.codex.completeTurn(codexThreadId, "Codex completed after blocked replacement");
+    for (const runId of busyRuns.values()) await waitForRun(runId);
+
+    const backendBeforeFailedReplay = structuredClone(
+      fixture.application.store.getBackend("codex-paired").descriptor
+    );
+    const authorityBeforeFailedReplay = structuredClone(
+      fixture.application.store.getBackendInstanceGenerationAuthority("codex-paired")
+    );
+    const sessionsBeforeFailedReplay = new Map(backendIds.map((backendId) => [backendId, structuredClone(
+      fixture.application.store.getSession(sessions.get(backendId)!).descriptor
+    )] as const));
+    const tracesBeforeFailedReplay = {
+      providerRequests: setup.requests.length,
+      codexRequests: setup.codex.transport?.requests.length ?? 0,
+      claudeQueries: setup.claude.queries.length,
+      lifecycle: setup.lifecycle.length
+    };
+    const replayedFailedRestart = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      failedRestartMutation,
+      failedRestartOperationId
+    );
+    expect(replayedFailedRestart.operationId).toBe(failedRestart.operationId);
+    expect(replayedFailedRestart.state).toBe(failedRestart.state);
+    expect(replayedFailedRestart.requestSha256Hex).toBe(failedRestart.requestSha256Hex);
+    expect(replayedFailedRestart.error).toEqual(failedRestart.error);
+    expect(fixture.application.store.getBackend("codex-paired").descriptor)
+      .toEqual(backendBeforeFailedReplay);
+    expect(fixture.application.store.getBackendInstanceGenerationAuthority("codex-paired"))
+      .toEqual(authorityBeforeFailedReplay);
+    for (const backendId of backendIds) {
+      expect(fixture.application.store.getSession(sessions.get(backendId)!).descriptor)
+        .toEqual(sessionsBeforeFailedReplay.get(backendId));
+    }
+    expect(setup.requests).toHaveLength(tracesBeforeFailedReplay.providerRequests);
+    expect(setup.codex.transport?.requests).toHaveLength(tracesBeforeFailedReplay.codexRequests);
+    expect(setup.claude.queries).toHaveLength(tracesBeforeFailedReplay.claudeQueries);
+    expect(setup.lifecycle).toHaveLength(tracesBeforeFailedReplay.lifecycle);
+
+    for (const backendId of backendIds) {
+      const backendsBefore = new Map(backendIds.map((id) => [id, structuredClone(
+        fixture.application.store.getBackend(id).descriptor
+      )] as const));
+      const generationAuthorityBefore = structuredClone(
+        fixture.application.store.getBackendInstanceGenerationAuthority(backendId)
+      );
+      const sessionsBefore = new Map(backendIds.map((id) => [id, structuredClone(
+        fixture.application.store.getSession(sessions.get(id)!).descriptor
+      )] as const));
+      const publicSessionsBefore = new Map(await Promise.all(backendIds.map(async (id) => [
+        id,
+        (await paired.clients.session.getSession({ sessionId: sessions.get(id)! })).session
+      ] as const)));
+      const adapterBefore = fixture.application.adapters.find((adapter) => adapter.id === backendId);
+      if (adapterBefore === undefined) throw new Error(`No current ${backendId} Adapter exists before replacement.`);
+      const providerRequestsBefore = setup.requests.length;
+      const codexRequestsBefore = setup.codex.transport?.requests.length ?? 0;
+      const codexThreadsBefore = setup.codex.transport?.requests
+        .filter((request) => request.method === "thread/start").length ?? 0;
+      const codexStartsBefore = setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0;
+      const claudeQueriesBefore = setup.claude.queries.length;
+      const claudeInputsBefore = setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0);
+      const lifecycleBefore = setup.lifecycle.length;
+      const operationId = randomUUID();
+      const mutation = restartBackendMutation(backendId);
+      const restarted = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
+      expect(restarted.state).toBe(OperationState.SUCCEEDED);
+
+      const selectedSession = fixture.application.store.getSession(sessions.get(backendId)!).descriptor;
+      const previousInstanceGeneration = backendsBefore.get(backendId)!.instanceGeneration;
+      const nextInstanceGeneration = previousInstanceGeneration + 1;
+      expect(fixture.application.store.getBackend(backendId).descriptor.instanceGeneration)
+        .toBe(nextInstanceGeneration);
+      expect({
+        ...fixture.application.store.getBackend(backendId).descriptor,
+        instanceGeneration: previousInstanceGeneration
+      }).toEqual(backendsBefore.get(backendId));
+      const generationAuthorityAfter = fixture.application.store.getBackendInstanceGenerationAuthority(backendId);
+      expect(generationAuthorityAfter.currentGeneration).toBe(nextInstanceGeneration);
+      expect(generationAuthorityAfter.highWaterGeneration)
+        .toBe(generationAuthorityBefore.highWaterGeneration + 1);
+      expect(selectedSession.binding.generation)
+        .toBe(sessionsBefore.get(backendId)!.binding.generation + 1);
+      expect(selectedSession.binding).toMatchObject(nativeBindings.get(backendId)!);
+      const publicSessionAfter = (await paired.clients.session.getSession({
+        sessionId: sessions.get(backendId)!
+      })).session;
+      expect(publicSessionAfter?.version?.generation)
+        .toBe((publicSessionsBefore.get(backendId)?.version?.generation ?? 0n) + 1n);
+      expect(publicSessionAfter?.version?.generation)
+        .toBe(BigInt(selectedSession.binding.generation));
+      expect(publicSessionAfter?.nativeBinding?.runtimeGeneration)
+        .toBe(BigInt(selectedSession.binding.generation));
+      expect({
+        ...publicSessionAfter?.nativeBinding,
+        runtimeGeneration: publicSessionsBefore.get(backendId)?.nativeBinding?.runtimeGeneration
+      }).toEqual(publicSessionsBefore.get(backendId)?.nativeBinding);
+      expect(selectedSession.attention).toMatchObject({
+        kind: sessionsBefore.get(backendId)!.attention?.kind,
+        unread: sessionsBefore.get(backendId)!.attention?.unread,
+        subjectCursor: sessionsBefore.get(backendId)!.attention?.subjectCursor,
+        subjectGeneration: sessionsBefore.get(backendId)!.attention?.subjectGeneration
+      });
+      expect(publicSessionAfter?.attention).toMatchObject({
+        kind: publicSessionsBefore.get(backendId)?.attention?.kind,
+        unread: publicSessionsBefore.get(backendId)?.attention?.unread
+      });
+      expect(publicSessionAfter?.attention?.subjectCursor).toMatchObject({
+        sequence: publicSessionsBefore.get(backendId)?.attention?.subjectCursor?.sequence,
+        generation: publicSessionsBefore.get(backendId)?.attention?.subjectCursor?.generation,
+        opaqueToken: publicSessionsBefore.get(backendId)?.attention?.subjectCursor?.opaqueToken
+      });
+      expect({
+        ...selectedSession,
+        binding: sessionsBefore.get(backendId)!.binding,
+        updatedAt: sessionsBefore.get(backendId)!.updatedAt,
+        attention: sessionsBefore.get(backendId)!.attention
+      }).toEqual(sessionsBefore.get(backendId));
+      const publicContextAfter = publicSessionAfter?.context === undefined ? undefined : {
+        ...publicSessionAfter.context,
+        measuredAt: publicSessionsBefore.get(backendId)?.context?.measuredAt
+      };
+      expect(publicContextAfter).toEqual(publicSessionsBefore.get(backendId)?.context);
+      expect({
+        ...publicSessionAfter,
+        activeNativeEntryId: publicSessionsBefore.get(backendId)?.activeNativeEntryId,
+        nativeBinding: {
+          ...publicSessionAfter?.nativeBinding,
+          runtimeGeneration: publicSessionsBefore.get(backendId)?.nativeBinding?.runtimeGeneration
+        },
+        context: publicSessionsBefore.get(backendId)?.context,
+        version: publicSessionsBefore.get(backendId)?.version,
+        lastActivityAt: publicSessionsBefore.get(backendId)?.lastActivityAt,
+        attention: publicSessionsBefore.get(backendId)?.attention
+      })
+        .toEqual(publicSessionsBefore.get(backendId));
+      expect(fixture.application.adapters.find((adapter) => adapter.id === backendId))
+        .not.toBe(adapterBefore);
+      expect(setup.lifecycle.slice(lifecycleBefore)).toEqual([
+        { backendId, generation: nextInstanceGeneration, phase: "created" },
+        {
+          backendId,
+          generation: previousInstanceGeneration,
+          phase: "close_completed",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        { backendId, generation: previousInstanceGeneration, phase: "dispose_completed" },
+        {
+          backendId,
+          generation: nextInstanceGeneration,
+          phase: "resume_started",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        {
+          backendId,
+          generation: nextInstanceGeneration,
+          phase: "resume_completed",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        }
+      ]);
+      for (const otherBackendId of backendIds) {
+        if (otherBackendId === backendId) continue;
+        expect(fixture.application.store.getBackend(otherBackendId).descriptor)
+          .toEqual(backendsBefore.get(otherBackendId));
+        expect(fixture.application.store.getSession(sessions.get(otherBackendId)!).descriptor)
+          .toEqual(sessionsBefore.get(otherBackendId));
+        expect((await paired.clients.session.getSession({ sessionId: sessions.get(otherBackendId)! })).session)
+          .toEqual(publicSessionsBefore.get(otherBackendId));
+      }
+      expect(setup.requests).toHaveLength(providerRequestsBefore);
+      expect(setup.codex.transport?.requests.filter((request) => request.method === "turn/start"))
+        .toHaveLength(codexStartsBefore);
+      expect(setup.codex.transport?.requests.filter((request) => request.method === "thread/start"))
+        .toHaveLength(codexThreadsBefore);
+      expect(setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0))
+        .toBe(claudeInputsBefore);
+      if (backendId !== "codex-paired") {
+        expect(setup.codex.transport?.requests).toHaveLength(codexRequestsBefore);
+      }
+      if (backendId !== "claude-paired") {
+        expect(setup.claude.queries).toHaveLength(claudeQueriesBefore);
+      }
+      if (backendId === "codex-paired") {
+        const replacementRequests = (setup.codex.transport?.requests ?? []).slice(codexRequestsBefore);
+        const resumeRequests = replacementRequests.filter((request) => request.method === "thread/resume");
+        expect(resumeRequests.length).toBeGreaterThan(0);
+        expect(replacementRequests.some((request) =>
+          request.method === "thread/start" || request.method === "turn/start"
+        )).toBe(false);
+        expect(resumeRequests.every((request) =>
+          typeof request.params === "object"
+          && request.params !== null
+          && "threadId" in request.params
+          && request.params.threadId === nativeBindings.get(backendId)!.nativeSessionId
+        )).toBe(true);
+        expect(replacementRequests.every((request) =>
+          typeof request.params !== "object"
+          || request.params === null
+          || !("threadId" in request.params)
+          || request.params.threadId === nativeBindings.get(backendId)!.nativeSessionId
+        )).toBe(true);
+      }
+      if (backendId === "claude-paired") {
+        expect(setup.claude.queries).toHaveLength(claudeQueriesBefore + 1);
+        expect(setup.claude.queries.at(-1)?.params.options.resume)
+          .toBe(nativeBindings.get(backendId)!.nativeSessionId);
+        expect(setup.claude.queries.at(-1)?.receivedInputs).toEqual([]);
+      }
+
+      const generationAfterRestart = fixture.application.store.getBackend(backendId).descriptor.instanceGeneration;
+      const authorityAfterRestart = structuredClone(
+        fixture.application.store.getBackendInstanceGenerationAuthority(backendId)
+      );
+      const bindingAfterRestart = structuredClone(selectedSession.binding);
+      const publicGenerationAfterRestart = publicSessionAfter?.version?.generation;
+      const lifecycleAfterRestart = structuredClone(setup.lifecycle);
+      const codexRequestsAfterRestart = setup.codex.transport?.requests.length ?? 0;
+      const claudeQueriesAfterRestart = setup.claude.queries.length;
+      const replayed = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
+      expect(replayed.operationId).toBe(restarted.operationId);
+      expect(replayed.state).toBe(restarted.state);
+      expect(replayed.requestSha256Hex).toBe(restarted.requestSha256Hex);
+      expect(fixture.application.store.getBackend(backendId).descriptor.instanceGeneration)
+        .toBe(generationAfterRestart);
+      expect(fixture.application.store.getBackendInstanceGenerationAuthority(backendId))
+        .toEqual(authorityAfterRestart);
+      expect(fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding)
+        .toEqual(bindingAfterRestart);
+      expect((await paired.clients.session.getSession({ sessionId: sessions.get(backendId)! })).session?.version?.generation)
+        .toBe(publicGenerationAfterRestart);
+      expect(setup.requests).toHaveLength(providerRequestsBefore);
+      expect(setup.codex.transport?.requests).toHaveLength(codexRequestsAfterRestart);
+      expect(setup.claude.queries).toHaveLength(claudeQueriesAfterRestart);
+      expect(setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0))
+        .toBe(claudeInputsBefore);
+      expect(setup.lifecycle).toEqual(lifecycleAfterRestart);
+    }
+
+    const usageCountsBeforeFinal = new Map(backendIds.map((backendId) => [backendId,
+      fixture.application.store.listEvents({ sessionId: sessions.get(backendId)! })
+        .filter((event) => event.payload.type === "usage").length
+    ] as const));
+    const assistantCountsBeforeFinal = new Map(backendIds.map((backendId) => [backendId,
+      fixture.application.store.listEvents({ sessionId: sessions.get(backendId)! })
+        .filter((event) => event.payload.type === "message_complete" && event.payload.role === "assistant").length
+    ] as const));
+    const providerRequestsBeforeFinal = setup.requests.length;
+    const codexStartsBeforeFinal = setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0;
+    const claudeInputsBeforeFinal = setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0);
+    const finalRuns = new Map<(typeof backendIds)[number], string>();
+    for (const backendId of backendIds) finalRuns.set(backendId, await send(backendId, `${backendId} after replacement`));
+    await waitFor(async () => setup.requests.length, (count) => count === providerRequestsBeforeFinal + 1,
+      "Pi dispatch after Backend replacement");
+    await waitFor(async () => setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0,
+      (count) => count === codexStartsBeforeFinal + 1, "Codex dispatch after Backend replacement");
+    await waitFor(async () => setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0),
+      (count) => count === claudeInputsBeforeFinal + 1, "Claude dispatch after Backend replacement");
+    setup.claude.queries.at(-1)!.complete("Claude after replacement answer");
+    await setup.codex.completeTurn(codexThreadId, "Codex after replacement answer");
+    const finalAnswers = new Map<(typeof backendIds)[number], string>([
+      ["pi", "real npm Pi reached Orchestrator over binary Connect"],
+      ["codex-paired", "Codex after replacement answer"],
+      ["claude-paired", "Claude after replacement answer"]
+    ]);
+    for (const [backendId, runId] of finalRuns) {
+      await waitForRun(runId);
+      const sessionId = sessions.get(backendId)!;
+      const instanceGeneration = fixture.application.store.getBackend(backendId).descriptor.instanceGeneration;
+      const queue = fixture.application.store.findQueueItemByRunId(sessionId, runId);
+      expect(queue).toMatchObject({ backendInstanceGeneration: instanceGeneration, state: "completed" });
+      expect(queue?.attemptId).toBeDefined();
+      const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+      const attempt = fixture.application.store.getAttempt(queue!.attemptId!).descriptor;
+      expect(attempt).toMatchObject({
+        runId,
+        backendInstanceGeneration: instanceGeneration,
+        generation: binding.generation,
+        endedAt: expect.any(Number)
+      });
+      expect(attempt.error).toBeUndefined();
+      expect(binding).toMatchObject(nativeBindings.get(backendId)!);
+      const sessionEvents = fixture.application.store.listEvents({ sessionId });
+      const allAssistantEvents = sessionEvents.filter((event) =>
+        event.payload.type === "message_complete" && event.payload.role === "assistant");
+      const assistantEvents = allAssistantEvents.filter((event) => event.runId === runId);
+      const assistantDelta = allAssistantEvents.slice(assistantCountsBeforeFinal.get(backendId));
+      const allUsageEvents = sessionEvents.filter((event) => event.payload.type === "usage");
+      const usageEvents = allUsageEvents.slice(usageCountsBeforeFinal.get(backendId));
+      const doneEvents = sessionEvents.filter((event) => event.payload.type === "done" && event.runId === runId);
+      expect(assistantEvents, `${backendId} run-bound final assistant`).toHaveLength(1);
+      expect(assistantDelta.length).toBeGreaterThan(0);
+      expect(assistantDelta.every((event) =>
+        event.backendId === backendId
+        && event.sessionId === sessionId
+        && event.generation === binding.generation
+        && jsonWithBigints(event).includes(finalAnswers.get(backendId)!)
+      )).toBe(true);
+      expect(usageEvents.length, `${backendId} final usage delta`).toBeGreaterThan(0);
+      for (const event of assistantEvents) {
+        expect(event).toMatchObject({
+          backendId,
+          sessionId,
+          runId,
+          attemptId: queue!.attemptId,
+          generation: binding.generation
+        });
+      }
+      expect(
+        usageEvents.some((event) => event.runId === runId && event.attemptId === queue!.attemptId)
+        || assistantEvents.some((event) => event.payload.type === "message_complete" && event.payload.usage !== undefined),
+        `${backendId} run-bound final usage evidence`
+      ).toBe(true);
+      for (const event of usageEvents) {
+        expect(event).toMatchObject({ backendId, sessionId, generation: binding.generation });
+        expect(
+          (event.runId === runId && event.attemptId === queue!.attemptId)
+          || (
+            event.runId === undefined
+            && event.attemptId === undefined
+            && event.metadata?.namespace === "joko.runtime_usage"
+            && event.metadata.fields.cumulative === true
+          )
+        ).toBe(true);
+      }
+      expect(doneEvents, `${backendId} run-bound final terminal`).toHaveLength(1);
+      expect(doneEvents[0]).toMatchObject({
+        backendId,
+        sessionId,
+        runId,
+        attemptId: queue!.attemptId,
+        generation: binding.generation,
+        payload: { type: "done", outcome: "completed" }
+      });
+      expect(jsonWithBigints(assistantEvents))
+        .toContain(finalAnswers.get(backendId));
+      for (const [otherBackendId, otherSessionId] of sessions) {
+        if (otherBackendId === backendId) continue;
+        const otherEvents = fixture.application.store.listEvents({ sessionId: otherSessionId });
+        expect(otherEvents.some((event) => event.runId === runId || event.attemptId === queue!.attemptId)).toBe(false);
+        expect(jsonWithBigints(otherEvents)).not.toContain(`${backendId} after replacement`);
+        expect(jsonWithBigints(otherEvents)).not.toContain(finalAnswers.get(backendId));
+      }
+    }
+    expect(jsonWithBigints(setup.requests.at(-1)?.body)).toContain("pi before replacement");
+    expect(jsonWithBigints(setup.requests.at(-1)?.body)).toContain("pi after replacement");
+    expect(jsonWithBigints(fixture.application.store.listEvents({ sessionId: sessions.get("codex-paired")! })))
+      .toContain("Codex after replacement answer");
+    expect(jsonWithBigints(fixture.application.store.listEvents({ sessionId: sessions.get("claude-paired")! })))
+      .toContain("Claude after replacement answer");
+  } finally {
+    await setup.close();
+  }
+});
+
 mountedIt("keeps three native tasks distinct through mounted Web, approval and one native identity failure", { timeout: 120_000 }, async () => {
   const setup = await startPairedFixture(resolve(process.env.JOKO_MOUNTED_WEB_DIR!));
   const { fixture, codex, claude } = setup;
@@ -513,6 +976,7 @@ async function startPairedFixture(webDirectory?: string) {
   const codex = new FakeCodexAppServer();
   let codexHost = new AppServerHost({ transportFactory: () => codex.createTransport() });
   const claude = new ControlledClaudeRuntime();
+  const lifecycle: AdapterLifecycleEvent[] = [];
   let fixture: OrchestratorE2eFixture | undefined;
   let closed = false;
   const closeProvider = () => new Promise<void>((resolvePromise, reject) => {
@@ -521,14 +985,20 @@ async function startPairedFixture(webDirectory?: string) {
   const startFixture = () => OrchestratorE2eFixture.start({ rootDirectory: root, profiles: [],
     ...(webDirectory === undefined ? {} : { webDirectory }), backendFactories: [
     { instanceId: "pi", adapterKind: "pi", displayName: "Published Pi",
-      create: () => createPiAdapter({ agentHome: join(root, "pi-agent-home"), sessionRoot: join(root, "pi-sessions"),
-        externalSessionRoots: [], providers: [provider], versionProbe: async () => "pi 0.84.4" }) },
+      create: ({ generation }) => observeAdapterLifecycle(createPiAdapter({
+        agentHome: join(root, "pi-agent-home"), sessionRoot: join(root, "pi-sessions"),
+        externalSessionRoots: [], providers: [provider], versionProbe: async () => "pi 0.84.4"
+      }), generation, lifecycle) },
     { instanceId: "codex-paired", adapterKind: "codex", displayName: "Codex",
-      create: ({ generation }) => createCodexAdapter({ id: "codex-paired", instanceGeneration: generation, host: codexHost }) },
+      create: ({ generation }) => observeAdapterLifecycle(createCodexAdapter({
+        id: "codex-paired", instanceGeneration: generation, host: codexHost
+      }), generation, lifecycle) },
     { instanceId: "claude-paired", adapterKind: "claude-agent-sdk-stdio", displayName: "Claude",
-      create: ({ generation }) => new ClaudeCodeAdapter({ id: "claude-paired", instanceGeneration: generation,
+      create: ({ generation }) => observeAdapterLifecycle(new ClaudeCodeAdapter({
+        id: "claude-paired", instanceGeneration: generation,
         runtime: claude, environment: {}, initializationTimeoutMs: 500, admissionTimeoutMs: 500,
-        teardownTimeoutMs: 100 }) }
+        teardownTimeoutMs: 100
+      }), generation, lifecycle) }
   ] });
   try {
     fixture = await startFixture();
@@ -540,6 +1010,7 @@ async function startPairedFixture(webDirectory?: string) {
       requests,
       codex,
       claude,
+      lifecycle,
       async restart(beforeStart?: () => void | Promise<void>) {
         if (closed || fixture === undefined) throw new Error("The paired fixture is not running.");
         const current = fixture;
@@ -615,4 +1086,47 @@ function throwCleanupErrors(errors: readonly unknown[], message: string): void {
 
 function jsonWithBigints(value: unknown): string {
   return JSON.stringify(value, (_key, entry: unknown) => typeof entry === "bigint" ? entry.toString() : entry);
+}
+
+interface AdapterLifecycleEvent {
+  readonly backendId: string;
+  readonly generation: number;
+  readonly phase: "created" | "close_completed" | "resume_started" | "resume_completed" | "dispose_completed";
+  readonly nativeSessionId?: string;
+}
+
+function observeAdapterLifecycle<T extends BackendAdapter>(
+  adapter: T,
+  generation: number,
+  events: AdapterLifecycleEvent[]
+): T {
+  events.push({ backendId: adapter.id, generation, phase: "created" });
+  const closeSession = adapter.closeSession.bind(adapter);
+  adapter.closeSession = async (...args: Parameters<BackendAdapter["closeSession"]>) => {
+    await closeSession(...args);
+    events.push({
+      backendId: adapter.id,
+      generation,
+      phase: "close_completed",
+      ...(args[0].nativeSessionId === undefined ? {} : { nativeSessionId: args[0].nativeSessionId })
+    });
+  };
+  const resumeSession = adapter.resumeSession.bind(adapter);
+  adapter.resumeSession = async (...args: Parameters<BackendAdapter["resumeSession"]>) => {
+    const event = {
+      backendId: adapter.id,
+      generation,
+      ...(args[0].nativeSessionId === undefined ? {} : { nativeSessionId: args[0].nativeSessionId })
+    };
+    events.push({ ...event, phase: "resume_started" });
+    const state = await resumeSession(...args);
+    events.push({ ...event, phase: "resume_completed" });
+    return state;
+  };
+  const dispose = adapter.dispose.bind(adapter);
+  adapter.dispose = async () => {
+    await dispose();
+    events.push({ backendId: adapter.id, generation, phase: "dispose_completed" });
+  };
+  return adapter;
 }

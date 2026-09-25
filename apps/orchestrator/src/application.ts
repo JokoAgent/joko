@@ -227,7 +227,7 @@ import {
   COLLABORATION_TOOL_POLICY_ID,
   SessionHelperToolBridgeProvider
 } from "./session-helper-tool-provider.js";
-import { SessionHost } from "./session-host.js";
+import { SessionHost, withSessionReferenceCapability } from "./session-host.js";
 import { configuredSessionRuntimeFallback } from "./session-runtime-fallback.js";
 import { ToolPolicySettingsRepository } from "./tool-policy-settings.js";
 import {
@@ -1171,7 +1171,7 @@ export async function createOrchestratorApplication(
     claudeCodeBackendId
   );
   const claudeCodeOAuthFetch = createOutboundFetch(dependencies.resolveOutboundProxy);
-  backendInstances = new BackendInstanceRegistry(store);
+  backendInstances = new BackendInstanceRegistry(store, { projectDescriptor: withSessionReferenceCapability });
   const managedProviderProxy = new ManagedProviderProxy({
     providers,
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy),
@@ -1400,6 +1400,7 @@ export async function createOrchestratorApplication(
   };
   const sessionHost = new SessionHost(store, artifacts, initialAdapters, {
     backendDescriptors: backendInstances.descriptors(),
+    backendDescriptorsAlreadyPublished: true,
     workspaceCapture,
     freezeToolPolicies: (sessionId, targetId) => { toolPolicies.freezeSession(sessionId, targetId); },
     scheduleRunNotifications,
@@ -1870,19 +1871,7 @@ export async function createOrchestratorApplication(
         if (backendInstances.adapter(pi.id) !== pi) {
           throw new Error("Pi Backend descriptor refresh lost its current-instance fence.");
         }
-        const observedPi = await pi.describe();
-        if (backendInstances.adapter(pi.id) !== pi) {
-          throw new Error("Pi Backend descriptor refresh lost its current-instance fence.");
-        }
-        const piInstanceAuthority = store.getBackend(pi.id).descriptor;
-        const publication = store.refreshBackendInstanceDescriptor({
-          ...observedPi,
-          adapterKind: piInstanceAuthority.adapterKind,
-          instanceGeneration: piInstanceAuthority.instanceGeneration
-        }, piInstanceAuthority.instanceGeneration);
-        if (publication.status !== "published") {
-          throw new Error("Pi Backend descriptor refresh lost its current-generation fence.");
-        }
+        await backendInstances.refresh(pi.id);
       }
       await generationGcTail;
     } catch (error) {
