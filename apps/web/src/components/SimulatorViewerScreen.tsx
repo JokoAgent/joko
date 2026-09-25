@@ -2,9 +2,11 @@ import {
   useCallback, useEffect, useRef, useState, type JSX,
   type PointerEvent as ReactPointerEvent
 } from "react";
-import { AlertTriangle, Keyboard, MonitorSmartphone, Send } from "lucide-react";
+import { AlertTriangle, Camera, House, Keyboard, LockKeyhole, MonitorSmartphone,
+  RotateCw, Send, UnlockKeyhole } from "lucide-react";
 import type { AppController } from "../controller.js";
-import type { SimulatorViewerInputView, SimulatorViewerRouteView } from "../model.js";
+import type { SimulatorViewerCommandView, SimulatorViewerControlsView,
+  SimulatorViewerInputView, SimulatorViewerRouteView } from "../model.js";
 import { createBrowserSimulatorH264DecoderRuntime, SimulatorH264Decoder
 } from "../simulator-h264-decoder.js";
 import { randomUuid } from "../web-crypto.js";
@@ -71,10 +73,22 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   const [frameFresh, setFrameFresh] = useState(false);
   const [inputBusy, setInputBusy] = useState(false);
   const [inputError, setInputError] = useState<string>();
+  const [commandBusy, setCommandBusy] = useState(false);
+  const [commandError, setCommandError] = useState<string>();
+  const [clipboardError, setClipboardError] = useState<string>();
+  const [copied, setCopied] = useState(false);
+  const [controls, setControls] = useState<SimulatorViewerControlsView>();
+  const [inputFallback, setInputFallback] = useState(false);
+  const [streamFps, setStreamFps] = useState(0);
   const [textInput, setTextInput] = useState("");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pointerGestureRef = useRef<PointerGesture | undefined>(undefined);
   const inputRequestRef = useRef<AbortController | undefined>(undefined);
+  const commandRequestRef = useRef<AbortController | undefined>(undefined);
+  const frameRateRef = useRef({ startedAt: 0, frames: 0 });
+  const ownerKey = `${sessionId}:${route.instanceId}:${route.generation}:${route.leaseId}`;
+  const ownerKeyRef = useRef(ownerKey);
+  ownerKeyRef.current = ownerKey;
   const frameFreshnessTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const composingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -82,6 +96,23 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   const reconcileRef = useRef(onReconcile);
   controllerRef.current = controller;
   reconcileRef.current = onReconcile;
+
+  const resetTelemetry = useCallback((): void => {
+    frameRateRef.current = { startedAt: 0, frames: 0 };
+    setStreamFps(0);
+    setControls(undefined);
+    setInputFallback(false);
+  }, []);
+  const recordFrame = useCallback((): void => {
+    const now = performance.now();
+    if (frameRateRef.current.startedAt === 0) frameRateRef.current.startedAt = now;
+    frameRateRef.current.frames += 1;
+    const elapsed = now - frameRateRef.current.startedAt;
+    if (elapsed >= 900) {
+      setStreamFps(frameRateRef.current.frames * 1_000 / elapsed);
+      frameRateRef.current = { startedAt: now, frames: 0 };
+    }
+  }, []);
 
   const clearFrameFreshness = useCallback((): void => {
     if (frameFreshnessTimerRef.current !== undefined) {
@@ -96,8 +127,9 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     frameFreshnessTimerRef.current = setTimeout(() => {
       frameFreshnessTimerRef.current = undefined;
       setFrameFresh(false);
+      resetTelemetry();
     }, 3_000);
-  }, []);
+  }, [resetTelemetry]);
 
   useEffect(() => {
     const update = (): void => setDocumentVisible(!ownerDocument.hidden);
@@ -113,6 +145,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       setFrameUrl(undefined);
       setPresentation(null);
       setNativeAvailable(false);
+      resetTelemetry();
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; }
       return;
     }
@@ -123,10 +156,12 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     clearFrameFreshness();
     setFrameUrl(undefined);
     setPresentation(null);
+    resetTelemetry();
     const clear = (): void => {
       clearFrameFreshness();
       setFrameUrl(undefined);
       setPresentation(null);
+      resetTelemetry();
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; }
     };
     const watch = async (native: boolean): Promise<void> => {
@@ -147,6 +182,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         },
         onFrameRendered() { if (active && !current.signal.aborted) {
           setFrameUrl(undefined); setPresentation("h264"); setState("streaming");
+          recordFrame();
           markFrameFresh();
         } },
         onFallback() { fallback = true; current.abort(); }
@@ -166,6 +202,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
               { type: "image/jpeg" })));
             setPresentation("jpeg");
             setState("streaming");
+            recordFrame();
             markFrameFresh();
           } else if (event.kind === "h264") {
             if (!decoder) throw new Error("Unexpected Simulator H.264 frame.");
@@ -196,12 +233,34 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     return () => { active = false; subscription?.abort(); clearFrameFreshness();
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; } };
   }, [enabled, documentVisible, sessionId, route.instanceId, route.generation, route.leaseId,
-    quality, retry, clearFrameFreshness, markFrameFresh]);
+    quality, retry, clearFrameFreshness, markFrameFresh, recordFrame, resetTelemetry]);
 
   useEffect(() => () => { if (frameUrl) URL.revokeObjectURL(frameUrl); }, [frameUrl]);
 
   const interactive = enabled && documentVisible && state === "streaming" &&
     presentation !== null && frameFresh;
+
+  useEffect(() => {
+    if (!interactive) { setControls(undefined); return; }
+    const request = new AbortController();
+    const read = async (): Promise<void> => {
+      try {
+        const next = await controllerRef.current.getSimulatorViewerControls(sessionId, route, request.signal);
+        if (!request.signal.aborted && ownerKeyRef.current === ownerKey) setControls(next);
+      } catch { if (!request.signal.aborted) setControls(undefined); }
+    };
+    void read();
+    const timer = setInterval(() => { if (!commandRequestRef.current && !pointerGestureRef.current) void read(); }, 4_000);
+    return () => { request.abort(); clearInterval(timer); setControls(undefined); };
+  }, [interactive, ownerKey, route, sessionId]);
+
+  useEffect(() => {
+    if (!enabled || !documentVisible) {
+      commandRequestRef.current?.abort();
+      setCopied(false);
+      setClipboardError(undefined);
+    }
+  }, [enabled, documentVisible]);
 
   const runInput = useCallback(async (input: SimulatorViewerInputView,
     fallbackAfterUndispatchedBegin = false,
@@ -209,7 +268,8 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       { sessionId, route }): Promise<boolean> => {
     if ((!interactive && !fallbackAfterUndispatchedBegin) ||
         (inputBusy && !fallbackAfterUndispatchedBegin) ||
-        inputRequestRef.current || inputError !== undefined) return false;
+        inputRequestRef.current || inputError !== undefined || commandBusy ||
+        commandError !== undefined) return false;
     const request = new AbortController();
     inputRequestRef.current = request;
     setInputBusy(true);
@@ -227,7 +287,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       if (inputRequestRef.current === request) inputRequestRef.current = undefined;
       if (mountedRef.current) setInputBusy(false);
     }
-  }, [inputBusy, inputError, interactive, route, sessionId, t]);
+  }, [inputBusy, inputError, interactive, route, sessionId, t, commandBusy, commandError]);
 
   const ratio = (event: ReactPointerEvent<FrameElement>): {
     readonly xRatio: number; readonly yRatio: number } | null => {
@@ -361,7 +421,8 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     [sessionId, route.instanceId, route.generation, route.leaseId, cancelPointerGesture]);
 
   const onPointerDown = (event: ReactPointerEvent<FrameElement>): void => {
-    if (!interactive || inputBusy || inputError !== undefined || pointerGestureRef.current ||
+    if (!interactive || inputBusy || commandBusy || inputError !== undefined ||
+        commandError !== undefined || pointerGestureRef.current ||
         event.button !== 0 || !event.isPrimary) return;
     const start = ratio(event);
     if (!start) return;
@@ -385,6 +446,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         if (gesture.beginState === "failed" || pointerGestureRef.current !== gesture) return;
         if (!result.accepted) {
           gesture.beginState = "unavailable";
+          setInputFallback(true);
           const terminal = gesture.terminal;
           if (terminal?.phase === "end" && terminal.fallback) {
             await runInput(terminal.fallback, true, gesture);
@@ -393,6 +455,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
           return;
         }
         gesture.beginState = "active";
+        setInputFallback(false);
         void pumpGesture(gesture);
       } catch (cause) { await unknownGesture(gesture, cause); }
     })();
@@ -437,16 +500,113 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   };
 
   const recoverInput = async (): Promise<void> => {
-    if (inputBusy || !enabled) return;
+    if (inputBusy || commandBusy || !enabled) return;
     setInputBusy(true);
     try {
       await reconcileRef.current();
-      if (mountedRef.current) setInputError(undefined);
+      if (mountedRef.current) { setInputError(undefined); setCommandError(undefined); }
     } catch {
-      if (mountedRef.current) setInputError(t("simulator.inputRefreshFailed"));
+      if (mountedRef.current) setCommandError(t("simulator.inputRefreshFailed"));
     } finally {
       if (mountedRef.current) setInputBusy(false);
     }
+  };
+
+  const commandUnavailable = !enabled || !documentVisible || inputBusy || commandBusy ||
+    inputError !== undefined || commandError !== undefined || pointerGestureRef.current !== undefined;
+  const runCommand = async (command: SimulatorViewerCommandView): Promise<void> => {
+    if (commandUnavailable || !interactive || commandRequestRef.current) return;
+    const request = new AbortController();
+    commandRequestRef.current = request;
+    const originalOwner = ownerKey;
+    setCommandBusy(true);
+    setCopied(false);
+    setClipboardError(undefined);
+    let dispatched = false;
+    try {
+      let action = command;
+      if (action.action === "rotate") {
+        const latest = await controllerRef.current.getSimulatorViewerControls(sessionId, route, request.signal);
+        if (request.signal.aborted || ownerKeyRef.current !== originalOwner) return;
+        setControls(latest);
+        action = { action: "rotate", orientation: latest.orientation === "PORTRAIT"
+          ? "LANDSCAPE" : "PORTRAIT" };
+      }
+      dispatched = true;
+      await controllerRef.current.controlSimulatorViewerCommand(sessionId, randomUuid(), route,
+        action, request.signal);
+      if (!request.signal.aborted && ownerKeyRef.current === originalOwner) {
+        setControls(undefined);
+        try { setControls(await controllerRef.current.getSimulatorViewerControls(sessionId, route,
+          request.signal)); }
+        catch { /* A completed command can transiently interrupt video; the next frame refreshes state. */ }
+      }
+    } catch (cause) {
+      if (!request.signal.aborted && mountedRef.current && ownerKeyRef.current === originalOwner) {
+        setCommandError(`${t(dispatched ? "simulator.actionUnconfirmed"
+          : "simulator.inputRefreshFailed")} ${messageOf(cause)}`);
+        if (dispatched) await reconcileRef.current().catch(() => undefined);
+      }
+    } finally {
+      if (commandRequestRef.current === request) commandRequestRef.current = undefined;
+      if (mountedRef.current) setCommandBusy(false);
+    }
+  };
+
+  const copyScreenshot = (): void => {
+    if (commandUnavailable || commandRequestRef.current) return;
+    const clipboard = ownerDocument.defaultView?.navigator.clipboard;
+    const ClipboardItemCtor = ownerDocument.defaultView?.ClipboardItem;
+    if (!clipboard?.write || !ClipboardItemCtor) {
+      setClipboardError(t("simulator.clipboardUnavailable"));
+      return;
+    }
+    const request = new AbortController();
+    commandRequestRef.current = request;
+    const originalOwner = ownerKey;
+    setCommandBusy(true);
+    setCopied(false);
+    setClipboardError(undefined);
+    let captureError: unknown;
+    let captureConfirmed = false;
+    const image = (async (): Promise<Blob> => {
+      try {
+        const result = await controllerRef.current.controlSimulatorViewerCommand(sessionId,
+          randomUuid(), route, { action: "copyScreenshot" }, request.signal);
+        captureConfirmed = true;
+        if (!result.screenshotBlobId || request.signal.aborted || ownerKeyRef.current !== originalOwner) {
+          throw new Error("Simulator screenshot owner changed before copy.");
+        }
+        const blobId = result.screenshotBlobId;
+        const url = await controllerRef.current.getArtifactUrl(blobId);
+        try {
+          const response = await fetch(url, { signal: request.signal });
+          const blob = await response.blob();
+          await requirePng(blob);
+          return blob;
+        } finally { controllerRef.current.releaseArtifactUrl(blobId); }
+      } catch (cause) { captureError = cause; throw cause; }
+    })();
+    void image.catch(() => undefined);
+    let write: Promise<void>;
+    try { write = clipboard.write([new ClipboardItemCtor({ "image/png": image })]); }
+    catch (cause) { write = Promise.reject(cause); }
+    void write.then(() => {
+      if (!request.signal.aborted && mountedRef.current && ownerKeyRef.current === originalOwner) {
+        setCopied(true);
+      }
+    }).catch(async (cause: unknown) => {
+      await image.catch(() => undefined);
+      if (request.signal.aborted || !mountedRef.current || ownerKeyRef.current !== originalOwner) return;
+      if (captureError !== undefined && !captureConfirmed) {
+        setCommandError(`${t("simulator.actionUnconfirmed")} ${messageOf(captureError)}`);
+        await reconcileRef.current().catch(() => undefined);
+      } else setClipboardError(`${t("simulator.clipboardFailed")} ${messageOf(
+        captureError ?? cause)}`);
+    }).finally(() => {
+      if (commandRequestRef.current === request) commandRequestRef.current = undefined;
+      if (mountedRef.current) setCommandBusy(false);
+    });
   };
 
   const notice = state === "paused" ? t("simulator.streamPaused")
@@ -460,7 +620,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     onPointerCancel: cancelPointerGesture,
     onLostPointerCapture: cancelPointerGesture
   };
-  const controlsDisabled = !interactive || inputBusy || inputError !== undefined;
+  const controlsDisabled = !interactive || commandUnavailable;
 
   return <div className="simulator-viewer__interaction" role="group"
     aria-label={t("simulator.liveScreen")}>
@@ -491,9 +651,34 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         </select>
       </label>}
     </div>
-    {inputError && <div className="simulator-viewer__input-error" role="alert">
-      <AlertTriangle aria-hidden="true" /><span>{inputError}</span>
-      <Button tone="ghost" disabled={inputBusy || !enabled}
+    <div className="simulator-viewer__toolbar" role="group" aria-label={t("simulator.deviceControls")}>
+      <Button tone="ghost" disabled={controlsDisabled} onClick={() => void runCommand({ action: "home" })}>
+        <House aria-hidden="true" />{t("simulator.home")}</Button>
+      <Button tone="ghost" disabled={commandUnavailable} onClick={copyScreenshot}>
+        <Camera aria-hidden="true" />{t("simulator.copyScreenshot")}</Button>
+      <Button tone="ghost" disabled={controlsDisabled || controls === undefined}
+        onClick={() => void runCommand({ action: "rotate", orientation: controls?.orientation === "PORTRAIT"
+          ? "LANDSCAPE" : "PORTRAIT" })}>
+        <RotateCw aria-hidden="true" />{t("simulator.rotate")}</Button>
+      <Button tone="ghost" disabled={controlsDisabled} onClick={() => void runCommand({ action: "lock" })}>
+        <LockKeyhole aria-hidden="true" />{t("simulator.lock")}</Button>
+      <Button tone="ghost" disabled={controlsDisabled} onClick={() => void runCommand({ action: "unlock" })}>
+        <UnlockKeyhole aria-hidden="true" />{t("simulator.unlock")}</Button>
+    </div>
+    <p className="simulator-viewer__telemetry" role="status">{t("simulator.telemetry", {
+      fps: streamFps.toFixed(1),
+      size: controls ? `${controls.viewportWidth}×${controls.viewportHeight}` : "—",
+      stream: state === "streaming" && presentation === "h264" ? t("simulator.routeH264")
+        : state === "streaming" && presentation === "jpeg" ? t("simulator.routeMjpeg")
+          : t(`simulator.stream.${state}`),
+      input: controls ? controls.nativeTouchAvailable && !inputFallback ? t("simulator.routeNativeTouch")
+        : t("simulator.routeWdaInput") : t("simulator.routeUnknown")
+    })}</p>
+    {copied && <p className="simulator-viewer__feedback" role="status">{t("simulator.copied")}</p>}
+    {clipboardError && <p className="simulator-viewer__input-error" role="alert">{clipboardError}</p>}
+    {(inputError || commandError) && <div className="simulator-viewer__input-error" role="alert">
+      <AlertTriangle aria-hidden="true" /><span>{inputError || commandError}</span>
+      <Button tone="ghost" disabled={inputBusy || commandBusy || !enabled}
         onClick={() => void recoverInput()}>{t("simulator.inputReview")}</Button>
     </div>}
     <form className="simulator-viewer__keyboard" onSubmit={event => {
@@ -527,4 +712,14 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+async function requirePng(blob: Blob): Promise<void> {
+  if (blob.type !== "image/png" || blob.size < 8 || blob.size > 32 * 1024 * 1024) {
+    throw new Error("Simulator screenshot is not a bounded PNG.");
+  }
+  const signature = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
+  if (![137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => signature[index] === byte)) {
+    throw new Error("Simulator screenshot PNG signature is invalid.");
+  }
 }

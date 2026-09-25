@@ -156,12 +156,17 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
   let booted = false;
   let deletes = 0;
   let jpeg: Buffer | undefined;
+  let png: Buffer | undefined;
   let h264: Uint8Array | undefined;
   let stopNative = false;
   let wdaPort = 0;
   let ownerFingerprint = "";
   const viewerInputs: Array<{ readonly url: string; readonly body: unknown;
     readonly claimed: boolean }> = [];
+  const deviceCommands: Array<{ readonly url: string; readonly body: unknown;
+    readonly claimed: boolean }> = [];
+  const screenshots: boolean[] = [];
+  let orientation: "PORTRAIT" | "LANDSCAPE" = "PORTRAIT";
   const liveTouches: Array<{ readonly gestureId: string; readonly phase: string;
     readonly sequence: number; readonly x: number; readonly y: number;
     readonly claimed: boolean }> = [];
@@ -195,7 +200,14 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         ? { ...device, state: booted ? "Booted" : "Shutdown" } : null,
       bootExact: async value => { expect(value).toBe(udid); booted = true;
         return { ...device, state: "Booted" }; },
-      shutdownExact: async value => { expect(value).toBe(udid); booted = false; }
+      shutdownExact: async value => { expect(value).toBe(udid); booted = false; },
+      takeScreenshot: async value => {
+        expect(value).toBe(udid);
+        screenshots.push(application.store.listOperations({ sessionId: "viewer-web-task",
+          status: "started" }).some(operation => operation.kind === "ios_simulator_screenshot"));
+        if (!png) throw new Error("Fixture screenshot is unavailable.");
+        return png;
+      }
     },
     delete: { deleteExact: async input => {
       expect(input.udid).toBe(udid);
@@ -257,16 +269,27 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     };
     if (request.method === "POST" && request.url && [
       "/session/SESSION-1/actions", "/session/SESSION-1/wda/keys",
-      "/session/SESSION-1/appium/settings"
+      "/session/SESSION-1/appium/settings", "/session/SESSION-1/wda/pressButton",
+      "/session/SESSION-1/orientation", "/session/SESSION-1/wda/lock",
+      "/session/SESSION-1/wda/unlock"
     ].includes(request.url)) {
       const chunks: Buffer[] = [];
       request.on("data", chunk => chunks.push(Buffer.from(chunk)));
       request.on("end", () => {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         if (request.url === "/session/SESSION-1/appium/settings") viewerProfiles.push(body);
-        else viewerInputs.push({ url: request.url!, body,
+        else if (request.url === "/session/SESSION-1/wda/keys" ||
+          request.url === "/session/SESSION-1/actions") viewerInputs.push({ url: request.url!, body,
           claimed: application.store.listOperations({ sessionId: "viewer-web-task", status: "started" })
             .some(operation => operation.kind === "ios_simulator_input") });
+        else {
+          const kind = request.url === "/session/SESSION-1/wda/pressButton"
+            ? "ios_simulator_input" : "ios_simulator_state_control";
+          deviceCommands.push({ url: request.url!, body,
+            claimed: application.store.listOperations({ sessionId: "viewer-web-task",
+              status: "started" }).some(operation => operation.kind === kind) });
+          if (request.url === "/session/SESSION-1/orientation") orientation = body.orientation;
+        }
         send(null);
       });
       return;
@@ -278,8 +301,9 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         label: "Viewer input", enabled: true, visible: true,
         rect: { x: 10, y: 20, width: 160, height: 44 } }]
     });
-    else if (request.url === "/session/SESSION-1/window/size") send({ width: 393, height: 852 });
-    else if (request.url === "/session/SESSION-1/orientation") send("PORTRAIT");
+    else if (request.url === "/session/SESSION-1/window/size") send(orientation === "PORTRAIT"
+      ? { width: 393, height: 852 } : { width: 852, height: 393 });
+    else if (request.url === "/session/SESSION-1/orientation") send(orientation);
     else { response.writeHead(404, { "content-type": "application/json" });
       response.end(JSON.stringify({ value: { error: "invalid session id" } })); }
   });
@@ -313,17 +337,22 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       if (!code) throw new Error("Viewer Web pairing code was not observed.");
       browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
       const page = await browser.newPage({ viewport: { width: 1160, height: 850 } });
-      const dataUrl = await page.evaluate(() => {
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"],
+        { origin: new URL(baseUrl).origin });
+      const dataUrls = await page.evaluate(() => {
         const canvas = document.createElement("canvas");
         canvas.width = 16; canvas.height = 12;
         const context = canvas.getContext("2d");
         if (!context) throw new Error("Browser canvas is unavailable.");
         context.fillStyle = "#497cbd";
         context.fillRect(0, 0, 16, 12);
-        return canvas.toDataURL("image/jpeg", 0.8);
+        return { jpeg: canvas.toDataURL("image/jpeg", 0.8),
+          png: canvas.toDataURL("image/png") };
       });
-      jpeg = Buffer.from(dataUrl.split(",")[1] ?? "", "base64");
+      jpeg = Buffer.from(dataUrls.jpeg.split(",")[1] ?? "", "base64");
+      png = Buffer.from(dataUrls.png.split(",")[1] ?? "", "base64");
       expect(jpeg.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
+      expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
       await page.goto(`${baseUrl}/#/tasks/viewer-web-task`, { waitUntil: "domcontentloaded" });
       // A 64×64 solid frame encoded as Annex-B Main-profile H.264 by libx264.
       h264 = new Uint8Array(Buffer.from("AAAAAWdNQArcQmwEQAAAAwBAAAADAIPEieAAAAABaO4PLIAAAAFliIQEv/7oyfzLHD3dQ0paXYOlpxzCPR0j/rkHZkvIIcFZB4uJwQ==", "base64"));
@@ -411,8 +440,34 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         response: "response" in operation ? operation.response : null })),
       (_key, value) => typeof value === "bigint" ? value.toString() : value))
         .not.toContain("mounted-private-text");
+      await panel.getByText(/393×852 · Video: WDA MJPEG · Input: Native touch/u).waitFor();
+      await panel.getByRole("button", { name: "Home", exact: true }).click();
+      await vi.waitFor(() => expect(deviceCommands).toContainEqual({
+        url: "/session/SESSION-1/wda/pressButton", body: { name: "home" }, claimed: true
+      }), { timeout: 5_000 });
+      await panel.getByRole("button", { name: "Rotate device" }).click();
+      await vi.waitFor(() => expect(deviceCommands).toContainEqual({
+        url: "/session/SESSION-1/orientation", body: { orientation: "LANDSCAPE" }, claimed: true
+      }), { timeout: 5_000 });
+      await panel.getByText(/852×393 · Video: WDA MJPEG · Input: Native touch/u).waitFor();
+      await panel.getByRole("button", { name: "Lock screen", exact: true }).click();
+      await panel.getByRole("button", { name: "Unlock screen", exact: true }).click();
+      expect(deviceCommands.map(item => item.url)).toEqual([
+        "/session/SESSION-1/wda/pressButton", "/session/SESSION-1/orientation",
+        "/session/SESSION-1/wda/lock", "/session/SESSION-1/wda/unlock"
+      ]);
+      expect(deviceCommands.every(item => item.claimed)).toBe(true);
+      await panel.getByRole("button", { name: "Copy screenshot" }).click();
+      await panel.getByText("Screenshot copied to clipboard.").waitFor();
+      expect(screenshots).toEqual([true]);
+      expect(await page.evaluate(async () => {
+        const item = (await navigator.clipboard.read())[0];
+        const blob = await item!.getType("image/png");
+        return { type: blob.type, signature: [...new Uint8Array(await blob.slice(0, 8).arrayBuffer())] };
+      })).toEqual({ type: "image/png", signature: [137, 80, 78, 71, 13, 10, 26, 10] });
       await page.setViewportSize({ width: 390, height: 844 });
       await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
+      await panel.getByRole("button", { name: "Copy screenshot" }).waitFor({ state: "visible" });
       const deleteButton = panel.getByRole("button", { name: "Delete", exact: true });
       await deleteButton.focus();
       await page.keyboard.press("Enter");

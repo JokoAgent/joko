@@ -112,6 +112,26 @@ function hasClaim(store: OperationalStore): boolean {
     .some(operation => operation.kind === "ios_simulator_state_control");
 }
 
+it("replays a Viewer state command after snapshot refresh without dispatching another effect", async () => {
+  const h = fixture();
+  try {
+    const first = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    const effect = authority("a");
+    expect(await h.state.execute(SCOPE, route(h.instance), { type: "set_orientation",
+      snapshotId: first.snapshotId, orientation: "LANDSCAPE" }, effect, undefined,
+    { bindSnapshotToOperation: false })).toMatchObject({ replayed: false });
+    const current = (await h.screen.screenMap(SCOPE, route(h.instance))).screenMap;
+    expect(current.snapshotId).not.toBe(first.snapshotId);
+    expect(await h.state.execute(SCOPE, route(h.instance), { type: "set_orientation",
+      snapshotId: current.snapshotId, orientation: "LANDSCAPE" }, effect, undefined,
+    { bindSnapshotToOperation: false })).toMatchObject({ replayed: true });
+    expect(h.calls).toEqual([{ type: "orientation", value: "LANDSCAPE", claimed: true }]);
+    const operation = h.store.listOperations({ sessionId: SCOPE.sessionId })
+      .find(item => item.kind === "ios_simulator_state_control");
+    expect(operation?.body).not.toHaveProperty("snapshotId");
+  } finally { h.store.close(); }
+});
+
 it("claims each state change, rotates from the current snapshot and does not replay effects", async () => {
   const h = fixture();
   try {

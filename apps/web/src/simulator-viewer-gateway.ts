@@ -1,6 +1,6 @@
 import { createClient, type Transport } from "@connectrpc/connect";
 import {
-  CapabilitySupport, SimulatorViewerAction, SimulatorViewerService, SimulatorViewerStreamState,
+  CapabilitySupport, SimulatorViewerAction, SimulatorViewerCommand, SimulatorViewerService, SimulatorViewerStreamState,
   SimulatorViewerTouchPhase,
   type SimulatorViewerInstance
 } from "@joko/contracts";
@@ -10,7 +10,8 @@ import type {
 } from "./model.js";
 
 type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance" |
-  "controlSimulatorViewerInput" | "controlSimulatorViewerTouch" | "watchSimulatorFrames">;
+  "controlSimulatorViewerInput" | "controlSimulatorViewerTouch" | "getSimulatorViewerControls" |
+  "controlSimulatorViewerCommand" | "watchSimulatorFrames">;
 
 export function createSimulatorViewerGateway(transport: Transport, ownerSignal?: AbortSignal): ViewerApi {
   const client = createClient(SimulatorViewerService, transport);
@@ -71,6 +72,33 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
         gestureId: touch.gestureId, sequence: touch.sequence, phase,
         point: { xRatio: touch.xRatio, yRatio: touch.yRatio } }, options(signal));
       return { accepted: response.accepted };
+    },
+    async getSimulatorViewerControls(sessionId, route, signal) {
+      const response = await client.getSimulatorViewerControls({ sessionId, route }, options(signal));
+      if (!Number.isSafeInteger(response.viewportWidth) || response.viewportWidth < 1 ||
+          response.viewportWidth > 8_192 || !Number.isSafeInteger(response.viewportHeight) ||
+          response.viewportHeight < 1 || response.viewportHeight > 8_192 ||
+          response.orientation !== "PORTRAIT" && response.orientation !== "LANDSCAPE") {
+        throw new Error("Simulator Viewer controls response is invalid.");
+      }
+      return { viewportWidth: response.viewportWidth, viewportHeight: response.viewportHeight,
+        orientation: response.orientation, nativeTouchAvailable: response.nativeTouchAvailable };
+    },
+    async controlSimulatorViewerCommand(sessionId, requestId, route, command, signal) {
+      const mapped = command.action === "home" ? SimulatorViewerCommand.HOME
+        : command.action === "rotate" ? SimulatorViewerCommand.ROTATE
+          : command.action === "lock" ? SimulatorViewerCommand.LOCK
+            : command.action === "unlock" ? SimulatorViewerCommand.UNLOCK
+              : SimulatorViewerCommand.COPY_SCREENSHOT;
+      const response = await client.controlSimulatorViewerCommand({ sessionId, requestId,
+        route, command: mapped,
+        orientation: command.action === "rotate" ? command.orientation : ""
+      }, options(signal));
+      if (command.action === "copyScreenshot" ? response.screenshotBlobId === ""
+        : response.screenshotBlobId !== "") throw new Error(
+        "Simulator Viewer command response is invalid.");
+      return { replayed: response.replayed,
+        ...(response.screenshotBlobId === "" ? {} : { screenshotBlobId: response.screenshotBlobId }) };
     },
     async *watchSimulatorFrames(sessionId, route, signal, preference) {
       let sequence = 0n;

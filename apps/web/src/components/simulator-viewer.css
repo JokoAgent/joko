@@ -11,6 +11,11 @@
 .simulator-viewer__card-header h4 { margin: 0; font-size: var(--text-15); }
 .simulator-viewer__card-header span { color: var(--text-muted); font-size: var(--text-12); }
 .simulator-viewer__interaction { display: grid; gap: 8px; min-width: 0; }
+.simulator-viewer__toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.simulator-viewer__toolbar .button { min-height: 36px; }
+.simulator-viewer__toolbar .button svg { width: 15px; height: 15px; }
+.simulator-viewer__telemetry, .simulator-viewer__feedback { margin: 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
+.simulator-viewer__feedback { color: var(--green); }
 .simulator-viewer__screen { display: grid; place-content: center; justify-items: center; gap: 8px; min-height: 175px; padding: 16px; border: 1px dashed var(--line-strong); border-radius: 10px; background: var(--surface-sunken); color: var(--text-muted); text-align: center; }
 .simulator-viewer__screen svg { width: 30px; height: 30px; }
 .simulator-viewer__screen img, .simulator-viewer__screen canvas { display: block; max-width: 100%; max-height: min(65vh, 680px); object-fit: contain; }
@@ -33,4 +38,4 @@
 .simulator-viewer__forms input, .simulator-viewer__forms select { width: 100%; min-width: 0; min-height: 36px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
 .simulator-viewer__delete { display: grid; gap: 10px; }
 .simulator-viewer__delete p { margin: 0; }
-@container (max-width: 340px) { .simulator-viewer { padding: 12px; } .simulator-viewer__header .button { width: 100%; } .simulator-viewer__keyboard { align-items: stretch; flex-direction: column; } .simulator-viewer__keyboard .button { width: 100%; } .simulator-viewer__input-error { align-items: stretch; flex-direction: column; } }
+@container (max-width: 340px) { .simulator-viewer { padding: 12px; } .simulator-viewer__header .button { width: 100%; } .simulator-viewer__toolbar .button { flex: 1 1 calc(50% - 6px); } .simulator-viewer__keyboard { align-items: stretch; flex-direction: column; } .simulator-viewer__keyboard .button { width: 100%; } .simulator-viewer__input-error { align-items: stretch; flex-direction: column; } }

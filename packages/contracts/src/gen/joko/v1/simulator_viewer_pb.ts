@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/simulator_viewer.proto.
  */
 export const file_joko_v1_simulator_viewer: GenFile = /*@__PURE__*/
-  fileDesc("Ch5qb2tvL3YxL3NpbXVsYXRvcl92aWV3ZXIucHJvdG8SB2pva28udjEiUQoUU2ltdWxhdG9yVmlld2VyUm91dGUSEwoLaW5zdGFuY2VfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBIQCghsZWFzZV9pZBgDIAEoCSKnAQoVU2ltdWxhdG9yVmlld2VyRGV2aWNlEgwKBHVkaWQYASABKAkSDAoEbmFtZRgCIAEoCRINCgVzdGF0ZRgDIAEoCRIaChJydW50aW1lX2lkZW50aWZpZXIYBCABKAkSFAoMcnVudGltZV9uYW1lGAUgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBiABKAkSEQoJYXZhaWxhYmxlGAcgASgIIvwCChdTaW11bGF0b3JWaWV3ZXJJbnN0YW5jZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSFgoOc2ltdWxhdG9yX3VkaWQYAiABKAkSFgoOc2ltdWxhdG9yX25hbWUYAyABKAkSGgoScnVudGltZV9pZGVudGlmaWVyGAQgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBSABKAkSGwoTY3JlYXRpb25fcHJvdmVuYW5jZRgGIAEoCRIXCg9ib290X3Byb3ZlbmFuY2UYByABKAkSFwoPbGlmZWN5Y2xlX3N0YXRlGAggASgJEhQKDHZpZXdlcl9zdGF0ZRgJIAEoCRIUCgxoZWFsdGhfc3RhdGUYCiABKAkSEgoKZXJyb3JfY29kZRgLIAEoCRIbChNncmFjZV9leHBpcmVzX2F0X21zGAwgASgEEhsKE2xlYXNlX2V4cGlyZXNfYXRfbXMYDSABKAQiNAoeR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiyQEKH0dldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USKwoHc3VwcG9ydBgBIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQSEwoLcmVhc29uX2NvZGUYAiABKAkSLwoHZGV2aWNlcxgDIAMoCzIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyRGV2aWNlEjMKCWluc3RhbmNlcxgEIAMoCzIgLmpva28udjEuU2ltdWxhdG9yVmlld2VySW5zdGFuY2Ui4QEKH0NvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEi4KBmFjdGlvbhgDIAEoDjIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyQWN0aW9uEiwKBXJvdXRlGAQgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIVCg10ZW1wbGF0ZV91ZGlkGAUgASgJEgwKBG5hbWUYBiABKAkSEwoLZGV2aWNlX3VkaWQYByABKAkieQogQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USMgoIaW5zdGFuY2UYASABKAsyIC5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckluc3RhbmNlEg8KB2RlbGV0ZWQYAiABKAgSEAoIcmVwbGF5ZWQYAyABKAgiOAoUU2ltdWxhdG9yVmlld2VyUG9pbnQSDwoHeF9yYXRpbxgBIAEoARIPCgd5X3JhdGlvGAIgASgBIkIKElNpbXVsYXRvclZpZXdlclRhcBIsCgVwb2ludBgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUG9pbnQihQEKFFNpbXVsYXRvclZpZXdlclN3aXBlEiwKBXN0YXJ0GAEgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJQb2ludBIqCgNlbmQYAiABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclBvaW50EhMKC2R1cmF0aW9uX21zGAMgASgNIigKGFNpbXVsYXRvclZpZXdlclRleHRJbnB1dBIMCgR0ZXh0GAEgASgJIpICCiJDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCRIsCgVyb3V0ZRgDIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSKgoDdGFwGAQgASgLMhsuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUYXBIABIuCgVzd2lwZRgFIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyU3dpcGVIABIxCgR0ZXh0GAYgASgLMiEuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUZXh0SW5wdXRIAEIHCgVpbnB1dCI3CiNDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXNwb25zZRIQCghyZXBsYXllZBgBIAEoCCLtAQoiQ29udHJvbFNpbXVsYXRvclZpZXdlclRvdWNoUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEiwKBXJvdXRlGAIgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRISCgpnZXN0dXJlX2lkGAMgASgJEhAKCHNlcXVlbmNlGAQgASgNEjEKBXBoYXNlGAUgASgOMiIuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUb3VjaFBoYXNlEiwKBXBvaW50GAYgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJQb2ludCI3CiNDb250cm9sU2ltdWxhdG9yVmlld2VyVG91Y2hSZXNwb25zZRIQCghhY2NlcHRlZBgBIAEoCCKaAgobV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSLAoFcm91dGUYAiABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclJvdXRlEhoKEnByZWZlcl9uYXRpdmVfaDI2NBgDIAEoCBIZChFmcmFtZXNfcGVyX3NlY29uZBgEIAEoDRIXCg9zY2FsaW5nX3BlcmNlbnQYBSABKA0SEwoLb3JpZW50YXRpb24YBiABKAkSFAoManBlZ19xdWFsaXR5GAcgASgNEh8KF21qcGVnX2ZyYW1lc19wZXJfc2Vjb25kGAggASgNEh0KFW1qcGVnX3NjYWxpbmdfcGVyY2VudBgJIAEoDSLCAgocV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXNwb25zZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSMgoFc3RhdGUYAiABKA4yIy5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclN0cmVhbVN0YXRlEhAKCHNlcXVlbmNlGAMgASgEEhYKDnJlY2VpdmVkX2F0X21zGAQgASgDEgwKBGpwZWcYBSABKAwSGQoRcmVjb25uZWN0X2F0dGVtcHQYBiABKA0SDAoEaDI2NBgHIAEoDBINCgV3aWR0aBgIIAEoDRIOCgZoZWlnaHQYCSABKA0SGAoQdGltZXN0YW1wX21pY3JvcxgKIAEoBBIRCglrZXlfZnJhbWUYCyABKAgSEwoLaDI2NF9mb3JtYXQYDCABKAkqlQIKFVNpbXVsYXRvclZpZXdlckFjdGlvbhInCiNTSU1VTEFUT1JfVklFV0VSX0FDVElPTl9VTlNQRUNJRklFRBAAEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0NSRUFURRABEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0FUVEFDSBACEiEKHVNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX1NUQVJUEAMSIAocU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fU1RPUBAEEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0RFVEFDSBAFEiIKHlNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX0RFTEVURRAGKucBChlTaW11bGF0b3JWaWV3ZXJUb3VjaFBoYXNlEiwKKFNJTVVMQVRPUl9WSUVXRVJfVE9VQ0hfUEhBU0VfVU5TUEVDSUZJRUQQABImCiJTSU1VTEFUT1JfVklFV0VSX1RPVUNIX1BIQVNFX0JFR0lOEAESJQohU0lNVUxBVE9SX1ZJRVdFUl9UT1VDSF9QSEFTRV9NT1ZFEAISJAogU0lNVUxBVE9SX1ZJRVdFUl9UT1VDSF9QSEFTRV9FTkQQAxInCiNTSU1VTEFUT1JfVklFV0VSX1RPVUNIX1BIQVNFX0NBTkNFTBAEKoICChpTaW11bGF0b3JWaWV3ZXJTdHJlYW1TdGF0ZRItCilTSU1VTEFUT1JfVklFV0VSX1NUUkVBTV9TVEFURV9VTlNQRUNJRklFRBAAEiwKKFNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX0NPTk5FQ1RJTkcQARIuCipTSU1VTEFUT1JfVklFV0VSX1NUUkVBTV9TVEFURV9SRUNPTk5FQ1RJTkcQAhInCiNTSU1VTEFUT1JfVklFV0VSX1NUUkVBTV9TVEFURV9GUkFNRRADEi4KKlNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX0RJU0NPTk5FQ1RFRBAEMtIEChZTaW11bGF0b3JWaWV3ZXJTZXJ2aWNlEmwKF0dldFNpbXVsYXRvclZpZXdlclN0YXRlEicuam9rby52MS5HZXRTaW11bGF0b3JWaWV3ZXJTdGF0ZVJlcXVlc3QaKC5qb2tvLnYxLkdldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USbwoYQ29udHJvbFNpbXVsYXRvckluc3RhbmNlEiguam9rby52MS5Db250cm9sU2ltdWxhdG9ySW5zdGFuY2VSZXF1ZXN0Gikuam9rby52MS5Db250cm9sU2ltdWxhdG9ySW5zdGFuY2VSZXNwb25zZRJ4ChtDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXQSKy5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JWaWV3ZXJJbnB1dFJlcXVlc3QaLC5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JWaWV3ZXJJbnB1dFJlc3BvbnNlEngKG0NvbnRyb2xTaW11bGF0b3JWaWV3ZXJUb3VjaBIrLmpva28udjEuQ29udHJvbFNpbXVsYXRvclZpZXdlclRvdWNoUmVxdWVzdBosLmpva28udjEuQ29udHJvbFNpbXVsYXRvclZpZXdlclRvdWNoUmVzcG9uc2USZQoUV2F0Y2hTaW11bGF0b3JGcmFtZXMSJC5qb2tvLnYxLldhdGNoU2ltdWxhdG9yRnJhbWVzUmVxdWVzdBolLmpva28udjEuV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXNwb25zZTABYgZwcm90bzM", [file_joko_v1_capability]);
+  fileDesc("Ch5qb2tvL3YxL3NpbXVsYXRvcl92aWV3ZXIucHJvdG8SB2pva28udjEiUQoUU2ltdWxhdG9yVmlld2VyUm91dGUSEwoLaW5zdGFuY2VfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBIQCghsZWFzZV9pZBgDIAEoCSKnAQoVU2ltdWxhdG9yVmlld2VyRGV2aWNlEgwKBHVkaWQYASABKAkSDAoEbmFtZRgCIAEoCRINCgVzdGF0ZRgDIAEoCRIaChJydW50aW1lX2lkZW50aWZpZXIYBCABKAkSFAoMcnVudGltZV9uYW1lGAUgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBiABKAkSEQoJYXZhaWxhYmxlGAcgASgIIvwCChdTaW11bGF0b3JWaWV3ZXJJbnN0YW5jZRIsCgVyb3V0ZRgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSFgoOc2ltdWxhdG9yX3VkaWQYAiABKAkSFgoOc2ltdWxhdG9yX25hbWUYAyABKAkSGgoScnVudGltZV9pZGVudGlmaWVyGAQgASgJEh4KFmRldmljZV90eXBlX2lkZW50aWZpZXIYBSABKAkSGwoTY3JlYXRpb25fcHJvdmVuYW5jZRgGIAEoCRIXCg9ib290X3Byb3ZlbmFuY2UYByABKAkSFwoPbGlmZWN5Y2xlX3N0YXRlGAggASgJEhQKDHZpZXdlcl9zdGF0ZRgJIAEoCRIUCgxoZWFsdGhfc3RhdGUYCiABKAkSEgoKZXJyb3JfY29kZRgLIAEoCRIbChNncmFjZV9leHBpcmVzX2F0X21zGAwgASgEEhsKE2xlYXNlX2V4cGlyZXNfYXRfbXMYDSABKAQiNAoeR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiyQEKH0dldFNpbXVsYXRvclZpZXdlclN0YXRlUmVzcG9uc2USKwoHc3VwcG9ydBgBIAEoDjIaLmpva28udjEuQ2FwYWJpbGl0eVN1cHBvcnQSEwoLcmVhc29uX2NvZGUYAiABKAkSLwoHZGV2aWNlcxgDIAMoCzIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyRGV2aWNlEjMKCWluc3RhbmNlcxgEIAMoCzIgLmpva28udjEuU2ltdWxhdG9yVmlld2VySW5zdGFuY2Ui4QEKH0NvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEi4KBmFjdGlvbhgDIAEoDjIeLmpva28udjEuU2ltdWxhdG9yVmlld2VyQWN0aW9uEiwKBXJvdXRlGAQgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIVCg10ZW1wbGF0ZV91ZGlkGAUgASgJEgwKBG5hbWUYBiABKAkSEwoLZGV2aWNlX3VkaWQYByABKAkieQogQ29udHJvbFNpbXVsYXRvckluc3RhbmNlUmVzcG9uc2USMgoIaW5zdGFuY2UYASABKAsyIC5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckluc3RhbmNlEg8KB2RlbGV0ZWQYAiABKAgSEAoIcmVwbGF5ZWQYAyABKAgiOAoUU2ltdWxhdG9yVmlld2VyUG9pbnQSDwoHeF9yYXRpbxgBIAEoARIPCgd5X3JhdGlvGAIgASgBIkIKElNpbXVsYXRvclZpZXdlclRhcBIsCgVwb2ludBgBIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUG9pbnQihQEKFFNpbXVsYXRvclZpZXdlclN3aXBlEiwKBXN0YXJ0GAEgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJQb2ludBIqCgNlbmQYAiABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclBvaW50EhMKC2R1cmF0aW9uX21zGAMgASgNIigKGFNpbXVsYXRvclZpZXdlclRleHRJbnB1dBIMCgR0ZXh0GAEgASgJIpICCiJDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCRIsCgVyb3V0ZRgDIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUSKgoDdGFwGAQgASgLMhsuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUYXBIABIuCgVzd2lwZRgFIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyU3dpcGVIABIxCgR0ZXh0GAYgASgLMiEuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUZXh0SW5wdXRIAEIHCgVpbnB1dCI3CiNDb250cm9sU2ltdWxhdG9yVmlld2VySW5wdXRSZXNwb25zZRIQCghyZXBsYXllZBgBIAEoCCLtAQoiQ29udHJvbFNpbXVsYXRvclZpZXdlclRvdWNoUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEiwKBXJvdXRlGAIgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRISCgpnZXN0dXJlX2lkGAMgASgJEhAKCHNlcXVlbmNlGAQgASgNEjEKBXBoYXNlGAUgASgOMiIuam9rby52MS5TaW11bGF0b3JWaWV3ZXJUb3VjaFBoYXNlEiwKBXBvaW50GAYgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJQb2ludCI3CiNDb250cm9sU2ltdWxhdG9yVmlld2VyVG91Y2hSZXNwb25zZRIQCghhY2NlcHRlZBgBIAEoCCJlCiFHZXRTaW11bGF0b3JWaWV3ZXJDb250cm9sc1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIsCgVyb3V0ZRgCIAEoCzIdLmpva28udjEuU2ltdWxhdG9yVmlld2VyUm91dGUiigEKIkdldFNpbXVsYXRvclZpZXdlckNvbnRyb2xzUmVzcG9uc2USFgoOdmlld3BvcnRfd2lkdGgYASABKA0SFwoPdmlld3BvcnRfaGVpZ2h0GAIgASgNEhMKC29yaWVudGF0aW9uGAMgASgJEh4KFm5hdGl2ZV90b3VjaF9hdmFpbGFibGUYBCABKAgiwwEKJENvbnRyb2xTaW11bGF0b3JWaWV3ZXJDb21tYW5kUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkSLAoFcm91dGUYAyABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclJvdXRlEjAKB2NvbW1hbmQYBCABKA4yHy5qb2tvLnYxLlNpbXVsYXRvclZpZXdlckNvbW1hbmQSEwoLb3JpZW50YXRpb24YBSABKAkiVQolQ29udHJvbFNpbXVsYXRvclZpZXdlckNvbW1hbmRSZXNwb25zZRIQCghyZXBsYXllZBgBIAEoCBIaChJzY3JlZW5zaG90X2Jsb2JfaWQYAiABKAkimgIKG1dhdGNoU2ltdWxhdG9yRnJhbWVzUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEiwKBXJvdXRlGAIgASgLMh0uam9rby52MS5TaW11bGF0b3JWaWV3ZXJSb3V0ZRIaChJwcmVmZXJfbmF0aXZlX2gyNjQYAyABKAgSGQoRZnJhbWVzX3Blcl9zZWNvbmQYBCABKA0SFwoPc2NhbGluZ19wZXJjZW50GAUgASgNEhMKC29yaWVudGF0aW9uGAYgASgJEhQKDGpwZWdfcXVhbGl0eRgHIAEoDRIfChdtanBlZ19mcmFtZXNfcGVyX3NlY29uZBgIIAEoDRIdChVtanBlZ19zY2FsaW5nX3BlcmNlbnQYCSABKA0iwgIKHFdhdGNoU2ltdWxhdG9yRnJhbWVzUmVzcG9uc2USLAoFcm91dGUYASABKAsyHS5qb2tvLnYxLlNpbXVsYXRvclZpZXdlclJvdXRlEjIKBXN0YXRlGAIgASgOMiMuam9rby52MS5TaW11bGF0b3JWaWV3ZXJTdHJlYW1TdGF0ZRIQCghzZXF1ZW5jZRgDIAEoBBIWCg5yZWNlaXZlZF9hdF9tcxgEIAEoAxIMCgRqcGVnGAUgASgMEhkKEXJlY29ubmVjdF9hdHRlbXB0GAYgASgNEgwKBGgyNjQYByABKAwSDQoFd2lkdGgYCCABKA0SDgoGaGVpZ2h0GAkgASgNEhgKEHRpbWVzdGFtcF9taWNyb3MYCiABKAQSEQoJa2V5X2ZyYW1lGAsgASgIEhMKC2gyNjRfZm9ybWF0GAwgASgJKpUCChVTaW11bGF0b3JWaWV3ZXJBY3Rpb24SJwojU0lNVUxBVE9SX1ZJRVdFUl9BQ1RJT05fVU5TUEVDSUZJRUQQABIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9DUkVBVEUQARIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9BVFRBQ0gQAhIhCh1TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9TVEFSVBADEiAKHFNJTVVMQVRPUl9WSUVXRVJfQUNUSU9OX1NUT1AQBBIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9ERVRBQ0gQBRIiCh5TSU1VTEFUT1JfVklFV0VSX0FDVElPTl9ERUxFVEUQBirnAQoZU2ltdWxhdG9yVmlld2VyVG91Y2hQaGFzZRIsCihTSU1VTEFUT1JfVklFV0VSX1RPVUNIX1BIQVNFX1VOU1BFQ0lGSUVEEAASJgoiU0lNVUxBVE9SX1ZJRVdFUl9UT1VDSF9QSEFTRV9CRUdJThABEiUKIVNJTVVMQVRPUl9WSUVXRVJfVE9VQ0hfUEhBU0VfTU9WRRACEiQKIFNJTVVMQVRPUl9WSUVXRVJfVE9VQ0hfUEhBU0VfRU5EEAMSJwojU0lNVUxBVE9SX1ZJRVdFUl9UT1VDSF9QSEFTRV9DQU5DRUwQBCqAAgoWU2ltdWxhdG9yVmlld2VyQ29tbWFuZBIoCiRTSU1VTEFUT1JfVklFV0VSX0NPTU1BTkRfVU5TUEVDSUZJRUQQABIhCh1TSU1VTEFUT1JfVklFV0VSX0NPTU1BTkRfSE9NRRABEiMKH1NJTVVMQVRPUl9WSUVXRVJfQ09NTUFORF9ST1RBVEUQAhIhCh1TSU1VTEFUT1JfVklFV0VSX0NPTU1BTkRfTE9DSxADEiMKH1NJTVVMQVRPUl9WSUVXRVJfQ09NTUFORF9VTkxPQ0sQBBIsCihTSU1VTEFUT1JfVklFV0VSX0NPTU1BTkRfQ09QWV9TQ1JFRU5TSE9UEAUqggIKGlNpbXVsYXRvclZpZXdlclN0cmVhbVN0YXRlEi0KKVNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX1VOU1BFQ0lGSUVEEAASLAooU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfQ09OTkVDVElORxABEi4KKlNJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX1JFQ09OTkVDVElORxACEicKI1NJTVVMQVRPUl9WSUVXRVJfU1RSRUFNX1NUQVRFX0ZSQU1FEAMSLgoqU0lNVUxBVE9SX1ZJRVdFUl9TVFJFQU1fU1RBVEVfRElTQ09OTkVDVEVEEAQyyQYKFlNpbXVsYXRvclZpZXdlclNlcnZpY2USbAoXR2V0U2ltdWxhdG9yVmlld2VyU3RhdGUSJy5qb2tvLnYxLkdldFNpbXVsYXRvclZpZXdlclN0YXRlUmVxdWVzdBooLmpva28udjEuR2V0U2ltdWxhdG9yVmlld2VyU3RhdGVSZXNwb25zZRJvChhDb250cm9sU2ltdWxhdG9ySW5zdGFuY2USKC5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlcXVlc3QaKS5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JJbnN0YW5jZVJlc3BvbnNlEngKG0NvbnRyb2xTaW11bGF0b3JWaWV3ZXJJbnB1dBIrLmpva28udjEuQ29udHJvbFNpbXVsYXRvclZpZXdlcklucHV0UmVxdWVzdBosLmpva28udjEuQ29udHJvbFNpbXVsYXRvclZpZXdlcklucHV0UmVzcG9uc2USeAobQ29udHJvbFNpbXVsYXRvclZpZXdlclRvdWNoEisuam9rby52MS5Db250cm9sU2ltdWxhdG9yVmlld2VyVG91Y2hSZXF1ZXN0Giwuam9rby52MS5Db250cm9sU2ltdWxhdG9yVmlld2VyVG91Y2hSZXNwb25zZRJ1ChpHZXRTaW11bGF0b3JWaWV3ZXJDb250cm9scxIqLmpva28udjEuR2V0U2ltdWxhdG9yVmlld2VyQ29udHJvbHNSZXF1ZXN0Gisuam9rby52MS5HZXRTaW11bGF0b3JWaWV3ZXJDb250cm9sc1Jlc3BvbnNlEn4KHUNvbnRyb2xTaW11bGF0b3JWaWV3ZXJDb21tYW5kEi0uam9rby52MS5Db250cm9sU2ltdWxhdG9yVmlld2VyQ29tbWFuZFJlcXVlc3QaLi5qb2tvLnYxLkNvbnRyb2xTaW11bGF0b3JWaWV3ZXJDb21tYW5kUmVzcG9uc2USZQoUV2F0Y2hTaW11bGF0b3JGcmFtZXMSJC5qb2tvLnYxLldhdGNoU2ltdWxhdG9yRnJhbWVzUmVxdWVzdBolLmpva28udjEuV2F0Y2hTaW11bGF0b3JGcmFtZXNSZXNwb25zZTABYgZwcm90bzM", [file_joko_v1_capability]);
 
 /**
  * @generated from message joko.v1.SimulatorViewerRoute
@@ -500,6 +500,123 @@ export const ControlSimulatorViewerTouchResponseSchema: GenMessage<ControlSimula
   messageDesc(file_joko_v1_simulator_viewer, 14);
 
 /**
+ * @generated from message joko.v1.GetSimulatorViewerControlsRequest
+ */
+export type GetSimulatorViewerControlsRequest = Message<"joko.v1.GetSimulatorViewerControlsRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerRoute route = 2;
+   */
+  route?: SimulatorViewerRoute | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetSimulatorViewerControlsRequest.
+ * Use `create(GetSimulatorViewerControlsRequestSchema)` to create a new message.
+ */
+export const GetSimulatorViewerControlsRequestSchema: GenMessage<GetSimulatorViewerControlsRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 15);
+
+/**
+ * @generated from message joko.v1.GetSimulatorViewerControlsResponse
+ */
+export type GetSimulatorViewerControlsResponse = Message<"joko.v1.GetSimulatorViewerControlsResponse"> & {
+  /**
+   * @generated from field: uint32 viewport_width = 1;
+   */
+  viewportWidth: number;
+
+  /**
+   * @generated from field: uint32 viewport_height = 2;
+   */
+  viewportHeight: number;
+
+  /**
+   * @generated from field: string orientation = 3;
+   */
+  orientation: string;
+
+  /**
+   * @generated from field: bool native_touch_available = 4;
+   */
+  nativeTouchAvailable: boolean;
+};
+
+/**
+ * Describes the message joko.v1.GetSimulatorViewerControlsResponse.
+ * Use `create(GetSimulatorViewerControlsResponseSchema)` to create a new message.
+ */
+export const GetSimulatorViewerControlsResponseSchema: GenMessage<GetSimulatorViewerControlsResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 16);
+
+/**
+ * @generated from message joko.v1.ControlSimulatorViewerCommandRequest
+ */
+export type ControlSimulatorViewerCommandRequest = Message<"joko.v1.ControlSimulatorViewerCommandRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string request_id = 2;
+   */
+  requestId: string;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerRoute route = 3;
+   */
+  route?: SimulatorViewerRoute | undefined;
+
+  /**
+   * @generated from field: joko.v1.SimulatorViewerCommand command = 4;
+   */
+  command: SimulatorViewerCommand;
+
+  /**
+   * ROTATE carries its target so a replay cannot reverse a completed rotation.
+   *
+   * @generated from field: string orientation = 5;
+   */
+  orientation: string;
+};
+
+/**
+ * Describes the message joko.v1.ControlSimulatorViewerCommandRequest.
+ * Use `create(ControlSimulatorViewerCommandRequestSchema)` to create a new message.
+ */
+export const ControlSimulatorViewerCommandRequestSchema: GenMessage<ControlSimulatorViewerCommandRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 17);
+
+/**
+ * @generated from message joko.v1.ControlSimulatorViewerCommandResponse
+ */
+export type ControlSimulatorViewerCommandResponse = Message<"joko.v1.ControlSimulatorViewerCommandResponse"> & {
+  /**
+   * @generated from field: bool replayed = 1;
+   */
+  replayed: boolean;
+
+  /**
+   * Only COPY_SCREENSHOT returns an authenticated artifact identity; never PNG bytes.
+   *
+   * @generated from field: string screenshot_blob_id = 2;
+   */
+  screenshotBlobId: string;
+};
+
+/**
+ * Describes the message joko.v1.ControlSimulatorViewerCommandResponse.
+ * Use `create(ControlSimulatorViewerCommandResponseSchema)` to create a new message.
+ */
+export const ControlSimulatorViewerCommandResponseSchema: GenMessage<ControlSimulatorViewerCommandResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_simulator_viewer, 18);
+
+/**
  * @generated from message joko.v1.WatchSimulatorFramesRequest
  */
 export type WatchSimulatorFramesRequest = Message<"joko.v1.WatchSimulatorFramesRequest"> & {
@@ -554,7 +671,7 @@ export type WatchSimulatorFramesRequest = Message<"joko.v1.WatchSimulatorFramesR
  * Use `create(WatchSimulatorFramesRequestSchema)` to create a new message.
  */
 export const WatchSimulatorFramesRequestSchema: GenMessage<WatchSimulatorFramesRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_simulator_viewer, 15);
+  messageDesc(file_joko_v1_simulator_viewer, 19);
 
 /**
  * @generated from message joko.v1.WatchSimulatorFramesResponse
@@ -626,7 +743,7 @@ export type WatchSimulatorFramesResponse = Message<"joko.v1.WatchSimulatorFrames
  * Use `create(WatchSimulatorFramesResponseSchema)` to create a new message.
  */
 export const WatchSimulatorFramesResponseSchema: GenMessage<WatchSimulatorFramesResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_simulator_viewer, 16);
+  messageDesc(file_joko_v1_simulator_viewer, 20);
 
 /**
  * @generated from enum joko.v1.SimulatorViewerAction
@@ -711,6 +828,47 @@ export const SimulatorViewerTouchPhaseSchema: GenEnum<SimulatorViewerTouchPhase>
   enumDesc(file_joko_v1_simulator_viewer, 1);
 
 /**
+ * @generated from enum joko.v1.SimulatorViewerCommand
+ */
+export enum SimulatorViewerCommand {
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_COMMAND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_COMMAND_HOME = 1;
+   */
+  HOME = 1,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_COMMAND_ROTATE = 2;
+   */
+  ROTATE = 2,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_COMMAND_LOCK = 3;
+   */
+  LOCK = 3,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_COMMAND_UNLOCK = 4;
+   */
+  UNLOCK = 4,
+
+  /**
+   * @generated from enum value: SIMULATOR_VIEWER_COMMAND_COPY_SCREENSHOT = 5;
+   */
+  COPY_SCREENSHOT = 5,
+}
+
+/**
+ * Describes the enum joko.v1.SimulatorViewerCommand.
+ */
+export const SimulatorViewerCommandSchema: GenEnum<SimulatorViewerCommand> = /*@__PURE__*/
+  enumDesc(file_joko_v1_simulator_viewer, 2);
+
+/**
  * @generated from enum joko.v1.SimulatorViewerStreamState
  */
 export enum SimulatorViewerStreamState {
@@ -744,7 +902,7 @@ export enum SimulatorViewerStreamState {
  * Describes the enum joko.v1.SimulatorViewerStreamState.
  */
 export const SimulatorViewerStreamStateSchema: GenEnum<SimulatorViewerStreamState> = /*@__PURE__*/
-  enumDesc(file_joko_v1_simulator_viewer, 2);
+  enumDesc(file_joko_v1_simulator_viewer, 3);
 
 /**
  * Visible Viewer controls use authenticated task authority, never an agent Tool call.
@@ -783,6 +941,22 @@ export const SimulatorViewerService: GenService<{
     methodKind: "unary";
     input: typeof ControlSimulatorViewerTouchRequestSchema;
     output: typeof ControlSimulatorViewerTouchResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SimulatorViewerService.GetSimulatorViewerControls
+   */
+  getSimulatorViewerControls: {
+    methodKind: "unary";
+    input: typeof GetSimulatorViewerControlsRequestSchema;
+    output: typeof GetSimulatorViewerControlsResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.SimulatorViewerService.ControlSimulatorViewerCommand
+   */
+  controlSimulatorViewerCommand: {
+    methodKind: "unary";
+    input: typeof ControlSimulatorViewerCommandRequestSchema;
+    output: typeof ControlSimulatorViewerCommandResponseSchema;
   },
   /**
    * @generated from rpc joko.v1.SimulatorViewerService.WatchSimulatorFrames

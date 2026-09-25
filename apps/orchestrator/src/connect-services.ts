@@ -400,6 +400,8 @@ import { createTerminalConnectService } from "./terminal-connect-service.js";
 import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
 import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
+import { SimulatorScreenshotError } from "./ios-simulator-screenshot.js";
+import { SimulatorStateControlError } from "./ios-simulator-state-control.js";
 import { SimulatorObservationError } from "./ios-simulator-screen-observation.js";
 import { SimulatorViewerFrameError } from "./ios-simulator-viewer-frames.js";
 import { SimulatorInstanceControlError } from "./ios-simulator-instance-control.js";
@@ -755,7 +757,8 @@ function toConnectError(error: unknown): ConnectError {
       : error.code === "STREAM_TOO_LARGE" ? Code.ResourceExhausted
         : error.code === "STREAM_TIMEOUT" ? Code.DeadlineExceeded
           : error.code === "STREAM_INVALID" ? Code.DataLoss : Code.Unavailable);
-  if (error instanceof SimulatorInputError) return new ConnectError(redactSecrets(error.message),
+  if (error instanceof SimulatorInputError || error instanceof SimulatorStateControlError ||
+      error instanceof SimulatorScreenshotError) return new ConnectError(redactSecrets(error.message),
     error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
       : error.code === "MUTATION_CANCELLED" ? Code.Canceled
         : error.code === "MUTATION_CONFLICT" ? Code.AlreadyExists

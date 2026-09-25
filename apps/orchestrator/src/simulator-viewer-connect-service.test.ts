@@ -22,6 +22,11 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
     readonly screenMap: ReturnType<typeof vi.fn>;
     readonly liveTouch?: { readonly begin: ReturnType<typeof vi.fn>;
       readonly advance: ReturnType<typeof vi.fn>; readonly clearInstance: ReturnType<typeof vi.fn> };
+  }, commands?: {
+    readonly driver?: { readonly isReady: ReturnType<typeof vi.fn>;
+      readonly probeNativeLiveInput: ReturnType<typeof vi.fn> };
+    readonly stateControl?: { readonly execute: ReturnType<typeof vi.fn> };
+    readonly screenshot?: { readonly execute: ReturnType<typeof vi.fn> };
   }) {
   const store = new OperationalStore(":memory:");
   store.upsertBackend({ id: "pi", displayName: "Pi", version: "fixture", health: "healthy",
@@ -52,12 +57,81 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
       clearInstance: clear, frames: frames as never,
       input: viewerInput === undefined ? undefined : { execute: viewerInput.execute } as never,
       liveTouch: viewerInput?.liveTouch as never,
-      screen: viewerInput === undefined ? undefined : { screenMap: viewerInput.screenMap } as never },
+      screen: viewerInput === undefined ? undefined : { screenMap: viewerInput.screenMap } as never,
+      driver: commands?.driver as never, stateControl: commands?.stateControl as never,
+      screenshot: commands?.screenshot as never },
     authenticate: () => { if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated); }
   });
   return { store, ownership, instance, remove, clear, service, context,
     revoke: () => { authorized = false; }, authorize: () => { authorized = true; } };
 }
+
+it("routes visible Viewer commands through exact durable owners without binding refreshed snapshots", async () => {
+  const snapshotId = randomUUID();
+  const screenMap = vi.fn(async () => ({ screenMap: { snapshotId },
+    viewport: { width: 393, height: 852, orientation: "PORTRAIT" } }));
+  const inputView = vi.fn(() => ({ state: "streaming" as const, encoding: "jpeg" as const,
+    viewerOrientation: null, lastFrameAt: new Date().toISOString() }));
+  const inputExecute = vi.fn(async () => ({ replayed: false }));
+  const stateExecute = vi.fn(async () => ({ replayed: false }));
+  const screenshotExecute = vi.fn(async () => ({ replayed: false,
+    receipt: { image: { id: "screenshot-blob" } } }));
+  const driver = { isReady: vi.fn(() => true), probeNativeLiveInput: vi.fn(async () => true) };
+  const h = fixture({ watch: async function* () { /* not consumed */ }, inputView },
+    { execute: inputExecute, screenMap }, { driver, stateControl: { execute: stateExecute },
+      screenshot: { execute: screenshotExecute } });
+  const route = { instanceId: h.instance.instanceId, generation: BigInt(h.instance.generation),
+    leaseId: h.instance.lease.id };
+  const request = { sessionId: SCOPE.sessionId, route, requestId: randomUUID() };
+  try {
+    expect(await h.service.getSimulatorViewerControls(create(
+      contract.GetSimulatorViewerControlsRequestSchema, { sessionId: SCOPE.sessionId, route }), h.context))
+      .toMatchObject({ viewportWidth: 393, viewportHeight: 852,
+        orientation: "PORTRAIT", nativeTouchAvailable: true });
+    const home = await h.service.controlSimulatorViewerCommand(create(
+      contract.ControlSimulatorViewerCommandRequestSchema, {
+        ...request, command: contract.SimulatorViewerCommand.HOME
+      }), h.context);
+    expect(home).toMatchObject({ replayed: false, screenshotBlobId: "" });
+    expect(inputExecute).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
+      instanceId: route.instanceId }), { type: "press_home", snapshotId },
+    { mode: "none", timeoutMs: 5_000, stableForMs: 300 },
+    expect.objectContaining({ requestBodyHash: expect.stringMatching(/^sha256:/u) }),
+    h.context.signal, { bindSnapshotToOperation: false });
+    await h.service.controlSimulatorViewerCommand(create(
+      contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
+        requestId: randomUUID(), command: contract.SimulatorViewerCommand.ROTATE,
+        orientation: "LANDSCAPE" }), h.context);
+    expect(stateExecute).toHaveBeenCalledWith(SCOPE, expect.anything(),
+      { type: "set_orientation", snapshotId, orientation: "LANDSCAPE" },
+      expect.anything(), h.context.signal, { bindSnapshotToOperation: false });
+    for (const [command, type] of [
+      [contract.SimulatorViewerCommand.LOCK, "lock_screen"],
+      [contract.SimulatorViewerCommand.UNLOCK, "unlock_screen"]
+    ] as const) {
+      await h.service.controlSimulatorViewerCommand(create(
+        contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
+          requestId: randomUUID(), command }), h.context);
+      expect(stateExecute).toHaveBeenLastCalledWith(SCOPE, expect.anything(),
+        { type, snapshotId }, expect.anything(), h.context.signal,
+        { bindSnapshotToOperation: false });
+    }
+    expect(await h.service.controlSimulatorViewerCommand(create(
+      contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
+        requestId: randomUUID(), command: contract.SimulatorViewerCommand.COPY_SCREENSHOT }), h.context))
+      .toMatchObject({ screenshotBlobId: "screenshot-blob" });
+    expect(screenshotExecute).toHaveBeenCalledWith(SCOPE, expect.anything(),
+      expect.anything(), h.context.signal);
+    await expect(h.service.controlSimulatorViewerCommand(create(
+      contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
+        route: { ...route, leaseId: "wrong" }, command: contract.SimulatorViewerCommand.COPY_SCREENSHOT }),
+    h.context)).rejects.toBeDefined();
+    await expect(h.service.controlSimulatorViewerCommand(create(
+      contract.ControlSimulatorViewerCommandRequestSchema, { ...request,
+        command: contract.SimulatorViewerCommand.ROTATE, orientation: "SIDEWAYS" }),
+    h.context)).rejects.toMatchObject({ code: Code.InvalidArgument });
+  } finally { h.store.close(); }
+});
 
 it("streams task-bound frame messages and fences authentication between yields", async () => {
   const jpeg = new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]);

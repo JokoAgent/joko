@@ -153,7 +153,8 @@ export class SimulatorStateControlCoordinator {
 
   async execute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
     action: SimulatorStateControlAction, authority: SimulatorLifecycleEffectAuthority,
-    signal?: AbortSignal): Promise<SimulatorStateControlExecution> {
+    signal?: AbortSignal, options: { readonly bindSnapshotToOperation?: boolean } = {}
+  ): Promise<SimulatorStateControlExecution> {
     this.#validate(action, authority);
     if (signal?.aborted) {
       throw new SimulatorStateControlError("MUTATION_CANCELLED",
@@ -168,7 +169,8 @@ export class SimulatorStateControlCoordinator {
         body: { action: action.type, sessionId: scope.sessionId, targetId: scope.targetId,
           bindingGeneration: scope.generation, instanceId: route.instanceId,
           instanceGeneration: route.generation, leaseId: route.leaseId,
-          ...(action.type === "set_orientation" || action.type === "lock_screen" ||
+          ...(options.bindSnapshotToOperation === false ? {} :
+            action.type === "set_orientation" || action.type === "lock_screen" ||
             action.type === "unlock_screen" ? { snapshotId: action.snapshotId } : {}),
           requestBodyHash: authority.requestBodyHash,
           providerGeneration: authority.providerGeneration }

@@ -1833,6 +1833,8 @@ export function useAppController(): AppController {
       controlSimulatorInstance: (...args: Parameters<OperationApi["controlSimulatorInstance"]>) => original().controlSimulatorInstance(...args),
       controlSimulatorViewerInput: (...args: Parameters<OperationApi["controlSimulatorViewerInput"]>) => original().controlSimulatorViewerInput(...args),
       controlSimulatorViewerTouch: (...args: Parameters<OperationApi["controlSimulatorViewerTouch"]>) => original().controlSimulatorViewerTouch(...args),
+      getSimulatorViewerControls: (...args: Parameters<OperationApi["getSimulatorViewerControls"]>) => original().getSimulatorViewerControls(...args),
+      controlSimulatorViewerCommand: (...args: Parameters<OperationApi["controlSimulatorViewerCommand"]>) => original().controlSimulatorViewerCommand(...args),
       watchSimulatorFrames: (...args: Parameters<OperationApi["watchSimulatorFrames"]>) => original().watchSimulatorFrames(...args)
     };
   }, [artifactGateway]);

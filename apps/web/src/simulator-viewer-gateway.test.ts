@@ -1,10 +1,13 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
+  ControlSimulatorViewerCommandResponseSchema,
   ControlSimulatorViewerInputResponseSchema,
   ControlSimulatorViewerTouchResponseSchema,
+  GetSimulatorViewerControlsResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
-  SimulatorViewerInstanceSchema, SimulatorViewerStreamState, SimulatorViewerTouchPhase,
+  SimulatorViewerCommand, SimulatorViewerInstanceSchema,
+  SimulatorViewerStreamState, SimulatorViewerTouchPhase,
   WatchSimulatorFramesResponseSchema } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
@@ -31,6 +34,13 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
         ? create(ControlSimulatorViewerInputResponseSchema, { replayed: false })
         : method.localName === "controlSimulatorViewerTouch"
           ? create(ControlSimulatorViewerTouchResponseSchema, { accepted: true })
+          : method.localName === "getSimulatorViewerControls"
+            ? create(GetSimulatorViewerControlsResponseSchema, { viewportWidth: 393,
+              viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true })
+            : method.localName === "controlSimulatorViewerCommand"
+              ? create(ControlSimulatorViewerCommandResponseSchema, { replayed: false,
+                screenshotBlobId: input.command === SimulatorViewerCommand.COPY_SCREENSHOT
+                  ? "captured-blob" : "" })
         : create(ControlSimulatorInstanceResponseSchema, { instance, deleted: true });
     return { service: method.parent, method, stream: false,
       header: new Headers(), trailer: new Headers(), message };
@@ -60,6 +70,16 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
       gestureId: "A0123456-1234-1234-1234-123456789ABC", sequence: 1,
       phase: SimulatorViewerTouchPhase.MOVE,
       point: { xRatio: 0.4, yRatio: 0.6 } } });
+  expect(await gateway.getSimulatorViewerControls("task", route)).toEqual({
+    viewportWidth: 393, viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true
+  });
+  expect(await gateway.controlSimulatorViewerCommand("task", "rotate-request", route,
+    { action: "rotate", orientation: "LANDSCAPE" })).toEqual({ replayed: false });
+  expect(requests.at(-1)).toMatchObject({ name: "controlSimulatorViewerCommand",
+    input: { sessionId: "task", requestId: "rotate-request", route,
+      command: SimulatorViewerCommand.ROTATE, orientation: "LANDSCAPE" } });
+  expect(await gateway.controlSimulatorViewerCommand("task", "capture-request", route,
+    { action: "copyScreenshot" })).toEqual({ replayed: false, screenshotBlobId: "captured-blob" });
   failControl = true;
   await expect(gateway.controlSimulatorInstance("task", "uncertain", { action: "stop", route }))
     .rejects.toThrow("Outcome unknown");

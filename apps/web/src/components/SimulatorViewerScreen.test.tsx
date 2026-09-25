@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { Blob as NodeBlob } from "node:buffer";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
@@ -20,6 +21,78 @@ afterEach(async () => {
   Object.defineProperty(document, "hidden", { configurable: true, value: false });
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  Reflect.deleteProperty(window.navigator, "clipboard");
+  Reflect.deleteProperty(window, "ClipboardItem");
+});
+
+it("shows current route telemetry, rotates from a fresh viewport and copies an exact PNG", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:viewer-frame",
+    revokeObjectURL: vi.fn() });
+  const png = new NodeBlob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1])],
+    { type: "image/png" }) as Blob;
+  const fetcher = vi.fn(async () => ({ blob: async () => png }));
+  vi.stubGlobal("fetch", fetcher);
+  class FakeClipboardItem {
+    constructor(readonly data: Record<string, Promise<Blob>>) {}
+  }
+  Object.defineProperty(window, "ClipboardItem", { configurable: true, value: FakeClipboardItem });
+  const clipboardWrite = vi.fn(async (items: FakeClipboardItem[]) => {
+    expect(items).toHaveLength(1);
+    expect(await items[0]!.data["image/png"]).toBe(png);
+  });
+  Object.defineProperty(window.navigator, "clipboard", { configurable: true,
+    value: { write: clipboardWrite } });
+  let orientation: "PORTRAIT" | "LANDSCAPE" = "PORTRAIT";
+  const getControls = vi.fn(async () => ({ viewportWidth: orientation === "PORTRAIT" ? 393 : 852,
+    viewportHeight: orientation === "PORTRAIT" ? 852 : 393,
+    orientation, nativeTouchAvailable: true }));
+  const command = vi.fn(async (_session: string, _id: string, _route: typeof route,
+    input: { action: string; orientation?: "PORTRAIT" | "LANDSCAPE" }) => {
+    if (input.action === "rotate") orientation = input.orientation!;
+    return input.action === "copyScreenshot"
+      ? { replayed: false, screenshotBlobId: "exact-image" } : { replayed: false };
+  });
+  const release = vi.fn();
+  const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  };
+  const controller = { watchSimulatorFrames: watch, getSimulatorViewerControls: getControls,
+    controlSimulatorViewerCommand: command, getArtifactUrl: async () => "blob:artifact",
+    releaseArtifactUrl: release } as unknown as AppController;
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen controller={controller}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={async () => undefined}
+    t={(key, values) => translate("en", key, values)} />));
+  expect(container.textContent).toContain("393×852");
+  expect(container.textContent).toContain("WDA MJPEG");
+  expect(container.textContent).toContain("Native touch");
+  const button = (label: string): HTMLButtonElement | undefined =>
+    [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find(candidate => candidate.textContent === label);
+  await act(async () => button("Rotate device")?.click());
+  expect(command).toHaveBeenCalledWith("task", expect.any(String), route,
+    { action: "rotate", orientation: "LANDSCAPE" }, expect.any(AbortSignal));
+  expect(container.textContent).toContain("852×393");
+  await act(async () => button("Copy screenshot")?.click());
+  expect(clipboardWrite).toHaveBeenCalledOnce();
+  expect(fetcher).toHaveBeenCalledWith("blob:artifact", expect.anything());
+  expect(release).toHaveBeenCalledWith("exact-image");
+  expect(container.textContent).toContain("Screenshot copied to clipboard.");
+  clipboardWrite.mockRejectedValueOnce(new Error("Clipboard permission denied"));
+  await act(async () => button("Copy screenshot")?.click());
+  expect(container.textContent).toContain("Could not copy the screenshot to the clipboard.");
+  expect(button("Home")?.disabled).toBe(false);
+  expect(command.mock.calls.filter(call => call[3].action === "copyScreenshot")).toHaveLength(2);
+  Object.defineProperty(document, "hidden", { configurable: true, value: true });
+  await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+  expect(container.textContent).not.toContain("852×393");
+  expect(container.textContent).toContain("Paused");
 });
 
 it("shows actual JPEG frames only for the visible route, revokes old URLs and stops on hide", async () => {

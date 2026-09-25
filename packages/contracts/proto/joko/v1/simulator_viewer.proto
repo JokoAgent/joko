@@ -10,6 +10,8 @@ service SimulatorViewerService {
   rpc ControlSimulatorInstance(ControlSimulatorInstanceRequest) returns (ControlSimulatorInstanceResponse);
   rpc ControlSimulatorViewerInput(ControlSimulatorViewerInputRequest) returns (ControlSimulatorViewerInputResponse);
   rpc ControlSimulatorViewerTouch(ControlSimulatorViewerTouchRequest) returns (ControlSimulatorViewerTouchResponse);
+  rpc GetSimulatorViewerControls(GetSimulatorViewerControlsRequest) returns (GetSimulatorViewerControlsResponse);
+  rpc ControlSimulatorViewerCommand(ControlSimulatorViewerCommandRequest) returns (ControlSimulatorViewerCommandResponse);
   rpc WatchSimulatorFrames(WatchSimulatorFramesRequest) returns (stream WatchSimulatorFramesResponse);
 }
 
@@ -136,6 +138,42 @@ message ControlSimulatorViewerTouchRequest {
 message ControlSimulatorViewerTouchResponse {
   // False is returned only when begin was certainly not dispatched to the native helper.
   bool accepted = 1;
+}
+
+message GetSimulatorViewerControlsRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+}
+
+message GetSimulatorViewerControlsResponse {
+  uint32 viewport_width = 1;
+  uint32 viewport_height = 2;
+  string orientation = 3;
+  bool native_touch_available = 4;
+}
+
+enum SimulatorViewerCommand {
+  SIMULATOR_VIEWER_COMMAND_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_COMMAND_HOME = 1;
+  SIMULATOR_VIEWER_COMMAND_ROTATE = 2;
+  SIMULATOR_VIEWER_COMMAND_LOCK = 3;
+  SIMULATOR_VIEWER_COMMAND_UNLOCK = 4;
+  SIMULATOR_VIEWER_COMMAND_COPY_SCREENSHOT = 5;
+}
+
+message ControlSimulatorViewerCommandRequest {
+  string session_id = 1;
+  string request_id = 2;
+  SimulatorViewerRoute route = 3;
+  SimulatorViewerCommand command = 4;
+  // ROTATE carries its target so a replay cannot reverse a completed rotation.
+  string orientation = 5;
+}
+
+message ControlSimulatorViewerCommandResponse {
+  bool replayed = 1;
+  // Only COPY_SCREENSHOT returns an authenticated artifact identity; never PNG bytes.
+  string screenshot_blob_id = 2;
 }
 
 enum SimulatorViewerStreamState {

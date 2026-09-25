@@ -5339,6 +5339,22 @@ export interface SimulatorViewerTouchView {
   readonly yRatio: number;
 }
 
+export interface SimulatorViewerControlsView {
+  readonly viewportWidth: number;
+  readonly viewportHeight: number;
+  readonly orientation: "PORTRAIT" | "LANDSCAPE";
+  readonly nativeTouchAvailable: boolean;
+}
+
+export type SimulatorViewerCommandView =
+  | { readonly action: "home" | "lock" | "unlock" | "copyScreenshot" }
+  | { readonly action: "rotate"; readonly orientation: "PORTRAIT" | "LANDSCAPE" };
+
+export interface SimulatorViewerCommandResultView {
+  readonly replayed: boolean;
+  readonly screenshotBlobId?: string;
+}
+
 export type SimulatorViewerFrameEventView =
   | { readonly kind: "connecting" | "reconnecting" | "disconnected";
     readonly attempt: number }
@@ -5366,6 +5382,10 @@ export interface OperationApi {
     input: SimulatorViewerInputView, signal?: AbortSignal): Promise<SimulatorViewerInputResultView>;
   controlSimulatorViewerTouch(sessionId: string, route: SimulatorViewerRouteView,
     touch: SimulatorViewerTouchView, signal?: AbortSignal): Promise<{ readonly accepted: boolean }>;
+  getSimulatorViewerControls(sessionId: string, route: SimulatorViewerRouteView,
+    signal?: AbortSignal): Promise<SimulatorViewerControlsView>;
+  controlSimulatorViewerCommand(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
+    command: SimulatorViewerCommandView, signal?: AbortSignal): Promise<SimulatorViewerCommandResultView>;
   watchSimulatorFrames(sessionId: string, route: SimulatorViewerRouteView,
     signal?: AbortSignal,
     preference?: SimulatorViewerVideoPreferenceView): AsyncIterable<SimulatorViewerFrameEventView>;
