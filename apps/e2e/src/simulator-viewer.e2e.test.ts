@@ -155,6 +155,8 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
   let booted = false;
   let deletes = 0;
   let jpeg: Buffer | undefined;
+  let h264: Uint8Array | undefined;
+  let stopNative = false;
   let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -191,7 +193,20 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       deletes += 1;
       existing = false;
     } },
-    driver: { architecture: "arm64", manager: {
+    driver: { architecture: "arm64", nativeH264Runtime: {
+      probe: async () => h264 !== undefined,
+      stream: async function* (_identity, _profile, signal) {
+        let sequence = 0;
+        while (!signal?.aborted && !stopNative) {
+          sequence += 1;
+          yield { sequence, width: 64, height: 64, timestampMicros: sequence * 1_000_000,
+            keyFrame: true, format: "annex-b" as const, bytes: h264!,
+            receivedAt: new Date().toISOString() };
+          await new Promise<void>(resolve => setTimeout(resolve, 250));
+        }
+        if (stopNative) throw new Error("Native frame source disconnected.");
+      }
+    }, manager: {
       get: instanceId => activeDriver?.instanceId === instanceId ? activeDriver : null,
       start: async options => {
         activeDriver = { instanceId: options.instanceId, simulatorUdid: udid,
@@ -241,6 +256,14 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       jpeg = Buffer.from(dataUrl.split(",")[1] ?? "", "base64");
       expect(jpeg.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
       await page.goto(`${baseUrl}/#/tasks/viewer-web-task`, { waitUntil: "domcontentloaded" });
+      // A 64×64 solid frame encoded as Annex-B Main-profile H.264 by libx264.
+      h264 = new Uint8Array(Buffer.from("AAAAAWdNQArcQmwEQAAAAwBAAAADAIPEieAAAAABaO4PLIAAAAFliIQEv/7oyfzLHD3dQ0paXYOlpxzCPR0j/rkHZkvIIcFZB4uJwQ==", "base64"));
+      expect(h264.subarray(0, 4)).toEqual(new Uint8Array([0, 0, 0, 1]));
+      const decoderSupported = await page.evaluate(async () => typeof VideoDecoder !== "undefined" &&
+        (await VideoDecoder.isConfigSupported({ codec: "avc1.4d400a", codedWidth: 64,
+          codedHeight: 64, optimizeForLatency: true,
+          hardwareAcceleration: "prefer-hardware" })).supported);
+      expect(decoderSupported).toBe(true);
       await page.locator(".connection-tabs > button").nth(2).click();
       await page.getByLabel("Joko node address").fill(baseUrl);
       await page.getByLabel("Pairing code").fill(code);
@@ -261,6 +284,13 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await panel.getByRole("article", { name: "Joko iPhone" }).waitFor({ state: "visible" });
       await panel.getByText("paused").first().waitFor();
       await panel.getByRole("button", { name: "Start", exact: true }).click();
+      await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
+      await page.waitForFunction(() => {
+        const canvas = document.querySelector<HTMLCanvasElement>(".simulator-viewer__screen canvas");
+        return canvas?.width === 64 && canvas.height === 64 &&
+          (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
+      });
+      stopNative = true;
       await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       await page.waitForFunction(() => {
         const image = document.querySelector<HTMLImageElement>(".simulator-viewer__screen img");

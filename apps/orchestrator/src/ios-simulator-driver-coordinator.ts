@@ -1,8 +1,10 @@
 import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
-  MacSimulatorNativeHidRuntime, WdaDriverManager, WdaLoopbackClient,
+  MacSimulatorNativeHidRuntime, MacSimulatorNativeH264Runtime, WdaDriverManager, WdaLoopbackClient,
   streamSimulatorMjpeg,
   type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
-  type SimulatorNativeHidRuntime, type SimulatorNormalizedTouchSample,
+  type SimulatorNativeHidRuntime, type SimulatorNativeH264Runtime,
+  type SimulatorNativeH264Profile, type SimulatorNativeH264Frame,
+  type SimulatorNormalizedTouchSample,
   type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
   type WdaDriverHealth, type WdaPoint, type WdaRunningDriver, type WdaViewport } from "@joko/tool-ios-simulator";
 import type { SimulatorMjpegFrame } from "@joko/tool-ios-simulator";
@@ -19,7 +21,7 @@ const BODY_HASH = /^sha256:[0-9a-f]{64}$/u;
 export type SimulatorDriverErrorCode = "INVALID_ARGUMENT" | "MUTATION_CANCELLED" | "DRIVER_UNAVAILABLE" |
   "DEVICE_NOT_BOOTED" | "DRIVER_BUSY" | "DRIVER_CONFLICT" | "DRIVER_START_UNKNOWN" |
   "DRIVER_STOP_UNKNOWN" | "DRIVER_RUNTIME_LOST" | "STALE_DRIVER" | "INPUT_OUTCOME_UNKNOWN" |
-  "CLEANUP_REQUIRED" | "NATIVE_INPUT_UNAVAILABLE";
+  "CLEANUP_REQUIRED" | "NATIVE_INPUT_UNAVAILABLE" | "NATIVE_STREAM_UNAVAILABLE";
 
 export class SimulatorDriverError extends Error {
   constructor(readonly code: SimulatorDriverErrorCode, message: string) { super(message); }
@@ -40,6 +42,8 @@ export interface SimulatorDriverCoordinatorOptions {
   readonly state?: SimulatorDriverStateRegistry;
   readonly nativeHidPath?: string;
   readonly nativeHidRuntime?: SimulatorNativeHidRuntime;
+  readonly nativeH264Path?: string;
+  readonly nativeH264Runtime?: SimulatorNativeH264Runtime;
   readonly mjpegStream?: typeof streamSimulatorMjpeg;
 }
 
@@ -67,6 +71,7 @@ export class SimulatorDriverCoordinator {
   readonly #cacheRoot: string;
   readonly #architecture: "arm64" | "x86_64";
   readonly #nativeHid: SimulatorNativeHidRuntime | undefined;
+  readonly #nativeH264: SimulatorNativeH264Runtime | undefined;
   readonly #mjpegStream: typeof streamSimulatorMjpeg;
 
   constructor(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
@@ -83,6 +88,8 @@ export class SimulatorDriverCoordinator {
     this.#architecture = architecture(options.architecture);
     this.#nativeHid = options.nativeHidRuntime ?? (options.nativeHidPath === undefined
       ? undefined : new MacSimulatorNativeHidRuntime({ helperPath: options.nativeHidPath }));
+    this.#nativeH264 = options.nativeH264Runtime ?? (options.nativeH264Path === undefined
+      ? undefined : new MacSimulatorNativeH264Runtime({ helperPath: options.nativeH264Path }));
     this.#mjpegStream = options.mjpegStream ?? streamSimulatorMjpeg;
   }
 
@@ -115,6 +122,33 @@ export class SimulatorDriverCoordinator {
           current.mjpegPort !== active.mjpegPort || signal?.aborted) {
         throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during streaming.");
       }
+      yield frame;
+    }
+  }
+
+  async probeNativeH264(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<boolean> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance) || !this.#nativeH264) return false;
+    const available = await this.#nativeH264.probe({ simulatorUdid: instance.simulatorUdid,
+      generation: instance.generation }, signal);
+    const current = this.#manager.get(instance.instanceId);
+    if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+        current.driverSessionId !== active.driverSessionId || signal?.aborted) throw new SimulatorDriverError(
+      "STALE_DRIVER", "Simulator driver changed during native stream probe.");
+    return available;
+  }
+
+  async *streamNativeH264Frames(instance: PublicSimulatorInstance, profile: SimulatorNativeH264Profile,
+    signal?: AbortSignal): AsyncGenerator<SimulatorNativeH264Frame> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance) || !this.#nativeH264) throw new SimulatorDriverError(
+      "NATIVE_STREAM_UNAVAILABLE", "Simulator native H.264 streaming is unavailable.");
+    for await (const frame of this.#nativeH264.stream({ simulatorUdid: instance.simulatorUdid,
+      generation: instance.generation }, profile, signal)) {
+      const current = this.#manager.get(instance.instanceId);
+      if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+          current.driverSessionId !== active.driverSessionId || signal?.aborted) throw new SimulatorDriverError(
+        "STALE_DRIVER", "Simulator driver changed during native streaming.");
       yield frame;
     }
   }

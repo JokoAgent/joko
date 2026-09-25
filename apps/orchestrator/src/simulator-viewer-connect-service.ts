@@ -140,18 +140,37 @@ export function createSimulatorViewerConnectService(input: {
       if (!currentOwner.frames) throw new ConnectError(
         "Simulator Viewer frames are unavailable.", Code.Unimplemented);
       const route = requiredRoute(request.route);
+      if (request.preferNativeH264 && (!Number.isSafeInteger(request.framesPerSecond) ||
+          request.framesPerSecond < 1 || request.framesPerSecond > 60 ||
+          !Number.isSafeInteger(request.scalingPercent) || request.scalingPercent < 1 ||
+          request.scalingPercent > 100 ||
+          !["PORTRAIT", "LANDSCAPE"].includes(request.orientation))) {
+        throw new ConnectError("Simulator video profile is invalid.", Code.InvalidArgument);
+      }
       fence(context, task, false);
-      for await (const event of currentOwner.frames.watch(task, route, context.signal)) {
+      for await (const event of currentOwner.frames.watch(task, route, context.signal,
+        { preferNativeH264: request.preferNativeH264, profile: {
+          framesPerSecond: request.preferNativeH264 ? request.framesPerSecond : 20,
+          scalingPercent: request.preferNativeH264 ? request.scalingPercent : 70,
+          orientation: request.preferNativeH264 ? request.orientation as "PORTRAIT" | "LANDSCAPE"
+            : "PORTRAIT"
+        } })) {
         fence(context, task, false);
         yield create(contract.WatchSimulatorFramesResponseSchema, {
           route: create(contract.SimulatorViewerRouteSchema, { instanceId: route.instanceId,
             generation: BigInt(route.generation), leaseId: route.leaseId }),
-          state: event.kind === "frame" ? contract.SimulatorViewerStreamState.FRAME
+          state: event.kind === "frame" || event.kind === "h264"
+            ? contract.SimulatorViewerStreamState.FRAME
             : event.kind === "connecting" ? contract.SimulatorViewerStreamState.CONNECTING
               : event.kind === "reconnecting" ? contract.SimulatorViewerStreamState.RECONNECTING
                 : contract.SimulatorViewerStreamState.DISCONNECTED,
           ...(event.kind === "frame" ? { sequence: BigInt(event.sequence),
             receivedAtMs: BigInt(Date.parse(event.receivedAt)), jpeg: event.bytes }
+            : event.kind === "h264" ? { sequence: BigInt(event.sequence),
+              receivedAtMs: BigInt(Date.parse(event.receivedAt)), h264: event.bytes,
+              width: event.width, height: event.height,
+              timestampMicros: BigInt(event.timestampMicros),
+              keyFrame: event.keyFrame, h264Format: event.format }
             : { reconnectAttempt: event.attempt })
         });
       }

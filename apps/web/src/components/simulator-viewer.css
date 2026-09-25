@@ -12,8 +12,10 @@
 .simulator-viewer__card-header span { color: var(--text-muted); font-size: var(--text-12); }
 .simulator-viewer__screen { display: grid; place-content: center; justify-items: center; gap: 8px; min-height: 175px; padding: 16px; border: 1px dashed var(--line-strong); border-radius: 10px; background: var(--surface-sunken); color: var(--text-muted); text-align: center; }
 .simulator-viewer__screen svg { width: 30px; height: 30px; }
-.simulator-viewer__screen img { display: block; max-width: 100%; max-height: min(65vh, 680px); object-fit: contain; }
+.simulator-viewer__screen img, .simulator-viewer__screen canvas { display: block; max-width: 100%; max-height: min(65vh, 680px); object-fit: contain; }
 .simulator-viewer__screen .button { margin-top: 4px; }
+.simulator-viewer__quality { display: flex; align-items: center; gap: 8px; max-width: 100%; font-size: var(--text-12); }
+.simulator-viewer__quality select { min-width: 0; max-width: 100%; }
 .simulator-viewer__metadata { margin: 0; color: var(--text-muted); font-size: var(--text-12); overflow-wrap: anywhere; }
 .simulator-viewer__actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .simulator-viewer__forms label { display: grid; gap: 5px; min-width: 0; }

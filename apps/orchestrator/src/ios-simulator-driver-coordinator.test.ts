@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OperationalStore } from "@joko/store";
 import { createWdaOwnerFingerprint, WDA_SOURCE_PIN, type SimulatorNativeHidRuntime,
+  type SimulatorNativeH264Runtime,
   type WdaRunningDriver, type streamSimulatorMjpeg } from "@joko/tool-ios-simulator";
 import { expect, it } from "vitest";
 import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } from "./ios-simulator-driver-coordinator.js";
@@ -52,12 +53,14 @@ function harness(store: OperationalStore, ownership: SimulatorOwnershipRegistry,
   input: { readonly onStart?: () => Promise<void>; readonly onInspect?: () => void;
     readonly environmentReady?: boolean; readonly controlPort?: number;
     readonly nativeHidRuntime?: SimulatorNativeHidRuntime;
+    readonly nativeH264Runtime?: SimulatorNativeH264Runtime;
     readonly mjpegStream?: typeof streamSimulatorMjpeg } = {}) {
   let active: WdaRunningDriver | null = null;
   const effects: string[] = [];
   const options: SimulatorDriverCoordinatorOptions = { archivePath: "/private/joko/wda.tar.gz",
     cacheRoot: "/private/joko/driver-cache", architecture: "arm64",
     nativeHidRuntime: input.nativeHidRuntime,
+    nativeH264Runtime: input.nativeH264Runtime,
     mjpegStream: input.mjpegStream,
     environment: { inspect: async () => { input.onInspect?.();
       return { ...ENVIRONMENT, ready: input.environmentReady ?? true }; } },
@@ -127,6 +130,41 @@ it("reads MJPEG only from the current owned driver port and rejects a changed ma
     expect(ports).toEqual([19100]);
     h.loseActive();
     await expect(stream.next()).rejects.toMatchObject({ code: "STALE_DRIVER" });
+  } finally { store.close(); }
+});
+
+it("probes and streams native H.264 only for the exact ready driver lease", async () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    const ownership = new SimulatorOwnershipRegistry(store);
+    const initial = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const calls: string[] = [];
+    let loseActive = (): void => undefined;
+    const h = harness(store, ownership, { nativeH264Runtime: {
+      probe: async identity => { calls.push(`probe:${identity.simulatorUdid}:${identity.generation}`);
+        return true; },
+      stream: async function* (identity, profile) {
+        calls.push(`stream:${identity.simulatorUdid}:${identity.generation}:${profile.framesPerSecond}`);
+        yield { sequence: 1, width: 64, height: 64, timestampMicros: 1000,
+          keyFrame: true, format: "annex-b" as const, bytes: new Uint8Array([0, 0, 0, 1, 0x65]),
+          receivedAt: new Date().toISOString() };
+        loseActive();
+        yield { sequence: 2, width: 64, height: 64, timestampMicros: 2000,
+          keyFrame: false, format: "annex-b" as const, bytes: new Uint8Array([0, 0, 0, 1, 0x41]),
+          receivedAt: new Date().toISOString() };
+      }
+    } });
+    loseActive = h.loseActive;
+    const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    await expect(h.coordinator.probeNativeH264(started.instance)).resolves.toBe(true);
+    const stream = h.coordinator.streamNativeH264Frames(started.instance,
+      { framesPerSecond: 30, scalingPercent: 100, orientation: "PORTRAIT" });
+    expect((await stream.next()).value?.sequence).toBe(1);
+    await expect(stream.next()).rejects.toMatchObject({ code: "STALE_DRIVER" });
+    await expect(h.coordinator.probeNativeH264(started.instance)).resolves.toBe(false);
+    expect(calls).toEqual([`probe:${UDID}:${started.instance.generation}`,
+      `stream:${UDID}:${started.instance.generation}:30`]);
   } finally { store.close(); }
 });
 

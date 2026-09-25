@@ -83,6 +83,14 @@
       ]
     },
     {
+      "from": "dist/native-simulator-h264",
+      "to": "native-simulator-h264",
+      "filter": [
+        "manifest.json",
+        "joko-simulator-h264"
+      ]
+    },
+    {
       "from": "dist/orchestrator-runtime",
       "to": "orchestrator-runtime",
       "filter": [

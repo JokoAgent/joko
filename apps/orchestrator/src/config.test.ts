@@ -137,7 +137,8 @@ describe("Orchestrator network configuration", () => {
     expect(loadConfig({ ...base, JOKO_DESKTOP_RESOURCES_PATH: desktopResources }).iosSimulatorDriver)
       .toEqual({ archivePath: join(desktopResources, "ios-simulator", WDA_SOURCE_PIN.archiveFileName),
         cacheRoot: join(dataDirectory, "ios-simulator", "driver-cache"),
-        nativeHidPath: join(desktopResources, "native-simulator-hid", "joko-simulator-hid") });
+        nativeHidPath: join(desktopResources, "native-simulator-hid", "joko-simulator-hid"),
+        nativeH264Path: join(desktopResources, "native-simulator-h264", "joko-simulator-h264") });
     expect(() => loadConfig({ ...base, JOKO_DESKTOP_RESOURCES_PATH: "relative/resources" })).toThrow();
     expect(() => loadConfig({ ...base, JOKO_DESKTOP_RESOURCES_PATH: join(fixtureRoot, "absent") })).toThrow();
   });

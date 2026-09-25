@@ -15,6 +15,8 @@ export * from "./screen-map.js";
 export * from "./visual-diff.js";
 export * from "./native-touch-path.js";
 export * from "./native-hid-runtime.js";
+export * from "./native-h264-protocol.js";
+export * from "./native-h264-runtime.js";
 export * from "./recording-runtime.js";
 export * from "./delete.js";
 export * from "./mjpeg-stream.js";

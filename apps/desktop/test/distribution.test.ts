@@ -92,6 +92,7 @@ describe("Desktop distribution", () => {
       { from: "resources/native-task-status-sounds", to: "native-task-status-sounds" },
       { from: "dist/native-voice-shortcut", to: "native-voice-shortcut" },
       { from: "dist/native-simulator-hid", to: "native-simulator-hid" },
+      { from: "dist/native-simulator-h264", to: "native-simulator-h264" },
       { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },
       { from: "dist/orchestrator-runtime/node_modules", to: "orchestrator-runtime/node_modules" }
     ]);
@@ -100,6 +101,9 @@ describe("Desktop distribution", () => {
     ]);
     expect(config.extraResources.find(item => item.to === "native-simulator-hid")?.filter).toEqual([
       "manifest.json", "joko-simulator-hid"
+    ]);
+    expect(config.extraResources.find(item => item.to === "native-simulator-h264")?.filter).toEqual([
+      "manifest.json", "joko-simulator-h264"
     ]);
     expect(config.extraResources.filter(item => item.to.startsWith("orchestrator-runtime")))
       .toEqual(expect.arrayContaining([

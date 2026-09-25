@@ -47,7 +47,7 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
   expect(requests.every(item => item.signal.aborted)).toBe(true);
 });
 
-it("validates generated frame stream route, sequence and JPEG bytes before presentation", async () => {
+it("validates generated frame stream route, sequence and encoded bytes before presentation", async () => {
   const route = { instanceId: "owned", generation: 4n, leaseId: "lease" };
   const responses = [
     create(WatchSimulatorFramesResponseSchema,
@@ -56,8 +56,13 @@ it("validates generated frame stream route, sequence and JPEG bytes before prese
       { route, state: SimulatorViewerStreamState.FRAME, sequence: 1n,
         receivedAtMs: 1_000n, jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) }),
     create(WatchSimulatorFramesResponseSchema,
+      { route, state: SimulatorViewerStreamState.FRAME, sequence: 2n,
+        receivedAtMs: 1_500n, h264: new Uint8Array([0, 0, 0, 1, 0x65, 0x88]),
+        width: 16, height: 12, timestampMicros: 3_000n,
+        keyFrame: true, h264Format: "annex-b" }),
+    create(WatchSimulatorFramesResponseSchema,
       { route: { ...route, generation: 5n }, state: SimulatorViewerStreamState.FRAME,
-        sequence: 2n, receivedAtMs: 2_000n, jpeg: new Uint8Array([0xff, 0xd8, 2, 0xff, 0xd9]) })
+        sequence: 3n, receivedAtMs: 2_000n, jpeg: new Uint8Array([0xff, 0xd8, 2, 0xff, 0xd9]) })
   ];
   const stream = vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown,
     _headers: unknown, input: any) => ({ service: method.parent, method, stream: true,
@@ -65,9 +70,16 @@ it("validates generated frame stream route, sequence and JPEG bytes before prese
         for (const response of responses) yield response;
       })(), signal, input }));
   const gateway = createSimulatorViewerGateway({ stream } as unknown as Transport);
-  const iterator = gateway.watchSimulatorFrames("task", route)[Symbol.asyncIterator]();
+  const iterator = gateway.watchSimulatorFrames("task", route, undefined,
+    { preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
+      orientation: "PORTRAIT" })[Symbol.asyncIterator]();
   expect((await iterator.next()).value).toEqual({ kind: "connecting", attempt: 0 });
   expect((await iterator.next()).value).toMatchObject({ kind: "frame", sequence: 1n });
+  expect((await iterator.next()).value).toMatchObject({ kind: "h264", sequence: 2n,
+    width: 16, height: 12, keyFrame: true });
   await expect(iterator.next()).rejects.toThrow("another instance route");
   expect(stream).toHaveBeenCalledOnce();
+  const sent = await stream.mock.calls[0]?.[4][Symbol.asyncIterator]().next();
+  expect(sent?.value).toMatchObject({ preferNativeH264: true,
+    framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" });
 });

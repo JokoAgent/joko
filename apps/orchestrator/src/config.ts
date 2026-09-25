@@ -39,7 +39,7 @@ export interface OrchestratorConfig {
   };
   readonly pdfRendererHost?: { readonly executablePath: string; readonly appPath?: string };
   readonly iosSimulatorDriver?: { readonly archivePath: string; readonly cacheRoot: string;
-    readonly nativeHidPath?: string };
+    readonly nativeHidPath?: string; readonly nativeH264Path?: string };
   readonly mobilePush?: {
     readonly apns: {
       readonly teamId: string;
@@ -158,7 +158,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     ...(simulatorResources === undefined ? {} : { iosSimulatorDriver: {
       archivePath: join(simulatorResources, "ios-simulator", WDA_SOURCE_PIN.archiveFileName),
       cacheRoot: join(dataDirectory, "ios-simulator", "driver-cache"),
-      nativeHidPath: join(simulatorResources, "native-simulator-hid", "joko-simulator-hid")
+      nativeHidPath: join(simulatorResources, "native-simulator-hid", "joko-simulator-hid"),
+      nativeH264Path: join(simulatorResources, "native-simulator-h264", "joko-simulator-h264")
     } }),
     ...(mobilePush === undefined ? {} : { mobilePush }),
     corsOrigins

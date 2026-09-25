@@ -80,6 +80,38 @@ it("streams task-bound frame messages and fences authentication between yields",
   } finally { h.store.close(); }
 });
 
+it("passes a bounded native profile and projects H.264 metadata without durable media", async () => {
+  const bytes = new Uint8Array([0, 0, 0, 1, 0x65, 0x88]);
+  const watch = vi.fn(async function* () {
+    yield { kind: "h264", sequence: 1, receivedAt: new Date(2_000).toISOString(),
+      bytes, width: 16, height: 12, timestampMicros: 3_000,
+      keyFrame: true, format: "annex-b" } as const;
+  });
+  const h = fixture({ watch });
+  try {
+    const request = create(contract.WatchSimulatorFramesRequestSchema, {
+      sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
+        generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
+      preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
+      orientation: "PORTRAIT"
+    });
+    const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
+    expect((await stream.next()).value).toMatchObject({ state: contract.SimulatorViewerStreamState.FRAME,
+      sequence: 1n, receivedAtMs: 2_000n, h264: bytes, jpeg: new Uint8Array(),
+      width: 16, height: 12, timestampMicros: 3_000n,
+      keyFrame: true, h264Format: "annex-b" });
+    expect(watch).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
+      instanceId: h.instance.instanceId }), h.context.signal,
+    expect.objectContaining({ preferNativeH264: true,
+      profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" } }));
+    expect(h.store.listOperations({ sessionId: SCOPE.sessionId })).toEqual([]);
+    await stream.return?.();
+    await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
+      { ...request, framesPerSecond: 61 }), h.context)[Symbol.asyncIterator]().next())
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+  } finally { h.store.close(); }
+});
+
 it("projects only the authenticated task's exact instance and routes UI deletion outside the agent catalog", async () => {
   const h = fixture();
   try {

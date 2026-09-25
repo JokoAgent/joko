@@ -71,6 +71,7 @@ module.exports = async function auditPackaged(context) {
   const runtimeRoot = resolve(resourcesRoot, "orchestrator-runtime");
   const nativeVoiceShortcutRoot = resolve(resourcesRoot, "native-voice-shortcut");
   const nativeSimulatorHidRoot = resolve(resourcesRoot, "native-simulator-hid");
+  const nativeSimulatorH264Root = resolve(resourcesRoot, "native-simulator-h264");
 
   const updaterConfigPath = resolve(resourcesRoot, "app-update.yml");
   await assertCanonicalRegularFile(updaterConfigPath, "The packaged application is missing app-update.yml.");
@@ -86,7 +87,10 @@ module.exports = async function auditPackaged(context) {
     context.electronPlatformName,
     targetArch
   );
-  await auditNativeSimulatorHid(nativeSimulatorHidRoot, context.electronPlatformName, targetArch);
+  await auditNativeSimulatorHelper(nativeSimulatorHidRoot, context.electronPlatformName,
+    targetArch, "Simulator HID", "joko-simulator-hid");
+  await auditNativeSimulatorHelper(nativeSimulatorH264Root, context.electronPlatformName,
+    targetArch, "Simulator H.264", "joko-simulator-h264");
 
   const applicationEntries = await readdir(applicationRoot, { withFileTypes: true });
   const unexpectedApplicationRoot = applicationEntries.find((entry) =>
@@ -437,32 +441,32 @@ async function auditNativeVoiceShortcut(root, platform, targetArch) {
   return helper;
 }
 
-async function auditNativeSimulatorHid(root, platform, targetArch) {
-  const manifest = await readJsonManifest(resolve(root, "manifest.json"), "Simulator HID");
+async function auditNativeSimulatorHelper(root, platform, targetArch, label, helperName) {
+  const manifest = await readJsonManifest(resolve(root, "manifest.json"), label);
   const helper = manifest.helper;
-  const expected = (helper === null ? ["manifest.json"] : ["joko-simulator-hid", "manifest.json"]).sort();
+  const expected = (helper === null ? ["manifest.json"] : [helperName, "manifest.json"]).sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();
   if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
-    throw new Error("The packaged Simulator HID helper directory is incomplete or contains unexpected files.");
+    throw new Error(`The packaged ${label} helper directory is incomplete or contains unexpected files.`);
   }
   for (const entry of entries) {
     await assertCanonicalRegularFile(resolve(root, entry.name),
-      `The packaged Simulator HID file is unsafe: ${entry.name}`);
+      `The packaged ${label} file is unsafe: ${entry.name}`);
   }
   if (Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion" ||
       (platform === "darwin" && helper !== null ?
         !["universal", targetArch === "x64" ? "x86_64" : targetArch].includes(manifest.architecture) :
         manifest.architecture !== (platform === "darwin" && targetArch === "x64" ? "x86_64" : targetArch)) ||
       manifest.platform !== platform ||
-      ![null, platform === "darwin" ? "joko-simulator-hid" : null].includes(helper) ||
+      ![null, platform === "darwin" ? helperName : null].includes(helper) ||
       (platform !== "darwin" && helper !== null) || manifest.protocolVersion !== 1) {
-    throw new Error("The packaged Simulator HID manifest does not match the artifact target.");
+    throw new Error(`The packaged ${label} manifest does not match the artifact target.`);
   }
   if (helper === null) return;
   const info = await lstat(resolve(root, helper));
   if (info.size <= 0 || info.size > 16 * 1024 * 1024 || (info.mode & 0o111) === 0) {
-    throw new Error("The packaged macOS Simulator HID helper is invalid or not executable.");
+    throw new Error(`The packaged macOS ${label} helper is invalid or not executable.`);
   }
 }
 

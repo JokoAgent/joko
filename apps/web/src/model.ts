@@ -5325,13 +5325,25 @@ export type SimulatorViewerFrameEventView =
   | { readonly kind: "connecting" | "reconnecting" | "disconnected";
     readonly attempt: number }
   | { readonly kind: "frame"; readonly sequence: bigint; readonly receivedAtMs: number;
-    readonly jpeg: Uint8Array };
+    readonly jpeg: Uint8Array }
+  | { readonly kind: "h264"; readonly sequence: bigint; readonly receivedAtMs: number;
+    readonly h264: Uint8Array; readonly width: number; readonly height: number;
+    readonly timestampMicros: number; readonly keyFrame: boolean;
+    readonly format: "annex-b" };
+
+export interface SimulatorViewerVideoPreferenceView {
+  readonly preferNativeH264: boolean;
+  readonly framesPerSecond: number;
+  readonly scalingPercent: number;
+  readonly orientation: "PORTRAIT" | "LANDSCAPE";
+}
 
 export interface OperationApi {
   getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   watchSimulatorFrames(sessionId: string, route: SimulatorViewerRouteView,
-    signal?: AbortSignal): AsyncIterable<SimulatorViewerFrameEventView>;
+    signal?: AbortSignal,
+    preference?: SimulatorViewerVideoPreferenceView): AsyncIterable<SimulatorViewerFrameEventView>;
   getTerminalCapabilities(sessionId?: string, signal?: AbortSignal): Promise<TerminalCapabilitiesView>;
   listTerminals(sessionId: string, signal?: AbortSignal): Promise<readonly TerminalView[]>;
   createTerminal(sessionId: string, requestId: string, shellId: string, columns: number, rows: number, initialPalette: TerminalPaletteView, signal?: AbortSignal): Promise<TerminalView>;

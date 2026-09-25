@@ -46,7 +46,8 @@ it("shows actual JPEG frames only for the visible route, revokes old URLs and st
       enabled={enabled} ownerDocument={document}
       t={(key, values) => translate("en", key, values)} />));
   await render(true);
-  expect(watch).toHaveBeenCalledWith("task", route, expect.any(AbortSignal));
+  expect(watch).toHaveBeenCalledWith("task", route, expect.any(AbortSignal),
+    expect.objectContaining({ preferNativeH264: false }));
   expect(container.querySelector("img")?.getAttribute("src")).toBe("blob:viewer-1");
   Object.defineProperty(document, "hidden", { configurable: true, value: true });
   await act(async () => document.dispatchEvent(new Event("visibilitychange")));
@@ -84,4 +85,56 @@ it("requires an explicit retry after finite stream loss and does not retain the 
   await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
   expect(calls).toBe(2);
   expect(container.querySelector("img")?.getAttribute("src")).toBe("blob:recovered");
+});
+
+it("renders current H.264 output to a canvas and falls back to JPEG when decoding is unavailable", async () => {
+  const drawImage = vi.fn();
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage } as unknown as CanvasRenderingContext2D);
+  let output: ((frame: { close(): void }) => void) | undefined;
+  class FakeDecoder {
+    static async isConfigSupported() { return { supported: true }; }
+    constructor(callbacks: { output(frame: { close(): void }): void }) { output = callbacks.output; }
+    configure() {}
+    decode() { output?.({ close: vi.fn() }); }
+    close() {}
+  }
+  vi.stubGlobal("VideoDecoder", FakeDecoder);
+  vi.stubGlobal("EncodedVideoChunk", class { constructor(_input: unknown) {} });
+  let called = 0;
+  const watch = vi.fn(async function* (_task: string, _route: typeof route, signal: AbortSignal,
+    preference: { preferNativeH264: boolean }) {
+    called += 1;
+    expect(preference.preferNativeH264).toBe(true);
+    yield { kind: "h264", sequence: 1n, receivedAtMs: 1,
+      h264: new Uint8Array([0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x1f,
+        0, 0, 0, 1, 0x68, 1, 0, 0, 0, 1, 0x65, 1]),
+      width: 16, height: 12, timestampMicros: 1_000, keyFrame: true,
+      format: "annex-b" } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen
+    controller={{ watchSimulatorFrames: watch } as unknown as AppController}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    t={(key, values) => translate("en", key, values)} />));
+  expect(called).toBe(1);
+  expect(drawImage).toHaveBeenCalledOnce();
+  expect(container.querySelector("canvas")?.width).toBe(16);
+  expect(container.querySelector("img")).toBeNull();
+  const quality = container.querySelector(".simulator-viewer__quality select") as HTMLSelectElement;
+  expect(quality.value).toBe("balanced");
+  await act(async () => {
+    quality.value = "high";
+    quality.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  expect(called).toBe(2);
+  expect(watch.mock.calls[1]?.[3]).toMatchObject({ preferNativeH264: true,
+    framesPerSecond: 30, scalingPercent: 100, orientation: "PORTRAIT" });
+  await act(async () => root.unmount());
+  roots.pop();
+  expect(container.querySelector("canvas")).toBeNull();
+  vi.unstubAllGlobals();
 });

@@ -91,6 +91,10 @@ enum SimulatorViewerStreamState {
 message WatchSimulatorFramesRequest {
   string session_id = 1;
   SimulatorViewerRoute route = 2;
+  bool prefer_native_h264 = 3;
+  uint32 frames_per_second = 4;
+  uint32 scaling_percent = 5;
+  string orientation = 6;
 }
 
 message WatchSimulatorFramesResponse {
@@ -100,4 +104,10 @@ message WatchSimulatorFramesResponse {
   int64 received_at_ms = 4;
   bytes jpeg = 5;
   uint32 reconnect_attempt = 6;
+  bytes h264 = 7;
+  uint32 width = 8;
+  uint32 height = 9;
+  uint64 timestamp_micros = 10;
+  bool key_frame = 11;
+  string h264_format = 12;
 }

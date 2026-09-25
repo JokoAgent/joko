@@ -1,20 +1,27 @@
-import type { SimulatorMjpegFrame } from "@joko/tool-ios-simulator";
+import type { SimulatorMjpegFrame, SimulatorNativeH264Frame,
+  SimulatorNativeH264Profile } from "@joko/tool-ios-simulator";
 import { SimulatorDriverError, type SimulatorDriverCoordinator } from "./ios-simulator-driver-coordinator.js";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance,
   type SimulatorInstanceRoute, type SimulatorTaskScope } from "./ios-simulator-ownership.js";
 
-type FrameDriver = Pick<SimulatorDriverCoordinator, "isReady" | "streamMjpegFrames">;
+type FrameDriver = Pick<SimulatorDriverCoordinator, "isReady" | "streamMjpegFrames"> &
+  Partial<Pick<SimulatorDriverCoordinator, "probeNativeH264" | "streamNativeH264Frames">>;
 type FrameState = "connecting" | "streaming" | "reconnecting" | "disconnected";
+export interface SimulatorViewerVideoPreference {
+  readonly preferNativeH264: boolean;
+  readonly profile: SimulatorNativeH264Profile;
+}
 interface FrameSubscription {
   readonly controller: AbortController;
   readonly route: SimulatorInstanceRoute;
   state: FrameState;
   sequence: number;
   lastFrameAt: string | null;
+  encoding: "jpeg" | "h264";
 }
 export interface SimulatorViewerFrameSnapshot {
-  readonly adapter: "wda-mjpeg";
-  readonly encoding: "jpeg";
+  readonly adapter: "wda-mjpeg" | "native-h264";
+  readonly encoding: "jpeg" | "h264";
   readonly state: FrameState;
   readonly sequence: number;
   readonly lastFrameAt: string | null;
@@ -23,7 +30,10 @@ export type SimulatorViewerFrameEvent =
   | { readonly kind: "connecting" | "reconnecting" | "disconnected";
     readonly attempt: number }
   | { readonly kind: "frame"; readonly sequence: number; readonly receivedAt: string;
-    readonly bytes: Uint8Array };
+    readonly bytes: Uint8Array }
+  | { readonly kind: "h264"; readonly sequence: number; readonly receivedAt: string;
+    readonly bytes: Uint8Array; readonly width: number; readonly height: number;
+    readonly timestampMicros: number; readonly keyFrame: boolean; readonly format: "annex-b" };
 
 export class SimulatorViewerFrameError extends Error {
   constructor(readonly code: "SUBSCRIPTION_LIMIT", message: string) { super(message); }
@@ -53,19 +63,20 @@ export class SimulatorViewerFrameCoordinator {
     const current = [...(subscriptions ?? [])].filter(item => !item.controller.signal.aborted &&
       item.route.generation === route.generation && item.route.leaseId === route.leaseId);
     const preferred = current.find(item => item.state === "streaming") ?? current[0];
-    return preferred ? { adapter: "wda-mjpeg", encoding: "jpeg", state: preferred.state,
+    return preferred ? { adapter: preferred.encoding === "h264" ? "native-h264" : "wda-mjpeg",
+      encoding: preferred.encoding, state: preferred.state,
       sequence: preferred.sequence, lastFrameAt: preferred.lastFrameAt } : null;
   }
 
   async *watch(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
-    signal?: AbortSignal): AsyncGenerator<SimulatorViewerFrameEvent> {
+    signal?: AbortSignal, preference?: SimulatorViewerVideoPreference): AsyncGenerator<SimulatorViewerFrameEvent> {
     const instance = this.#requireReady(scope, route);
     const subscriptions = this.#subscriptions.get(instance.instanceId) ?? new Set<FrameSubscription>();
     if (subscriptions.size >= 2) throw new SimulatorViewerFrameError(
       "SUBSCRIPTION_LIMIT", "Simulator Viewer subscription limit reached.");
     const controller = new AbortController();
     const subscription: FrameSubscription = { controller, route, state: "connecting",
-      sequence: 0, lastFrameAt: null };
+      sequence: 0, lastFrameAt: null, encoding: "jpeg" };
     subscriptions.add(subscription);
     this.#subscriptions.set(instance.instanceId, subscriptions);
     const abort = (): void => controller.abort();
@@ -87,6 +98,14 @@ export class SimulatorViewerFrameCoordinator {
     };
     const fencer = setInterval(check, 500);
     try {
+      let useNative = false;
+      if (preference?.preferNativeH264 && this.#driver.probeNativeH264 &&
+          this.#driver.streamNativeH264Frames) {
+        useNative = await this.#driver.probeNativeH264(instance, controller.signal);
+        check();
+        if (stale) throw stale;
+      }
+      subscription.encoding = useNative ? "h264" : "jpeg";
       for (let attempt = 0; attempt <= 3 && !controller.signal.aborted; attempt += 1) {
         check();
         if (stale) throw stale;
@@ -94,20 +113,36 @@ export class SimulatorViewerFrameCoordinator {
         subscription.lastFrameAt = null;
         yield { kind: attempt === 0 ? "connecting" : "reconnecting", attempt };
         try {
-          for await (const frame of this.#driver.streamMjpegFrames(instance, controller.signal)) {
-            check();
-            if (stale) throw stale;
-            if (controller.signal.aborted) return;
-            subscription.state = "streaming";
-            subscription.sequence += 1;
-            subscription.lastFrameAt = frame.receivedAt;
-            yield this.#frame(subscription.sequence, frame);
+          if (useNative) {
+            for await (const frame of this.#driver.streamNativeH264Frames!(instance,
+              preference!.profile, controller.signal)) {
+              check();
+              if (stale) throw stale;
+              if (controller.signal.aborted) return;
+              subscription.state = "streaming";
+              subscription.sequence += 1;
+              subscription.lastFrameAt = frame.receivedAt;
+              yield this.#h264Frame(subscription.sequence, frame);
+            }
+            useNative = false;
+            subscription.encoding = "jpeg";
+          } else {
+            for await (const frame of this.#driver.streamMjpegFrames(instance, controller.signal)) {
+              check();
+              if (stale) throw stale;
+              if (controller.signal.aborted) return;
+              subscription.state = "streaming";
+              subscription.sequence += 1;
+              subscription.lastFrameAt = frame.receivedAt;
+              yield this.#frame(subscription.sequence, frame);
+            }
           }
           if (stale) throw stale;
         } catch (error) {
           if (stale) throw stale;
           if (controller.signal.aborted) return;
           if (error instanceof SimulatorDriverError && error.code === "STALE_DRIVER") throw error;
+          if (useNative) { useNative = false; subscription.encoding = "jpeg"; }
           if (attempt === 3) break;
           await this.#delay([250, 1_000, 2_000][attempt]!, controller.signal);
           continue;
@@ -143,6 +178,12 @@ export class SimulatorViewerFrameCoordinator {
 
   #frame(sequence: number, frame: SimulatorMjpegFrame): SimulatorViewerFrameEvent {
     return { kind: "frame", sequence, receivedAt: frame.receivedAt, bytes: frame.bytes };
+  }
+
+  #h264Frame(sequence: number, frame: SimulatorNativeH264Frame): SimulatorViewerFrameEvent {
+    return { kind: "h264", sequence, receivedAt: frame.receivedAt, bytes: frame.bytes,
+      width: frame.width, height: frame.height, timestampMicros: frame.timestampMicros,
+      keyFrame: frame.keyFrame, format: frame.format };
   }
 
   async #delay(milliseconds: number, signal: AbortSignal): Promise<void> {

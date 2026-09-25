@@ -47,27 +47,51 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
       }, options(signal));
       return { instance: instanceView(response.instance), deleted: response.deleted, replayed: response.replayed };
     },
-    async *watchSimulatorFrames(sessionId, route, signal) {
+    async *watchSimulatorFrames(sessionId, route, signal, preference) {
       let sequence = 0n;
-      for await (const response of client.watchSimulatorFrames({ sessionId, route }, options(signal))) {
+      for await (const response of client.watchSimulatorFrames({ sessionId, route,
+        ...(preference === undefined ? {} : { preferNativeH264: preference.preferNativeH264,
+          framesPerSecond: preference.framesPerSecond, scalingPercent: preference.scalingPercent,
+          orientation: preference.orientation }) }, options(signal))) {
         if (response.route?.instanceId !== route.instanceId ||
             response.route.generation !== route.generation || response.route.leaseId !== route.leaseId) {
           throw new Error("Simulator frame belongs to another instance route.");
         }
         if (response.state === SimulatorViewerStreamState.FRAME) {
           if (response.sequence <= sequence || response.receivedAtMs <= 0n ||
-              response.jpeg.length < 4 || response.jpeg.length > 16 * 1024 * 1024 ||
-              response.jpeg[0] !== 0xff || response.jpeg[1] !== 0xd8 ||
-              response.jpeg[response.jpeg.length - 2] !== 0xff ||
-              response.jpeg[response.jpeg.length - 1] !== 0xd9) {
+              response.receivedAtMs > BigInt(Number.MAX_SAFE_INTEGER)) {
             throw new Error("Simulator frame response is invalid.");
           }
           sequence = response.sequence;
-          yield { kind: "frame", sequence, receivedAtMs: Number(response.receivedAtMs),
-            jpeg: response.jpeg };
+          if (response.jpeg.length > 0 && response.h264.length === 0 &&
+              response.width === 0 && response.height === 0 &&
+              response.timestampMicros === 0n && !response.keyFrame &&
+              response.h264Format === "") {
+            if (response.jpeg.length < 4 || response.jpeg.length > 16 * 1024 * 1024 ||
+                response.jpeg[0] !== 0xff || response.jpeg[1] !== 0xd8 ||
+                response.jpeg[response.jpeg.length - 2] !== 0xff ||
+                response.jpeg[response.jpeg.length - 1] !== 0xd9)
+              throw new Error("Simulator JPEG frame is invalid.");
+            yield { kind: "frame", sequence, receivedAtMs: Number(response.receivedAtMs),
+              jpeg: response.jpeg };
+          } else if (response.h264.length >= 5 && response.h264.length <= 16 * 1024 * 1024 &&
+              response.jpeg.length === 0 && response.width >= 1 && response.width <= 8_192 &&
+              response.height >= 1 && response.height <= 8_192 &&
+              response.timestampMicros <= BigInt(Number.MAX_SAFE_INTEGER) &&
+              response.h264Format === "annex-b" &&
+              response.h264[0] === 0 && response.h264[1] === 0 &&
+              response.h264[2] === 0 && response.h264[3] === 1) {
+            yield { kind: "h264", sequence, receivedAtMs: Number(response.receivedAtMs),
+              h264: response.h264, width: response.width, height: response.height,
+              timestampMicros: Number(response.timestampMicros), keyFrame: response.keyFrame,
+              format: "annex-b" };
+          } else throw new Error("Simulator H.264 frame is invalid.");
           continue;
         }
-        if (response.jpeg.length !== 0 || response.sequence !== 0n ||
+        if (response.jpeg.length !== 0 || response.h264.length !== 0 ||
+            response.width !== 0 || response.height !== 0 ||
+            response.timestampMicros !== 0n || response.keyFrame ||
+            response.h264Format !== "" || response.sequence !== 0n ||
             !Number.isSafeInteger(response.reconnectAttempt) || response.reconnectAttempt > 3) {
           throw new Error("Simulator frame status is invalid.");
         }
