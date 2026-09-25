@@ -10,6 +10,7 @@ service SimulatorViewerService {
   rpc ControlSimulatorInstance(ControlSimulatorInstanceRequest) returns (ControlSimulatorInstanceResponse);
   rpc ControlSimulatorViewerInput(ControlSimulatorViewerInputRequest) returns (ControlSimulatorViewerInputResponse);
   rpc ControlSimulatorViewerTouch(ControlSimulatorViewerTouchRequest) returns (ControlSimulatorViewerTouchResponse);
+  rpc SetSimulatorViewerInteractionProfile(SetSimulatorViewerInteractionProfileRequest) returns (SetSimulatorViewerInteractionProfileResponse);
   rpc GetSimulatorViewerControls(GetSimulatorViewerControlsRequest) returns (GetSimulatorViewerControlsResponse);
   rpc ControlSimulatorViewerCommand(ControlSimulatorViewerCommandRequest) returns (ControlSimulatorViewerCommandResponse);
   rpc WatchSimulatorFrames(WatchSimulatorFramesRequest) returns (stream WatchSimulatorFramesResponse);
@@ -140,6 +141,19 @@ message ControlSimulatorViewerTouchResponse {
   bool accepted = 1;
 }
 
+message SetSimulatorViewerInteractionProfileRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  // Ephemeral identity of one exact active WatchSimulatorFrames subscription.
+  string subscription_id = 3;
+  bool active = 4;
+}
+
+message SetSimulatorViewerInteractionProfileResponse {
+  // False means no profile change was needed because the requested state was already effective.
+  bool applied = 1;
+}
+
 message GetSimulatorViewerControlsRequest {
   string session_id = 1;
   SimulatorViewerRoute route = 2;
@@ -205,6 +219,8 @@ message WatchSimulatorFramesRequest {
   uint32 mjpeg_scaling_percent = 9;
   // Only a client that attempted native decode may report this bounded local failure.
   string client_fallback_reason = 10;
+  // Ephemeral identity used only to target interaction-time profile changes.
+  string subscription_id = 11;
 }
 
 message WatchSimulatorFramesResponse {

@@ -6,6 +6,7 @@ import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
   ControlSimulatorViewerTouchResponseSchema,
   GetSimulatorViewerControlsResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
+  SetSimulatorViewerInteractionProfileResponseSchema,
   SimulatorViewerCommand, SimulatorViewerInstanceSchema, SimulatorViewerNativeRouteState,
   SimulatorViewerStreamState, SimulatorViewerTouchPhase,
   WatchSimulatorFramesResponseSchema } from "@joko/contracts";
@@ -34,6 +35,8 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
         ? create(ControlSimulatorViewerInputResponseSchema, { replayed: false })
         : method.localName === "controlSimulatorViewerTouch"
           ? create(ControlSimulatorViewerTouchResponseSchema, { accepted: true })
+          : method.localName === "setSimulatorViewerInteractionProfile"
+            ? create(SetSimulatorViewerInteractionProfileResponseSchema, { applied: true })
           : method.localName === "getSimulatorViewerControls"
             ? create(GetSimulatorViewerControlsResponseSchema, { viewportWidth: 393,
               viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true })
@@ -70,6 +73,11 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
       gestureId: "A0123456-1234-1234-1234-123456789ABC", sequence: 1,
       phase: SimulatorViewerTouchPhase.MOVE,
       point: { xRatio: 0.4, yRatio: 0.6 } } });
+  expect(await gateway.setSimulatorViewerInteractionProfile("task", route,
+    "A0123456-1234-4234-8234-123456789ABC", true)).toEqual({ applied: true });
+  expect(requests.at(-1)).toMatchObject({ name: "setSimulatorViewerInteractionProfile",
+    input: { sessionId: "task", route,
+      subscriptionId: "A0123456-1234-4234-8234-123456789ABC", active: true } });
   expect(await gateway.getSimulatorViewerControls("task", route)).toEqual({
     viewportWidth: 393, viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true
   });
@@ -116,7 +124,8 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
       })(), signal, input }));
   const gateway = createSimulatorViewerGateway({ stream } as unknown as Transport);
   const iterator = gateway.watchSimulatorFrames("task", route, undefined,
-    { preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
+    { subscriptionId: "11111111-1111-4111-8111-111111111111",
+      preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
       orientation: "PORTRAIT", mjpegFramesPerSecond: 10, jpegQuality: 45,
       mjpegScalingPercent: 70 })[Symbol.asyncIterator]();
   expect((await iterator.next()).value).toEqual({ kind: "connecting", attempt: 0,
@@ -128,6 +137,7 @@ it("validates generated frame stream route, sequence and encoded bytes before pr
   expect(stream).toHaveBeenCalledOnce();
   const sent = await stream.mock.calls[0]?.[4][Symbol.asyncIterator]().next();
   expect(sent?.value).toMatchObject({ preferNativeH264: true,
+    subscriptionId: "11111111-1111-4111-8111-111111111111",
     framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT",
     mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 });
 });
@@ -143,7 +153,8 @@ it("passes a decoder failure only on a fallback subscription and reports its exa
           nativeRouteState: SimulatorViewerNativeRouteState.FALLBACK_DECODE });
       })(), signal, input }));
   const gateway = createSimulatorViewerGateway({ stream } as unknown as Transport);
-  const profile = { preferNativeH264: false, framesPerSecond: 20, scalingPercent: 70,
+  const profile = { subscriptionId: "22222222-2222-4222-8222-222222222222",
+    preferNativeH264: false, framesPerSecond: 20, scalingPercent: 70,
     orientation: "PORTRAIT" as const, mjpegFramesPerSecond: 10, jpegQuality: 45,
     mjpegScalingPercent: 70, clientFallbackReason: "decode_failed" as const };
   const events = gateway.watchSimulatorFrames("task", route, undefined, profile);
@@ -151,5 +162,6 @@ it("passes a decoder failure only on a fallback subscription and reports its exa
     nativeRoute: "fallbackDecode" });
   const sent = await stream.mock.calls[0]?.[4][Symbol.asyncIterator]().next();
   expect(sent?.value).toMatchObject({ clientFallbackReason: "decode_failed",
-    preferNativeH264: false, route });
+    preferNativeH264: false, route,
+    subscriptionId: "22222222-2222-4222-8222-222222222222" });
 });

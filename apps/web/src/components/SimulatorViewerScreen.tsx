@@ -39,6 +39,12 @@ interface PointerGesture {
   lastDispatchedAt: number;
   watchdog?: ReturnType<typeof setTimeout>;
 }
+interface ViewerSubscriptionIdentity {
+  readonly sessionId: string;
+  readonly route: SimulatorViewerRouteView;
+  readonly ownerKey: string;
+  readonly subscriptionId: string;
+}
 
 const VIDEO_PROFILES: Record<VideoQuality, { framesPerSecond: number; scalingPercent: number }> = {
   low: { framesPerSecond: 5, scalingPercent: 50 },
@@ -52,6 +58,7 @@ const MJPEG_PROFILES: Record<Exclude<VideoQuality, "experimental60">, {
   balanced: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 },
   high: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 }
 };
+const INTERACTION_PROFILE_RESTORE_DELAY_MS = 250;
 
 /** One visible, current-route subscription and its exact task-owned input surface. */
 export function SimulatorViewerScreen({ controller, sessionId, route, enabled, ownerDocument,
@@ -91,6 +98,11 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   const commandRequestRef = useRef<AbortController | undefined>(undefined);
   const frameRateRef = useRef({ startedAt: 0, frames: 0 });
   const nativeRecoveryRef = useRef(false);
+  const qualityRef = useRef<VideoQuality>(quality);
+  const activeSubscriptionRef = useRef<ViewerSubscriptionIdentity | undefined>(undefined);
+  const interactionProfileRef = useRef<ViewerSubscriptionIdentity | undefined>(undefined);
+  const profileRestoreTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const profileMutationTailRef = useRef<Promise<void>>(Promise.resolve());
   const ownerKey = `${sessionId}:${route.instanceId}:${route.generation}:${route.leaseId}`;
   const ownerKeyRef = useRef(ownerKey);
   ownerKeyRef.current = ownerKey;
@@ -101,6 +113,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
   const reconcileRef = useRef(onReconcile);
   controllerRef.current = controller;
   reconcileRef.current = onReconcile;
+  qualityRef.current = quality;
 
   const resetTelemetry = useCallback((): void => {
     frameRateRef.current = { startedAt: 0, frames: 0 };
@@ -137,6 +150,48 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       resetTelemetry();
     }, 3_000);
   }, [resetTelemetry]);
+
+  const mutateInteractionProfile = useCallback((identity: ViewerSubscriptionIdentity,
+    active: boolean): void => {
+    const api = controllerRef.current;
+    const mutation = profileMutationTailRef.current.then(async () => {
+      await api.setSimulatorViewerInteractionProfile(identity.sessionId,
+        identity.route, identity.subscriptionId, active);
+    });
+    profileMutationTailRef.current = mutation.catch(() => undefined);
+  }, []);
+
+  const restoreInteractionProfile = useCallback((immediate = false): void => {
+    if (profileRestoreTimerRef.current !== undefined) {
+      clearTimeout(profileRestoreTimerRef.current);
+      profileRestoreTimerRef.current = undefined;
+    }
+    const restore = (): void => {
+      profileRestoreTimerRef.current = undefined;
+      const identity = interactionProfileRef.current;
+      if (!identity) return;
+      interactionProfileRef.current = undefined;
+      mutateInteractionProfile(identity, false);
+    };
+    if (immediate) restore();
+    else profileRestoreTimerRef.current = setTimeout(
+      restore, INTERACTION_PROFILE_RESTORE_DELAY_MS);
+  }, [mutateInteractionProfile]);
+
+  const beginInteractionProfile = useCallback((): void => {
+    if (profileRestoreTimerRef.current !== undefined) {
+      clearTimeout(profileRestoreTimerRef.current);
+      profileRestoreTimerRef.current = undefined;
+    }
+    const subscription = activeSubscriptionRef.current;
+    if (!subscription || subscription.ownerKey !== ownerKeyRef.current ||
+        qualityRef.current !== "low" && qualityRef.current !== "balanced") return;
+    const current = interactionProfileRef.current;
+    if (current?.subscriptionId === subscription.subscriptionId) return;
+    if (current) restoreInteractionProfile(true);
+    interactionProfileRef.current = subscription;
+    mutateInteractionProfile(subscription, true);
+  }, [mutateInteractionProfile, restoreInteractionProfile]);
 
   useEffect(() => {
     const update = (): void => setDocumentVisible(!ownerDocument.hidden);
@@ -178,6 +233,9 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       clientFallbackReason?: "decode_failed"): Promise<void> => {
       subscription = new AbortController();
       const current = subscription;
+      const identity: ViewerSubscriptionIdentity = { sessionId, route: { ...route },
+        ownerKey, subscriptionId: randomUuid() };
+      activeSubscriptionRef.current = identity;
       const mjpeg = MJPEG_PROFILES[quality === "experimental60" ? "high" : quality];
       let fallback = false;
       let decoderFallback = false;
@@ -207,7 +265,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       }) : null;
       try {
         for await (const event of controllerRef.current.watchSimulatorFrames(sessionId, route,
-          current.signal, { preferNativeH264: native,
+          current.signal, { subscriptionId: identity.subscriptionId, preferNativeH264: native,
             framesPerSecond: VIDEO_PROFILES[quality].framesPerSecond,
             scalingPercent: VIDEO_PROFILES[quality].scalingPercent,
             orientation: "PORTRAIT", mjpegFramesPerSecond: mjpeg.framesPerSecond,
@@ -266,6 +324,12 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
         }
       } finally {
         decoder?.close();
+        if (activeSubscriptionRef.current?.subscriptionId === identity.subscriptionId) {
+          activeSubscriptionRef.current = undefined;
+        }
+        if (interactionProfileRef.current?.subscriptionId === identity.subscriptionId) {
+          restoreInteractionProfile(true);
+        }
       }
       if (active && fallback) {
         clear();
@@ -277,8 +341,9 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     void watch(runtime !== null);
     return () => { active = false; subscription?.abort(); clearFrameFreshness();
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; } };
-  }, [enabled, documentVisible, sessionId, route.instanceId, route.generation, route.leaseId,
-    quality, retry, clearFrameFreshness, markFrameFresh, recordFrame, resetTelemetry]);
+  }, [enabled, documentVisible, sessionId, ownerKey, route.instanceId, route.generation, route.leaseId,
+    quality, retry, clearFrameFreshness, markFrameFresh, recordFrame, resetTelemetry,
+    restoreInteractionProfile]);
 
   useEffect(() => () => { if (frameUrl) URL.revokeObjectURL(frameUrl); }, [frameUrl]);
 
@@ -356,8 +421,9 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     if (pointerGestureRef.current === gesture) pointerGestureRef.current = undefined;
     if (gesture.watchdog !== undefined) clearTimeout(gesture.watchdog);
     releaseCapture(gesture);
+    restoreInteractionProfile();
     if (mountedRef.current) setInputBusy(false);
-  }, []);
+  }, [restoreInteractionProfile]);
 
   const unknownGesture = useCallback(async (gesture: PointerGesture, cause: unknown): Promise<void> => {
     if (gesture.beginState === "failed") return;
@@ -459,11 +525,15 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       mountedRef.current = false;
       inputRequestRef.current?.abort();
       cancelPointerGesture();
+      restoreInteractionProfile(true);
     };
-  }, [cancelPointerGesture]);
+  }, [cancelPointerGesture, restoreInteractionProfile]);
 
-  useEffect(() => () => cancelPointerGesture(),
-    [sessionId, route.instanceId, route.generation, route.leaseId, cancelPointerGesture]);
+  useEffect(() => () => {
+    cancelPointerGesture();
+    restoreInteractionProfile(true);
+  }, [sessionId, route.instanceId, route.generation, route.leaseId,
+    cancelPointerGesture, restoreInteractionProfile]);
 
   const onPointerDown = (event: ReactPointerEvent<FrameElement>): void => {
     if (!interactive || inputBusy || commandBusy || inputError !== undefined ||
@@ -481,6 +551,7 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
       lastDispatchedAt: performance.now() };
     pointerGestureRef.current = gesture;
     setInputBusy(true);
+    beginInteractionProfile();
     resetWatchdog(gesture);
     void (async () => {
       try {

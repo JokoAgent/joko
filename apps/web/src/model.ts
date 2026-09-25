@@ -5369,6 +5369,7 @@ export type SimulatorViewerNativeRouteView = "inactive" | "active" |
   "fallbackUnavailable" | "fallbackLost" | "fallbackDecode";
 
 export interface SimulatorViewerVideoPreferenceView {
+  readonly subscriptionId: string;
   readonly preferNativeH264: boolean;
   readonly framesPerSecond: number;
   readonly scalingPercent: number;
@@ -5386,6 +5387,8 @@ export interface OperationApi {
     input: SimulatorViewerInputView, signal?: AbortSignal): Promise<SimulatorViewerInputResultView>;
   controlSimulatorViewerTouch(sessionId: string, route: SimulatorViewerRouteView,
     touch: SimulatorViewerTouchView, signal?: AbortSignal): Promise<{ readonly accepted: boolean }>;
+  setSimulatorViewerInteractionProfile(sessionId: string, route: SimulatorViewerRouteView,
+    subscriptionId: string, active: boolean, signal?: AbortSignal): Promise<{ readonly applied: boolean }>;
   getSimulatorViewerControls(sessionId: string, route: SimulatorViewerRouteView,
     signal?: AbortSignal): Promise<SimulatorViewerControlsView>;
   controlSimulatorViewerCommand(sessionId: string, requestId: string, route: SimulatorViewerRouteView,

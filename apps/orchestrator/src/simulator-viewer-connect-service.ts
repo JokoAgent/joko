@@ -12,8 +12,8 @@ import type { SimulatorInstanceControlCoordinator } from "./ios-simulator-instan
 import type { PublicSimulatorInstance, SimulatorInstanceRoute,
   SimulatorOwnershipRegistry, SimulatorTaskScope } from "./ios-simulator-ownership.js";
 import type { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
-import type { SimulatorViewerFrameCoordinator, SimulatorViewerNativeRouteState
-} from "./ios-simulator-viewer-frames.js";
+import { SimulatorViewerFrameError, type SimulatorViewerFrameCoordinator,
+  type SimulatorViewerNativeRouteState } from "./ios-simulator-viewer-frames.js";
 import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
 import type { SimulatorViewerLiveTouchCoordinator } from "./ios-simulator-viewer-live-touch.js";
 
@@ -244,6 +244,27 @@ export function createSimulatorViewerConnectService(input: {
       catch (error) { currentOwner.liveTouch.clearInstance(route.instanceId); throw error; }
       return create(contract.ControlSimulatorViewerTouchResponseSchema, { accepted: true });
     },
+    setSimulatorViewerInteractionProfile: async (request, context) => {
+      input.authenticate(context);
+      const task = scope(request.sessionId, true);
+      const currentOwner = owner();
+      if (!currentOwner.frames) throw new ConnectError(
+        "Simulator Viewer frames are unavailable.", Code.Unimplemented);
+      const route = requiredRoute(request.route);
+      if (!UUID.test(request.subscriptionId)) throw new ConnectError(
+        "Simulator Viewer subscription identity is invalid.", Code.InvalidArgument);
+      fence(context, task, true);
+      try {
+        const applied = await currentOwner.frames.setInteractionProfile(
+          task, route, request.subscriptionId, request.active);
+        fence(context, task, true);
+        return create(contract.SetSimulatorViewerInteractionProfileResponseSchema, { applied });
+      } catch (error) {
+        if (error instanceof SimulatorViewerFrameError) throw new ConnectError(error.message,
+          error.code === "SUBSCRIPTION_NOT_FOUND" ? Code.Aborted : Code.FailedPrecondition);
+        throw error;
+      }
+    },
     getSimulatorViewerControls: async (request, context) => {
       input.authenticate(context);
       const task = scope(request.sessionId, false);
@@ -337,6 +358,8 @@ export function createSimulatorViewerConnectService(input: {
       if (!currentOwner.frames) throw new ConnectError(
         "Simulator Viewer frames are unavailable.", Code.Unimplemented);
       const route = requiredRoute(request.route);
+      if (!UUID.test(request.subscriptionId)) throw new ConnectError(
+        "Simulator Viewer subscription identity is invalid.", Code.InvalidArgument);
       if (!Number.isSafeInteger(request.mjpegFramesPerSecond) ||
           request.mjpegFramesPerSecond < 1 || request.mjpegFramesPerSecond > 60 ||
           !Number.isSafeInteger(request.jpegQuality) || request.jpegQuality < 1 ||
@@ -366,7 +389,7 @@ export function createSimulatorViewerConnectService(input: {
         }, mjpegProfile: { framesPerSecond: request.mjpegFramesPerSecond,
           jpegQuality: request.jpegQuality, scalingPercent: request.mjpegScalingPercent },
         ...(request.clientFallbackReason === "decode_failed"
-          ? { clientFallbackReason: "decode_failed" as const } : {}) })) {
+          ? { clientFallbackReason: "decode_failed" as const } : {}) }, request.subscriptionId)) {
         fence(context, task, false);
         yield create(contract.WatchSimulatorFramesResponseSchema, {
           route: create(contract.SimulatorViewerRouteSchema, { instanceId: route.instanceId,

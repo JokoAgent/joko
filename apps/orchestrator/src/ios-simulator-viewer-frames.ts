@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { SimulatorMjpegFrame, SimulatorNativeH264Frame, WdaMjpegProfile,
   SimulatorNativeH264Profile } from "@joko/tool-ios-simulator";
 import { SimulatorDriverError, type SimulatorDriverCoordinator } from "./ios-simulator-driver-coordinator.js";
@@ -11,6 +12,12 @@ type FrameState = "connecting" | "streaming" | "reconnecting" | "disconnected";
 const DEFAULT_MJPEG_PROFILE: WdaMjpegProfile = {
   framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70
 };
+const INTERACTION_MJPEG_PROFILE: WdaMjpegProfile = {
+  framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100
+};
+const INTERACTION_NATIVE_PROFILE = {
+  framesPerSecond: 30, scalingPercent: 100
+} as const;
 export interface SimulatorViewerVideoPreference {
   readonly preferNativeH264: boolean;
   readonly profile: SimulatorNativeH264Profile;
@@ -20,15 +27,25 @@ export interface SimulatorViewerVideoPreference {
 export type SimulatorViewerNativeRouteState = "inactive" | "active" |
   "fallback_unavailable" | "fallback_lost" | "fallback_decode";
 interface FrameSubscription {
+  readonly id: string;
+  readonly scope: SimulatorTaskScope;
   readonly controller: AbortController;
   readonly route: SimulatorInstanceRoute;
+  readonly baseProfile: SimulatorNativeH264Profile;
+  readonly baseMjpegProfile: WdaMjpegProfile;
   state: FrameState;
   sequence: number;
   lastFrameAt: string | null;
   encoding: "jpeg" | "h264";
   viewerOrientation: SimulatorNativeH264Profile["orientation"] | null;
   nativeRoute: SimulatorViewerNativeRouteState;
-  readonly mjpegProfile: WdaMjpegProfile;
+  profile: SimulatorNativeH264Profile;
+  mjpegProfile: WdaMjpegProfile;
+  profileRevision: number;
+  profileTail: Promise<void>;
+  interactionActive: boolean;
+  closing: boolean;
+  sourceController?: AbortController;
 }
 interface MjpegConfigurationState {
   readonly leaseId: string;
@@ -53,7 +70,9 @@ export type SimulatorViewerFrameEvent =
     readonly nativeRoute: SimulatorViewerNativeRouteState };
 
 export class SimulatorViewerFrameError extends Error {
-  constructor(readonly code: "SUBSCRIPTION_LIMIT" | "PROFILE_CONFLICT" | "PROFILE_UNCERTAIN",
+  constructor(readonly code: "SUBSCRIPTION_LIMIT" | "SUBSCRIPTION_CONFLICT" |
+    "SUBSCRIPTION_NOT_FOUND" | "SUBSCRIPTION_NOT_READY" | "PROFILE_CONFLICT" |
+    "PROFILE_UNCERTAIN",
     message: string) { super(message); }
 }
 
@@ -105,8 +124,33 @@ export class SimulatorViewerFrameCoordinator {
       viewerOrientation: preferred.viewerOrientation, lastFrameAt: preferred.lastFrameAt } : null;
   }
 
+  /** Applies an exact subscription's temporary interaction profile without rebuilding its Viewer stream. */
+  async setInteractionProfile(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
+    subscriptionId: string, active: boolean): Promise<boolean> {
+    const instance = this.#requireReady(scope, route);
+    const subscriptions = this.#subscriptions.get(route.instanceId);
+    const subscription = [...(subscriptions ?? [])].find(item => !item.controller.signal.aborted &&
+      !item.closing && item.id === subscriptionId && item.scope.sessionId === scope.sessionId &&
+      item.scope.targetId === scope.targetId && item.scope.generation === scope.generation &&
+      item.route.generation === route.generation && item.route.leaseId === route.leaseId);
+    if (!subscription) throw new SimulatorViewerFrameError("SUBSCRIPTION_NOT_FOUND",
+      "The Simulator Viewer subscription is no longer current.");
+    if (active && !freshSubscription(subscription)) throw new SimulatorViewerFrameError(
+      "SUBSCRIPTION_NOT_READY", "The Simulator Viewer subscription has no fresh visible frame.");
+    const shouldBoost = subscription.baseProfile.framesPerSecond <
+      INTERACTION_NATIVE_PROFILE.framesPerSecond;
+    if (!shouldBoost) return false;
+    const apply = subscription.profileTail.then(() => {
+      if (subscription.closing && active) return false;
+      return this.#applyInteractionProfile(instance, subscriptions!, subscription, active);
+    });
+    subscription.profileTail = apply.then(() => undefined, () => undefined);
+    return apply;
+  }
+
   async *watch(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
-    signal?: AbortSignal, preference?: SimulatorViewerVideoPreference): AsyncGenerator<SimulatorViewerFrameEvent> {
+    signal?: AbortSignal, preference?: SimulatorViewerVideoPreference,
+    subscriptionId: string = randomUUID()): AsyncGenerator<SimulatorViewerFrameEvent> {
     const instance = this.#requireReady(scope, route);
     const subscriptions = this.#subscriptions.get(instance.instanceId) ?? new Set<FrameSubscription>();
     if (subscriptions.size >= 16 ||
@@ -114,11 +158,22 @@ export class SimulatorViewerFrameCoordinator {
       throw new SimulatorViewerFrameError(
       "SUBSCRIPTION_LIMIT", "Simulator Viewer subscription limit reached.");
     }
+    if ([...subscriptions].some(item => !item.controller.signal.aborted && item.id === subscriptionId)) {
+      throw new SimulatorViewerFrameError(
+        "SUBSCRIPTION_CONFLICT", "Simulator Viewer subscription identity is already active.");
+    }
     const controller = new AbortController();
-    const subscription: FrameSubscription = { controller, route, state: "connecting",
+    const baseProfile = preference?.profile ?? {
+      framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT"
+    };
+    const baseMjpegProfile = preference?.mjpegProfile ?? DEFAULT_MJPEG_PROFILE;
+    const subscription: FrameSubscription = { id: subscriptionId, scope, controller, route,
+      baseProfile, baseMjpegProfile, profile: baseProfile,
+      profileRevision: 0, profileTail: Promise.resolve(), interactionActive: false, closing: false,
+      state: "connecting",
       sequence: 0, lastFrameAt: null, encoding: "jpeg", viewerOrientation: null,
       nativeRoute: preference?.clientFallbackReason === "decode_failed" ? "fallback_decode" : "inactive",
-      mjpegProfile: preference?.mjpegProfile ?? DEFAULT_MJPEG_PROFILE };
+      mjpegProfile: baseMjpegProfile };
     subscriptions.add(subscription);
     this.#subscriptions.set(instance.instanceId, subscriptions);
     const abort = (): void => controller.abort();
@@ -150,7 +205,7 @@ export class SimulatorViewerFrameCoordinator {
       if (preference?.preferNativeH264) subscription.nativeRoute = useNative
         ? "active" : "fallback_unavailable";
       subscription.encoding = useNative ? "h264" : "jpeg";
-      subscription.viewerOrientation = useNative ? preference!.profile.orientation : null;
+      subscription.viewerOrientation = useNative ? subscription.profile.orientation : null;
       for (let attempt = 0; attempt <= 3 && !controller.signal.aborted; attempt += 1) {
         check();
         if (stale) throw stale;
@@ -160,15 +215,39 @@ export class SimulatorViewerFrameCoordinator {
           nativeRoute: subscription.nativeRoute };
         try {
           if (useNative) {
-            for await (const frame of this.#driver.streamNativeH264Frames!(instance,
-              preference!.profile, controller.signal)) {
-              check();
-              if (stale) throw stale;
+            while (!controller.signal.aborted) {
+              const profileRevision = subscription.profileRevision;
+              const profile = subscription.profile;
+              const sourceController = new AbortController();
+              subscription.sourceController = sourceController;
+              const stopSource = (): void => sourceController.abort();
+              controller.signal.addEventListener("abort", stopSource, { once: true });
+              if (controller.signal.aborted) stopSource();
+              let sourceError: unknown;
+              try {
+                for await (const frame of this.#driver.streamNativeH264Frames!(instance,
+                  profile, sourceController.signal)) {
+                  check();
+                  if (stale) throw stale;
+                  if (controller.signal.aborted) return;
+                  subscription.state = "streaming";
+                  subscription.viewerOrientation = profile.orientation;
+                  subscription.sequence += 1;
+                  subscription.lastFrameAt = frame.receivedAt;
+                  yield this.#h264Frame(subscription, frame);
+                }
+              } catch (error) { sourceError = error; }
+              finally {
+                controller.signal.removeEventListener("abort", stopSource);
+                if (subscription.sourceController === sourceController) {
+                  subscription.sourceController = undefined;
+                }
+                sourceController.abort();
+              }
               if (controller.signal.aborted) return;
-              subscription.state = "streaming";
-              subscription.sequence += 1;
-              subscription.lastFrameAt = frame.receivedAt;
-              yield this.#h264Frame(subscription, frame);
+              if (subscription.profileRevision !== profileRevision) continue;
+              if (sourceError !== undefined) throw sourceError;
+              break;
             }
             useNative = false;
             subscription.encoding = "jpeg";
@@ -226,7 +305,14 @@ export class SimulatorViewerFrameCoordinator {
     } finally {
       clearInterval(fencer);
       signal?.removeEventListener("abort", abort);
+      subscription.closing = true;
+      subscription.sourceController?.abort();
       controller.abort();
+      await subscription.profileTail;
+      if (subscription.interactionActive) {
+        await this.#applyInteractionProfile(instance, subscriptions, subscription, false)
+          .catch(() => undefined);
+      }
       subscriptions.delete(subscription);
       if (subscriptions.size === 0 && this.#subscriptions.get(instance.instanceId) === subscriptions) {
         this.#subscriptions.delete(instance.instanceId);
@@ -242,8 +328,48 @@ export class SimulatorViewerFrameCoordinator {
     return instance;
   }
 
+  async #applyInteractionProfile(instance: PublicSimulatorInstance,
+    subscriptions: Set<FrameSubscription>, subscription: FrameSubscription,
+    active: boolean): Promise<boolean> {
+    const configuration = this.#mjpegConfiguration.get(instance.instanceId);
+    if (configuration?.leaseId === this.#driver.mjpegConfigurationLease(instance.instanceId) &&
+        configuration.uncertain) throw new SimulatorViewerFrameError(
+      "PROFILE_UNCERTAIN", "The previous MJPEG profile outcome is unknown; restart the Viewer driver.");
+    const targetProfile: SimulatorNativeH264Profile = active
+      ? { ...INTERACTION_NATIVE_PROFILE, orientation: subscription.baseProfile.orientation }
+      : subscription.baseProfile;
+    const targetMjpegProfile = active ? INTERACTION_MJPEG_PROFILE : subscription.baseMjpegProfile;
+    if (sameNativeProfile(subscription.profile, targetProfile) &&
+        sameMjpegProfile(subscription.mjpegProfile, targetMjpegProfile)) {
+      subscription.interactionActive = active;
+      return false;
+    }
+    const peers = [...subscriptions].filter(item => item !== subscription && !item.closing &&
+      !item.controller.signal.aborted && item.encoding === "jpeg");
+    if (peers.some(item => !sameMjpegProfile(item.mjpegProfile, targetMjpegProfile))) {
+      throw new SimulatorViewerFrameError("PROFILE_CONFLICT",
+        "Another Viewer is using a different MJPEG stream profile.");
+    }
+    const current = this.#requireReady(subscription.scope, subscription.route);
+    if (current.simulatorUdid !== instance.simulatorUdid) throw new SimulatorDriverError(
+      "STALE_DRIVER", "Simulator Viewer device changed before stream configuration.");
+    await this.#configureMjpeg(current, subscription, targetMjpegProfile, null);
+    subscription.mjpegProfile = targetMjpegProfile;
+    if (!sameNativeProfile(subscription.profile, targetProfile)) {
+      subscription.profile = targetProfile;
+      subscription.profileRevision += 1;
+      subscription.sourceController?.abort();
+    }
+    subscription.interactionActive = active;
+    const confirmed = this.#requireReady(subscription.scope, subscription.route);
+    if (confirmed.simulatorUdid !== instance.simulatorUdid) throw new SimulatorDriverError(
+      "STALE_DRIVER", "Simulator Viewer device changed during stream configuration.");
+    return true;
+  }
+
   async #configureMjpeg(instance: PublicSimulatorInstance,
-    subscription: FrameSubscription): Promise<void> {
+    subscription: FrameSubscription, profile = subscription.mjpegProfile,
+    signal: AbortSignal | null | undefined = subscription.controller.signal): Promise<void> {
     const key = instance.instanceId;
     const leaseId = this.#driver.mjpegConfigurationLease(key);
     if (leaseId === null) throw new SimulatorDriverError("STALE_DRIVER",
@@ -255,14 +381,13 @@ export class SimulatorViewerFrameCoordinator {
     }
     const configuration = state;
     const current = configuration.tail.then(async () => {
-      if (subscription.controller.signal.aborted) return;
+      if (signal?.aborted) return;
       if (configuration.uncertain) throw new SimulatorViewerFrameError(
         "PROFILE_UNCERTAIN", "The previous MJPEG profile outcome is unknown; restart the Viewer driver.");
       try {
-        await this.#driver.configureMjpegProfile(instance, subscription.mjpegProfile,
-          subscription.controller.signal);
+        await this.#driver.configureMjpegProfile(instance, profile, signal ?? undefined);
       } catch (error) {
-        if (!subscription.controller.signal.aborted) configuration.uncertain = true;
+        if (!signal?.aborted) configuration.uncertain = true;
         throw error;
       }
     });
@@ -295,4 +420,16 @@ export class SimulatorViewerFrameCoordinator {
 function sameMjpegProfile(left: WdaMjpegProfile, right: WdaMjpegProfile): boolean {
   return left.framesPerSecond === right.framesPerSecond &&
     left.jpegQuality === right.jpegQuality && left.scalingPercent === right.scalingPercent;
+}
+
+function sameNativeProfile(left: SimulatorNativeH264Profile,
+  right: SimulatorNativeH264Profile): boolean {
+  return left.framesPerSecond === right.framesPerSecond &&
+    left.scalingPercent === right.scalingPercent && left.orientation === right.orientation;
+}
+
+function freshSubscription(subscription: FrameSubscription): boolean {
+  if (subscription.state !== "streaming" || subscription.lastFrameAt === null) return false;
+  const age = Date.now() - Date.parse(subscription.lastFrameAt);
+  return Number.isFinite(age) && age >= -1_000 && age <= 3_000;
 }

@@ -100,6 +100,89 @@ it("prefers owned H.264 frames and falls back to MJPEG after native loss", async
   } finally { h.store.close(); }
 });
 
+it("raises only the exact MJPEG subscription during interaction and restores its base profile", async () => {
+  const h = fixture(async function* (_instance, signal) {
+    yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+      receivedAt: new Date().toISOString() };
+    if (!signal?.aborted) await new Promise<void>(resolve =>
+      signal?.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const subscriptionId = "11111111-1111-4111-8111-111111111111";
+  const base = { preferNativeH264: false, profile: { framesPerSecond: 5,
+    scalingPercent: 50, orientation: "PORTRAIT" as const },
+    mjpegProfile: { framesPerSecond: 5, jpegQuality: 25, scalingPercent: 50 } };
+  try {
+    const watch = h.frames.watch(SCOPE, h.route, undefined, base, subscriptionId);
+    await watch.next();
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, true))
+      .rejects.toMatchObject({ code: "SUBSCRIPTION_NOT_READY" });
+    await watch.next();
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route,
+      "22222222-2222-4222-8222-222222222222", true)).rejects.toMatchObject({
+      code: "SUBSCRIPTION_NOT_FOUND" });
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, true))
+      .resolves.toBe(true);
+    expect(h.driver.configureMjpegProfile).toHaveBeenNthCalledWith(2, h.instance,
+      { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 }, undefined);
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, false))
+      .resolves.toBe(true);
+    expect(h.driver.configureMjpegProfile).toHaveBeenNthCalledWith(3, h.instance,
+      base.mjpegProfile, undefined);
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, false))
+      .resolves.toBe(false);
+    await h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, true);
+    await watch.return(undefined);
+    expect(h.driver.configureMjpegProfile).toHaveBeenLastCalledWith(
+      h.instance, base.mjpegProfile, undefined);
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledTimes(5);
+
+    const highSubscriptionId = "55555555-5555-4555-8555-555555555555";
+    const high = { preferNativeH264: false, profile: { framesPerSecond: 30,
+      scalingPercent: 100, orientation: "PORTRAIT" as const },
+      mjpegProfile: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 } };
+    const highWatch = h.frames.watch(SCOPE, h.route, undefined, high, highSubscriptionId);
+    await highWatch.next();
+    await highWatch.next();
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route, highSubscriptionId, true))
+      .resolves.toBe(false);
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledTimes(6);
+    await highWatch.return(undefined);
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledTimes(6);
+  } finally { h.store.close(); }
+});
+
+it("restarts native H.264 inside the same subscription for interaction profiles", async () => {
+  const h264 = new Uint8Array([0, 0, 0, 1, 0x65, 0x88]);
+  const profiles: Array<{ framesPerSecond: number; scalingPercent: number }> = [];
+  const native = { probeNativeH264: vi.fn(async () => true),
+    streamNativeH264Frames: vi.fn(async function* (_instance, profile, signal?: AbortSignal) {
+      profiles.push(profile);
+      yield { sequence: profiles.length, width: 16, height: 12,
+        timestampMicros: profiles.length * 1_000, keyFrame: true, format: "annex-b" as const,
+        bytes: h264, receivedAt: new Date().toISOString() };
+      if (!signal?.aborted) await new Promise<void>(resolve =>
+        signal?.addEventListener("abort", () => resolve(), { once: true }));
+    }) };
+  const h = fixture(async function* () { throw new Error("unexpected fallback"); }, native);
+  const subscriptionId = "33333333-3333-4333-8333-333333333333";
+  try {
+    const watch = h.frames.watch(SCOPE, h.route, undefined, { preferNativeH264: true,
+      profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" },
+      mjpegProfile: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 }
+    }, subscriptionId);
+    await watch.next();
+    expect((await watch.next()).value).toMatchObject({ kind: "h264", sequence: 1 });
+    await h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, true);
+    expect((await watch.next()).value).toMatchObject({ kind: "h264", sequence: 2 });
+    expect(profiles[1]).toMatchObject({ framesPerSecond: 30, scalingPercent: 100 });
+    await h.frames.setInteractionProfile(SCOPE, h.route, subscriptionId, false);
+    expect((await watch.next()).value).toMatchObject({ kind: "h264", sequence: 3 });
+    expect(profiles[2]).toMatchObject({ framesPerSecond: 20, scalingPercent: 70 });
+    expect(native.probeNativeH264).toHaveBeenCalledOnce();
+    await watch.return(undefined);
+  } finally { h.store.close(); }
+});
+
 it("reports native fallback per subscription and re-probes only on a new explicit watch", async () => {
   let nativeReady = false;
   const native = { probeNativeH264: vi.fn(async () => nativeReady),
@@ -148,8 +231,10 @@ it("does not let a second MJPEG subscription silently replace the active profile
       receivedAt: new Date().toISOString() };
     await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
   });
+  const firstSubscriptionId = "66666666-6666-4666-8666-666666666666";
+  const peerSubscriptionId = "77777777-7777-4777-8777-777777777777";
   try {
-    const first = h.frames.watch(SCOPE, h.route);
+    const first = h.frames.watch(SCOPE, h.route, undefined, undefined, firstSubscriptionId);
     await first.next();
     await first.next();
     const second = h.frames.watch(SCOPE, h.route, undefined, { preferNativeH264: false,
@@ -159,6 +244,13 @@ it("does not let a second MJPEG subscription silently replace the active profile
       nativeRoute: "inactive" });
     await expect(second.next()).rejects.toMatchObject({ code: "PROFILE_CONFLICT" });
     expect(h.driver.configureMjpegProfile).toHaveBeenCalledOnce();
+    const peer = h.frames.watch(SCOPE, h.route, undefined, undefined, peerSubscriptionId);
+    await peer.next();
+    await peer.next();
+    await expect(h.frames.setInteractionProfile(SCOPE, h.route, firstSubscriptionId, true))
+      .rejects.toMatchObject({ code: "PROFILE_CONFLICT" });
+    expect(h.driver.configureMjpegProfile).toHaveBeenCalledTimes(2);
+    await peer.return(undefined);
     await first.return(undefined);
   } finally { h.store.close(); }
 });

@@ -303,6 +303,13 @@ it("keeps captured touch begin/move/end on one route and sends IME-safe text sep
     ({ replayed: false }));
   const live = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerTouch"]>) =>
     ({ accepted: true }));
+  let releaseProfile: (() => void) | undefined;
+  const firstProfile = new Promise<{ readonly applied: boolean }>(resolve => {
+    releaseProfile = () => resolve({ applied: true });
+  });
+  const profile = vi.fn<AppController["setSimulatorViewerInteractionProfile"]>()
+    .mockImplementationOnce(() => firstProfile)
+    .mockResolvedValue({ applied: true });
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -310,7 +317,8 @@ it("keeps captured touch begin/move/end on one route and sends IME-safe text sep
   await act(async () => root.render(<SimulatorViewerScreen
     controller={{ watchSimulatorFrames: watch,
       controlSimulatorViewerInput: control,
-      controlSimulatorViewerTouch: live } as unknown as AppController}
+      controlSimulatorViewerTouch: live,
+      setSimulatorViewerInteractionProfile: profile } as unknown as AppController}
     sessionId="task" route={route} enabled ownerDocument={document}
     onReconcile={async () => undefined}
     t={(key, values) => translate("en", key, values)} />));
@@ -372,6 +380,21 @@ it("keeps captured touch begin/move/end on one route and sends IME-safe text sep
   });
   expect(live.mock.calls.slice(5).map(call => call[2].phase)).toEqual(["begin", "cancel"]);
   expect(control).toHaveBeenCalledTimes(1);
+  await act(async () => { await new Promise<void>(resolve => setTimeout(resolve, 275)); });
+  expect(profile).toHaveBeenCalledOnce();
+  expect(profile.mock.calls[0]?.[3]).toBe(true);
+  await act(async () => {
+    releaseProfile?.();
+    await firstProfile;
+    await Promise.resolve();
+  });
+  expect(profile).toHaveBeenCalledTimes(2);
+  expect(profile.mock.calls.map(call => call.slice(0, 2))).toEqual([
+    ["task", route], ["task", route]
+  ]);
+  expect(profile.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/u);
+  expect(profile.mock.calls[1]?.[2]).toBe(profile.mock.calls[0]?.[2]);
+  expect(profile.mock.calls.map(call => call[3])).toEqual([true, false]);
 });
 
 it("falls back only after a definitely undispatched begin and locks unknown native results", async () => {
@@ -386,6 +409,8 @@ it("falls back only after a definitely undispatched begin and locks unknown nati
     .mockRejectedValueOnce(new Error("Native begin outcome unknown"));
   const control = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerInput"]>) =>
     ({ replayed: false }));
+  const profile = vi.fn(async (..._args: Parameters<AppController[
+    "setSimulatorViewerInteractionProfile"]>) => ({ applied: true }));
   const reconcile = vi.fn(async () => undefined);
   const container = document.createElement("div");
   document.body.append(container);
@@ -393,7 +418,8 @@ it("falls back only after a definitely undispatched begin and locks unknown nati
   roots.push(root);
   await act(async () => root.render(<SimulatorViewerScreen
     controller={{ watchSimulatorFrames: watch, controlSimulatorViewerInput: control,
-      controlSimulatorViewerTouch: live } as unknown as AppController}
+      controlSimulatorViewerTouch: live,
+      setSimulatorViewerInteractionProfile: profile } as unknown as AppController}
     sessionId="task" route={route} enabled ownerDocument={document}
     onReconcile={reconcile}
     t={(key, values) => translate("en", key, values)} />));
@@ -426,6 +452,8 @@ it("falls back only after a definitely undispatched begin and locks unknown nati
   expect(container.querySelector("[role=alert]")?.textContent)
     .toContain("Native begin outcome unknown");
   expect(reconcile).toHaveBeenCalledOnce();
+  await act(async () => { await new Promise<void>(resolve => setTimeout(resolve, 275)); });
+  expect(profile.mock.calls.map(call => call[3])).toEqual([true, false]);
 });
 
 it("keeps typed text and locks input after an unconfirmed result until explicit reconciliation", async () => {

@@ -17,7 +17,7 @@ const DEVICE = { udid: "A0123456-1234-1234-1234-123456789ABC", name: "Joko iPhon
   deviceTypeIdentifier: "com.apple.CoreSimulator.SimDeviceType.iPhone-17", lastBootedAt: null } as const;
 
 function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
-  Partial<Pick<SimulatorViewerFrameCoordinator, "inputView">>, viewerInput?: {
+  Partial<Pick<SimulatorViewerFrameCoordinator, "inputView" | "setInteractionProfile">>, viewerInput?: {
     readonly execute: ReturnType<typeof vi.fn>;
     readonly screenMap: ReturnType<typeof vi.fn>;
     readonly liveTouch?: { readonly begin: ReturnType<typeof vi.fn>;
@@ -145,7 +145,8 @@ it("streams task-bound frame messages and fences authentication between yields",
     const request = create(contract.WatchSimulatorFramesRequestSchema, {
       sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
         generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
-      mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70
+      mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70,
+      subscriptionId: randomUUID()
     });
     const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
     expect((await stream.next()).value).toMatchObject({
@@ -165,6 +166,31 @@ it("streams task-bound frame messages and fences authentication between yields",
       nativeRouteState: contract.SimulatorViewerNativeRouteState.FALLBACK_UNAVAILABLE
     });
     await second.return?.();
+  } finally { h.store.close(); }
+});
+
+it("targets interaction profiles to an authenticated exact frame subscription", async () => {
+  const setInteractionProfile = vi.fn(async () => true);
+  const h = fixture({ watch: async function* () { /* not consumed */ }, setInteractionProfile });
+  const subscriptionId = randomUUID();
+  const route = { instanceId: h.instance.instanceId,
+    generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id };
+  try {
+    const request = create(contract.SetSimulatorViewerInteractionProfileRequestSchema, {
+      sessionId: SCOPE.sessionId, route, subscriptionId, active: true
+    });
+    await expect(h.service.setSimulatorViewerInteractionProfile(request, h.context))
+      .resolves.toMatchObject({ applied: true });
+    expect(setInteractionProfile).toHaveBeenCalledWith(SCOPE, {
+      instanceId: route.instanceId, generation: Number(route.generation), leaseId: route.leaseId
+    }, subscriptionId, true);
+    await expect(h.service.setSimulatorViewerInteractionProfile(create(
+      contract.SetSimulatorViewerInteractionProfileRequestSchema,
+      { ...request, subscriptionId: "stale" }), h.context))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    h.revoke();
+    await expect(h.service.setSimulatorViewerInteractionProfile(request, h.context))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
   } finally { h.store.close(); }
 });
 
@@ -237,7 +263,7 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
         generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
       preferNativeH264: true, framesPerSecond: 20, scalingPercent: 70,
       orientation: "PORTRAIT", mjpegFramesPerSecond: 10, jpegQuality: 45,
-      mjpegScalingPercent: 70
+      mjpegScalingPercent: 70, subscriptionId: randomUUID()
     });
     const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
     expect((await stream.next()).value).toMatchObject({ state: contract.SimulatorViewerStreamState.FRAME,
@@ -249,7 +275,8 @@ it("passes a bounded native profile and projects H.264 metadata without durable 
       instanceId: h.instance.instanceId }), h.context.signal,
     expect.objectContaining({ preferNativeH264: true,
       profile: { framesPerSecond: 20, scalingPercent: 70, orientation: "PORTRAIT" },
-      mjpegProfile: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 } }));
+      mjpegProfile: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 } }),
+    request.subscriptionId);
     expect(h.store.listOperations({ sessionId: SCOPE.sessionId })).toEqual([]);
     await stream.return?.();
     await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
@@ -272,7 +299,7 @@ it("projects an explicit decoder fallback without accepting arbitrary route reas
     sessionId: SCOPE.sessionId, route: { instanceId: h.instance.instanceId,
       generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id },
     mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70,
-    clientFallbackReason: "decode_failed"
+    clientFallbackReason: "decode_failed", subscriptionId: randomUUID()
   });
   try {
     const stream = h.service.watchSimulatorFrames(request, h.context)[Symbol.asyncIterator]();
@@ -282,7 +309,7 @@ it("projects an explicit decoder fallback without accepting arbitrary route reas
     });
     expect(watch).toHaveBeenCalledWith(SCOPE, expect.anything(), h.context.signal,
       expect.objectContaining({ preferNativeH264: false,
-        clientFallbackReason: "decode_failed" }));
+        clientFallbackReason: "decode_failed" }), request.subscriptionId);
     await expect(h.service.watchSimulatorFrames(create(contract.WatchSimulatorFramesRequestSchema,
       { ...request, clientFallbackReason: "arbitrary" }),
     h.context)[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: Code.InvalidArgument });

@@ -9,9 +9,11 @@ import type {
   OperationApi, SimulatorViewerInstanceView, SimulatorViewerRouteView,
   SimulatorViewerStateView
 } from "./model.js";
+import { randomUuid } from "./web-crypto.js";
 
 type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance" |
-  "controlSimulatorViewerInput" | "controlSimulatorViewerTouch" | "getSimulatorViewerControls" |
+  "controlSimulatorViewerInput" | "controlSimulatorViewerTouch" |
+  "setSimulatorViewerInteractionProfile" | "getSimulatorViewerControls" |
   "controlSimulatorViewerCommand" | "watchSimulatorFrames">;
 
 export function createSimulatorViewerGateway(transport: Transport, ownerSignal?: AbortSignal): ViewerApi {
@@ -74,6 +76,11 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
         point: { xRatio: touch.xRatio, yRatio: touch.yRatio } }, options(signal));
       return { accepted: response.accepted };
     },
+    async setSimulatorViewerInteractionProfile(sessionId, route, subscriptionId, active, signal) {
+      const response = await client.setSimulatorViewerInteractionProfile({ sessionId, route,
+        subscriptionId, active }, options(signal));
+      return { applied: response.applied };
+    },
     async getSimulatorViewerControls(sessionId, route, signal) {
       const response = await client.getSimulatorViewerControls({ sessionId, route }, options(signal));
       if (!Number.isSafeInteger(response.viewportWidth) || response.viewportWidth < 1 ||
@@ -103,7 +110,8 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
     },
     async *watchSimulatorFrames(sessionId, route, signal, preference) {
       let sequence = 0n;
-      const profile = preference ?? { preferNativeH264: false, framesPerSecond: 20,
+      const profile = preference ?? { subscriptionId: randomUuid(),
+        preferNativeH264: false, framesPerSecond: 20,
         scalingPercent: 70, orientation: "PORTRAIT" as const,
         mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 };
       for await (const response of client.watchSimulatorFrames({ sessionId, route,
@@ -111,7 +119,8 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
         framesPerSecond: profile.framesPerSecond, scalingPercent: profile.scalingPercent,
         orientation: profile.orientation, mjpegFramesPerSecond: profile.mjpegFramesPerSecond,
         jpegQuality: profile.jpegQuality, mjpegScalingPercent: profile.mjpegScalingPercent,
-        clientFallbackReason: profile.clientFallbackReason ?? ""
+        clientFallbackReason: profile.clientFallbackReason ?? "",
+        subscriptionId: profile.subscriptionId
       }, options(signal))) {
         if (response.route?.instanceId !== route.instanceId ||
             response.route.generation !== route.generation || response.route.leaseId !== route.leaseId) {

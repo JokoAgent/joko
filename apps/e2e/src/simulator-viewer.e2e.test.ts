@@ -98,7 +98,8 @@ it("serves authenticated task-owned Simulator inventory and durable exact deleti
       devices: [{ udid }], instances: [{ simulatorUdid: udid, creationProvenance: "joko" }] });
     const watchRequest = { sessionId: "viewer-task", route: { instanceId: owned.instanceId,
       generation: BigInt(owned.generation), leaseId: owned.lease.id },
-      mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70 };
+      mjpegFramesPerSecond: 10, jpegQuality: 45, mjpegScalingPercent: 70,
+      subscriptionId: randomUUID() };
     await expect(anonymous.simulatorViewer.watchSimulatorFrames(watchRequest)[Symbol.asyncIterator]().next())
       .rejects.toMatchObject({ code: Code.Unauthenticated });
     await expect(clients.simulatorViewer.watchSimulatorFrames({ ...watchRequest,
@@ -171,6 +172,8 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     readonly sequence: number; readonly x: number; readonly y: number;
     readonly claimed: boolean }> = [];
   const viewerProfiles: unknown[] = [];
+  const nativeProfiles: Array<{ readonly framesPerSecond: number;
+    readonly scalingPercent: number }> = [];
   let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
     driverSessionId: string; health: { ready: true; message: null; osName: string;
@@ -233,7 +236,9 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       }
     }, nativeH264Runtime: {
       probe: async () => h264 !== undefined,
-      stream: async function* (_identity, _profile, signal) {
+      stream: async function* (_identity, profile, signal) {
+        nativeProfiles.push({ framesPerSecond: profile.framesPerSecond,
+          scalingPercent: profile.scalingPercent });
         let sequence = 0;
         while (!signal?.aborted && !stopNative) {
           sequence += 1;
@@ -401,6 +406,10 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await vi.waitFor(() => expect(viewerProfiles).toContainEqual({ settings: {
         mjpegServerFramerate: 20, mjpegServerScreenshotQuality: 70, mjpegScalingFactor: 100
       } }), { timeout: 5_000 });
+      await panel.getByLabel("Video quality").selectOption("balanced");
+      await vi.waitFor(() => expect(viewerProfiles.at(-1)).toEqual({ settings: {
+        mjpegServerFramerate: 10, mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70
+      } }), { timeout: 5_000 });
       await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       const textInput = panel.getByRole("textbox", { name: "Text to type in the Simulator" });
       await textInput.fill("mounted-private-text");
@@ -410,11 +419,18 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       expect(await textInput.inputValue()).toBe("");
 
       const interactiveFrame = panel.locator(".simulator-viewer__screen img");
+      const interactionProfilesStart = viewerProfiles.length;
       await interactiveFrame.click({ position: { x: 8, y: 6 } });
       await vi.waitFor(() => expect(liveTouches).toHaveLength(2), { timeout: 5_000 });
       expect(liveTouches.map(touch => touch.phase)).toEqual(["begin", "end"]);
       expect(new Set(liveTouches.map(touch => touch.gestureId)).size).toBe(1);
       expect(liveTouches.every(touch => touch.claimed)).toBe(true);
+      await vi.waitFor(() => expect(viewerProfiles.slice(interactionProfilesStart)).toEqual([
+        { settings: { mjpegServerFramerate: 20, mjpegServerScreenshotQuality: 70,
+          mjpegScalingFactor: 100 } },
+        { settings: { mjpegServerFramerate: 10, mjpegServerScreenshotQuality: 45,
+          mjpegScalingFactor: 70 } }
+      ]), { timeout: 5_000 });
       const frameBox = await interactiveFrame.boundingBox();
       if (!frameBox) throw new Error("Visible Simulator frame has no pointer bounds.");
       await page.mouse.move(frameBox.x + 2, frameBox.y + 2);
@@ -475,6 +491,12 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         return canvas?.width === 64 && canvas.height === 64 &&
           (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
       });
+      const nativeInteractionStart = nativeProfiles.length;
+      await panel.locator(".simulator-viewer__screen canvas").click({ position: { x: 8, y: 6 } });
+      await vi.waitFor(() => expect(nativeProfiles.slice(nativeInteractionStart)).toEqual([
+        { framesPerSecond: 30, scalingPercent: 100 },
+        { framesPerSecond: 20, scalingPercent: 70 }
+      ]), { timeout: 5_000 });
       await page.setViewportSize({ width: 390, height: 844 });
       await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
       await panel.getByRole("button", { name: "Copy screenshot" }).waitFor({ state: "visible" });
