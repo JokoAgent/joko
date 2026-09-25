@@ -226,6 +226,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       existing = false;
     } },
     driver: { architecture: "arm64", nativeHidRuntime: {
+      capabilities: { continuousInput: true, multiTouch: false },
       probe: async () => true,
       touch: async () => { throw new Error("Viewer must use a continuous native contact."); },
       beginLiveTouch: async (identity, gestureId, point) => {
@@ -530,6 +531,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       (_key, value) => typeof value === "bigint" ? value.toString() : value))
         .not.toContain("mounted-private-text");
       await panel.getByText(/393×852 · Video: WDA MJPEG · Input: Native touch/u).waitFor();
+      await panel.getByText("Multi-touch unavailable", { exact: true }).waitFor();
       await panel.getByRole("button", { name: "Rotate device" }).click();
       await vi.waitFor(() => expect(deviceCommands).toContainEqual({
         url: "/session/SESSION-1/orientation", body: { orientation: "LANDSCAPE" }, claimed: true

@@ -89,6 +89,7 @@ it("fences native HID dispatch to the exact ready driver lease", async () => {
     let retire = false;
     let loseActive = (): void => undefined;
     const h = harness(store, ownership, { nativeHidRuntime: {
+      capabilities: { continuousInput: false, multiTouch: true },
       probe: async identity => { calls.push(`probe:${identity.simulatorUdid}:${identity.generation}`);
         return true; },
       touch: async (identity, first, second) => {
@@ -100,7 +101,9 @@ it("fences native HID dispatch to the exact ready driver lease", async () => {
     const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
     const samples = [{ phase: "down" as const, x: 0.1, y: 0.1, dtMs: 0, edge: "none" as const },
       { phase: "up" as const, x: 0.2, y: 0.2, dtMs: 16, edge: "none" as const }];
-    await expect(h.coordinator.probeNativeInput(started.instance)).resolves.toBe(true);
+    await expect(h.coordinator.probeNativeInputCapabilities(started.instance)).resolves.toEqual({
+      available: true, continuousInput: false, multiTouch: true
+    });
     await expect(h.coordinator.touchNativePath(started.instance, samples, samples)).resolves.toBeUndefined();
     retire = true;
     await expect(h.coordinator.touchNativePath(started.instance, samples))
@@ -121,6 +124,7 @@ it("fences a continuous native contact after every move and releases it on drive
     const phases: string[] = [];
     let loseActive = (): void => undefined;
     const h = harness(store, ownership, { nativeHidRuntime: {
+      capabilities: { continuousInput: true, multiTouch: false },
       probe: async () => true,
       touch: async () => { throw new Error("Unexpected one-shot native touch."); },
       beginLiveTouch: async (identity, gestureId, point) => {
@@ -136,6 +140,9 @@ it("fences a continuous native contact after every move and releases it on drive
     } });
     loseActive = h.loseActive;
     const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    expect(await h.coordinator.probeNativeInputCapabilities(started.instance)).toEqual({
+      available: true, continuousInput: true, multiTouch: false
+    });
     expect(await h.coordinator.probeNativeLiveInput(started.instance)).toBe(true);
     const contact = await h.coordinator.beginNativeLiveTouch(started.instance,
       "C0123456-1234-1234-1234-123456789ABC", { x: 0.1, y: 0.2 });

@@ -101,7 +101,8 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
         throw new Error("Simulator Viewer controls response is invalid.");
       }
       return { viewportWidth: response.viewportWidth, viewportHeight: response.viewportHeight,
-        orientation: response.orientation, nativeTouchAvailable: response.nativeTouchAvailable };
+        orientation: response.orientation, nativeTouchAvailable: response.nativeTouchAvailable,
+        multiTouchAvailable: response.multiTouchAvailable };
     },
     async controlSimulatorViewerCommand(sessionId, requestId, route, command, signal) {
       const mapped = command.action === "home" ? SimulatorViewerCommand.HOME

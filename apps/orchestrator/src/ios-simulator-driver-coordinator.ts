@@ -49,6 +49,12 @@ export interface SimulatorDriverCoordinatorOptions {
   readonly mjpegStream?: typeof streamSimulatorMjpeg;
 }
 
+export interface SimulatorNativeInputCapabilities {
+  readonly available: boolean;
+  readonly continuousInput: boolean;
+  readonly multiTouch: boolean;
+}
+
 function buildVersion(value: string | null): string | null {
   const match = /(?:^|\n)Build version ([A-Za-z0-9.()-]{1,100})(?:\n|$)/u.exec(value ?? "");
   return match?.[1] ?? null;
@@ -194,21 +200,31 @@ export class SimulatorDriverCoordinator {
   }
 
   async probeNativeInput(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<boolean> {
+    return (await this.probeNativeInputCapabilities(instance, signal)).available;
+  }
+
+  async probeNativeInputCapabilities(instance: PublicSimulatorInstance,
+    signal?: AbortSignal): Promise<SimulatorNativeInputCapabilities> {
     const active = this.#manager.get(instance.instanceId);
-    if (!active || !this.isReady(instance)) return false;
-    const available = await this.#nativeHid?.probe({ simulatorUdid: instance.simulatorUdid,
-      generation: instance.generation }, signal) ?? false;
+    const runtime = this.#nativeHid;
+    if (!active || !this.isReady(instance) || !runtime) return {
+      available: false, continuousInput: false, multiTouch: false
+    };
+    const available = await runtime.probe({ simulatorUdid: instance.simulatorUdid,
+      generation: instance.generation }, signal);
     const current = this.#manager.get(instance.instanceId);
     if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
         current.driverSessionId !== active.driverSessionId || current.controlPort !== active.controlPort) {
       throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during native input probe.");
     }
-    return available;
+    return { available,
+      continuousInput: available && runtime.capabilities.continuousInput &&
+        typeof runtime.beginLiveTouch === "function",
+      multiTouch: available && runtime.capabilities.multiTouch };
   }
 
   async probeNativeLiveInput(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<boolean> {
-    return typeof this.#nativeHid?.beginLiveTouch === "function" &&
-      await this.probeNativeInput(instance, signal);
+    return (await this.probeNativeInputCapabilities(instance, signal)).continuousInput;
   }
 
   async beginNativeLiveTouch(instance: PublicSimulatorInstance, gestureId: string,

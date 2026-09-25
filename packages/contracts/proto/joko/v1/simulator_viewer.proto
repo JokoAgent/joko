@@ -201,6 +201,7 @@ message GetSimulatorViewerControlsResponse {
   uint32 viewport_height = 2;
   string orientation = 3;
   bool native_touch_available = 4;
+  bool multi_touch_available = 5;
 }
 
 enum SimulatorViewerCommand {

@@ -21,7 +21,13 @@ export interface SimulatorNativeHidIdentity {
   readonly generation: number;
 }
 
+export interface SimulatorNativeHidCapabilities {
+  readonly continuousInput: boolean;
+  readonly multiTouch: boolean;
+}
+
 export interface SimulatorNativeHidRuntime {
+  readonly capabilities: SimulatorNativeHidCapabilities;
   probe(identity: SimulatorNativeHidIdentity, signal?: AbortSignal): Promise<boolean>;
   touch(identity: SimulatorNativeHidIdentity, first: readonly SimulatorNormalizedTouchSample[],
     second?: readonly SimulatorNormalizedTouchSample[], signal?: AbortSignal): Promise<void>;
@@ -189,6 +195,7 @@ class LiveHidContact implements SimulatorNativeLiveContact {
 
 /** One-shot, exact-device SimulatorKit helper. No ambient subprocess output is published. */
 export class MacSimulatorNativeHidRuntime implements SimulatorNativeHidRuntime {
+  readonly capabilities = { continuousInput: true, multiTouch: true } as const;
   readonly #helperPath: string;
   readonly #platform: NodeJS.Platform;
   readonly #verifyHelper: () => Promise<boolean>;

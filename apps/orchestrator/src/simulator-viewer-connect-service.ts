@@ -28,7 +28,7 @@ export interface SimulatorViewerServiceOwner {
   readonly mutations: SimulatorMutationArbiter;
   readonly frames?: SimulatorViewerFrameCoordinator;
   readonly input?: Pick<SimulatorInputCoordinator, "execute">;
-  readonly driver?: Pick<SimulatorDriverCoordinator, "isReady" | "probeNativeLiveInput">;
+  readonly driver?: Pick<SimulatorDriverCoordinator, "isReady" | "probeNativeInputCapabilities">;
   readonly stateControl?: Pick<SimulatorStateControlCoordinator, "execute">;
   readonly screenshot?: Pick<SimulatorScreenshotCoordinator, "execute">;
   readonly liveTouch?: Pick<SimulatorViewerLiveTouchCoordinator, "begin" | "advance" | "clearInstance">;
@@ -332,14 +332,16 @@ export function createSimulatorViewerConnectService(input: {
             !freshInputView(currentOwner.frames!.inputView(task, route))) {
           throw new ConnectError("The visible Simulator frame changed before controls were read.", Code.Aborted);
         }
-        const nativeTouchAvailable = await currentOwner.driver!.probeNativeLiveInput(instance, signal);
+        const inputCapabilities = await currentOwner.driver!.probeNativeInputCapabilities(instance, signal);
+        const nativeTouchAvailable = inputCapabilities.available && inputCapabilities.continuousInput;
         fence(context, task, false);
         currentOwner.ownership.requireRoute(task, route);
         if (!freshInputView(currentOwner.frames!.inputView(task, route))) throw new ConnectError(
           "The visible Simulator frame changed before controls were read.", Code.Aborted);
         return create(contract.GetSimulatorViewerControlsResponseSchema, {
           viewportWidth: observed.viewport.width, viewportHeight: observed.viewport.height,
-          orientation: observed.viewport.orientation, nativeTouchAvailable
+          orientation: observed.viewport.orientation, nativeTouchAvailable,
+          multiTouchAvailable: nativeTouchAvailable && inputCapabilities.multiTouch
         });
       });
     },

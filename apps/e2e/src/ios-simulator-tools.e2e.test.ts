@@ -642,6 +642,7 @@ it("runs task-bound Simulator attach, live diagnosis and detach through producti
     },
     driver: { architecture: "arm64", cleanupOrphans: async () => { events.push("orphan-cleanup"); },
       nativeHidRuntime: {
+        capabilities: { continuousInput: true, multiTouch: true },
         probe: async identity => nativeReady && identity.simulatorUdid === udid,
         touch: async (identity, first, second) => {
           expect(identity.simulatorUdid).toBe(udid);

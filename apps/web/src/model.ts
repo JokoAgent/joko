@@ -5356,6 +5356,7 @@ export interface SimulatorViewerControlsView {
   readonly viewportHeight: number;
   readonly orientation: "PORTRAIT" | "LANDSCAPE";
   readonly nativeTouchAvailable: boolean;
+  readonly multiTouchAvailable: boolean;
 }
 
 export type SimulatorViewerCommandView =

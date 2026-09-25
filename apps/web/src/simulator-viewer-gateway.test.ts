@@ -50,7 +50,8 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
             } })
           : method.localName === "getSimulatorViewerControls"
             ? create(GetSimulatorViewerControlsResponseSchema, { viewportWidth: 393,
-              viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true })
+              viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true,
+              multiTouchAvailable: false })
             : method.localName === "controlSimulatorViewerCommand"
               ? create(ControlSimulatorViewerCommandResponseSchema, { replayed: false,
                 screenshotBlobId: input.command === SimulatorViewerCommand.COPY_SCREENSHOT
@@ -99,7 +100,8 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
   expect(requests.at(-1)).toMatchObject({ name: "setSimulatorViewerMutationControl",
     input: { sessionId: "task", route, agentPaused: true } });
   expect(await gateway.getSimulatorViewerControls("task", route)).toEqual({
-    viewportWidth: 393, viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true
+    viewportWidth: 393, viewportHeight: 852, orientation: "PORTRAIT", nativeTouchAvailable: true,
+    multiTouchAvailable: false
   });
   expect(await gateway.controlSimulatorViewerCommand("task", "rotate-request", route,
     { action: "rotate", orientation: "LANDSCAPE" })).toEqual({ replayed: false });

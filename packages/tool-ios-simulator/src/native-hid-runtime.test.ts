@@ -40,6 +40,7 @@ it("executes only an exact-device, bounded native helper with filtered environme
   const runtime = new MacSimulatorNativeHidRuntime({ helperPath: "/private/joko-simulator-hid",
     platform: "darwin", developerDir: "/Applications/Xcode.app/Contents/Developer",
     verifyHelper: async () => true, spawn: fakeSpawn({ code: "OK", status: 0 }, calls) });
+  expect(runtime.capabilities).toEqual({ continuousInput: true, multiTouch: true });
   expect(await runtime.probe(identity)).toBe(true);
   await expect(runtime.touch(identity, path)).resolves.toBeUndefined();
   expect(calls).toHaveLength(2);

@@ -46,7 +46,7 @@ it("shows current route telemetry, rotates from a fresh viewport and copies an e
   let orientation: "PORTRAIT" | "LANDSCAPE" = "PORTRAIT";
   const getControls = vi.fn(async () => ({ viewportWidth: orientation === "PORTRAIT" ? 393 : 852,
     viewportHeight: orientation === "PORTRAIT" ? 852 : 393,
-    orientation, nativeTouchAvailable: true }));
+    orientation, nativeTouchAvailable: true, multiTouchAvailable: orientation === "LANDSCAPE" }));
   const command = vi.fn(async (_session: string, _id: string, _route: typeof route,
     input: { action: string; orientation?: "PORTRAIT" | "LANDSCAPE" }) => {
     if (input.action === "rotate") orientation = input.orientation!;
@@ -73,6 +73,7 @@ it("shows current route telemetry, rotates from a fresh viewport and copies an e
   expect(container.textContent).toContain("393×852");
   expect(container.textContent).toContain("WDA MJPEG");
   expect(container.textContent).toContain("Native touch");
+  expect(container.textContent).toContain("Multi-touch unavailable");
   const button = (label: string): HTMLButtonElement | undefined =>
     [...container.querySelectorAll<HTMLButtonElement>("button")]
       .find(candidate => candidate.textContent === label);
@@ -80,6 +81,7 @@ it("shows current route telemetry, rotates from a fresh viewport and copies an e
   expect(command).toHaveBeenCalledWith("task", expect.any(String), route,
     { action: "rotate", orientation: "LANDSCAPE" }, expect.any(AbortSignal));
   expect(container.textContent).toContain("852×393");
+  expect(container.textContent).not.toContain("Multi-touch unavailable");
   await act(async () => button("Copy screenshot")?.click());
   expect(clipboardWrite).toHaveBeenCalledOnce();
   expect(fetcher).toHaveBeenCalledWith("blob:artifact", expect.anything());
@@ -191,11 +193,13 @@ it("retries a current native fallback only on user action and retains MJPEG on f
   await act(async () => root.render(<SimulatorViewerScreen
     controller={{ watchSimulatorFrames: watch,
       getSimulatorViewerControls: async () => ({ viewportWidth: 393, viewportHeight: 852,
-        orientation: "PORTRAIT", nativeTouchAvailable: false }) } as unknown as AppController}
+        orientation: "PORTRAIT", nativeTouchAvailable: false,
+        multiTouchAvailable: false }) } as unknown as AppController}
     sessionId="task" route={route} enabled ownerDocument={document}
     onReconcile={async () => undefined}
     t={(key, values) => translate("en", key, values)} />));
   expect(container.textContent).toContain("Native video is unavailable; showing WDA video.");
+  expect(container.textContent).not.toContain("Multi-touch unavailable");
   expect(watch).toHaveBeenCalledTimes(1);
   const retry = [...container.querySelectorAll<HTMLButtonElement>("button")]
     .find(button => button.textContent === "Retry native video")!;

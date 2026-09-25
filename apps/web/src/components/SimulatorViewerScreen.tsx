@@ -813,6 +813,10 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, c
       input: controls ? controls.nativeTouchAvailable && !inputFallback ? t("simulator.routeNativeTouch")
         : t("simulator.routeWdaInput") : t("simulator.routeUnknown")
     })}</p>
+    {controls?.nativeTouchAvailable === true && !controls.multiTouchAvailable && !inputFallback &&
+      <p className="simulator-viewer__telemetry" role="status">
+        {t("simulator.multiTouchUnavailable")}
+      </p>}
     {nativeFallbackVisible && <p className="simulator-viewer__telemetry" role="status">
       {t(`simulator.nativeRoute.${nativeRoute}`)}</p>}
     {(nativeFallbackVisible || nativeRecoveryPending) &&

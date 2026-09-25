@@ -25,7 +25,7 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
       readonly advance: ReturnType<typeof vi.fn>; readonly clearInstance: ReturnType<typeof vi.fn> };
   }, commands?: {
     readonly driver?: { readonly isReady: ReturnType<typeof vi.fn>;
-      readonly probeNativeLiveInput: ReturnType<typeof vi.fn> };
+      readonly probeNativeInputCapabilities: ReturnType<typeof vi.fn> };
     readonly stateControl?: { readonly execute: ReturnType<typeof vi.fn> };
     readonly screenshot?: { readonly execute: ReturnType<typeof vi.fn> };
   }) {
@@ -81,7 +81,9 @@ it("routes visible Viewer commands through exact durable owners without binding 
   const stateExecute = vi.fn(async () => ({ replayed: false }));
   const screenshotExecute = vi.fn(async () => ({ replayed: false,
     receipt: { image: { id: "screenshot-blob" } } }));
-  const driver = { isReady: vi.fn(() => true), probeNativeLiveInput: vi.fn(async () => true) };
+  const driver = { isReady: vi.fn(() => true),
+    probeNativeInputCapabilities: vi.fn(async () => ({ available: true,
+      continuousInput: true, multiTouch: false })) };
   const h = fixture({ watch: async function* () { /* not consumed */ }, inputView },
     { execute: inputExecute, screenMap }, { driver, stateControl: { execute: stateExecute },
       screenshot: { execute: screenshotExecute } });
@@ -92,7 +94,12 @@ it("routes visible Viewer commands through exact durable owners without binding 
     expect(await h.service.getSimulatorViewerControls(create(
       contract.GetSimulatorViewerControlsRequestSchema, { sessionId: SCOPE.sessionId, route }), h.context))
       .toMatchObject({ viewportWidth: 393, viewportHeight: 852,
-        orientation: "PORTRAIT", nativeTouchAvailable: true });
+        orientation: "PORTRAIT", nativeTouchAvailable: true, multiTouchAvailable: false });
+    driver.probeNativeInputCapabilities.mockResolvedValueOnce({ available: true,
+      continuousInput: false, multiTouch: true });
+    expect(await h.service.getSimulatorViewerControls(create(
+      contract.GetSimulatorViewerControlsRequestSchema, { sessionId: SCOPE.sessionId, route }), h.context))
+      .toMatchObject({ nativeTouchAvailable: false, multiTouchAvailable: false });
     const home = await h.service.controlSimulatorViewerCommand(create(
       contract.ControlSimulatorViewerCommandRequestSchema, {
         ...request, command: contract.SimulatorViewerCommand.HOME
@@ -394,7 +401,9 @@ it("projects Agent mutation ownership and gates Viewer input through takeover an
     viewerOrientation: null, lastFrameAt: new Date().toISOString() }));
   const h = fixture({ watch: async function* () { /* not consumed */ }, inputView }, {
     execute, screenMap
-  }, { driver: { isReady: vi.fn(() => true), probeNativeLiveInput: vi.fn(async () => true) } });
+  }, { driver: { isReady: vi.fn(() => true),
+    probeNativeInputCapabilities: vi.fn(async () => ({ available: true,
+      continuousInput: true, multiTouch: true })) } });
   const route = { instanceId: h.instance.instanceId,
     generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id };
   const internalRoute = { ...route, generation: Number(route.generation) };
