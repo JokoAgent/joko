@@ -2,8 +2,9 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import { CapabilitySupport, ControlSimulatorInstanceResponseSchema,
   ControlSimulatorViewerInputResponseSchema,
+  ControlSimulatorViewerTouchResponseSchema,
   GetSimulatorViewerStateResponseSchema, SimulatorViewerAction,
-  SimulatorViewerInstanceSchema, SimulatorViewerStreamState,
+  SimulatorViewerInstanceSchema, SimulatorViewerStreamState, SimulatorViewerTouchPhase,
   WatchSimulatorFramesResponseSchema } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
@@ -28,6 +29,8 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
       })
       : method.localName === "controlSimulatorViewerInput"
         ? create(ControlSimulatorViewerInputResponseSchema, { replayed: false })
+        : method.localName === "controlSimulatorViewerTouch"
+          ? create(ControlSimulatorViewerTouchResponseSchema, { accepted: true })
         : create(ControlSimulatorInstanceResponseSchema, { instance, deleted: true });
     return { service: method.parent, method, stream: false,
       header: new Headers(), trailer: new Headers(), message };
@@ -49,6 +52,14 @@ it("maps the generated Viewer route and preserves one-shot control with the exac
     input: { sessionId: "task", requestId: "input-request", route,
       input: { case: "swipe", value: { start: { xRatio: 0.1, yRatio: 0.2 },
         end: { xRatio: 0.8, yRatio: 0.9 }, durationMs: 450 } } } });
+  expect(await gateway.controlSimulatorViewerTouch("task", route, {
+    gestureId: "A0123456-1234-1234-1234-123456789ABC", sequence: 1,
+    phase: "move", xRatio: 0.4, yRatio: 0.6 })).toEqual({ accepted: true });
+  expect(requests.at(-1)).toMatchObject({ name: "controlSimulatorViewerTouch",
+    input: { sessionId: "task", route,
+      gestureId: "A0123456-1234-1234-1234-123456789ABC", sequence: 1,
+      phase: SimulatorViewerTouchPhase.MOVE,
+      point: { xRatio: 0.4, yRatio: 0.6 } } });
   failControl = true;
   await expect(gateway.controlSimulatorInstance("task", "uncertain", { action: "stop", route }))
     .rejects.toThrow("Outcome unknown");

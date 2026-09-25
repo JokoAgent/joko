@@ -162,6 +162,9 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
   let ownerFingerprint = "";
   const viewerInputs: Array<{ readonly url: string; readonly body: unknown;
     readonly claimed: boolean }> = [];
+  const liveTouches: Array<{ readonly gestureId: string; readonly phase: string;
+    readonly sequence: number; readonly x: number; readonly y: number;
+    readonly claimed: boolean }> = [];
   const viewerProfiles: unknown[] = [];
   let activeDriver: { instanceId: string; simulatorUdid: string; leaseId: string; pid: number;
     controlPort: number; mjpegPort: number; sourceRevision: string; buildCacheKey: string;
@@ -199,7 +202,24 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       deletes += 1;
       existing = false;
     } },
-    driver: { architecture: "arm64", nativeH264Runtime: {
+    driver: { architecture: "arm64", nativeHidRuntime: {
+      probe: async () => true,
+      touch: async () => { throw new Error("Viewer must use a continuous native contact."); },
+      beginLiveTouch: async (identity, gestureId, point) => {
+        expect(identity.simulatorUdid).toBe(udid);
+        const record = (phase: string, sequence: number,
+          next: { readonly x: number; readonly y: number }): void => {
+          liveTouches.push({ gestureId, phase, sequence, x: next.x, y: next.y,
+            claimed: application.store.listOperations({ sessionId: "viewer-web-task",
+              status: "started" }).some(operation => operation.kind === "ios_simulator_input") });
+        };
+        record("begin", 0, point);
+        return { move: async (next, sequence) => record("move", sequence, next),
+          end: async (next, sequence) => record("end", sequence, next),
+          cancel: async (next, sequence) => record("cancel", sequence, next),
+          forceRelease: () => {} };
+      }
+    }, nativeH264Runtime: {
       probe: async () => h264 !== undefined,
       stream: async function* (_identity, _profile, signal) {
         let sequence = 0;
@@ -362,8 +382,10 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
 
       const interactiveFrame = panel.locator(".simulator-viewer__screen img");
       await interactiveFrame.click({ position: { x: 8, y: 6 } });
-      await vi.waitFor(() => expect(viewerInputs).toHaveLength(2), { timeout: 5_000 });
-      expect(viewerInputs[1]).toMatchObject({ url: "/session/SESSION-1/actions", claimed: true });
+      await vi.waitFor(() => expect(liveTouches).toHaveLength(2), { timeout: 5_000 });
+      expect(liveTouches.map(touch => touch.phase)).toEqual(["begin", "end"]);
+      expect(new Set(liveTouches.map(touch => touch.gestureId)).size).toBe(1);
+      expect(liveTouches.every(touch => touch.claimed)).toBe(true);
       const frameBox = await interactiveFrame.boundingBox();
       if (!frameBox) throw new Error("Visible Simulator frame has no pointer bounds.");
       await page.mouse.move(frameBox.x + 2, frameBox.y + 2);
@@ -371,8 +393,17 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await page.mouse.move(frameBox.x + frameBox.width - 2,
         frameBox.y + frameBox.height - 2, { steps: 4 });
       await page.mouse.up();
-      await vi.waitFor(() => expect(viewerInputs).toHaveLength(3), { timeout: 5_000 });
-      expect(viewerInputs[2]).toMatchObject({ url: "/session/SESSION-1/actions", claimed: true });
+      await vi.waitFor(() => {
+        expect(liveTouches.length).toBeGreaterThan(3);
+        expect(liveTouches.at(-1)?.phase).toBe("end");
+      }, { timeout: 5_000 });
+      const drag = liveTouches.slice(2);
+      expect(drag[0]?.phase).toBe("begin");
+      expect(drag.some(touch => touch.phase === "move")).toBe(true);
+      expect(drag.at(-1)?.phase).toBe("end");
+      expect(new Set(drag.map(touch => touch.gestureId)).size).toBe(1);
+      expect(drag.every(touch => touch.claimed)).toBe(true);
+      expect(viewerInputs).toHaveLength(1);
       const inputOperations = application.store.listOperations({ sessionId: "viewer-web-task",
         status: "completed" }).filter(operation => operation.kind === "ios_simulator_input");
       expect(inputOperations).toHaveLength(3);

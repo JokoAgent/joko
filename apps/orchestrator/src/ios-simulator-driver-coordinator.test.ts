@@ -112,6 +112,39 @@ it("fences native HID dispatch to the exact ready driver lease", async () => {
   } finally { store.close(); }
 });
 
+it("fences a continuous native contact after every move and releases it on driver retirement", async () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    seed(store);
+    const ownership = new SimulatorOwnershipRegistry(store);
+    const initial = ownership.bindExternalDevice(SCOPE, DEVICE);
+    const phases: string[] = [];
+    let loseActive = (): void => undefined;
+    const h = harness(store, ownership, { nativeHidRuntime: {
+      probe: async () => true,
+      touch: async () => { throw new Error("Unexpected one-shot native touch."); },
+      beginLiveTouch: async (identity, gestureId, point) => {
+        expect(identity.simulatorUdid).toBe(UDID);
+        expect(gestureId).toBe("C0123456-1234-1234-1234-123456789ABC");
+        expect(point).toEqual({ x: 0.1, y: 0.2 });
+        phases.push("begin");
+        return { move: async () => { phases.push("move"); loseActive(); },
+          end: async () => { phases.push("end"); },
+          cancel: async () => { phases.push("cancel"); },
+          forceRelease: () => { phases.push("release"); } };
+      }
+    } });
+    loseActive = h.loseActive;
+    const started = await h.coordinator.start(SCOPE, route(initial), authority("a"));
+    expect(await h.coordinator.probeNativeLiveInput(started.instance)).toBe(true);
+    const contact = await h.coordinator.beginNativeLiveTouch(started.instance,
+      "C0123456-1234-1234-1234-123456789ABC", { x: 0.1, y: 0.2 });
+    await expect(contact.move({ x: 0.3, y: 0.4 }, 1))
+      .rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    expect(phases).toEqual(["begin", "move", "release"]);
+  } finally { store.close(); }
+});
+
 it("reads MJPEG only from the current owned driver port and rejects a changed manager lease", async () => {
   const store = new OperationalStore(":memory:");
   try {

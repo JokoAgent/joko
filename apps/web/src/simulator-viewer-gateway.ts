@@ -1,6 +1,7 @@
 import { createClient, type Transport } from "@connectrpc/connect";
 import {
   CapabilitySupport, SimulatorViewerAction, SimulatorViewerService, SimulatorViewerStreamState,
+  SimulatorViewerTouchPhase,
   type SimulatorViewerInstance
 } from "@joko/contracts";
 import type {
@@ -9,7 +10,7 @@ import type {
 } from "./model.js";
 
 type ViewerApi = Pick<OperationApi, "getSimulatorViewerState" | "controlSimulatorInstance" |
-  "controlSimulatorViewerInput" | "watchSimulatorFrames">;
+  "controlSimulatorViewerInput" | "controlSimulatorViewerTouch" | "watchSimulatorFrames">;
 
 export function createSimulatorViewerGateway(transport: Transport, ownerSignal?: AbortSignal): ViewerApi {
   const client = createClient(SimulatorViewerService, transport);
@@ -60,6 +61,16 @@ export function createSimulatorViewerGateway(transport: Transport, ownerSignal?:
       const response = await client.controlSimulatorViewerInput({ sessionId, requestId, route,
         input: action }, options(signal));
       return { replayed: response.replayed };
+    },
+    async controlSimulatorViewerTouch(sessionId, route, touch, signal) {
+      const phase = touch.phase === "begin" ? SimulatorViewerTouchPhase.BEGIN
+        : touch.phase === "move" ? SimulatorViewerTouchPhase.MOVE
+          : touch.phase === "end" ? SimulatorViewerTouchPhase.END
+            : SimulatorViewerTouchPhase.CANCEL;
+      const response = await client.controlSimulatorViewerTouch({ sessionId, route,
+        gestureId: touch.gestureId, sequence: touch.sequence, phase,
+        point: { xRatio: touch.xRatio, yRatio: touch.yRatio } }, options(signal));
+      return { accepted: response.accepted };
     },
     async *watchSimulatorFrames(sessionId, route, signal, preference) {
       let sequence = 0n;

@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
 import type { SimulatorNormalizedTouchSample } from "./native-touch-path.js";
@@ -9,6 +10,10 @@ const MAX_OUTPUT_BYTES = 256;
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 10_000;
 const TOUCH_TIMEOUT_MS = 75_000;
+const LIVE_READY_TIMEOUT_MS = 10_000;
+const LIVE_STEP_TIMEOUT_MS = 5_000;
+const LIVE_IDLE_TIMEOUT_MS = 5_000;
+const LIVE_MAX_OUTPUT_BYTES = 256 * 1024;
 const execFileAsync = promisify(execFile);
 
 export interface SimulatorNativeHidIdentity {
@@ -20,6 +25,16 @@ export interface SimulatorNativeHidRuntime {
   probe(identity: SimulatorNativeHidIdentity, signal?: AbortSignal): Promise<boolean>;
   touch(identity: SimulatorNativeHidIdentity, first: readonly SimulatorNormalizedTouchSample[],
     second?: readonly SimulatorNormalizedTouchSample[], signal?: AbortSignal): Promise<void>;
+  beginLiveTouch?(identity: SimulatorNativeHidIdentity, gestureId: string,
+    point: SimulatorNativeLivePoint, signal?: AbortSignal): Promise<SimulatorNativeLiveContact>;
+}
+
+export interface SimulatorNativeLivePoint { readonly x: number; readonly y: number }
+export interface SimulatorNativeLiveContact {
+  move(point: SimulatorNativeLivePoint, sequence: number, signal?: AbortSignal): Promise<void>;
+  end(point: SimulatorNativeLivePoint, sequence: number, signal?: AbortSignal): Promise<void>;
+  cancel(point: SimulatorNativeLivePoint, sequence: number, signal?: AbortSignal): Promise<void>;
+  forceRelease(): void;
 }
 
 export class SimulatorNativeHidError extends Error {
@@ -38,6 +53,138 @@ interface NativeHidRuntimeOptions {
 function validIdentity(identity: SimulatorNativeHidIdentity): boolean {
   return /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(identity.simulatorUdid) &&
     Number.isSafeInteger(identity.generation) && identity.generation > 0;
+}
+
+function validLivePoint(point: SimulatorNativeLivePoint): boolean {
+  return point !== null && typeof point === "object" && Number.isFinite(point.x) &&
+    point.x >= 0 && point.x <= 1 && Number.isFinite(point.y) && point.y >= 0 && point.y <= 1;
+}
+
+class LiveHidContact implements SimulatorNativeLiveContact {
+  readonly #child: ChildProcessByStdio<Writable, Readable, null>;
+  readonly #lines: AsyncIterator<string>;
+  readonly #gestureId: string;
+  #closed = false;
+  #terminal = false;
+  #pending = false;
+  #lastSequence = -1;
+  #outputBytes = 0;
+  #idle: ReturnType<typeof setTimeout> | undefined;
+  #forceKill: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(child: ChildProcessByStdio<Writable, Readable, null>, gestureId: string) {
+    this.#child = child;
+    this.#gestureId = gestureId;
+    this.#lines = createInterface({ input: child.stdout, crlfDelay: Infinity })[Symbol.asyncIterator]();
+    child.stdout.on("data", (chunk: Buffer) => {
+      this.#outputBytes += chunk.byteLength;
+      if (this.#outputBytes > LIVE_MAX_OUTPUT_BYTES) this.forceRelease();
+    });
+    child.on("close", () => { this.#closed = true; this.#clearTimers(); });
+    child.on("error", () => { this.#closed = true; this.#clearTimers(); });
+  }
+
+  async ready(): Promise<void> {
+    await this.#reply("READY", undefined, LIVE_READY_TIMEOUT_MS, false);
+  }
+
+  async begin(point: SimulatorNativeLivePoint, signal?: AbortSignal): Promise<void> {
+    await this.#send("begin", point, 0, signal);
+  }
+
+  move(point: SimulatorNativeLivePoint, sequence: number, signal?: AbortSignal): Promise<void> {
+    return this.#send("move", point, sequence, signal);
+  }
+
+  end(point: SimulatorNativeLivePoint, sequence: number, signal?: AbortSignal): Promise<void> {
+    return this.#send("end", point, sequence, signal);
+  }
+
+  cancel(point: SimulatorNativeLivePoint, sequence: number, signal?: AbortSignal): Promise<void> {
+    return this.#send("cancel", point, sequence, signal);
+  }
+
+  async #send(phase: "begin" | "move" | "end" | "cancel", point: SimulatorNativeLivePoint,
+    sequence: number, signal?: AbortSignal): Promise<void> {
+    if (!validLivePoint(point) || !Number.isSafeInteger(sequence) ||
+        sequence !== this.#lastSequence + 1 || this.#terminal || this.#pending) {
+      throw new SimulatorNativeHidError("INPUT_OUTCOME_UNKNOWN", "Native live touch state is invalid.");
+    }
+    if (signal?.aborted) throw new SimulatorNativeHidError("MUTATION_CANCELLED",
+      "Native live touch was cancelled before dispatch.");
+    if (this.#closed) throw new SimulatorNativeHidError("INPUT_OUTCOME_UNKNOWN",
+      "Native live touch helper has exited.");
+    this.#pending = true;
+    this.#clearIdle();
+    try {
+      const payload = JSON.stringify({ gestureId: this.#gestureId, sequence, phase,
+        x: point.x, y: point.y });
+      this.#child.stdin.write(`${payload}\n`);
+      await this.#reply("OK", sequence, LIVE_STEP_TIMEOUT_MS, true);
+      this.#lastSequence = sequence;
+      if (phase === "end" || phase === "cancel") {
+        this.#terminal = true;
+        this.#child.stdin.end();
+      } else {
+        this.#idle = setTimeout(() => this.forceRelease(), LIVE_IDLE_TIMEOUT_MS);
+      }
+    } catch (error) {
+      this.forceRelease();
+      throw error;
+    } finally { this.#pending = false; }
+  }
+
+  async #reply(code: "READY" | "OK", sequence: number | undefined,
+    timeoutMs: number, dispatched: boolean): Promise<void> {
+    if (this.#closed) throw this.#failure(dispatched);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let onClose: (() => void) | undefined;
+    let onError: (() => void) | undefined;
+    try {
+      const interrupted = new Promise<never>((_resolve, reject) => {
+        onClose = () => reject(this.#failure(dispatched));
+        onError = () => reject(this.#failure(dispatched));
+        this.#child.once("close", onClose);
+        this.#child.once("error", onError);
+        timeout = setTimeout(() => reject(this.#failure(dispatched)), timeoutMs);
+      });
+      const next = await Promise.race([this.#lines.next(), interrupted]);
+      if (next.done || next.value.length > 256) throw this.#failure(dispatched);
+      let message: unknown;
+      try { message = JSON.parse(next.value); }
+      catch { throw this.#failure(dispatched); }
+      if (!message || typeof message !== "object" || Array.isArray(message) ||
+          (message as Record<string, unknown>)["code"] !== code ||
+          (sequence !== undefined && (message as Record<string, unknown>)["sequence"] !== sequence)) {
+        throw this.#failure(dispatched);
+      }
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (onClose) this.#child.off("close", onClose);
+      if (onError) this.#child.off("error", onError);
+    }
+  }
+
+  #failure(dispatched: boolean): SimulatorNativeHidError {
+    return new SimulatorNativeHidError(dispatched ? "INPUT_OUTCOME_UNKNOWN" : "NATIVE_INPUT_UNAVAILABLE",
+      dispatched ? "Native live touch outcome is unknown." : "Native live touch helper is unavailable.");
+  }
+
+  #clearIdle(): void { if (this.#idle !== undefined) clearTimeout(this.#idle); this.#idle = undefined; }
+  #clearTimers(): void {
+    this.#clearIdle();
+    if (this.#forceKill !== undefined) clearTimeout(this.#forceKill);
+    this.#forceKill = undefined;
+  }
+
+  forceRelease(): void {
+    if (this.#closed || this.#terminal) return;
+    this.#terminal = true;
+    this.#clearIdle();
+    this.#child.kill("SIGTERM");
+    this.#forceKill = setTimeout(() => this.#child.kill("SIGKILL"), 2_000);
+    this.#forceKill.unref?.();
+  }
 }
 
 /** One-shot, exact-device SimulatorKit helper. No ambient subprocess output is published. */
@@ -81,6 +228,35 @@ export class MacSimulatorNativeHidRuntime implements SimulatorNativeHidRuntime {
     if (code === "OK") return;
     throw new SimulatorNativeHidError("INPUT_OUTCOME_UNKNOWN",
       "Simulator native touch result is unknown; read a new screen map before retrying.");
+  }
+
+  async beginLiveTouch(identity: SimulatorNativeHidIdentity, gestureId: string,
+    point: SimulatorNativeLivePoint, signal?: AbortSignal): Promise<SimulatorNativeLiveContact> {
+    if (signal?.aborted) throw new SimulatorNativeHidError("MUTATION_CANCELLED",
+      "Native live touch was cancelled before admission.");
+    if (!validIdentity(identity) || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(gestureId) ||
+        !validLivePoint(point) || this.#platform !== "darwin" || !await this.#verifyHelper()) {
+      throw new SimulatorNativeHidError("NATIVE_INPUT_UNAVAILABLE",
+        "Native live touch is unavailable on this host.");
+    }
+    const developerDir = await this.#developerDirectory();
+    if (signal?.aborted) throw new SimulatorNativeHidError("MUTATION_CANCELLED",
+      "Native live touch was cancelled before dispatch.");
+    let child: ChildProcessByStdio<Writable, Readable, null>;
+    try {
+      child = this.#spawn(this.#helperPath, ["--simulator-udid", identity.simulatorUdid,
+        "--generation", String(identity.generation), "--live-touch"], {
+        stdio: ["pipe", "pipe", "ignore"], shell: false, windowsHide: true,
+        env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "",
+          TMPDIR: process.env.TMPDIR ?? "/tmp", DEVELOPER_DIR: developerDir }
+      });
+    } catch {
+      throw new SimulatorNativeHidError("NATIVE_INPUT_UNAVAILABLE",
+        "Native live touch helper could not start.");
+    }
+    const contact = new LiveHidContact(child, gestureId);
+    try { await contact.ready(); await contact.begin(point, signal); return contact; }
+    catch (error) { contact.forceRelease(); throw error; }
   }
 
   async #inspectHelper(): Promise<boolean> {

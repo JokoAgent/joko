@@ -5331,6 +5331,14 @@ export interface SimulatorViewerInputResultView {
   readonly replayed: boolean;
 }
 
+export interface SimulatorViewerTouchView {
+  readonly gestureId: string;
+  readonly sequence: number;
+  readonly phase: "begin" | "move" | "end" | "cancel";
+  readonly xRatio: number;
+  readonly yRatio: number;
+}
+
 export type SimulatorViewerFrameEventView =
   | { readonly kind: "connecting" | "reconnecting" | "disconnected";
     readonly attempt: number }
@@ -5356,6 +5364,8 @@ export interface OperationApi {
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
     input: SimulatorViewerInputView, signal?: AbortSignal): Promise<SimulatorViewerInputResultView>;
+  controlSimulatorViewerTouch(sessionId: string, route: SimulatorViewerRouteView,
+    touch: SimulatorViewerTouchView, signal?: AbortSignal): Promise<{ readonly accepted: boolean }>;
   watchSimulatorFrames(sessionId: string, route: SimulatorViewerRouteView,
     signal?: AbortSignal,
     preference?: SimulatorViewerVideoPreferenceView): AsyncIterable<SimulatorViewerFrameEventView>;

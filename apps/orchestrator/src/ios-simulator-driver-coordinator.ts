@@ -3,6 +3,7 @@ import { cleanupWdaOrphanProcesses, createSimulatorEnvironmentRuntime, createSim
   streamSimulatorMjpeg,
   type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime,
   type SimulatorNativeHidRuntime, type SimulatorNativeH264Runtime,
+  type SimulatorNativeLiveContact, type SimulatorNativeLivePoint,
   type SimulatorNativeH264Profile, type SimulatorNativeH264Frame,
   type SimulatorNormalizedTouchSample,
   type WdaAccessibilitySnapshot, type WdaDriverStartOptions, type WdaOrphanCleanupInput,
@@ -203,6 +204,46 @@ export class SimulatorDriverCoordinator {
       throw new SimulatorDriverError("STALE_DRIVER", "Simulator driver changed during native input probe.");
     }
     return available;
+  }
+
+  async probeNativeLiveInput(instance: PublicSimulatorInstance, signal?: AbortSignal): Promise<boolean> {
+    return typeof this.#nativeHid?.beginLiveTouch === "function" &&
+      await this.probeNativeInput(instance, signal);
+  }
+
+  async beginNativeLiveTouch(instance: PublicSimulatorInstance, gestureId: string,
+    point: SimulatorNativeLivePoint, signal?: AbortSignal): Promise<SimulatorNativeLiveContact> {
+    const active = this.#manager.get(instance.instanceId);
+    if (!active || !this.isReady(instance)) throw new SimulatorDriverError(
+      "DRIVER_RUNTIME_LOST", "Simulator driver is not ready for live touch.");
+    if (!this.#nativeHid?.beginLiveTouch) throw new SimulatorDriverError(
+      "NATIVE_INPUT_UNAVAILABLE", "Simulator continuous native touch is unavailable.");
+    const contact = await this.#nativeHid.beginLiveTouch({ simulatorUdid: instance.simulatorUdid,
+      generation: instance.generation }, gestureId, point, signal);
+    const fence = (): void => {
+      const current = this.#manager.get(instance.instanceId);
+      if (!this.isReady(instance) || !current || current.leaseId !== active.leaseId ||
+          current.driverSessionId !== active.driverSessionId ||
+          current.controlPort !== active.controlPort) {
+        contact.forceRelease();
+        throw new SimulatorDriverError("INPUT_OUTCOME_UNKNOWN",
+          "Simulator driver changed during continuous touch; observe before retrying.");
+      }
+    };
+    fence();
+    const step = async (phase: "move" | "end" | "cancel", next: SimulatorNativeLivePoint,
+      sequence: number, nextSignal?: AbortSignal): Promise<void> => {
+      fence();
+      try { await contact[phase](next, sequence, nextSignal); }
+      catch (error) { contact.forceRelease(); throw error; }
+      fence();
+    };
+    return {
+      move: (next, sequence, nextSignal) => step("move", next, sequence, nextSignal),
+      end: (next, sequence, nextSignal) => step("end", next, sequence, nextSignal),
+      cancel: (next, sequence, nextSignal) => step("cancel", next, sequence, nextSignal),
+      forceRelease: () => contact.forceRelease()
+    };
   }
 
   async touchNativePath(instance: PublicSimulatorInstance,

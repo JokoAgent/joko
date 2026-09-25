@@ -7,6 +7,8 @@ import ObjectiveC
 private let maxInputBytes = 2 * 1024 * 1024
 private let maxSamples = 4_096
 private let maxDurationMs = 60_000
+private let liveIdleSeconds = 5.0
+private let maxLiveLineBytes = 512
 private var cancellationRequested: Int32 = 0
 
 private typealias ClassObjectError = @convention(c) (
@@ -207,17 +209,96 @@ private func wait(_ milliseconds: Int) -> Bool {
     return cancellationRequested == 0
 }
 
+private func liveReply(_ code: String, sequence: Int? = nil) {
+    let suffix = sequence.map { ",\"sequence\":\($0)" } ?? ""
+    FileHandle.standardOutput.write(Data("{\"code\":\"\(code)\"\(suffix)}\n".utf8))
+}
+
+private func readLiveLine(_ buffer: inout Data, until deadline: Double) -> Data? {
+    while cancellationRequested == 0 && ProcessInfo.processInfo.systemUptime < deadline {
+        if let newline = buffer.firstIndex(of: 10) {
+            let line = Data(buffer[..<newline])
+            buffer.removeSubrange(buffer.startIndex...newline)
+            return line.count <= maxLiveLineBytes ? line : nil
+        }
+        guard buffer.count <= maxLiveLineBytes else { return nil }
+        var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        let ready = Darwin.poll(&descriptor, 1, 250)
+        if ready == 0 || ready < 0 && errno == EINTR { continue }
+        if ready < 0 { return nil }
+        var chunk = [UInt8](repeating: 0, count: 1_024)
+        let count = read(STDIN_FILENO, &chunk, chunk.count)
+        if count <= 0 { return nil }
+        buffer.append(contentsOf: chunk[0..<count])
+    }
+    return nil
+}
+
+private func runLive(_ injector: HIDInjector) -> Never {
+    signal(SIGTERM) { _ in cancellationRequested = 1 }
+    signal(SIGINT) { _ in cancellationRequested = 1 }
+    var buffer = Data()
+    var gestureId: String?
+    var lastSequence = -1
+    var lastPoint: TouchSample?
+    let startedAt = ProcessInfo.processInfo.systemUptime
+    liveReply("READY")
+    for _ in 0..<maxSamples {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - startedAt >= Double(maxDurationMs) / 1_000 { break }
+        let deadline = min(now + liveIdleSeconds,
+            startedAt + Double(maxDurationMs) / 1_000)
+        guard let line = readLiveLine(&buffer, until: deadline),
+              let object = try? JSONSerialization.jsonObject(with: line),
+              let value = object as? [String: Any],
+              let identifier = value["gestureId"] as? String,
+              UUID(uuidString: identifier) != nil,
+              let sequenceValue = numeric(value["sequence"])?.doubleValue,
+              sequenceValue.isFinite,
+              sequenceValue.rounded() == sequenceValue,
+              sequenceValue == Double(lastSequence + 1),
+              let phase = value["phase"] as? String,
+              let x = numeric(value["x"])?.doubleValue,
+              let y = numeric(value["y"])?.doubleValue,
+              x.isFinite, y.isFinite,
+              x >= 0, x <= 1, y >= 0, y <= 1 else { break }
+        if gestureId == nil {
+            guard phase == "begin" else { break }
+            gestureId = identifier
+        } else {
+            guard gestureId == identifier,
+                  phase == "move" || phase == "end" || phase == "cancel" else { break }
+        }
+        let sample = TouchSample(x: x, y: y,
+            phase: phase == "begin" ? "down" : phase == "end" ? "up" : phase,
+            dtMs: 0, edge: 0)
+        guard cancellationRequested == 0, injector.send(sample, nil) else { break }
+        lastSequence += 1
+        lastPoint = sample
+        liveReply("OK", sequence: lastSequence)
+        if phase == "end" || phase == "cancel" { exit(0) }
+    }
+    if let lastPoint, lastPoint.phase != "up" && lastPoint.phase != "cancel" {
+        _ = injector.send(TouchSample(x: lastPoint.x, y: lastPoint.y,
+            phase: "cancel", dtMs: 0, edge: 0), nil)
+    }
+    liveReply("INPUT_OUTCOME_UNKNOWN")
+    exit(1)
+}
+
 guard let udid = argument("--simulator-udid"), UUID(uuidString: udid) != nil,
       let generation = argument("--generation"),
       let generationNumber = Int(generation), generationNumber > 0,
       CommandLine.arguments.contains("--probe") ||
-        CommandLine.arguments.contains("--touch") else {
+        CommandLine.arguments.contains("--touch") ||
+        CommandLine.arguments.contains("--live-touch") else {
     reply("INVALID_ARGUMENT")
 }
 guard let device = exactDevice(udid), let injector = HIDInjector(device: device) else {
     reply("NATIVE_INPUT_UNAVAILABLE")
 }
 if CommandLine.arguments.contains("--probe") { reply("OK") }
+if CommandLine.arguments.contains("--live-touch") { runLive(injector) }
 guard let input = readInput(),
       input["simulatorUdid"] as? String == udid,
       input["generation"] as? Int == generationNumber,

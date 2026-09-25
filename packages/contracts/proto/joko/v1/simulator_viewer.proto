@@ -9,6 +9,7 @@ service SimulatorViewerService {
   rpc GetSimulatorViewerState(GetSimulatorViewerStateRequest) returns (GetSimulatorViewerStateResponse);
   rpc ControlSimulatorInstance(ControlSimulatorInstanceRequest) returns (ControlSimulatorInstanceResponse);
   rpc ControlSimulatorViewerInput(ControlSimulatorViewerInputRequest) returns (ControlSimulatorViewerInputResponse);
+  rpc ControlSimulatorViewerTouch(ControlSimulatorViewerTouchRequest) returns (ControlSimulatorViewerTouchResponse);
   rpc WatchSimulatorFrames(WatchSimulatorFramesRequest) returns (stream WatchSimulatorFramesResponse);
 }
 
@@ -113,6 +114,28 @@ message ControlSimulatorViewerInputRequest {
 
 message ControlSimulatorViewerInputResponse {
   bool replayed = 1;
+}
+
+enum SimulatorViewerTouchPhase {
+  SIMULATOR_VIEWER_TOUCH_PHASE_UNSPECIFIED = 0;
+  SIMULATOR_VIEWER_TOUCH_PHASE_BEGIN = 1;
+  SIMULATOR_VIEWER_TOUCH_PHASE_MOVE = 2;
+  SIMULATOR_VIEWER_TOUCH_PHASE_END = 3;
+  SIMULATOR_VIEWER_TOUCH_PHASE_CANCEL = 4;
+}
+
+message ControlSimulatorViewerTouchRequest {
+  string session_id = 1;
+  SimulatorViewerRoute route = 2;
+  string gesture_id = 3;
+  uint32 sequence = 4;
+  SimulatorViewerTouchPhase phase = 5;
+  SimulatorViewerPoint point = 6;
+}
+
+message ControlSimulatorViewerTouchResponse {
+  // False is returned only when begin was certainly not dispatched to the native helper.
+  bool accepted = 1;
 }
 
 enum SimulatorViewerStreamState {

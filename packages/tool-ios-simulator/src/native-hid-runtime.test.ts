@@ -73,3 +73,44 @@ it("fails closed without a helper and treats cancelled dispatched touch as unkno
   await expect(pending).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
   expect(calls[0]?.kills).toEqual(["SIGTERM"]);
 });
+
+it("keeps one exact-device HID contact across live begin, move and end", async () => {
+  const calls: Array<{ args: readonly string[]; messages: unknown[]; kills: string[] }> = [];
+  const spawn = ((_command: string, args: readonly string[]) => {
+    const child = new EventEmitter() as EventEmitter & { stdin: Writable; stdout: PassThrough;
+      kill: (signal: string) => boolean };
+    const call = { args, messages: [] as unknown[], kills: [] as string[] };
+    calls.push(call);
+    child.stdout = new PassThrough();
+    child.stdin = new Writable({ write(chunk: Buffer, _encoding, callback) {
+      for (const line of chunk.toString("utf8").trim().split("\n")) {
+        const message = JSON.parse(line) as { phase: string; sequence: number };
+        call.messages.push(message);
+        queueMicrotask(() => { child.stdout.write(`${JSON.stringify({ code: "OK",
+          sequence: message.sequence })}\n`);
+          if (message.phase === "end") child.emit("close", 0); });
+      }
+      callback();
+    } });
+    child.kill = signal => { call.kills.push(signal); queueMicrotask(() => child.emit("close", null));
+      return true; };
+    queueMicrotask(() => child.stdout.write('{"code":"READY"}\n'));
+    return child;
+  }) as never;
+  const runtime = new MacSimulatorNativeHidRuntime({ helperPath: "/private/joko-simulator-hid",
+    platform: "darwin", developerDir: "/Applications/Xcode.app/Contents/Developer",
+    verifyHelper: async () => true, spawn });
+  const gestureId = "A0123456-1234-1234-1234-123456789ABC";
+  const contact = await runtime.beginLiveTouch(identity, gestureId, { x: 0.1, y: 0.2 });
+  await contact.move({ x: 0.3, y: 0.4 }, 1);
+  await contact.end({ x: 0.5, y: 0.6 }, 2);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.args).toEqual(["--simulator-udid", identity.simulatorUdid,
+    "--generation", "3", "--live-touch"]);
+  expect(calls[0]?.messages).toMatchObject([
+    { gestureId, phase: "begin", sequence: 0, x: 0.1, y: 0.2 },
+    { gestureId, phase: "move", sequence: 1, x: 0.3, y: 0.4 },
+    { gestureId, phase: "end", sequence: 2, x: 0.5, y: 0.6 }
+  ]);
+  expect(calls[0]?.kills).toEqual([]);
+});

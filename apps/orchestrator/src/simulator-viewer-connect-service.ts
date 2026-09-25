@@ -10,6 +10,8 @@ import type { PublicSimulatorInstance, SimulatorInstanceRoute,
   SimulatorOwnershipRegistry, SimulatorTaskScope } from "./ios-simulator-ownership.js";
 import type { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
+import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
+import type { SimulatorViewerLiveTouchCoordinator } from "./ios-simulator-viewer-live-touch.js";
 
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 
@@ -19,6 +21,7 @@ export interface SimulatorViewerServiceOwner {
   readonly environment: SimulatorEnvironmentRuntime;
   readonly frames?: SimulatorViewerFrameCoordinator;
   readonly input?: Pick<SimulatorInputCoordinator, "execute">;
+  readonly liveTouch?: Pick<SimulatorViewerLiveTouchCoordinator, "begin" | "advance" | "clearInstance">;
   readonly screen?: Pick<SimulatorScreenObservationCoordinator, "screenMap">;
   clearInstance(instanceId: string): Promise<void>;
 }
@@ -175,6 +178,64 @@ export function createSimulatorViewerConnectService(input: {
         context.signal, { bindSnapshotToOperation: false });
       fence(context, task, true);
       return create(contract.ControlSimulatorViewerInputResponseSchema, { replayed: result.replayed });
+    },
+    controlSimulatorViewerTouch: async (request, context) => {
+      input.authenticate(context);
+      const task = scope(request.sessionId, true);
+      const currentOwner = owner();
+      const route = requiredRoute(request.route);
+      const gestureId = request.gestureId;
+      const point = normalizedPoint(request.point);
+      if (!UUID.test(gestureId) || !Number.isSafeInteger(request.sequence) ||
+          request.sequence >= 4_096 || !currentOwner.liveTouch || !currentOwner.frames ||
+          !currentOwner.screen) {
+        if (!currentOwner.liveTouch || !currentOwner.frames || !currentOwner.screen) throw new ConnectError(
+          "Simulator continuous touch is unavailable.", Code.Unimplemented);
+        throw new ConnectError("Simulator touch identity or sequence is invalid.", Code.InvalidArgument);
+      }
+      const phase = request.phase;
+      if (phase === contract.SimulatorViewerTouchPhase.BEGIN) {
+        if (request.sequence !== 0) throw new ConnectError(
+          "Simulator touch begin sequence is invalid.", Code.InvalidArgument);
+        const view = currentOwner.frames.inputView(task, route);
+        if (!freshInputView(view)) throw new ConnectError(
+          "A current visible Simulator frame is required for touch.", Code.FailedPrecondition);
+        fence(context, task, true);
+        const observed = await currentOwner.screen.screenMap(task, route, context.signal);
+        fence(context, task, true);
+        const currentView = currentOwner.frames.inputView(task, route);
+        if (!currentView || !freshInputView(currentView)) throw new ConnectError(
+          "The visible Simulator frame changed before touch.", Code.Aborted);
+        const viewerOrientation = currentView.encoding === "h264"
+          ? currentView.viewerOrientation ?? observed.viewport.orientation
+          : observed.viewport.orientation;
+        try {
+          await currentOwner.liveTouch.begin(task, route, gestureId, point,
+            observed.screenMap.snapshotId, observed.viewport, viewerOrientation, context.signal);
+        } catch (error) {
+          if (error instanceof SimulatorInputError && error.code === "NATIVE_INPUT_UNAVAILABLE") {
+            return create(contract.ControlSimulatorViewerTouchResponseSchema, { accepted: false });
+          }
+          throw error;
+        }
+      } else {
+        const step = phase === contract.SimulatorViewerTouchPhase.MOVE ? "move"
+          : phase === contract.SimulatorViewerTouchPhase.END ? "end"
+            : phase === contract.SimulatorViewerTouchPhase.CANCEL ? "cancel" : null;
+        if (!step || request.sequence < 1) throw new ConnectError(
+          "Simulator touch phase or sequence is invalid.", Code.InvalidArgument);
+        if (step !== "cancel" && !freshInputView(currentOwner.frames.inputView(task, route))) {
+          currentOwner.liveTouch.clearInstance(route.instanceId);
+          throw new ConnectError("Simulator touch lost its visible frame.", Code.FailedPrecondition);
+        }
+        try { fence(context, task, true); }
+        catch (error) { currentOwner.liveTouch.clearInstance(route.instanceId); throw error; }
+        await currentOwner.liveTouch.advance(task, route, gestureId, step,
+          request.sequence, point, context.signal);
+      }
+      try { fence(context, task, true); }
+      catch (error) { currentOwner.liveTouch.clearInstance(route.instanceId); throw error; }
+      return create(contract.ControlSimulatorViewerTouchResponseSchema, { accepted: true });
     },
     watchSimulatorFrames: async function* (request, context) {
       input.authenticate(context);

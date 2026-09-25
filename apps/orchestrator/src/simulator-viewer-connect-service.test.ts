@@ -5,6 +5,7 @@ import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { expect, it, vi } from "vitest";
 import { SimulatorOwnershipRegistry } from "./ios-simulator-ownership.js";
+import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
 import type { SimulatorViewerFrameCoordinator } from "./ios-simulator-viewer-frames.js";
 import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
 
@@ -19,6 +20,8 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
   Partial<Pick<SimulatorViewerFrameCoordinator, "inputView">>, viewerInput?: {
     readonly execute: ReturnType<typeof vi.fn>;
     readonly screenMap: ReturnType<typeof vi.fn>;
+    readonly liveTouch?: { readonly begin: ReturnType<typeof vi.fn>;
+      readonly advance: ReturnType<typeof vi.fn>; readonly clearInstance: ReturnType<typeof vi.fn> };
   }) {
   const store = new OperationalStore(":memory:");
   store.upsertBackend({ id: "pi", displayName: "Pi", version: "fixture", health: "healthy",
@@ -48,6 +51,7 @@ function fixture(frames?: Pick<SimulatorViewerFrameCoordinator, "watch"> &
         devices: [DEVICE], issue: null }) } as never,
       clearInstance: clear, frames: frames as never,
       input: viewerInput === undefined ? undefined : { execute: viewerInput.execute } as never,
+      liveTouch: viewerInput?.liveTouch as never,
       screen: viewerInput === undefined ? undefined : { screenMap: viewerInput.screenMap } as never },
     authenticate: () => { if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated); }
   });
@@ -84,6 +88,61 @@ it("streams task-bound frame messages and fences authentication between yields",
       receivedAtMs: 1_000n, jpeg
     });
     await second.return?.();
+  } finally { h.store.close(); }
+});
+
+it("admits exact live touch from a fresh frame and distinguishes undispatched begin from unknown", async () => {
+  const begin = vi.fn(async () => undefined);
+  const advance = vi.fn(async () => undefined);
+  const clearInstance = vi.fn();
+  const liveTouch = { begin, advance, clearInstance };
+  const snapshotId = randomUUID();
+  const screenMap = vi.fn(async () => ({ screenMap: { snapshotId },
+    viewport: { width: 100, height: 200, orientation: "PORTRAIT" } }));
+  const inputView = vi.fn(() => ({ state: "streaming" as const, encoding: "h264" as const,
+    viewerOrientation: "LANDSCAPE" as const, lastFrameAt: new Date().toISOString() }));
+  const h = fixture({ watch: async function* () { /* not consumed */ }, inputView },
+    { execute: vi.fn(), screenMap, liveTouch });
+  const gestureId = randomUUID();
+  const route = { instanceId: h.instance.instanceId,
+    generation: BigInt(h.instance.generation), leaseId: h.instance.lease.id };
+  const request = create(contract.ControlSimulatorViewerTouchRequestSchema, {
+    sessionId: SCOPE.sessionId, gestureId, route, sequence: 0,
+    phase: contract.SimulatorViewerTouchPhase.BEGIN,
+    point: { xRatio: 0.3, yRatio: 0.2 }
+  });
+  try {
+    expect(await h.service.controlSimulatorViewerTouch(request, h.context))
+      .toMatchObject({ accepted: true });
+    expect(begin).toHaveBeenCalledWith(SCOPE, expect.objectContaining({
+      instanceId: route.instanceId }), gestureId, { xRatio: 0.3, yRatio: 0.2 },
+    snapshotId, { width: 100, height: 200, orientation: "PORTRAIT" },
+    "LANDSCAPE", h.context.signal);
+    expect(await h.service.controlSimulatorViewerTouch(create(
+      contract.ControlSimulatorViewerTouchRequestSchema, { ...request, sequence: 1,
+        phase: contract.SimulatorViewerTouchPhase.MOVE }), h.context))
+      .toMatchObject({ accepted: true });
+    expect(advance).toHaveBeenCalledWith(SCOPE, expect.anything(), gestureId,
+      "move", 1, { xRatio: 0.3, yRatio: 0.2 }, h.context.signal);
+    begin.mockRejectedValueOnce(new SimulatorInputError("NATIVE_INPUT_UNAVAILABLE", "Not dispatched."));
+    expect(await h.service.controlSimulatorViewerTouch(create(
+      contract.ControlSimulatorViewerTouchRequestSchema, { ...request, gestureId: randomUUID() }),
+    h.context)).toMatchObject({ accepted: false });
+    begin.mockRejectedValueOnce(new SimulatorInputError("INPUT_OUTCOME_UNKNOWN", "Already sent."));
+    await expect(h.service.controlSimulatorViewerTouch(create(
+      contract.ControlSimulatorViewerTouchRequestSchema, { ...request, gestureId: randomUUID() }),
+    h.context)).rejects.toMatchObject({ code: "INPUT_OUTCOME_UNKNOWN" });
+    await expect(h.service.controlSimulatorViewerTouch(create(
+      contract.ControlSimulatorViewerTouchRequestSchema, { ...request, sequence: 2 }),
+    h.context)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    begin.mockImplementationOnce(async () => { h.revoke(); });
+    await expect(h.service.controlSimulatorViewerTouch(create(
+      contract.ControlSimulatorViewerTouchRequestSchema, { ...request, gestureId: randomUUID() }),
+    h.context)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(clearInstance).toHaveBeenCalledWith(route.instanceId);
+    h.revoke();
+    await expect(h.service.controlSimulatorViewerTouch(request, h.context))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
   } finally { h.store.close(); }
 });
 

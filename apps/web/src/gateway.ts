@@ -1443,6 +1443,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   getSimulatorViewerState(...args: Parameters<OperationApi["getSimulatorViewerState"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).getSimulatorViewerState(...args); }
   controlSimulatorInstance(...args: Parameters<OperationApi["controlSimulatorInstance"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorInstance(...args); }
   controlSimulatorViewerInput(...args: Parameters<OperationApi["controlSimulatorViewerInput"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorViewerInput(...args); }
+  controlSimulatorViewerTouch(...args: Parameters<OperationApi["controlSimulatorViewerTouch"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorViewerTouch(...args); }
   watchSimulatorFrames(...args: Parameters<OperationApi["watchSimulatorFrames"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).watchSimulatorFrames(...args); }
 
   async getVoiceInputCapabilities(signal?: AbortSignal): Promise<VoiceInputCapabilityView> {

@@ -127,6 +127,7 @@ import { SimulatorDriverCoordinator, type SimulatorDriverCoordinatorOptions } fr
 import { SimulatorInstanceControlCoordinator } from "./ios-simulator-instance-control.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 import { SimulatorInputCoordinator } from "./ios-simulator-input-coordinator.js";
+import { SimulatorViewerLiveTouchCoordinator } from "./ios-simulator-viewer-live-touch.js";
 import { createSimulatorEnvironmentRuntime, createSimulatorLifecycleRuntime,
   inspectSimulatorAppArtifact, type SimulatorCreateRuntime,
   type SimulatorEnvironmentRuntime, type SimulatorLifecycleRuntime } from "@joko/tool-ios-simulator";
@@ -877,6 +878,8 @@ export async function createOrchestratorApplication(
     : new SimulatorScreenObservationCoordinator(simulatorOwnership, simulatorDriver);
   const simulatorInput = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorInputCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen);
+  const simulatorLiveTouch = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
+    : new SimulatorViewerLiveTouchCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen);
   const simulatorStateControl = simulatorDriver === undefined || simulatorScreen === undefined ? undefined
     : new SimulatorStateControlCoordinator(store, simulatorOwnership, simulatorDriver, simulatorScreen,
       dependencies.simulatorRuntime?.lifecycle ?? createSimulatorLifecycleRuntime());
@@ -910,8 +913,10 @@ export async function createOrchestratorApplication(
       Date.now, simulatorViewerFrames);
   const simulatorViewer: SimulatorViewerServiceOwner | undefined = simulatorControl === undefined ? undefined : {
     ownership: simulatorOwnership, control: simulatorControl, environment: simulatorEnvironment,
-    frames: simulatorViewerFrames, input: simulatorInput, screen: simulatorScreen,
+    frames: simulatorViewerFrames, input: simulatorInput, liveTouch: simulatorLiveTouch,
+    screen: simulatorScreen,
     clearInstance: async instanceId => {
+      simulatorLiveTouch?.clearInstance(instanceId);
       simulatorViewerFrames?.clear(instanceId);
       simulatorScreen?.clear(instanceId);
       simulatorVisual?.clear(instanceId);

@@ -17,10 +17,24 @@ type FrameElement = HTMLImageElement | HTMLCanvasElement;
 interface PointerGesture {
   readonly pointerId: number;
   readonly target: FrameElement;
+  readonly gestureId: string;
+  readonly sessionId: string;
+  readonly route: SimulatorViewerRouteView;
+  readonly beginAbort: AbortController;
   readonly startedAt: number;
   readonly startClientX: number;
   readonly startClientY: number;
   readonly start: { readonly xRatio: number; readonly yRatio: number };
+  last: { readonly xRatio: number; readonly yRatio: number };
+  beginState: "pending" | "active" | "unavailable" | "failed";
+  sequence: number;
+  pendingMove?: { readonly xRatio: number; readonly yRatio: number };
+  terminal?: { readonly phase: "end" | "cancel";
+    readonly point: { readonly xRatio: number; readonly yRatio: number };
+    readonly fallback?: SimulatorViewerInputView };
+  pumping: boolean;
+  lastDispatchedAt: number;
+  watchdog?: ReturnType<typeof setTimeout>;
 }
 
 const VIDEO_PROFILES: Record<VideoQuality, { framesPerSecond: number; scalingPercent: number }> = {
@@ -186,50 +200,21 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
 
   useEffect(() => () => { if (frameUrl) URL.revokeObjectURL(frameUrl); }, [frameUrl]);
 
-  const releasePointerGesture = useCallback((): void => {
-    const gesture = pointerGestureRef.current;
-    pointerGestureRef.current = undefined;
-    if (!gesture) return;
-    try {
-      if (gesture.target.hasPointerCapture(gesture.pointerId)) {
-        gesture.target.releasePointerCapture(gesture.pointerId);
-      }
-    } catch { /* The owner may already have released capture during teardown. */ }
-  }, []);
-
   const interactive = enabled && documentVisible && state === "streaming" &&
     presentation !== null && frameFresh;
 
-  useEffect(() => {
-    if (!interactive) {
-      releasePointerGesture();
-      inputRequestRef.current?.abort();
-    }
-  }, [interactive, releasePointerGesture]);
-
-  useEffect(() => {
-    const ownerWindow = ownerDocument.defaultView;
-    const loseContext = (): void => releasePointerGesture();
-    ownerWindow?.addEventListener("blur", loseContext);
-    return () => ownerWindow?.removeEventListener("blur", loseContext);
-  }, [ownerDocument, releasePointerGesture]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-    mountedRef.current = false;
-    inputRequestRef.current?.abort();
-    releasePointerGesture();
-    };
-  }, [releasePointerGesture]);
-
-  const runInput = useCallback(async (input: SimulatorViewerInputView): Promise<boolean> => {
-    if (!interactive || inputBusy || inputRequestRef.current || inputError !== undefined) return false;
+  const runInput = useCallback(async (input: SimulatorViewerInputView,
+    fallbackAfterUndispatchedBegin = false,
+    owner: { readonly sessionId: string; readonly route: SimulatorViewerRouteView } =
+      { sessionId, route }): Promise<boolean> => {
+    if ((!interactive && !fallbackAfterUndispatchedBegin) ||
+        (inputBusy && !fallbackAfterUndispatchedBegin) ||
+        inputRequestRef.current || inputError !== undefined) return false;
     const request = new AbortController();
     inputRequestRef.current = request;
     setInputBusy(true);
     try {
-      await controllerRef.current.controlSimulatorViewerInput(sessionId, randomUuid(), route,
+      await controllerRef.current.controlSimulatorViewerInput(owner.sessionId, randomUuid(), owner.route,
         input, request.signal);
       return true;
     } catch (cause) {
@@ -254,42 +239,200 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     };
   };
 
+  const releaseCapture = (gesture: PointerGesture): void => {
+    try {
+      if (gesture.target.hasPointerCapture(gesture.pointerId)) {
+        gesture.target.releasePointerCapture(gesture.pointerId);
+      }
+    } catch { /* Capture may already have been released during teardown. */ }
+  };
+
+  const finishGesture = useCallback((gesture: PointerGesture): void => {
+    if (pointerGestureRef.current === gesture) pointerGestureRef.current = undefined;
+    if (gesture.watchdog !== undefined) clearTimeout(gesture.watchdog);
+    releaseCapture(gesture);
+    if (mountedRef.current) setInputBusy(false);
+  }, []);
+
+  const unknownGesture = useCallback(async (gesture: PointerGesture, cause: unknown): Promise<void> => {
+    if (gesture.beginState === "failed") return;
+    gesture.beginState = "failed";
+    finishGesture(gesture);
+    if (!mountedRef.current) return;
+    setInputError(`${t("simulator.inputUnconfirmed")} ${messageOf(cause)}`);
+    await reconcileRef.current().catch(() => undefined);
+  }, [finishGesture, t]);
+
+  const pumpGesture = useCallback(async (gesture: PointerGesture): Promise<void> => {
+    if (gesture.pumping || gesture.beginState !== "active") return;
+    gesture.pumping = true;
+    const cancelled = (): boolean => gesture.terminal?.phase === "cancel";
+    try {
+      while (gesture.beginState === "active") {
+        if (gesture.sequence >= 4_094) {
+          gesture.terminal = { phase: "cancel", point: gesture.last };
+          gesture.pendingMove = undefined;
+        }
+        if (gesture.pendingMove && !cancelled()) {
+          const waitMs = Math.max(0, 4 - (performance.now() - gesture.lastDispatchedAt));
+          if (waitMs > 0) await new Promise<void>(resolve => setTimeout(resolve, waitMs));
+          if (gesture.beginState !== "active" || cancelled()) continue;
+          const move = gesture.pendingMove;
+          gesture.pendingMove = undefined;
+          if (!move) continue;
+          gesture.sequence += 1;
+          const result = await controllerRef.current.controlSimulatorViewerTouch(
+            gesture.sessionId, gesture.route, { gestureId: gesture.gestureId,
+              sequence: gesture.sequence, phase: "move", xRatio: move.xRatio,
+              yRatio: move.yRatio });
+          if (!result.accepted) throw new Error("Simulator touch move was not accepted.");
+          gesture.lastDispatchedAt = performance.now();
+          continue;
+        }
+        const terminal = gesture.terminal;
+        if (!terminal) break;
+        gesture.pendingMove = undefined;
+        gesture.sequence += 1;
+        const result = await controllerRef.current.controlSimulatorViewerTouch(
+          gesture.sessionId, gesture.route, { gestureId: gesture.gestureId,
+            sequence: gesture.sequence, phase: terminal.phase,
+            xRatio: terminal.point.xRatio, yRatio: terminal.point.yRatio });
+        if (!result.accepted) throw new Error("Simulator touch release was not accepted.");
+        finishGesture(gesture);
+        break;
+      }
+    } catch (cause) { await unknownGesture(gesture, cause); }
+    finally { gesture.pumping = false; }
+  }, [finishGesture, unknownGesture]);
+
+  const resetWatchdog = useCallback((gesture: PointerGesture): void => {
+    if (gesture.watchdog !== undefined) clearTimeout(gesture.watchdog);
+    gesture.watchdog = setTimeout(() => {
+      if (pointerGestureRef.current !== gesture || gesture.terminal) return;
+      gesture.terminal = { phase: "cancel", point: gesture.last };
+      gesture.pendingMove = undefined;
+      releaseCapture(gesture);
+      if (gesture.beginState === "active") void pumpGesture(gesture);
+      else if (gesture.beginState === "pending") {
+        gesture.beginAbort.abort();
+        void unknownGesture(gesture, new Error("Simulator touch begin timed out."));
+      }
+      else if (gesture.beginState === "unavailable") finishGesture(gesture);
+    }, Math.min(4_500, Math.max(1, 59_000 - (performance.now() - gesture.startedAt))));
+  }, [finishGesture, pumpGesture, unknownGesture]);
+
+  const cancelPointerGesture = useCallback((): void => {
+    const gesture = pointerGestureRef.current;
+    if (!gesture || gesture.terminal) return;
+    gesture.terminal = { phase: "cancel", point: gesture.last };
+    gesture.pendingMove = undefined;
+    releaseCapture(gesture);
+    if (gesture.beginState === "active") void pumpGesture(gesture);
+    else if (gesture.beginState === "pending") {
+      gesture.beginAbort.abort();
+      void unknownGesture(gesture, new Error("Simulator touch begin was interrupted."));
+    }
+    else if (gesture.beginState === "unavailable") finishGesture(gesture);
+  }, [finishGesture, pumpGesture, unknownGesture]);
+
+  useEffect(() => {
+    if (!interactive) {
+      cancelPointerGesture();
+      inputRequestRef.current?.abort();
+    }
+  }, [interactive, cancelPointerGesture]);
+
+  useEffect(() => {
+    const ownerWindow = ownerDocument.defaultView;
+    ownerWindow?.addEventListener("blur", cancelPointerGesture);
+    return () => ownerWindow?.removeEventListener("blur", cancelPointerGesture);
+  }, [ownerDocument, cancelPointerGesture]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      inputRequestRef.current?.abort();
+      cancelPointerGesture();
+    };
+  }, [cancelPointerGesture]);
+
+  useEffect(() => () => cancelPointerGesture(),
+    [sessionId, route.instanceId, route.generation, route.leaseId, cancelPointerGesture]);
+
   const onPointerDown = (event: ReactPointerEvent<FrameElement>): void => {
     if (!interactive || inputBusy || inputError !== undefined || pointerGestureRef.current ||
-        event.button !== 0) return;
+        event.button !== 0 || !event.isPrimary) return;
     const start = ratio(event);
     if (!start) return;
     try { event.currentTarget.setPointerCapture(event.pointerId); }
     catch { return; }
-    pointerGestureRef.current = { pointerId: event.pointerId, target: event.currentTarget,
-      startedAt: performance.now(), startClientX: event.clientX, startClientY: event.clientY, start };
+    const gesture: PointerGesture = { pointerId: event.pointerId, target: event.currentTarget,
+      gestureId: randomUuid(), sessionId, route, beginAbort: new AbortController(),
+      startedAt: performance.now(),
+      startClientX: event.clientX, startClientY: event.clientY, start, last: start,
+      beginState: "pending", sequence: 0, pumping: false,
+      lastDispatchedAt: performance.now() };
+    pointerGestureRef.current = gesture;
+    setInputBusy(true);
+    resetWatchdog(gesture);
+    void (async () => {
+      try {
+        const result = await controllerRef.current.controlSimulatorViewerTouch(
+          gesture.sessionId, gesture.route, { gestureId: gesture.gestureId,
+            sequence: 0, phase: "begin", xRatio: start.xRatio, yRatio: start.yRatio },
+          gesture.beginAbort.signal);
+        if (gesture.beginState === "failed" || pointerGestureRef.current !== gesture) return;
+        if (!result.accepted) {
+          gesture.beginState = "unavailable";
+          const terminal = gesture.terminal;
+          if (terminal?.phase === "end" && terminal.fallback) {
+            await runInput(terminal.fallback, true, gesture);
+            finishGesture(gesture);
+          } else if (terminal) finishGesture(gesture);
+          return;
+        }
+        gesture.beginState = "active";
+        void pumpGesture(gesture);
+      } catch (cause) { await unknownGesture(gesture, cause); }
+    })();
     event.preventDefault();
   };
 
   const onPointerMove = (event: ReactPointerEvent<FrameElement>): void => {
     const gesture = pointerGestureRef.current;
-    if (!gesture || gesture.pointerId !== event.pointerId) return;
-    if ((event.buttons & 1) === 0) {
-      releasePointerGesture();
-      return;
-    }
+    if (!gesture || gesture.pointerId !== event.pointerId || gesture.terminal) return;
+    if ((event.buttons & 1) === 0) { cancelPointerGesture(); return; }
+    const point = ratio(event);
+    if (!point) { cancelPointerGesture(); return; }
+    gesture.last = point;
+    gesture.pendingMove = point;
+    resetWatchdog(gesture);
+    if (gesture.beginState === "active") void pumpGesture(gesture);
     event.preventDefault();
   };
 
   const onPointerUp = (event: ReactPointerEvent<FrameElement>): void => {
     const gesture = pointerGestureRef.current;
-    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    if (!gesture || gesture.pointerId !== event.pointerId || gesture.terminal) return;
     const end = ratio(event);
+    if (!end) { cancelPointerGesture(); return; }
     const distance = Math.hypot(event.clientX - gesture.startClientX,
       event.clientY - gesture.startClientY);
     const durationMs = Math.round(Math.min(2_000,
       Math.max(100, performance.now() - gesture.startedAt)));
-    releasePointerGesture();
-    if (end) void runInput(distance < 8
+    const fallback: SimulatorViewerInputView = distance < 8
       ? { action: "tap", xRatio: end.xRatio, yRatio: end.yRatio }
       : { action: "swipe", startXRatio: gesture.start.xRatio,
         startYRatio: gesture.start.yRatio, endXRatio: end.xRatio,
-        endYRatio: end.yRatio, durationMs });
+        endYRatio: end.yRatio, durationMs };
+    gesture.last = end;
+    gesture.terminal = { phase: "end", point: end, fallback };
+    releaseCapture(gesture);
+    if (gesture.beginState === "active") void pumpGesture(gesture);
+    else if (gesture.beginState === "unavailable") {
+      void runInput(fallback, true, gesture).finally(() => finishGesture(gesture));
+    }
     event.preventDefault();
   };
 
@@ -314,8 +457,8 @@ export function SimulatorViewerScreen({ controller, sessionId, route, enabled, o
     onPointerDown,
     onPointerMove,
     onPointerUp,
-    onPointerCancel: releasePointerGesture,
-    onLostPointerCapture: releasePointerGesture
+    onPointerCancel: cancelPointerGesture,
+    onLostPointerCapture: cancelPointerGesture
   };
   const controlsDisabled = !interactive || inputBusy || inputError !== undefined;
 

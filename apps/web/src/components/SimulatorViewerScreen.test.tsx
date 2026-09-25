@@ -173,7 +173,7 @@ it("renders current H.264 output to a canvas and falls back to JPEG when decodin
   vi.unstubAllGlobals();
 });
 
-it("maps captured pointer gestures and IME-safe text to the exact visible route", async () => {
+it("keeps captured touch begin/move/end on one route and sends IME-safe text separately", async () => {
   vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:interactive",
     revokeObjectURL: vi.fn() });
   const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
@@ -183,13 +183,16 @@ it("maps captured pointer gestures and IME-safe text to the exact visible route"
   };
   const control = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerInput"]>) =>
     ({ replayed: false }));
+  const live = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerTouch"]>) =>
+    ({ accepted: true }));
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   await act(async () => root.render(<SimulatorViewerScreen
     controller={{ watchSimulatorFrames: watch,
-      controlSimulatorViewerInput: control } as unknown as AppController}
+      controlSimulatorViewerInput: control,
+      controlSimulatorViewerTouch: live } as unknown as AppController}
     sessionId="task" route={route} enabled ownerDocument={document}
     onReconcile={async () => undefined}
     t={(key, values) => translate("en", key, values)} />));
@@ -209,8 +212,12 @@ it("maps captured pointer gestures and IME-safe text to the exact visible route"
       button: 0, buttons: 0 });
     await Promise.resolve();
   });
-  expect(control).toHaveBeenNthCalledWith(1, "task", expect.stringMatching(/^[0-9a-f-]{36}$/u),
-    route, { action: "tap", xRatio: 0.26, yRatio: 0.255 }, expect.any(AbortSignal));
+  expect(live).toHaveBeenNthCalledWith(1, "task", route, expect.objectContaining({
+    phase: "begin", sequence: 0, xRatio: 0.25, yRatio: 0.25 }), expect.any(AbortSignal));
+  expect(live).toHaveBeenNthCalledWith(2, "task", route, expect.objectContaining({
+    phase: "end", sequence: 1, xRatio: 0.26, yRatio: 0.255 }));
+  expect(live.mock.calls[0]?.[2].gestureId).toBe(live.mock.calls[1]?.[2].gestureId);
+  expect(control).not.toHaveBeenCalled();
 
   await act(async () => {
     dispatchPointer(image, "pointerdown", { pointerId: 2, clientX: 20, clientY: 40,
@@ -219,11 +226,14 @@ it("maps captured pointer gestures and IME-safe text to the exact visible route"
       button: 0, buttons: 1 });
     dispatchPointer(image, "pointerup", { pointerId: 2, clientX: 180, clientY: 360,
       button: 0, buttons: 0 });
-    await Promise.resolve();
+    await new Promise<void>(resolve => setTimeout(resolve, 12));
   });
-  expect(control.mock.calls[1]?.[3]).toMatchObject({ action: "swipe",
-    startXRatio: 0.1, startYRatio: 0.1, endXRatio: 0.9, endYRatio: 0.9,
-    durationMs: expect.any(Number) });
+  expect(live.mock.calls.slice(2).map(call => call[2])).toMatchObject([
+    { phase: "begin", sequence: 0, xRatio: 0.1, yRatio: 0.1 },
+    { phase: "move", sequence: 1, xRatio: 0.5, yRatio: 0.5 },
+    { phase: "end", sequence: 2, xRatio: 0.9, yRatio: 0.9 }
+  ]);
+  expect(new Set(live.mock.calls.slice(2).map(call => call[2].gestureId)).size).toBe(1);
 
   const text = container.querySelector<HTMLInputElement>(".simulator-viewer__keyboard input")!;
   await act(async () => {
@@ -232,16 +242,72 @@ it("maps captured pointer gestures and IME-safe text to the exact visible route"
     text.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
     await Promise.resolve();
   });
-  expect(control.mock.calls[2]?.[3]).toEqual({ action: "typeText", text: "hello" });
+  expect(control.mock.calls[0]?.[3]).toEqual({ action: "typeText", text: "hello" });
   expect(text.value).toBe("");
 
   await act(async () => {
     dispatchPointer(image, "pointerdown", { pointerId: 3, clientX: 40, clientY: 80,
       button: 0, buttons: 1 });
+    await Promise.resolve();
     dispatchPointer(image, "pointercancel", { pointerId: 3, clientX: 40, clientY: 80,
       button: 0, buttons: 0 });
   });
-  expect(control).toHaveBeenCalledTimes(3);
+  expect(live.mock.calls.slice(5).map(call => call[2].phase)).toEqual(["begin", "cancel"]);
+  expect(control).toHaveBeenCalledTimes(1);
+});
+
+it("falls back only after a definitely undispatched begin and locks unknown native results", async () => {
+  vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:touch-fallback",
+    revokeObjectURL: vi.fn() });
+  const watch = async function* (_sessionId: string, _route: typeof route, signal: AbortSignal) {
+    yield { kind: "frame", sequence: 1n, receivedAtMs: 1,
+      jpeg: new Uint8Array([0xff, 0xd8, 1, 0xff, 0xd9]) } as const;
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+  };
+  const live = vi.fn().mockResolvedValueOnce({ accepted: false })
+    .mockRejectedValueOnce(new Error("Native begin outcome unknown"));
+  const control = vi.fn(async (..._args: Parameters<AppController["controlSimulatorViewerInput"]>) =>
+    ({ replayed: false }));
+  const reconcile = vi.fn(async () => undefined);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => root.render(<SimulatorViewerScreen
+    controller={{ watchSimulatorFrames: watch, controlSimulatorViewerInput: control,
+      controlSimulatorViewerTouch: live } as unknown as AppController}
+    sessionId="task" route={route} enabled ownerDocument={document}
+    onReconcile={reconcile}
+    t={(key, values) => translate("en", key, values)} />));
+  const image = container.querySelector("img")!;
+  let captured = false;
+  Object.defineProperties(image, {
+    setPointerCapture: { configurable: true, value: () => { captured = true; } },
+    hasPointerCapture: { configurable: true, value: () => captured },
+    releasePointerCapture: { configurable: true, value: () => { captured = false; } },
+    getBoundingClientRect: { configurable: true,
+      value: () => ({ left: 0, top: 0, width: 200, height: 400 }) }
+  });
+  await act(async () => {
+    dispatchPointer(image, "pointerdown", { pointerId: 1, clientX: 50, clientY: 100,
+      button: 0, buttons: 1 });
+    dispatchPointer(image, "pointerup", { pointerId: 1, clientX: 52, clientY: 102,
+      button: 0, buttons: 0 });
+    await Promise.resolve();
+  });
+  expect(control).toHaveBeenCalledOnce();
+  expect(control.mock.calls[0]?.[3]).toEqual({ action: "tap", xRatio: 0.26, yRatio: 0.255 });
+  await act(async () => {
+    dispatchPointer(image, "pointerdown", { pointerId: 2, clientX: 60, clientY: 120,
+      button: 0, buttons: 1 });
+    dispatchPointer(image, "pointerup", { pointerId: 2, clientX: 62, clientY: 122,
+      button: 0, buttons: 0 });
+    await Promise.resolve();
+  });
+  expect(control).toHaveBeenCalledOnce();
+  expect(container.querySelector("[role=alert]")?.textContent)
+    .toContain("Native begin outcome unknown");
+  expect(reconcile).toHaveBeenCalledOnce();
 });
 
 it("keeps typed text and locks input after an unconfirmed result until explicit reconciliation", async () => {
@@ -297,6 +363,7 @@ function dispatchPointer(target: Element, type: string, input: {
     clientX: input.clientX, clientY: input.clientY,
     button: input.button, buttons: input.buttons });
   Object.defineProperty(event, "pointerId", { configurable: true, value: input.pointerId });
+  Object.defineProperty(event, "isPrimary", { configurable: true, value: true });
   target.dispatchEvent(event);
 }
 
