@@ -3365,7 +3365,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           }
         );
         if (!turn.admission.settled()) {
-          turn.admission.reject(cause instanceof JokoError ? cause : admissionError);
+          // Once the SDK input gate consumed the user message, a later stream
+          // error cannot prove that native state is unchanged. Preserve a
+          // specific pre-consumption failure, but never let its false-state
+          // classification release the durable unknown-dispatch fence.
+          turn.admission.reject(turn.inputConsumed
+            ? admissionError
+            : cause instanceof JokoError ? cause : admissionError);
         } else if (this.#isTurnCurrent(runtime, turn) && !turn.terminalClaimed) {
           turn.terminalClaimed = true;
           await turn.eventsReady.promise;

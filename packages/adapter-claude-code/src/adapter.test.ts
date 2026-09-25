@@ -4038,6 +4038,31 @@ describe("ClaudeCodeAdapter", () => {
     expect(query.interruptCalls).toBe(0);
   });
 
+  test("keeps consumed dispatch unknown when an admission-time stream error claims native state is unchanged", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: false });
+    const adapter = adapterFor(runtime, { admissionTimeoutMs: 1_000 });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const query = runtime.queries[0]!;
+
+    const sending = adapter.send(
+      textPrompt("consumed before the stream identity failed"),
+      contextFor(binding, { operationId: "consumed-before-false-state-stream-error" }).context
+    );
+    await vi.waitFor(() => expect(query.receivedInputs).toHaveLength(1));
+    query.push(systemInit(randomUUID()));
+
+    await expect(sending).rejects.toMatchObject({
+      publicError: {
+        code: "NATIVE_DISPATCH_UNKNOWN",
+        stateMayHaveChanged: true
+      }
+    });
+    expect(query.receivedInputs).toHaveLength(1);
+    expect(query.params.options.abortController.signal.aborted).toBe(true);
+    expect(query.closeCalls).toBe(1);
+    expect(query.interruptCalls).toBe(0);
+  });
+
   test("resumes the Host's previous binding into the exact next product generation", async () => {
     const nativeSessionId = randomUUID();
     const runtime = new FakeSdkRuntime();

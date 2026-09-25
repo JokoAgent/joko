@@ -32,7 +32,15 @@ export class ControlledClaudeRuntime implements ClaudeSdkRuntime {
   readonly supportsWorkspaceDerivation = false;
   readonly queries: ControlledClaudeQuery[] = [];
   readonly sessions = new Map<string, ClaudeSdkSessionInfo>();
+  readonly #failBeforeAdmission = new Set<string>();
   onInput?: (message: ClaudeSdkUserMessage) => void;
+
+  failNextInputBeforeAdmission(sessionId: string): void {
+    if (this.#failBeforeAdmission.has(sessionId)) {
+      throw new Error(`A controlled Claude pre-admission stream failure is already armed for ${sessionId}.`);
+    }
+    this.#failBeforeAdmission.add(sessionId);
+  }
 
   async probe(_input: ClaudeSdkProbeInput) {
     return {
@@ -52,7 +60,12 @@ export class ControlledClaudeRuntime implements ClaudeSdkRuntime {
       lastModified: Date.now(),
       cwd: params.options.cwd
     });
-    const query = new ControlledClaudeQuery(params, sessionId, (message) => this.onInput?.(message));
+    const query = new ControlledClaudeQuery(
+      params,
+      sessionId,
+      (message) => this.onInput?.(message),
+      () => this.#failBeforeAdmission.delete(sessionId)
+    );
     this.queries.push(query);
     return query;
   }
@@ -96,13 +109,20 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
   readonly #output = new AsyncOutput();
   readonly #sessionId: string;
   readonly #onInput: (message: ClaudeSdkUserMessage) => void;
+  readonly #consumePreAdmissionFailure: () => boolean;
   readonly params: ClaudeSdkQueryParams;
   #closed = false;
 
-  constructor(params: ClaudeSdkQueryParams, sessionId: string, onInput: (message: ClaudeSdkUserMessage) => void) {
+  constructor(
+    params: ClaudeSdkQueryParams,
+    sessionId: string,
+    onInput: (message: ClaudeSdkUserMessage) => void,
+    consumePreAdmissionFailure: () => boolean
+  ) {
     this.params = params;
     this.#sessionId = sessionId;
     this.#onInput = onInput;
+    this.#consumePreAdmissionFailure = consumePreAdmissionFailure;
     void this.#consume();
   }
 
@@ -114,6 +134,10 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
     for await (const message of this.params.prompt) {
       this.receivedInputs.push(message);
       this.#onInput(message);
+      if (this.#consumePreAdmissionFailure()) {
+        this.#output.fail(new Error("Controlled Claude stream failed after consuming input before admission."));
+        return;
+      }
       this.#output.push({
         type: "system",
         subtype: "init",
@@ -201,26 +225,40 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
 
 class AsyncOutput implements AsyncIterable<unknown>, AsyncIterator<unknown> {
   readonly #values: unknown[] = [];
-  readonly #readers: Array<(result: IteratorResult<unknown>) => void> = [];
+  readonly #readers: Array<{
+    readonly resolve: (result: IteratorResult<unknown>) => void;
+    readonly reject: (error: unknown) => void;
+  }> = [];
   #closed = false;
+  #failure: unknown;
 
   push(value: unknown): void {
+    if (this.#closed) return;
     const reader = this.#readers.shift();
     if (reader === undefined) this.#values.push(value);
-    else reader({ value, done: false });
+    else reader.resolve({ value, done: false });
+  }
+
+  fail(error: unknown): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#failure = error;
+    this.#values.splice(0);
+    for (const reader of this.#readers.splice(0)) reader.reject(error);
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    for (const reader of this.#readers.splice(0)) reader({ value: undefined, done: true });
+    for (const reader of this.#readers.splice(0)) reader.resolve({ value: undefined, done: true });
   }
 
   next(): Promise<IteratorResult<unknown>> {
     const value = this.#values.shift();
     if (value !== undefined) return Promise.resolve({ value, done: false });
+    if (this.#failure !== undefined) return Promise.reject(this.#failure);
     if (this.#closed) return Promise.resolve({ value: undefined, done: true });
-    return new Promise((resolve) => this.#readers.push(resolve));
+    return new Promise((resolve, reject) => this.#readers.push({ resolve, reject }));
   }
 
   [Symbol.asyncIterator](): AsyncIterator<unknown> {

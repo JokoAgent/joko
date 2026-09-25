@@ -1548,8 +1548,6 @@ export async function createOrchestratorApplication(
             publishDescriptor: false
           }
         : undefined;
-      if (replacementRoute !== undefined) piReplacementRefreshRoute = replacementRoute;
-
       const resolveTarget = (target: PiBackendAdapter): void => {
         if (replacementTargetResolved) return;
         replacementTargetResolved = true;
@@ -1583,6 +1581,10 @@ export async function createOrchestratorApplication(
           backendId,
           expectedCurrentGeneration: previous.generation,
           perform: async (hooks) => {
+            // Expose the replacement refresh route only after SessionHost has
+            // admitted replacement. A pre-admission busy rejection must not
+            // refresh or republish the retained Pi instance as a side effect.
+            if (replacementRoute !== undefined) piReplacementRefreshRoute = replacementRoute;
             try {
               return await backendInstances.replace(backendId, {
                 preparePrevious: async ({ candidateAdapter, candidateGeneration }) => {

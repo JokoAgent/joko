@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PiBackendAdapter } from "@joko/adapter-pi";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   availableBackendProviderIds,
@@ -521,6 +521,134 @@ describe("Orchestrator application composition", () => {
     await mkdir(differentRoot, { recursive: true });
     await expect(createOrchestratorApplication({ ...config, workspace: { ...config.workspace, root: differentRoot } }))
       .rejects.toThrow("does not match its persisted Target");
+  }, 20_000);
+
+  it("rejects a busy Pi replacement before refreshing or republishing its retained instance", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-pi-busy-replacement-"));
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1",
+      port: 4518,
+      internalPort: 4517,
+      publicOrigin: "http://127.0.0.1:4518",
+      internalOrigin: "http://127.0.0.1:4517",
+      dataDirectory,
+      databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true,
+      allowInsecureLan: false,
+      lanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"),
+      piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-pi-busy-replacement", root: workspace, displayName: "Busy Pi replacement", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"),
+      webDirectory: join(root, "no-web-build"),
+      corsOrigins: []
+    };
+
+    const application = await createOrchestratorApplication(config);
+    cleanups.push(async () => {
+      await application.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    const store = application.store;
+    const sessionId = "pi-dispatch-unknown-session";
+    const runId = "pi-dispatch-unknown-run";
+    const attemptId = "pi-dispatch-unknown-attempt";
+    const queueItemId = "pi-dispatch-unknown-queue";
+    const operationId = "pi-dispatch-unknown-operation";
+    const binding = {
+      opaqueRef: join(config.piAgentHome, "sessions", "dispatch-unknown.jsonl"),
+      nativeSessionId: "pi-dispatch-unknown-native",
+      generation: 7
+    };
+    store.createSession({
+      id: sessionId,
+      backendId: "pi",
+      targetId: config.workspace.id,
+      title: "Dispatch unknown",
+      binding,
+      pinned: false,
+      archived: false,
+      permissionMode: "ask",
+      planMode: false,
+      fastMode: false,
+      createdAt: 1,
+      updatedAt: 1
+    });
+    store.createRun({
+      id: runId,
+      sessionId,
+      source: "user",
+      state: "queued",
+      createdAt: 2
+    });
+    store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: binding.generation, startedAt: 2 });
+    const prompt = { text: "Consumed without a receipt", images: [], files: [], mentions: [], disposition: "prompt" as const };
+    store.runOperation({ id: operationId, kind: "prompt", body: prompt }, (transaction) => {
+      transaction.enqueueQueueItem({
+        id: queueItemId,
+        sessionId,
+        runId,
+        attemptId,
+        operationId,
+        disposition: "prompt",
+        body: prompt,
+        createdAt: 2
+      });
+      return { accepted: true };
+    });
+    const backendInstanceGeneration = store.getBackend("pi").descriptor.instanceGeneration;
+    expect(store.claimNextQueueItem({ sessionId, backendInstanceGeneration })).toMatchObject({
+      state: "dispatching",
+      attemptId,
+      backendInstanceGeneration
+    });
+    const error = {
+      code: "PI_PROCESS_EXITED",
+      message: "Pi consumed the prompt before its receipt was lost.",
+      phase: "dispatch" as const,
+      retryable: true,
+      stateMayHaveChanged: true,
+      recovery: "Inspect native state before retrying."
+    };
+    store.updateQueueState({
+      queueItemId,
+      state: "dispatch_unknown",
+      attemptId,
+      error,
+      traceId: "test:pi-dispatch-unknown:queue"
+    });
+    store.updateRunState({
+      runId,
+      state: "dispatch_unknown",
+      activeAttemptId: attemptId,
+      error,
+      traceId: "test:pi-dispatch-unknown:run"
+    });
+    store.finishAttempt(attemptId, error);
+
+    const pi = application.adapters.find((candidate) => candidate.id === "pi");
+    expect(pi).toBeInstanceOf(PiBackendAdapter);
+    const currentPi = pi as PiBackendAdapter;
+    const updateManagedGeneration = vi.spyOn(currentPi, "updateManagedGeneration");
+    const describe = vi.spyOn(currentPi, "describe");
+    const backendBefore = store.getBackend("pi");
+    const authorityBefore = store.getBackendInstanceGenerationAuthority("pi");
+    const sessionBefore = store.getSession(sessionId);
+
+    expect(application.sessionHost.canReplaceBackendInstance("pi")).toBe(false);
+    await expect(application.restartBackend("pi")).rejects.toThrow("only after every affected task");
+
+    expect(updateManagedGeneration).not.toHaveBeenCalled();
+    expect(describe).not.toHaveBeenCalled();
+    expect(application.adapters.find((candidate) => candidate.id === "pi")).toBe(currentPi);
+    expect(store.getBackend("pi")).toEqual(backendBefore);
+    expect(store.getBackendInstanceGenerationAuthority("pi")).toEqual(authorityBefore);
+    expect(store.getSession(sessionId)).toEqual(sessionBefore);
+    expect(store.getQueueItem(queueItemId).state).toBe("dispatch_unknown");
+    expect(store.getRun(runId).descriptor.state).toBe("dispatch_unknown");
   }, 20_000);
 
   it("replaces an idle Pi runtime after native auth write-back without stale generation or fence", async () => {
