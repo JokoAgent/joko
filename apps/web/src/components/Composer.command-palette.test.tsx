@@ -396,6 +396,119 @@ it("owns private drag position and cancellation in the mounted document without 
   expect(editorHarness.routeDropActions.at(-1)).toEqual({ kind: "cancel" });
 });
 
+it("flushes a structured draft on task change and waits for it before quick return hydration", async () => {
+  const source: ComposerDraft = {
+    ...draft("Read @notes"),
+    mentions: [{ id: "mention-one", kind: "workspace", reference: "notes.md", label: "notes", token: "@notes", workspaceId: "workspace-one" }],
+    inlineMentionRanges: [{ mentionId: "mention-one", from: 5, to: 11 }],
+    attachments: [{ id: "attachment-one", file: new File(["notes"], "notes.txt", { type: "text/plain" }), kind: "file" }]
+  };
+  const view = await mount(source);
+  let finishSave!: () => void;
+  vi.mocked(view.api.saveDraft).mockImplementationOnce((sessionId, draftValue) => new Promise<void>((resolve) => {
+    finishSave = () => { view.drafts.set(sessionId, draftValue); resolve(); };
+  }));
+  await input(view.editor(), "Read @notes now", 15);
+  await view.render({ ...baseSession, id: "task-two", name: "Task two", generation: 2n });
+  await vi.waitFor(() => expect(finishSave).toBeTypeOf("function"));
+  expect(view.editor().value).toBe("second task");
+  const returningController = {
+    ...view.api,
+    saveDraft: (sessionId: string, draftValue: ComposerDraft) => view.api.saveDraft(sessionId, draftValue)
+  };
+  await view.render(baseSession, returningController);
+  expect(view.editor().value).not.toBe("Read @notes now");
+  await act(async () => { finishSave(); await Promise.resolve(); });
+  await vi.waitFor(() => expect(view.editor().value).toBe("Read @notes now"));
+  const persisted = view.drafts.get(baseSession.id);
+  expect(persisted).toMatchObject({
+    text: "Read @notes now",
+    mentions: source.mentions,
+    inlineMentionRanges: source.inlineMentionRanges,
+    attachments: source.attachments,
+    deliveryMode: source.deliveryMode
+  });
+  expect(persisted?.editorDocument).toEqual(plainTextToComposerDocument("Read @notes now"));
+  expect(view.drafts.get("task-two")?.text).toBe("second task");
+
+  await input(view.editor(), "Read @notes now!", 16);
+  await view.hide();
+  await view.render(baseSession);
+  await vi.waitFor(() => expect(view.editor().value).toBe("Read @notes now!"));
+
+  await input(view.editor(), "Read @notes now!!", 17);
+  await act(async () => view.add().focus());
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe("Read @notes now!!"));
+  await input(view.editor(), "Read @notes now!!!", 18);
+  await act(async () => window.dispatchEvent(new Event("pagehide")));
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe("Read @notes now!!!"));
+});
+
+it("recovers a failed outgoing save and keeps an earlier save before send clear", async () => {
+  const view = await mount(draft("Start"));
+  let failSave!: () => void;
+  vi.mocked(view.api.saveDraft).mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+    failSave = () => reject(new Error("Draft storage unavailable"));
+  }));
+  await input(view.editor(), "Unsent work", 11);
+  await view.render({ ...baseSession, id: "task-two", name: "Task two", generation: 2n });
+  await vi.waitFor(() => expect(failSave).toBeTypeOf("function"));
+  await view.render(baseSession);
+  await act(async () => { failSave(); await Promise.resolve(); });
+  await vi.waitFor(() => expect(view.editor().value).toBe("Unsent work"));
+  expect(document.querySelector("[role='alert']")?.textContent).toContain("Draft storage unavailable");
+  await act(async () => view.add().focus());
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe("Unsent work"));
+
+  let finishSave!: () => void;
+  vi.mocked(view.api.saveDraft).mockImplementationOnce((sessionId, draftValue) => new Promise<void>((resolve) => {
+    finishSave = () => { view.drafts.set(sessionId, draftValue); resolve(); };
+  }));
+  await input(view.editor(), "Ready to send", 13);
+  await act(async () => view.add().focus());
+  await vi.waitFor(() => expect(finishSave).toBeTypeOf("function"));
+  await act(async () => view.send().click());
+  await act(async () => { finishSave(); await Promise.resolve(); });
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe(""));
+  expect(view.api.send).toHaveBeenCalledWith(baseSession.id, expect.objectContaining({ text: "Ready to send" }), { expectedGeneration: baseSession.generation });
+  await view.render({ ...baseSession, id: "task-two", name: "Task two", generation: 2n });
+  await view.render(baseSession);
+  expect(view.editor().value).toBe("");
+});
+
+it("does not clear a newly returned task draft when an earlier reset completes", async () => {
+  const view = await mount(draft("/clear"));
+  let finishReset!: () => void;
+  vi.mocked(view.api.resetSession).mockImplementationOnce(() => new Promise<void>((resolve) => { finishReset = resolve; }));
+  await act(async () => view.send().click());
+  await vi.waitFor(() => expect(finishReset).toBeTypeOf("function"));
+  await view.render({ ...baseSession, id: "task-two", name: "Task two", generation: 2n });
+  await view.render(baseSession);
+  await vi.waitFor(() => expect(view.editor().value).toBe("/clear"));
+  await input(view.editor(), "New task draft", 14);
+  await act(async () => { finishReset(); await Promise.resolve(); });
+  await act(async () => view.add().focus());
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe("New task draft"));
+  expect(view.editor().value).toBe("New task draft");
+  expect(vi.mocked(view.api.saveDraft).mock.calls.at(-1)?.[1].text).toBe("New task draft");
+});
+
+it("does not clear a new mounted owner after the old reset completes", async () => {
+  const view = await mount(draft("/clear"));
+  let finishReset!: () => void;
+  vi.mocked(view.api.resetSession).mockImplementationOnce(() => new Promise<void>((resolve) => { finishReset = resolve; }));
+  await act(async () => view.send().click());
+  await vi.waitFor(() => expect(finishReset).toBeTypeOf("function"));
+  await view.hide();
+  await view.render(baseSession);
+  await vi.waitFor(() => expect(view.editor().value).toBe("/clear"));
+  await input(view.editor(), "Fresh draft", 11);
+  await act(async () => { finishReset(); await Promise.resolve(); });
+  await act(async () => view.add().focus());
+  await vi.waitFor(() => expect(view.drafts.get(baseSession.id)?.text).toBe("Fresh draft"));
+  expect(view.editor().value).toBe("Fresh draft");
+});
+
 async function mount(initialDraft: ComposerDraft, ownerDocument: Document = document) {
   const drafts = new Map<string, ComposerDraft>([
     [baseSession.id, initialDraft],
@@ -405,8 +518,9 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
     state: { connectionState: "connected", activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
     readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
-    saveDraft: vi.fn(async () => undefined),
+    saveDraft: vi.fn(async (sessionId: string, draftValue: ComposerDraft) => { drafts.set(sessionId, draftValue); }),
     send: vi.fn(async () => undefined),
+    resetSession: vi.fn(async () => undefined),
     getVoiceInputCapabilities: vi.fn(async () => ({})),
     listCommands: vi.fn(async () => commands),
     listWorkspaceFiles: vi.fn(async () => ({ paths: ["notes.md"], truncated: false, revision: "1" }))
@@ -431,9 +545,11 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
   const root = createRoot(host);
   roots.push(root);
   const actions: Promise<unknown>[] = [];
-  const render = async (session: SessionView) => {
+  let activeController = api;
+  const render = async (session: SessionView, nextController: AppController = activeController) => {
+    activeController = nextController;
     await act(async () => root.render(<Composer
-      controller={api}
+      controller={activeController}
       session={session}
       backend={backend}
       autoFocus={false}
@@ -451,8 +567,10 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
   await render(baseSession);
   return {
     api,
+    drafts,
     actions,
     render,
+    hide: async () => { await act(async () => root.render(null)); },
     editor: () => host.querySelector<HTMLTextAreaElement>('[data-mock-composer-editor="true"]')!,
     send: () => host.querySelector<HTMLButtonElement>(".send-button")!,
     add: () => host.querySelector<HTMLButtonElement>('button[aria-label="common.add"]')!,
