@@ -2034,10 +2034,26 @@ CREATE TABLE native_session_derivations (
         operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
         body_hash TEXT NOT NULL,
         source_session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE RESTRICT,
-        derived_session_id TEXT NOT NULL UNIQUE,
+        derived_session_id TEXT NOT NULL,
         backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
         backend_instance_generation INTEGER NOT NULL CHECK (backend_instance_generation >= 0),
+        lifecycle_owner_generation INTEGER NOT NULL CHECK (
+          lifecycle_owner_generation >= backend_instance_generation
+        ),
         target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        source_session_revision INTEGER CHECK (source_session_revision IS NULL OR source_session_revision >= 1),
+        target_revision INTEGER CHECK (target_revision IS NULL OR target_revision >= 1),
+        derived_worktree_json TEXT CHECK (
+          derived_worktree_json IS NULL OR length(derived_worktree_json) BETWEEN 2 AND 131072
+        ),
+        derived_worktree_digest TEXT CHECK (
+          derived_worktree_digest IS NULL OR (
+            length(derived_worktree_digest) = 71
+            AND substr(derived_worktree_digest, 1, 7) = 'sha256:'
+            AND substr(derived_worktree_digest, 8) NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        external_lifecycle INTEGER NOT NULL CHECK (external_lifecycle IN (0, 1)),
         source_native_opaque_ref TEXT NOT NULL,
         source_native_session_id TEXT,
         source_generation INTEGER NOT NULL CHECK (source_generation >= 0),
@@ -2048,14 +2064,16 @@ CREATE TABLE native_session_derivations (
         remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
         remote_host_id TEXT,
         remote_workspace_root TEXT,
-        native_opaque_ref TEXT NOT NULL COLLATE NOCASE,
+        native_opaque_ref TEXT COLLATE NOCASE,
         native_session_id TEXT,
-        generation INTEGER NOT NULL CHECK (generation >= 0),
+        generation INTEGER CHECK (generation IS NULL OR generation >= 0),
         state TEXT NOT NULL CHECK (state IN (
-          'recorded', 'adopted', 'cleanup_claimed', 'cleaned', 'cleanup_unknown'
+          'prepared', 'recorded', 'product_adopted', 'adopted',
+          'cleanup_claimed', 'workspace_cleanup_pending', 'cleaned', 'cleanup_unknown'
         )),
         cleanup_token TEXT,
         cleanup_started_at INTEGER CHECK (cleanup_started_at IS NULL OR cleanup_started_at >= 0),
+        product_adopted_at INTEGER CHECK (product_adopted_at IS NULL OR product_adopted_at >= 0),
         adopted_at INTEGER CHECK (adopted_at IS NULL OR adopted_at >= 0),
         cleaned_at INTEGER CHECK (cleaned_at IS NULL OR cleaned_at >= 0),
         failure_code TEXT,
@@ -2065,12 +2083,28 @@ CREATE TABLE native_session_derivations (
         UNIQUE(backend_id, native_opaque_ref),
         CHECK ((remote_host_target_id IS NULL) = (remote_host_id IS NULL)),
         CHECK ((remote_host_id IS NULL) = (remote_workspace_root IS NULL)),
-      CHECK (source_session_id <> derived_session_id OR generation = source_generation + 1),
-        CHECK (source_native_opaque_ref <> native_opaque_ref COLLATE NOCASE),
+        CHECK ((source_session_revision IS NULL) = (target_revision IS NULL)),
+        CHECK ((derived_worktree_json IS NULL) = (derived_worktree_digest IS NULL)),
+        CHECK ((external_lifecycle = 1) = (source_session_revision IS NOT NULL)),
+        CHECK ((native_opaque_ref IS NULL) = (generation IS NULL)),
+        CHECK (native_opaque_ref IS NOT NULL OR native_session_id IS NULL),
+        CHECK (state NOT IN ('recorded', 'product_adopted', 'adopted') OR native_opaque_ref IS NOT NULL),
+        CHECK (native_opaque_ref IS NULL OR source_session_id <> derived_session_id OR generation = source_generation + 1),
+        CHECK (native_opaque_ref IS NULL OR source_native_opaque_ref <> native_opaque_ref COLLATE NOCASE),
         CHECK (state <> 'cleanup_claimed' OR (cleanup_token IS NOT NULL AND cleanup_started_at IS NOT NULL)),
+        CHECK (state <> 'workspace_cleanup_pending' OR (cleanup_token IS NOT NULL AND cleanup_started_at IS NOT NULL)),
+        CHECK ((state IN ('product_adopted', 'adopted')) = (product_adopted_at IS NOT NULL)),
         CHECK ((state = 'adopted') = (adopted_at IS NOT NULL)),
         CHECK ((state = 'cleaned') = (cleaned_at IS NOT NULL))
       ) STRICT;
+
+CREATE UNIQUE INDEX native_session_derivations_derived_child_idx
+        ON native_session_derivations(derived_session_id)
+        WHERE source_session_id <> derived_session_id;
+
+CREATE UNIQUE INDEX native_session_derivations_product_adopted_session_idx
+        ON native_session_derivations(derived_session_id)
+        WHERE state = 'product_adopted';
 
 CREATE TABLE native_binding_adoptions (
         backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,

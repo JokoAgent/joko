@@ -1358,6 +1358,7 @@ export async function createOrchestratorApplication(
           recoverStale: backendInstances.adapter(instanceId) === undefined,
           supervisor: createDefaultPiManagedProcessSupervisor()
         },
+        sessionStoreRootDirectory: join(config.dataDirectory, "backend-session-store", instanceId),
         ...(config.claudeCodeExecutable === undefined
           ? {}
           : { pathToClaudeCodeExecutable: config.claudeCodeExecutable }),

@@ -21,6 +21,7 @@ import type {
   NativeSessionCatalogEntry,
   NativeSessionCatalogResult,
   NativeSessionDerivation,
+  NativeSessionDerivationLifecycle,
   NativeSessionForkResult,
   NativeSessionNavigationResult,
   NativeHistoryProjection,
@@ -38,6 +39,7 @@ import type {
   RuntimeToolCatalog,
   SessionDescriptor,
   SessionReferenceSnapshot,
+  SessionWorktreeBinding,
   SubagentControlInput,
   SubagentRunDetail,
   TargetDescriptor,
@@ -810,6 +812,7 @@ export class SessionHost {
   readonly #activeEffectFlights = new Map<string, Set<Promise<void>>>();
   readonly #backendSideEffectFlights = new Map<string, Set<Promise<void>>>();
   readonly #nativeDerivationCleanupCalls = new Map<string, Set<AbortController>>();
+  readonly #nativeDerivationAdoptionFlights = new Map<string, Promise<void>>();
   readonly #backgroundTasks = new Map<string, Map<string, TrackedBackgroundTask>>();
   readonly #runSilenceWatchdogs = new Map<string, RunSilenceWatchdog>();
   readonly #runSilenceRecoveries = new Map<string, Promise<boolean>>();
@@ -1108,7 +1111,15 @@ export class SessionHost {
           });
     }
     for (const record of this.#store.listUnadoptedNativeSessionDerivations()) {
-      if (record.state === "recorded") await this.cleanupNativeSessionDerivation(record.operationId);
+      if (record.state === "product_adopted") {
+        await this.adoptNativeSessionDerivation(record.operationId).catch((error: unknown) => {
+          this.recordDerivationFailure("native_session_derivation_adoption_recovery", error);
+        });
+      } else if (record.state === "prepared" || record.state === "recorded") {
+        await this.cleanupNativeSessionDerivation(record.operationId);
+      } else if (record.state === "workspace_cleanup_pending") {
+        await this.cleanupNativeSessionDerivation(record.operationId);
+      }
     }
     // Native runtimes are lazy. Accepted durable work below is sufficient to
     // reactivate its owning session; merely having a product Session must not
@@ -2644,6 +2655,9 @@ export class SessionHost {
     readonly preserveClaimOnEffectFailure?: (error: unknown) => boolean;
   }): Promise<OperationExecution<T>> {
     this.#assertOpen();
+    if (input.sessionLifecycleFenceId !== undefined) {
+      await this.adoptPendingNativeSessionDerivationForSession(input.sessionLifecycleFenceId);
+    }
     if (input.effect === undefined) {
       const execution = this.#store.runAuthorizedOperation(
         input.connection.id,
@@ -3350,6 +3364,7 @@ export class SessionHost {
    */
   async prepareSessionLifecycleClose(sessionId: string, disposition: "archive" | "delete"): Promise<void> {
     this.#assertOpen();
+    await this.adoptPendingNativeSessionDerivationForSession(sessionId);
     if (disposition === "archive") {
       this.assertSessionLifecycleIdle(sessionId);
       // The claimed durable lifecycle fence prevents new work from entering.
@@ -3402,7 +3417,9 @@ export class SessionHost {
   }
 
   async deleteNativeSession(sessionId: string, lifecycleOperationId?: string): Promise<void> {
+    this.#assertOpen();
     if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer native Sessions cannot be deleted through task controls.");
+    await this.adoptPendingNativeSessionDerivationForSession(sessionId);
     this.#clearSessionRuntimeRecovery(sessionId);
     this.clearRunSilenceWatchdog(sessionId);
     const detachedStored = this.#store.getSession(sessionId);
@@ -3737,16 +3754,17 @@ export class SessionHost {
       }
     );
     if (!claim.claimed) {
+      await this.adoptNativeSessionDerivation(claim.operation.id);
       return { replayed: true, value: claim.value, operation: claim.operation };
     }
 
+    const sessionId = stableId("session", input.operationId);
     let releaseBackendAdmission: (() => void) | undefined;
     let sideEffectLease: ActiveBackendSideEffectLease | undefined;
-    let acquiredDerivedWorktreeSessionId: string | undefined;
+    let acquiredDerivedWorktree: SessionWorktreeBinding | undefined;
     try {
       const admittedSource = this.#store.getSession(input.sourceSessionId);
       const admittedTarget = this.#store.getTarget(admittedSource.descriptor.targetId);
-      const sessionId = stableId("session", input.operationId);
       this.assertInheritedSessionCreationReady(
         admittedSource.descriptor.backendId,
         {
@@ -3783,10 +3801,43 @@ export class SessionHost {
               sourceSessionId: source.descriptor.id
             })
           : undefined;
-      if (derivedWorktree !== undefined) acquiredDerivedWorktreeSessionId = sessionId;
+      if (derivedWorktree !== undefined) acquiredDerivedWorktree = derivedWorktree;
       const derivationTarget = derivedWorktree === undefined
         ? sourceContext.target
         : { ...admittedTarget.descriptor, workspaceRoot: derivedWorktree.path };
+      const lifecycle: NativeSessionDerivationLifecycle = {
+        operationId: claim.operation.id,
+        kind: input.kind,
+        sourceSessionId: source.descriptor.id,
+        sourceBinding: source.descriptor.binding,
+        sessionId,
+        sourceTarget: sourceContext.target,
+        target: derivationTarget
+      };
+      const ownsDurableLifecycle = active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
+      if (ownsDurableLifecycle) {
+        if (active.adapter.adoptNativeSessionDerivation === undefined
+          || active.adapter.cleanupNativeSessionDerivation === undefined) {
+          throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");
+        }
+        this.#store.prepareNativeSessionDerivation({
+          operationId: claim.operation.id,
+          expectedBodyHash: claim.operation.bodyHash,
+          sourceSessionId: source.descriptor.id,
+          sourceBinding: source.descriptor.binding,
+          sourceSessionRevision: source.revision,
+          sessionId,
+          backendId: source.descriptor.backendId,
+          backendInstanceGeneration: active.backendInstanceGeneration,
+          targetId: source.descriptor.targetId,
+          targetRevision: admittedTarget.revision,
+          effectiveWorkspaceRoot: derivationTarget.workspaceRoot,
+          ...(sourceContext.target.remoteWorkspace === undefined
+            ? {}
+            : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+          ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree })
+        });
+      }
       const derivation: NativeSessionDerivation = {
         sessionId,
         target: derivationTarget,
@@ -3804,6 +3855,7 @@ export class SessionHost {
             ...(sourceContext.target.remoteWorkspace === undefined
               ? {}
               : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+            ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
             binding
           });
         }
@@ -3815,7 +3867,7 @@ export class SessionHost {
         ? forkResult!.binding
         : await active.adapter.clone(sourceContext, derivation);
       const receipt = this.#store.findNativeSessionDerivation(claim.operation.id);
-      if (receipt === undefined || !sameNativeBinding(receipt.binding, binding)) {
+      if (receipt?.binding === undefined || !sameNativeBinding(receipt.binding, binding)) {
         throw new StoreError("The Backend did not register the returned derived native binding.");
       }
       this.assertActiveBackendSideEffectLease(sideEffectLease);
@@ -3902,17 +3954,23 @@ export class SessionHost {
           return { sessionId };
         }
       );
-      acquiredDerivedWorktreeSessionId = undefined;
+      acquiredDerivedWorktree = undefined;
+      await this.adoptNativeSessionDerivation(claim.operation.id);
       return execution;
     } catch (error) {
+      if (this.#store.getOperation(claim.operation.id).status === "completed") {
+        this.recordDerivationFailure(`${input.kind}_session_adoption`, error);
+        throw error;
+      }
       const failure = nestedOperationFailure(error);
       const failed = this.#store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, failure);
-      await this.cleanupNativeSessionDerivation(claim.operation.id);
+      await this.cleanupNativeSessionDerivation(claim.operation.id, acquiredDerivedWorktree);
       const derivationReceipt = this.#store.findNativeSessionDerivation(claim.operation.id);
-      if (acquiredDerivedWorktreeSessionId !== undefined
-        && (derivationReceipt === undefined || derivationReceipt.state === "cleaned")
+      if (derivationReceipt?.state === "cleaned") acquiredDerivedWorktree = undefined;
+      if (acquiredDerivedWorktree !== undefined
+        && derivationReceipt === undefined
         && this.#worktrees !== undefined) {
-        await this.#worktrees.release(acquiredDerivedWorktreeSessionId)
+        await this.#worktrees.release(sessionId, acquiredDerivedWorktree)
           .catch((cleanupError: unknown) => this.recordDerivationFailure("derived_worktree_cleanup", cleanupError));
       }
       this.recordDerivationFailure(`${input.kind}_session`, failure);
@@ -3991,104 +4049,292 @@ export class SessionHost {
     }
   }
 
-  private async cleanupNativeSessionDerivation(operationId: string): Promise<void> {
+  private nativeSessionDerivationLifecycle(
+    record: NativeSessionDerivationRecord,
+    expectedWorktree?: SessionWorktreeBinding
+  ): NativeSessionDerivationLifecycle {
+    const target = this.#store.getTarget(record.targetId).descriptor;
+    if (target.backendId !== record.backendId
+      || target.remoteWorkspace?.hostTargetId !== record.remoteWorkspace?.hostTargetId
+      || target.remoteWorkspace?.hostId !== record.remoteWorkspace?.hostId
+      || target.remoteWorkspace?.workspaceRoot !== record.remoteWorkspace?.workspaceRoot) {
+      throw new StoreError("The native derivation lifecycle target authority changed.");
+    }
+    if (record.worktree !== undefined && expectedWorktree !== undefined
+      && !sameSessionWorktreeBinding(record.worktree, expectedWorktree)) {
+      throw new StoreError("The native derivation lifecycle worktree authority changed.");
+    }
+    const worktree = record.worktree ?? expectedWorktree;
+    let effectiveTarget = target;
+    if (target.workspaceRoot !== record.effectiveWorkspaceRoot) {
+      if (worktree === undefined || resolve(worktree.path) !== resolve(record.effectiveWorkspaceRoot)) {
+        throw new StoreError("The native derivation lifecycle has no exact worktree authority.");
+      }
+      const activePath = this.#worktrees?.activeWorkspacePath(record.sessionId, worktree);
+      if (activePath === undefined || target.remoteWorkspace !== undefined) {
+        throw new StoreError("The native derivation lifecycle workspace authority changed.");
+      }
+      effectiveTarget = { ...target, workspaceRoot: activePath };
+    } else if (worktree !== undefined
+      && this.#worktrees?.activeWorkspacePath(record.sessionId, worktree) === undefined) {
+      throw new StoreError("The native derivation lifecycle worktree is no longer active.");
+    }
+    if (record.state === "product_adopted") {
+      const productWorktree = this.#store.getSession(record.sessionId).descriptor.worktree;
+      if ((worktree === undefined) !== (productWorktree === undefined)
+        || (worktree !== undefined && productWorktree !== undefined
+          && !sameSessionWorktreeBinding(worktree, productWorktree))) {
+        throw new StoreError("The native derivation lifecycle Product worktree authority changed.");
+      }
+    }
+    const source = this.#store.getSession(record.sourceSessionId).descriptor;
+    if (source.backendId !== record.backendId || source.targetId !== record.targetId) {
+      throw new StoreError("The native derivation lifecycle source authority changed.");
+    }
+    const sourceTarget = source.worktree === undefined
+      ? target
+      : { ...target, workspaceRoot: source.worktree.path };
+    const operationKind = this.#store.getOperation(record.operationId).kind;
+    const kind = operationKind === "fork_session"
+      ? "fork"
+      : operationKind === "clone_session"
+        ? "clone"
+        : operationKind === "navigate_session" || operationKind === "navigateSessionBranch"
+          ? "navigate"
+          : undefined;
+    if (kind === undefined) throw new StoreError("The native derivation lifecycle operation kind changed.");
+    return {
+      operationId: record.operationId,
+      kind,
+      sourceSessionId: record.sourceSessionId,
+      sourceBinding: record.sourceBinding,
+      sessionId: record.sessionId,
+      sourceTarget,
+      target: effectiveTarget,
+      ...(record.binding === undefined ? {} : { binding: record.binding })
+    };
+  }
+
+  private beginNativeDerivationLifecycleCall(backendId: string): {
+    readonly controller: AbortController;
+    readonly release: () => void;
+  } {
+    const controller = new AbortController();
+    const calls = this.#nativeDerivationCleanupCalls.get(backendId) ?? new Set<AbortController>();
+    calls.add(controller);
+    this.#nativeDerivationCleanupCalls.set(backendId, calls);
+    return {
+      controller,
+      release: () => {
+        calls.delete(controller);
+        if (calls.size === 0 && this.#nativeDerivationCleanupCalls.get(backendId) === calls) {
+          this.#nativeDerivationCleanupCalls.delete(backendId);
+        }
+      }
+    };
+  }
+
+  private claimCurrentNativeSessionDerivationLifecycleOwner(
+    record: NativeSessionDerivationRecord,
+    adapter: BackendAdapter
+  ): NativeSessionDerivationRecord {
+    const currentGeneration = this.requireAdapterGeneration(record.backendId, adapter);
+    this.assertCurrentAdapterGeneration(record.backendId, adapter, currentGeneration);
+    if (record.lifecycleOwnerGeneration === currentGeneration) return record;
+    const claimed = this.#store.claimNativeSessionDerivationLifecycleOwner({
+      operationId: record.operationId,
+      expectedRevision: record.revision,
+      expectedOwnerGeneration: record.lifecycleOwnerGeneration,
+      nextGeneration: currentGeneration
+    });
+    this.assertCurrentAdapterGeneration(record.backendId, adapter, currentGeneration);
+    return claimed;
+  }
+
+  private adoptNativeSessionDerivation(operationId: string): Promise<void> {
+    const existing = this.#nativeDerivationAdoptionFlights.get(operationId);
+    if (existing !== undefined) return existing;
+    const flight = this.adoptNativeSessionDerivationOnce(operationId).finally(() => {
+      if (this.#nativeDerivationAdoptionFlights.get(operationId) === flight) {
+        this.#nativeDerivationAdoptionFlights.delete(operationId);
+      }
+    });
+    this.#nativeDerivationAdoptionFlights.set(operationId, flight);
+    return flight;
+  }
+
+  private async adoptPendingNativeSessionDerivationForSession(sessionId: string): Promise<void> {
+    for (;;) {
+      const pending = this.#store.findProductAdoptedNativeSessionDerivation(sessionId);
+      if (pending === undefined) return;
+      await this.adoptNativeSessionDerivation(pending.operationId);
+      const unresolved = this.#store.findProductAdoptedNativeSessionDerivation(sessionId);
+      if (unresolved?.operationId === pending.operationId) {
+        throw new StoreError("The task's durable native derivation adoption did not settle.");
+      }
+    }
+  }
+
+  private async adoptNativeSessionDerivationOnce(operationId: string): Promise<void> {
+    const pending = this.#store.findNativeSessionDerivation(operationId);
+    if (pending === undefined || pending.state === "adopted") return;
+    if (pending.state !== "product_adopted") return;
+    if (!pending.externalLifecycle || pending.binding === undefined) {
+      throw new StoreError("The Product-adopted native derivation has no external lifecycle authority.");
+    }
+    const adapter = this.requireAdapter(pending.backendId);
+    if (adapter.adoptNativeSessionDerivation === undefined) {
+      throw new StoreError("The Backend cannot adopt its durable native derivation lifecycle.");
+    }
+    const releaseAdmission = this.beginBackendAdmissionEffect(pending.backendId);
+    try {
+      const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(pending, adapter);
+      if (record.binding === undefined) {
+        throw new StoreError("The Product-adopted native derivation lost its recorded binding.");
+      }
+      const lifecycle = this.nativeSessionDerivationLifecycle(record);
+      const call = this.beginNativeDerivationLifecycleCall(record.backendId);
+      let adoption: Promise<void>;
+      try {
+        adoption = adapter.adoptNativeSessionDerivation({ ...lifecycle, binding: record.binding }, call.controller.signal);
+      } catch (error) {
+        call.release();
+        throw error;
+      }
+      void adoption.then(call.release, call.release);
+      await nativeDerivationCleanupDeadline(adoption, call.controller);
+      call.controller.signal.throwIfAborted();
+      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.lifecycleOwnerGeneration);
+      this.#store.finishNativeSessionDerivationAdoption({
+        operationId,
+        expectedRevision: record.revision
+      });
+    } finally {
+      releaseAdmission();
+    }
+  }
+
+  private async cleanupNativeSessionDerivation(
+    operationId: string,
+    expectedWorktree?: SessionWorktreeBinding
+  ): Promise<void> {
     let claim: { readonly record: NativeSessionDerivationRecord; readonly token: string } | undefined;
     let releaseAdmission: (() => void) | undefined;
-    let derivedWorktreeSessionId: string | undefined;
     try {
       const current = this.#store.findNativeSessionDerivation(operationId);
-      if (current?.state !== "recorded") return;
-      const record = current;
-      const adapter = this.requireAdapter(record.backendId);
-      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.backendInstanceGeneration);
+      if (current === undefined) return;
+      if (current.state === "workspace_cleanup_pending") {
+        await this.finishNativeSessionDerivationWorkspaceCleanup(current);
+        return;
+      }
+      if (current.state !== "prepared" && current.state !== "recorded") return;
+      const adapter = this.requireAdapter(current.backendId);
+      if (current.externalLifecycle) {
+        if (adapter.cleanupNativeSessionDerivation === undefined) {
+          throw new StoreError("The Backend cannot clean up its durable native derivation lifecycle.");
+        }
+      } else if (current.binding === undefined) {
+        throw new StoreError("A detached native deletion requires its recorded binding.");
+      }
       // A failed live derivation still holds its original backend flight during
       // shutdown. Startup cleanup instead acquires its own admission authority.
-      if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(record.backendId);
-      const target = this.#store.getTarget(record.targetId).descriptor;
-      const activeDerivedWorkspace = target.workspaceRoot === record.effectiveWorkspaceRoot
-        ? undefined
-        : this.#worktrees?.activeWorkspacePath(record.sessionId, record.effectiveWorkspaceRoot);
-      if (
-        target.backendId !== record.backendId
-        || (target.workspaceRoot !== record.effectiveWorkspaceRoot && activeDerivedWorkspace === undefined)
-        || (activeDerivedWorkspace !== undefined && target.remoteWorkspace !== undefined)
-        || target.remoteWorkspace?.hostId !== record.remoteWorkspace?.hostId
-        || target.remoteWorkspace?.workspaceRoot !== record.remoteWorkspace?.workspaceRoot
-      ) throw new StoreError("The derived native cleanup workspace authority changed.");
-      const effectiveTarget = activeDerivedWorkspace === undefined
-        ? target
-        : { ...target, workspaceRoot: activeDerivedWorkspace };
-      if (activeDerivedWorkspace !== undefined) derivedWorktreeSessionId = record.sessionId;
-      const controller = new AbortController();
-      const context: AdapterContext = {
-        sessionId: record.sessionId,
-        generation: record.binding.generation,
-        backendInstanceGeneration: record.backendInstanceGeneration,
-        target: effectiveTarget,
-        binding: record.binding,
-        operationId: record.operationId,
-        signal: controller.signal,
-        emit: async () => undefined,
-        requestInteraction: async () => {
-          throw new StoreError("Native derivation cleanup cannot request an interaction.");
-        },
-        artifactCapacityBytes: this.#artifactStore.maximumBlobBytes,
-        storeArtifact: async () => {
-          throw new StoreError("Native derivation cleanup cannot create an artifact.");
-        }
-      };
-      if (adapter.supportsDetachedSessionDeletion?.(context) !== true) {
-        throw new StoreError("The Backend cannot clean up a detached derived native task.");
-      }
-      claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: current.revision });
-      const calls = this.#nativeDerivationCleanupCalls.get(record.backendId) ?? new Set<AbortController>();
-      calls.add(controller);
-      this.#nativeDerivationCleanupCalls.set(record.backendId, calls);
-      const releaseCall = () => {
-        calls.delete(controller);
-        if (calls.size === 0 && this.#nativeDerivationCleanupCalls.get(record.backendId) === calls) {
-          this.#nativeDerivationCleanupCalls.delete(record.backendId);
-        }
-      };
+      if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
+      const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(current, adapter);
+      const lifecycle = this.nativeSessionDerivationLifecycle(record, expectedWorktree);
+      const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let deletion: Promise<void>;
       try {
-        deletion = adapter.deleteSession(record.binding, context);
+        if (record.externalLifecycle) {
+          claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: record.revision });
+          deletion = adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal);
+        } else {
+          const binding = record.binding;
+          if (binding === undefined) {
+            throw new StoreError("A detached native deletion requires its recorded binding.");
+          }
+          const context: AdapterContext = {
+            sessionId: record.sessionId,
+            generation: binding.generation,
+            backendInstanceGeneration: record.lifecycleOwnerGeneration,
+            target: lifecycle.target,
+            binding,
+            operationId: record.operationId,
+            signal: call.controller.signal,
+            emit: async () => undefined,
+            requestInteraction: async () => {
+              throw new StoreError("Native derivation cleanup cannot request an interaction.");
+            },
+            artifactCapacityBytes: this.#artifactStore.maximumBlobBytes,
+            storeArtifact: async () => {
+              throw new StoreError("Native derivation cleanup cannot create an artifact.");
+            }
+          };
+          if (adapter.supportsDetachedSessionDeletion?.(context) !== true) {
+            throw new StoreError("The Backend cannot clean up a detached derived native task.");
+          }
+          claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: record.revision });
+          deletion = adapter.deleteSession(binding, context);
+        }
       } catch (error) {
-        releaseCall();
+        call.release();
         throw error;
       }
       // A timed-out call still fences replacement until its native promise
       // settles. Its late handlers only release this memory owner, never Store.
-      void deletion.then(releaseCall, releaseCall);
-      await nativeDerivationCleanupDeadline(deletion, controller);
-      controller.signal.throwIfAborted();
-      this.#store.finishNativeSessionDerivationCleanup({ operationId, token: claim.token, outcome: "cleaned" });
-      if (derivedWorktreeSessionId !== undefined && this.#worktrees !== undefined) {
-        await this.#worktrees.release(derivedWorktreeSessionId)
-          .catch((cleanupError: unknown) => this.recordDerivationFailure("derived_worktree_cleanup", cleanupError));
-        derivedWorktreeSessionId = undefined;
-      }
+      void deletion.then(call.release, call.release);
+      await nativeDerivationCleanupDeadline(deletion, call.controller);
+      call.controller.signal.throwIfAborted();
+      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.lifecycleOwnerGeneration);
+      const workspaceCleanup = this.#store.confirmNativeSessionDerivationNativeCleanup({
+        operationId,
+        token: claim.token
+      });
+      await this.finishNativeSessionDerivationWorkspaceCleanup(workspaceCleanup);
     } catch (error) {
       if (claim !== undefined) {
-        try {
-          this.#store.finishNativeSessionDerivationCleanup({
-            operationId,
-            token: claim.token,
-            outcome: "cleanup_unknown",
-            failureCode: "native_session_derivation_cleanup_unknown"
-          });
-        } catch {
-          // The durable claim remains reserved; startup converts an unfinished
-          // claim to unknown instead of repeating a possibly completed delete.
+        const current = this.#store.findNativeSessionDerivation(operationId);
+        if (current?.state === "cleanup_claimed") {
+          try {
+            this.#store.finishNativeSessionDerivationCleanup({
+              operationId,
+              token: claim.token,
+              outcome: "cleanup_unknown",
+              failureCode: "native_session_derivation_cleanup_unknown"
+            });
+          } catch {
+            // The durable claim remains reserved; startup converts an unfinished
+            // claim to unknown instead of repeating a possibly completed delete.
+          }
         }
-        // An unknown detached-native deletion still owns its exact workspace.
-        // Keep the lease across restart; releasing it here could destroy a cwd
-        // that the native task may still be using.
+        // cleanup_claimed/cleanup_unknown retain the lease because native use
+        // may be uncertain. workspace_cleanup_pending instead records a known
+        // native result and exact, replayable worktree-release intent.
       }
       this.recordDerivationFailure("native_session_derivation_cleanup", error);
     } finally {
       releaseAdmission?.();
     }
+  }
+
+  private async finishNativeSessionDerivationWorkspaceCleanup(
+    record: NativeSessionDerivationRecord
+  ): Promise<void> {
+    if (record.state !== "workspace_cleanup_pending" || record.cleanupToken === undefined) return;
+    const operationKind = this.#store.getOperation(record.operationId).kind;
+    const releasesDerivedWorktree = operationKind !== "navigate_session"
+      && operationKind !== "navigateSessionBranch"
+      && record.worktree !== undefined;
+    if (releasesDerivedWorktree) {
+      if (this.#worktrees === undefined) {
+        throw new StoreError("The native derivation workspace cleanup owner is unavailable.");
+      }
+      await this.#worktrees.release(record.sessionId, record.worktree!);
+    }
+    this.#store.finishNativeSessionDerivationCleanup({
+      operationId: record.operationId,
+      token: record.cleanupToken,
+      outcome: "cleaned"
+    });
   }
 
   #sessionRuntimeMutationMustDefer(sessionId: string): boolean {
@@ -6196,7 +6442,7 @@ export class SessionHost {
       recovery: "Refresh the task history before further changes. Do not repeat the native navigation automatically."
     });
     try {
-      return await this.mutate({
+      const execution = await this.mutate({
         connection: authority.connection, operationId: authority.operationId,
         kind: authority.protocol.kind === "internal" ? "navigate_session" : "navigateSessionBranch",
         body: authority.protocol.kind === "connect" ? authority.protocol.body
@@ -6241,10 +6487,44 @@ export class SessionHost {
           if (this.#store.getTarget(admittedTarget.descriptor.id).revision !== admittedTarget.revision) {
             throw new StoreError("The navigation workspace authority changed before dispatch.");
           }
+          const operation = this.#store.getOperation(authority.operationId);
+          const lifecycle: NativeSessionDerivationLifecycle = {
+            operationId: authority.operationId,
+            kind: "navigate",
+            sourceSessionId: sessionId,
+            sourceBinding: lease.stored.descriptor.binding,
+            sessionId,
+            sourceTarget: lease.context.target,
+            target: lease.context.target
+          };
+          if (active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
+            if (active.adapter.adoptNativeSessionDerivation === undefined
+              || active.adapter.cleanupNativeSessionDerivation === undefined) {
+              throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");
+            }
+            this.#store.prepareNativeSessionDerivation({
+              operationId: operation.id,
+              expectedBodyHash: operation.bodyHash,
+              sourceSessionId: sessionId,
+              sourceBinding: lease.stored.descriptor.binding,
+              sourceSessionRevision: lease.stored.revision,
+              sessionId,
+              backendId: lease.backendId,
+              backendInstanceGeneration: lease.backendInstanceGeneration,
+              targetId: lease.stored.descriptor.targetId,
+              targetRevision: admittedTarget.revision,
+              effectiveWorkspaceRoot: lease.context.target.workspaceRoot,
+              ...(lease.context.target.remoteWorkspace === undefined
+                ? {}
+                : { remoteWorkspace: lease.context.target.remoteWorkspace }),
+              ...(lease.stored.descriptor.worktree === undefined
+                ? {}
+                : { worktree: lease.stored.descriptor.worktree })
+            });
+          }
           try {
             navigation = await active.adapter.navigateTree(target, summarize, lease.context, customInstructions, {
               recordBinding: (binding) => {
-                const operation = this.#store.getOperation(authority.operationId);
                 this.#store.recordNativeSessionDerivation({
                   operationId: operation.id, expectedBodyHash: operation.bodyHash,
                   sourceSessionId: sessionId, sessionId,
@@ -6253,6 +6533,7 @@ export class SessionHost {
                   targetId: lease!.stored.descriptor.targetId,
                   effectiveWorkspaceRoot: lease!.context.target.workspaceRoot,
                   ...(lease!.context.target.remoteWorkspace === undefined ? {} : { remoteWorkspace: lease!.context.target.remoteWorkspace }),
+                  ...(lease!.stored.descriptor.worktree === undefined ? {} : { worktree: lease!.stored.descriptor.worktree }),
                   binding
                 });
               }
@@ -6261,7 +6542,7 @@ export class SessionHost {
             this.assertActiveBackendSideEffectLease(lease);
             if (navigation.kind === "replacement") {
               const receipt = this.#store.findNativeSessionDerivation(authority.operationId);
-              if (receipt === undefined || !sameNativeBinding(receipt.binding, navigation.binding)) {
+              if (receipt?.binding === undefined || !sameNativeBinding(receipt.binding, navigation.binding)) {
                 throw new StoreError("Native navigation did not register its exact replacement binding.");
               }
               // Validate the projection before retiring the source runtime. Adoption
@@ -6311,6 +6592,8 @@ export class SessionHost {
           catch (error) { if (nativeNavigationConfirmed) throw syncUnknown(); throw error; }
         }
       });
+      await this.adoptNativeSessionDerivation(authority.operationId);
+      return execution;
     } catch (error) {
       await this.cleanupNativeSessionDerivation(authority.operationId);
       throw error;
@@ -6634,6 +6917,10 @@ export class SessionHost {
   }
 
   #assertBackendReplacementIdle(backendId: string): void {
+    if (this.#store.listUnadoptedNativeSessionDerivations()
+      .some((record) => record.backendId === backendId)) {
+      throw new StoreError("A Backend cannot be replaced while a durable native derivation lifecycle is unresolved.");
+    }
     if ((this.#nativeDerivationCleanupCalls.get(backendId)?.size ?? 0) > 0) {
       throw new StoreError("A Backend cannot be replaced while a derived native cleanup has not settled.");
     }
@@ -8035,7 +8322,7 @@ export class SessionHost {
     if (this.#disposed) return;
     this.#disposed = true;
     for (const calls of this.#nativeDerivationCleanupCalls.values()) {
-      for (const controller of calls) controller.abort(new StoreError("Native derivation cleanup was interrupted by shutdown."));
+      for (const controller of calls) controller.abort(new StoreError("Native derivation lifecycle work was interrupted by shutdown."));
     }
     for (const pending of this.#pendingInteractions.values()) {
       clearPendingInteractionExpiry(pending);
@@ -8077,6 +8364,8 @@ export class SessionHost {
       [...this.#backendSideEffectFlights.values()].flatMap((flights) => [...flights])
     );
     this.#backendSideEffectFlights.clear();
+    await Promise.allSettled([...this.#nativeDerivationAdoptionFlights.values()]);
+    this.#nativeDerivationAdoptionFlights.clear();
     this.#nativeDerivationCleanupCalls.clear();
     this.#activeEffectFlights.clear();
     this.#sessionLifecycleBackendAdmissions.clear();
@@ -9557,6 +9846,7 @@ export class SessionHost {
     providerAuthenticationRouteId?: string
   ): Promise<ActiveSession> {
     this.#assertOpen();
+    await this.adoptPendingNativeSessionDerivationForSession(sessionId);
     const session = this.#store.getSession(sessionId);
     this.assertSessionProviderAuthenticationAvailable(session, providerAuthenticationRouteId);
     if (session.descriptor.deletedAt !== undefined || session.descriptor.archived) {
@@ -13322,6 +13612,22 @@ function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBindi
   return left.opaqueRef === right.opaqueRef
     && left.nativeSessionId === right.nativeSessionId
     && left.generation === right.generation;
+}
+
+function sameSessionWorktreeBinding(left: SessionWorktreeBinding, right: SessionWorktreeBinding): boolean {
+  return left.leaseId === right.leaseId
+    && left.workspaceId === right.workspaceId
+    && resolve(left.path) === resolve(right.path)
+    && resolve(left.repositoryRoot) === resolve(right.repositoryRoot)
+    && left.branch === right.branch
+    && left.sourceRef === right.sourceRef
+    && left.sourceCommit === right.sourceCommit
+    && left.sourceStrategy === right.sourceStrategy
+    && left.sourceRefreshed === right.sourceRefreshed
+    && left.sourceRemote === right.sourceRemote
+    && left.state === right.state
+    && left.acquiredAt === right.acquiredAt
+    && left.updatedAt === right.updatedAt;
 }
 
 function sameEventIds(left: readonly string[], right: readonly string[]): boolean {

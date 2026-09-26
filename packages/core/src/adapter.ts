@@ -216,6 +216,21 @@ export interface NativeSessionDerivation {
   readonly recordBinding: (binding: NativeSessionBinding) => void;
 }
 
+/** Backend-neutral authority for an Adapter-owned durable derivation lifecycle.
+ * The Host persists the matching Product receipt before calling the Adapter,
+ * then uses this exact identity to adopt or clean up the native-side operation
+ * without replaying the original fork or clone. */
+export interface NativeSessionDerivationLifecycle {
+  readonly operationId: string;
+  readonly kind: "fork" | "clone" | "navigate";
+  readonly sourceSessionId: SessionId;
+  readonly sourceBinding: NativeSessionBinding;
+  readonly sessionId: SessionId;
+  readonly sourceTarget: TargetDescriptor;
+  readonly target: TargetDescriptor;
+  readonly binding?: NativeSessionBinding;
+}
+
 /** Host authority for a navigation that may replace this product Session's
  * native context. Register the new binding before any subsequent await. */
 export interface NativeSessionNavigation {
@@ -493,6 +508,21 @@ export interface BackendAdapter {
   fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult>;
   /** Same ownership contract as fork, for the complete durable history. */
   clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding>;
+  /** True only when this exact route is durably staged by the Adapter and
+   * therefore requires explicit post-Product adoption or exact cleanup. */
+  ownsNativeSessionDerivationLifecycle?(lifecycle: NativeSessionDerivationLifecycle): boolean;
+  /** Adopt an already-recorded native child after the Product transaction has
+   * committed. Must be idempotent for the exact operation and binding. */
+  adoptNativeSessionDerivation?(
+    lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding },
+    signal: AbortSignal
+  ): Promise<void>;
+  /** Clean an unadopted Adapter-owned operation. The binding is absent when a
+   * crash occurred before the native child identity was reserved. */
+  cleanupNativeSessionDerivation?(
+    lifecycle: NativeSessionDerivationLifecycle,
+    signal: AbortSignal
+  ): Promise<void>;
   /**
    * Replace the attached native context with a fresh same-Backend session.
    * Implementations must accept a fenced inactive or unhealthy source binding,

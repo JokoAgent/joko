@@ -11,6 +11,8 @@ import {
   CLAUDE_SESSION_STORE_LIMITS,
   ClaudeSessionStoreError,
   adoptClaudeSessionStoreChild,
+  claimClaudeSessionStoreSession,
+  cleanupClaudeSessionStoreOperation,
   createClaudeDurableSessionStore,
   createClaudeSessionStoreAuthority,
   createClaudeSessionStoreSessionAccess,
@@ -19,6 +21,7 @@ import {
   prepareClaudeSessionStoreDerivation,
   prepareClaudeSessionStoreImport,
   readClaudeSessionStoreOperation,
+  recoverClaudeSessionStoreOperation,
   rebindClaudeSessionStoreGeneration,
   sealClaudeSessionStoreImport,
   type ClaudeSessionStoreAuthority,
@@ -256,6 +259,417 @@ describe("ClaudeDurableSessionStore", () => {
       expectedGeneration: 2
     })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
     newStore.close();
+  });
+
+  it("claims adopted sessions by Store-discovered generation and rejects future or corrupt state", async () => {
+    const fixture = await createFixture();
+    const child = await createAdoptedChild(fixture, "workspace.claim", "project-claim");
+    const nextAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root,
+      namespace: "test-owner",
+      generation: 2
+    });
+
+    const claimed = claimClaudeSessionStoreSession(nextAuthority, {
+      workspaceAuthority: child.access.workspaceAuthority,
+      sessionId: child.sessionId
+    });
+    expect(claimed).toEqual({
+      kind: "session",
+      generation: 2,
+      workspaceAuthority: child.access.workspaceAuthority,
+      sessionId: child.sessionId
+    });
+    expect(claimClaudeSessionStoreSession(nextAuthority, {
+      workspaceAuthority: child.access.workspaceAuthority,
+      sessionId: child.sessionId
+    })).toEqual(claimed);
+    expect(() => claimClaudeSessionStoreSession(fixture.authority, {
+      workspaceAuthority: child.access.workspaceAuthority,
+      sessionId: child.sessionId
+    })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
+
+    const claimedStore = createClaudeDurableSessionStore(nextAuthority, claimed);
+    expect(await claimedStore.load({ projectKey: "project-claim", sessionId: child.sessionId })).toHaveLength(1);
+    claimedStore.close();
+    const thirdAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root,
+      namespace: "test-owner",
+      generation: 3
+    });
+    const recovered = recoverClaudeSessionStoreOperation(thirdAuthority, {
+      operationId: child.operation.operationId,
+      targetWorkspaceAuthority: child.operation.target.workspaceAuthority,
+      expectedChildSessionId: child.sessionId
+    });
+    expect(recovered.generation).toBe(3);
+    expect(readClaudeSessionStoreOperation(thirdAuthority, recovered).state).toBe("adopted");
+
+    const deletedBeforeCleanup = await createAdoptedChild(
+      fixture,
+      "workspace.claim-delete-first",
+      "project-claim-delete-first"
+    );
+    const deleteFirstStore = createClaudeDurableSessionStore(fixture.authority, deletedBeforeCleanup.access);
+    await deleteFirstStore.delete({
+      projectKey: "project-claim-delete-first",
+      sessionId: deletedBeforeCleanup.sessionId
+    });
+    deleteFirstStore.close();
+    const recoveredAfterDelete = recoverClaudeSessionStoreOperation(nextAuthority, {
+      operationId: deletedBeforeCleanup.operation.operationId,
+      targetWorkspaceAuthority: deletedBeforeCleanup.operation.target.workspaceAuthority,
+      expectedChildSessionId: deletedBeforeCleanup.sessionId
+    });
+    expect(readClaudeSessionStoreOperation(nextAuthority, recoveredAfterDelete).state).toBe("adopted");
+    expect(cleanupClaudeSessionStoreOperation(nextAuthority, recoveredAfterDelete, {
+      expectedChildSessionId: deletedBeforeCleanup.sessionId
+    }).state).toBe("cleaned");
+
+    const corrupt = await createAdoptedChild(fixture, "workspace.claim-corrupt", "project-claim-corrupt");
+    const database = new DatabaseSync(await onlyDatabasePath(fixture.root));
+    database.prepare(`
+      UPDATE session_entries SET entry_digest = ?
+      WHERE workspace_authority = ? AND session_id = ?
+    `).run("0".repeat(64), corrupt.access.workspaceAuthority, corrupt.sessionId);
+    database.close();
+    expect(() => claimClaudeSessionStoreSession(nextAuthority, {
+      workspaceAuthority: corrupt.access.workspaceAuthority,
+      sessionId: corrupt.sessionId
+    })).toThrowError(expect.objectContaining({ code: "CORRUPT" }));
+  });
+
+  it("recovers old-generation operations and explicitly cleans every durable state", async () => {
+    const fixture = await createFixture();
+    const states = [
+      "importing",
+      "ready",
+      "aliased",
+      "child_pending",
+      "child_reserved",
+      "adopted"
+    ] as const;
+    const operations: Array<{
+      access: ClaudeSessionStoreOperationAccess;
+      state: typeof states[number] | "durable_ready";
+      childSessionId?: string;
+    }> = [];
+
+    for (const [index, state] of states.entries()) {
+      const access = prepareClaudeSessionStoreImport(fixture.authority, {
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: `workspace.recover-source-${index}`,
+        sourceSessionId: randomUUID(),
+        targetWorkspaceAuthority: `workspace.recover-target-${index}`
+      });
+      const store = createClaudeDurableSessionStore(fixture.authority, access, {
+        onChildReserved: state === "child_pending"
+          ? async () => { throw new Error("registration unavailable"); }
+          : async () => undefined
+      });
+      await store.append(
+        { projectKey: `recover-source-${index}`, sessionId: access.source.sessionId },
+        [{ type: "user", uuid: randomUUID(), marker: state }]
+      );
+      if (state !== "importing") {
+        sealClaudeSessionStoreImport(fixture.authority, access);
+      }
+      if (!["importing", "ready"].includes(state)) {
+        await store.load({ projectKey: `recover-target-${index}`, sessionId: access.source.sessionId });
+      }
+      let childSessionId: string | undefined;
+      if (["child_pending", "child_reserved", "adopted"].includes(state)) {
+        childSessionId = randomUUID();
+        const append = store.append(
+          { projectKey: `recover-target-${index}`, sessionId: childSessionId },
+          [{ type: "assistant", uuid: randomUUID(), marker: state }]
+        );
+        if (state === "child_pending") {
+          await expect(append).rejects.toMatchObject({ code: "RESERVATION_FAILED", stateMayHaveChanged: true });
+        } else {
+          await append;
+        }
+        if (state === "adopted") {
+          adoptClaudeSessionStoreChild(fixture.authority, access, childSessionId);
+        }
+      }
+      store.close();
+      operations.push({ access, state, ...(childSessionId === undefined ? {} : { childSessionId }) });
+    }
+
+    const durableSource = await createAdoptedChild(
+      fixture,
+      "workspace.recover-durable-source",
+      "recover-durable-source"
+    );
+    operations.push({
+      access: prepareClaudeSessionStoreDerivation(fixture.authority, {
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: durableSource.access.workspaceAuthority,
+        sourceSessionId: durableSource.sessionId,
+        targetWorkspaceAuthority: "workspace.recover-durable-target"
+      }),
+      state: "durable_ready"
+    });
+
+    const nextAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root,
+      namespace: "test-owner",
+      generation: 2
+    });
+    const first = operations[0]!;
+    expect(() => recoverClaudeSessionStoreOperation(nextAuthority, {
+      operationId: first.access.operationId,
+      targetWorkspaceAuthority: "workspace.wrong"
+    })).toThrowError(expect.objectContaining({ code: "INVALID_ACCESS" }));
+    expect(() => recoverClaudeSessionStoreOperation(nextAuthority, {
+      operationId: randomUUID(),
+      targetWorkspaceAuthority: first.access.target.workspaceAuthority
+    })).toThrowError(expect.objectContaining({ code: "NOT_FOUND" }));
+
+    for (const operation of operations) {
+      if (operation.childSessionId !== undefined) {
+        expect(() => recoverClaudeSessionStoreOperation(nextAuthority, {
+          operationId: operation.access.operationId,
+          targetWorkspaceAuthority: operation.access.target.workspaceAuthority,
+          expectedChildSessionId: randomUUID()
+        })).toThrowError(expect.objectContaining({ code: "INVALID_ACCESS" }));
+      }
+      const recovered = recoverClaudeSessionStoreOperation(nextAuthority, {
+        operationId: operation.access.operationId,
+        targetWorkspaceAuthority: operation.access.target.workspaceAuthority,
+        ...(operation.childSessionId === undefined
+          ? {}
+          : { expectedChildSessionId: operation.childSessionId })
+      });
+      expect(recovered).toMatchObject({
+        kind: "operation",
+        operationId: operation.access.operationId,
+        generation: 2,
+        target: { workspaceAuthority: operation.access.target.workspaceAuthority }
+      });
+      expect(readClaudeSessionStoreOperation(nextAuthority, recovered).state).toBe(
+        operation.state === "durable_ready" ? "ready" : operation.state
+      );
+      const cleaned = cleanupClaudeSessionStoreOperation(nextAuthority, recovered,
+        operation.childSessionId === undefined ? {} : { expectedChildSessionId: operation.childSessionId });
+      expect(cleaned.state).toBe("cleaned");
+      expect(cleanupClaudeSessionStoreOperation(nextAuthority, recovered,
+        operation.childSessionId === undefined ? {} : { expectedChildSessionId: operation.childSessionId }))
+        .toEqual(cleaned);
+      expect(await operationStagingCount(fixture.root, operation.access.operationId)).toBe(0);
+    }
+
+    expect(() => recoverClaudeSessionStoreOperation(fixture.authority, {
+      operationId: first.access.operationId,
+      targetWorkspaceAuthority: first.access.target.workspaceAuthority
+    })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
+    const adoptedOperation = operations.find((operation) => operation.state === "adopted")!;
+    const adoptedStore = createClaudeDurableSessionStore(nextAuthority, createClaudeSessionStoreSessionAccess({
+      generation: 2,
+      workspaceAuthority: adoptedOperation.access.target.workspaceAuthority,
+      sessionId: adoptedOperation.childSessionId!
+    }));
+    expect(await adoptedStore.load({
+      projectKey: `recover-target-${states.indexOf("adopted")}`,
+      sessionId: adoptedOperation.childSessionId!
+    })).toHaveLength(1);
+    await adoptedStore.delete({
+      projectKey: `recover-target-${states.indexOf("adopted")}`,
+      sessionId: adoptedOperation.childSessionId!
+    });
+    adoptedStore.close();
+    const finalAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root,
+      namespace: "test-owner",
+      generation: 3
+    });
+    const recoveredCleanedAdoption = recoverClaudeSessionStoreOperation(finalAuthority, {
+      operationId: adoptedOperation.access.operationId,
+      targetWorkspaceAuthority: adoptedOperation.access.target.workspaceAuthority,
+      expectedChildSessionId: adoptedOperation.childSessionId!
+    });
+    expect(cleanupClaudeSessionStoreOperation(finalAuthority, recoveredCleanedAdoption, {
+      expectedChildSessionId: adoptedOperation.childSessionId!
+    }).state).toBe("cleaned");
+    const database = new DatabaseSync(await onlyDatabasePath(fixture.root));
+    const remaining = database.prepare(`
+      SELECT COUNT(*) AS count FROM sessions
+      WHERE workspace_authority LIKE 'workspace.recover-target-%'
+    `).get() as Record<string, unknown> | undefined;
+    database.close();
+    expect(Number(remaining?.["count"] ?? -1)).toBe(0);
+  });
+
+  it("fails closed when operation and reserved-child receipt states disagree", async () => {
+    const fixture = await createFixture();
+    const operations: Array<{
+      access: ClaudeSessionStoreOperationAccess;
+      childSessionId: string;
+      corruptReservationState: "pending" | "confirmed";
+    }> = [];
+    for (const [index, operationState] of (["child_pending", "child_reserved"] as const).entries()) {
+      const access = prepareClaudeSessionStoreImport(fixture.authority, {
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: `workspace.receipt-source-${index}`,
+        sourceSessionId: randomUUID(),
+        targetWorkspaceAuthority: `workspace.receipt-target-${index}`
+      });
+      const store = createClaudeDurableSessionStore(fixture.authority, access, {
+        onChildReserved: operationState === "child_pending"
+          ? async () => { throw new Error("registration unavailable"); }
+          : async () => undefined
+      });
+      await store.append(
+        { projectKey: `receipt-source-${index}`, sessionId: access.source.sessionId },
+        [{ type: "user", uuid: randomUUID() }]
+      );
+      sealClaudeSessionStoreImport(fixture.authority, access);
+      await store.load({ projectKey: `receipt-target-${index}`, sessionId: access.source.sessionId });
+      const childSessionId = randomUUID();
+      const append = store.append(
+        { projectKey: `receipt-target-${index}`, sessionId: childSessionId },
+        [{ type: "assistant", uuid: randomUUID() }]
+      );
+      if (operationState === "child_pending") {
+        await expect(append).rejects.toMatchObject({ code: "RESERVATION_FAILED" });
+      } else {
+        await append;
+      }
+      store.close();
+      operations.push({
+        access,
+        childSessionId,
+        corruptReservationState: operationState === "child_pending" ? "confirmed" : "pending"
+      });
+    }
+    const databasePath = await onlyDatabasePath(fixture.root);
+    const database = new DatabaseSync(databasePath);
+    for (const operation of operations) {
+      database.prepare(`
+        UPDATE sessions SET reservation_state = ?
+        WHERE workspace_authority = ? AND session_id = ?
+      `).run(
+        operation.corruptReservationState,
+        operation.access.target.workspaceAuthority,
+        operation.childSessionId
+      );
+    }
+    database.close();
+    const nextAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root,
+      namespace: "test-owner",
+      generation: 2
+    });
+    for (const operation of operations) {
+      expect(() => recoverClaudeSessionStoreOperation(nextAuthority, {
+        operationId: operation.access.operationId,
+        targetWorkspaceAuthority: operation.access.target.workspaceAuthority,
+        expectedChildSessionId: operation.childSessionId
+      })).toThrowError(expect.objectContaining({ code: "CORRUPT" }));
+      expect(() => cleanupClaudeSessionStoreOperation(fixture.authority, operation.access, {
+        expectedChildSessionId: operation.childSessionId
+      })).toThrowError(expect.objectContaining({ code: "CORRUPT" }));
+      expect(readClaudeSessionStoreOperation(fixture.authority, operation.access).generation).toBe(1);
+    }
+    const verify = new DatabaseSync(databasePath);
+    const rows = verify.prepare(`
+      SELECT COUNT(*) AS count FROM sessions WHERE workspace_authority LIKE 'workspace.receipt-target-%'
+    `).get() as Record<string, unknown> | undefined;
+    verify.close();
+    expect(Number(rows?.["count"] ?? -1)).toBe(2);
+  });
+
+  it("refuses to claim or clean reserved children with drifted batch authority", async () => {
+    const fixture = await createFixture();
+    const createReserved = async (suffix: string) => {
+      const access = prepareClaudeSessionStoreImport(fixture.authority, {
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: `workspace.batch-source-${suffix}`,
+        sourceSessionId: randomUUID(),
+        targetWorkspaceAuthority: `workspace.batch-target-${suffix}`
+      });
+      const store = createClaudeDurableSessionStore(fixture.authority, access, {
+        onChildReserved: async () => undefined
+      });
+      await store.append(
+        { projectKey: `batch-source-${suffix}`, sessionId: access.source.sessionId },
+        [{ type: "user", uuid: randomUUID() }]
+      );
+      sealClaudeSessionStoreImport(fixture.authority, access);
+      await store.load({ projectKey: `batch-target-${suffix}`, sessionId: access.source.sessionId });
+      const childSessionId = randomUUID();
+      await store.append(
+        { projectKey: `batch-target-${suffix}`, sessionId: childSessionId },
+        [{ type: "assistant", uuid: randomUUID(), suffix }]
+      );
+      store.close();
+      return { access, childSessionId };
+    };
+    const badDigest = await createReserved("digest");
+    const badSubkey = await createReserved("subkey");
+    const missingChild = await createReserved("missing");
+    const databasePath = await onlyDatabasePath(fixture.root);
+    const database = new DatabaseSync(databasePath, { enableForeignKeyConstraints: true });
+    database.prepare("UPDATE operations SET reservation_batch_digest = ? WHERE operation_id = ?")
+      .run("0".repeat(64), badDigest.access.operationId);
+    const rootEntry = database.prepare(`
+      SELECT uuid, entry_json, entry_bytes, entry_digest
+      FROM session_entries WHERE workspace_authority = ? AND session_id = ? AND subpath = ''
+      ORDER BY ordinal ASC LIMIT 1
+    `).get(badSubkey.access.target.workspaceAuthority, badSubkey.childSessionId) as Record<string, unknown>;
+    const session = database.prepare(`
+      SELECT next_ordinal FROM sessions WHERE workspace_authority = ? AND session_id = ?
+    `).get(badSubkey.access.target.workspaceAuthority, badSubkey.childSessionId) as Record<string, unknown>;
+    const nextOrdinal = Number(session["next_ordinal"]);
+    const entryUuid = String(rootEntry["uuid"]);
+    const entryJson = String(rootEntry["entry_json"]);
+    const entryBytes = Number(rootEntry["entry_bytes"]);
+    const entryDigest = String(rootEntry["entry_digest"]);
+    database.prepare(`
+      INSERT INTO session_entries (
+        workspace_authority, session_id, subpath, ordinal, uuid,
+        entry_json, entry_bytes, entry_digest
+      ) VALUES (?, ?, 'subagents/drift', ?, ?, ?, ?, ?)
+    `).run(
+      badSubkey.access.target.workspaceAuthority,
+      badSubkey.childSessionId,
+      nextOrdinal,
+      entryUuid,
+      entryJson,
+      entryBytes,
+      entryDigest
+    );
+    database.prepare(`
+      UPDATE sessions
+      SET revision = revision + 1, entry_count = entry_count + 1,
+          byte_count = byte_count + ?, subkey_count = subkey_count + 1,
+          next_ordinal = next_ordinal + 1
+      WHERE workspace_authority = ? AND session_id = ?
+    `).run(entryBytes, badSubkey.access.target.workspaceAuthority, badSubkey.childSessionId);
+    database.prepare("DELETE FROM sessions WHERE workspace_authority = ? AND session_id = ?")
+      .run(missingChild.access.target.workspaceAuthority, missingChild.childSessionId);
+    database.close();
+
+    const nextAuthority = createClaudeSessionStoreAuthority({
+      rootDirectory: fixture.root,
+      namespace: "test-owner",
+      generation: 2
+    });
+    for (const operation of [badDigest, badSubkey, missingChild]) {
+      expect(() => recoverClaudeSessionStoreOperation(nextAuthority, {
+        operationId: operation.access.operationId,
+        targetWorkspaceAuthority: operation.access.target.workspaceAuthority,
+        expectedChildSessionId: operation.childSessionId
+      })).toThrowError(expect.objectContaining({ code: "CORRUPT" }));
+      expect(() => cleanupClaudeSessionStoreOperation(fixture.authority, operation.access, {
+        expectedChildSessionId: operation.childSessionId
+      })).toThrowError(expect.objectContaining({ code: "CORRUPT" }));
+      expect(readClaudeSessionStoreOperation(fixture.authority, operation.access)).toMatchObject({
+        generation: 1,
+        state: "child_reserved"
+      });
+    }
   });
 
   it("keeps partial imports unusable across reopen and discards only their exact operation", async () => {

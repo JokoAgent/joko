@@ -14,7 +14,11 @@ import {
 import { z } from "zod";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
 import {
+  CLAUDE_SESSION_STORE_LIMITS,
+  createClaudeDurableSessionStore,
   createClaudeSessionStoreAuthority,
+  type ClaudeDurableSessionStore,
+  type ClaudeSessionStoreAuthority,
   type ClaudeSessionStoreOperationAccess,
   type ClaudeSessionStoreOperationSnapshot,
   type ClaudeSessionStoreSessionAccess
@@ -238,6 +242,8 @@ export interface ClaudeSdkQueryOptions {
   readonly permissionMode: ClaudeSdkPermissionMode;
   readonly persistSession: boolean;
   readonly resume?: string;
+  /** Exact adopted Store Session authority for this Query. */
+  readonly sessionStoreAccess?: ClaudeSessionStoreSessionAccess;
   readonly sessionId?: string;
   readonly settings?: Exclude<NativeOptions["settings"], string>;
   readonly settingSources: readonly ("user" | "project" | "local")[];
@@ -314,10 +320,9 @@ export interface ClaudeSdkRuntime {
   /** Exact CLI version declared by this runtime's bundled executable. Callers
    * may trust it only when they did not supply an executable override. */
   readonly bundledCliVersion?: string;
-  /** True only when the injected runtime can create and subsequently resume a
-   * public SDK fork in a different canonical workspace. The fixed filesystem
-   * SDK runtime does not provide that migration primitive: ForkSessionOptions.dir
-   * selects the source project store and does not rewrite the copied cwd. */
+  /** True only when this runtime can create and subsequently resume a fork in
+   * a different canonical workspace. The fixed runtime sets this only when its
+   * durable SessionStore and exact process-owner generation are configured. */
   readonly supportsWorkspaceDerivation?: boolean;
   /** Private durable alpha-SDK bridge. Its presence is infrastructure only;
    * the Adapter must not advertise workspace derivation until Host adoption,
@@ -355,8 +360,21 @@ export interface ClaudeSdkStoredSessionRuntime {
     readonly targetWorkspaceAuthority: string;
   }): ClaudeSessionStoreOperationAccess;
   readOperation(access: ClaudeSessionStoreOperationAccess): ClaudeSessionStoreOperationSnapshot;
+  recoverOperation(input: {
+    readonly operationId: string;
+    readonly targetWorkspaceAuthority: string;
+    readonly expectedChildSessionId?: string;
+  }): ClaudeSessionStoreOperationAccess;
+  cleanupOperation(
+    access: ClaudeSessionStoreOperationAccess,
+    input?: { readonly expectedChildSessionId?: string }
+  ): ClaudeSessionStoreOperationSnapshot;
   discardImport(access: ClaudeSessionStoreOperationAccess): void;
   adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): ClaudeSessionStoreSessionAccess;
+  claim(input: {
+    readonly workspaceAuthority: string;
+    readonly sessionId: string;
+  }): ClaudeSessionStoreSessionAccess;
   rebind(input: {
     readonly workspaceAuthority: string;
     readonly sessionId: string;
@@ -456,12 +474,16 @@ interface LoadedSdkModule {
 export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
   readonly bundledCliVersion = CLAUDE_AGENT_SDK_CLI_VERSION;
-  readonly supportsWorkspaceDerivation = false;
+  readonly supportsWorkspaceDerivation: boolean;
   readonly storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
   readonly #sessionOwner: SessionSdkOwner;
-  readonly #queryProcesses = new WeakMap<ClaudeSdkQuery, DurableProcessLease[]>();
+  readonly #queryProcesses = new WeakMap<ClaudeSdkQuery, {
+    readonly leases: DurableProcessLease[];
+    readonly sessionStore?: ClaudeDurableSessionStore;
+  }>();
+  readonly #sessionStoreAuthority: ClaudeSessionStoreAuthority | undefined;
   #module: Promise<LoadedSdkModule> | undefined;
 
   constructor(options: {
@@ -495,6 +517,8 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
           namespace: `backend-${createHash("sha256").update(options.processOwner.instanceId, "utf8").digest("hex")}`,
           generation: options.processOwner.generation
         });
+    this.#sessionStoreAuthority = sessionStoreAuthority;
+    this.supportsWorkspaceDerivation = sessionStoreAuthority !== undefined;
     this.#sessionOwner = new SessionSdkOwner({
       environment: options.environment ?? process.env,
       timeoutMs: positiveTimeout(options.sessionOperationTimeoutMs, 30_000),
@@ -591,6 +615,12 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ? undefined
       : createManagedAgentServer(loaded, params.options.managedAgentTool);
     const productMcpServers = createProductMcpServers(params.options.mcpTools ?? []);
+    if (params.options.sessionStoreAccess !== undefined && this.#sessionStoreAuthority === undefined) {
+      throw new Error("Claude SessionStore Query authority is unavailable.");
+    }
+    const querySessionStore = params.options.sessionStoreAccess === undefined
+      ? undefined
+      : createClaudeDurableSessionStore(this.#sessionStoreAuthority!, params.options.sessionStoreAccess);
     const options: NativeOptionsWithOAuth = {
       abortController: params.options.abortController,
       additionalDirectories: [...params.options.additionalDirectories],
@@ -632,6 +662,9 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
         ? {}
         : { spawnClaudeCodeProcess: (spawnOptions) => this.#spawnOwnedProcess(spawnOptions, (lease) => leases.push(lease)) }),
       ...(params.options.resume === undefined ? {} : { resume: params.options.resume }),
+      ...(querySessionStore === undefined
+        ? {}
+        : { sessionStore: claudeSdkSessionStoreBoundary(querySessionStore) }),
       ...(params.options.sessionId === undefined ? {} : { sessionId: params.options.sessionId }),
       ...(params.options.settings === undefined ? {} : { settings: { ...params.options.settings } }),
       settingSources: [...params.options.settingSources],
@@ -651,22 +684,31 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
         ? [...params.options.tools]
         : { type: "preset", preset: "claude_code" }
     };
-    const query = loaded.query({
-      prompt: params.prompt as AsyncIterable<NativeSdkUserMessage>,
-      options
-    }) as unknown as ClaudeSdkQuery;
-    this.#queryProcesses.set(query, leases);
-    return query;
+    try {
+      const query = loaded.query({
+        prompt: params.prompt as AsyncIterable<NativeSdkUserMessage>,
+        options
+      }) as unknown as ClaudeSdkQuery;
+      this.#queryProcesses.set(query, {
+        leases,
+        ...(querySessionStore === undefined ? {} : { sessionStore: querySessionStore })
+      });
+      return query;
+    } catch (error) {
+      querySessionStore?.close();
+      throw error;
+    }
   }
 
   async retireQuery(query: ClaudeSdkQuery, timeoutMs: number): Promise<void> {
-    const leases = this.#queryProcesses.get(query);
-    if (this.#processOwner === undefined || leases === undefined || leases.length === 0) {
+    const owner = this.#queryProcesses.get(query);
+    if (this.#processOwner === undefined || owner === undefined || owner.leases.length === 0) {
       throw new Error("The exact native Query process cannot be confirmed retired.");
     }
-    const results = await Promise.allSettled(leases.map((lease) => this.#processOwner!.retireLease(lease, timeoutMs)));
+    const results = await Promise.allSettled(owner.leases.map((lease) => this.#processOwner!.retireLease(lease, timeoutMs)));
     const failed = results.find((result) => result.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
+    owner.sessionStore?.close();
     this.#queryProcesses.delete(query);
   }
 
@@ -734,8 +776,11 @@ function storedSessionRuntime(owner: SessionSdkOwner): ClaudeSdkStoredSessionRun
     prepareImport: (input) => owner.prepareSessionImport(input),
     prepareDerivation: (input) => owner.prepareStoredSessionDerivation(input),
     readOperation: (access) => owner.readStoredSessionOperation(access),
+    recoverOperation: (input) => owner.recoverStoredSessionOperation(input),
+    cleanupOperation: (access, input = {}) => owner.cleanupStoredSessionOperation(access, input),
     discardImport: (access) => owner.discardSessionImport(access),
     adopt: (access, sessionId) => owner.adoptStoredSession(access, sessionId),
+    claim: (input) => owner.claimStoredSession(input),
     rebind: (input) => owner.rebindStoredSession(input),
     importSession: async (sessionId, options) => {
       await owner.run({
@@ -1065,6 +1110,8 @@ import type {
   Options as NativeOptions,
   Query as NativeQuery,
   SDKUserMessage as NativeSdkUserMessage,
+  SessionStore as NativeSessionStore,
+  SessionStoreEntry as NativeSessionStoreEntry,
   SpawnedProcess as NativeSpawnedProcess,
   SpawnOptions as NativeSpawnOptions,
   WarmQuery as NativeWarmQuery
@@ -1073,3 +1120,21 @@ import type {
 type NativeOptionsWithOAuth = NativeOptions & {
   readonly getOAuthToken?: ClaudeSdkOAuthTokenProvider;
 };
+
+function claudeSdkSessionStoreBoundary(store: ClaudeDurableSessionStore): NativeSessionStore {
+  return {
+    append: async (key, entries) => {
+      const json = JSON.stringify(entries);
+      if (Buffer.byteLength(json, "utf8") > CLAUDE_SESSION_STORE_LIMITS.maximumBatchBytes) {
+        throw new Error("Stored Session batch exceeds its bound.");
+      }
+      const normalized: unknown = JSON.parse(json);
+      if (!Array.isArray(normalized)) throw new Error("Stored Session batch is invalid.");
+      await store.append(key, normalized as NativeSessionStoreEntry[]);
+    },
+    load: async (key) => await store.load(key),
+    listSessions: async (projectKey) => await store.listSessions(projectKey),
+    delete: async (key) => await store.delete(key),
+    listSubkeys: async (key) => await store.listSubkeys(key)
+  };
+}

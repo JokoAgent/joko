@@ -6,12 +6,282 @@ import type { NativeSessionBinding, SessionDescriptor } from "@joko/core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { OperationalStore, OperationInProgressError, OperationPreviouslyFailedError,
-  RevisionConflictError, type RecordNativeSessionDerivationInput } from "./index.js";
+  RevisionConflictError, type PrepareNativeSessionDerivationInput,
+  type RecordNativeSessionDerivationInput } from "./index.js";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
 
 describe("native derivation receipts", () => {
+  it("orders an external native lifecycle before Product adoption and finalizes it after restart", () => {
+    const f = fixture();
+    const input = f.claim("external-lifecycle");
+    const attempt = f.attempt(input);
+    const prepared = f.store.prepareNativeSessionDerivation(attempt);
+    expect(prepared).toMatchObject({ state: "prepared", externalLifecycle: true });
+    expect(prepared.binding).toBeUndefined();
+    const preparedRevision = f.store.health().revision;
+    expect(f.store.prepareNativeSessionDerivation(attempt)).toEqual(prepared);
+    expect(f.store.health().revision).toBe(preparedRevision);
+    expect(() => f.store.prepareNativeSessionDerivation({
+      ...attempt,
+      targetRevision: attempt.targetRevision + 1n
+    })).toThrow(/original effect/u);
+
+    const recorded = f.store.recordNativeSessionDerivation(input);
+    expect(recorded).toMatchObject({ state: "recorded", binding: input.binding, externalLifecycle: true });
+    f.complete(input, (store) => store.createSession(f.child(input), { derivationOperationId: input.operationId }));
+    const productAdopted = f.store.findNativeSessionDerivation(input.operationId)!;
+    expect(productAdopted).toMatchObject({ state: "product_adopted", binding: input.binding });
+    expect(f.store.findProductAdoptedNativeSessionDerivation(input.sessionId)).toEqual(productAdopted);
+    expect(productAdopted.productAdoptedAt).toEqual(expect.any(Number));
+    expect(productAdopted.adoptedAt).toBeUndefined();
+    expect(f.store.getOperation(input.operationId).status).toBe("completed");
+    expect(() => f.store.finishNativeSessionDerivationAdoption({
+      operationId: input.operationId,
+      expectedRevision: productAdopted.revision - 1n
+    })).toThrow(RevisionConflictError);
+
+    f.reopen();
+    expect(f.store.listUnadoptedNativeSessionDerivations()).toEqual([productAdopted]);
+    const adopted = f.store.finishNativeSessionDerivationAdoption({
+      operationId: input.operationId,
+      expectedRevision: productAdopted.revision
+    });
+    expect(adopted).toMatchObject({ state: "adopted", externalLifecycle: true });
+    expect(adopted.adoptedAt).toEqual(expect.any(Number));
+    const revision = f.store.health().revision;
+    expect(f.store.finishNativeSessionDerivationAdoption({
+      operationId: input.operationId,
+      expectedRevision: productAdopted.revision
+    })).toEqual(adopted);
+    expect(f.store.health().revision).toBe(revision);
+    expect(f.store.listUnadoptedNativeSessionDerivations()).toEqual([]);
+    expect(f.store.findProductAdoptedNativeSessionDerivation(input.sessionId)).toBeUndefined();
+  });
+
+  it("transfers only a settled lifecycle to the published successor generation with exact CAS fences", () => {
+    const f = fixture();
+    const input = f.claim("successor-owner");
+    const prepared = f.store.prepareNativeSessionDerivation(f.attempt(input));
+    const current = f.store.getBackend(input.backendId).descriptor;
+    const successor = f.store.reserveBackendInstanceGeneration({
+      backendId: input.backendId,
+      adapterKind: current.adapterKind
+    });
+    expect(successor.generation).toBe(current.instanceGeneration + 1);
+    expect(f.store.publishBackendInstanceDescriptor({
+      descriptor: { ...current, instanceGeneration: successor.generation },
+      expectedCurrentGeneration: current.instanceGeneration
+    }).status).toBe("published");
+
+    expect(() => f.store.claimNativeSessionDerivationLifecycleOwner({
+      operationId: input.operationId,
+      expectedRevision: prepared.revision,
+      expectedOwnerGeneration: current.instanceGeneration,
+      nextGeneration: successor.generation
+    })).toThrow(/live native derivation lifecycle/u);
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(prepared);
+
+    f.fail(input);
+    const transferred = f.store.claimNativeSessionDerivationLifecycleOwner({
+      operationId: input.operationId,
+      expectedRevision: prepared.revision,
+      expectedOwnerGeneration: current.instanceGeneration,
+      nextGeneration: successor.generation
+    });
+    expect(transferred).toMatchObject({
+      state: "prepared",
+      backendInstanceGeneration: current.instanceGeneration,
+      lifecycleOwnerGeneration: successor.generation
+    });
+    expect(() => f.store.recordNativeSessionDerivation(input)).toThrow(/stale Backend generation/u);
+    expect(() => f.store.claimNativeSessionDerivationLifecycleOwner({
+      operationId: input.operationId,
+      expectedRevision: transferred.revision,
+      expectedOwnerGeneration: current.instanceGeneration,
+      nextGeneration: successor.generation
+    })).toThrow(/generation owner is stale/u);
+
+    const future = f.store.reserveBackendInstanceGeneration({
+      backendId: input.backendId,
+      adapterKind: current.adapterKind
+    });
+    expect(future.generation).toBe(successor.generation + 1);
+    expect(() => f.store.claimNativeSessionDerivationLifecycleOwner({
+      operationId: input.operationId,
+      expectedRevision: transferred.revision,
+      expectedOwnerGeneration: successor.generation,
+      nextGeneration: future.generation
+    })).toThrow(/not the published Backend generation/u);
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(transferred);
+  });
+
+  it("allows at most one pending external adoption for a product Session", () => {
+    const f = fixture();
+    const first = f.claim("pending-navigation-first", "navigate_session");
+    f.store.prepareNativeSessionDerivation(f.attempt(first));
+    f.store.recordNativeSessionDerivation(first);
+    f.complete(first, (store) => store.updateSession("source", { binding: first.binding }, undefined, Date.now(),
+      { derivationOperationId: first.operationId }));
+    const pending = f.store.findNativeSessionDerivation(first.operationId)!;
+    expect(f.store.findProductAdoptedNativeSessionDerivation("source")).toEqual(pending);
+
+    const nextClaim = f.claim("pending-navigation-second", "navigate_session");
+    const second = { ...nextClaim, binding: native("pending-navigation-second", first.binding.generation + 1) };
+    f.store.prepareNativeSessionDerivation(f.attempt(second));
+    f.store.recordNativeSessionDerivation(second);
+    expect(() => f.complete(second, (store) => store.updateSession("source", { binding: second.binding }, undefined,
+      Date.now(), { derivationOperationId: second.operationId }))).toThrow();
+    expect(f.store.findProductAdoptedNativeSessionDerivation("source")).toEqual(pending);
+    expect(f.store.findNativeSessionDerivation(second.operationId)?.state).toBe("recorded");
+  });
+
+  it("cleans exact failed external attempts before or after their native binding is recorded", () => {
+    const f = fixture();
+    const preparedInput = f.claim("prepared-cleanup");
+    const prepared = f.store.prepareNativeSessionDerivation(f.attempt(preparedInput));
+    f.fail(preparedInput);
+    const preparedClaim = f.store.claimNativeSessionDerivationCleanup({
+      operationId: preparedInput.operationId,
+      expectedRevision: prepared.revision
+    });
+    expect(preparedClaim.record.binding).toBeUndefined();
+    expect(f.store.confirmNativeSessionDerivationNativeCleanup({
+      operationId: preparedInput.operationId,
+      token: preparedClaim.token
+    }).state).toBe("workspace_cleanup_pending");
+    expect(f.store.finishNativeSessionDerivationCleanup({
+      operationId: preparedInput.operationId,
+      token: preparedClaim.token,
+      outcome: "cleaned"
+    }).state).toBe("cleaned");
+
+    const recordedInput = f.claim("recorded-cleanup");
+    f.store.prepareNativeSessionDerivation(f.attempt(recordedInput));
+    const recorded = f.store.recordNativeSessionDerivation(recordedInput);
+    f.fail(recordedInput);
+    const recordedClaim = f.store.claimNativeSessionDerivationCleanup({
+      operationId: recordedInput.operationId,
+      expectedRevision: recorded.revision
+    });
+    expect(recordedClaim.record.binding).toEqual(recordedInput.binding);
+    expect(f.store.finishNativeSessionDerivationCleanup({
+      operationId: recordedInput.operationId,
+      token: recordedClaim.token,
+      outcome: "cleanup_unknown",
+      failureCode: "store_cleanup_unknown"
+    })).toMatchObject({ state: "cleanup_unknown", failureCode: "store_cleanup_unknown" });
+  });
+
+  it.each(["cleanup_claimed", "workspace_cleanup_pending", "cleaned", "cleanup_unknown"] as const)(
+    "rejects a late binding after an unbound external attempt reaches %s",
+    (cleanupState) => {
+      const f = fixture();
+      const input = f.claim(`late-${cleanupState}`);
+      const prepared = f.store.prepareNativeSessionDerivation(f.attempt(input));
+      f.fail(input);
+      const claim = f.store.claimNativeSessionDerivationCleanup({
+        operationId: input.operationId,
+        expectedRevision: prepared.revision
+      });
+      if (cleanupState === "workspace_cleanup_pending" || cleanupState === "cleaned") {
+        f.store.confirmNativeSessionDerivationNativeCleanup({
+          operationId: input.operationId,
+          token: claim.token
+        });
+      }
+      if (cleanupState === "cleaned" || cleanupState === "cleanup_unknown") {
+        f.store.finishNativeSessionDerivationCleanup({
+          operationId: input.operationId,
+          token: claim.token,
+          outcome: cleanupState
+        });
+      }
+      const before = f.store.findNativeSessionDerivation(input.operationId)!;
+      const revision = f.store.health().revision;
+      expect(before).toMatchObject({ state: cleanupState });
+      expect(before.binding).toBeUndefined();
+      expect(() => f.store.recordNativeSessionDerivation(input)).toThrow(/no longer accepts a late binding/u);
+      expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(before);
+      expect(f.store.health().revision).toBe(revision);
+    }
+  );
+
+  it("rejects a cross-workspace child that reuses the source native session identity", () => {
+    const f = fixture();
+    const claimed = f.claim("cross-workspace-source-id");
+    const input = {
+      ...claimed,
+      effectiveWorkspaceRoot: "D:/derived-workspace",
+      binding: {
+        opaqueRef: "native://cross-workspace-child",
+        nativeSessionId: claimed.sourceBinding.nativeSessionId,
+        generation: claimed.binding.generation
+      }
+    };
+    const prepared = f.store.prepareNativeSessionDerivation(f.attempt(input));
+    expect(() => f.store.recordNativeSessionDerivation(input)).toThrow(/distinct binding/u);
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(prepared);
+    expect(f.store.findNativeSessionDerivation(input.operationId)?.binding).toBeUndefined();
+  });
+
+  it("fences external adoption to the prepared Store revisions and exact worktree authority", () => {
+    const f = fixture();
+    const staleInput = f.claim("stale-authority");
+    const staleAttempt = f.attempt(staleInput);
+    f.store.updateSession("source", { title: "changed while admission was pending" });
+    expect(() => f.store.prepareNativeSessionDerivation(staleAttempt)).toThrow(RevisionConflictError);
+
+    const claimed = f.claim("worktree-authority");
+    const worktree = {
+      leaseId: "lease-worktree-authority", workspaceId: "workspace", path: "D:/derived-worktree",
+      repositoryRoot: "D:/workspace", branch: "codex/worktree-authority", sourceRef: "main",
+      sourceCommit: "a".repeat(40), sourceStrategy: "explicit" as const, sourceRefreshed: false,
+      state: "active" as const, acquiredAt: 10, updatedAt: 10
+    };
+    const input = { ...claimed, effectiveWorkspaceRoot: worktree.path, worktree };
+    const attempt = f.attempt(input, worktree);
+    expect(() => f.store.prepareNativeSessionDerivation({
+      ...attempt,
+      worktree: { ...worktree, path: "D:/another-worktree" }
+    })).toThrow(/worktree authority/u);
+    const prepared = f.store.prepareNativeSessionDerivation(attempt);
+    f.reopen();
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(prepared);
+    f.store.recordNativeSessionDerivation(input);
+    expect(() => f.complete(input, (store) => store.createSession({
+      ...f.child(input),
+      worktree: { ...worktree, branch: "codex/wrong-branch" }
+    }, { derivationOperationId: input.operationId }))).toThrow(/prepared authority/u);
+    expect(f.store.findNativeSessionDerivation(input.operationId)?.state).toBe("recorded");
+    f.complete(input, (store) => store.createSession({ ...f.child(input), worktree }, {
+      derivationOperationId: input.operationId
+    }));
+    expect(f.store.getSession(input.sessionId).descriptor.worktree).toEqual(worktree);
+    expect(f.store.findNativeSessionDerivation(input.operationId)?.state).toBe("product_adopted");
+  });
+
+  it("persists exact direct-lifecycle worktree authority across replay and restart", () => {
+    const f = fixture();
+    const worktree = {
+      leaseId: "lease-direct-worktree", workspaceId: "workspace", path: "D:/direct-worktree",
+      repositoryRoot: "D:/workspace", branch: "codex/direct-worktree", sourceRef: "main",
+      sourceCommit: "b".repeat(40), sourceStrategy: "explicit" as const, sourceRefreshed: false,
+      state: "active" as const, acquiredAt: 20, updatedAt: 20
+    };
+    const input = { ...f.claim("direct-worktree"), effectiveWorkspaceRoot: worktree.path, worktree };
+    const recorded = f.store.recordNativeSessionDerivation(input);
+    expect(recorded).toMatchObject({ externalLifecycle: false, state: "recorded", worktree });
+    expect(f.store.recordNativeSessionDerivation(input)).toEqual(recorded);
+    expect(() => f.store.recordNativeSessionDerivation({
+      ...input,
+      worktree: { ...worktree, branch: "codex/different-branch" }
+    })).toThrow(/original effect/u);
+    f.reopen();
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(recorded);
+  });
+
   it("records one exact effect, rejects mismatched receipts, and transfers no adopted identity", () => {
     const f = fixture();
     const input = f.claim("derive");
@@ -114,6 +384,40 @@ describe("native derivation receipts", () => {
     expect(f.complete(input, () => { throw new Error("no repeated adoption"); }).replayed).toBe(true);
   });
 
+  it("records consecutive navigation receipts for one product while preserving each exact adoption", () => {
+    const f = fixture();
+    const first = f.claim("navigation-first", "navigate_session");
+    f.store.recordNativeSessionDerivation(first);
+    f.complete(first, (store) => store.updateSession("source", { binding: first.binding }, undefined, Date.now(),
+      { derivationOperationId: first.operationId }));
+
+    const secondClaim = f.claim("navigation-second", "navigate_session");
+    const second = { ...secondClaim, binding: native("navigation-second", first.binding.generation + 1) };
+    f.store.recordNativeSessionDerivation(second);
+    f.complete(second, (store) => store.updateSession("source", { binding: second.binding }, undefined, Date.now(),
+      { derivationOperationId: second.operationId }));
+
+    expect(f.store.getSession("source").descriptor.binding).toEqual(second.binding);
+    expect(f.store.findNativeSessionDerivation(first.operationId)).toMatchObject({
+      sourceSessionId: "source",
+      sessionId: "source",
+      sourceBinding: native("source"),
+      binding: first.binding,
+      state: "adopted"
+    });
+    expect(f.store.findNativeSessionDerivation(second.operationId)).toMatchObject({
+      sourceSessionId: "source",
+      sessionId: "source",
+      sourceBinding: first.binding,
+      binding: second.binding,
+      state: "adopted"
+    });
+    f.reopen();
+    expect(f.store.getSession("source").descriptor.binding).toEqual(second.binding);
+    expect(f.store.findNativeSessionDerivation(first.operationId)?.state).toBe("adopted");
+    expect(f.store.findNativeSessionDerivation(second.operationId)?.state).toBe("adopted");
+  });
+
   it.each(["wrong-product", "wrong-generation", "changed-source"] as const)("rejects %s navigation receipt authority", (boundary) => {
     const f = fixture();
     const input = f.claim("navigation-invalid", "navigate_session");
@@ -184,7 +488,20 @@ describe("native derivation receipts", () => {
     f.fail(input);
     expect(() => f.store.claimNativeSessionDerivationCleanup({ operationId: input.operationId, expectedRevision: record.revision - 1n })).toThrow(RevisionConflictError);
     const claim = f.store.claimNativeSessionDerivationCleanup({ operationId: input.operationId, expectedRevision: record.revision });
+    expect(() => f.store.confirmNativeSessionDerivationNativeCleanup({
+      operationId: input.operationId,
+      token: "wrong-owner"
+    })).toThrow(/owner is stale/u);
     expect(() => f.store.finishNativeSessionDerivationCleanup({ operationId: input.operationId, token: "wrong-owner", outcome: "cleaned" })).toThrow(/owner is stale/u);
+    const workspaceCleanup = f.store.confirmNativeSessionDerivationNativeCleanup({
+      operationId: input.operationId,
+      token: claim.token
+    });
+    expect(workspaceCleanup.state).toBe("workspace_cleanup_pending");
+    expect(f.store.listUnadoptedNativeSessionDerivations()).toEqual([workspaceCleanup]);
+    f.reopen();
+    f.store.recoverStartup();
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(workspaceCleanup);
     const cleaned = f.store.finishNativeSessionDerivationCleanup({ operationId: input.operationId, token: claim.token, outcome: "cleaned" });
     const revision = f.store.health().revision;
     expect(f.store.finishNativeSessionDerivationCleanup({ operationId: input.operationId, token: claim.token, outcome: "cleaned" })).toEqual(cleaned);
@@ -270,6 +587,27 @@ function fixture() {
         sourceBinding: store.getSession("source").descriptor.binding, sessionId: kind === "navigate_session" ? "source" : `child-${operationId}`,
         backendId: "native", backendInstanceGeneration: 0, targetId: "workspace", effectiveWorkspaceRoot: "D:/workspace",
         binding: native(operationId, kind === "navigate_session" ? 1 : 0) };
+    },
+    attempt(
+      input: RecordNativeSessionDerivationInput,
+      worktree?: PrepareNativeSessionDerivationInput["worktree"]
+    ): PrepareNativeSessionDerivationInput {
+      const exactWorktree = worktree ?? input.worktree;
+      return {
+        operationId: input.operationId,
+        expectedBodyHash: input.expectedBodyHash,
+        sourceSessionId: input.sourceSessionId,
+        sourceBinding: input.sourceBinding,
+        sourceSessionRevision: store.getSession(input.sourceSessionId).revision,
+        sessionId: input.sessionId,
+        backendId: input.backendId,
+        backendInstanceGeneration: input.backendInstanceGeneration,
+        targetId: input.targetId,
+        targetRevision: store.getTarget(input.targetId).revision,
+        effectiveWorkspaceRoot: input.effectiveWorkspaceRoot,
+        ...(input.remoteWorkspace === undefined ? {} : { remoteWorkspace: input.remoteWorkspace }),
+        ...(exactWorktree === undefined ? {} : { worktree: exactWorktree })
+      };
     },
     child(input: RecordNativeSessionDerivationInput): SessionDescriptor {
       return { ...descriptor(input.sessionId, input.binding), derivationOrigin: { kind: "clone", sourceSessionId: input.sourceSessionId } };

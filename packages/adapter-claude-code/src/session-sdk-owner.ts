@@ -4,12 +4,15 @@ import { Worker, type WorkerOptions } from "node:worker_threads";
 import type { ClaudeSdkGetSessionMessagesOptions, ClaudeSdkListSessionsOptions } from "./sdk-runtime.js";
 import {
   adoptClaudeSessionStoreChild,
+  claimClaudeSessionStoreSession,
+  cleanupClaudeSessionStoreOperation,
   createClaudeSessionStoreAuthority,
   createClaudeSessionStoreSessionAccess,
   discardClaudeSessionStoreImport,
   prepareClaudeSessionStoreDerivation,
   prepareClaudeSessionStoreImport,
   readClaudeSessionStoreOperation,
+  recoverClaudeSessionStoreOperation,
   rebindClaudeSessionStoreGeneration,
   type ClaudeSessionStoreAuthority,
   type ClaudeSessionStoreOperationAccess,
@@ -133,6 +136,27 @@ export class SessionSdkOwner {
     return readClaudeSessionStoreOperation(this.#requireSessionStoreAuthority(), access);
   }
 
+  recoverStoredSessionOperation(input: {
+    readonly operationId: string;
+    readonly targetWorkspaceAuthority: string;
+    readonly expectedChildSessionId?: string;
+  }): ClaudeSessionStoreOperationAccess {
+    if (this.ownsStoreOperation(input.operationId)) {
+      throw new SessionSdkFailure("CLEANUP_UNKNOWN", true);
+    }
+    return recoverClaudeSessionStoreOperation(this.#requireSessionStoreAuthority(), input);
+  }
+
+  cleanupStoredSessionOperation(
+    access: ClaudeSessionStoreOperationAccess,
+    input: { readonly expectedChildSessionId?: string } = {}
+  ): ClaudeSessionStoreOperationSnapshot {
+    if (this.ownsStoreOperation(access.operationId)) {
+      throw new SessionSdkFailure("CLEANUP_UNKNOWN", true);
+    }
+    return cleanupClaudeSessionStoreOperation(this.#requireSessionStoreAuthority(), access, input);
+  }
+
   discardSessionImport(access: ClaudeSessionStoreOperationAccess): void {
     if (this.ownsStoreOperation(access.operationId)) {
       throw new SessionSdkFailure("CLEANUP_UNKNOWN", true);
@@ -142,6 +166,13 @@ export class SessionSdkOwner {
 
   adoptStoredSession(access: ClaudeSessionStoreOperationAccess, sessionId: string): ClaudeSessionStoreSessionAccess {
     return adoptClaudeSessionStoreChild(this.#requireSessionStoreAuthority(), access, sessionId);
+  }
+
+  claimStoredSession(input: {
+    readonly workspaceAuthority: string;
+    readonly sessionId: string;
+  }): ClaudeSessionStoreSessionAccess {
+    return claimClaudeSessionStoreSession(this.#requireSessionStoreAuthority(), input);
   }
 
   rebindStoredSession(input: {

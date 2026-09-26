@@ -36,6 +36,7 @@ import {
   type NativeMemoryStatus,
   type NativeSessionBinding,
   type NativeSessionDerivation,
+  type NativeSessionDerivationLifecycle,
   type NativeSessionForkResult,
   type NativeSessionNavigation,
   type NativeSessionNavigationResult,
@@ -116,10 +117,17 @@ import {
   resetClaudeNativeMemory,
   scanClaudeNativeMemory
 } from "./native-memory.js";
+import {
+  ClaudeSessionStoreError,
+  type ClaudeSessionStoreOperationSnapshot,
+  type ClaudeSessionStoreOperationAccess,
+  type ClaudeSessionStoreSessionAccess
+} from "./claude-session-store.js";
 
 const ADAPTER_ID = "claude-code";
 const PROVIDER_ID = "claude-code";
 const OPAQUE_REFERENCE_PREFIX = "claude-code:session:";
+const STORED_OPAQUE_REFERENCE_PREFIX = "claude-code:stored-session:";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 20_000;
 const DEFAULT_ADMISSION_TIMEOUT_MS = 20_000;
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
@@ -513,6 +521,8 @@ interface NativeRuntime {
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
   readonly nativeSessionId: string;
+  readonly storedSessionAccess?: ClaudeSessionStoreSessionAccess;
+  readonly storedInitialization?: Deferred<void>;
   readonly gate: AsyncInputGate<ClaudeSdkUserMessage>;
   readonly abortController: AbortController;
   readonly query: ClaudeSdkQuery;
@@ -1197,11 +1207,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return nativeState(existing);
     }
     assertStandardReviewContext(context, "inspect a detached native Session");
-    const nativeSessionId = parseBinding(binding);
+    const route = parseBindingRoute(binding);
+    const nativeSessionId = route.nativeSessionId;
     const scoped = await this.#targetRuntime(context.target, context.signal);
-    const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped);
+    const storedAccess = route.kind === "stored"
+      ? this.#claimStoredSession(route, context.target, scoped)
+      : undefined;
+    const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped, storedAccess);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
+    if (storedAccess === undefined) assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
+    else assertSessionInfoIdentity(info, nativeSessionId);
     return {
       binding,
       ...(info.customTitle === undefined ? {} : { name: this.#projection.text(info.customTitle, 512) }),
@@ -1224,20 +1239,38 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const nativeSessionId = parseBinding(binding);
     if (nativeSessionId !== runtime.nativeSessionId) throw continuityGap();
 
-    const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, targetRuntimeOf(runtime));
+    const info = await this.#sessionInfo(
+      nativeSessionId,
+      context.target,
+      context.signal,
+      targetRuntimeOf(runtime),
+      runtime.storedSessionAccess
+    );
     this.#assertCurrent(runtime, context, binding);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+    if (runtime.storedSessionAccess === undefined) {
+      assertSessionInfo(info, nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+    } else {
+      assertSessionInfoIdentity(info, nativeSessionId);
+    }
 
     let messages: readonly ClaudeSdkSessionMessage[];
     try {
       runtime.assertRuntimeCurrent();
-      messages = await runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
-        dir: runtime.runtimeWorkspaceRoot,
-        limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
-        offset: 0,
-        includeSystemMessages: true
-      });
+      messages = runtime.storedSessionAccess === undefined
+        ? await runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
+            dir: runtime.runtimeWorkspaceRoot,
+            limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
+            offset: 0,
+            includeSystemMessages: true
+          })
+        : await runtime.sdkRuntime.storedSessions!.getSessionMessages(nativeSessionId, {
+            dir: runtime.runtimeWorkspaceRoot,
+            limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
+            offset: 0,
+            includeSystemMessages: true,
+            access: runtime.storedSessionAccess
+          });
       runtime.assertRuntimeCurrent();
     } catch {
       throw claudeCodeError(
@@ -1252,10 +1285,20 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       );
     }
     this.#assertCurrent(runtime, context, binding);
-    const confirmedInfo = await this.#sessionInfo(nativeSessionId, context.target, context.signal, targetRuntimeOf(runtime));
+    const confirmedInfo = await this.#sessionInfo(
+      nativeSessionId,
+      context.target,
+      context.signal,
+      targetRuntimeOf(runtime),
+      runtime.storedSessionAccess
+    );
     this.#assertCurrent(runtime, context, binding);
     if (confirmedInfo === undefined) throw continuityGap();
-    assertSessionInfo(confirmedInfo, nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+    if (runtime.storedSessionAccess === undefined) {
+      assertSessionInfo(confirmedInfo, nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+    } else {
+      assertSessionInfoIdentity(confirmedInfo, nativeSessionId);
+    }
     if (!Array.isArray(messages)) throw invalidNativeHistory();
     if (messages.length > MAX_NATIVE_HISTORY_MESSAGES) {
       throw claudeCodeError(
@@ -1313,8 +1356,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     assertStandardReviewContext(context, "delete native Session state");
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
-    const nativeSessionId = parseBinding(binding);
+    const route = parseBindingRoute(binding);
+    const nativeSessionId = route.nativeSessionId;
     const targetRuntime = await this.#targetRuntime(context.target, context.signal);
+    const storedAccess = route.kind === "stored"
+      ? this.#claimStoredSession(route, context.target, targetRuntime)
+      : undefined;
     if (targetRuntime.runtime.ownsSessionFork(nativeSessionId)
       || [...this.#sessions.values()].some((runtime) => runtime.nativeSessionId === nativeSessionId && runtime.productSessionId !== context.sessionId)) {
       throw claudeCodeError("NATIVE_SESSION_DELETE_BUSY", "The native Session still has an active owner.", "session_delete", {
@@ -1332,10 +1379,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     try {
       targetRuntime.assertCurrent();
-      const info = await targetRuntime.runtime.getSessionInfo(nativeSessionId, {
-        dir: targetRuntime.workspaceRoot,
-        signal: context.signal
-      });
+      const info = storedAccess === undefined
+        ? await targetRuntime.runtime.getSessionInfo(nativeSessionId, {
+            dir: targetRuntime.workspaceRoot,
+            signal: context.signal
+          })
+        : await targetRuntime.runtime.storedSessions!.getSessionInfo(nativeSessionId, {
+            dir: targetRuntime.workspaceRoot,
+            access: storedAccess,
+            signal: context.signal
+          });
       await this.validateTarget(context.target);
       targetRuntime.assertCurrent();
       context.signal.throwIfAborted();
@@ -1347,8 +1400,20 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       // The SDK may search related worktree stores for this UUID. Metadata is
       // the public authority for the exact workspace selected by this delete.
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, nativeSessionId, targetRuntime.workspaceRoot, targetRuntime.remote);
-      await targetRuntime.runtime.deleteSession(nativeSessionId, { dir: targetRuntime.workspaceRoot, signal: context.signal });
+      if (storedAccess === undefined) {
+        assertSessionInfo(info, nativeSessionId, targetRuntime.workspaceRoot, targetRuntime.remote);
+        await targetRuntime.runtime.deleteSession(nativeSessionId, {
+          dir: targetRuntime.workspaceRoot,
+          signal: context.signal
+        });
+      } else {
+        assertSessionInfoIdentity(info, nativeSessionId);
+        await targetRuntime.runtime.storedSessions!.deleteSession(nativeSessionId, {
+          dir: targetRuntime.workspaceRoot,
+          access: storedAccess,
+          signal: context.signal
+        });
+      }
       targetRuntime.assertCurrent();
     } catch {
       throw claudeCodeError("NATIVE_SESSION_DELETE_UNKNOWN", "The native Session delete outcome is unknown.", "session_delete", {
@@ -1719,6 +1784,127 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return { binding: (await this.#deriveSession(context, derivation, entryId)).binding };
   }
 
+  ownsNativeSessionDerivationLifecycle(lifecycle: NativeSessionDerivationLifecycle): boolean {
+    if (this.#runtime.storedSessions === undefined
+      || lifecycle.sourceTarget.remoteWorkspace !== undefined
+      || lifecycle.target.remoteWorkspace !== undefined) return false;
+    const source = parseBindingRoute(lifecycle.sourceBinding);
+    if (source.kind === "stored") {
+      return source.workspaceAuthority === claudeWorkspaceAuthority(lifecycle.sourceTarget);
+    }
+    return canonicalPathKey(effectiveTargetWorkspace(lifecycle.sourceTarget))
+      !== canonicalPathKey(effectiveTargetWorkspace(lifecycle.target));
+  }
+
+  async adoptNativeSessionDerivation(
+    lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding },
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    if (!this.ownsNativeSessionDerivationLifecycle(lifecycle)) {
+      throw claudeCodeError(
+        "NATIVE_SESSION_ADOPTION_UNKNOWN",
+        "The durable native Session adoption authority is unavailable.",
+        "session_adoption",
+        { stateMayHaveChanged: true, recovery: "Keep the Product Session and reconcile its exact Store operation." }
+      );
+    }
+    const storedSessions = this.#runtime.storedSessions!;
+    const parsed = parseBindingRoute(lifecycle.binding);
+    const targetWorkspaceAuthority = claudeWorkspaceAuthority(lifecycle.target);
+    if (parsed.kind !== "stored" || parsed.workspaceAuthority !== targetWorkspaceAuthority) throw continuityGap();
+    try {
+      const access = storedSessions.recoverOperation({
+        operationId: operationUuid(lifecycle.operationId),
+        targetWorkspaceAuthority,
+        expectedChildSessionId: parsed.nativeSessionId
+      });
+      const snapshot = storedSessions.readOperation(access);
+      let sessionAccess: ClaudeSessionStoreSessionAccess;
+      if (snapshot.state === "cleaned") {
+        if (!snapshot.childReservationConfirmed || snapshot.childSessionId !== parsed.nativeSessionId) {
+          throw new Error("Stored derivation was cleaned before adoption.");
+        }
+        sessionAccess = storedSessions.claim({
+          workspaceAuthority: targetWorkspaceAuthority,
+          sessionId: parsed.nativeSessionId
+        });
+      } else {
+        sessionAccess = storedSessions.adopt(access, parsed.nativeSessionId);
+        storedSessions.cleanupOperation(access, { expectedChildSessionId: parsed.nativeSessionId });
+      }
+      if (sessionAccess.workspaceAuthority !== targetWorkspaceAuthority
+        || sessionAccess.sessionId !== parsed.nativeSessionId) throw new Error("Stored adoption returned different authority.");
+      signal.throwIfAborted();
+    } catch {
+      throw claudeCodeError(
+        "NATIVE_SESSION_ADOPTION_UNKNOWN",
+        "The durable native Session adoption outcome is unknown.",
+        "session_adoption",
+        {
+          retryable: true,
+          stateMayHaveChanged: true,
+          recovery: "Keep the Product Session and reconcile its exact Store operation before retrying."
+        }
+      );
+    }
+  }
+
+  async cleanupNativeSessionDerivation(
+    lifecycle: NativeSessionDerivationLifecycle,
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    const storedSessions = this.#runtime.storedSessions;
+    if (storedSessions === undefined || lifecycle.target.remoteWorkspace !== undefined) {
+      throw claudeCodeError(
+        "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
+        "The durable native Session cleanup authority is unavailable.",
+        "session_cleanup",
+        { stateMayHaveChanged: true, recovery: "Restore the exact local Store owner before reconciling cleanup." }
+      );
+    }
+    const targetWorkspaceAuthority = claudeWorkspaceAuthority(lifecycle.target);
+    const parsed = lifecycle.binding === undefined ? undefined : parseBindingRoute(lifecycle.binding);
+    if (parsed !== undefined && (parsed.kind !== "stored" || parsed.workspaceAuthority !== targetWorkspaceAuthority)) {
+      throw continuityGap();
+    }
+    let access: ClaudeSessionStoreOperationAccess;
+    try {
+      access = storedSessions.recoverOperation({
+        operationId: operationUuid(lifecycle.operationId),
+        targetWorkspaceAuthority,
+        ...(parsed === undefined ? {} : { expectedChildSessionId: parsed.nativeSessionId })
+      });
+    } catch (error) {
+      // The Host omits the binding only for a prepared receipt that never
+      // recorded a child. Once a binding exists, a missing operation can also
+      // mean the durable operation catalog was lost, so cleanup must remain
+      // unknown and retain the Product receipt and workspace authority.
+      if (parsed === undefined && error instanceof ClaudeSessionStoreError && error.code === "NOT_FOUND") return;
+      throw claudeCodeError(
+        "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
+        "The durable native Session cleanup outcome is unknown.",
+        "session_cleanup",
+        { stateMayHaveChanged: true, recovery: "Inspect the exact Store operation before retrying cleanup." }
+      );
+    }
+    try {
+      const snapshot: ClaudeSessionStoreOperationSnapshot = storedSessions.cleanupOperation(access, {
+        ...(parsed === undefined ? {} : { expectedChildSessionId: parsed.nativeSessionId })
+      });
+      if (snapshot.state !== "cleaned") throw new Error("Stored derivation cleanup did not settle.");
+      signal.throwIfAborted();
+    } catch {
+      throw claudeCodeError(
+        "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
+        "The durable native Session cleanup outcome is unknown.",
+        "session_cleanup",
+        { stateMayHaveChanged: true, recovery: "Inspect the exact Store operation before retrying cleanup." }
+      );
+    }
+  }
+
   override async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext,
     customInstructions: string | undefined, navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
     if (target.kind === "session_start") return this.unsupported("session.rewind_to_start");
@@ -1736,6 +1922,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const runtime = this.#requireIdleRuntime(context);
     const phase = replacement ? "session_navigation" : entryId === undefined ? "session_clone" : "session_fork";
     const derivedTarget = "target" in derivation ? derivation.target : context.target;
+    const sourceRoute = parseBindingRoute(runtime.binding);
+    const storedSessions = runtime.sdkRuntime.storedSessions;
+    const useStoredDerivation = !runtime.remote && storedSessions !== undefined
+      && (sourceRoute.kind === "stored"
+        || canonicalPathKey(effectiveTargetWorkspace(context.target))
+          !== canonicalPathKey(effectiveTargetWorkspace(derivedTarget)));
+    const derivationStore = useStoredDerivation ? storedSessions! : undefined;
+    if (sourceRoute.kind === "stored"
+      && sourceRoute.workspaceAuthority !== claudeWorkspaceAuthority(context.target)) throw continuityGap();
     if ("target" in derivation) {
       assertClaudeDerivationTarget(
         context.target,
@@ -1761,12 +1956,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       await this.validateTarget(runtime.target);
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
-      const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, signal), this.#initializationTimeoutMs, signal,
+      const info = await waitFor(this.#sessionInfo(
+        runtime.nativeSessionId,
+        runtime.target,
+        signal,
+        undefined,
+        runtime.storedSessionAccess
+      ), this.#initializationTimeoutMs, signal,
         () => new SessionSdkFailure("TIMEOUT", false));
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      if (runtime.storedSessionAccess === undefined) {
+        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      } else {
+        assertSessionInfoIdentity(info, runtime.nativeSessionId);
+      }
       let sourceHistory: readonly ValidatedHistoryMessage[] | undefined;
       let boundaryId: string | undefined;
       let prefix: readonly ValidatedHistoryMessage[] | undefined;
@@ -1786,35 +1991,91 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (runtime.nativeTasks.hasActiveTasks()) throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase);
+      const recordSessionId = (sessionId: string): void => {
+        if (!uuidPattern().test(sessionId)) throw new Error("Native Session copy returned an invalid identity.");
+        const normalized = sessionId.toLowerCase();
+        const binding = useStoredDerivation
+          ? storedBindingFor(normalized, claudeWorkspaceAuthority(derivedTarget), context.generation + (replacement ? 1 : 0))
+          : bindingFor(normalized, context.generation + (replacement ? 1 : 0));
+        if (normalized === runtime.nativeSessionId.toLowerCase()
+          || [...this.#sessions.values()].some((session) => session.nativeSessionId.toLowerCase() === normalized)) {
+          throw new Error("Native Session copy returned an owned identity.");
+        }
+        derivation.recordBinding(binding);
+        registered = binding;
+      };
+      let operationAccess: ClaudeSessionStoreOperationAccess | undefined;
+      if (useStoredDerivation) {
+        const operationId = context.operationId;
+        if (operationId === undefined) throw new Error("Stored native derivation requires its durable operation identity.");
+        const sourceWorkspaceAuthority = sourceRoute.kind === "stored"
+          ? sourceRoute.workspaceAuthority
+          : claudeWorkspaceAuthority(context.target);
+        const targetWorkspaceAuthority = claudeWorkspaceAuthority(derivedTarget);
+        operationAccess = sourceRoute.kind === "stored"
+          ? derivationStore!.prepareDerivation({
+              operationId: operationUuid(operationId),
+              sourceWorkspaceAuthority,
+              sourceSessionId: runtime.nativeSessionId,
+              targetWorkspaceAuthority
+            })
+          : derivationStore!.prepareImport({
+              operationId: operationUuid(operationId),
+              sourceWorkspaceAuthority,
+              sourceSessionId: runtime.nativeSessionId,
+              targetWorkspaceAuthority
+            });
+        if (sourceRoute.kind !== "stored") {
+          await derivationStore!.importSession(runtime.nativeSessionId, {
+            dir: runtime.runtimeWorkspaceRoot,
+            access: operationAccess,
+            signal
+          });
+        }
+      }
       dispatched = true;
       runtime.assertRuntimeCurrent();
-      const result = await runtime.sdkRuntime.forkSession(runtime.nativeSessionId, {
-        dir: effectiveTargetWorkspace(derivedTarget),
-        ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
-        signal,
-        recordSessionId: (sessionId) => {
-          if (!uuidPattern().test(sessionId)) throw new Error("Native Session copy returned an invalid identity.");
-          const binding = bindingFor(sessionId.toLowerCase(), context.generation + (replacement ? 1 : 0));
-          if (sessionId.toLowerCase() === runtime.nativeSessionId.toLowerCase()
-            || [...this.#sessions.values()].some((session) => session.nativeSessionId.toLowerCase() === sessionId.toLowerCase())) {
-            throw new Error("Native Session copy returned an owned identity.");
-          }
-          derivation.recordBinding(binding);
-          registered = binding;
-        }
-      });
+      const result = useStoredDerivation
+        ? await derivationStore!.forkSession(runtime.nativeSessionId, {
+            dir: effectiveTargetWorkspace(derivedTarget),
+            access: operationAccess!,
+            ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
+            signal,
+            recordSessionId
+          })
+        : await runtime.sdkRuntime.forkSession(runtime.nativeSessionId, {
+            dir: effectiveTargetWorkspace(derivedTarget),
+            ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
+            signal,
+            recordSessionId
+          });
       runtime.assertRuntimeCurrent();
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (registered === undefined || registered.nativeSessionId !== result.sessionId.toLowerCase()) throw new Error("Native Session copy lacks its receipt.");
-      const derivedInfo = await waitFor(this.#sessionInfo(result.sessionId, derivedTarget, signal), this.#initializationTimeoutMs, signal,
+      const derivedInfo = await waitFor(useStoredDerivation
+        ? derivationStore!.getSessionInfo(result.sessionId, {
+            dir: effectiveTargetWorkspace(derivedTarget),
+            access: operationAccess!,
+            signal
+          })
+        : this.#sessionInfo(result.sessionId, derivedTarget, signal), this.#initializationTimeoutMs, signal,
         () => new SessionSdkFailure("TIMEOUT", true));
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (derivedInfo === undefined) throw continuityGap();
-      assertSessionInfo(derivedInfo, result.sessionId, effectiveTargetWorkspace(derivedTarget), runtime.remote);
+      if (useStoredDerivation) assertSessionInfoIdentity(derivedInfo, result.sessionId);
+      else assertSessionInfo(derivedInfo, result.sessionId, effectiveTargetWorkspace(derivedTarget), runtime.remote);
       if (sourceHistory !== undefined && prefix !== undefined) {
-        const derivedHistory = await this.#readForkHistory(runtime, result.sessionId, signal, effectiveTargetWorkspace(derivedTarget));
+        const derivedHistory = useStoredDerivation
+          ? await this.#readStoredForkHistory(
+              derivationStore!,
+              operationAccess!,
+              result.sessionId,
+              signal,
+              effectiveTargetWorkspace(derivedTarget)
+            )
+          : await this.#readForkHistory(runtime, result.sessionId, signal, effectiveTargetWorkspace(derivedTarget));
         const derivedMessages = derivedHistory.entries.filter((entry) => entry.type !== "system");
         const sourceIds = new Set(sourceHistory.map((entry) => entry.uuid));
         if (derivedHistory.entries.some((entry) => entry.child || sourceIds.has(entry.uuid))
@@ -1824,6 +2085,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         }
         await this.#assertForkSourceUnchanged(runtime, context, info, signal);
         nativeHistory = projectNativeHistory(derivedHistory.messages, result.sessionId.toLowerCase(), this.#projection);
+      } else {
+        await this.#assertForkSourceUnchanged(runtime, context, info, signal);
       }
       return { binding: registered, ...(nativeHistory === undefined ? {} : { nativeHistory }) };
     } catch (error) {
@@ -1842,10 +2105,44 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     readonly entries: readonly ValidatedHistoryMessage[];
   }> {
     runtime.assertRuntimeCurrent();
-    const messages = await waitFor(runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
-      dir: workspaceRoot, limit: MAX_NATIVE_HISTORY_MESSAGES + 1, offset: 0, includeSystemMessages: true, signal
-    }), this.#initializationTimeoutMs, signal, () => new SessionSdkFailure("TIMEOUT", false));
+    const messages = await waitFor(runtime.storedSessionAccess === undefined
+      ? runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
+          dir: workspaceRoot, limit: MAX_NATIVE_HISTORY_MESSAGES + 1, offset: 0, includeSystemMessages: true, signal
+        })
+      : runtime.sdkRuntime.storedSessions!.getSessionMessages(nativeSessionId, {
+          dir: workspaceRoot,
+          limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
+          offset: 0,
+          includeSystemMessages: true,
+          access: runtime.storedSessionAccess,
+          signal
+        }), this.#initializationTimeoutMs, signal, () => new SessionSdkFailure("TIMEOUT", false));
     runtime.assertRuntimeCurrent();
+    signal.throwIfAborted();
+    if (!Array.isArray(messages) || messages.length > MAX_NATIVE_HISTORY_MESSAGES) throw invalidNativeHistory();
+    const entries = messages.map((message) => validatedHistoryMessage(message, nativeSessionId));
+    if (new Set(entries.map((entry) => entry.uuid)).size !== entries.length) throw invalidNativeHistory();
+    return { messages, entries };
+  }
+
+  async #readStoredForkHistory(
+    storedSessions: NonNullable<ClaudeSdkRuntime["storedSessions"]>,
+    access: ClaudeSessionStoreOperationAccess,
+    nativeSessionId: string,
+    signal: AbortSignal,
+    workspaceRoot: string
+  ): Promise<{
+    readonly messages: readonly ClaudeSdkSessionMessage[];
+    readonly entries: readonly ValidatedHistoryMessage[];
+  }> {
+    const messages = await waitFor(storedSessions.getSessionMessages(nativeSessionId, {
+      dir: workspaceRoot,
+      limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
+      offset: 0,
+      includeSystemMessages: true,
+      access,
+      signal
+    }), this.#initializationTimeoutMs, signal, () => new SessionSdkFailure("TIMEOUT", false));
     signal.throwIfAborted();
     if (!Array.isArray(messages) || messages.length > MAX_NATIVE_HISTORY_MESSAGES) throw invalidNativeHistory();
     const entries = messages.map((message) => validatedHistoryMessage(message, nativeSessionId));
@@ -1857,12 +2154,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     await this.validateTarget(runtime.target);
     signal.throwIfAborted();
     this.#assertCurrent(runtime, context, context.binding);
-    const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, signal), this.#initializationTimeoutMs, signal,
+    const info = await waitFor(this.#sessionInfo(
+      runtime.nativeSessionId,
+      runtime.target,
+      signal,
+      undefined,
+      runtime.storedSessionAccess
+    ), this.#initializationTimeoutMs, signal,
       () => new SessionSdkFailure("TIMEOUT", false));
     signal.throwIfAborted();
     this.#assertCurrent(runtime, context, context.binding);
     if (info === undefined) throw continuityGap();
-    assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+    if (runtime.storedSessionAccess === undefined) {
+      assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+    } else {
+      assertSessionInfoIdentity(info, runtime.nativeSessionId);
+    }
     if (!Number.isFinite(initialInfo.lastModified) || info.lastModified !== initialInfo.lastModified || runtime.nativeTasks.hasActiveTasks()) {
       throw claudeCodeError("NATIVE_SESSION_FORK_SOURCE_CHANGED", "Native history changed while its fork was being prepared.", "session_fork");
     }
@@ -2000,7 +2307,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     runtime.pendingControl = token;
     let retired = false;
     try {
-      const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal),
+      const info = await waitFor(this.#sessionInfo(
+        runtime.nativeSessionId,
+        runtime.target,
+        context.signal,
+        undefined,
+        runtime.storedSessionAccess
+      ),
         this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
       this.#assertCurrent(runtime, context, context.binding);
       let confirmFreshAfterRetirement = false;
@@ -2010,11 +2323,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         this.#assertCurrent(runtime, context, context.binding);
         confirmFreshAfterRetirement = true;
       } else {
-        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+        if (runtime.storedSessionAccess === undefined) {
+          assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+        } else {
+          assertSessionInfoIdentity(info, runtime.nativeSessionId);
+        }
       }
       retired = true;
       await this.#retireRuntime(runtime);
-      if (!runtime.remote) {
+      if (!runtime.remote && runtime.storedSessionAccess === undefined) {
         await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
           context.signal, () => managedRouteUnavailable(true));
       }
@@ -2024,13 +2341,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           runtime.nativeSessionId,
           runtime.target,
           context.signal,
-          targetRuntimeOf(runtime)
+          targetRuntimeOf(runtime),
+          runtime.storedSessionAccess
         ), this.#initializationTimeoutMs, context.signal, () => managedRouteUnavailable(true));
         if (confirmedInfo === undefined) {
           if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
           restartFresh = true;
         } else {
-          assertSessionInfo(confirmedInfo, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+          if (runtime.storedSessionAccess === undefined) {
+            assertSessionInfo(confirmedInfo, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+          } else {
+            assertSessionInfoIdentity(confirmedInfo, runtime.nativeSessionId);
+          }
         }
       }
       context.signal.throwIfAborted();
@@ -2082,7 +2404,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     let retired = false;
     try {
-      const info = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal),
+      const info = await waitFor(this.#sessionInfo(
+        runtime.nativeSessionId,
+        runtime.target,
+        context.signal,
+        undefined,
+        runtime.storedSessionAccess
+      ),
         this.#initializationTimeoutMs, context.signal, () => mcpBindUnknown());
       this.#assertCurrent(runtime, context, runtime.binding);
       let confirmFresh = false;
@@ -2090,21 +2418,34 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (!runtime.freshSessionCanRestart || await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
         this.#assertCurrent(runtime, context, runtime.binding);
         confirmFresh = true;
-      } else assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      } else if (runtime.storedSessionAccess === undefined) {
+        assertSessionInfo(info, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+      } else {
+        assertSessionInfoIdentity(info, runtime.nativeSessionId);
+      }
       retired = true;
       await this.#retireRuntime(runtime);
-      if (!runtime.remote) {
+      if (!runtime.remote && runtime.storedSessionAccess === undefined) {
         await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
           context.signal, () => mcpBindUnknown());
       }
       let fresh = false;
       if (confirmFresh) {
-        const current = await waitFor(this.#sessionInfo(runtime.nativeSessionId, runtime.target, context.signal,
-          targetRuntimeOf(runtime)), this.#initializationTimeoutMs, context.signal, () => mcpBindUnknown());
+        const current = await waitFor(this.#sessionInfo(
+          runtime.nativeSessionId,
+          runtime.target,
+          context.signal,
+          targetRuntimeOf(runtime),
+          runtime.storedSessionAccess
+        ), this.#initializationTimeoutMs, context.signal, () => mcpBindUnknown());
         if (current === undefined) {
           if (await this.#sessionHasHistory(runtime, context.signal)) throw continuityGap();
           fresh = true;
-        } else assertSessionInfo(current, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+        } else if (runtime.storedSessionAccess === undefined) {
+          assertSessionInfo(current, runtime.nativeSessionId, runtime.runtimeWorkspaceRoot, runtime.remote);
+        } else {
+          assertSessionInfoIdentity(current, runtime.nativeSessionId);
+        }
       }
       context.signal.throwIfAborted();
       lease.assertCurrent();
@@ -2391,11 +2732,26 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (launch.mcpLease !== undefined && launch.runtimePolicy !== "standard") {
       throw claudeCodeError("MCP_QUERY_BIND_UNAVAILABLE", "The MCP Query route does not belong to a standard Session.", "session_start");
     }
-    const nativeSessionId = parseBinding(binding);
+    const route = parseBindingRoute(binding);
+    const nativeSessionId = route.nativeSessionId;
+    const storedSessionAccess = route.kind === "stored"
+      ? this.#claimStoredSession(route, context.target, scoped)
+      : undefined;
+    if (storedSessionAccess !== undefined && !launch.resume) throw continuityGap();
     if (launch.resume) {
-      const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped);
+      const info = await this.#sessionInfo(
+        nativeSessionId,
+        context.target,
+        context.signal,
+        scoped,
+        storedSessionAccess
+      );
       if (info === undefined) throw continuityGap();
-      assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
+      if (storedSessionAccess === undefined) {
+        assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
+      } else {
+        assertSessionInfoIdentity(info, nativeSessionId);
+      }
     }
     const providerId = launch.providerId ?? context.modelSelection?.providerId;
     const modelId = launch.modelId ?? context.modelSelection?.modelId;
@@ -2465,7 +2821,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       );
     }
     let runtime: NativeRuntime | undefined;
-    const startedQuery = await this.#createQuery(scoped, gate, abortController, nativeSessionId, context, launch, managedRoute, (...args) => {
+    const storedInitialization = storedSessionAccess === undefined ? undefined : deferred<void>();
+    // Runtime creation can fail before the explicit initialization wait is
+    // installed. Keep rejection observed while preserving the original promise
+    // as the authoritative live-cwd proof below.
+    void storedInitialization?.promise.catch(() => undefined);
+    const startedQuery = await this.#createQuery(
+      scoped,
+      gate,
+      abortController,
+      nativeSessionId,
+      context,
+      launch,
+      managedRoute,
+      storedSessionAccess,
+      (...args) => {
       if (runtime === undefined) {
         return Promise.resolve({ behavior: "deny", message: "The native Session is not ready." });
       }
@@ -2492,6 +2862,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         backendInstanceGeneration: this.#instanceGeneration,
         queryGeneration: this.#nextQueryGeneration++,
         nativeSessionId,
+        ...(storedSessionAccess === undefined ? {} : { storedSessionAccess }),
+        ...(storedInitialization === undefined ? {} : { storedInitialization }),
         gate,
         abortController,
         query,
@@ -2548,6 +2920,23 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           recovery: "Inspect native Session availability before retrying."
         })
       );
+      if (storedInitialization !== undefined) {
+        await waitFor(
+          storedInitialization.promise,
+          this.#initializationTimeoutMs,
+          context.signal,
+          () => claudeCodeError(
+            "NATIVE_INITIALIZATION_TIMEOUT",
+            "Claude Code did not confirm the stored Session workspace in time.",
+            "session_start",
+            {
+              retryable: true,
+              stateMayHaveChanged: true,
+              recovery: "Keep the product Session blocked and inspect the exact stored Session before retrying."
+            }
+          )
+        );
+      }
       this.#assertCurrent(runtime, context, binding);
       runtime.initialization = initialization;
       if (runtime.runtimePolicy === "review_read_only") assertReviewInitialization(initialization);
@@ -2611,6 +3000,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       readonly mcpLease?: ClaudeMcpRuntimeLease;
     },
     managedRoute: ManagedProviderRouteBinding | undefined,
+    storedSessionAccess: ClaudeSessionStoreSessionAccess | undefined,
     canUseTool: (
       toolName: string,
       input: Readonly<Record<string, unknown>>,
@@ -2806,6 +3196,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           ...(this.#pathToExecutable === undefined ? {} : { pathToClaudeCodeExecutable: this.#pathToExecutable }),
           permissionMode: toSdkPermissionMode(launch.permissionMode),
           persistSession: launch.runtimePolicy !== "review_read_only",
+          ...(storedSessionAccess === undefined ? {} : { sessionStoreAccess: storedSessionAccess }),
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
           settingSources: launch.runtimePolicy === "review_read_only" ? [] : [...this.#settingSources],
           systemPrompt: {
@@ -2850,6 +3241,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
       if (!runtime.closed) await this.#handleStreamFailure(runtime);
     } catch (error) {
+      runtime.storedInitialization?.reject(error);
       if (!runtime.closed) await this.#handleStreamFailure(runtime, error);
     }
   }
@@ -2920,6 +3312,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
       const apiKeySource = stringValue(envelope["apiKeySource"]);
       if (credentialSourceIsActive(apiKeySource)) this.#authenticationState = "authenticated";
+      runtime.storedInitialization?.resolve(undefined);
     }
 
     const turn = runtime.activeTurn;
@@ -4689,6 +5082,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const reason = retirementError?.(runtime.activeTurn?.inputConsumed === true)
         ?? pendingAdmissionFailure
         ?? new Error("The native runtime was retired.");
+      runtime.storedInitialization?.reject(reason);
       runtime.activeTurn?.admission.reject(reason);
       runtime.activeTurn?.eventsReady.resolve(undefined);
       runtime.gate.close(reason);
@@ -4699,21 +5093,32 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         // The AbortController and closed generation fence remain authoritative.
       }
     }
-    if (runtime.remote) {
+    if (runtime.remote || runtime.storedSessionAccess !== undefined) {
       try {
         await runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs);
         runtime.assertRuntimeCurrent();
       } catch {
-        throw claudeCodeError(
-          "REMOTE_QUERY_RETIREMENT_UNKNOWN",
-          "The remote Claude Code Query did not confirm exact process retirement.",
-          "session_close",
-          {
-            retryable: true,
-            stateMayHaveChanged: true,
-            recovery: "Reconnect the exact Remote Host and inspect the native Session before resuming it."
-          }
-        );
+        throw runtime.remote
+          ? claudeCodeError(
+              "REMOTE_QUERY_RETIREMENT_UNKNOWN",
+              "The remote Claude Code Query did not confirm exact process retirement.",
+              "session_close",
+              {
+                retryable: true,
+                stateMayHaveChanged: true,
+                recovery: "Reconnect the exact Remote Host and inspect the native Session before resuming it."
+              }
+            )
+          : claudeCodeError(
+              "STORED_QUERY_RETIREMENT_UNKNOWN",
+              "The stored Claude Code Query did not confirm exact process retirement.",
+              "session_close",
+              {
+                retryable: true,
+                stateMayHaveChanged: true,
+                recovery: "Keep the exact stored Session fenced and retry retirement before resuming it."
+              }
+            );
       }
     }
     runtime.retirementConfirmed = true;
@@ -4732,10 +5137,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         providerAuthenticationRevoked(true).publicError,
         providerAuthenticationRevoked
       );
-      // Remote Queries already receive exact process retirement inside the
-      // ordinary runtime-retirement owner. Local Queries need the additional
-      // SDK confirmation before their credential may be deleted.
-      if (runtime.remote) return;
+      // Remote and Store-backed Queries already receive exact process
+      // retirement inside the ordinary runtime-retirement owner. Other local
+      // Queries need the additional SDK confirmation before their credential
+      // may be deleted.
+      if (runtime.remote || runtime.storedSessionAccess !== undefined) return;
       try {
         await runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs);
         runtime.assertRuntimeCurrent();
@@ -4763,19 +5169,50 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }));
   }
 
+  #claimStoredSession(
+    route: Extract<ParsedBindingRoute, { readonly kind: "stored" }>,
+    target: TargetDescriptor,
+    scoped: ClaudeTargetRuntime
+  ): ClaudeSessionStoreSessionAccess {
+    if (scoped.remote
+      || scoped.runtime.storedSessions === undefined
+      || route.workspaceAuthority !== claudeWorkspaceAuthority(target)) throw continuityGap();
+    try {
+      const access = scoped.runtime.storedSessions.claim({
+        workspaceAuthority: route.workspaceAuthority,
+        sessionId: route.nativeSessionId
+      });
+      if (access.workspaceAuthority !== route.workspaceAuthority
+        || access.sessionId !== route.nativeSessionId) throw new Error("Stored Session claim returned different authority.");
+      return access;
+    } catch {
+      throw continuityGap();
+    }
+  }
+
   async #sessionInfo(
     nativeSessionId: string,
     target: TargetDescriptor,
     signal?: AbortSignal,
-    existing?: ClaudeTargetRuntime
+    existing?: ClaudeTargetRuntime,
+    storedAccess?: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess
   ) {
     try {
       const scoped = existing ?? await this.#targetRuntime(target, signal);
       scoped.assertCurrent();
-      const info = await scoped.runtime.getSessionInfo(nativeSessionId, {
-        dir: scoped.workspaceRoot,
-        ...(signal === undefined ? {} : { signal })
-      });
+      if (storedAccess !== undefined && (scoped.remote || scoped.runtime.storedSessions === undefined)) {
+        throw new Error("Claude SessionStore authority is unavailable for this Target.");
+      }
+      const info = storedAccess === undefined
+        ? await scoped.runtime.getSessionInfo(nativeSessionId, {
+            dir: scoped.workspaceRoot,
+            ...(signal === undefined ? {} : { signal })
+          })
+        : await scoped.runtime.storedSessions!.getSessionInfo(nativeSessionId, {
+            dir: scoped.workspaceRoot,
+            access: storedAccess,
+            ...(signal === undefined ? {} : { signal })
+          });
       scoped.assertCurrent();
       return info;
     } catch {
@@ -4790,13 +5227,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   async #sessionHasHistory(runtime: NativeRuntime, signal: AbortSignal): Promise<boolean> {
     try {
       runtime.assertRuntimeCurrent();
-      const messages = await waitFor(runtime.sdkRuntime.getSessionMessages(runtime.nativeSessionId, {
-        dir: runtime.runtimeWorkspaceRoot,
-        limit: 1,
-        offset: 0,
-        includeSystemMessages: true,
-        signal
-      }), this.#initializationTimeoutMs, signal, () => claudeCodeError(
+      const messages = await waitFor(runtime.storedSessionAccess === undefined
+        ? runtime.sdkRuntime.getSessionMessages(runtime.nativeSessionId, {
+            dir: runtime.runtimeWorkspaceRoot,
+            limit: 1,
+            offset: 0,
+            includeSystemMessages: true,
+            signal
+          })
+        : runtime.sdkRuntime.storedSessions!.getSessionMessages(runtime.nativeSessionId, {
+            dir: runtime.runtimeWorkspaceRoot,
+            limit: 1,
+            offset: 0,
+            includeSystemMessages: true,
+            access: runtime.storedSessionAccess,
+            signal
+          }), this.#initializationTimeoutMs, signal, () => claudeCodeError(
         "NATIVE_SESSION_INSPECTION_FAILED",
         "The native Session could not be inspected.",
         "session_inspect",
@@ -5885,10 +6331,63 @@ function bindingFor(nativeSessionId: string, generation: number): NativeSessionB
   };
 }
 
+type ParsedBindingRoute =
+  | { readonly kind: "filesystem"; readonly nativeSessionId: string }
+  | { readonly kind: "stored"; readonly nativeSessionId: string; readonly workspaceAuthority: string };
+
+function storedBindingFor(
+  nativeSessionId: string,
+  workspaceAuthority: string,
+  generation: number
+): NativeSessionBinding {
+  if (!/^workspace-[0-9a-f]{64}$/u.test(workspaceAuthority)) throw continuityGap();
+  const normalized = normalizeNativeSessionId(nativeSessionId);
+  return {
+    opaqueRef: `${STORED_OPAQUE_REFERENCE_PREFIX}${workspaceAuthority}:${normalized}`,
+    nativeSessionId: normalized,
+    generation
+  };
+}
+
 function parseBinding(binding: NativeSessionBinding): string {
-  const nativeSessionId = parseNativeSessionReference(binding.opaqueRef);
+  return parseBindingRoute(binding).nativeSessionId;
+}
+
+function parseBindingRoute(binding: NativeSessionBinding): ParsedBindingRoute {
+  let route: ParsedBindingRoute;
+  if (binding.opaqueRef.startsWith(STORED_OPAQUE_REFERENCE_PREFIX)) {
+    const value = binding.opaqueRef.slice(STORED_OPAQUE_REFERENCE_PREFIX.length);
+    const separator = value.indexOf(":");
+    if (separator < 0 || value.indexOf(":", separator + 1) >= 0) throw continuityGap();
+    const workspaceAuthority = value.slice(0, separator);
+    const nativeSessionId = value.slice(separator + 1);
+    if (!/^workspace-[0-9a-f]{64}$/u.test(workspaceAuthority) || !uuidPattern().test(nativeSessionId)) {
+      throw continuityGap();
+    }
+    route = {
+      kind: "stored",
+      workspaceAuthority,
+      nativeSessionId: nativeSessionId.toLowerCase()
+    };
+  } else {
+    route = { kind: "filesystem", nativeSessionId: parseNativeSessionReference(binding.opaqueRef) };
+  }
+  const nativeSessionId = route.nativeSessionId;
   if (binding.nativeSessionId !== undefined && binding.nativeSessionId !== nativeSessionId) throw continuityGap();
-  return nativeSessionId;
+  return route;
+}
+
+function claudeWorkspaceAuthority(target: TargetDescriptor): string {
+  if (target.remoteWorkspace !== undefined) throw continuityGap();
+  const digest = createHash("sha256")
+    .update("joko-claude-workspace\0", "utf8")
+    .update(target.backendId, "utf8")
+    .update("\0", "utf8")
+    .update(target.id, "utf8")
+    .update("\0", "utf8")
+    .update(canonicalPathKey(target.workspaceRoot), "utf8")
+    .digest("hex");
+  return `workspace-${digest}`;
 }
 
 function parseNativeSessionReference(reference: string): string {
@@ -6305,8 +6804,12 @@ function assertSessionInfo(
   expectedCwd: string,
   remote = false
 ): void {
-  if (normalizeNativeSessionId(info.sessionId) !== expectedSessionId) throw continuityGap();
+  assertSessionInfoIdentity(info, expectedSessionId);
   assertSessionTarget(info.cwd, expectedCwd, remote);
+}
+
+function assertSessionInfoIdentity(info: ClaudeSdkSessionInfo, expectedSessionId: string): void {
+  if (normalizeNativeSessionId(info.sessionId) !== normalizeNativeSessionId(expectedSessionId)) throw continuityGap();
 }
 
 function assertSessionTarget(observedCwd: string | undefined, expectedCwd: string, remote = false): void {

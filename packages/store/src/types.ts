@@ -27,6 +27,7 @@ import type {
   SessionDescriptor,
   SessionAttention,
   SessionId,
+  SessionWorktreeBinding,
   SubagentRunDetail,
   SubagentRunState,
   SubagentTranscriptEntry,
@@ -1586,33 +1587,67 @@ export interface SessionLifecycleCleanupRecord {
   readonly revision: bigint;
 }
 
+export interface PrepareNativeSessionDerivationInput {
+  readonly operationId: string;
+  readonly expectedBodyHash: string;
+  readonly sourceSessionId: string;
+  readonly sourceBinding: SessionDescriptor["binding"];
+  /** Exact OperationalStore revisions frozen before any Adapter-side mutation. */
+  readonly sourceSessionRevision: bigint;
+  /** Stable new product Session identity, distinct from the source runtime key. */
+  readonly sessionId: string;
+  readonly backendId: string;
+  readonly backendInstanceGeneration: number;
+  readonly targetId: string;
+  readonly targetRevision: bigint;
+  readonly effectiveWorkspaceRoot: string;
+  readonly remoteWorkspace?: SessionDescriptor["remoteWorkspace"];
+  /** Exact derived checkout lease, when local workspace isolation was acquired. */
+  readonly worktree?: SessionWorktreeBinding;
+}
+
 export interface RecordNativeSessionDerivationInput {
   readonly operationId: string;
   readonly expectedBodyHash: string;
   readonly sourceSessionId: string;
   readonly sourceBinding: SessionDescriptor["binding"];
-  /** Stable new product Session identity, distinct from the source runtime key. */
   readonly sessionId: string;
   readonly backendId: string;
   readonly backendInstanceGeneration: number;
   readonly targetId: string;
   readonly effectiveWorkspaceRoot: string;
   readonly remoteWorkspace?: SessionDescriptor["remoteWorkspace"];
+  /** Exact derived checkout lease owned by this native effect, including when
+   * the Host (rather than the Adapter) owns post-failure cleanup. */
+  readonly worktree?: SessionWorktreeBinding;
   readonly binding: SessionDescriptor["binding"];
 }
 
 export type NativeSessionDerivationState =
+  | "prepared"
   | "recorded"
+  | "product_adopted"
   | "adopted"
   | "cleanup_claimed"
+  | "workspace_cleanup_pending"
   | "cleaned"
   | "cleanup_unknown";
 
 /** Private receipt for an exact native effect; never a transcript or credential store. */
-export interface NativeSessionDerivationRecord extends RecordNativeSessionDerivationInput {
+export interface NativeSessionDerivationRecord extends Omit<RecordNativeSessionDerivationInput, "binding"> {
+  readonly binding?: SessionDescriptor["binding"];
+  readonly sourceSessionRevision?: bigint;
+  readonly targetRevision?: bigint;
+  readonly worktree?: SessionWorktreeBinding;
+  readonly externalLifecycle: boolean;
+  /** Immutable attempts retain backendInstanceGeneration. This separate,
+   * durable CAS owner is the only Backend generation allowed to reconcile the
+   * pending lifecycle after a process restart. */
+  readonly lifecycleOwnerGeneration: number;
   readonly state: NativeSessionDerivationState;
   readonly cleanupToken?: string;
   readonly cleanupStartedAt?: UnixMillis;
+  readonly productAdoptedAt?: UnixMillis;
   readonly adoptedAt?: UnixMillis;
   readonly cleanedAt?: UnixMillis;
   readonly failureCode?: string;

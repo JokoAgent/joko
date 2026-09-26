@@ -65,6 +65,7 @@ export class SessionWorktreeCoordinator {
   readonly #store: OperationalStore;
   readonly #workspaces: WorkspaceService;
   readonly #service: EphemeralWorktreeService;
+  readonly #activeBindings = new Map<string, SessionWorktreeBinding>();
   #initialized = false;
 
   constructor(options: {
@@ -104,6 +105,10 @@ export class SessionWorktreeCoordinator {
     });
     if (!initialized.ok) throw new SessionWorktreeCoordinatorError(initialized.error.code);
     const active = new Map(this.#service.snapshot().active.map((lease) => [lease.sessionId, lease]));
+    this.#activeBindings.clear();
+    for (const lease of active.values()) {
+      this.#activeBindings.set(lease.sessionId, worktreeBindingFor(lease.sessionId, lease));
+    }
     for (const session of sessions) {
       const binding = session.descriptor.worktree!;
       if (session.descriptor.archived) {
@@ -114,22 +119,23 @@ export class SessionWorktreeCoordinator {
         continue;
       }
       const lease = active.get(session.descriptor.id);
-      if (lease === undefined || lease.id !== binding.leaseId
-        || resolve(lease.path) !== resolve(binding.path)
-        || resolve(lease.repositoryRoot) !== resolve(binding.repositoryRoot)
-        || lease.branch !== binding.branch
-        || lease.source.ref !== binding.sourceRef
-        || lease.source.commit !== binding.sourceCommit
-        || lease.source.strategy !== binding.sourceStrategy
-        || lease.source.refreshed !== binding.sourceRefreshed
-        || lease.source.remote !== binding.sourceRemote) {
+      if (lease === undefined || !sameLease(lease, { ...binding, state: "active" })) {
         if (binding.state !== "preserved") {
           this.#store.updateSessionWorktreeState(session.descriptor.id, "preserved");
         }
         continue;
       }
       if (binding.state !== "active") this.#store.updateSessionWorktreeState(session.descriptor.id, "active");
-      await this.#registerWorkspace(session, { ...binding, state: "active" });
+      const activeBinding = this.#store.getSession(session.descriptor.id).descriptor.worktree!;
+      this.#activeBindings.set(session.descriptor.id, activeBinding);
+      await this.#registerWorkspace(session, activeBinding);
+    }
+    for (const record of this.#store.listUnadoptedNativeSessionDerivations()) {
+      if (record.worktree === undefined) continue;
+      const lease = active.get(record.sessionId);
+      if (lease !== undefined && sameLease(lease, record.worktree)) {
+        this.#activeBindings.set(record.sessionId, record.worktree);
+      }
     }
     this.#initialized = true;
   }
@@ -183,6 +189,7 @@ export class SessionWorktreeCoordinator {
       await this.#service.release(input.sessionId).catch(() => undefined);
       throw error;
     }
+    this.#activeBindings.set(input.sessionId, binding);
     return binding;
   }
 
@@ -216,6 +223,7 @@ export class SessionWorktreeCoordinator {
       await this.#service.release(input.sessionId).catch(() => undefined);
       throw error;
     }
+    this.#activeBindings.set(input.sessionId, binding);
     return binding;
   }
 
@@ -254,6 +262,7 @@ export class SessionWorktreeCoordinator {
       await this.#service.release(input.sessionId).catch(() => undefined);
       throw error;
     }
+    this.#activeBindings.set(input.sessionId, binding);
     return binding;
   }
 
@@ -265,10 +274,14 @@ export class SessionWorktreeCoordinator {
     return { ...target, workspaceRoot: worktree.path };
   }
 
-  activeWorkspacePath(sessionId: string, expectedPath: string): string | undefined {
+  activeWorkspacePath(sessionId: string, expectedBinding: SessionWorktreeBinding): string | undefined {
     if (!this.#initialized) return undefined;
+    const authoritativeBinding = this.#activeBindings.get(sessionId);
+    if (authoritativeBinding === undefined || !samePersistedBinding(authoritativeBinding, expectedBinding)) {
+      return undefined;
+    }
     const lease = this.#service.snapshot().active.find((candidate) => candidate.sessionId === sessionId);
-    if (lease === undefined || resolve(lease.path) !== resolve(expectedPath)) return undefined;
+    if (lease === undefined || !sameLease(lease, expectedBinding)) return undefined;
     return lease.path;
   }
 
@@ -288,16 +301,72 @@ export class SessionWorktreeCoordinator {
     return Object.freeze({ hasWorktree: true, dirty: result.value.dirty });
   }
 
-  async release(sessionId: string): Promise<void> {
+  async release(sessionId: string, expectedBinding?: SessionWorktreeBinding): Promise<void> {
     this.#requireInitialized();
-    const result = await this.#service.release(sessionId);
-    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     const session = this.#store.listSessions({ includeArchived: true, includeDeleted: true })
       .find((candidate) => candidate.descriptor.id === sessionId);
-    const binding = session?.descriptor.worktree;
+    const persistedBinding = session?.descriptor.worktree;
+    const binding = expectedBinding ?? persistedBinding ?? this.#activeBindings.get(sessionId);
+    let result: Awaited<ReturnType<EphemeralWorktreeService["release"]>>;
+    if (binding !== undefined) {
+      const authoritativeBinding = this.#activeBindings.get(sessionId);
+      if (persistedBinding !== undefined && !samePersistedBinding(persistedBinding, binding)) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+      if (expectedBinding !== undefined) {
+        if (binding.state !== "active"
+          || (authoritativeBinding !== undefined && !samePersistedBinding(authoritativeBinding, binding))) {
+          throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+        }
+        result = await this.#service.releaseExact({
+          sessionId,
+          leaseId: binding.leaseId,
+          path: binding.path,
+          repositoryRoot: binding.repositoryRoot,
+          branch: binding.branch,
+          source: {
+            ref: binding.sourceRef,
+            commit: binding.sourceCommit,
+            strategy: binding.sourceStrategy,
+            refreshed: binding.sourceRefreshed,
+            ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
+          },
+          acquiredAt: binding.acquiredAt
+        });
+      } else if (binding.state === "active") {
+        const activeLease = this.#service.snapshot().active
+          .find((candidate) => candidate.sessionId === sessionId);
+        if (authoritativeBinding === undefined
+          || !samePersistedBinding(authoritativeBinding, binding)
+          || activeLease === undefined
+          || !sameLease(activeLease, binding)) {
+          throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+        }
+        result = await this.#service.release(sessionId);
+      } else {
+        if (persistedBinding === undefined) {
+          throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+        }
+        const preview = await this.#service.previewRemoval({ sessionId, leaseId: binding.leaseId });
+        if (!preview.ok) throw new SessionWorktreeCoordinatorError(preview.error.code);
+        if (preview.value.state !== "preserved") {
+          throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+        }
+        result = await this.#service.release(sessionId);
+      }
+    } else {
+      result = await this.#service.release(sessionId);
+    }
+    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
+    if (expectedBinding !== undefined && result.value.status === "preserved") {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    this.#activeBindings.delete(sessionId);
     this.#workspaces.unregister(binding?.workspaceId ?? workspaceIdFor(sessionId));
     // Once a lease is released it must never remain projected as active.
-    if (binding !== undefined && binding.state !== "preserved") {
+    if (persistedBinding !== undefined && binding !== undefined
+      && samePersistedBinding(persistedBinding, binding)
+      && persistedBinding.state !== "preserved") {
       this.#store.updateSessionWorktreeState(sessionId, "preserved");
     }
   }
@@ -307,12 +376,16 @@ export class SessionWorktreeCoordinator {
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
+    if (this.activeWorkspacePath(sessionId, binding) === undefined) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
     const result = await this.#service.release(sessionId, { retainForRestore: true });
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (result.value.status !== "preserved" || result.value.reason !== "restorable"
       || result.value.pathRemoved !== true) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
+    this.#activeBindings.delete(sessionId);
     this.#workspaces.unregister(binding.workspaceId);
     if (binding.state !== "preserved") this.#store.updateSessionWorktreeState(sessionId, "preserved");
   }
@@ -328,30 +401,25 @@ export class SessionWorktreeCoordinator {
     });
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     const lease = result.value.lease;
-    if (lease.id !== binding.leaseId
-      || resolve(lease.path) !== resolve(binding.path)
-      || resolve(lease.repositoryRoot) !== resolve(binding.repositoryRoot)
-      || lease.branch !== binding.branch
-      || lease.source.ref !== binding.sourceRef
-      || lease.source.commit !== binding.sourceCommit
-      || lease.source.strategy !== binding.sourceStrategy
-      || lease.source.refreshed !== binding.sourceRefreshed
-      || lease.source.remote !== binding.sourceRemote) {
+    if (!sameLease(lease, { ...binding, state: "active" })) {
       await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     try {
       await this.#registerWorkspace(session, { ...binding, state: "active" });
       if (binding.state !== "active") this.#store.updateSessionWorktreeState(sessionId, "active");
+      this.#activeBindings.set(sessionId, this.#store.getSession(sessionId).descriptor.worktree!);
     } catch (error) {
       this.#workspaces.unregister(binding.workspaceId);
       await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
+      this.#activeBindings.delete(sessionId);
       throw error;
     }
   }
 
   dispose(): void {
     this.#service.dispose();
+    this.#activeBindings.clear();
   }
 
   async #registerWorkspace(session: StoredSession, binding: SessionWorktreeBinding): Promise<void> {
@@ -399,7 +467,9 @@ function sameLease(
   lease: ReturnType<EphemeralWorktreeService["snapshot"]>["active"][number],
   binding: SessionWorktreeBinding
 ): boolean {
-  return lease.id === binding.leaseId
+  return binding.workspaceId === workspaceIdFor(lease.sessionId)
+    && binding.state === "active"
+    && lease.id === binding.leaseId
     && resolve(lease.path) === resolve(binding.path)
     && resolve(lease.repositoryRoot) === resolve(binding.repositoryRoot)
     && lease.branch === binding.branch
@@ -407,7 +477,24 @@ function sameLease(
     && lease.source.commit === binding.sourceCommit
     && lease.source.strategy === binding.sourceStrategy
     && lease.source.refreshed === binding.sourceRefreshed
-    && lease.source.remote === binding.sourceRemote;
+    && lease.source.remote === binding.sourceRemote
+    && lease.acquiredAt === binding.acquiredAt;
+}
+
+function samePersistedBinding(left: SessionWorktreeBinding, right: SessionWorktreeBinding): boolean {
+  return left.leaseId === right.leaseId
+    && left.workspaceId === right.workspaceId
+    && resolve(left.path) === resolve(right.path)
+    && resolve(left.repositoryRoot) === resolve(right.repositoryRoot)
+    && left.branch === right.branch
+    && left.sourceRef === right.sourceRef
+    && left.sourceCommit === right.sourceCommit
+    && left.sourceStrategy === right.sourceStrategy
+    && left.sourceRefreshed === right.sourceRefreshed
+    && left.sourceRemote === right.sourceRemote
+    && left.state === right.state
+    && left.acquiredAt === right.acquiredAt
+    && left.updatedAt === right.updatedAt;
 }
 
 function probeEligibility(code: WorktreeErrorCode): TargetWorktreeEligibility {

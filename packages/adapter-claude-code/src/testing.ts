@@ -18,9 +18,12 @@ export type {
   ClaudeSdkSessionMessage,
   ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
+export { DefaultClaudeSdkRuntime } from "./sdk-runtime.js";
 export { SessionSdkOwner, SessionSdkFailure } from "./session-sdk-owner.js";
 export {
   adoptClaudeSessionStoreChild,
+  claimClaudeSessionStoreSession,
+  cleanupClaudeSessionStoreOperation,
   createClaudeDurableSessionStore,
   createClaudeSessionStoreAuthority,
   createClaudeSessionStoreSessionAccess,
@@ -29,6 +32,7 @@ export {
   prepareClaudeSessionStoreDerivation,
   prepareClaudeSessionStoreImport,
   readClaudeSessionStoreOperation,
+  recoverClaudeSessionStoreOperation,
   rebindClaudeSessionStoreGeneration,
   sealClaudeSessionStoreImport,
   type ClaudeSessionStoreAccess,

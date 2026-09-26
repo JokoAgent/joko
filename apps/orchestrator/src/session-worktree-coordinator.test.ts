@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,7 +13,7 @@ import type {
 } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
@@ -235,7 +235,7 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
     })).rejects.toThrow();
     const unknown = store.findNativeSessionDerivation("clone-ordinary-source-unknown-cleanup");
     expect(unknown).toMatchObject({ state: "cleanup_unknown" });
-    expect(worktrees.activeWorkspacePath(unknown!.sessionId, unknown!.effectiveWorkspaceRoot))
+    expect(worktrees.activeWorkspacePath(unknown!.sessionId, unknown!.worktree!))
       .toBe(resolve(unknown!.effectiveWorkspaceRoot));
     expect(adapter.deleteRoots.at(-1)).toBe(resolve(unknown!.effectiveWorkspaceRoot));
 
@@ -257,18 +257,18 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
       await restartedWorkspaces.close().catch(() => undefined);
     });
     await restartedWorktrees.initialize();
-    expect(restartedWorktrees.activeWorkspacePath(unknown!.sessionId, unknown!.effectiveWorkspaceRoot))
+    expect(restartedWorktrees.activeWorkspacePath(unknown!.sessionId, unknown!.worktree!))
       .toBe(resolve(unknown!.effectiveWorkspaceRoot));
     await restartedHost.initialize();
     expect(store.findNativeSessionDerivation(unknown!.operationId)?.state).toBe("cleanup_unknown");
     expect(restartedAdapter.deleteRoots).toEqual([]);
-    expect(restartedWorktrees.activeWorkspacePath(unknown!.sessionId, unknown!.effectiveWorkspaceRoot))
+    expect(restartedWorktrees.activeWorkspacePath(unknown!.sessionId, unknown!.worktree!))
       .toBe(resolve(unknown!.effectiveWorkspaceRoot));
     await restartedHost.resume(derivedId);
     expect(restartedAdapter.resumeRoots.at(-1)).toBe(resolve(derived.worktree.path));
   });
 
-  test("derives an independent checkout and resumes the detached native binding from its copied cwd", { timeout: 60_000 }, async () => {
+  test("derives an independent checkout and resumes the detached native binding from its copied cwd", { timeout: 120_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-derived-worktree-"));
     const repositoryRoot = await createRepository(join(root, "project"));
     const store = new OperationalStore(join(root, "store.db"));
@@ -352,6 +352,28 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
       expect.objectContaining({ id: derived.worktree.workspaceId, root: resolve(derived.worktree.path) })
     ]));
 
+    for (const staleBinding of [
+      { ...derived.worktree, workspaceId: `${derived.worktree.workspaceId}-stale` },
+      { ...derived.worktree, acquiredAt: derived.worktree.acquiredAt - 1 },
+      { ...derived.worktree, path: `${derived.worktree.path}-stale` },
+      { ...derived.worktree, state: "preserved" as const }
+    ]) {
+      expect(worktrees.activeWorkspacePath(derivedId, staleBinding)).toBeUndefined();
+      await expect(worktrees.release(derivedId, staleBinding)).rejects.toMatchObject({
+        code: "SESSION_CONFLICT"
+      });
+      expect(worktrees.activeWorkspacePath(derivedId, derived.worktree)).toBe(resolve(derived.worktree.path));
+    }
+
+    await writeFile(join(derived.worktree.path, ".worktree-keep"), "retain exact checkout\n", "utf8");
+    await expect(worktrees.release(derivedId, derived.worktree)).rejects.toMatchObject({
+      code: "SESSION_CONFLICT"
+    });
+    expect(worktrees.activeWorkspacePath(derivedId, derived.worktree)).toBe(resolve(derived.worktree.path));
+    expect(await readFile(join(derived.worktree.path, ".worktree-keep"), "utf8")).toContain("retain exact checkout");
+    expect(store.getSession(derivedId).descriptor.worktree?.state).toBe("active");
+    await rm(join(derived.worktree.path, ".worktree-keep"), { force: true });
+
     await host.resume(derivedId);
     expect(adapter.resumeRoots.at(-1)).toBe(resolve(derived.worktree.path));
     const sent = host.enqueueInput({
@@ -375,8 +397,40 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
     const failedReceipt = store.findNativeSessionDerivation("clone-isolated-source-failure");
     expect(failedReceipt).toMatchObject({ state: "cleaned" });
     expect(adapter.deleteRoots.at(-1)).toBe(resolve(failedReceipt!.effectiveWorkspaceRoot));
-    expect(worktrees.activeWorkspacePath(failedReceipt!.sessionId, failedReceipt!.effectiveWorkspaceRoot)).toBeUndefined();
+    expect(worktrees.activeWorkspacePath(failedReceipt!.sessionId, failedReceipt!.worktree!)).toBeUndefined();
     expect(workspaces.listRegistrations().some((entry) => entry.id === `worktree-${failedReceipt!.sessionId}`)).toBe(false);
+
+    const releaseFailure = vi.spyOn(worktrees, "release").mockRejectedValueOnce(
+      new Error("The worktree release result was unavailable.")
+    );
+    await expect(host.deriveSession({
+      operationId: "clone-isolated-worktree-release-failure",
+      connection,
+      sourceSessionId: sourceId,
+      title: "Release retry task",
+      kind: "clone"
+    })).rejects.toThrow();
+    releaseFailure.mockRestore();
+    const releasePending = store.findNativeSessionDerivation("clone-isolated-worktree-release-failure")!;
+    expect(releasePending.state).toBe("workspace_cleanup_pending");
+    expect(worktrees.activeWorkspacePath(releasePending.sessionId, releasePending.worktree!))
+      .toBe(resolve(releasePending.effectiveWorkspaceRoot));
+
+    const finalStoreWrite = vi.spyOn(store, "finishNativeSessionDerivationCleanup")
+      .mockImplementationOnce(() => { throw new Error("The final cleanup receipt write was unavailable."); });
+    await expect(host.deriveSession({
+      operationId: "clone-isolated-final-store-failure",
+      connection,
+      sourceSessionId: sourceId,
+      title: "Final receipt retry task",
+      kind: "clone"
+    })).rejects.toThrow();
+    finalStoreWrite.mockRestore();
+    const finalizePending = store.findNativeSessionDerivation("clone-isolated-final-store-failure")!;
+    expect(finalizePending.state).toBe("workspace_cleanup_pending");
+    expect(worktrees.activeWorkspacePath(finalizePending.sessionId, finalizePending.worktree!)).toBeUndefined();
+    await expect(lstat(finalizePending.effectiveWorkspaceRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    const nativeDeletesBeforeRestart = adapter.deleteRoots.length;
 
     const pendingProductSessionId = "pending-derived-product";
     const pendingWorktree = await worktrees.derive({
@@ -408,6 +462,7 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
       backendInstanceGeneration: store.getBackend(source.backendId).descriptor.instanceGeneration,
       targetId: source.targetId,
       effectiveWorkspaceRoot: pendingWorktree.path,
+      worktree: pendingWorktree,
       binding: pendingNativeBinding
     });
     await host.dispose();
@@ -428,12 +483,20 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
       await restartedWorkspaces.close().catch(() => undefined);
     });
     await restartedWorktrees.initialize();
-    expect(restartedWorktrees.activeWorkspacePath(recorded.sessionId, recorded.effectiveWorkspaceRoot))
+    expect(restartedWorktrees.activeWorkspacePath(recorded.sessionId, recorded.worktree!))
       .toBe(resolve(pendingWorktree.path));
+    expect(restartedWorktrees.activeWorkspacePath(releasePending.sessionId, releasePending.worktree!))
+      .toBe(resolve(releasePending.effectiveWorkspaceRoot));
+    expect(restartedWorktrees.activeWorkspacePath(finalizePending.sessionId, finalizePending.worktree!))
+      .toBeUndefined();
     await restartedHost.initialize();
     expect(store.findNativeSessionDerivation(recorded.operationId)?.state).toBe("cleaned");
+    expect(store.findNativeSessionDerivation(releasePending.operationId)?.state).toBe("cleaned");
+    expect(store.findNativeSessionDerivation(finalizePending.operationId)?.state).toBe("cleaned");
     expect(restartedAdapter.deleteRoots).toEqual([resolve(pendingWorktree.path)]);
-    expect(restartedWorktrees.activeWorkspacePath(recorded.sessionId, recorded.effectiveWorkspaceRoot)).toBeUndefined();
+    expect(adapter.deleteRoots).toHaveLength(nativeDeletesBeforeRestart);
+    expect(restartedWorktrees.activeWorkspacePath(recorded.sessionId, recorded.worktree!)).toBeUndefined();
+    expect(restartedWorktrees.activeWorkspacePath(releasePending.sessionId, releasePending.worktree!)).toBeUndefined();
   });
 });
 

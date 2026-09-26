@@ -150,6 +150,13 @@ describe("SessionSdkOwner", () => {
         options: { dir: join(root, "target") },
         access: operation
       }, { recordSessionId: () => { throw new Error("private Host failure"); } });
+      expect(() => owner.recoverStoredSessionOperation({
+        operationId: operation.operationId,
+        targetWorkspaceAuthority: operation.target.workspaceAuthority
+      })).toThrowError(expect.objectContaining({ code: "CLEANUP_UNKNOWN", stateMayHaveChanged: true }));
+      expect(() => owner.cleanupStoredSessionOperation(operation)).toThrowError(
+        expect.objectContaining({ code: "CLEANUP_UNKNOWN", stateMayHaveChanged: true })
+      );
       worker.emit("message", {
         type: "childReserved",
         operationId: operation.operationId,
@@ -173,6 +180,89 @@ describe("SessionSdkOwner", () => {
       expect(owner.ownsSession(derivedId)).toBe(false);
     } finally {
       await owner.retire();
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  test("facades claim an adopted Session and recover then clean its old-generation operation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-session-recovery-owner-"));
+    const authority = createClaudeSessionStoreAuthority({
+      rootDirectory: join(root, "store"),
+      namespace: "recovery-owner",
+      generation: 1
+    });
+    const firstOwner = new SessionSdkOwner({
+      environment: { CLAUDE_CONFIG_DIR: join(root, "profile") },
+      timeoutMs: 1_000,
+      cleanupTimeoutMs: 100,
+      sessionStoreAuthority: authority
+    });
+    const operation = firstOwner.prepareSessionImport({
+      operationId: randomUUID(),
+      sourceWorkspaceAuthority: "workspace.recovery-source",
+      sourceSessionId: sourceId,
+      targetWorkspaceAuthority: "workspace.recovery-target"
+    });
+    const store = createClaudeDurableSessionStore(authority, operation, {
+      onChildReserved: async () => undefined
+    });
+    try {
+      await store.append(
+        { projectKey: "recovery-source", sessionId: sourceId },
+        [{ type: "user", uuid: randomUUID() }]
+      );
+      sealClaudeSessionStoreImport(authority, operation);
+      await store.load({ projectKey: "recovery-target", sessionId: sourceId });
+      await store.append(
+        { projectKey: "recovery-target", sessionId: derivedId },
+        [{ type: "assistant", uuid: randomUUID(), value: "preserve adopted history" }]
+      );
+      firstOwner.adoptStoredSession(operation, derivedId);
+      store.close();
+
+      const nextAuthority = createClaudeSessionStoreAuthority({
+        rootDirectory: join(root, "store"),
+        namespace: "recovery-owner",
+        generation: 2
+      });
+      const nextOwner = new SessionSdkOwner({
+        environment: { CLAUDE_CONFIG_DIR: join(root, "profile") },
+        timeoutMs: 1_000,
+        cleanupTimeoutMs: 100,
+        sessionStoreAuthority: nextAuthority
+      });
+      try {
+        const claimed = nextOwner.claimStoredSession({
+          workspaceAuthority: "workspace.recovery-target",
+          sessionId: derivedId
+        });
+        expect(claimed.generation).toBe(2);
+        const recovered = nextOwner.recoverStoredSessionOperation({
+          operationId: operation.operationId,
+          targetWorkspaceAuthority: "workspace.recovery-target",
+          expectedChildSessionId: derivedId
+        });
+        expect(recovered.generation).toBe(2);
+        expect(nextOwner.cleanupStoredSessionOperation(recovered, {
+          expectedChildSessionId: derivedId
+        }).state).toBe("cleaned");
+        expect(nextOwner.cleanupStoredSessionOperation(recovered, {
+          expectedChildSessionId: derivedId
+        }).state).toBe("cleaned");
+        const adopted = createClaudeDurableSessionStore(nextAuthority, claimed);
+        expect(await adopted.load({ projectKey: "recovery-target", sessionId: derivedId })).toHaveLength(1);
+        adopted.close();
+      } finally {
+        await nextOwner.retire();
+      }
+      expect(() => firstOwner.recoverStoredSessionOperation({
+        operationId: operation.operationId,
+        targetWorkspaceAuthority: "workspace.recovery-target",
+        expectedChildSessionId: derivedId
+      })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
+    } finally {
+      store.close();
+      await firstOwner.retire();
       await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });

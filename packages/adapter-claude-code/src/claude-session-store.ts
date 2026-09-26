@@ -319,6 +319,226 @@ export function readClaudeSessionStoreOperation(
   ));
 }
 
+/**
+ * Reconstruct and claim one exact durable operation after a Backend restart.
+ * The caller supplies only Host-owned identity; the Store discovers the prior
+ * generation and moves it forward with the reserved/adopted child in one CAS
+ * transaction. Future generations and mismatched identities fail closed.
+ */
+export function recoverClaudeSessionStoreOperation(
+  authority: ClaudeSessionStoreAuthority,
+  input: {
+    readonly operationId: string;
+    readonly targetWorkspaceAuthority: string;
+    readonly expectedChildSessionId?: string;
+  }
+): ClaudeSessionStoreOperationAccess {
+  const normalized = normalizeAuthority(authority);
+  if (!UUID.test(input.operationId) || !validOpaqueAuthority(input.targetWorkspaceAuthority)) {
+    throw failure("INVALID_ACCESS");
+  }
+  if (input.expectedChildSessionId !== undefined) {
+    validateSessionId(input.expectedChildSessionId, "INVALID_ACCESS");
+  }
+  return withDatabase(normalized, (database) => transaction(database, () => {
+    const operation = findOperation(database, input.operationId);
+    if (operation === null) throw failure("NOT_FOUND");
+    assertOperationStorageIntegrity(database, operation);
+    if (operation.targetWorkspaceAuthority !== input.targetWorkspaceAuthority
+      || (input.expectedChildSessionId !== undefined
+        && operation.childSessionId !== input.expectedChildSessionId)) {
+      throw failure("INVALID_ACCESS");
+    }
+    if (operation.generation > normalized.generation) throw failure("CONFLICT");
+
+    if (operation.childSessionId !== null) {
+      const session = findSession(database, operation.targetWorkspaceAuthority, operation.childSessionId);
+      if (operation.state === "cleaned") {
+        if (operation.reservationState === "confirmed") {
+          if (session !== null) {
+            assertAdoptedOperationChild(session, operation);
+            if (session.writerGeneration > normalized.generation) throw failure("CONFLICT");
+            if (session.writerGeneration < operation.generation) {
+              throw failure("CORRUPT");
+            }
+            assertSessionIntegrity(database, session);
+            if (session.writerGeneration < normalized.generation) {
+              const sessionChanged = database.prepare(`
+                UPDATE sessions
+                SET writer_generation = ?, revision = revision + 1
+                WHERE workspace_authority = ? AND session_id = ? AND writer_generation = ?
+                  AND revision = ? AND lifecycle = 'adopted'
+              `).run(
+                normalized.generation,
+                session.workspaceAuthority,
+                session.sessionId,
+                session.writerGeneration,
+                session.revision
+              );
+              requireSingleChange(sessionChanged.changes);
+            }
+          }
+        } else if (session !== null) throw failure("CORRUPT");
+      } else if (session === null) {
+        if (operation.state !== "adopted") throw failure("CORRUPT");
+      } else {
+        assertOperationChildProvenance(session, operation);
+        if (session.writerGeneration > normalized.generation) throw failure("CONFLICT");
+        const independentlyClaimedAdoptedSession = operation.state === "adopted"
+          && session.lifecycle === "adopted"
+          && session.writerGeneration >= operation.generation;
+        if (session.writerGeneration !== operation.generation && !independentlyClaimedAdoptedSession) {
+          throw failure("CORRUPT");
+        }
+        assertSessionIntegrity(database, session);
+        if (operation.state === "child_pending" || operation.state === "child_reserved") {
+          assertReservedChildBatch(database, session, operation);
+        }
+        if (session.writerGeneration < normalized.generation) {
+          const sessionChanged = database.prepare(`
+            UPDATE sessions
+            SET writer_generation = ?, revision = revision + 1
+            WHERE workspace_authority = ? AND session_id = ? AND writer_generation = ?
+              AND revision = ? AND lifecycle = ?
+          `).run(
+            normalized.generation,
+            session.workspaceAuthority,
+            session.sessionId,
+            session.writerGeneration,
+            session.revision,
+            session.lifecycle
+          );
+          requireSingleChange(sessionChanged.changes);
+        }
+      }
+    }
+
+    if (operation.generation < normalized.generation) {
+      const operationChanged = database.prepare(`
+        UPDATE operations
+        SET generation = ?, revision = revision + 1, updated_at = ?
+        WHERE operation_id = ? AND generation = ? AND revision = ?
+      `).run(
+        normalized.generation,
+        now(),
+        operation.operationId,
+        operation.generation,
+        operation.revision
+      );
+      requireSingleChange(operationChanged.changes);
+    }
+    return operationAccess(normalized.generation, operation);
+  }));
+}
+
+/** Claim an adopted Session for the current generation without trusting a caller-supplied old generation. */
+export function claimClaudeSessionStoreSession(
+  authority: ClaudeSessionStoreAuthority,
+  input: {
+    readonly workspaceAuthority: string;
+    readonly sessionId: string;
+  }
+): ClaudeSessionStoreSessionAccess {
+  const normalized = normalizeAuthority(authority);
+  validateGenerationAndSessionAccess({
+    generation: normalized.generation,
+    workspaceAuthority: input.workspaceAuthority,
+    sessionId: input.sessionId
+  });
+  withDatabase(normalized, (database) => transaction(database, () => {
+    const session = requireSession(database, input.workspaceAuthority, input.sessionId);
+    if (session.lifecycle !== "adopted" || session.writerGeneration > normalized.generation) {
+      throw failure("CONFLICT");
+    }
+    assertSessionIntegrity(database, session);
+    if (session.writerGeneration === normalized.generation) return;
+    const result = database.prepare(`
+      UPDATE sessions
+      SET writer_generation = ?, revision = revision + 1
+      WHERE workspace_authority = ? AND session_id = ? AND writer_generation = ?
+        AND revision = ? AND lifecycle = 'adopted'
+    `).run(
+      normalized.generation,
+      input.workspaceAuthority,
+      input.sessionId,
+      session.writerGeneration,
+      session.revision
+    );
+    requireSingleChange(result.changes);
+  }));
+  return createClaudeSessionStoreSessionAccess({
+    generation: normalized.generation,
+    workspaceAuthority: input.workspaceAuthority,
+    sessionId: input.sessionId
+  });
+}
+
+/**
+ * Explicitly retire one exact operation. Every pre-cleaned state is accepted;
+ * its staging rows and exact operation-owned reserved child are removed
+ * atomically, while a child already adopted by the product remains intact.
+ */
+export function cleanupClaudeSessionStoreOperation(
+  authority: ClaudeSessionStoreAuthority,
+  access: ClaudeSessionStoreOperationAccess,
+  input: { readonly expectedChildSessionId?: string } = {}
+): ClaudeSessionStoreOperationSnapshot {
+  const normalized = normalizeAuthority(authority);
+  validateOperationAccess(normalized, access);
+  if (input.expectedChildSessionId !== undefined) {
+    validateSessionId(input.expectedChildSessionId, "INVALID_ACCESS");
+  }
+  return withDatabase(normalized, (database) => transaction(database, () => {
+    const operation = requireOperation(database, access);
+    if (input.expectedChildSessionId !== undefined
+      && operation.childSessionId !== input.expectedChildSessionId) {
+      throw failure("INVALID_ACCESS");
+    }
+    if (operation.state === "cleaned") {
+      if (operation.childSessionId !== null) {
+        const session = findSession(database, operation.targetWorkspaceAuthority, operation.childSessionId);
+        if (operation.reservationState === "confirmed") {
+          if (session !== null) {
+            assertSessionGeneration(session, access.generation);
+            assertAdoptedOperationChild(session, operation);
+            assertSessionIntegrity(database, session);
+          }
+        } else if (session !== null) throw failure("CORRUPT");
+      }
+      return operationSnapshot(operation);
+    }
+    if (operation.childSessionId !== null) {
+      const session = findSession(database, operation.targetWorkspaceAuthority, operation.childSessionId);
+      if (session === null) {
+        if (operation.state !== "adopted") throw failure("CORRUPT");
+      } else {
+        assertOperationChildSession(session, operation, access);
+        assertSessionIntegrity(database, session);
+        if (operation.state === "child_pending" || operation.state === "child_reserved") {
+          assertReservedChildBatch(database, session, operation);
+        }
+        if (operation.state !== "adopted") {
+          const removed = database.prepare(`
+            DELETE FROM sessions
+            WHERE workspace_authority = ? AND session_id = ? AND writer_generation = ? AND revision = ?
+          `).run(session.workspaceAuthority, session.sessionId, session.writerGeneration, session.revision);
+          requireSingleChange(removed.changes);
+        }
+      }
+    }
+    database.prepare("DELETE FROM operation_source_entries WHERE operation_id = ?").run(operation.operationId);
+    const changed = database.prepare(`
+      UPDATE operations
+      SET state = 'cleaned',
+          reservation_state = CASE WHEN state = 'adopted' THEN 'confirmed' ELSE NULL END,
+          revision = revision + 1, updated_at = ?
+      WHERE operation_id = ? AND generation = ? AND revision = ? AND state <> 'cleaned'
+    `).run(now(), operation.operationId, operation.generation, operation.revision);
+    requireSingleChange(changed.changes);
+    return operationSnapshot(requireOperation(database, access));
+  }));
+}
+
 export function discardClaudeSessionStoreImport(
   authority: ClaudeSessionStoreAuthority,
   access: ClaudeSessionStoreOperationAccess
@@ -415,6 +635,7 @@ export function rebindClaudeSessionStoreGeneration(
     if (session.lifecycle !== "adopted" || session.writerGeneration !== input.expectedGeneration) {
       throw failure("CONFLICT");
     }
+    assertSessionIntegrity(database, session);
     if (input.expectedGeneration === normalized.generation) return;
     const result = database.prepare(`
       UPDATE sessions
@@ -705,15 +926,20 @@ export class ClaudeDurableSessionStore implements SessionStore {
         || !["child_pending", "child_reserved"].includes(operation.state)) {
         throw failure("INVALID_KEY");
       }
-      const session = requireSession(database, operation.targetWorkspaceAuthority, key.sessionId);
+      const session = findSession(database, operation.targetWorkspaceAuthority, key.sessionId);
+      if (session === null) throw failure("CORRUPT");
       assertOperationChildSession(session, operation, this.#access);
+      assertSessionIntegrity(database, session);
+      assertReservedChildBatch(database, session, operation);
       const removed = database.prepare(`
         DELETE FROM sessions
         WHERE workspace_authority = ? AND session_id = ? AND writer_generation = ? AND revision = ?
       `).run(session.workspaceAuthority, session.sessionId, session.writerGeneration, session.revision);
       requireSingleChange(removed.changes);
       const changed = database.prepare(`
-        UPDATE operations SET state = 'cleaned', revision = revision + 1, updated_at = ?
+        UPDATE operations
+        SET state = 'cleaned', reservation_state = NULL,
+            revision = revision + 1, updated_at = ?
         WHERE operation_id = ? AND generation = ? AND revision = ?
       `).run(now(), operation.operationId, operation.generation, operation.revision);
       requireSingleChange(changed.changes);
@@ -1555,12 +1781,16 @@ function initializeOrVerifySchema(database: DatabaseSync, namespace: string, may
           CHECK (state <> 'importing' OR (source_kind = 'import' AND target_project_key IS NULL AND child_session_id IS NULL)),
           CHECK (state <> 'ready' OR (target_project_key IS NULL AND child_session_id IS NULL)),
           CHECK (state <> 'aliased' OR (target_project_key IS NOT NULL AND child_session_id IS NULL)),
-          CHECK (state NOT IN ('child_pending', 'child_reserved', 'adopted', 'cleaned') OR
+          CHECK (state NOT IN ('child_pending', 'child_reserved', 'adopted') OR
             (target_project_key IS NOT NULL AND child_session_id IS NOT NULL)),
           CHECK (child_session_id IS NOT NULL OR reservation_state IS NULL),
           CHECK ((child_session_id IS NULL) = (reservation_batch_digest IS NULL)),
           CHECK (state <> 'child_pending' OR reservation_state = 'pending'),
-          CHECK (state NOT IN ('child_reserved', 'adopted') OR reservation_state = 'confirmed')
+          CHECK (state NOT IN ('child_reserved', 'adopted') OR reservation_state = 'confirmed'),
+          CHECK (state <> 'cleaned' OR
+            ((child_session_id IS NULL AND reservation_state IS NULL) OR
+             (target_project_key IS NOT NULL AND child_session_id IS NOT NULL AND
+              (reservation_state IS NULL OR reservation_state = 'confirmed'))))
         ) STRICT;
         CREATE TABLE operation_source_entries (
           operation_id TEXT NOT NULL,
@@ -1686,6 +1916,11 @@ function requireOperation(database: DatabaseSync, access: ClaudeSessionStoreOper
   const operation = findOperation(database, access.operationId);
   if (operation === null) throw failure("NOT_FOUND");
   assertOperationAccess(operation, access);
+  assertOperationStorageIntegrity(database, operation);
+  return operation;
+}
+
+function assertOperationStorageIntegrity(database: DatabaseSync, operation: OperationRow): void {
   const source = database.prepare(`
     SELECT COUNT(*) AS entry_count, COALESCE(SUM(entry_bytes), 0) AS byte_count,
       COALESCE(MAX(ordinal) + 1, 0) AS next_ordinal
@@ -1705,7 +1940,6 @@ function requireOperation(database: DatabaseSync, access: ClaudeSessionStoreOper
     || sqlInteger(source["next_ordinal"]) !== expectedEntryCount) {
     throw failure("CORRUPT");
   }
-  return operation;
 }
 
 function assertOperationAccess(operation: OperationRow, access: ClaudeSessionStoreOperationAccess): void {
@@ -1762,7 +1996,7 @@ function decodeOperationRow(row: Record<string, unknown>): OperationRow {
   const hasTarget = operation.targetProjectKey !== null;
   const validSource = operation.sourceKind === "durable"
     ? operation.sourceProjectKey === null && operation.sourceEntryCount === 0 && operation.sourceBytes === 0
-    : operation.state === "importing"
+    : operation.state === "importing" || operation.state === "cleaned"
       ? (operation.sourceProjectKey === null
           ? operation.sourceEntryCount === 0 && operation.sourceBytes === 0
           : (operation.sourceEntryCount === 0) === (operation.sourceBytes === 0))
@@ -1776,7 +2010,9 @@ function decodeOperationRow(row: Record<string, unknown>): OperationRow {
         : operation.state === "child_pending"
           ? hasTarget && hasChild && operation.reservationState === "pending"
           : operation.state === "cleaned"
-            ? hasTarget && hasChild && operation.reservationState !== null
+            ? (hasChild
+                ? hasTarget && operation.reservationState !== "pending"
+                : operation.reservationState === null)
             : ["child_reserved", "adopted"].includes(operation.state)
               && hasTarget && hasChild && operation.reservationState === "confirmed";
   if (!validSource || !validState) throw failure("CORRUPT");
@@ -1843,13 +2079,58 @@ function assertOperationChildSession(
   access: ClaudeSessionStoreOperationAccess
 ): void {
   assertSessionGeneration(session, access.generation);
+  assertOperationChildProvenance(session, operation);
+}
+
+function assertOperationChildProvenance(session: SessionRow, operation: OperationRow): void {
   const provenanceMatches = operation.state === "adopted"
     ? session.lifecycle === "adopted" && session.ownerOperationId === null && session.reservationState === null
-    : session.ownerOperationId === operation.operationId;
+    : operation.state === "child_pending"
+      ? session.lifecycle === "reserved" && session.ownerOperationId === operation.operationId
+        && session.reservationState === "pending"
+      : operation.state === "child_reserved"
+        && session.lifecycle === "reserved" && session.ownerOperationId === operation.operationId
+        && session.reservationState === "confirmed";
   if (session.projectKey !== operation.targetProjectKey || session.sessionId !== operation.childSessionId
     || !provenanceMatches || session.workspaceAuthority !== operation.targetWorkspaceAuthority) {
     throw failure("CORRUPT");
   }
+}
+
+function assertReservedChildBatch(
+  database: DatabaseSync,
+  session: SessionRow,
+  operation: OperationRow
+): void {
+  const childEntries = loadSessionEntries(database, session, undefined);
+  if (childEntries === null || session.subkeyCount !== 0 || operation.reservationBatchDigest === null
+    || entryBatchDigest(childEntries.map((entry) => prepareEntry(entry, "CORRUPT")))
+      !== operation.reservationBatchDigest) {
+    throw failure("CORRUPT");
+  }
+}
+
+function assertAdoptedOperationChild(session: SessionRow, operation: OperationRow): void {
+  if (operation.state !== "cleaned" || operation.reservationState !== "confirmed"
+    || session.projectKey !== operation.targetProjectKey || session.sessionId !== operation.childSessionId
+    || session.workspaceAuthority !== operation.targetWorkspaceAuthority || session.lifecycle !== "adopted"
+    || session.ownerOperationId !== null || session.reservationState !== null) {
+    throw failure("CORRUPT");
+  }
+}
+
+function operationAccess(generation: number, operation: OperationRow): ClaudeSessionStoreOperationAccess {
+  return Object.freeze({
+    kind: "operation",
+    operationId: operation.operationId,
+    generation,
+    source: Object.freeze({
+      kind: operation.sourceKind,
+      workspaceAuthority: operation.sourceWorkspaceAuthority,
+      sessionId: operation.sourceSessionId
+    }),
+    target: Object.freeze({ workspaceAuthority: operation.targetWorkspaceAuthority })
+  });
 }
 
 function operationSnapshot(operation: OperationRow): ClaudeSessionStoreOperationSnapshot {

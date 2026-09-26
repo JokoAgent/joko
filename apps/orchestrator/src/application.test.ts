@@ -388,6 +388,7 @@ describe("Orchestrator application composition", () => {
     expect(claudeCapabilities.get("memory.native")?.supported).toBe(true);
     expect(claudeCapabilities.get("memory.native")?.options).toEqual(["reset_local"]);
     expect(claudeCapabilities.get("workspace.extra_dirs")?.supported).toBe(true);
+    expect(claudeCapabilities.get("workspace.derive")?.supported).toBe(true);
     expect(claudeCapabilities.get("runtime.resources")).toMatchObject({
       supported: true,
       options: ["skill", "prompt"]

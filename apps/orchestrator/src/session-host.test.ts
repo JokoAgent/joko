@@ -32,6 +32,7 @@ import {
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
   type NativeSessionDerivation,
+  type NativeSessionDerivationLifecycle,
   type NativeSessionForkResult,
   type NativeSessionState,
   type PermissionMode,
@@ -9506,6 +9507,554 @@ describe("SessionHost", () => {
       .toHaveLength(1);
   });
 
+  it("orders an Adapter-owned derivation around Product adoption before reporting success", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "owned-lifecycle-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "owned-lifecycle-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const operationId = "owned-lifecycle-derive";
+    const observed: string[] = [];
+    adapter.beforeDurableFork = () => {
+      const prepared = fixture.store.findNativeSessionDerivation(operationId);
+      expect(prepared).toMatchObject({
+        state: "prepared",
+        externalLifecycle: true
+      });
+      expect(prepared?.binding).toBeUndefined();
+      expect(fixture.store.getOperation(operationId).status).toBe("started");
+      observed.push("prepared");
+    };
+    adapter.afterFork = async () => {
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "recorded",
+        externalLifecycle: true,
+        binding: expect.objectContaining({ opaqueRef: expect.stringContaining("/fork/root") })
+      });
+      expect(fixture.store.getOperation(operationId).status).toBe("started");
+      observed.push("recorded");
+    };
+    adapter.onAdopt = (lifecycle) => {
+      const product = fixture.store.getSession(lifecycle.sessionId);
+      expect(product.descriptor.binding).toEqual(lifecycle.binding);
+      expect(fixture.store.getOperation(operationId).status).toBe("completed");
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "product_adopted",
+        binding: lifecycle.binding
+      });
+      observed.push("product_adopted");
+    };
+
+    const derived = await fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Durably owned child",
+      kind: "fork",
+      entryId: "root",
+      sourceMessage: { messageId: "owned-lifecycle-message", eventId: "owned-lifecycle-message" }
+    });
+
+    expect(observed).toEqual(["prepared", "recorded", "product_adopted"]);
+    expect(adapter.adoptCalls).toHaveLength(1);
+    expect(adapter.cleanupCalls).toHaveLength(0);
+    expect(fixture.store.getSession(derived.value.sessionId).descriptor.binding)
+      .toEqual(adapter.adoptCalls[0]?.binding);
+    expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+      state: "adopted",
+      externalLifecycle: true,
+      adoptedAt: expect.any(Number)
+    });
+  });
+
+  it("retries only Adapter adoption after Product commit without replaying the native derivation", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 1;
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "adoption-retry-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "adoption-retry-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const input = {
+      operationId: "adoption-retry-derive",
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Committed before adoption",
+      kind: "fork" as const,
+      entryId: "root",
+      sourceMessage: { messageId: "adoption-retry-message", eventId: "adoption-retry-message" }
+    };
+
+    await expect(fixture.host.deriveSession(input)).rejects.toThrow("Adapter adoption failed");
+    const pendingAdoption = fixture.store.findNativeSessionDerivation(input.operationId)!;
+    expect(fixture.store.getOperation(input.operationId).status).toBe("completed");
+    expect(fixture.store.getSession(pendingAdoption.sessionId).descriptor.binding)
+      .toEqual(pendingAdoption.binding);
+    expect(pendingAdoption).toMatchObject({ state: "product_adopted", externalLifecycle: true });
+    expect(adapter.forkCalls).toBe(1);
+    expect(adapter.adoptCalls).toHaveLength(1);
+
+    const replay = await fixture.host.deriveSession(input);
+
+    expect(replay).toMatchObject({ replayed: true, value: { sessionId: pendingAdoption.sessionId } });
+    expect(adapter.forkCalls).toBe(1);
+    expect(adapter.adoptCalls).toHaveLength(2);
+    expect(adapter.cleanupCalls).toHaveLength(0);
+    expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("adopted");
+  });
+
+  it("adopts a Product-committed derivation before activation and detached deletion", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "adoption-use-gate-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+
+    adapter.adoptionFailuresRemaining = 1;
+    const resumeOperationId = "adoption-use-gate-resume";
+    await expect(fixture.host.deriveSession({
+      operationId: resumeOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Resume-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const resumePending = fixture.store.findNativeSessionDerivation(resumeOperationId)!;
+    const resumeNative = vi.spyOn(adapter, "resumeSession");
+
+    await fixture.host.resume(resumePending.sessionId);
+
+    expect(fixture.store.findNativeSessionDerivation(resumeOperationId)?.state).toBe("adopted");
+    expect(adapter.adoptCalls.filter((call) => call.operationId === resumeOperationId)).toHaveLength(2);
+    expect(resumeNative).toHaveBeenCalledOnce();
+
+    adapter.adoptionFailuresRemaining = 2;
+    const deleteOperationId = "adoption-use-gate-delete";
+    await expect(fixture.host.deriveSession({
+      operationId: deleteOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Delete-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const deletePending = fixture.store.findNativeSessionDerivation(deleteOperationId)!;
+    const deleteNative = vi.spyOn(adapter, "deleteSession");
+
+    await expect(fixture.host.deleteNativeSession(deletePending.sessionId)).rejects.toThrow("Adapter adoption failed");
+    expect(deleteNative).not.toHaveBeenCalled();
+    expect(fixture.store.findNativeSessionDerivation(deleteOperationId)?.state).toBe("product_adopted");
+
+    await fixture.host.deleteNativeSession(deletePending.sessionId);
+    expect(fixture.store.findNativeSessionDerivation(deleteOperationId)?.state).toBe("adopted");
+    expect(deleteNative).toHaveBeenCalledOnce();
+  });
+
+  it("settles pending native adoption before claiming a task lifecycle operation", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 2;
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "adoption-lifecycle-gate-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const derivationOperationId = "adoption-lifecycle-gate-derive";
+    await expect(fixture.host.deriveSession({
+      operationId: derivationOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Lifecycle-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const pending = fixture.store.findNativeSessionDerivation(derivationOperationId)!;
+    const lifecycleEffect = vi.fn(async () => undefined);
+    const lifecycleInput = {
+      operationId: "adoption-lifecycle-gate-archive",
+      connection: fixture.connection,
+      kind: "archiveSession",
+      body: { sessionId: pending.sessionId },
+      sessionLifecycleFenceId: pending.sessionId,
+      effect: lifecycleEffect,
+      commit: () => ({ accepted: true as const })
+    };
+
+    await expect(fixture.host.mutate(lifecycleInput)).rejects.toThrow("Adapter adoption failed");
+    expect(lifecycleEffect).not.toHaveBeenCalled();
+    expect(fixture.store.findOperation(lifecycleInput.operationId)).toBeUndefined();
+    expect(fixture.store.findNativeSessionDerivation(derivationOperationId)?.state).toBe("product_adopted");
+
+    await expect(fixture.host.mutate(lifecycleInput)).resolves.toMatchObject({
+      replayed: false,
+      value: { accepted: true }
+    });
+    expect(lifecycleEffect).toHaveBeenCalledOnce();
+    expect(fixture.store.findNativeSessionDerivation(derivationOperationId)?.state).toBe("adopted");
+  });
+
+  it("fails and cleans an Adapter-owned navigation that returns in-place after durable prepare", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "owned-navigation-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Navigation source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const operationId = "owned-navigation-in-place";
+
+    await expect(fixture.host.navigateTree(
+      sessionId,
+      { kind: "native_entry", entryId: "root" },
+      false,
+      undefined,
+      undefined,
+      { connection: fixture.connection, operationId, protocol: { kind: "internal" } }
+    )).rejects.toMatchObject({ storedError: expect.objectContaining({ code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" }) });
+
+    expect(adapter.cleanupCalls.map((call) => call.operationId)).toContain(operationId);
+    const cleaned = fixture.store.findNativeSessionDerivation(operationId);
+    expect(cleaned).toMatchObject({
+      state: "cleaned",
+      externalLifecycle: true
+    });
+    expect(cleaned?.binding).toBeUndefined();
+  });
+
+  it("recovers Adapter-owned prepared, recorded, and Product-adopted derivations without retrying unknown cleanup", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 1;
+    const fixture = await createFixture(adapter);
+    const attemptGeneration = fixture.store.getBackend(adapter.id).descriptor.instanceGeneration;
+    const sourceId = (await fixture.host.createSession({
+      operationId: "owned-recovery-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const productAdoptionOperationId = "owned-recovery-product-adopted";
+    await expect(fixture.host.deriveSession({
+      operationId: productAdoptionOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Committed child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+
+    const prepare = (operationId: string, binding?: NativeSessionBinding) => {
+      const source = fixture.store.getSession(sourceId);
+      const target = fixture.store.getTarget(source.descriptor.targetId);
+      const claim = fixture.store.claimAuthorizedDeferredEffectOperation(
+        fixture.connection.id,
+        fixture.connection.authKeyDigest,
+        { id: operationId, kind: "clone_session", body: { sourceSessionId: sourceId } }
+      );
+      const common = {
+        operationId,
+        expectedBodyHash: claim.operation.bodyHash,
+        sourceSessionId: sourceId,
+        sourceBinding: source.descriptor.binding,
+        sessionId: `child-${operationId}`,
+        backendId: source.descriptor.backendId,
+        backendInstanceGeneration: fixture.store.getBackend(source.descriptor.backendId).descriptor.instanceGeneration,
+        targetId: source.descriptor.targetId,
+        effectiveWorkspaceRoot: target.descriptor.workspaceRoot
+      };
+      const prepared = fixture.store.prepareNativeSessionDerivation({
+        ...common,
+        sourceSessionRevision: source.revision,
+        targetRevision: target.revision
+      });
+      const record = binding === undefined
+        ? prepared
+        : fixture.store.recordNativeSessionDerivation({ ...common, binding });
+      return { claim, record };
+    };
+    const preparedOperationId = "owned-recovery-prepared";
+    const recordedOperationId = "owned-recovery-recorded";
+    const cleanupUnknownOperationId = "owned-recovery-cleanup-unknown";
+    prepare(preparedOperationId);
+    const recordedBinding = {
+      opaqueRef: "fake://recovery/recorded",
+      nativeSessionId: "owned-recovery-recorded-native",
+      generation: 0
+    };
+    prepare(recordedOperationId, recordedBinding);
+    const unknown = prepare(cleanupUnknownOperationId);
+    fixture.store.failEffectOperation(
+      cleanupUnknownOperationId,
+      unknown.claim.operation.bodyHash,
+      new Error("Prepared effect outcome is unknown.")
+    );
+    const unknownCleanup = fixture.store.claimNativeSessionDerivationCleanup({
+      operationId: cleanupUnknownOperationId,
+      expectedRevision: unknown.record.revision
+    });
+    fixture.store.finishNativeSessionDerivationCleanup({
+      operationId: cleanupUnknownOperationId,
+      token: unknownCleanup.token,
+      outcome: "cleanup_unknown",
+      failureCode: "native_cleanup_unknown"
+    });
+
+    await fixture.host.dispose();
+    const recoveryGeneration = advanceBackendInstanceGeneration(fixture.store, adapter.id);
+    expect(recoveryGeneration).toBe(attemptGeneration + 1);
+    const recoveryDescriptor = fixture.store.getBackend(adapter.id).descriptor;
+    const recoveredAdapter = new AdapterOwnedDerivationFakeAdapter();
+    const cloneNative = vi.spyOn(recoveredAdapter, "clone");
+    const resumeNative = vi.spyOn(recoveredAdapter, "resumeSession");
+    const restarted = new SessionHost(fixture.store, fixture.artifacts, [recoveredAdapter], {
+      backendDescriptors: [recoveryDescriptor],
+      backendDescriptorsAlreadyPublished: true
+    });
+    try {
+      await restarted.initialize();
+
+      expect(fixture.store.findNativeSessionDerivation(preparedOperationId)).toMatchObject({
+        state: "cleaned",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(fixture.store.findNativeSessionDerivation(recordedOperationId)).toMatchObject({
+        state: "cleaned",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(fixture.store.findNativeSessionDerivation(productAdoptionOperationId)).toMatchObject({
+        state: "adopted",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(fixture.store.findNativeSessionDerivation(cleanupUnknownOperationId)).toMatchObject({
+        state: "cleanup_unknown",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: attemptGeneration
+      });
+      expect(recoveredAdapter.cleanupCalls.map((lifecycle) => lifecycle.operationId).sort())
+        .toEqual([preparedOperationId, recordedOperationId].sort());
+      expect(recoveredAdapter.cleanupCalls.find((lifecycle) => lifecycle.operationId === preparedOperationId)?.binding)
+        .toBeUndefined();
+      expect(recoveredAdapter.cleanupCalls.find((lifecycle) => lifecycle.operationId === recordedOperationId)?.binding)
+        .toEqual(recordedBinding);
+      expect(recoveredAdapter.adoptCalls.map((lifecycle) => lifecycle.operationId))
+        .toEqual([productAdoptionOperationId]);
+      expect(cloneNative).not.toHaveBeenCalled();
+      expect(resumeNative).not.toHaveBeenCalled();
+      expect(fixture.store.getOperation(preparedOperationId)).toMatchObject({
+        status: "failed",
+        error: { code: "EFFECT_OUTCOME_UNKNOWN" }
+      });
+      expect(fixture.store.getOperation(recordedOperationId)).toMatchObject({
+        status: "failed",
+        error: { code: "EFFECT_OUTCOME_UNKNOWN" }
+      });
+    } finally {
+      await restarted.dispose();
+    }
+  });
+
+  it("keeps replacement and native use gated while a successor generation adopts a Product-committed derivation", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 1;
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "successor-adoption-gate-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const operationId = "successor-adoption-gate-derive";
+    await expect(fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Successor-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const pending = fixture.store.findNativeSessionDerivation(operationId)!;
+    const attemptGeneration = pending.backendInstanceGeneration;
+
+    await fixture.host.dispose();
+    const recoveryGeneration = advanceBackendInstanceGeneration(fixture.store, adapter.id);
+    expect(recoveryGeneration).toBe(attemptGeneration + 1);
+    const recoveredAdapter = new AdapterOwnedDerivationFakeAdapter();
+    recoveredAdapter.adoptionFailuresRemaining = 1;
+    const resumeNative = vi.spyOn(recoveredAdapter, "resumeSession");
+    recoveredAdapter.onAdopt = () => {
+      expect(resumeNative).not.toHaveBeenCalled();
+    };
+    const restarted = new SessionHost(fixture.store, fixture.artifacts, [recoveredAdapter], {
+      backendDescriptors: [fixture.store.getBackend(adapter.id).descriptor],
+      backendDescriptorsAlreadyPublished: true
+    });
+    try {
+      await restarted.initialize();
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "product_adopted",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(() => fixture.store.recordNativeSessionDerivation({
+        operationId: pending.operationId,
+        expectedBodyHash: pending.expectedBodyHash,
+        sourceSessionId: pending.sourceSessionId,
+        sourceBinding: pending.sourceBinding,
+        sessionId: pending.sessionId,
+        backendId: pending.backendId,
+        backendInstanceGeneration: attemptGeneration,
+        targetId: pending.targetId,
+        effectiveWorkspaceRoot: pending.effectiveWorkspaceRoot,
+        binding: pending.binding!
+      })).toThrow("stale Backend generation");
+
+      const replacementEffect = vi.fn(async () => undefined);
+      await expect(restarted.replaceBackendInstance({
+        backendId: adapter.id,
+        expectedCurrentGeneration: recoveryGeneration,
+        perform: replacementEffect
+      })).rejects.toThrow("durable native derivation lifecycle is unresolved");
+      expect(replacementEffect).not.toHaveBeenCalled();
+
+      await restarted.resume(pending.sessionId);
+
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "adopted",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(recoveredAdapter.adoptCalls.map((lifecycle) => lifecycle.operationId))
+        .toEqual([operationId, operationId]);
+      expect(resumeNative).toHaveBeenCalledOnce();
+    } finally {
+      await restarted.dispose();
+    }
+  });
+
+  it("cleans an Adapter-owned prepared attempt without requiring a reserved binding", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.forkFailure = new Error("Fork failed before reserving a child.");
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "prepared-cleanup-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "prepared-cleanup-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const operationId = "prepared-cleanup-derive";
+
+    await expect(fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Never reserved",
+      kind: "fork",
+      entryId: "root",
+      sourceMessage: { messageId: "prepared-cleanup-message", eventId: "prepared-cleanup-message" }
+    })).rejects.toMatchObject({ storedError: { message: "Fork failed before reserving a child." } });
+
+    expect(adapter.cleanupCalls).toHaveLength(1);
+    expect(adapter.cleanupCalls[0]).toMatchObject({ operationId, sessionId: expect.any(String) });
+    expect(adapter.cleanupCalls[0]?.binding).toBeUndefined();
+    const cleaned = fixture.store.findNativeSessionDerivation(operationId);
+    expect(cleaned).toMatchObject({
+      state: "cleaned",
+      externalLifecycle: true
+    });
+    expect(cleaned?.binding).toBeUndefined();
+  });
+
+  it("blocks Backend replacement while an Adapter-owned cleanup outcome remains durably unknown", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.forkFailure = new Error("Fork failed before reserving a child.");
+    adapter.cleanupFailure = new Error("Cleanup acknowledgement was lost.");
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "unresolved-lifecycle-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "unresolved-lifecycle-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const operationId = "unresolved-lifecycle-derive";
+    await expect(fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Unknown cleanup",
+      kind: "fork",
+      entryId: "root",
+      sourceMessage: { messageId: "unresolved-lifecycle-message", eventId: "unresolved-lifecycle-message" }
+    })).rejects.toMatchObject({ storedError: { message: "Fork failed before reserving a child." } });
+    const unresolved = fixture.store.findNativeSessionDerivation(operationId);
+    expect(unresolved).toMatchObject({ state: "cleanup_unknown" });
+    expect(unresolved?.binding).toBeUndefined();
+
+    const current = fixture.store.getBackend(adapter.id).descriptor;
+    const perform = vi.fn(async () => undefined);
+    await expect(fixture.host.replaceBackendInstance({
+      backendId: adapter.id,
+      expectedCurrentGeneration: current.instanceGeneration,
+      perform
+    })).rejects.toThrow("durable native derivation lifecycle is unresolved");
+    expect(perform).not.toHaveBeenCalled();
+    expect(adapter.cleanupCalls).toHaveLength(1);
+  });
+
   it.each(["native_validation", "authorization", "source_deleted", "store_commit"] as const)(
     "cleans only the registered derived binding after %s fails and preserves source emissions",
     async (failurePoint) => {
@@ -9537,11 +10086,12 @@ describe("SessionHost", () => {
       };
       await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
       const receipt = fixture.store.findNativeSessionDerivation(input.operationId)!;
+      const receiptBinding = receipt.binding!;
       expect(receipt.state).toBe("cleaned");
-      expect(receipt.binding.opaqueRef).not.toBe(sourceBinding.opaqueRef);
+      expect(receiptBinding.opaqueRef).not.toBe(sourceBinding.opaqueRef);
       expect(deleteNative).toHaveBeenCalledOnce();
-      expect(deleteNative).toHaveBeenCalledWith(receipt.binding, expect.objectContaining({
-        sessionId: receipt.sessionId, binding: receipt.binding, generation: receipt.binding.generation,
+      expect(deleteNative).toHaveBeenCalledWith(receiptBinding, expect.objectContaining({
+        sessionId: receipt.sessionId, binding: receiptBinding, generation: receiptBinding.generation,
         operationId: input.operationId, target: expect.objectContaining({ workspaceRoot: fixture.directory })
       }));
       expect(fixture.store.listSessions({ includeDeleted: true, includeArchived: true })).toHaveLength(1);
@@ -9715,7 +10265,7 @@ describe("SessionHost", () => {
           const perform = vi.fn(async () => undefined);
           await expect(fixture.host.replaceBackendInstance({
             backendId: adapter.id, expectedCurrentGeneration: current.instanceGeneration, perform
-          })).rejects.toThrow("derived native cleanup has not settled");
+          })).rejects.toThrow("durable native derivation lifecycle is unresolved");
           expect(perform).not.toHaveBeenCalled();
           await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
         }
@@ -9769,11 +10319,15 @@ describe("SessionHost", () => {
       await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
         storedError: { message: "Original derived validation failure." }
       });
-      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_claimed");
+      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe(
+        cleanupOutcome === "resolved" ? "workspace_cleanup_pending" : "cleanup_claimed"
+      );
       finish.mockRestore();
       diagnostic.mockRestore();
       fixture.store.recoverStartup();
-      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_unknown");
+      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe(
+        cleanupOutcome === "resolved" ? "workspace_cleanup_pending" : "cleanup_unknown"
+      );
       await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
         storedError: { message: "Original derived validation failure." }
       });
@@ -15309,6 +15863,62 @@ class GatedFakeAdapter extends FakeBackendAdapter {
     const result = await super.fork(entryId, context, derivation);
     await this.afterFork?.();
     return this.forkEditorText === undefined ? result : { ...result, editorText: this.forkEditorText };
+  }
+}
+
+class AdapterOwnedDerivationFakeAdapter extends GatedFakeAdapter {
+  readonly adoptCalls: Array<NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding }> = [];
+  readonly cleanupCalls: NativeSessionDerivationLifecycle[] = [];
+  beforeDurableFork: ((derivation: NativeSessionDerivation) => Promise<void> | void) | undefined;
+  onAdopt: ((lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding }) => Promise<void> | void) | undefined;
+  onCleanup: ((lifecycle: NativeSessionDerivationLifecycle) => Promise<void> | void) | undefined;
+  adoptionFailuresRemaining = 0;
+  cleanupFailure: Error | undefined;
+
+  ownsNativeSessionDerivationLifecycle(_lifecycle: NativeSessionDerivationLifecycle): boolean {
+    return true;
+  }
+
+  async adoptNativeSessionDerivation(
+    lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding },
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    this.adoptCalls.push(lifecycle);
+    await this.onAdopt?.(lifecycle);
+    if (this.adoptionFailuresRemaining > 0) {
+      this.adoptionFailuresRemaining -= 1;
+      throw new Error("Adapter adoption failed.");
+    }
+  }
+
+  async cleanupNativeSessionDerivation(
+    lifecycle: NativeSessionDerivationLifecycle,
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    this.cleanupCalls.push(lifecycle);
+    await this.onCleanup?.(lifecycle);
+    if (this.cleanupFailure !== undefined) throw this.cleanupFailure;
+  }
+
+  override async fork(
+    entryId: string,
+    context: AdapterContext,
+    derivation: NativeSessionDerivation
+  ): Promise<NativeSessionForkResult> {
+    await this.beforeDurableFork?.(derivation);
+    return super.fork(entryId, context, derivation);
+  }
+
+  override async navigateTree(
+    _target: import("@joko/core").NativeNavigationTarget,
+    _summarize: boolean,
+    _context: AdapterContext,
+    _instructions: string | undefined,
+    _navigation: import("@joko/core").NativeSessionNavigation
+  ): Promise<import("@joko/core").NativeSessionNavigationResult> {
+    return { kind: "in_place" };
   }
 }
 
