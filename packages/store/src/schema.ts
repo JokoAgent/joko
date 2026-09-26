@@ -11,7 +11,9 @@ export const SCHEMA_VERSION = 1;
 const DURABLE_JSON_SHAPE_BASELINE = [
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
-  "resource-usage-event:exact-v1"
+  "resource-usage-event:exact-v1",
+  "native-derivation-remote-worktree-plan:exact-v1",
+  "native-derivation-worktree:optional-remote-owner-exact-v1"
 ].join("\n");
 
 const SCHEMA_MARKER_SCHEMA = `
@@ -1823,11 +1825,45 @@ CREATE TABLE session_worktrees (
             AND source_remote NOT GLOB '*[^A-Za-z0-9._-]*'
           )
         ),
+        remote_host_owner_id TEXT CHECK (
+          remote_host_owner_id IS NULL OR length(remote_host_owner_id) BETWEEN 1 AND 256
+        ),
+        remote_host_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        remote_host_id TEXT CHECK (
+          remote_host_id IS NULL OR length(remote_host_id) BETWEEN 1 AND 256
+        ),
+        remote_host_identity TEXT CHECK (
+          remote_host_identity IS NULL OR (
+            length(remote_host_identity) = 71 AND substr(remote_host_identity, 1, 7) = 'sha256:'
+            AND substr(remote_host_identity, 8) NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        remote_target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        remote_target_revision INTEGER CHECK (remote_target_revision IS NULL OR remote_target_revision >= 1),
+        remote_host_revision INTEGER CHECK (remote_host_revision IS NULL OR remote_host_revision >= 1),
+        remote_manifest_id TEXT CHECK (
+          remote_manifest_id IS NULL OR length(remote_manifest_id) BETWEEN 1 AND 256
+        ),
         state TEXT NOT NULL CHECK (state IN ('active', 'preserved')),
         acquired_at INTEGER NOT NULL CHECK (acquired_at >= 0),
         updated_at INTEGER NOT NULL CHECK (updated_at >= acquired_at),
-        revision INTEGER NOT NULL CHECK (revision >= 1)
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK (
+          (remote_host_owner_id IS NULL AND remote_host_target_id IS NULL AND remote_host_id IS NULL
+            AND remote_host_identity IS NULL AND remote_target_id IS NULL AND remote_target_revision IS NULL
+            AND remote_host_revision IS NULL AND remote_manifest_id IS NULL)
+          OR
+          (remote_host_owner_id IS NOT NULL AND remote_host_target_id IS NOT NULL AND remote_host_id IS NOT NULL
+            AND remote_host_identity IS NOT NULL AND remote_target_id IS NOT NULL AND remote_target_revision IS NOT NULL
+            AND remote_host_revision IS NOT NULL AND remote_manifest_id IS NOT NULL)
+        ),
+        FOREIGN KEY(remote_host_owner_id, remote_host_target_id, remote_host_id)
+          REFERENCES remote_hosts(owner_id, target_id, host_id) ON DELETE RESTRICT
       ) STRICT;
+
+CREATE UNIQUE INDEX session_worktrees_remote_manifest_idx
+        ON session_worktrees(remote_host_owner_id, remote_host_target_id, remote_host_id, remote_manifest_id)
+        WHERE remote_manifest_id IS NOT NULL;
 
 CREATE TABLE settings (
         scope_type TEXT NOT NULL CHECK (scope_type IN ('service', 'connection', 'backend', 'target', 'session')),
@@ -2053,6 +2089,16 @@ CREATE TABLE native_session_derivations (
             AND substr(derived_worktree_digest, 8) NOT GLOB '*[^0-9a-f]*'
           )
         ),
+        remote_worktree_plan_json TEXT CHECK (
+          remote_worktree_plan_json IS NULL OR length(remote_worktree_plan_json) BETWEEN 2 AND 131072
+        ),
+        remote_worktree_plan_digest TEXT CHECK (
+          remote_worktree_plan_digest IS NULL OR (
+            length(remote_worktree_plan_digest) = 71
+            AND substr(remote_worktree_plan_digest, 1, 7) = 'sha256:'
+            AND substr(remote_worktree_plan_digest, 8) NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
         external_lifecycle INTEGER NOT NULL CHECK (external_lifecycle IN (0, 1)),
         source_native_opaque_ref TEXT NOT NULL,
         source_native_session_id TEXT,
@@ -2085,6 +2131,8 @@ CREATE TABLE native_session_derivations (
         CHECK ((remote_host_id IS NULL) = (remote_workspace_root IS NULL)),
         CHECK ((source_session_revision IS NULL) = (target_revision IS NULL)),
         CHECK ((derived_worktree_json IS NULL) = (derived_worktree_digest IS NULL)),
+        CHECK ((remote_worktree_plan_json IS NULL) = (remote_worktree_plan_digest IS NULL)),
+        CHECK (remote_worktree_plan_json IS NULL OR (external_lifecycle = 1 AND remote_host_id IS NOT NULL)),
         CHECK ((external_lifecycle = 1) = (source_session_revision IS NOT NULL)),
         CHECK ((native_opaque_ref IS NULL) = (generation IS NULL)),
         CHECK (native_opaque_ref IS NOT NULL OR native_session_id IS NULL),

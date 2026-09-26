@@ -10366,6 +10366,36 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(source.descriptor.id).descriptor.worktree).toEqual(source.descriptor.worktree);
   });
 
+  it("does not treat a local workspace capability as remote derivation authority", async () => {
+    const adapter = new GatedFakeAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "workspace.derive", supported: true }]
+    });
+    const fixture = await createFixture(adapter);
+    await fixture.host.registerTarget({
+      id: "remote-derive-target",
+      backendId: adapter.id,
+      displayName: "Remote source",
+      workspaceRoot: "/workspace",
+      remoteWorkspace: { hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" },
+      managed: true,
+      trusted: true
+    });
+    const sourceId = (await fixture.host.createSession({
+      operationId: "remote-derive-source", connection: fixture.connection,
+      targetId: "remote-derive-target", title: "Source", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const cloneNative = vi.spyOn(adapter, "clone");
+    await expect(fixture.host.deriveSession({
+      operationId: "remote-derive-without-coordinator", connection: fixture.connection,
+      sourceSessionId: sourceId, title: "Derived", kind: "clone"
+    })).rejects.toMatchObject({
+      publicError: { code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED", stateMayHaveChanged: false }
+    });
+    expect(cloneNative).not.toHaveBeenCalled();
+  });
+
   it("snapshots a private append prompt and safely advances a service-owned runtime identity", async () => {
     const adapter = new PersonalizationPromptFakeAdapter();
     const fixture = await createFixture(adapter);

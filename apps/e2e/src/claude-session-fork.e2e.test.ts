@@ -868,18 +868,18 @@ class StoredLocalSessionRuntime implements ClaudeSdkRuntime {
     });
     const owner = this.#sessionOwner;
     this.storedSessions = {
-      prepareImport: (input) => owner.prepareSessionImport(input),
-      prepareDerivation: (input) => owner.prepareStoredSessionDerivation(input),
-      readOperation: (access) => owner.readStoredSessionOperation(access),
-      recoverOperation: (input) => owner.recoverStoredSessionOperation(input),
-      cleanupOperation: (access, input = {}) => {
+      prepareImport: async (input) => owner.prepareSessionImport(input),
+      prepareDerivation: async (input) => owner.prepareStoredSessionDerivation(input),
+      readOperation: async (access) => owner.readStoredSessionOperation(access),
+      recoverOperation: async (input) => owner.recoverStoredSessionOperation(input),
+      cleanupOperation: async (access, input = {}) => {
         options.cleanupOperations.push(access.operationId);
         return owner.cleanupStoredSessionOperation(access, input);
       },
-      discardImport: (access) => owner.discardSessionImport(access),
-      adopt: (access, sessionId) => owner.adoptStoredSession(access, sessionId),
-      claim: (input) => owner.claimStoredSession(input),
-      rebind: (input) => owner.rebindStoredSession(input),
+      discardImport: async (access) => owner.discardSessionImport(access),
+      adopt: async (access, sessionId) => owner.adoptStoredSession(access, sessionId),
+      claim: async (input) => owner.claimStoredSession(input),
+      rebind: async (input) => owner.rebindStoredSession(input),
       importSession: async (sessionId, input) => {
         await owner.run({
           kind: "importSessionToStore",

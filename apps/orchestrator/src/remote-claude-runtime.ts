@@ -5,6 +5,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv
 
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  ClaudeSessionStoreError,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
   type ClaudeRemoteRuntimePort,
@@ -27,8 +28,14 @@ import {
   type ClaudeSdkRuntime,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
+  type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkUserMessage,
   type ClaudeTargetRuntime
+} from "@joko/adapter-claude-code";
+import type {
+  ClaudeSessionStoreOperationAccess,
+  ClaudeSessionStoreOperationSnapshot,
+  ClaudeSessionStoreSessionAccess
 } from "@joko/adapter-claude-code";
 import type { TargetDescriptor } from "@joko/core";
 import type {
@@ -61,43 +68,84 @@ const MAXIMUM_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
 const MAXIMUM_MCP_PAYLOAD_BYTES = 24 * 1024 * 1024;
 const REMOTE_HOOK_EVENTS = ["PreToolUse", "PermissionDenied", "PostToolUse", "PostToolUseFailure"] as const satisfies readonly ClaudeSdkHookEvent[];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WORKSPACE_AUTHORITY = /^workspace-[0-9a-f]{64}$/u;
+const STORE_CODES = new Set([
+  "INVALID_AUTHORITY", "INVALID_ACCESS", "INVALID_KEY", "INVALID_ENTRY", "LIMIT_EXCEEDED",
+  "NOT_FOUND", "CONFLICT", "OPERATION_NOT_READY", "CORRUPT", "STORAGE_UNAVAILABLE",
+  "COMMIT_UNKNOWN", "RESERVATION_REQUIRED", "RESERVATION_FAILED"
+]);
+
+interface RemoteClaudeStoreAuthority {
+  readonly schemaVersion: 1;
+  readonly namespace: string;
+  readonly generation: number;
+}
 
 type ProcessAuthority = Awaited<ReturnType<RemoteHostRegistry["captureProcessAuthority"]>>;
 
 interface ResolverEntry {
+  readonly key: string;
   readonly targetId: string;
   readonly targetRevision: bigint;
   readonly targetSignature: string;
+  readonly storedSignature: string;
   readonly authority: ProcessAuthority;
   readonly runtime: RemoteClaudeSdkRuntime;
   readonly binding: ClaudeTargetRuntime;
 }
 
+export interface RemoteClaudeDerivedWorkspaceAuthority {
+  /** Synchronous product/Host fence for a previously verified exact checkout. */
+  readonly assertCurrent: () => void;
+  /** Read-only remote manifest and Git identity check before an SDK effect. */
+  readonly verifyExact: (signal?: AbortSignal) => Promise<void>;
+}
+
 export interface RemoteClaudeRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
   readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  /** Persisted monotonic Backend instance generation, shared by its source and derived runtimes. */
+  readonly storeGeneration: number;
+  readonly authorizeDerivedWorkspace?: (
+    target: TargetDescriptor,
+    storedTarget: StoredTarget,
+    signal?: AbortSignal
+  ) => Promise<RemoteClaudeDerivedWorkspaceAuthority>;
 }
 
 /** Target-, Host-, SSH-, installation-, and manager-generation-bound Claude runtime owner. */
 export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
   readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly #authorizeDerivedWorkspace: RemoteClaudeRuntimeResolverOptions["authorizeDerivedWorkspace"];
+  readonly #storeGeneration: number;
   readonly #entries = new Map<string, ResolverEntry>();
   readonly #flights = new Map<string, Promise<ClaudeTargetRuntime>>();
   #closing = false;
   #closed = false;
 
   constructor(options: RemoteClaudeRuntimeResolverOptions) {
+    if (!Number.isSafeInteger(options.storeGeneration) || options.storeGeneration < 1) {
+      throw runtimeFault("store_generation_invalid", false);
+    }
     this.#store = options.store;
     this.#registry = options.registry;
+    this.#storeGeneration = options.storeGeneration;
+    this.#authorizeDerivedWorkspace = options.authorizeDerivedWorkspace;
   }
 
   async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime> {
     this.#assertOpen();
     if (signal?.aborted) throw runtimeFault("cancelled", false);
     const stored = this.#storedTarget(target);
+    const derived = target.workspaceRoot !== stored.descriptor.workspaceRoot;
+    const directoryAuthority = derived
+      ? await this.#authorizeDerivedWorkspace!(target, stored, signal)
+      : undefined;
+    await directoryAuthority?.verifyExact(signal);
+    const key = JSON.stringify([target.id, target.workspaceRoot]);
     const signature = targetSignature(target);
-    const existing = this.#entries.get(target.id);
+    const existing = this.#entries.get(key);
     if (existing !== undefined
       && existing.targetRevision === stored.revision
       && existing.targetSignature === signature) {
@@ -110,12 +158,12 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     } else if (existing !== undefined) {
       await this.#retire(existing);
     }
-    const active = this.#flights.get(target.id);
+    const active = this.#flights.get(key);
     if (active !== undefined) return active;
-    const flight = this.#resolveFresh(target, stored, signature, signal);
-    this.#flights.set(target.id, flight);
+    const flight = this.#resolveFresh(target, stored, signature, key, directoryAuthority, signal);
+    this.#flights.set(key, flight);
     try { return await flight; }
-    finally { if (this.#flights.get(target.id) === flight) this.#flights.delete(target.id); }
+    finally { if (this.#flights.get(key) === flight) this.#flights.delete(key); }
   }
 
   async close(): Promise<void> {
@@ -139,9 +187,11 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     target: TargetDescriptor,
     stored: StoredTarget,
     signature: string,
+    key: string,
+    directoryAuthority: RemoteClaudeDerivedWorkspaceAuthority | undefined,
     signal?: AbortSignal
   ): Promise<ClaudeTargetRuntime> {
-    const remote = requireRemoteBinding(target);
+    const remote = requireRemoteBinding(stored.descriptor);
     const authority = await this.#registry.captureProcessAuthority(remote.hostTargetId, remote.hostId, signal);
     const processes = requireProcesses(authority.lease);
     authority.assertCurrent();
@@ -154,18 +204,35 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       ownerId: authority.host.ownerId,
       targetId: target.id,
       host: executionHostIdentity(authority.host),
-      runtimeRoot: installation.runtimeRoot
+      runtimeRoot: installation.runtimeRoot,
+      ...(directoryAuthority === undefined ? {} : { workspaceRoot: target.workspaceRoot })
     }), "utf8").digest("hex");
     const ownerGeneration = `${stored.revision}:${authority.hostRevision}:${authority.leaseGeneration}:${randomUUID()}`;
+    const storeAuthority: RemoteClaudeStoreAuthority = Object.freeze({
+      schemaVersion: 1,
+      namespace: `backend-${createHash("sha256").update(JSON.stringify({
+        kind: "joko-remote-claude-store-v1",
+        backendId: target.backendId,
+        targetId: target.id,
+        primaryWorkspaceRoot: remote.workspaceRoot,
+        ownerId: authority.host.ownerId,
+        host: executionHostIdentity(authority.host),
+        runtimeRoot: installation.runtimeRoot
+      }), "utf8").digest("hex")}`,
+      generation: this.#storeGeneration
+    });
+    const workspaceAuthority = claudeWorkspaceAuthority(target);
+    const storedSignature = targetSignature(stored.descriptor);
     let entry!: ResolverEntry;
     let runtime: RemoteClaudeSdkRuntime | undefined;
     const assertAuthorityCurrent = (): void => {
       if (this.#closed) throw runtimeFault("authority_changed", false);
       const current = this.#store.getTarget(target.id);
       if (current.revision !== stored.revision
-        || targetSignature(current.descriptor) !== signature
-        || this.#entries.get(target.id) !== entry) throw runtimeFault("authority_changed", false);
+        || targetSignature(current.descriptor) !== storedSignature
+        || this.#entries.get(key) !== entry) throw runtimeFault("authority_changed", false);
       authority.assertCurrent();
+      directoryAuthority?.assertCurrent();
     };
     const assertCurrent = (): void => {
       if (this.#closed || this.#closing) throw runtimeFault("authority_changed", false);
@@ -178,27 +245,33 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       installation,
       ownerKey,
       ownerGeneration,
+      storeAuthority,
+      workspaceAuthority,
+      authorizedWorkspaceRoot: target.workspaceRoot,
+      ...(directoryAuthority === undefined ? {} : { verifyWorkspace: directoryAuthority.verifyExact }),
       assertCurrent,
       assertAuthorityCurrent,
       assertForwardingCurrent: authority.assertForwardingCurrent
     });
     const binding: ClaudeTargetRuntime = Object.freeze({
       runtime,
-      workspaceRoot: installation.workspaceRoot,
+      workspaceRoot: target.workspaceRoot,
       remote: true,
       assertCurrent
     });
     entry = Object.freeze({
+      key,
       targetId: target.id,
       targetRevision: stored.revision,
       targetSignature: signature,
+      storedSignature,
       authority,
       runtime,
       binding
     });
     this.#assertOpen();
     authority.assertCurrent();
-    this.#entries.set(target.id, entry);
+    this.#entries.set(key, entry);
     try {
       binding.assertCurrent();
       await runtime.initialize(signal);
@@ -212,12 +285,31 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
 
   async #retire(entry: ResolverEntry): Promise<void> {
     try { await entry.runtime.shutdown(); }
-    finally { if (this.#entries.get(entry.targetId) === entry) this.#entries.delete(entry.targetId); }
+    finally { if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key); }
   }
 
   #storedTarget(target: TargetDescriptor): StoredTarget {
     const stored = this.#store.getTarget(target.id);
-    if (targetSignature(stored.descriptor) !== targetSignature(target)) throw runtimeFault("target_stale", false);
+    const storedSignature = targetSignature(stored.descriptor);
+    if (storedSignature !== targetSignature(target)) {
+      const binding = target.remoteWorkspace;
+      const primaryBinding = stored.descriptor.remoteWorkspace;
+      const normalized = binding !== undefined && primaryBinding !== undefined
+        && (binding.workspaceRoot === primaryBinding.workspaceRoot || binding.workspaceRoot === target.workspaceRoot)
+        ? {
+            ...target,
+            workspaceRoot: stored.descriptor.workspaceRoot,
+            remoteWorkspace: { ...binding, workspaceRoot: primaryBinding.workspaceRoot }
+          }
+        : undefined;
+      if (target.workspaceRoot === stored.descriptor.workspaceRoot
+        || !normalizedAbsoluteRemotePath(target.workspaceRoot)
+        || normalized === undefined
+        || targetSignature(normalized) !== storedSignature
+        || this.#authorizeDerivedWorkspace === undefined) {
+        throw runtimeFault("target_stale", false);
+      }
+    }
     requireRemoteBinding(stored.descriptor);
     return stored;
   }
@@ -233,6 +325,10 @@ interface RemoteClaudeSdkRuntimeOptions {
   readonly installation: RemoteClaudeInstallationProbe;
   readonly ownerKey: string;
   readonly ownerGeneration: string;
+  readonly storeAuthority: RemoteClaudeStoreAuthority;
+  readonly workspaceAuthority: string;
+  readonly authorizedWorkspaceRoot: string;
+  readonly verifyWorkspace?: (signal?: AbortSignal) => Promise<void>;
   readonly assertCurrent: () => void;
   readonly assertAuthorityCurrent: () => void;
   readonly assertForwardingCurrent: () => void;
@@ -240,18 +336,226 @@ interface RemoteClaudeSdkRuntimeOptions {
 
 class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
-  readonly supportsWorkspaceDerivation = false;
+  readonly supportsWorkspaceDerivation = true;
+  readonly storedSessions: ClaudeSdkStoredSessionRuntime;
   readonly #options: RemoteClaudeSdkRuntimeOptions;
   readonly #queries = new Map<ClaudeSdkQuery, RemoteClaudeQuery>();
   readonly #ownedQueries = new WeakSet<ClaudeSdkQuery>();
   readonly #sessionOperations = new Set<Promise<unknown>>();
   readonly #forks = new Set<string>();
+  readonly #storeOperations = new Set<string>();
   #managerGeneration: string | undefined;
   #managerGenerationCurrent = true;
   #closed = false;
 
   constructor(options: RemoteClaudeSdkRuntimeOptions) {
     this.#options = options;
+    this.storedSessions = this.#createStoredSessions();
+  }
+
+  #createStoredSessions(): ClaudeSdkStoredSessionRuntime {
+    const runtime: ClaudeSdkStoredSessionRuntime = {
+      prepareImport: async (input) => {
+        this.#assertStoreSourceInput(input);
+        const value = await this.#storeOperation("store.prepareImport", { input });
+        const access = storeOperationAccess(value, this.#options.storeAuthority.generation, true);
+        if (access.operationId !== input.operationId || access.source.kind !== "import"
+          || access.source.workspaceAuthority !== input.sourceWorkspaceAuthority
+          || access.source.sessionId !== input.sourceSessionId
+          || access.target.workspaceAuthority !== input.targetWorkspaceAuthority) throw runtimeFault("invalid_response", true);
+        this.#storeOperations.add(access.operationId);
+        return access;
+      },
+      prepareDerivation: async (input) => {
+        this.#assertStoreSourceInput(input);
+        const value = await this.#storeOperation("store.prepareDerivation", { input });
+        const access = storeOperationAccess(value, this.#options.storeAuthority.generation, true);
+        if (access.operationId !== input.operationId || access.source.kind !== "durable"
+          || access.source.workspaceAuthority !== input.sourceWorkspaceAuthority
+          || access.source.sessionId !== input.sourceSessionId
+          || access.target.workspaceAuthority !== input.targetWorkspaceAuthority) throw runtimeFault("invalid_response", true);
+        this.#storeOperations.add(access.operationId);
+        return access;
+      },
+      readOperation: async (access) => {
+        this.#assertStoreTargetOperation(access);
+        return storeOperationSnapshot(
+          await this.#storeOperation("store.readOperation", { access }), access
+        );
+      },
+      recoverOperation: async (input) => {
+        if (!UUID.test(input.operationId) || input.targetWorkspaceAuthority !== this.#options.workspaceAuthority
+          || (input.expectedChildSessionId !== undefined && !UUID.test(input.expectedChildSessionId))) {
+          throw runtimeFault("store_access_mismatch", false);
+        }
+        const access = storeOperationAccess(
+          await this.#storeOperation("store.recoverOperation", { input }),
+          this.#options.storeAuthority.generation,
+          true
+        );
+        if (access.operationId !== input.operationId
+          || access.target.workspaceAuthority !== input.targetWorkspaceAuthority) throw runtimeFault("invalid_response", true);
+        this.#storeOperations.add(access.operationId);
+        return access;
+      },
+      cleanupOperation: async (access, input) => {
+        this.#assertStoreTargetOperation(access);
+        if (input?.expectedChildSessionId !== undefined && !UUID.test(input.expectedChildSessionId)) {
+          throw runtimeFault("store_access_mismatch", false);
+        }
+        return storeOperationSnapshot(await this.#storeOperation("store.cleanupOperation", {
+          access, ...(input === undefined ? {} : { input })
+        }), access);
+      },
+      discardImport: async (access) => {
+        this.#assertStoreSourceOperation(access, "import");
+        const value = await this.#storeOperation("store.discardImport", { access });
+        if (!isRecord(value) || value.discarded !== true) throw runtimeFault("invalid_response", true);
+      },
+      adopt: async (access, sessionId) => {
+        this.#assertStoreTargetOperation(access);
+        if (!UUID.test(sessionId)) throw runtimeFault("store_access_mismatch", false);
+        return storeSessionAccess(await this.#storeOperation("store.adopt", { access, sessionId }),
+          this.#options.storeAuthority.generation, this.#options.workspaceAuthority, sessionId, true);
+      },
+      claim: async (input) => {
+        this.#assertStoreSessionInput(input);
+        return storeSessionAccess(await this.#storeOperation("store.claim", { input }),
+          this.#options.storeAuthority.generation, input.workspaceAuthority, input.sessionId, true);
+      },
+      rebind: async (input) => {
+        this.#assertStoreSessionInput(input);
+        if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration < 1
+          || input.expectedGeneration > this.#options.storeAuthority.generation) throw runtimeFault("store_access_mismatch", false);
+        return storeSessionAccess(await this.#storeOperation("store.rebind", { input }),
+          this.#options.storeAuthority.generation, input.workspaceAuthority, input.sessionId, true);
+      },
+      importSession: async (sessionId, options) => {
+        this.#assertDirectory(options.dir);
+        this.#assertStoreSourceOperation(options.access, "import", sessionId);
+        const value = await this.#storeOperation("store.import", {
+          access: options.access, sessionId, dir: options.dir
+        }, options.signal);
+        if (!isRecord(value) || value.imported !== true) throw runtimeFault("invalid_response", true);
+      },
+      forkSession: async (sessionId, options) => {
+        this.#assertDirectory(options.dir);
+        this.#assertStoreTargetOperation(options.access);
+        if (!UUID.test(sessionId) || options.access.source.sessionId !== sessionId
+          || (options.upToMessageId !== undefined && !UUID.test(options.upToMessageId))) {
+          throw runtimeFault("store_access_mismatch", false);
+        }
+        this.#forks.add(sessionId);
+        let reservedSessionId: string | undefined;
+        try {
+          const value = await this.#storeOperation("store.fork", {
+            access: options.access, sessionId, dir: options.dir,
+            ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId })
+          }, options.signal, async (channel, frame) => {
+            const callbackId = frame.callbackId;
+            try {
+              if (frame.callback !== "storeChildReserved" || frame.queryId !== undefined
+                || typeof callbackId !== "string" || !UUID.test(callbackId)) {
+                throw runtimeFault("callback_invalid", false);
+              }
+              const reservation = storeChildReservation(frame.value, options.access);
+              this.#options.assertCurrent();
+              if (reservedSessionId === undefined) {
+                options.recordSessionId(reservation.sessionId);
+                reservedSessionId = reservation.sessionId;
+              } else if (reservedSessionId !== reservation.sessionId) {
+                throw runtimeFault("callback_invalid", true);
+              }
+              this.#options.assertCurrent();
+              await channel.sendCallback(callbackId, true, { accepted: true });
+            } catch {
+              if (typeof callbackId === "string") await channel.sendCallback(callbackId, false).catch(() => undefined);
+            }
+          });
+          if (!isRecord(value) || typeof value.sessionId !== "string" || !UUID.test(value.sessionId)
+            || value.sessionId.toLowerCase() !== reservedSessionId) throw runtimeFault("invalid_response", true);
+          return { sessionId: reservedSessionId };
+        } finally { this.#forks.delete(sessionId); }
+      },
+      getSessionInfo: async (sessionId, options) => {
+        this.#assertDirectory(options.dir);
+        this.#assertStoreReadAccess(options.access, sessionId);
+        const value = await this.#storeOperation("store.info", {
+          access: options.access, sessionId, dir: options.dir
+        }, options.signal);
+        return value === undefined || value === null ? undefined : sessionInfo(value);
+      },
+      getSessionMessages: async (sessionId, options) => {
+        this.#assertDirectory(options.dir);
+        this.#assertStoreReadAccess(options.access, sessionId);
+        const value = await this.#storeOperation("store.messages", {
+          access: options.access, sessionId, dir: options.dir,
+          limit: options.limit, offset: options.offset,
+          includeSystemMessages: options.includeSystemMessages
+        }, options.signal);
+        if (!Array.isArray(value) || value.length > options.limit) throw runtimeFault("invalid_response", false);
+        return value.map(sessionMessage);
+      },
+      deleteSession: async (sessionId, options) => {
+        this.#assertDirectory(options.dir);
+        this.#assertStoreReadAccess(options.access, sessionId);
+        await this.#storeOperation("store.delete", {
+          access: options.access, sessionId, dir: options.dir
+        }, options.signal);
+      },
+      ownsOperation: (operationId) => this.#storeOperations.has(operationId)
+    };
+    return Object.freeze(runtime);
+  }
+
+  #assertStoreSourceInput(input: {
+    readonly operationId: string;
+    readonly sourceWorkspaceAuthority: string;
+    readonly sourceSessionId: string;
+    readonly targetWorkspaceAuthority: string;
+  }): void {
+    if (!UUID.test(input.operationId) || !UUID.test(input.sourceSessionId)
+      || input.sourceWorkspaceAuthority !== this.#options.workspaceAuthority
+      || !WORKSPACE_AUTHORITY.test(input.targetWorkspaceAuthority)) throw runtimeFault("store_access_mismatch", false);
+  }
+
+  #assertStoreSourceOperation(access: ClaudeSessionStoreOperationAccess, kind: "import" | "durable", sessionId?: string): void {
+    storeOperationAccess(access, this.#options.storeAuthority.generation);
+    if (access.source.kind !== kind || access.source.workspaceAuthority !== this.#options.workspaceAuthority
+      || (sessionId !== undefined && access.source.sessionId !== sessionId)) throw runtimeFault("store_access_mismatch", false);
+  }
+
+  #assertStoreTargetOperation(access: ClaudeSessionStoreOperationAccess): void {
+    storeOperationAccess(access, this.#options.storeAuthority.generation);
+    if (access.target.workspaceAuthority !== this.#options.workspaceAuthority) throw runtimeFault("store_access_mismatch", false);
+  }
+
+  #assertStoreSessionInput(input: { readonly workspaceAuthority: string; readonly sessionId: string }): void {
+    if (input.workspaceAuthority !== this.#options.workspaceAuthority || !UUID.test(input.sessionId)) {
+      throw runtimeFault("store_access_mismatch", false);
+    }
+  }
+
+  #assertStoreReadAccess(access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess, sessionId: string): void {
+    if (!UUID.test(sessionId)) throw runtimeFault("store_access_mismatch", false);
+    if (access.kind === "operation") this.#assertStoreTargetOperation(access);
+    else storeSessionAccess(access, this.#options.storeAuthority.generation, this.#options.workspaceAuthority, sessionId);
+  }
+
+  async #storeOperation(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+    signal?: AbortSignal,
+    onCallback?: (channel: RemoteClaudeManagerChannel, frame: Readonly<Record<string, unknown>>) => Promise<void>
+  ): Promise<unknown> {
+    try {
+      return await this.#sessionOperation(method, { authority: this.#options.storeAuthority, ...params }, signal, onCallback);
+    } catch (error) {
+      if (error instanceof RemoteClaudeManagerFault && STORE_CODES.has(error.code)) {
+        throw new ClaudeSessionStoreError(error.code as ConstructorParameters<typeof ClaudeSessionStoreError>[0], error.stateMayHaveChanged);
+      }
+      throw error;
+    }
   }
 
   async initialize(signal?: AbortSignal): Promise<void> {
@@ -277,7 +581,15 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
 
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
     this.#assertOpen();
+    this.#assertDirectory(params.options.cwd);
+    if (params.options.sessionStoreAccess !== undefined) {
+      storeSessionAccess(params.options.sessionStoreAccess,
+        this.#options.storeAuthority.generation,
+        this.#options.workspaceAuthority,
+        params.options.resume ?? params.options.sessionId);
+    }
     this.#options.assertCurrent();
+    await this.#options.verifyWorkspace?.(params.options.abortController.signal);
     let forward: RemoteReverseForwardHandle | undefined;
     let forwardedParams = params;
     try {
@@ -288,6 +600,7 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
         ...this.#channelOptions(),
         ownerKey: this.#options.ownerKey,
         ownerGeneration: this.#options.ownerGeneration,
+        storeAuthority: this.#options.storeAuthority,
         params: forwardedParams,
         assertAuthorityCurrent: this.#options.assertAuthorityCurrent,
         ...(forward === undefined ? {} : { forward }),
@@ -402,8 +715,13 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     if (failure !== undefined) throw failure;
   }
 
-  async #sessionOperation(method: string, params: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<unknown> {
-    const operation = this.#requestOnce(method, params, signal, SESSION_OPERATION_TIMEOUT_MS);
+  async #sessionOperation(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+    signal?: AbortSignal,
+    onCallback?: (channel: RemoteClaudeManagerChannel, frame: Readonly<Record<string, unknown>>) => Promise<void>
+  ): Promise<unknown> {
+    const operation = this.#requestOnce(method, params, signal, SESSION_OPERATION_TIMEOUT_MS, onCallback);
     this.#sessionOperations.add(operation);
     try { return await operation; }
     finally { this.#sessionOperations.delete(operation); }
@@ -413,11 +731,18 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     method: string,
     params: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    timeoutMs: number
+    timeoutMs: number,
+    onCallback?: (channel: RemoteClaudeManagerChannel, frame: Readonly<Record<string, unknown>>) => Promise<void>
   ): Promise<unknown> {
     this.#assertOpen();
     signal?.throwIfAborted();
-    const channel = await RemoteClaudeManagerChannel.open(this.#channelOptions(), signal);
+    await this.#options.verifyWorkspace?.(signal);
+    this.#assertOpen();
+    let channel!: RemoteClaudeManagerChannel;
+    channel = await RemoteClaudeManagerChannel.open({
+      ...this.#channelOptions(),
+      ...(onCallback === undefined ? {} : { onCallback: (frame) => onCallback(channel, frame) })
+    }, signal);
     try {
       const value = await channel.request(method, params, { timeoutMs, signal });
       this.#options.assertCurrent();
@@ -491,7 +816,7 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
 
   #assertDirectory(dir: string): void {
     this.#options.assertCurrent();
-    if (dir !== this.#options.installation.workspaceRoot) throw runtimeFault("workspace_mismatch", false);
+    if (dir !== this.#options.authorizedWorkspaceRoot) throw runtimeFault("workspace_mismatch", false);
   }
 
   #assertOpen(): void {
@@ -504,6 +829,7 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
 interface RemoteClaudeQueryOpenOptions extends RemoteClaudeManagerChannelOptions {
   readonly ownerKey: string;
   readonly ownerGeneration: string;
+  readonly storeAuthority: RemoteClaudeStoreAuthority;
   readonly params: ClaudeSdkQueryParams;
   readonly assertAuthorityCurrent: () => void;
   readonly forward?: RemoteReverseForwardHandle;
@@ -624,7 +950,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
       ownerKey: this.#options.ownerKey,
       ownerGeneration: this.#options.ownerGeneration,
       afterSeq: 0,
-      options: serializeQueryOptions(this.#options.params.options)
+      options: serializeQueryOptions(this.#options.params.options, this.#options.storeAuthority)
     };
     let previous: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1080,7 +1406,7 @@ class RemoteClaudeManagerChannel {
         ...(options.signal === undefined ? {} : { signal: options.signal, abort })
       });
       options.signal?.addEventListener("abort", abort!, { once: true });
-      this.#send({ v: 1, kind: "request", id, method, params }).catch((error) => {
+      this.#send({ v: REMOTE_CLAUDE_PROTOCOL_VERSION, kind: "request", id, method, params }).catch((error) => {
         const pending = this.#pending.get(id);
         if (pending === undefined) return;
         this.#pending.delete(id);
@@ -1092,7 +1418,7 @@ class RemoteClaudeManagerChannel {
   }
 
   sendCallback(callbackId: string, ok: boolean, value?: unknown): Promise<void> {
-    return this.#send({ v: 1, kind: "callback_result", callbackId, ok, ...(ok ? { value } : {}) });
+    return this.#send({ v: REMOTE_CLAUDE_PROTOCOL_VERSION, kind: "callback_result", callbackId, ok, ...(ok ? { value } : {}) });
   }
 
   close(): Promise<void> {
@@ -1152,7 +1478,7 @@ class RemoteClaudeManagerChannel {
       let frame: unknown;
       try { frame = JSON.parse(decodeUtf8(line)); }
       catch { return this.#fail(transportFault("protocol_error")); }
-      if (!isRecord(frame) || frame.v !== 1 || typeof frame.kind !== "string") return this.#fail(transportFault("protocol_error"));
+      if (!isRecord(frame) || frame.v !== REMOTE_CLAUDE_PROTOCOL_VERSION || typeof frame.kind !== "string") return this.#fail(transportFault("protocol_error"));
       this.#acceptFrame(frame);
       if (this.#closed) return;
     }
@@ -1290,7 +1616,10 @@ class RemoteClaudeManagerFault extends Error {
   }
 }
 
-function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<string, unknown>> {
+function serializeQueryOptions(
+  options: ClaudeSdkQueryOptions,
+  storeAuthority: RemoteClaudeStoreAuthority
+): Readonly<Record<string, unknown>> {
   return {
     additionalDirectories: [...options.additionalDirectories],
     allowDangerouslySkipPermissions: options.allowDangerouslySkipPermissions,
@@ -1313,6 +1642,10 @@ function serializeQueryOptions(options: ClaudeSdkQueryOptions): Readonly<Record<
     persistSession: options.persistSession,
     ...(options.resume === undefined ? {} : { resume: options.resume }),
     ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+    ...(options.sessionStoreAccess === undefined ? {} : {
+      sessionStoreAuthority: storeAuthority,
+      sessionStoreAccess: options.sessionStoreAccess
+    }),
     ...(options.settings === undefined ? {} : { settings: { ...options.settings } }),
     settingSources: [...options.settingSources],
     ...(options.skills === undefined ? {} : { skills: [...options.skills] }),
@@ -1514,6 +1847,91 @@ function sessionMessage(value: unknown): ClaudeSdkSessionMessage {
     throw runtimeFault("invalid_response", false);
   }
   return value as unknown as ClaudeSdkSessionMessage;
+}
+
+function storeOperationAccess(value: unknown, generation: number, stateMayHaveChanged = false): ClaudeSessionStoreOperationAccess {
+  if (!isRecord(value) || value.kind !== "operation" || typeof value.operationId !== "string"
+    || !UUID.test(value.operationId) || value.generation !== generation
+    || !isRecord(value.source) || !["import", "durable"].includes(String(value.source.kind))
+    || typeof value.source.workspaceAuthority !== "string" || !WORKSPACE_AUTHORITY.test(value.source.workspaceAuthority)
+    || typeof value.source.sessionId !== "string" || !UUID.test(value.source.sessionId)
+    || !isRecord(value.target) || typeof value.target.workspaceAuthority !== "string"
+    || !WORKSPACE_AUTHORITY.test(value.target.workspaceAuthority)
+    || !exactKeys(value, ["kind", "operationId", "generation", "source", "target"])
+    || !exactKeys(value.source, ["kind", "workspaceAuthority", "sessionId"])
+    || !exactKeys(value.target, ["workspaceAuthority"])) throw runtimeFault("store_access_mismatch", stateMayHaveChanged);
+  return value as unknown as ClaudeSessionStoreOperationAccess;
+}
+
+function storeSessionAccess(
+  value: unknown,
+  generation: number,
+  workspaceAuthority: string,
+  sessionId: string | undefined,
+  stateMayHaveChanged = false
+): ClaudeSessionStoreSessionAccess {
+  if (!isRecord(value) || value.kind !== "session" || value.generation !== generation
+    || value.workspaceAuthority !== workspaceAuthority || typeof value.sessionId !== "string"
+    || !UUID.test(value.sessionId) || value.sessionId !== sessionId
+    || !exactKeys(value, ["kind", "generation", "workspaceAuthority", "sessionId"])) {
+    throw runtimeFault("store_access_mismatch", stateMayHaveChanged);
+  }
+  return value as unknown as ClaudeSessionStoreSessionAccess;
+}
+
+function storeOperationSnapshot(value: unknown, access: ClaudeSessionStoreOperationAccess): ClaudeSessionStoreOperationSnapshot {
+  if (!isRecord(value) || value.operationId !== access.operationId || value.generation !== access.generation
+    || value.sourceKind !== access.source.kind
+    || value.sourceWorkspaceAuthority !== access.source.workspaceAuthority
+    || value.sourceSessionId !== access.source.sessionId
+    || value.targetWorkspaceAuthority !== access.target.workspaceAuthority
+    || !["importing", "ready", "aliased", "child_pending", "child_reserved", "adopted", "cleaned"].includes(String(value.state))
+    || typeof value.sourceProjectKeyCaptured !== "boolean" || typeof value.targetProjectKeyCaptured !== "boolean"
+    || !Number.isSafeInteger(value.sourceEntryCount) || (value.sourceEntryCount as number) < 0
+    || !Number.isSafeInteger(value.sourceBytes) || (value.sourceBytes as number) < 0
+    || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1
+    || typeof value.childReservationConfirmed !== "boolean"
+    || (value.childSessionId !== undefined && (typeof value.childSessionId !== "string" || !UUID.test(value.childSessionId)))) {
+    throw runtimeFault("invalid_response", true);
+  }
+  return value as unknown as ClaudeSessionStoreOperationSnapshot;
+}
+
+function storeChildReservation(value: unknown, access: ClaudeSessionStoreOperationAccess): {
+  readonly sessionId: string;
+} {
+  if (!isRecord(value) || value.operationId !== access.operationId || value.generation !== access.generation
+    || value.targetWorkspaceAuthority !== access.target.workspaceAuthority
+    || typeof value.sessionId !== "string" || !UUID.test(value.sessionId)
+    || !exactKeys(value, ["operationId", "generation", "targetWorkspaceAuthority", "sessionId"])) {
+    throw runtimeFault("callback_invalid", false);
+  }
+  return { sessionId: value.sessionId.toLowerCase() };
+}
+
+function exactKeys(value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key));
+}
+
+/** The Adapter's Target-scoped Store key; effective cwd is intentionally part of remote identity. */
+function claudeWorkspaceAuthority(target: TargetDescriptor): string {
+  const remote = requireRemoteBinding(target);
+  if (!normalizedAbsoluteRemotePath(target.workspaceRoot)) throw runtimeFault("remote_target_invalid", false);
+  const hash = createHash("sha256")
+    .update("joko-claude-workspace\0", "utf8")
+    .update(target.backendId, "utf8")
+    .update("\0", "utf8")
+    .update(target.id, "utf8")
+    .update("\0", "utf8")
+    .update("remote\0", "utf8")
+    .update(remote.hostTargetId, "utf8")
+    .update("\0", "utf8")
+    .update(remote.hostId, "utf8")
+    .update("\0", "utf8")
+    .update(remote.workspaceRoot, "utf8")
+    .update("\0", "utf8")
+    .update(target.workspaceRoot, "utf8");
+  return `workspace-${hash.digest("hex")}`;
 }
 
 function targetSignature(target: TargetDescriptor): string {

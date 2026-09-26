@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createManagerState, ManagerConnection } from "./remote-manager/manager.mjs";
+import * as sessionStoreModule from "./claude-session-store.js";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const QUERY_ID = "22222222-2222-4222-8222-222222222222";
@@ -17,6 +18,13 @@ const FORK_ID = "44444444-4444-4444-8444-444444444444";
 const PEER_INPUT_ID = "55555555-5555-4555-8555-555555555555";
 const NOTIFICATION_INPUT_ID = "66666666-6666-4666-8666-666666666666";
 const CALLBACK_TOKEN = "manager-callback-token";
+const STORE_ENTRY_ID = "99999999-9999-4999-8999-999999999999";
+
+interface TestSessionStore {
+  append(key: { readonly projectKey: string; readonly sessionId: string }, entries: readonly Record<string, unknown>[]): Promise<void>;
+  load(key: { readonly projectKey: string; readonly sessionId: string }): Promise<readonly Record<string, unknown>[] | null>;
+  delete(key: { readonly projectKey: string; readonly sessionId: string }): Promise<void>;
+}
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -121,8 +129,8 @@ describe("remote Claude manager protocol", () => {
     cleanups.push(() => first.close());
     const hello = await first.request("hello", {}) as Record<string, unknown>;
     expect(hello).toMatchObject({
-      protocolVersion: 1,
-      managerVersion: "1.0.0",
+      protocolVersion: 2,
+      managerVersion: "2.0.0",
       managerGeneration: managerState.generation
     });
 
@@ -285,10 +293,121 @@ describe("remote Claude manager protocol", () => {
     })).resolves.toEqual({ retired: true });
     expect(managerState.queries.get(QUERY_ID)?.retired).toBe(true);
   });
+
+  it("bridges the public SDK Store with durable reservation-before-ACK and stored Query resume", async () => {
+    const previousRoot = process.env["JOKO_CLAUDE_RUNTIME_ROOT"];
+    const previousExecutable = process.env["JOKO_CLAUDE_EXECUTABLE"];
+    process.env["JOKO_CLAUDE_RUNTIME_ROOT"] = "/srv/joko-runtime";
+    process.env["JOKO_CLAUDE_EXECUTABLE"] = "/srv/joko-runtime/current/claude";
+    const storeRoot = await mkdtemp(join(tmpdir(), "joko-remote-manager-store-"));
+    cleanups.push(async () => {
+      restoreEnvironment("JOKO_CLAUDE_RUNTIME_ROOT", previousRoot);
+      restoreEnvironment("JOKO_CLAUDE_EXECUTABLE", previousExecutable);
+      await rm(storeRoot, { recursive: true, force: true });
+    });
+    const sdk = new FakeSdk();
+    const managerState = createManagerState(sdk as never, {
+      sessionStoreModule,
+      sessionStoreRootDirectory: storeRoot
+    });
+    const socketPath = managerSocketPath();
+    const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
+    await listen(server, socketPath);
+    cleanups.push(async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== "win32") await rm(socketPath, { force: true });
+    });
+    const connection = await FrameClient.connect(socketPath);
+    cleanups.push(() => connection.close());
+
+    const authority = { schemaVersion: 1, namespace: `backend-${"a".repeat(64)}`, generation: 7 };
+    const operationId = "77777777-7777-4777-8777-777777777777";
+    const access = await connection.request("store.prepareImport", {
+      authority,
+      input: {
+        operationId,
+        sourceWorkspaceAuthority: "workspace-source",
+        sourceSessionId: SESSION_ID,
+        targetWorkspaceAuthority: "workspace-target"
+      }
+    }) as Record<string, unknown>;
+    await expect(connection.request("store.import", {
+      authority, access, sessionId: SESSION_ID, dir: "/srv/project"
+    })).resolves.toEqual({ imported: true });
+    await expect(connection.request("store.readOperation", { authority, access }))
+      .resolves.toMatchObject({ state: "ready", sourceProjectKeyCaptured: true });
+
+    const forked = await connection.request("store.fork", {
+      authority, access, sessionId: SESSION_ID, dir: "/srv/project-derived"
+    }) as { readonly sessionId: string };
+    expect(forked).toEqual({ sessionId: FORK_ID });
+    expect(connection.reservationFrames).toEqual([expect.objectContaining({
+      callback: "storeChildReserved",
+      value: expect.objectContaining({ operationId, sessionId: FORK_ID })
+    })]);
+    expect(connection.reservationFrames[0]).not.toHaveProperty("queryId");
+    expect(sdk.forkAppendResolved).toBe(true);
+    const sessionAccess = await connection.request("store.adopt", {
+      authority, access, sessionId: FORK_ID
+    }) as Record<string, unknown>;
+    await expect(connection.request("store.cleanupOperation", {
+      authority, access, input: { expectedChildSessionId: FORK_ID }
+    })).resolves.toMatchObject({ state: "cleaned", childReservationConfirmed: true });
+    await expect(connection.request("store.info", {
+      authority, access: sessionAccess, sessionId: FORK_ID, dir: "/srv/project-derived"
+    })).resolves.toMatchObject({ sessionId: FORK_ID, cwd: "/srv/project-derived" });
+    await expect(connection.request("store.messages", {
+      authority,
+      access: sessionAccess,
+      sessionId: FORK_ID,
+      dir: "/srv/project-derived",
+      limit: 10,
+      offset: 0,
+      includeSystemMessages: true
+    })).resolves.toEqual([expect.objectContaining({ session_id: FORK_ID })]);
+
+    const storedQueryId = "88888888-8888-4888-8888-888888888888";
+    await connection.request("query.start", {
+      requestId: storedQueryId,
+      queryId: storedQueryId,
+      sessionId: FORK_ID,
+      ownerKey: "b".repeat(64),
+      ownerGeneration: "target:host:ssh:derived",
+      afterSeq: 0,
+      options: {
+        ...queryOptions(),
+        cwd: "/srv/project-derived",
+        sessionId: undefined,
+        resume: FORK_ID,
+        sessionStoreAuthority: authority,
+        sessionStoreAccess: sessionAccess
+      }
+    }, storedQueryId);
+    expect(sdk.queries.at(-1)?.options).toMatchObject({
+      cwd: "/srv/project-derived",
+      resume: FORK_ID,
+      sessionStore: expect.any(Object)
+    });
+    const storedQuery = managerState.queries.get(storedQueryId);
+    await expect(connection.request("query.retire", {
+      queryId: storedQueryId,
+      attachmentId: storedQuery?.attachmentId,
+      ownerKey: "b".repeat(64),
+      ownerGeneration: "target:host:ssh:derived",
+      timeoutMs: 1_000
+    })).resolves.toEqual({ retired: true });
+    await expect(connection.request("store.delete", {
+      authority, access: sessionAccess, sessionId: FORK_ID, dir: "/srv/project-derived"
+    })).resolves.toBeUndefined();
+    await expect(connection.request("store.info", {
+      authority, access: sessionAccess, sessionId: FORK_ID, dir: "/srv/project-derived"
+    })).resolves.toBeUndefined();
+  });
 });
 
 class FakeSdk {
   queryCalls = 0;
+  forkAppendResolved = false;
   readonly queries: FakeQuery[] = [];
   readonly managedServerCalls: Array<Record<string, unknown>> = [];
   readonly sessions = new Map<string, { sessionId: string; cwd: string }>([
@@ -307,7 +426,11 @@ class FakeSdk {
     return { type: "sdk", name: options["name"], options };
   }
 
-  async getSessionInfo(sessionId: string, options: { readonly dir: string }) {
+  async getSessionInfo(sessionId: string, options: { readonly dir: string; readonly sessionStore?: TestSessionStore }) {
+    if (options.sessionStore !== undefined) {
+      const entries = await options.sessionStore.load({ projectKey: "remote-target-project", sessionId });
+      if (entries === null) return undefined;
+    }
     const session = this.sessions.get(sessionId);
     return session === undefined ? undefined : {
       ...session,
@@ -317,7 +440,12 @@ class FakeSdk {
     };
   }
 
-  async getSessionMessages() { return []; }
+  async getSessionMessages(sessionId?: string, options?: { readonly sessionStore?: TestSessionStore }) {
+    if (sessionId !== undefined && options?.sessionStore !== undefined) {
+      return await options.sessionStore.load({ projectKey: "remote-target-project", sessionId }) ?? [];
+    }
+    return [];
+  }
 
   async listSessions(options: { readonly dir: string }) {
     return [...this.sessions.values()].map((session) => ({
@@ -328,10 +456,34 @@ class FakeSdk {
     }));
   }
 
-  async deleteSession(sessionId: string) { this.sessions.delete(sessionId); }
+  async deleteSession(sessionId: string, options?: { readonly sessionStore?: TestSessionStore }) {
+    if (options?.sessionStore !== undefined) {
+      await options.sessionStore.delete({ projectKey: "remote-target-project", sessionId });
+    }
+    this.sessions.delete(sessionId);
+  }
 
-  async forkSession() {
-    this.sessions.set(FORK_ID, { sessionId: FORK_ID, cwd: "/srv/project" });
+  async importSessionToStore(sessionId: string, store: TestSessionStore) {
+    await store.append({ projectKey: "remote-source-project", sessionId }, [{
+      type: "user",
+      uuid: STORE_ENTRY_ID,
+      session_id: sessionId,
+      message: { role: "user", content: "stored source" }
+    }]);
+  }
+
+  async forkSession(sessionId = SESSION_ID, options?: { readonly dir?: string; readonly sessionStore?: TestSessionStore }) {
+    if (options?.sessionStore !== undefined) {
+      const entries = await options.sessionStore.load({ projectKey: "remote-target-project", sessionId });
+      if (entries === null) throw new Error("Stored source is unavailable.");
+      await options.sessionStore.append({ projectKey: "remote-target-project", sessionId: FORK_ID }, entries.map((entry) => ({
+        ...entry,
+        uuid: randomUUID(),
+        session_id: FORK_ID
+      })));
+      this.forkAppendResolved = true;
+    }
+    this.sessions.set(FORK_ID, { sessionId: FORK_ID, cwd: options?.dir ?? "/srv/project" });
     return { sessionId: FORK_ID };
   }
 }
@@ -459,6 +611,7 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
 
 class FrameClient {
   readonly callbackFrames: Array<Record<string, unknown>> = [];
+  readonly reservationFrames: Array<Record<string, unknown>> = [];
   readonly #socket: net.Socket;
   readonly #pending = new Map<string, { resolve(value: unknown): void; reject(error: unknown): void }>();
   readonly #events: Array<Record<string, unknown>> = [];
@@ -493,7 +646,7 @@ class FrameClient {
     if (this.#closed) return Promise.reject(new Error("Manager test client is closed."));
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#socket.write(`${JSON.stringify({ v: 1, kind: "request", id, method, params })}\n`);
+      this.#socket.write(`${JSON.stringify({ v: 2, kind: "request", id, method, params })}\n`);
     });
   }
 
@@ -550,6 +703,7 @@ class FrameClient {
         }
       } else if (frame["kind"] === "callback") {
         if (frame["callback"] === "productMcpTool") this.callbackFrames.push(frame);
+        if (frame["callback"] === "storeChildReserved") this.reservationFrames.push(frame);
         const value = frame["callback"] === "canUseTool"
           ? { behavior: "allow", updatedInput: { path: "/srv/project/a.ts" } }
           : frame["callback"] === "hook"
@@ -565,9 +719,11 @@ class FrameClient {
               ? { text: "delegated from host" }
               : frame["callback"] === "productMcpTool"
                 ? { content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" }, isError: false }
-              : { value: CALLBACK_TOKEN, declined: false };
+              : frame["callback"] === "storeChildReserved"
+                ? { accepted: true }
+                : { value: CALLBACK_TOKEN, declined: false };
         this.#socket.write(`${JSON.stringify({
-          v: 1,
+          v: 2,
           kind: "callback_result",
           callbackId: frame["callbackId"],
           ok: true,

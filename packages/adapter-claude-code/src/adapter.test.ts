@@ -107,7 +107,7 @@ describe("ClaudeCodeAdapter", () => {
 
   test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
     const remoteTarget: TargetDescriptor = {
-      ...target, id: "remote-mcp-target", workspaceRoot: "D:\\service-owned-placeholder",
+      ...target, id: "remote-mcp-target", workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
@@ -167,7 +167,7 @@ describe("ClaudeCodeAdapter", () => {
   test.each(["local", "remote"] as const)("keeps a no-tool %s Query isolated, retries at idle, and fails closed on uncertain retirement", async (location) => {
     const remote = location === "remote";
     const selectedTarget: TargetDescriptor = remote ? {
-      ...target, id: "remote-no-tool", workspaceRoot: "D:\\service-owned-placeholder",
+      ...target, id: "remote-no-tool", workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
     } : target;
     const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
@@ -278,7 +278,7 @@ describe("ClaudeCodeAdapter", () => {
       ? {
           ...target,
           id: "target-remote-managed-effort",
-          workspaceRoot: "D:\\service-owned-placeholder",
+          workspaceRoot: "/srv/effort",
           remoteWorkspace: { hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
         }
       : target;
@@ -947,7 +947,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "target-remote-managed-limits",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
@@ -3100,7 +3100,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "target-remote",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const localRuntime = new FakeSdkRuntime();
@@ -3196,7 +3196,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "target-remote-manager-replacement",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const runtime = new FakeSdkRuntime();
@@ -4757,6 +4757,92 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
+  test("derives a remote stored Session through the exact source and child POSIX runtimes", async () => {
+    const sourceTarget: TargetDescriptor = {
+      ...target,
+      id: "remote-stored-target",
+      workspaceRoot: "/srv/source",
+      remoteWorkspace: {
+        hostTargetId: "remote-stored-target",
+        hostId: "remote-store-host",
+        workspaceRoot: "/srv/source"
+      }
+    };
+    const derivedTarget: TargetDescriptor = { ...sourceTarget, workspaceRoot: "/srv/derived" };
+    const sourceRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/source" } });
+    const derivedRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/derived" } });
+    const storedSessions = new FakeStoredSessionRuntime(sourceRuntime);
+    sourceRuntime.storedSessions = storedSessions;
+    derivedRuntime.storedSessions = storedSessions;
+    const resolved: string[] = [];
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      remoteRuntimes: {
+        resolve: async (selected) => {
+          resolved.push(selected.workspaceRoot);
+          return {
+            runtime: selected.workspaceRoot === derivedTarget.workspaceRoot ? derivedRuntime : sourceRuntime,
+            workspaceRoot: selected.workspaceRoot,
+            remote: true,
+            assertCurrent: () => undefined
+          };
+        },
+        close: async () => undefined
+      }
+    });
+    const sourceBinding = await adapter.createSession(
+      createInput({ target: sourceTarget }),
+      contextFor(undefined, { target: sourceTarget }).context
+    );
+    sourceRuntime.sessions.set(sourceBinding.nativeSessionId!, {
+      ...sessionInfo(sourceBinding.nativeSessionId!),
+      cwd: "/srv/source"
+    });
+    sourceRuntime.messages.set(sourceBinding.nativeSessionId!, forkHistory(sourceBinding.nativeSessionId!));
+    const operationId = "remote-stored-clone";
+    const source = contextFor(sourceBinding, { operationId, target: sourceTarget });
+    const binding = await adapter.clone(source.context, {
+      sessionId: "remote-stored-product",
+      target: derivedTarget,
+      recordBinding: vi.fn()
+    });
+    expect(storedSessions.importCalls).toEqual([
+      expect.objectContaining({ sessionId: sourceBinding.nativeSessionId })
+    ]);
+    expect(storedSessions.forkCalls).toEqual([
+      expect.objectContaining({ sessionId: sourceBinding.nativeSessionId, dir: "/srv/derived" })
+    ]);
+    expect(sourceRuntime.forks).toEqual([]);
+    expect(derivedRuntime.forks).toEqual([]);
+    const lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding } = {
+      operationId,
+      kind: "clone",
+      sourceSessionId: source.context.sessionId,
+      sourceBinding,
+      sessionId: "remote-stored-product",
+      sourceTarget,
+      target: derivedTarget,
+      binding
+    };
+    expect(adapter.ownsNativeSessionDerivationLifecycle(lifecycle)).toBe(true);
+    await adapter.adoptNativeSessionDerivation(lifecycle, new AbortController().signal);
+    const derivedContext = {
+      ...contextFor(binding, { target: derivedTarget }).context,
+      sessionId: "remote-stored-product"
+    };
+    await adapter.resumeSession(binding, derivedContext);
+    expect(derivedRuntime.queries.at(-1)?.params.options).toMatchObject({
+      cwd: "/srv/derived",
+      resume: binding.nativeSessionId,
+      sessionStoreAccess: expect.objectContaining({
+        kind: "session",
+        sessionId: binding.nativeSessionId
+      })
+    });
+    expect(resolved).toContain("/srv/source");
+    expect(resolved).toContain("/srv/derived");
+    await adapter.dispose();
+  });
+
   test("accepts a missing prepared Store operation only before a child binding was recorded", async () => {
     const runtime = new FakeSdkRuntime();
     const storedSessions = new FakeStoredSessionRuntime(runtime);
@@ -5360,7 +5446,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "native-oauth-remote-target",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/auth",
       remoteWorkspace: {
         hostTargetId: "native-oauth-remote-target",
         hostId: "host-auth",
@@ -5828,17 +5914,17 @@ class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
     this.#runtime = runtime;
   }
 
-  prepareImport(input: Parameters<ClaudeSdkStoredSessionRuntime["prepareImport"]>[0]): ClaudeSessionStoreOperationAccess {
+  async prepareImport(input: Parameters<ClaudeSdkStoredSessionRuntime["prepareImport"]>[0]): Promise<ClaudeSessionStoreOperationAccess> {
     this.prepareImportCalls.push(input);
     return this.#prepare(input, "import");
   }
 
-  prepareDerivation(input: Parameters<ClaudeSdkStoredSessionRuntime["prepareDerivation"]>[0]): ClaudeSessionStoreOperationAccess {
+  async prepareDerivation(input: Parameters<ClaudeSdkStoredSessionRuntime["prepareDerivation"]>[0]): Promise<ClaudeSessionStoreOperationAccess> {
     this.prepareDerivationCalls.push(input);
     return this.#prepare(input, "durable");
   }
 
-  readOperation(access: ClaudeSessionStoreOperationAccess): ClaudeSessionStoreOperationSnapshot {
+  async readOperation(access: ClaudeSessionStoreOperationAccess): Promise<ClaudeSessionStoreOperationSnapshot> {
     const operation = this.#operation(access);
     const source = this.sessions.get(access.source.sessionId);
     return {
@@ -5859,7 +5945,7 @@ class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
     };
   }
 
-  recoverOperation(input: Parameters<ClaudeSdkStoredSessionRuntime["recoverOperation"]>[0]): ClaudeSessionStoreOperationAccess {
+  async recoverOperation(input: Parameters<ClaudeSdkStoredSessionRuntime["recoverOperation"]>[0]): Promise<ClaudeSessionStoreOperationAccess> {
     const operation = this.operations.get(input.operationId);
     if (operation === undefined
       || operation.access.target.workspaceAuthority !== input.targetWorkspaceAuthority
@@ -5869,10 +5955,10 @@ class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
     return operation.access;
   }
 
-  cleanupOperation(
+  async cleanupOperation(
     access: ClaudeSessionStoreOperationAccess,
     input: { readonly expectedChildSessionId?: string } = {}
-  ): ClaudeSessionStoreOperationSnapshot {
+  ): Promise<ClaudeSessionStoreOperationSnapshot> {
     const operation = this.#operation(access);
     if (input.expectedChildSessionId !== undefined && operation.childSessionId !== input.expectedChildSessionId) {
       throw new Error("Stored operation child changed.");
@@ -5881,14 +5967,14 @@ class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
       this.sessions.delete(operation.childSessionId);
     }
     operation.state = "cleaned";
-    return this.readOperation(access);
+    return await this.readOperation(access);
   }
 
-  discardImport(access: ClaudeSessionStoreOperationAccess): void {
-    this.cleanupOperation(access);
+  async discardImport(access: ClaudeSessionStoreOperationAccess): Promise<void> {
+    await this.cleanupOperation(access);
   }
 
-  adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): ClaudeSessionStoreSessionAccess {
+  async adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): Promise<ClaudeSessionStoreSessionAccess> {
     const operation = this.#operation(access);
     const record = this.sessions.get(sessionId);
     if (operation.childSessionId !== sessionId || record === undefined
@@ -5900,7 +5986,7 @@ class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
     return this.#sessionAccess(record, sessionId);
   }
 
-  claim(input: Parameters<ClaudeSdkStoredSessionRuntime["claim"]>[0]): ClaudeSessionStoreSessionAccess {
+  async claim(input: Parameters<ClaudeSdkStoredSessionRuntime["claim"]>[0]): Promise<ClaudeSessionStoreSessionAccess> {
     this.claimCalls.push(input);
     const record = this.sessions.get(input.sessionId);
     if (record === undefined || !record.adopted || record.workspaceAuthority !== input.workspaceAuthority) {
@@ -5909,7 +5995,7 @@ class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
     return this.#sessionAccess(record, input.sessionId);
   }
 
-  rebind(input: Parameters<ClaudeSdkStoredSessionRuntime["rebind"]>[0]): ClaudeSessionStoreSessionAccess {
+  async rebind(input: Parameters<ClaudeSdkStoredSessionRuntime["rebind"]>[0]): Promise<ClaudeSessionStoreSessionAccess> {
     const record = this.sessions.get(input.sessionId);
     if (record === undefined || !record.adopted || record.workspaceAuthority !== input.workspaceAuthority
       || record.generation !== input.expectedGeneration) throw new Error("Stored Session generation changed.");

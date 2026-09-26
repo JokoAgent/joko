@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -9,17 +10,20 @@ import type {
   NativeSessionBinding,
   NativeSessionDerivation,
   NativeSessionState,
-  PromptInput
+  PromptInput,
+  SessionDescriptor
 } from "@joko/core";
 import { OperationalStore } from "@joko/store";
+import type { RemoteGitCheckoutLease, RemoteGitCheckoutPlan } from "@joko/remote-ssh";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { remoteBindingFromLease } from "./remote-claude-worktree-owner.js";
 import { SessionHost } from "./session-host.js";
 import { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
-import { WorkspaceService } from "./workspace-service.js";
+import { WorkspaceService, type RemoteWorkspaceDelegate, type WorkspaceRegistration } from "./workspace-service.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -499,6 +503,155 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
     expect(restartedWorktrees.activeWorkspacePath(releasePending.sessionId, releasePending.worktree!)).toBeUndefined();
   });
 });
+
+describe("remote checkout coordination", () => {
+  test("keeps a remote lease active in Store when startup inspection is unavailable and releases only exact ownership", async () => {
+    const f = await remoteFixture();
+    const binding = remoteBindingFromLease(f.plan.workspaceId, f.lease);
+    f.store.createSession({ ...f.session("child", "native://child"), worktree: binding });
+    f.owner.assertExact.mockRejectedValueOnce(new Error("Remote inspection is temporarily unavailable."));
+    await f.worktrees.initialize();
+
+    expect(f.store.getSession("child").descriptor.worktree?.state).toBe("active");
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+    expect(f.worktrees.activeWorkspacePath("child", binding)).toBeUndefined();
+    expect(await f.worktrees.assertActiveRemoteWorktree("child", binding)).toBe(f.plan.path);
+    expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
+      id: f.plan.workspaceId,
+      root: f.plan.path,
+      remote: expect.objectContaining({ workspaceRoot: f.plan.path, targetId: "remote-target" })
+    }));
+    expect(f.worktrees.effectiveTarget(f.store.getSession("child")).remoteWorkspace?.workspaceRoot)
+      .toBe(f.plan.path);
+    expect(await f.worktrees.previewRemoval("child")).toEqual({ hasWorktree: true, dirty: true });
+
+    f.owner.releaseExact.mockResolvedValueOnce("preserved");
+    await expect(f.worktrees.release("child", binding)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    expect(f.store.getSession("child").descriptor.worktree?.state).toBe("active");
+    expect(f.workspaces.listRegistrations()).toHaveLength(1);
+    await f.worktrees.release("child", binding);
+    expect(f.store.getSession("child").descriptor.worktree?.state).toBe("preserved");
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+  });
+
+  test("requires a durable plan before remote checkout mutation and retains an exact unadopted lease", async () => {
+    const f = await remoteFixture();
+    await f.worktrees.initialize();
+    expect(await f.worktrees.planRemoteDerivation({ sessionId: "child", sourceSessionId: "source" }))
+      .toEqual(f.plan);
+    await expect(f.worktrees.acquirePlannedRemoteDerivation(f.plan))
+      .rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    expect(f.owner.derive).not.toHaveBeenCalled();
+
+    const connection = f.store.createConnection({ id: "remote-device", name: "Remote device",
+      authKeyDigest: "remote-digest" });
+    const claim = f.store.claimAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest, {
+      id: "remote-derive", kind: "clone_session", body: { sourceSessionId: "source" }
+    });
+    if (!claim.claimed) throw new Error("Expected a fresh remote derivation claim.");
+    f.store.prepareNativeSessionDerivation({
+      operationId: claim.operation.id,
+      expectedBodyHash: claim.operation.bodyHash,
+      sourceSessionId: "source",
+      sourceBinding: f.store.getSession("source").descriptor.binding,
+      sourceSessionRevision: f.store.getSession("source").revision,
+      sessionId: "child",
+      backendId: "remote-backend",
+      backendInstanceGeneration: 0,
+      targetId: "remote-target",
+      targetRevision: f.store.getTarget("remote-target").revision,
+      effectiveWorkspaceRoot: f.plan.path,
+      remoteWorkspace: f.store.getTarget("remote-target").descriptor.remoteWorkspace,
+      remoteWorktreePlan: f.plan
+    });
+
+    const binding = await f.worktrees.acquirePlannedRemoteDerivation(f.plan);
+    expect(binding).toEqual(remoteBindingFromLease(f.plan.workspaceId, f.lease));
+    expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
+      id: f.plan.workspaceId, root: f.plan.path,
+      remote: expect.objectContaining({ workspaceRoot: f.plan.path })
+    }));
+    expect(await f.worktrees.inspectPlannedRemoteDerivation(f.plan)).toEqual({ status: "active", lease: f.lease });
+    f.owner.releaseExact.mockResolvedValueOnce("preserved");
+    expect(await f.worktrees.releasePlannedRemoteDerivation(f.plan, f.lease)).toBe("preserved");
+    expect(f.workspaces.listRegistrations()).toHaveLength(1);
+    expect(await f.worktrees.releasePlannedRemoteDerivation(f.plan, f.lease)).toBe("released");
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+    expect(f.store.findNativeSessionDerivation("remote-derive")?.remoteWorktreePlan).toEqual(f.plan);
+  });
+});
+
+async function remoteFixture() {
+  const root = await mkdtemp(join(tmpdir(), "joko-remote-worktree-coordinator-"));
+  const store = new OperationalStore(join(root, "store.db"));
+  store.upsertBackend({ id: "remote-backend", adapterKind: "fixture", displayName: "Remote",
+    version: "1", instanceGeneration: 0, health: "healthy", installationState: "installed",
+    authenticationState: "not_required", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+  const remoteWorkspace = { hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
+  store.upsertTarget({ id: "remote-target", backendId: "remote-backend", displayName: "Remote project",
+    workspaceRoot: join(root, "placeholder"), managed: true, trusted: true, remoteWorkspace });
+  let host = store.createRemoteHost({ ownerId: "owner", targetId: "remote-target", id: "ssh",
+    hostname: "host.example.test", user: "builder", source: "manual" });
+  host = store.pinRemoteHostTrust({ ownerId: host.ownerId, targetId: host.targetId, id: host.id,
+    expectedRevision: host.revision, algorithm: "ssh-ed25519", fingerprint: `SHA256:${"A".repeat(43)}` });
+  for (const state of ["connecting", "authenticating", "ready"] as const) {
+    host = store.updateRemoteHostStatus({ ownerId: host.ownerId, targetId: host.targetId,
+      id: host.id, expectedRevision: host.revision, state });
+  }
+  const session = (id: string, opaqueRef: string): SessionDescriptor => ({
+    id, backendId: "remote-backend", targetId: "remote-target", title: id,
+    binding: { opaqueRef, nativeSessionId: id, generation: 0 },
+    pinned: false, archived: false, permissionMode: "ask", planMode: false,
+    fastMode: false, remoteWorkspace, createdAt: 1, updatedAt: 1
+  });
+  store.createSession(session("source", "native://source"));
+  const leaseId = "99999999-9999-4999-8999-999999999999";
+  const manifestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const sourceCommit = "c".repeat(40);
+  const authority = {
+    hostOwnerId: host.ownerId, hostTargetId: host.targetId, hostId: host.id,
+    hostIdentity: `sha256:${"b".repeat(64)}`, targetId: "remote-target",
+    targetRevision: store.getTarget("remote-target").revision.toString(),
+    hostRevision: host.revision.toString()
+  };
+  const plan: RemoteGitCheckoutPlan = {
+    format: 1, leaseId, manifestId, sessionId: "child", sourceSessionId: "source",
+    workspaceId: "worktree-child", sourceCwd: remoteWorkspace.workspaceRoot,
+    sourceSnapshot: `sha256:${"f".repeat(64)}`,
+    path: `/srv/joko/checkouts/${leaseId}`, repositoryRoot: "/srv/repository",
+    branch: `joko/remote-${createHash("sha256").update("child").digest("hex").slice(0, 12)}-${leaseId.slice(0, 8)}`,
+    sourceRef: sourceCommit, sourceCommit, sourceStrategy: "explicit", sourceRefreshed: false,
+    storageRoot: "/srv/joko", authority, remote: { ...authority, manifestId }
+  };
+  const lease: RemoteGitCheckoutLease = {
+    id: leaseId, sessionId: "child", path: plan.path, repositoryRoot: plan.repositoryRoot,
+    branch: plan.branch, source: { ref: sourceCommit, commit: sourceCommit,
+      strategy: "explicit", refreshed: false }, acquiredAt: 10, remote: plan.remote
+  };
+  const owner = {
+    plan: vi.fn(async () => plan),
+    derive: vi.fn(async () => lease),
+    inspectExact: vi.fn(async () => ({ status: "active" as const, lease })),
+    cleanupPending: vi.fn(async () => "released" as const),
+    assertExact: vi.fn(async () => undefined),
+    releaseExact: vi.fn(async (): Promise<"released" | "preserved"> => "released")
+  };
+  const delegate = {
+    register: async (registration: WorkspaceRegistration) => registration,
+    unregister: vi.fn(),
+    close: async () => undefined
+  } as unknown as RemoteWorkspaceDelegate;
+  const workspaces = new WorkspaceService({ remoteDelegate: delegate });
+  const worktrees = new SessionWorktreeCoordinator({ store, workspaces, remoteOwner: owner,
+    storageRoot: join(root, "local-checkouts") });
+  cleanups.push(async () => {
+    worktrees.dispose();
+    await workspaces.close();
+    store.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 3 });
+  });
+  return { store, workspaces, worktrees, owner, plan, lease, session };
+}
 
 class TargetCaptureAdapter extends FakeBackendAdapter {
   readonly sendRoots: string[] = [];

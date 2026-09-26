@@ -1604,6 +1604,41 @@ export interface PrepareNativeSessionDerivationInput {
   readonly remoteWorkspace?: SessionDescriptor["remoteWorkspace"];
   /** Exact derived checkout lease, when local workspace isolation was acquired. */
   readonly worktree?: SessionWorktreeBinding;
+  /** Durable remote checkout intent saved before the first remote Git effect. */
+  readonly remoteWorktreePlan?: RemoteNativeDerivationWorktreePlan;
+}
+
+/** Full, content-free remote checkout intent. It is sufficient to inspect the
+ * exact owner manifest after a lost checkout response or service restart. */
+export interface RemoteNativeDerivationWorktreePlan extends Omit<SessionWorktreeBinding,
+  "state" | "acquiredAt" | "updatedAt" | "sourceStrategy" | "sourceRefreshed"> {
+  readonly format: 1;
+  readonly manifestId: string;
+  readonly sessionId: string;
+  readonly sourceSessionId: string;
+  readonly sourceCwd: string;
+  /** Read-only source HEAD/index/tracked/untracked snapshot fixed before checkout mutation. */
+  readonly sourceSnapshot: string;
+  readonly sourceLease?: {
+    readonly id: string;
+    readonly sessionId: string;
+    readonly path: string;
+    readonly repositoryRoot: string;
+    readonly branch: string;
+    readonly source: {
+      readonly ref: string;
+      readonly commit: string;
+      readonly refreshed: false;
+      readonly strategy: "explicit";
+    };
+    readonly acquiredAt: number;
+    readonly remote: NonNullable<SessionWorktreeBinding["remote"]>;
+  };
+  readonly storageRoot: string;
+  readonly sourceStrategy: "explicit";
+  readonly sourceRefreshed: false;
+  readonly authority: Omit<NonNullable<SessionWorktreeBinding["remote"]>, "manifestId">;
+  readonly remote: NonNullable<SessionWorktreeBinding["remote"]>;
 }
 
 export interface RecordNativeSessionDerivationInput {
@@ -1639,6 +1674,7 @@ export interface NativeSessionDerivationRecord extends Omit<RecordNativeSessionD
   readonly sourceSessionRevision?: bigint;
   readonly targetRevision?: bigint;
   readonly worktree?: SessionWorktreeBinding;
+  readonly remoteWorktreePlan?: RemoteNativeDerivationWorktreePlan;
   readonly externalLifecycle: boolean;
   /** Immutable attempts retain backendInstanceGeneration. This separate,
    * durable CAS owner is the only Backend generation allowed to reconcile the

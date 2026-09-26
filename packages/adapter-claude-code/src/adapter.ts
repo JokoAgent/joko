@@ -1211,7 +1211,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const nativeSessionId = route.nativeSessionId;
     const scoped = await this.#targetRuntime(context.target, context.signal);
     const storedAccess = route.kind === "stored"
-      ? this.#claimStoredSession(route, context.target, scoped)
+      ? await this.#claimStoredSession(route, context.target, scoped)
       : undefined;
     const info = await this.#sessionInfo(nativeSessionId, context.target, context.signal, scoped, storedAccess);
     if (info === undefined) throw continuityGap();
@@ -1360,7 +1360,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const nativeSessionId = route.nativeSessionId;
     const targetRuntime = await this.#targetRuntime(context.target, context.signal);
     const storedAccess = route.kind === "stored"
-      ? this.#claimStoredSession(route, context.target, targetRuntime)
+      ? await this.#claimStoredSession(route, context.target, targetRuntime)
       : undefined;
     if (targetRuntime.runtime.ownsSessionFork(nativeSessionId)
       || [...this.#sessions.values()].some((runtime) => runtime.nativeSessionId === nativeSessionId && runtime.productSessionId !== context.sessionId)) {
@@ -1785,15 +1785,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   ownsNativeSessionDerivationLifecycle(lifecycle: NativeSessionDerivationLifecycle): boolean {
-    if (this.#runtime.storedSessions === undefined
-      || lifecycle.sourceTarget.remoteWorkspace !== undefined
-      || lifecycle.target.remoteWorkspace !== undefined) return false;
+    const remote = lifecycle.sourceTarget.remoteWorkspace !== undefined;
+    if (remote !== (lifecycle.target.remoteWorkspace !== undefined)
+      || (remote ? this.#remoteRuntimes === undefined : this.#runtime.storedSessions === undefined)) return false;
+    if (lifecycle.sourceTarget.id !== lifecycle.target.id
+      || lifecycle.sourceTarget.backendId !== lifecycle.target.backendId
+      || lifecycle.sourceTarget.managed !== lifecycle.target.managed
+      || lifecycle.sourceTarget.trusted !== lifecycle.target.trusted
+      || lifecycle.sourceTarget.remoteWorkspace?.hostTargetId !== lifecycle.target.remoteWorkspace?.hostTargetId
+      || lifecycle.sourceTarget.remoteWorkspace?.hostId !== lifecycle.target.remoteWorkspace?.hostId
+      || lifecycle.sourceTarget.remoteWorkspace?.workspaceRoot !== lifecycle.target.remoteWorkspace?.workspaceRoot) return false;
     const source = parseBindingRoute(lifecycle.sourceBinding);
     if (source.kind === "stored") {
       return source.workspaceAuthority === claudeWorkspaceAuthority(lifecycle.sourceTarget);
     }
-    return canonicalPathKey(effectiveTargetWorkspace(lifecycle.sourceTarget))
-      !== canonicalPathKey(effectiveTargetWorkspace(lifecycle.target));
+    return !sameEffectiveTargetWorkspace(lifecycle.sourceTarget, lifecycle.target);
   }
 
   async adoptNativeSessionDerivation(
@@ -1809,32 +1815,35 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         { stateMayHaveChanged: true, recovery: "Keep the Product Session and reconcile its exact Store operation." }
       );
     }
-    const storedSessions = this.#runtime.storedSessions!;
+    const scoped = await this.#targetRuntime(lifecycle.target, signal);
+    const storedSessions = scoped.runtime.storedSessions;
+    if (storedSessions === undefined) throw continuityGap();
     const parsed = parseBindingRoute(lifecycle.binding);
     const targetWorkspaceAuthority = claudeWorkspaceAuthority(lifecycle.target);
     if (parsed.kind !== "stored" || parsed.workspaceAuthority !== targetWorkspaceAuthority) throw continuityGap();
     try {
-      const access = storedSessions.recoverOperation({
+      const access = await storedSessions.recoverOperation({
         operationId: operationUuid(lifecycle.operationId),
         targetWorkspaceAuthority,
         expectedChildSessionId: parsed.nativeSessionId
       });
-      const snapshot = storedSessions.readOperation(access);
+      const snapshot = await storedSessions.readOperation(access);
       let sessionAccess: ClaudeSessionStoreSessionAccess;
       if (snapshot.state === "cleaned") {
         if (!snapshot.childReservationConfirmed || snapshot.childSessionId !== parsed.nativeSessionId) {
           throw new Error("Stored derivation was cleaned before adoption.");
         }
-        sessionAccess = storedSessions.claim({
+        sessionAccess = await storedSessions.claim({
           workspaceAuthority: targetWorkspaceAuthority,
           sessionId: parsed.nativeSessionId
         });
       } else {
-        sessionAccess = storedSessions.adopt(access, parsed.nativeSessionId);
-        storedSessions.cleanupOperation(access, { expectedChildSessionId: parsed.nativeSessionId });
+        sessionAccess = await storedSessions.adopt(access, parsed.nativeSessionId);
+        await storedSessions.cleanupOperation(access, { expectedChildSessionId: parsed.nativeSessionId });
       }
       if (sessionAccess.workspaceAuthority !== targetWorkspaceAuthority
         || sessionAccess.sessionId !== parsed.nativeSessionId) throw new Error("Stored adoption returned different authority.");
+      scoped.assertCurrent();
       signal.throwIfAborted();
     } catch {
       throw claudeCodeError(
@@ -1855,13 +1864,24 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     signal: AbortSignal
   ): Promise<void> {
     signal.throwIfAborted();
-    const storedSessions = this.#runtime.storedSessions;
-    if (storedSessions === undefined || lifecycle.target.remoteWorkspace !== undefined) {
+    let scoped: ClaudeTargetRuntime;
+    try {
+      scoped = await this.#targetRuntime(lifecycle.target, signal);
+    } catch {
       throw claudeCodeError(
         "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
         "The durable native Session cleanup authority is unavailable.",
         "session_cleanup",
-        { stateMayHaveChanged: true, recovery: "Restore the exact local Store owner before reconciling cleanup." }
+        { stateMayHaveChanged: true, recovery: "Restore the exact Store owner before reconciling cleanup." }
+      );
+    }
+    const storedSessions = scoped.runtime.storedSessions;
+    if (storedSessions === undefined) {
+      throw claudeCodeError(
+        "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
+        "The durable native Session cleanup authority is unavailable.",
+        "session_cleanup",
+        { stateMayHaveChanged: true, recovery: "Restore the exact Store owner before reconciling cleanup." }
       );
     }
     const targetWorkspaceAuthority = claudeWorkspaceAuthority(lifecycle.target);
@@ -1871,7 +1891,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     let access: ClaudeSessionStoreOperationAccess;
     try {
-      access = storedSessions.recoverOperation({
+      access = await storedSessions.recoverOperation({
         operationId: operationUuid(lifecycle.operationId),
         targetWorkspaceAuthority,
         ...(parsed === undefined ? {} : { expectedChildSessionId: parsed.nativeSessionId })
@@ -1890,10 +1910,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       );
     }
     try {
-      const snapshot: ClaudeSessionStoreOperationSnapshot = storedSessions.cleanupOperation(access, {
+      const snapshot: ClaudeSessionStoreOperationSnapshot = await storedSessions.cleanupOperation(access, {
         ...(parsed === undefined ? {} : { expectedChildSessionId: parsed.nativeSessionId })
       });
       if (snapshot.state !== "cleaned") throw new Error("Stored derivation cleanup did not settle.");
+      scoped.assertCurrent();
       signal.throwIfAborted();
     } catch {
       throw claudeCodeError(
@@ -1924,11 +1945,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const derivedTarget = "target" in derivation ? derivation.target : context.target;
     const sourceRoute = parseBindingRoute(runtime.binding);
     const storedSessions = runtime.sdkRuntime.storedSessions;
-    const useStoredDerivation = !runtime.remote && storedSessions !== undefined
+    const useStoredDerivation = storedSessions !== undefined
       && (sourceRoute.kind === "stored"
-        || canonicalPathKey(effectiveTargetWorkspace(context.target))
-          !== canonicalPathKey(effectiveTargetWorkspace(derivedTarget)));
+        || !sameEffectiveTargetWorkspace(context.target, derivedTarget));
     const derivationStore = useStoredDerivation ? storedSessions! : undefined;
+    let targetStore = derivationStore;
+    let derivedScoped = targetRuntimeOf(runtime);
     if (sourceRoute.kind === "stored"
       && sourceRoute.workspaceAuthority !== claudeWorkspaceAuthority(context.target)) throw continuityGap();
     if ("target" in derivation) {
@@ -1953,6 +1975,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     let nativeHistory: NativeHistoryProjection | undefined;
     try {
       if ("target" in derivation) await this.validateTarget(derivedTarget);
+      if (useStoredDerivation) {
+        derivedScoped = await this.#targetRuntime(derivedTarget, signal);
+        targetStore = derivedScoped.runtime.storedSessions;
+        if (targetStore === undefined) throw new Error("Stored derivation target lacks Store authority.");
+        derivedScoped.assertCurrent();
+      }
       await this.validateTarget(runtime.target);
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
@@ -2013,13 +2041,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           : claudeWorkspaceAuthority(context.target);
         const targetWorkspaceAuthority = claudeWorkspaceAuthority(derivedTarget);
         operationAccess = sourceRoute.kind === "stored"
-          ? derivationStore!.prepareDerivation({
+          ? await derivationStore!.prepareDerivation({
               operationId: operationUuid(operationId),
               sourceWorkspaceAuthority,
               sourceSessionId: runtime.nativeSessionId,
               targetWorkspaceAuthority
             })
-          : derivationStore!.prepareImport({
+          : await derivationStore!.prepareImport({
               operationId: operationUuid(operationId),
               sourceWorkspaceAuthority,
               sourceSessionId: runtime.nativeSessionId,
@@ -2036,8 +2064,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       dispatched = true;
       runtime.assertRuntimeCurrent();
       const result = useStoredDerivation
-        ? await derivationStore!.forkSession(runtime.nativeSessionId, {
-            dir: effectiveTargetWorkspace(derivedTarget),
+        ? await targetStore!.forkSession(runtime.nativeSessionId, {
+            dir: derivedScoped.workspaceRoot,
             access: operationAccess!,
             ...(boundaryId === undefined ? {} : { upToMessageId: boundaryId }),
             signal,
@@ -2050,12 +2078,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             recordSessionId
           });
       runtime.assertRuntimeCurrent();
+      derivedScoped.assertCurrent();
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
       if (registered === undefined || registered.nativeSessionId !== result.sessionId.toLowerCase()) throw new Error("Native Session copy lacks its receipt.");
       const derivedInfo = await waitFor(useStoredDerivation
-        ? derivationStore!.getSessionInfo(result.sessionId, {
-            dir: effectiveTargetWorkspace(derivedTarget),
+        ? targetStore!.getSessionInfo(result.sessionId, {
+            dir: derivedScoped.workspaceRoot,
             access: operationAccess!,
             signal
           })
@@ -2063,17 +2092,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         () => new SessionSdkFailure("TIMEOUT", true));
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
+      derivedScoped.assertCurrent();
       if (derivedInfo === undefined) throw continuityGap();
       if (useStoredDerivation) assertSessionInfoIdentity(derivedInfo, result.sessionId);
       else assertSessionInfo(derivedInfo, result.sessionId, effectiveTargetWorkspace(derivedTarget), runtime.remote);
       if (sourceHistory !== undefined && prefix !== undefined) {
         const derivedHistory = useStoredDerivation
           ? await this.#readStoredForkHistory(
-              derivationStore!,
+              targetStore!,
               operationAccess!,
               result.sessionId,
               signal,
-              effectiveTargetWorkspace(derivedTarget)
+              derivedScoped.workspaceRoot
             )
           : await this.#readForkHistory(runtime, result.sessionId, signal, effectiveTargetWorkspace(derivedTarget));
         const derivedMessages = derivedHistory.entries.filter((entry) => entry.type !== "system");
@@ -2735,7 +2765,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const route = parseBindingRoute(binding);
     const nativeSessionId = route.nativeSessionId;
     const storedSessionAccess = route.kind === "stored"
-      ? this.#claimStoredSession(route, context.target, scoped)
+      ? await this.#claimStoredSession(route, context.target, scoped)
       : undefined;
     if (storedSessionAccess !== undefined && !launch.resume) throw continuityGap();
     if (launch.resume) {
@@ -5169,16 +5199,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }));
   }
 
-  #claimStoredSession(
+  async #claimStoredSession(
     route: Extract<ParsedBindingRoute, { readonly kind: "stored" }>,
     target: TargetDescriptor,
     scoped: ClaudeTargetRuntime
-  ): ClaudeSessionStoreSessionAccess {
-    if (scoped.remote
-      || scoped.runtime.storedSessions === undefined
+  ): Promise<ClaudeSessionStoreSessionAccess> {
+    if (scoped.runtime.storedSessions === undefined
       || route.workspaceAuthority !== claudeWorkspaceAuthority(target)) throw continuityGap();
     try {
-      const access = scoped.runtime.storedSessions.claim({
+      const access = await scoped.runtime.storedSessions.claim({
         workspaceAuthority: route.workspaceAuthority,
         sessionId: route.nativeSessionId
       });
@@ -5200,7 +5229,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     try {
       const scoped = existing ?? await this.#targetRuntime(target, signal);
       scoped.assertCurrent();
-      if (storedAccess !== undefined && (scoped.remote || scoped.runtime.storedSessions === undefined)) {
+      if (storedAccess !== undefined && scoped.runtime.storedSessions === undefined) {
         throw new Error("Claude SessionStore authority is unavailable for this Target.");
       }
       const info = storedAccess === undefined
@@ -5287,7 +5316,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       signal?.throwIfAborted();
       const scoped = await this.#remoteRuntimes.resolve(target, signal);
       signal?.throwIfAborted();
-      if (!scoped.remote || scoped.workspaceRoot !== target.remoteWorkspace.workspaceRoot) {
+      if (!scoped.remote || scoped.workspaceRoot !== target.workspaceRoot) {
         throw new Error("The remote runtime returned a different workspace authority.");
       }
       scoped.assertCurrent();
@@ -6378,15 +6407,26 @@ function parseBindingRoute(binding: NativeSessionBinding): ParsedBindingRoute {
 }
 
 function claudeWorkspaceAuthority(target: TargetDescriptor): string {
-  if (target.remoteWorkspace !== undefined) throw continuityGap();
-  const digest = createHash("sha256")
+  const hash = createHash("sha256")
     .update("joko-claude-workspace\0", "utf8")
     .update(target.backendId, "utf8")
     .update("\0", "utf8")
     .update(target.id, "utf8")
-    .update("\0", "utf8")
-    .update(canonicalPathKey(target.workspaceRoot), "utf8")
-    .digest("hex");
+    .update("\0", "utf8");
+  if (target.remoteWorkspace === undefined) {
+    hash.update("local\0", "utf8").update(canonicalPathKey(target.workspaceRoot), "utf8");
+  } else {
+    validateRemoteTarget(target);
+    hash.update("remote\0", "utf8")
+      .update(target.remoteWorkspace.hostTargetId, "utf8")
+      .update("\0", "utf8")
+      .update(target.remoteWorkspace.hostId, "utf8")
+      .update("\0", "utf8")
+      .update(target.remoteWorkspace.workspaceRoot, "utf8")
+      .update("\0", "utf8")
+      .update(target.workspaceRoot, "utf8");
+  }
+  const digest = hash.digest("hex");
   return `workspace-${digest}`;
 }
 
@@ -6878,10 +6918,14 @@ function findModel(models: readonly ClaudeSdkModelInfo[], modelId: string): Clau
 function validateRemoteTarget(target: TargetDescriptor): void {
   const binding = target.remoteWorkspace;
   if (binding === undefined
+    || binding.hostTargetId.length === 0
+    || binding.hostTargetId.length > 256
+    || /[\u0000-\u001f\u007f]/u.test(binding.hostTargetId)
     || binding.hostId.length === 0
     || binding.hostId.length > 256
     || /[\u0000-\u001f\u007f]/u.test(binding.hostId)
-    || !normalizedAbsoluteRemotePath(binding.workspaceRoot)) {
+    || !normalizedAbsoluteRemotePath(binding.workspaceRoot)
+    || !normalizedAbsoluteRemotePath(target.workspaceRoot)) {
     throw claudeCodeError("REMOTE_TARGET_INVALID", "The remote Claude Code Target binding is invalid.", "target", {
       recovery: "Select a canonical absolute workspace on a ready Remote Host."
     });
@@ -6897,7 +6941,16 @@ function normalizedAbsoluteRemotePath(value: string): boolean {
 }
 
 function effectiveTargetWorkspace(target: TargetDescriptor): string {
-  return target.remoteWorkspace?.workspaceRoot ?? target.workspaceRoot;
+  return target.workspaceRoot;
+}
+
+function sameEffectiveTargetWorkspace(left: TargetDescriptor, right: TargetDescriptor): boolean {
+  if (left.remoteWorkspace !== undefined || right.remoteWorkspace !== undefined) {
+    return left.remoteWorkspace !== undefined
+      && right.remoteWorkspace !== undefined
+      && left.workspaceRoot === right.workspaceRoot;
+  }
+  return canonicalPathKey(left.workspaceRoot) === canonicalPathKey(right.workspaceRoot);
 }
 
 function sameTargetWorkspace(left: TargetDescriptor, right: TargetDescriptor): boolean {

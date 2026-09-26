@@ -3790,7 +3790,14 @@ export class SessionHost {
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
       const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
         .descriptor.capabilities.get("workspace.derive")?.supported === true;
-      const derivedWorktree = source.descriptor.worktree !== undefined
+      const remotePlan = derivesWorkspace && source.descriptor.remoteWorkspace !== undefined
+        ? await this.#worktrees!.planRemoteDerivation({
+            sessionId,
+            sourceSessionId: source.descriptor.id
+          })
+        : undefined;
+      let derivedWorktree = source.descriptor.worktree !== undefined
+        && source.descriptor.remoteWorkspace === undefined
         ? await this.#worktrees!.derive({
             sessionId,
             sourceSessionId: source.descriptor.id
@@ -3803,7 +3810,9 @@ export class SessionHost {
           : undefined;
       if (derivedWorktree !== undefined) acquiredDerivedWorktree = derivedWorktree;
       const derivationTarget = derivedWorktree === undefined
-        ? sourceContext.target
+        ? remotePlan === undefined
+          ? sourceContext.target
+          : { ...admittedTarget.descriptor, workspaceRoot: remotePlan.path }
         : { ...admittedTarget.descriptor, workspaceRoot: derivedWorktree.path };
       const lifecycle: NativeSessionDerivationLifecycle = {
         operationId: claim.operation.id,
@@ -3815,12 +3824,15 @@ export class SessionHost {
         target: derivationTarget
       };
       const ownsDurableLifecycle = active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
+      if (remotePlan !== undefined && !ownsDurableLifecycle) {
+        throw new StoreError("The remote Backend cannot adopt an isolated native derivation safely.");
+      }
       if (ownsDurableLifecycle) {
         if (active.adapter.adoptNativeSessionDerivation === undefined
           || active.adapter.cleanupNativeSessionDerivation === undefined) {
           throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");
         }
-        this.#store.prepareNativeSessionDerivation({
+        const prepared = this.#store.prepareNativeSessionDerivation({
           operationId: claim.operation.id,
           expectedBodyHash: claim.operation.bodyHash,
           sourceSessionId: source.descriptor.id,
@@ -3835,8 +3847,21 @@ export class SessionHost {
           ...(sourceContext.target.remoteWorkspace === undefined
             ? {}
             : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
-          ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree })
+          ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
+          ...(remotePlan === undefined ? {} : { remoteWorktreePlan: remotePlan })
         });
+        if (remotePlan !== undefined) {
+          derivedWorktree = await this.#worktrees!.acquirePlannedRemoteDerivation(remotePlan);
+          acquiredDerivedWorktree = derivedWorktree;
+          this.#store.attachNativeSessionDerivationWorktree({
+            operationId: claim.operation.id,
+            expectedRevision: prepared.revision,
+            worktree: derivedWorktree
+          });
+          this.assertActiveBackendSideEffectLease(sideEffectLease);
+          this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
+          await this.#worktrees!.assertActiveRemoteWorktree(sessionId, derivedWorktree);
+        }
       }
       const derivation: NativeSessionDerivation = {
         sessionId,
@@ -3999,9 +4024,8 @@ export class SessionHost {
     }
     const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
       .descriptor.capabilities.get("workspace.derive")?.supported === true;
-    const requiresLocalIsolation = worktree !== undefined
-      || (source.descriptor.remoteWorkspace === undefined && derivesWorkspace);
-    if (!requiresLocalIsolation) return;
+    const requiresIsolation = worktree !== undefined || derivesWorkspace;
+    if (!requiresIsolation) return;
     if (this.#worktrees === undefined || !derivesWorkspace) {
       throw new JokoError({
         code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED",
@@ -4049,10 +4073,10 @@ export class SessionHost {
     }
   }
 
-  private nativeSessionDerivationLifecycle(
+  private async nativeSessionDerivationLifecycle(
     record: NativeSessionDerivationRecord,
     expectedWorktree?: SessionWorktreeBinding
-  ): NativeSessionDerivationLifecycle {
+  ): Promise<NativeSessionDerivationLifecycle> {
     const target = this.#store.getTarget(record.targetId).descriptor;
     if (target.backendId !== record.backendId
       || target.remoteWorkspace?.hostTargetId !== record.remoteWorkspace?.hostTargetId
@@ -4067,16 +4091,22 @@ export class SessionHost {
     const worktree = record.worktree ?? expectedWorktree;
     let effectiveTarget = target;
     if (target.workspaceRoot !== record.effectiveWorkspaceRoot) {
-      if (worktree === undefined || resolve(worktree.path) !== resolve(record.effectiveWorkspaceRoot)) {
+      if (worktree === undefined || (worktree.remote === undefined
+        ? resolve(worktree.path) !== resolve(record.effectiveWorkspaceRoot)
+        : worktree.path !== record.effectiveWorkspaceRoot)) {
         throw new StoreError("The native derivation lifecycle has no exact worktree authority.");
       }
-      const activePath = this.#worktrees?.activeWorkspacePath(record.sessionId, worktree);
-      if (activePath === undefined || target.remoteWorkspace !== undefined) {
+      const activePath = worktree.remote === undefined
+        ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree)
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree);
+      if (activePath === undefined || (target.remoteWorkspace === undefined) !== (worktree.remote === undefined)) {
         throw new StoreError("The native derivation lifecycle workspace authority changed.");
       }
       effectiveTarget = { ...target, workspaceRoot: activePath };
     } else if (worktree !== undefined
-      && this.#worktrees?.activeWorkspacePath(record.sessionId, worktree) === undefined) {
+      && (worktree.remote === undefined
+        ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree) === undefined
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree) === undefined)) {
       throw new StoreError("The native derivation lifecycle worktree is no longer active.");
     }
     if (record.state === "product_adopted") {
@@ -4192,7 +4222,7 @@ export class SessionHost {
       if (record.binding === undefined) {
         throw new StoreError("The Product-adopted native derivation lost its recorded binding.");
       }
-      const lifecycle = this.nativeSessionDerivationLifecycle(record);
+      const lifecycle = await this.nativeSessionDerivationLifecycle(record);
       const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let adoption: Promise<void>;
       try {
@@ -4228,6 +4258,15 @@ export class SessionHost {
         return;
       }
       if (current.state !== "prepared" && current.state !== "recorded") return;
+      if (current.state === "prepared" && current.remoteWorktreePlan !== undefined
+        && current.worktree === undefined && current.binding === undefined) {
+        const pending = this.#store.confirmUnstartedRemoteDerivationCleanup({
+          operationId,
+          expectedRevision: current.revision
+        });
+        await this.finishNativeSessionDerivationWorkspaceCleanup(pending);
+        return;
+      }
       const adapter = this.requireAdapter(current.backendId);
       if (current.externalLifecycle) {
         if (adapter.cleanupNativeSessionDerivation === undefined) {
@@ -4240,7 +4279,7 @@ export class SessionHost {
       // shutdown. Startup cleanup instead acquires its own admission authority.
       if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
       const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(current, adapter);
-      const lifecycle = this.nativeSessionDerivationLifecycle(record, expectedWorktree);
+      const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree);
       const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let deletion: Promise<void>;
       try {
@@ -4324,6 +4363,21 @@ export class SessionHost {
     const releasesDerivedWorktree = operationKind !== "navigate_session"
       && operationKind !== "navigateSessionBranch"
       && record.worktree !== undefined;
+    if (record.remoteWorktreePlan !== undefined && record.worktree === undefined) {
+      if (this.#worktrees === undefined) {
+        throw new StoreError("The remote checkout cleanup owner is unavailable.");
+      }
+      const inspection = await this.#worktrees.inspectPlannedRemoteDerivation(record.remoteWorktreePlan);
+      if (inspection.status === "active") {
+        const outcome = await this.#worktrees.releasePlannedRemoteDerivation(
+          record.remoteWorktreePlan, inspection.lease
+        );
+        if (outcome !== "released") throw new StoreError("The remote checkout cannot be released safely.");
+      } else if (inspection.status === "pending") {
+        const outcome = await this.#worktrees.cleanupPendingRemoteDerivation(record.remoteWorktreePlan);
+        if (outcome === "preserved") throw new StoreError("The remote checkout cleanup is uncertain.");
+      }
+    }
     if (releasesDerivedWorktree) {
       if (this.#worktrees === undefined) {
         throw new StoreError("The native derivation workspace cleanup owner is unavailable.");
@@ -13617,14 +13671,17 @@ function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBindi
 function sameSessionWorktreeBinding(left: SessionWorktreeBinding, right: SessionWorktreeBinding): boolean {
   return left.leaseId === right.leaseId
     && left.workspaceId === right.workspaceId
-    && resolve(left.path) === resolve(right.path)
-    && resolve(left.repositoryRoot) === resolve(right.repositoryRoot)
+    && (left.remote === undefined && right.remote === undefined
+      ? resolve(left.path) === resolve(right.path)
+        && resolve(left.repositoryRoot) === resolve(right.repositoryRoot)
+      : left.path === right.path && left.repositoryRoot === right.repositoryRoot)
     && left.branch === right.branch
     && left.sourceRef === right.sourceRef
     && left.sourceCommit === right.sourceCommit
     && left.sourceStrategy === right.sourceStrategy
     && left.sourceRefreshed === right.sourceRefreshed
     && left.sourceRemote === right.sourceRemote
+    && JSON.stringify(left.remote ?? null) === JSON.stringify(right.remote ?? null)
     && left.state === right.state
     && left.acquiredAt === right.acquiredAt
     && left.updatedAt === right.updatedAt;

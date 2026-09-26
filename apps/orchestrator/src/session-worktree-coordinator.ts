@@ -1,7 +1,8 @@
 import { resolve } from "node:path";
 
 import type { SessionWorktreeBinding, TargetDescriptor } from "@joko/core";
-import type { OperationalStore, StoredSession } from "@joko/store";
+import { operationBodyHash, type OperationalStore, type StoredSession, type StoredTarget } from "@joko/store";
+import type { RemoteGitCheckoutInspection, RemoteGitCheckoutLease, RemoteGitCheckoutPlan } from "@joko/remote-ssh";
 import {
   EphemeralWorktreeService,
   type WorktreeCallOptions,
@@ -10,6 +11,11 @@ import {
 } from "@joko/worktree";
 
 import type { WorkspaceService } from "./workspace-service.js";
+import {
+  remoteBindingFromLease,
+  remoteLeaseFromBinding,
+  type RemoteClaudeWorktreeOwner
+} from "./remote-claude-worktree-owner.js";
 
 /** Service-scoped durable owner marker written before a scheduled Adapter
  * creation effect. Keeping the key here lets startup retain an otherwise
@@ -43,12 +49,16 @@ export interface AcquireSessionWorktreeInput {
 export interface DeriveSessionWorktreeInput {
   readonly sessionId: string;
   readonly sourceSessionId: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface SessionWorktreeRemovalPreview {
   readonly hasWorktree: boolean;
   readonly dirty: boolean;
 }
+
+type RemoteWorktreeOwnerPort = Pick<RemoteClaudeWorktreeOwner,
+  "plan" | "derive" | "inspectExact" | "cleanupPending" | "assertExact" | "releaseExact">;
 
 export class SessionWorktreeCoordinatorError extends Error {
   readonly code: WorktreeErrorCode;
@@ -65,6 +75,7 @@ export class SessionWorktreeCoordinator {
   readonly #store: OperationalStore;
   readonly #workspaces: WorkspaceService;
   readonly #service: EphemeralWorktreeService;
+  readonly #remoteOwner: RemoteWorktreeOwnerPort | undefined;
   readonly #activeBindings = new Map<string, SessionWorktreeBinding>();
   #initialized = false;
 
@@ -73,25 +84,30 @@ export class SessionWorktreeCoordinator {
     readonly workspaces: WorkspaceService;
     readonly storageRoot: string;
     readonly service?: EphemeralWorktreeService;
+    readonly remoteOwner?: RemoteWorktreeOwnerPort;
   }) {
     this.#store = options.store;
     this.#workspaces = options.workspaces;
     this.#service = options.service ?? new EphemeralWorktreeService({ storageRoot: options.storageRoot });
+    this.#remoteOwner = options.remoteOwner;
   }
 
   async initialize(): Promise<void> {
     if (this.#initialized) return;
     const sessions = this.#store.listSessions({ includeArchived: true, includeDeleted: false })
       .filter((session) => session.descriptor.worktree !== undefined);
+    const localSessions = sessions.filter((session) => session.descriptor.worktree?.remote === undefined);
+    const remoteSessions = sessions.filter((session) => session.descriptor.worktree?.remote !== undefined);
     const scheduledOwnerSessionIds = this.#store.listSettings("service")
       .filter((setting) => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY)
       .map((setting) => setting.scopeId);
     const pendingDerivationSessionIds = this.#store.listUnadoptedNativeSessionDerivations()
+      .filter((record) => record.worktree?.remote === undefined && record.remoteWorktreePlan === undefined)
       .map((record) => record.sessionId);
-    const liveSessionIds = sessions
+    const liveSessionIds = localSessions
       .filter((session) => !session.descriptor.archived)
       .map((session) => session.descriptor.id);
-    const archivedSessionIds = sessions
+    const archivedSessionIds = localSessions
       .filter((session) => session.descriptor.archived)
       .map((session) => session.descriptor.id);
     const archivedSessionIdSet = new Set(archivedSessionIds);
@@ -109,7 +125,7 @@ export class SessionWorktreeCoordinator {
     for (const lease of active.values()) {
       this.#activeBindings.set(lease.sessionId, worktreeBindingFor(lease.sessionId, lease));
     }
-    for (const session of sessions) {
+    for (const session of localSessions) {
       const binding = session.descriptor.worktree!;
       if (session.descriptor.archived) {
         this.#workspaces.unregister(binding.workspaceId);
@@ -131,10 +147,36 @@ export class SessionWorktreeCoordinator {
       await this.#registerWorkspace(session, activeBinding);
     }
     for (const record of this.#store.listUnadoptedNativeSessionDerivations()) {
-      if (record.worktree === undefined) continue;
+      if (record.worktree === undefined || record.worktree.remote !== undefined) continue;
       const lease = active.get(record.sessionId);
       if (lease !== undefined && sameLease(lease, record.worktree)) {
         this.#activeBindings.set(record.sessionId, record.worktree);
+      }
+    }
+    if (this.#remoteOwner !== undefined) {
+      for (const session of remoteSessions) {
+        const binding = session.descriptor.worktree!;
+        if (session.descriptor.archived || binding.state !== "active") {
+          this.#workspaces.unregister(binding.workspaceId);
+          continue;
+        }
+        try {
+          await this.#remoteOwner.assertExact(session.descriptor.id, binding);
+          await this.#registerWorkspace(session, binding);
+          this.#activeBindings.set(session.descriptor.id, binding);
+        } catch {
+          // An unavailable remote inspection leaves the durable lease intact.
+          // A later explicit authority check can recover the registration.
+        }
+      }
+      for (const record of this.#store.listUnadoptedNativeSessionDerivations()) {
+        if (record.worktree?.remote === undefined || record.worktree.state !== "active") continue;
+        try {
+          await this.#remoteOwner.assertExact(record.sessionId, record.worktree);
+          this.#activeBindings.set(record.sessionId, record.worktree);
+        } catch {
+          // Keep the Store receipt for an exact retry; never infer preservation.
+        }
       }
     }
     this.#initialized = true;
@@ -266,16 +308,147 @@ export class SessionWorktreeCoordinator {
     return binding;
   }
 
+  /** Read-only remote source probe. The returned full plan must be written to
+   * the derivation receipt before acquirePlannedRemoteDerivation is called. */
+  async planRemoteDerivation(input: DeriveSessionWorktreeInput): Promise<RemoteGitCheckoutPlan | undefined> {
+    this.#requireInitialized();
+    const owner = this.#requireRemoteOwner();
+    const source = this.#store.getSession(input.sourceSessionId);
+    const target = this.#store.getTarget(source.descriptor.targetId);
+    const remote = target.descriptor.remoteWorkspace;
+    if (remote === undefined || source.descriptor.remoteWorkspace?.hostTargetId !== remote.hostTargetId
+      || source.descriptor.remoteWorkspace.hostId !== remote.hostId
+      || source.descriptor.remoteWorkspace.workspaceRoot !== remote.workspaceRoot) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const sourceBinding = source.descriptor.worktree;
+    const sourceLease = sourceBinding === undefined
+      ? undefined
+      : remoteLeaseFromBinding(input.sourceSessionId, sourceBinding);
+    if (sourceBinding !== undefined) await this.assertActiveRemoteWorktree(input.sourceSessionId, sourceBinding);
+    return owner.plan({
+      target,
+      sessionId: input.sessionId,
+      sourceSessionId: input.sourceSessionId,
+      workspaceId: workspaceIdFor(input.sessionId),
+      sourceCwd: sourceBinding?.path ?? remote.workspaceRoot,
+      ...(sourceLease === undefined ? {} : { sourceLease }),
+      ...(input.signal === undefined ? {} : { signal: input.signal })
+    });
+  }
+
+  async acquirePlannedRemoteDerivation(plan: RemoteGitCheckoutPlan): Promise<SessionWorktreeBinding> {
+    this.#requireInitialized();
+    this.#assertDurableRemotePlan(plan);
+    const lease = await this.#requireRemoteOwner().derive(plan);
+    const binding = remoteBindingFromLease(plan.workspaceId, lease);
+    if (!remoteBindingMatchesPlan(binding, plan)) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const target = this.#store.getTarget(plan.authority.targetId);
+    await this.#registerRemoteWorkspace(target, binding, `${target.descriptor.displayName} · ${binding.branch}`);
+    this.#activeBindings.set(plan.sessionId, binding);
+    return binding;
+  }
+
+  async inspectPlannedRemoteDerivation(plan: RemoteGitCheckoutPlan): Promise<RemoteGitCheckoutInspection> {
+    this.#requireInitialized();
+    this.#assertDurableRemotePlan(plan);
+    return this.#requireRemoteOwner().inspectExact(plan);
+  }
+
+  async cleanupPendingRemoteDerivation(plan: RemoteGitCheckoutPlan): Promise<"absent" | "released" | "preserved"> {
+    this.#requireInitialized();
+    this.#assertDurableRemotePlan(plan);
+    const outcome = await this.#requireRemoteOwner().cleanupPending(plan);
+    if (outcome !== "preserved") {
+      this.#activeBindings.delete(plan.sessionId);
+      this.#workspaces.unregister(plan.workspaceId);
+    }
+    return outcome;
+  }
+
+  async releasePlannedRemoteDerivation(
+    plan: RemoteGitCheckoutPlan,
+    lease: RemoteGitCheckoutLease
+  ): Promise<"released" | "preserved"> {
+    this.#requireInitialized();
+    this.#assertDurableRemotePlan(plan);
+    const binding = remoteBindingFromLease(plan.workspaceId, lease);
+    if (!remoteBindingMatchesPlan(binding, plan)) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    const outcome = await this.#requireRemoteOwner().releaseExact(plan.sessionId, binding);
+    if (outcome === "released") {
+      this.#activeBindings.delete(plan.sessionId);
+      this.#workspaces.unregister(plan.workspaceId);
+    }
+    return outcome;
+  }
+
+  /** Prove the remote manifest and checkout under current SSH authority. */
+  async assertActiveRemoteWorktree(sessionId: string, expectedBinding: SessionWorktreeBinding): Promise<string> {
+    this.#requireInitialized();
+    if (expectedBinding.remote === undefined || expectedBinding.state !== "active"
+      || expectedBinding.workspaceId !== workspaceIdFor(sessionId)
+      || !this.#hasDurableRemoteBinding(sessionId, expectedBinding)) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    await this.#requireRemoteOwner().assertExact(sessionId, expectedBinding);
+    const target = this.#store.getTarget(expectedBinding.remote.targetId);
+    if (!this.#workspaces.listRegistrations().some((registration) =>
+      registration.id === expectedBinding.workspaceId)) {
+      await this.#registerRemoteWorkspace(target, expectedBinding, `${target.descriptor.displayName} · ${expectedBinding.branch}`);
+    }
+    this.#activeBindings.set(sessionId, expectedBinding);
+    return expectedBinding.path;
+  }
+
+  #assertDurableRemotePlan(plan: RemoteGitCheckoutPlan): void {
+    const receipt = this.#store.listUnadoptedNativeSessionDerivations().find((record) =>
+      record.sessionId === plan.sessionId && record.remoteWorktreePlan !== undefined
+      && operationBodyHash(record.remoteWorktreePlan) === operationBodyHash(plan));
+    if (receipt === undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+  }
+
+  #hasDurableRemoteBinding(sessionId: string, expectedBinding: SessionWorktreeBinding): boolean {
+    const session = this.#store.listSessions({ includeArchived: true, includeDeleted: true })
+      .find((candidate) => candidate.descriptor.id === sessionId);
+    if (session?.descriptor.worktree !== undefined
+      && samePersistedBinding(session.descriptor.worktree, expectedBinding)) return true;
+    return this.#store.listUnadoptedNativeSessionDerivations().some((record) =>
+      record.sessionId === sessionId && record.worktree !== undefined
+      && samePersistedBinding(record.worktree, expectedBinding));
+  }
+
+  #requireRemoteOwner(): RemoteWorktreeOwnerPort {
+    if (this.#remoteOwner === undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    return this.#remoteOwner;
+  }
+
   effectiveTarget(session: StoredSession): TargetDescriptor {
     const target = this.#store.getTarget(session.descriptor.targetId).descriptor;
     const worktree = session.descriptor.worktree;
     if (worktree === undefined) return target;
     if (worktree.state !== "active") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    if (worktree.remote !== undefined) {
+      if (target.remoteWorkspace === undefined || worktree.remote.targetId !== target.id
+        || worktree.remote.hostTargetId !== target.remoteWorkspace.hostTargetId
+        || worktree.remote.hostId !== target.remoteWorkspace.hostId) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+      return {
+        ...target,
+        workspaceRoot: worktree.path,
+        remoteWorkspace: { ...target.remoteWorkspace, workspaceRoot: worktree.path }
+      };
+    }
     return { ...target, workspaceRoot: worktree.path };
   }
 
   activeWorkspacePath(sessionId: string, expectedBinding: SessionWorktreeBinding): string | undefined {
     if (!this.#initialized) return undefined;
+    if (expectedBinding.remote !== undefined) return undefined;
     const authoritativeBinding = this.#activeBindings.get(sessionId);
     if (authoritativeBinding === undefined || !samePersistedBinding(authoritativeBinding, expectedBinding)) {
       return undefined;
@@ -293,6 +466,12 @@ export class SessionWorktreeCoordinator {
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return Object.freeze({ hasWorktree: false, dirty: false });
+    if (binding.remote !== undefined) {
+      await this.assertActiveRemoteWorktree(sessionId, binding);
+      // The remote checkout owner does not expose a read-only dirty preview.
+      // Treat it as dirty so a removal never promises a clean discard.
+      return Object.freeze({ hasWorktree: true, dirty: true });
+    }
     const result = await this.#service.previewRemoval({ sessionId, leaseId: binding.leaseId }, options);
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (result.value.state !== binding.state) {
@@ -307,6 +486,20 @@ export class SessionWorktreeCoordinator {
       .find((candidate) => candidate.descriptor.id === sessionId);
     const persistedBinding = session?.descriptor.worktree;
     const binding = expectedBinding ?? persistedBinding ?? this.#activeBindings.get(sessionId);
+    if (binding?.remote !== undefined) {
+      if (binding.state !== "active" || !this.#hasDurableRemoteBinding(sessionId, binding)
+        || (persistedBinding !== undefined && !samePersistedBinding(persistedBinding, binding))) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+      const outcome = await this.#requireRemoteOwner().releaseExact(sessionId, binding);
+      if (outcome === "preserved") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      this.#activeBindings.delete(sessionId);
+      this.#workspaces.unregister(binding.workspaceId);
+      if (persistedBinding !== undefined && persistedBinding.state !== "preserved") {
+        this.#store.updateSessionWorktreeState(sessionId, "preserved");
+      }
+      return;
+    }
     let result: Awaited<ReturnType<EphemeralWorktreeService["release"]>>;
     if (binding !== undefined) {
       const authoritativeBinding = this.#activeBindings.get(sessionId);
@@ -376,6 +569,7 @@ export class SessionWorktreeCoordinator {
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
+    if (binding.remote !== undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     if (this.activeWorkspacePath(sessionId, binding) === undefined) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
@@ -395,6 +589,7 @@ export class SessionWorktreeCoordinator {
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
+    if (binding.remote !== undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     const result = await this.#service.acquire({
       sessionId,
       cwd: binding.repositoryRoot
@@ -423,12 +618,38 @@ export class SessionWorktreeCoordinator {
   }
 
   async #registerWorkspace(session: StoredSession, binding: SessionWorktreeBinding): Promise<void> {
-    const target = this.#store.getTarget(session.descriptor.targetId).descriptor;
+    const target = this.#store.getTarget(session.descriptor.targetId);
+    if (binding.remote !== undefined) {
+      await this.#registerRemoteWorkspace(target, binding, `${session.descriptor.title} · ${binding.branch}`);
+      return;
+    }
     await this.#workspaces.register({
       id: binding.workspaceId,
       root: binding.path,
       displayName: `${session.descriptor.title} · ${binding.branch}`,
-      trusted: target.trusted
+      trusted: target.descriptor.trusted
+    });
+  }
+
+  async #registerRemoteWorkspace(target: StoredTarget, binding: SessionWorktreeBinding, displayName: string): Promise<void> {
+    const remote = target.descriptor.remoteWorkspace;
+    if (remote === undefined || binding.remote === undefined || binding.remote.targetId !== target.descriptor.id
+      || binding.remote.targetRevision !== target.revision.toString()
+      || binding.remote.hostTargetId !== remote.hostTargetId || binding.remote.hostId !== remote.hostId
+      || binding.state !== "active") {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    await this.#workspaces.register({
+      id: binding.workspaceId,
+      root: binding.path,
+      displayName,
+      trusted: target.descriptor.trusted,
+      remote: {
+        targetId: target.descriptor.id,
+        hostTargetId: remote.hostTargetId,
+        hostId: remote.hostId,
+        workspaceRoot: binding.path
+      }
     });
   }
 
@@ -467,7 +688,8 @@ function sameLease(
   lease: ReturnType<EphemeralWorktreeService["snapshot"]>["active"][number],
   binding: SessionWorktreeBinding
 ): boolean {
-  return binding.workspaceId === workspaceIdFor(lease.sessionId)
+  return binding.remote === undefined
+    && binding.workspaceId === workspaceIdFor(lease.sessionId)
     && binding.state === "active"
     && lease.id === binding.leaseId
     && resolve(lease.path) === resolve(binding.path)
@@ -482,19 +704,33 @@ function sameLease(
 }
 
 function samePersistedBinding(left: SessionWorktreeBinding, right: SessionWorktreeBinding): boolean {
+  if ((left.remote === undefined) !== (right.remote === undefined)) return false;
+  const remote = left.remote !== undefined;
   return left.leaseId === right.leaseId
     && left.workspaceId === right.workspaceId
-    && resolve(left.path) === resolve(right.path)
-    && resolve(left.repositoryRoot) === resolve(right.repositoryRoot)
+    && (remote ? left.path === right.path : resolve(left.path) === resolve(right.path))
+    && (remote ? left.repositoryRoot === right.repositoryRoot
+      : resolve(left.repositoryRoot) === resolve(right.repositoryRoot))
     && left.branch === right.branch
     && left.sourceRef === right.sourceRef
     && left.sourceCommit === right.sourceCommit
     && left.sourceStrategy === right.sourceStrategy
     && left.sourceRefreshed === right.sourceRefreshed
     && left.sourceRemote === right.sourceRemote
+    && (remote ? operationBodyHash(left.remote) === operationBodyHash(right.remote) : true)
     && left.state === right.state
     && left.acquiredAt === right.acquiredAt
     && left.updatedAt === right.updatedAt;
+}
+
+function remoteBindingMatchesPlan(binding: SessionWorktreeBinding, plan: RemoteGitCheckoutPlan): boolean {
+  return binding.remote !== undefined && binding.state === "active"
+    && binding.workspaceId === plan.workspaceId && binding.leaseId === plan.leaseId
+    && binding.path === plan.path && binding.repositoryRoot === plan.repositoryRoot
+    && binding.branch === plan.branch && binding.sourceRef === plan.sourceRef
+    && binding.sourceCommit === plan.sourceCommit && binding.sourceStrategy === plan.sourceStrategy
+    && binding.sourceRefreshed === plan.sourceRefreshed
+    && operationBodyHash(binding.remote) === operationBodyHash(plan.remote);
 }
 
 function probeEligibility(code: WorktreeErrorCode): TargetWorktreeEligibility {

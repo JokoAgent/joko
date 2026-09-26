@@ -126,23 +126,23 @@ describe("Claude SDK owned custom spawn", () => {
       expect(runtime.supportsWorkspaceDerivation).toBe(true);
       const storedSessions = runtime.storedSessions;
       expect(storedSessions).toBeDefined();
-      const importAccess = storedSessions!.prepareImport({
+      const importAccess = await storedSessions!.prepareImport({
         operationId: "22222222-2222-4222-8222-222222222222",
         sourceWorkspaceAuthority: "workspace-source",
         sourceSessionId: "11111111-1111-4111-8111-111111111111",
         targetWorkspaceAuthority: "workspace-target"
       });
-      expect(storedSessions!.readOperation(importAccess)).toMatchObject({
+      await expect(storedSessions!.readOperation(importAccess)).resolves.toMatchObject({
         operationId: "22222222-2222-4222-8222-222222222222",
         state: "importing"
       });
-      const recovered = storedSessions!.recoverOperation({
+      const recovered = await storedSessions!.recoverOperation({
         operationId: importAccess.operationId,
         targetWorkspaceAuthority: importAccess.target.workspaceAuthority
       });
       expect(recovered).toEqual(importAccess);
-      expect(storedSessions!.cleanupOperation(recovered).state).toBe("cleaned");
-      expect(storedSessions!.cleanupOperation(recovered).state).toBe("cleaned");
+      expect((await storedSessions!.cleanupOperation(recovered)).state).toBe("cleaned");
+      expect((await storedSessions!.cleanupOperation(recovered)).state).toBe("cleaned");
       expect(storedSessions).toMatchObject({
         claim: expect.any(Function),
         recoverOperation: expect.any(Function),

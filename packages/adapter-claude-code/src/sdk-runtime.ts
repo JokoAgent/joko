@@ -352,34 +352,34 @@ export interface ClaudeSdkStoredSessionRuntime {
     readonly sourceWorkspaceAuthority: string;
     readonly sourceSessionId: string;
     readonly targetWorkspaceAuthority: string;
-  }): ClaudeSessionStoreOperationAccess;
+  }): Promise<ClaudeSessionStoreOperationAccess>;
   prepareDerivation(input: {
     readonly operationId: string;
     readonly sourceWorkspaceAuthority: string;
     readonly sourceSessionId: string;
     readonly targetWorkspaceAuthority: string;
-  }): ClaudeSessionStoreOperationAccess;
-  readOperation(access: ClaudeSessionStoreOperationAccess): ClaudeSessionStoreOperationSnapshot;
+  }): Promise<ClaudeSessionStoreOperationAccess>;
+  readOperation(access: ClaudeSessionStoreOperationAccess): Promise<ClaudeSessionStoreOperationSnapshot>;
   recoverOperation(input: {
     readonly operationId: string;
     readonly targetWorkspaceAuthority: string;
     readonly expectedChildSessionId?: string;
-  }): ClaudeSessionStoreOperationAccess;
+  }): Promise<ClaudeSessionStoreOperationAccess>;
   cleanupOperation(
     access: ClaudeSessionStoreOperationAccess,
     input?: { readonly expectedChildSessionId?: string }
-  ): ClaudeSessionStoreOperationSnapshot;
-  discardImport(access: ClaudeSessionStoreOperationAccess): void;
-  adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): ClaudeSessionStoreSessionAccess;
+  ): Promise<ClaudeSessionStoreOperationSnapshot>;
+  discardImport(access: ClaudeSessionStoreOperationAccess): Promise<void>;
+  adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): Promise<ClaudeSessionStoreSessionAccess>;
   claim(input: {
     readonly workspaceAuthority: string;
     readonly sessionId: string;
-  }): ClaudeSessionStoreSessionAccess;
+  }): Promise<ClaudeSessionStoreSessionAccess>;
   rebind(input: {
     readonly workspaceAuthority: string;
     readonly sessionId: string;
     readonly expectedGeneration: number;
-  }): ClaudeSessionStoreSessionAccess;
+  }): Promise<ClaudeSessionStoreSessionAccess>;
   importSession(
     sessionId: string,
     options: { readonly dir: string; readonly access: ClaudeSessionStoreOperationAccess; readonly signal?: AbortSignal }
@@ -773,15 +773,15 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
 
 function storedSessionRuntime(owner: SessionSdkOwner): ClaudeSdkStoredSessionRuntime {
   const runtime: ClaudeSdkStoredSessionRuntime = {
-    prepareImport: (input) => owner.prepareSessionImport(input),
-    prepareDerivation: (input) => owner.prepareStoredSessionDerivation(input),
-    readOperation: (access) => owner.readStoredSessionOperation(access),
-    recoverOperation: (input) => owner.recoverStoredSessionOperation(input),
-    cleanupOperation: (access, input = {}) => owner.cleanupStoredSessionOperation(access, input),
-    discardImport: (access) => owner.discardSessionImport(access),
-    adopt: (access, sessionId) => owner.adoptStoredSession(access, sessionId),
-    claim: (input) => owner.claimStoredSession(input),
-    rebind: (input) => owner.rebindStoredSession(input),
+    prepareImport: async (input) => owner.prepareSessionImport(input),
+    prepareDerivation: async (input) => owner.prepareStoredSessionDerivation(input),
+    readOperation: async (access) => owner.readStoredSessionOperation(access),
+    recoverOperation: async (input) => owner.recoverStoredSessionOperation(input),
+    cleanupOperation: async (access, input = {}) => owner.cleanupStoredSessionOperation(access, input),
+    discardImport: async (access) => owner.discardSessionImport(access),
+    adopt: async (access, sessionId) => owner.adoptStoredSession(access, sessionId),
+    claim: async (input) => owner.claimStoredSession(input),
+    rebind: async (input) => owner.rebindStoredSession(input),
     importSession: async (sessionId, options) => {
       await owner.run({
         kind: "importSessionToStore",

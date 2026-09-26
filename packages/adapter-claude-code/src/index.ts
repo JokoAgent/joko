@@ -43,10 +43,11 @@ export {
   type ClaudeCanUseToolOptions,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
-export type {
-  ClaudeSessionStoreOperationAccess,
-  ClaudeSessionStoreOperationSnapshot,
-  ClaudeSessionStoreSessionAccess
+export {
+  ClaudeSessionStoreError,
+  type ClaudeSessionStoreOperationAccess,
+  type ClaudeSessionStoreOperationSnapshot,
+  type ClaudeSessionStoreSessionAccess
 } from "./claude-session-store.js";
 export {
   type ClaudeTextResourceResolver,

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -260,6 +261,158 @@ describe("native derivation receipts", () => {
     }));
     expect(f.store.getSession(input.sessionId).descriptor.worktree).toEqual(worktree);
     expect(f.store.findNativeSessionDerivation(input.operationId)?.state).toBe("product_adopted");
+  });
+
+  it("persists remote checkout intent before effect and adopts only the inspected exact lease", () => {
+    const f = fixture(true);
+    const claimed = f.claim("remote-worktree");
+    const remoteWorkspace = f.store.getTarget("workspace").descriptor.remoteWorkspace!;
+    const plan = remotePlan(f, claimed, "a".repeat(40),
+      "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+    const worktree = remoteWorktree(plan);
+    const input = { ...claimed, effectiveWorkspaceRoot: plan.path, remoteWorkspace, worktree };
+    const attempt = { ...f.attempt({ ...input, worktree: undefined }), remoteWorktreePlan: plan };
+    expect(() => f.store.prepareNativeSessionDerivation({
+      ...attempt, remoteWorktreePlan: { ...plan, sourceSnapshot: "not-a-snapshot" }
+    })).toThrow(/source snapshot/u);
+    const prepared = f.store.prepareNativeSessionDerivation(attempt);
+    expect(prepared).toMatchObject({ state: "prepared", remoteWorktreePlan: plan });
+    expect(prepared.worktree).toBeUndefined();
+    expect(() => f.store.recordNativeSessionDerivation(input)).toThrow(/original effect/u);
+    f.reopen();
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(prepared);
+    const currentHost = f.store.getRemoteHost("owner", "workspace", "ssh");
+    const refreshedHost = f.store.updateRemoteHostStatus({ ownerId: currentHost.ownerId,
+      targetId: currentHost.targetId, id: currentHost.id, expectedRevision: currentHost.revision,
+      state: "ready" });
+    expect(refreshedHost.revision).toBeGreaterThan(currentHost.revision);
+    expect(() => f.store.attachNativeSessionDerivationWorktree({
+      operationId: input.operationId, expectedRevision: prepared.revision,
+      worktree: { ...worktree, branch: "codex/other" }
+    })).toThrow(/durable intent/u);
+    const attached = f.store.attachNativeSessionDerivationWorktree({
+      operationId: input.operationId, expectedRevision: prepared.revision, worktree
+    });
+    expect(attached).toMatchObject({ state: "prepared", worktree, remoteWorktreePlan: plan });
+    expect(f.store.attachNativeSessionDerivationWorktree({
+      operationId: input.operationId, expectedRevision: prepared.revision, worktree
+    })).toEqual(attached);
+    expect(f.store.prepareNativeSessionDerivation(attempt)).toEqual(attached);
+    f.store.recordNativeSessionDerivation(input);
+    expect(() => f.complete(input, (store) => store.createSession({
+      ...f.child(input), worktree: { ...worktree, remote: { ...plan.remote, manifestId: "wrong" } }
+    }, { derivationOperationId: input.operationId }))).toThrow(/prepared authority/u);
+    f.complete(input, (store) => store.createSession({ ...f.child(input), worktree }, {
+      derivationOperationId: input.operationId
+    }));
+    f.reopen();
+    expect(f.store.getSession(input.sessionId).descriptor).toMatchObject({
+      remoteWorkspace, worktree
+    });
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toMatchObject({
+      state: "product_adopted", worktree, remoteWorktreePlan: plan
+    });
+  });
+
+  it("retains a remote checkout intent when effect outcome and cleanup are unknown", () => {
+    const f = fixture(true);
+    const input = f.claim("remote-unknown");
+    const remoteWorkspace = f.store.getTarget("workspace").descriptor.remoteWorkspace!;
+    const plan = remotePlan(f, input, "b".repeat(40),
+      "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444");
+    const attempt = { ...f.attempt({ ...input, effectiveWorkspaceRoot: plan.path, remoteWorkspace }),
+      remoteWorktreePlan: plan };
+    const prepared = f.store.prepareNativeSessionDerivation(attempt);
+    f.fail(input);
+    const claim = f.store.claimNativeSessionDerivationCleanup({
+      operationId: input.operationId, expectedRevision: prepared.revision
+    });
+    f.store.finishNativeSessionDerivationCleanup({
+      operationId: input.operationId, token: claim.token, outcome: "cleanup_unknown"
+    });
+    f.reopen();
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toMatchObject({
+      state: "cleanup_unknown", remoteWorktreePlan: plan
+    });
+    expect(f.store.findNativeSessionDerivation(input.operationId)?.worktree).toBeUndefined();
+  });
+
+  it("replays exact workspace cleanup for a failed plan-only remote checkout after restart", () => {
+    const f = fixture(true);
+    const input = f.claim("remote-unstarted-cleanup");
+    const remoteWorkspace = f.store.getTarget("workspace").descriptor.remoteWorkspace!;
+    const plan = remotePlan(f, input, "e".repeat(40),
+      "99999999-9999-4999-8999-999999999999", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const prepared = f.store.prepareNativeSessionDerivation({
+      ...f.attempt({ ...input, effectiveWorkspaceRoot: plan.path, remoteWorkspace }),
+      remoteWorktreePlan: plan
+    });
+    f.fail(input);
+    expect(() => f.store.confirmUnstartedRemoteDerivationCleanup({
+      operationId: input.operationId, expectedRevision: prepared.revision - 1n
+    })).toThrow(RevisionConflictError);
+    const pending = f.store.confirmUnstartedRemoteDerivationCleanup({
+      operationId: input.operationId, expectedRevision: prepared.revision
+    });
+    expect(pending).toMatchObject({
+      state: "workspace_cleanup_pending", remoteWorktreePlan: plan,
+      cleanupToken: expect.any(String), cleanupStartedAt: expect.any(Number)
+    });
+    expect(pending.binding).toBeUndefined();
+    expect(pending.worktree).toBeUndefined();
+    expect(() => f.store.claimNativeSessionDerivationCleanup({
+      operationId: input.operationId, expectedRevision: pending.revision
+    })).toThrow(/unadopted failed derivation/u);
+
+    f.reopen();
+    f.store.recoverStartup();
+    expect(f.store.findNativeSessionDerivation(input.operationId)).toEqual(pending);
+    expect(f.store.listUnadoptedNativeSessionDerivations()).toContainEqual(pending);
+    expect(() => f.store.finishNativeSessionDerivationCleanup({
+      operationId: input.operationId, token: "wrong-cleanup-owner", outcome: "cleaned"
+    })).toThrow(/cleanup owner is stale/u);
+    const cleaned = f.store.finishNativeSessionDerivationCleanup({
+      operationId: input.operationId, token: pending.cleanupToken!, outcome: "cleaned"
+    });
+    expect(cleaned).toMatchObject({ state: "cleaned", remoteWorktreePlan: plan });
+    expect(cleaned.binding).toBeUndefined();
+    expect(cleaned.worktree).toBeUndefined();
+    f.reopen();
+    const revision = f.store.health().revision;
+    expect(f.store.finishNativeSessionDerivationCleanup({
+      operationId: input.operationId, token: pending.cleanupToken!, outcome: "cleaned"
+    })).toEqual(cleaned);
+    expect(f.store.health().revision).toBe(revision);
+  });
+
+  it("pins an active remote source checkout in the durable plan", () => {
+    const f = fixture(true);
+    const sourcePlan = remotePlan(f, { operationId: "owned-source", sessionId: "owned-source", sourceSessionId: "source" },
+      "c".repeat(40), "55555555-5555-4555-8555-555555555555", "66666666-6666-4666-8666-666666666666");
+    const sourceWorktree = { ...remoteWorktree(sourcePlan), acquiredAt: 8, updatedAt: 8 };
+    f.store.createSession({ ...f.descriptor("owned-source", native("owned-source")), worktree: sourceWorktree });
+    const claimed = f.claim("from-owned", "clone_session", "owned-source");
+    const plan = {
+      ...remotePlan(f, claimed, "d".repeat(40),
+        "77777777-7777-4777-8777-777777777777", "88888888-8888-4888-8888-888888888888"),
+      sourceCwd: sourceWorktree.path,
+      sourceLease: {
+        id: sourceWorktree.leaseId, sessionId: "owned-source", path: sourceWorktree.path,
+        repositoryRoot: sourceWorktree.repositoryRoot, branch: sourceWorktree.branch,
+        source: { ref: sourceWorktree.sourceRef, commit: sourceWorktree.sourceCommit,
+          refreshed: false as const, strategy: "explicit" as const },
+        acquiredAt: sourceWorktree.acquiredAt, remote: sourceWorktree.remote
+      }
+    };
+    const attempt = { ...f.attempt({ ...claimed, effectiveWorkspaceRoot: plan.path }),
+      remoteWorktreePlan: plan };
+    const prepared = f.store.prepareNativeSessionDerivation(attempt);
+    expect(prepared.remoteWorktreePlan?.sourceLease).toEqual(plan.sourceLease);
+    f.store.updateSessionWorktreeState("owned-source", "preserved");
+    expect(() => f.store.attachNativeSessionDerivationWorktree({ operationId: claimed.operationId,
+      expectedRevision: prepared.revision, worktree: remoteWorktree(plan) }))
+      .toThrow(/source checkout authority changed/u);
+    expect(f.store.findNativeSessionDerivation(claimed.operationId)).toEqual(prepared);
   });
 
   it("persists exact direct-lifecycle worktree authority across replay and restart", () => {
@@ -561,7 +714,43 @@ function native(id: string, generation = 0): NativeSessionBinding {
   return { opaqueRef: `native://${id}`, nativeSessionId: id, generation };
 }
 
-function fixture() {
+function remotePlan(
+  f: ReturnType<typeof fixture>,
+  input: Pick<RecordNativeSessionDerivationInput, "operationId" | "sessionId" | "sourceSessionId">,
+  sourceCommit: string, leaseId: string, manifestId: string
+) {
+  const target = f.store.getTarget("workspace");
+  const binding = target.descriptor.remoteWorkspace!;
+  const host = f.store.getRemoteHost("owner", "workspace", "ssh");
+  const authority = {
+    hostOwnerId: host.ownerId, hostTargetId: binding.hostTargetId, hostId: binding.hostId,
+    hostIdentity: `sha256:${"a".repeat(64)}`, targetId: target.descriptor.id,
+    targetRevision: target.revision.toString(), hostRevision: host.revision.toString()
+  };
+  return {
+    format: 1 as const,
+    leaseId, manifestId, sessionId: input.sessionId, sourceSessionId: input.sourceSessionId,
+    workspaceId: `workspace-${input.operationId}`, sourceCwd: binding.workspaceRoot,
+    sourceSnapshot: `sha256:${"f".repeat(64)}`,
+    path: `/srv/joko/checkouts/${leaseId}`, repositoryRoot: "/srv/repository",
+    branch: `joko/remote-${createHash("sha256").update(input.sessionId).digest("hex").slice(0, 12)}-${leaseId.slice(0, 8)}`,
+    sourceRef: sourceCommit, sourceCommit, sourceStrategy: "explicit" as const,
+    sourceRefreshed: false as const, storageRoot: "/srv/joko", authority,
+    remote: { ...authority, manifestId }
+  };
+}
+
+function remoteWorktree(plan: ReturnType<typeof remotePlan>) {
+  return {
+    leaseId: plan.leaseId, workspaceId: plan.workspaceId, path: plan.path,
+    repositoryRoot: plan.repositoryRoot, branch: plan.branch, sourceRef: plan.sourceRef,
+    sourceCommit: plan.sourceCommit, sourceStrategy: plan.sourceStrategy,
+    sourceRefreshed: plan.sourceRefreshed, remote: plan.remote,
+    state: "active" as const, acquiredAt: 10, updatedAt: 10
+  };
+}
+
+function fixture(remote = false) {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-derivation-store-"));
   const databasePath = path.join(directory, "operational.sqlite");
   let store = new OperationalStore(databasePath);
@@ -569,23 +758,41 @@ function fixture() {
   store.upsertBackend({ id: "native", adapterKind: "fixture", displayName: "Native", version: "1",
     instanceGeneration: 0, health: "healthy", installationState: "installed", authenticationState: "not_required",
     capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+  const remoteWorkspace = remote
+    ? { hostTargetId: "workspace", hostId: "ssh", workspaceRoot: "/srv/repository/project" }
+    : undefined;
   store.upsertTarget({ id: "workspace", backendId: "native", displayName: "Workspace", workspaceRoot: "D:/workspace",
-    managed: false, trusted: true });
+    managed: false, trusted: true, ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }) });
+  if (remote) {
+    let host = store.createRemoteHost({ ownerId: "owner", targetId: "workspace", id: "ssh",
+      hostname: "host.example.test", user: "builder", source: "manual" });
+    host = store.pinRemoteHostTrust({ ownerId: host.ownerId, targetId: host.targetId, id: host.id,
+      expectedRevision: host.revision, algorithm: "ssh-ed25519", fingerprint: `SHA256:${"A".repeat(43)}` });
+    for (const state of ["connecting", "authenticating", "ready"] as const) {
+      host = store.updateRemoteHostStatus({ ownerId: host.ownerId, targetId: host.targetId,
+        id: host.id, expectedRevision: host.revision, state });
+    }
+  }
   const descriptor = (id: string, binding: NativeSessionBinding): SessionDescriptor => ({
     id, binding, backendId: "native", targetId: "workspace", title: id,
-    pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1
+    pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1,
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace })
   });
   store.createSession(descriptor("source", native("source")));
   const connection = store.createConnection({ id: "client", name: "Client", authKeyDigest: "client-digest" });
   return {
     get store() { return store; }, connection, descriptor,
     reopen() { store.close(); store = new OperationalStore(databasePath); },
-    claim(operationId: string, kind: "clone_session" | "navigate_session" = "clone_session"): RecordNativeSessionDerivationInput {
+    claim(operationId: string, kind: "clone_session" | "navigate_session" = "clone_session",
+      sourceSessionId = "source"): RecordNativeSessionDerivationInput {
       const claim = store.claimAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest,
-        { id: operationId, kind, body: { sourceSessionId: "source" } });
-      return { operationId, expectedBodyHash: claim.operation.bodyHash, sourceSessionId: "source",
-        sourceBinding: store.getSession("source").descriptor.binding, sessionId: kind === "navigate_session" ? "source" : `child-${operationId}`,
-        backendId: "native", backendInstanceGeneration: 0, targetId: "workspace", effectiveWorkspaceRoot: "D:/workspace",
+        { id: operationId, kind, body: { sourceSessionId } });
+      return { operationId, expectedBodyHash: claim.operation.bodyHash, sourceSessionId,
+        sourceBinding: store.getSession(sourceSessionId).descriptor.binding,
+        sessionId: kind === "navigate_session" ? sourceSessionId : `child-${operationId}`,
+        backendId: "native", backendInstanceGeneration: 0, targetId: "workspace",
+        effectiveWorkspaceRoot: remoteWorkspace?.workspaceRoot ?? "D:/workspace",
+        ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
         binding: native(operationId, kind === "navigate_session" ? 1 : 0) };
     },
     attempt(

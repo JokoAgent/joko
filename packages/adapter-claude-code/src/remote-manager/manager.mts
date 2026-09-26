@@ -13,8 +13,9 @@ import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import { z } from "zod";
 
-const PROTOCOL_VERSION = 1;
-const MANAGER_VERSION = "1.0.0";
+const PROTOCOL_VERSION = 2;
+const MANAGER_VERSION = "2.0.0";
+const SESSION_STORE_MODULE_BASE64 = "__JOKO_EMBEDDED_CLAUDE_SESSION_STORE_V1__";
 const MANAGER_SHA256 = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
 const MAX_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_EVENTS = 4096;
@@ -42,14 +43,26 @@ const PATH_BACKED_CREDENTIALS = new Set([
   "AZURE_CLIENT_CERTIFICATE_PATH",
   "AZURE_FEDERATED_TOKEN_FILE"
 ]);
+const STORE_FAULT_CODES = new Set([
+  "INVALID_AUTHORITY", "INVALID_ACCESS", "INVALID_KEY", "INVALID_ENTRY", "LIMIT_EXCEEDED",
+  "NOT_FOUND", "CONFLICT", "OPERATION_NOT_READY", "CORRUPT", "STORAGE_UNAVAILABLE",
+  "COMMIT_UNKNOWN", "RESERVATION_REQUIRED", "RESERVATION_FAILED",
+  "invalid_request", "invalid_path", "invalid_store_authority", "invalid_store_access",
+  "invalid_store_entry", "store_limit_exceeded", "store_unavailable", "reservation_rejected",
+  "callback_unavailable", "callback_capacity", "callback_timeout", "callback_cancelled",
+  "connection_closed"
+]);
 
-export function createManagerState(runtimeSdk = nativeSdk) {
+export function createManagerState(runtimeSdk = nativeSdk, options = {}) {
   return {
     generation: randomUUID(),
     sdk: runtimeSdk,
     queries: new Map(),
     starts: new Map(),
-    terminalOrder: []
+    terminalOrder: [],
+    sessionStoreModule: options.sessionStoreModule,
+    sessionStoreModulePromise: undefined,
+    sessionStoreRootDirectory: options.sessionStoreRootDirectory
   };
 }
 
@@ -181,7 +194,9 @@ export class ManagerConnection {
   }
 
   callback(query, callback, value, signal) {
-    if (this.closed || query.connection !== this) return Promise.reject(fault("callback_unavailable", false));
+    if (this.closed || (query !== undefined && query.connection !== this)) {
+      return Promise.reject(fault("callback_unavailable", false));
+    }
     if (this.callbacks.size >= MAX_CALLBACKS_PER_CONNECTION) return Promise.reject(fault("callback_capacity", false));
     const callbackId = randomUUID();
     return new Promise((resolvePromise, reject) => {
@@ -202,7 +217,14 @@ export class ManagerConnection {
       };
       this.callbacks.set(callbackId, { query, resolve: resolvePromise, reject, timer, abort, signal });
       signal?.addEventListener("abort", abort, { once: true });
-      this.send({ v: PROTOCOL_VERSION, kind: "callback", callbackId, queryId: query.id, callback, value })
+      this.send({
+        v: PROTOCOL_VERSION,
+        kind: "callback",
+        callbackId,
+        ...(query === undefined ? {} : { queryId: query.id }),
+        callback,
+        value
+      })
         .catch(() => abort());
     });
   }
@@ -262,6 +284,10 @@ async function dispatch(connection, method, params) {
   if (method === "query.accountInfo") return queryControl(connection, params, (query) => query.accountInfo());
   if (method === "query.retire") return retireQuery(connection, params);
   if (method === "query.retireOwned") return retireOwnedQuery(connection, params);
+  if (typeof method === "string" && method.startsWith("store.")) {
+    try { return await storeOperation(connection, method, params); }
+    catch (error) { throw normalizeStoreFault(error); }
+  }
   if (method === "session.info") return sessionOperation(connection, params, (signal) => connection.state.sdk.getSessionInfo(
     uuid(params.sessionId), { dir: absolutePath(params.dir), signal }
   ));
@@ -290,6 +316,234 @@ async function dispatch(connection, method, params) {
     }
   ));
   throw fault("method_unsupported", false);
+}
+
+async function storeOperation(connection, method, params) {
+  if (!record(params)) throw fault("invalid_request", false);
+  const context = await remoteSessionStoreContext(connection.state, params.authority);
+  const storeModule = context.module;
+  if (method === "store.prepareImport") {
+    return storeModule.prepareClaudeSessionStoreImport(context.authority, storeOperationInput(params.input));
+  }
+  if (method === "store.prepareDerivation") {
+    return storeModule.prepareClaudeSessionStoreDerivation(context.authority, storeOperationInput(params.input));
+  }
+  if (method === "store.readOperation") {
+    return storeModule.readClaudeSessionStoreOperation(context.authority, storeAccess(params.access));
+  }
+  if (method === "store.recoverOperation") {
+    return storeModule.recoverClaudeSessionStoreOperation(context.authority, storeRecoveryInput(params.input));
+  }
+  if (method === "store.cleanupOperation") {
+    return storeModule.cleanupClaudeSessionStoreOperation(
+      context.authority,
+      storeAccess(params.access),
+      storeExpectedChildInput(params.input)
+    );
+  }
+  if (method === "store.discardImport") {
+    storeModule.discardClaudeSessionStoreImport(context.authority, storeAccess(params.access));
+    return { discarded: true };
+  }
+  if (method === "store.adopt") {
+    return storeModule.adoptClaudeSessionStoreChild(
+      context.authority,
+      storeAccess(params.access),
+      uuid(params.sessionId)
+    );
+  }
+  if (method === "store.claim") {
+    return storeModule.claimClaudeSessionStoreSession(context.authority, storeSessionInput(params.input));
+  }
+  if (method === "store.rebind") {
+    return storeModule.rebindClaudeSessionStoreGeneration(context.authority, storeRebindInput(params.input));
+  }
+  if (method === "store.import") {
+    return sessionOperation(connection, params, async (signal) => {
+      const access = storeAccess(params.access);
+      const store = storeModule.createClaudeDurableSessionStore(context.authority, access);
+      try {
+        await connection.state.sdk.importSessionToStore(
+          uuid(params.sessionId),
+          sdkStoreBoundary(store, storeModule.CLAUDE_SESSION_STORE_LIMITS.maximumBatchBytes),
+          { dir: absolutePath(params.dir), includeSubagents: false, batchSize: 500 }
+        );
+        storeModule.sealClaudeSessionStoreImport(context.authority, access);
+        return { imported: true };
+      } finally { store.close(); }
+    });
+  }
+  if (method === "store.fork") {
+    return sessionOperation(connection, params, async (signal) => {
+      const access = storeAccess(params.access);
+      const store = storeModule.createClaudeDurableSessionStore(context.authority, access, {
+        onChildReserved: async (reservation) => {
+          const result = await connection.callback(undefined, "storeChildReserved", reservation, signal);
+          if (!record(result) || result.accepted !== true) throw fault("reservation_rejected", false);
+        }
+      });
+      try {
+        return await connection.state.sdk.forkSession(uuid(params.sessionId), {
+          dir: absolutePath(params.dir),
+          signal,
+          ...(params.upToMessageId === undefined ? {} : { upToMessageId: uuid(params.upToMessageId) }),
+          sessionStore: sdkStoreBoundary(store, storeModule.CLAUDE_SESSION_STORE_LIMITS.maximumBatchBytes)
+        });
+      } finally { store.close(); }
+    });
+  }
+  if (method === "store.info") {
+    return storedSessionOperation(connection, params, context, (sessionId, options) =>
+      connection.state.sdk.getSessionInfo(sessionId, options));
+  }
+  if (method === "store.messages") {
+    return storedSessionOperation(connection, params, context, (sessionId, options) =>
+      connection.state.sdk.getSessionMessages(sessionId, {
+        ...options,
+        limit: boundedInteger(params.limit, "limit", 1, 10001),
+        offset: boundedInteger(params.offset, "offset", 0, 1_000_000),
+        includeSystemMessages: params.includeSystemMessages === true
+      }));
+  }
+  if (method === "store.delete") {
+    return storedSessionOperation(connection, params, context, (sessionId, options) =>
+      connection.state.sdk.deleteSession(sessionId, options));
+  }
+  throw fault("method_unsupported", false);
+}
+
+async function storedSessionOperation(connection, params, context, operation) {
+  return sessionOperation(connection, params, async (signal) => {
+    const store = context.module.createClaudeDurableSessionStore(
+      context.authority,
+      storeAccess(params.access)
+    );
+    try {
+      return await operation(uuid(params.sessionId), {
+        dir: absolutePath(params.dir),
+        signal,
+        sessionStore: sdkStoreBoundary(store, context.module.CLAUDE_SESSION_STORE_LIMITS.maximumBatchBytes)
+      });
+    } finally { store.close(); }
+  });
+}
+
+async function remoteSessionStoreContext(managerState, value) {
+  const wire = storeAuthority(value);
+  const rootDirectory = await ensureSessionStoreRoot(managerState);
+  const module = await loadSessionStoreModule(managerState);
+  return {
+    module,
+    authority: module.createClaudeSessionStoreAuthority({
+      rootDirectory,
+      namespace: wire.namespace,
+      generation: wire.generation
+    })
+  };
+}
+
+async function ensureSessionStoreRoot(managerState) {
+  const configured = managerState.sessionStoreRootDirectory;
+  const root = configured === undefined
+    ? join(absolutePath(process.env.JOKO_CLAUDE_RUNTIME_ROOT), "store")
+    : configured;
+  if (typeof root !== "string" || root.length === 0 || root.includes("\0") || resolve(root) !== root) {
+    throw fault("store_unavailable", false);
+  }
+  try { await mkdir(root, { mode: 0o700 }); }
+  catch (error) { if (error?.code !== "EEXIST") throw fault("store_unavailable", false); }
+  if (configured === undefined) {
+    try { await requirePrivateDirectory(root); }
+    catch { throw fault("store_unavailable", false); }
+  }
+  return root;
+}
+
+async function loadSessionStoreModule(managerState) {
+  if (managerState.sessionStoreModule !== undefined) return managerState.sessionStoreModule;
+  if (managerState.sessionStoreModulePromise === undefined) {
+    managerState.sessionStoreModulePromise = (async () => {
+      if (SESSION_STORE_MODULE_BASE64.length < 128
+        || SESSION_STORE_MODULE_BASE64.includes("JOKO_EMBEDDED")
+        || !/^[A-Za-z0-9+/]+={0,2}$/u.test(SESSION_STORE_MODULE_BASE64)) {
+        throw fault("store_unavailable", false);
+      }
+      try {
+        return await import(`data:text/javascript;base64,${SESSION_STORE_MODULE_BASE64}`);
+      } catch { throw fault("store_unavailable", false); }
+    })();
+  }
+  return await managerState.sessionStoreModulePromise;
+}
+
+function storeAuthority(value) {
+  if (!record(value) || value.schemaVersion !== 1
+    || !Object.keys(value).every((key) => ["schemaVersion", "namespace", "generation"].includes(key))
+    || typeof value.namespace !== "string" || !/^backend-[0-9a-f]{64}$/u.test(value.namespace)
+    || !Number.isSafeInteger(value.generation) || value.generation < 1) {
+    throw fault("invalid_store_authority", false);
+  }
+  return { schemaVersion: 1, namespace: value.namespace, generation: value.generation };
+}
+
+function storeAccess(value) {
+  if (!record(value) || jsonBytes(value) > 8 * 1024) throw fault("invalid_store_access", false);
+  return value;
+}
+
+function storeOperationInput(value) {
+  if (!record(value) || jsonBytes(value) > 4 * 1024) throw fault("invalid_request", false);
+  return value;
+}
+
+function storeRecoveryInput(value) {
+  if (!record(value) || jsonBytes(value) > 4 * 1024) throw fault("invalid_request", false);
+  return value;
+}
+
+function storeExpectedChildInput(value) {
+  if (value === undefined) return {};
+  if (!record(value) || !Object.keys(value).every((key) => key === "expectedChildSessionId")) {
+    throw fault("invalid_request", false);
+  }
+  return value.expectedChildSessionId === undefined ? {} : { expectedChildSessionId: uuid(value.expectedChildSessionId) };
+}
+
+function storeSessionInput(value) {
+  if (!record(value)) throw fault("invalid_request", false);
+  return { workspaceAuthority: boundedString(value.workspaceAuthority, "workspace authority", 256), sessionId: uuid(value.sessionId) };
+}
+
+function storeRebindInput(value) {
+  if (!record(value)) throw fault("invalid_request", false);
+  return {
+    workspaceAuthority: boundedString(value.workspaceAuthority, "workspace authority", 256),
+    sessionId: uuid(value.sessionId),
+    expectedGeneration: boundedInteger(value.expectedGeneration, "expected generation", 1, Number.MAX_SAFE_INTEGER)
+  };
+}
+
+function sdkStoreBoundary(store, maximumBatchBytes) {
+  return {
+    append: async (key, entries) => {
+      const json = JSON.stringify(entries);
+      if (Buffer.byteLength(json, "utf8") > maximumBatchBytes) throw fault("store_limit_exceeded", false);
+      const normalized = JSON.parse(json);
+      if (!Array.isArray(normalized)) throw fault("invalid_store_entry", false);
+      await store.append(key, normalized);
+    },
+    load: async (key) => await store.load(key),
+    listSessions: async (projectKey) => await store.listSessions(projectKey),
+    delete: async (key) => await store.delete(key),
+    listSubkeys: async (key) => await store.listSubkeys(key)
+  };
+}
+
+function normalizeStoreFault(error) {
+  if (error && typeof error.code === "string" && STORE_FAULT_CODES.has(error.code)) {
+    return fault(error.code, error.stateMayHaveChanged === true);
+  }
+  return fault("store_operation_failed", true);
 }
 
 async function startQuery(connection, params) {
@@ -328,12 +582,12 @@ async function startQuery(connection, params) {
     inputOrder: [],
     processes: [],
     consumeLoop: undefined,
+    sessionStore: undefined,
     ended: false,
     retired: false,
     retiring: undefined
   };
-  const options = queryOptions(params.options, queryRecord);
-  if ((options.resume ?? options.sessionId) !== sessionId) throw fault("session_mismatch", false);
+  const options = await queryOptions(params.options, queryRecord);
   managerState.queries.set(queryId, queryRecord);
   managerState.starts.set(requestId, { fingerprint, queryId });
   try {
@@ -341,6 +595,7 @@ async function startQuery(connection, params) {
   } catch (error) {
     queryRecord.queue.close();
     queryRecord.abortController.abort();
+    closeQueryStore(queryRecord);
     if (queryRecord.processes.length > 0) {
       try { await retireExactQuery(queryRecord, 5_000); }
       catch { throw fault("query_start_unknown", true); }
@@ -482,6 +737,7 @@ async function retireExactQuery(query, timeoutMs) {
     if (!settled || !query.ended) throw fault("retirement_unconfirmed", true);
   }
   await removeProcessManifests(query);
+  closeQueryStore(query);
   query.retired = true;
   query.ended = true;
   emitEvent(query, "retired");
@@ -497,8 +753,15 @@ async function pumpQuery(query) {
     query.ended = true;
     emitEvent(query, "fault", undefined, true);
   } finally {
+    closeQueryStore(query);
     rememberTerminal(query);
   }
+}
+
+function closeQueryStore(query) {
+  const store = query.sessionStore;
+  query.sessionStore = undefined;
+  try { store?.close(); } catch {}
 }
 
 async function promiseSettledBefore(operation, timeoutMs) {
@@ -565,7 +828,7 @@ function rememberTerminal(query) {
   }
 }
 
-function queryOptions(value, query) {
+async function queryOptions(value, query) {
   if (!record(value)) throw fault("invalid_request", false);
   const remoteRoot = absolutePath(process.env.JOKO_CLAUDE_RUNTIME_ROOT);
   const configRoot = join(remoteRoot, "profile");
@@ -637,6 +900,20 @@ function queryOptions(value, query) {
     tools: tools(value.tools)
   };
   if (options.additionalDirectories.length > 0) throw fault("remote_extra_directories_unsupported", false);
+  if ((options.resume ?? options.sessionId) !== query.sessionId) throw fault("session_mismatch", false);
+  if (value.sessionStoreAuthority !== undefined || value.sessionStoreAccess !== undefined) {
+    if (value.sessionStoreAuthority === undefined || value.sessionStoreAccess === undefined) {
+      throw fault("invalid_store_access", false);
+    }
+    const access = storeAccess(value.sessionStoreAccess);
+    if (access.kind !== "session" || access.sessionId !== query.sessionId) {
+      throw fault("invalid_store_access", false);
+    }
+    const context = await remoteSessionStoreContext(query.state, value.sessionStoreAuthority);
+    const store = context.module.createClaudeDurableSessionStore(context.authority, access);
+    query.sessionStore = store;
+    options.sessionStore = sdkStoreBoundary(store, context.module.CLAUDE_SESSION_STORE_LIMITS.maximumBatchBytes);
+  }
   return options;
 }
 

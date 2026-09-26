@@ -63,6 +63,8 @@ import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
 import { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 import { createClaudeMcpBridge } from "./claude-mcp-bridge.js";
 import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
+import { createRemoteClaudeDerivedWorkspaceAuthorizer } from "./remote-claude-derived-workspace-authority.js";
+import { RemoteClaudeWorktreeOwner } from "./remote-claude-worktree-owner.js";
 import {
   ComputerRuntime,
   ComputerToolProvider,
@@ -1325,7 +1327,12 @@ export async function createOrchestratorApplication(
         }),
         remoteRuntimes: new RemoteClaudeRuntimeResolver({
           store,
-          registry: remoteHosts
+          registry: remoteHosts,
+          storeGeneration: generation,
+          authorizeDerivedWorkspace: createRemoteClaudeDerivedWorkspaceAuthorizer({
+            store,
+            worktrees: () => sessionWorktrees
+          })
         }),
         managedProviders: managedRuntime(instanceId, generation, CLAUDE_MANAGED_PROVIDER_SUPPORT),
         credentialPort: claudeCodeCredentialPort,
@@ -1451,7 +1458,8 @@ export async function createOrchestratorApplication(
   sessionWorktrees = startupSessionWorktrees = new SessionWorktreeCoordinator({
     store,
     workspaces,
-    storageRoot: join(config.dataDirectory, "worktrees")
+    storageRoot: join(config.dataDirectory, "worktrees"),
+    remoteOwner: new RemoteClaudeWorktreeOwner({ store, registry: remoteHosts })
   });
   const workspaceCapture = new DurableWorkspaceRunCapture(store, workspaceChanges, workspaces, gitSafety);
   let androidRuntimeForSessionCleanup: AndroidRuntimeSupervisor | undefined;
