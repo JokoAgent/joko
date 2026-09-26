@@ -110,7 +110,7 @@ function mapError(error: unknown): ConnectError {
   if (!(error instanceof SshKeyError)) return new ConnectError("ssh_key.io_failed", Code.Internal);
   const code = error.code === "invalid_name" || error.code === "invalid_key" || error.code === "bad_passphrase" ? Code.InvalidArgument
     : error.code === "key_changed" ? Code.Aborted : error.code === "not_found" ? Code.NotFound
-      : error.code === "agent_unavailable" ? Code.Unavailable : error.code === "agent_failed" || error.code === "outcome_unknown" ? Code.FailedPrecondition
+      : error.code === "agent_unavailable" ? Code.Unavailable : error.code === "agent_failed" || error.code === "outcome_unknown" || error.code === "unsafe_permissions" ? Code.FailedPrecondition
         : error.code === "busy" ? Code.ResourceExhausted : error.code === "aborted" ? Code.Canceled : Code.Internal;
   return new ConnectError(error.message, code);
 }

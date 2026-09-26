@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import ssh2, { type ParsedKey } from "ssh2";
 import { encodeAgentPrivateKey } from "./agent-private-key.js";
 import { createPrivateFile, PrivateFileCreationError } from "./create-private-file.js";
+import { inspectKeyDirectoryPermissions, inspectPrivateKeyPermissions, KeyPermissionError, type PrivateKeyPermissionLease } from "./key-permissions.js";
 import { assertSshPrivateKeyInput } from "./key-input-policy.js";
 
 const MAXIMUM_KEY_BYTES = 64 * 1024;
@@ -14,7 +15,7 @@ const MAXIMUM_PUBLIC_BYTES = 4096;
 const MAXIMUM_KEYS = 512;
 
 export type SshKeyFailure = "invalid_name" | "invalid_key" | "bad_passphrase" | "key_changed" | "not_found"
-  | "agent_unavailable" | "agent_failed" | "busy" | "aborted" | "outcome_unknown" | "io_failed";
+  | "agent_unavailable" | "agent_failed" | "busy" | "aborted" | "outcome_unknown" | "io_failed" | "unsafe_permissions";
 export class SshKeyError extends Error {
   constructor(readonly code: SshKeyFailure) { super(`ssh_key.${code}`); this.name = "SshKeyError"; }
 }
@@ -55,6 +56,7 @@ export class SshKeyManager {
     signal = AbortSignal.any([signal, this.#lifetime.signal]);
     abortIfNeeded(signal);
     const exists = await this.#root(false);
+    if (exists) await this.#assertDirectory(signal);
     const keys: SshKeyInfo[] = [];
     if (exists) {
       const directory = await readdir(this.#directory, { withFileTypes: true });
@@ -66,8 +68,9 @@ export class SshKeyManager {
         try {
           validateName(id);
           const key = await this.#public(id);
-          const privateFile = await this.#openRegular(id, MAXIMUM_KEY_BYTES);
-          await privateFile.close();
+          const privateFile = await this.#openPrivate(id, signal);
+          try { await verifyPermissions(privateFile.permissions); await this.#assertHandle(id, privateFile.handle); }
+          finally { await privateFile.permissions.close(); await privateFile.handle.close(); }
           keys.push(key.info);
         } catch (error) {
           if (!(error instanceof SshKeyError)) throw new SshKeyError("io_failed");
@@ -93,6 +96,7 @@ export class SshKeyManager {
       if (signal.aborted) throw new SshKeyError("aborted");
       if (!(error instanceof SshKeyError) || error.code !== "agent_unavailable") agentState = "failed";
     }
+    if (exists) await this.#assertDirectory(signal);
     abortIfNeeded(signal);
     return {
       keys: keys.map(key => ({ ...key, inAgent: agentFingerprints.has(key.sha256Fingerprint) })).sort((a, b) =>
@@ -104,11 +108,20 @@ export class SshKeyManager {
   async readPublic(id: string, expectedFingerprint: string, signal: AbortSignal): Promise<string> {
     signal = AbortSignal.any([signal, this.#lifetime.signal]);
     abortIfNeeded(signal);
-    await this.#root(false);
+    await this.#assertDirectory(signal);
     const value = await this.#public(validateName(id));
     assertFingerprint(value.info, expectedFingerprint);
+    const privateFile = await this.#openPrivate(id, signal);
+    try {
+      await verifyPermissions(privateFile.permissions);
+      await this.#assertHandle(id, privateFile.handle);
+    }
+    finally { await privateFile.permissions.close(); await privateFile.handle.close(); }
+    await this.#assertDirectory(signal);
     abortIfNeeded(signal);
-    return value.publicKey;
+    const current = await this.#public(id);
+    assertFingerprint(current.info, expectedFingerprint);
+    return current.publicKey;
   }
 
   async generate(input: { readonly name: string; readonly comment: string; readonly passphrase?: string }, signal: AbortSignal): Promise<SshKeyInfo> {
@@ -119,6 +132,7 @@ export class SshKeyManager {
       if (Buffer.byteLength(input.comment) > 256 || /[\x00-\x1f\x7f]/u.test(input.comment)) throw new SshKeyError("invalid_name");
       validatePassphrase(input.passphrase);
       await this.#root(true);
+      await this.#assertDirectory(signal);
       const pair = await new Promise<{ private: string; public: string }>((accept, reject) => {
         ssh2.utils.generateKeyPair("ed25519", {
           comment: input.comment,
@@ -137,6 +151,7 @@ export class SshKeyManager {
           const occupied = await Promise.all([this.#exists(id), this.#exists(`${id}.pub`)]);
           if (occupied.some(Boolean)) continue;
           await this.#root(false);
+          await this.#assertDirectory(signal);
           abortIfNeeded(signal);
           const handles: Array<{ name: string; handle: FileHandle }> = [];
           try {
@@ -159,6 +174,7 @@ export class SshKeyManager {
             if (current.info.sha256Fingerprint !== fingerprint(parsePublic(pair.public))) throw new SshKeyError("key_changed");
             await this.#assertHandle(id, handles[0]!.handle);
             await this.#assertHandle(`${id}.pub`, handles[1]!.handle);
+            await this.#assertDirectory(signal);
             abortIfNeeded(signal);
             return current.info;
           } catch (error) {
@@ -182,8 +198,10 @@ export class SshKeyManager {
     signal = AbortSignal.any([signal, this.#lifetime.signal]);
     return this.#mutation(async () => {
       validatePassphrase(passphrase);
-      await this.readPublic(id, expectedFingerprint, signal);
-      const handle = await this.#openRegular(id, MAXIMUM_KEY_BYTES);
+      await this.#assertDirectory(signal);
+      const publicKey = await this.#public(validateName(id));
+      assertFingerprint(publicKey.info, expectedFingerprint);
+      const { handle, permissions } = await this.#openPrivate(id, signal);
       let encoded: Buffer | undefined;
       let plain: Buffer | undefined;
       try {
@@ -197,8 +215,11 @@ export class SshKeyManager {
         if (fingerprint(parsed) !== expectedFingerprint) throw new SshKeyError("key_changed");
         try { plain = encodeAgentPrivateKey(parsed); }
         catch { throw new SshKeyError("invalid_key"); }
-        await this.readPublic(id, expectedFingerprint, signal);
+        const current = await this.#public(id);
+        assertFingerprint(current.info, expectedFingerprint);
         await this.#assertHandle(id, handle);
+        await verifyPermissions(permissions);
+        await this.#assertDirectory(signal);
         abortIfNeeded(signal);
         let result: SshAgentCommandResult;
         try { result = await this.#agent(["-"], plain, signal); }
@@ -211,6 +232,7 @@ export class SshKeyManager {
         if (result.code !== 0) throw new SshKeyError("agent_failed");
       } finally {
         encoded?.fill(0); plain?.fill(0);
+        await permissions.close();
         await handle.close();
       }
     });
@@ -222,7 +244,7 @@ export class SshKeyManager {
     if (this.#mutating) throw new SshKeyError("busy");
     this.#mutating = true;
     try { return await action(); }
-    catch (error) { throw error instanceof SshKeyError ? error : new SshKeyError("io_failed"); }
+    catch (error) { throw keyError(error); }
     finally { this.#mutating = false; }
   }
   async #root(create: boolean): Promise<boolean> {
@@ -235,6 +257,16 @@ export class SshKeyManager {
       if (!create && isCode(error, "ENOENT")) return false;
       throw new SshKeyError("io_failed");
     }
+  }
+  async #assertDirectory(signal: AbortSignal): Promise<void> {
+    if (!await this.#root(false)) throw new SshKeyError("not_found");
+    try { await inspectKeyDirectoryPermissions(this.#directory, signal); }
+    catch (error) { throw keyError(error); }
+  }
+  async #openPrivate(name: string, signal: AbortSignal): Promise<{ handle: FileHandle; permissions: PrivateKeyPermissionLease }> {
+    const handle = await this.#openRegular(name, MAXIMUM_KEY_BYTES);
+    try { return { handle, permissions: await inspectPrivateKeyPermissions(this.#directory, name, handle, signal) }; }
+    catch (error) { await handle.close().catch(() => undefined); throw keyError(error); }
   }
   async #openRegular(name: string, maximumBytes: number): Promise<FileHandle> {
     const path = join(this.#directory, name);
@@ -318,6 +350,13 @@ function assertFingerprint(key: SshKeyInfo, expected: string): void { if (key.sh
 function abortIfNeeded(signal: AbortSignal): void { if (signal.aborted) throw new SshKeyError("aborted"); }
 function samePath(a: string, b: string): boolean { return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b; }
 function isCode(error: unknown, code: string): boolean { return error instanceof Error && "code" in error && error.code === code; }
+function keyError(error: unknown): SshKeyError {
+  return error instanceof SshKeyError ? error : error instanceof KeyPermissionError ? new SshKeyError(error.code) : new SshKeyError("io_failed");
+}
+async function verifyPermissions(lease: PrivateKeyPermissionLease): Promise<void> {
+  try { await lease.verifyFinal(); }
+  catch (error) { throw keyError(error); }
+}
 function posixQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
 /** The decrypted key travels only over stdin; raw subprocess output is never exposed. */

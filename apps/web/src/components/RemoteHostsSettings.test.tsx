@@ -427,6 +427,44 @@ it("retains generated identity after uncertain agent loading, refreshes explicit
   expect(fixture.controller.saveCredential).not.toHaveBeenCalled();
 });
 
+it("keeps an unsafe generated key out of a Host draft until manual correction and a fresh catalog", async () => {
+  const fixture = await mountSettings();
+  await fixture.publish([host()]);
+  await act(async () => button("Edit").click());
+  await selectNodeAuthentication();
+  vi.mocked(fixture.controller.addSshKeyToAgent).mockRejectedValueOnce(new ConnectError("ssh_key.unsafe_permissions", Code.FailedPrecondition));
+  await act(async () => button("Generate key").click());
+  const form = document.querySelector<HTMLFormElement>(".ssh-key-form")!;
+  await act(async () => form.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+  await act(async () => form.querySelector<HTMLButtonElement>('button[type="submit"]')!.click());
+  expect(document.body.textContent).toContain("Correct the key permissions on the service host");
+  expect(document.body.textContent).not.toContain("ssh_key.unsafe_permissions");
+  expect(button("Save").disabled).toBe(true);
+  expect(fixture.controller.updateRemoteHost).not.toHaveBeenCalled();
+  vi.mocked(fixture.controller.listSshKeys).mockResolvedValueOnce({ keys: [{ id: "work", name: "Work key", algorithm: "ssh-ed25519", comment: "", sha256Fingerprint: "SHA256:work", modifiedAt: 1, inAgent: true }], agentState: "ready", generationSupported: true });
+  await act(async () => button("Refresh").click());
+  expect(document.body.textContent).toContain("selected key is missing or changed");
+  expect(button("Save").disabled).toBe(true);
+});
+
+it("rechecks the same Host key after manual permission correction and shows the connection recovery path", async () => {
+  const fixture = await mountSettings();
+  await fixture.publish([{ ...host(), authentication: "nodeKey", credentialReferenceId: undefined,
+    nodeKey: { id: "work", expectedFingerprint: "SHA256:work" },
+    status: { state: "failed", changedAt: 2, failure: { code: "nodeKeyUnavailable", retryable: false } } }]);
+  expect(document.body.textContent).toContain("check its directory and private-file permissions");
+  expect(translate("zh-CN", "settings.remoteHosts.failure.nodeKeyUnavailable")).toContain("私钥文件权限");
+  vi.mocked(fixture.controller.readSshPublicKey).mockRejectedValueOnce(new ConnectError("ssh_key.unsafe_permissions", Code.FailedPrecondition));
+  await act(async () => button("Edit").click());
+  expect(document.body.textContent).toContain("ownership or permissions are unsafe");
+  expect(button("Save").disabled).toBe(true);
+  await act(async () => button("Refresh").click());
+  expect(fixture.controller.readSshPublicKey).toHaveBeenCalledTimes(2);
+  expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Public key"]')?.value).toBe("ssh-ed25519 fixture-public");
+  expect(document.body.textContent).not.toContain("ownership or permissions are unsafe");
+  expect(button("Save").disabled).toBe(false);
+});
+
 async function selectNodeAuthentication(): Promise<void> {
   const select = document.querySelector<HTMLSelectElement>('.remote-host-editor select')!;
   await act(async () => { select.value = "nodeKey"; select.dispatchEvent(new Event("change", { bubbles: true })); });

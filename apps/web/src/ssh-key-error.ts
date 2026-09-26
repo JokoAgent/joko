@@ -1,6 +1,6 @@
 import { ConnectError } from "@connectrpc/connect";
 
-export type SshKeyFailure = "invalid_key" | "invalid_name" | "bad_passphrase" | "key_changed" | "agent_unavailable" | "agent_failed" | "busy" | "aborted" | "outcome_unknown" | "io_failed" | "not_found" | "unknown";
+export type SshKeyFailure = "invalid_key" | "invalid_name" | "bad_passphrase" | "key_changed" | "unsafe_permissions" | "agent_unavailable" | "agent_failed" | "busy" | "aborted" | "outcome_unknown" | "io_failed" | "not_found" | "unknown";
 
 export function sshKeyFailure(cause: unknown): SshKeyFailure {
   if (!(cause instanceof ConnectError)) return "unknown";
@@ -9,6 +9,7 @@ export function sshKeyFailure(cause: unknown): SshKeyFailure {
     case "ssh_key.invalid_name": return "invalid_name";
     case "ssh_key.bad_passphrase": return "bad_passphrase";
     case "ssh_key.key_changed": return "key_changed";
+    case "ssh_key.unsafe_permissions": return "unsafe_permissions";
     case "ssh_key.agent_unavailable": return "agent_unavailable";
     case "ssh_key.agent_failed": return "agent_failed";
     case "ssh_key.busy": return "busy";

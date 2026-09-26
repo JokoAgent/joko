@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
-import { SshKeyManager } from "@joko/remote-ssh";
+import { SshKeyError, SshKeyManager } from "@joko/remote-ssh";
 import { expect, it, vi } from "vitest";
 import { mkdtemp } from "./test-paths.js";
 import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
@@ -14,7 +14,9 @@ it("authenticates unavailable capability and fences late key observations on con
   await expect(denied.listSshKeys(create(contract.ListSshKeysRequestSchema), context)).rejects.toMatchObject({ code: Code.Unauthenticated });
   const unavailable = createSshKeyConnectService({ authenticate: () => ({ connectionId: "a" }), onRevoked: () => () => undefined });
   await expect(unavailable.listSshKeys(create(contract.ListSshKeysRequestSchema), context)).rejects.toMatchObject({ code: Code.Unimplemented });
-  const directory = await mkdtemp(join(tmpdir(), "joko-ssh-service-"));
+  // This test exercises agent revocation, so it intentionally has no key
+  // directory; inherited ACLs on a temporary directory are unrelated here.
+  const directory = join(await mkdtemp(join(tmpdir(), "joko-ssh-service-")), ".ssh");
   let release!: () => void;
   let started!: () => void;
   const entered = new Promise<void>(resolve => { started = resolve; });
@@ -43,6 +45,19 @@ it("does not publish thrown process details", async () => {
   const service = createSshKeyConnectService({ keys, authenticate: () => ({ connectionId: "a" }), onRevoked: () => () => undefined });
   await expect(service.generateSshKey(create(contract.GenerateSshKeyRequestSchema, { name: "id_joko" }), { signal: new AbortController().signal } as HandlerContext))
     .rejects.toMatchObject({ code: Code.Internal, rawMessage: "ssh_key.io_failed" });
+  keys.close();
+});
+
+it("reports unsafe key permissions as a deterministic precondition without exposing host details", async () => {
+  const keys = new SshKeyManager({ directory: await mkdtemp(join(tmpdir(), "joko-ssh-permissions-")) });
+  vi.spyOn(keys, "readPublic").mockRejectedValue(new SshKeyError("unsafe_permissions"));
+  vi.spyOn(keys, "addToAgent").mockRejectedValue(new SshKeyError("unsafe_permissions"));
+  const service = createSshKeyConnectService({ keys, authenticate: () => ({ connectionId: "a" }), onRevoked: () => () => undefined });
+  const context = { signal: new AbortController().signal } as HandlerContext;
+  await expect(service.readSshPublicKey(create(contract.ReadSshPublicKeyRequestSchema, { keyId: "id_joko", expectedFingerprint: "SHA256:key" }), context))
+    .rejects.toMatchObject({ code: Code.FailedPrecondition, rawMessage: "ssh_key.unsafe_permissions" });
+  await expect(service.addSshKeyToAgent(create(contract.AddSshKeyToAgentRequestSchema, { keyId: "id_joko", expectedFingerprint: "SHA256:key" }), context))
+    .rejects.toMatchObject({ code: Code.FailedPrecondition, rawMessage: "ssh_key.unsafe_permissions" });
   keys.close();
 });
 

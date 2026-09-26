@@ -165,6 +165,37 @@ it.each(["network", "outcome_unknown"] as const)("lets a rejected passphrase be 
   expect(fixture.add).toHaveBeenCalledTimes(2);
 });
 
+it("shows manual permission recovery and blocks reuse of a rejected key until refresh", async () => {
+  const fixture = await mount();
+  fixture.add.mockRejectedValueOnce(new ConnectError("ssh_key.unsafe_permissions", Code.FailedPrecondition));
+  await act(async () => button("Add to agent").click());
+  await change(input("Passphrase"), "test-only-passphrase"); await submitTwice();
+  expect(document.querySelector('[role="dialog"] [role="alert"]')?.textContent).toContain("ownership or permissions are unsafe");
+  expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Correct the key permissions on the service host");
+  expect(submitButton().disabled).toBe(true);
+  expect(fixture.add).toHaveBeenCalledOnce();
+  await act(async () => button("Close", document.querySelector('[role="dialog"]')!).click());
+  expect(button("Add to agent").disabled).toBe(true);
+  expect(document.body.textContent).toContain("Correct the key permissions on the service host");
+  fixture.catalog = { ...fixture.catalog, keys: [] };
+  await act(async () => button("Refresh").click());
+  expect(document.body.textContent).toContain("An existing key missing from this list may have unsafe ownership or permissions");
+  expect(document.body.textContent).not.toContain("ssh_key.unsafe_permissions");
+  expect(fixture.add).toHaveBeenCalledOnce();
+});
+
+it("does not use a stale key catalog after the service rejects directory permissions", async () => {
+  const fixture = await mount();
+  fixture.list.mockRejectedValueOnce(new ConnectError("ssh_key.unsafe_permissions", Code.FailedPrecondition));
+  await act(async () => button("Refresh").click());
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("ownership or permissions are unsafe");
+  expect(button("Generate key").disabled).toBe(true);
+  expect(button("Add to agent").disabled).toBe(true);
+  await act(async () => button("Refresh").click());
+  expect(button("Generate key").disabled).toBe(false);
+  expect(button("Add to agent").disabled).toBe(false);
+});
+
 it.each(["api", "disconnect", "pagehide", "close"] as const)("retires a pending secret and never replays it after %s", async (retirement) => {
   const fixture = await mount(); const result = deferred<SshKeyView>(); fixture.generate.mockImplementationOnce(() => result.promise);
   await act(async () => button("Generate key").click());
