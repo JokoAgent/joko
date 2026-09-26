@@ -314,7 +314,7 @@ describe("BackendInstanceRegistry", () => {
     expect(current.dispose).toHaveBeenCalledOnce();
   });
 
-  it("durably publishes a validated generation before switching, draining, and disposing", async () => {
+  it("durably publishes a validated generation before switching and disposing", async () => {
     const { registry, store } = fixture();
     const previous = adapter("backend");
     const replacement = adapter("backend");
@@ -330,23 +330,14 @@ describe("BackendInstanceRegistry", () => {
       activateCurrent: ({ generation, adapter: activated }) => {
         hostAdapter = activated;
         observations.push(`activate:${generation}:${store.getBackend("backend").descriptor.instanceGeneration}`);
-      },
-      drainPrevious: async ({ generation, adapter: draining }) => {
-        observations.push(`drain:${[
-          generation,
-          draining === previous,
-          registry.adapter("backend") === replacement,
-          store.getBackend("backend").descriptor.instanceGeneration,
-          hostAdapter === replacement
-        ].join(":")}`);
       }
     });
 
     expect(observations).toEqual([
       "prepare:1:true:1",
-      "activate:2:2",
-      "drain:1:true:true:2:true"
+      "activate:2:2"
     ]);
+    expect(hostAdapter).toBe(replacement);
     expect(registry.get("backend")).toMatchObject({ generation: 2, state: "available" });
     expect(previous.dispose).toHaveBeenCalledOnce();
   });
@@ -462,52 +453,123 @@ describe("BackendInstanceRegistry", () => {
     expect(superseded.dispose).toHaveBeenCalledOnce();
   });
 
-  it("keeps a durably switched replacement successful when retired-instance cleanup fails", async () => {
-    const { registry, store } = fixture();
-    const previous = adapter("backend");
-    vi.mocked(previous.dispose).mockRejectedValueOnce(new Error("private cleanup detail"));
-    const replacement = adapter("backend");
-    const candidates = [previous, replacement];
-    const cleanupFailure = vi.fn();
-    await registry.provision([dynamicFactory("backend", () => candidates.shift()!)]);
-
-    await expect(registry.replace("backend", {
-      onPreviousCleanupFailure: cleanupFailure
-    })).resolves.toMatchObject({ generation: 2, state: "available" });
-
-    expect(registry.adapter("backend")).toBe(replacement);
-    expect(store.getBackend("backend").descriptor.instanceGeneration).toBe(2);
-    expect(cleanupFailure).toHaveBeenCalledExactlyOnceWith({ instanceId: "backend", generation: 1 });
-  });
-
-  it("bounds retired-generation drain and cleanup while an exact-owner janitor escalates and retries", async () => {
+  it("retains the exact retired owner while a bounded janitor retries without touching current or sibling Adapters", async () => {
     const { registry, store } = fixture({
       retirementStepTimeoutMs: 5,
       retirementRetryDelayMs: 0,
       retirementAttempts: 2
     });
-    const never = deferred<void>();
+    const stalledDispose = deferred<void>();
+    const retryEntered = deferred<void>();
+    const releaseRetry = deferred<void>();
+    const dispose = vi.fn()
+      .mockImplementationOnce(() => stalledDispose.promise)
+      .mockImplementationOnce(async () => {
+        retryEntered.resolve(undefined);
+        await releaseRetry.promise;
+      });
     const forceDispose = vi.fn()
-      .mockRejectedValueOnce(new Error("first hard-retirement attempt failed"))
-      .mockResolvedValueOnce(undefined);
-    const previous = adapter("backend", {
-      dispose: vi.fn(() => never.promise),
-      forceDispose
-    });
+      .mockRejectedValueOnce(new Error("private hard-retirement detail"));
+    const previous = adapter("backend", { dispose, forceDispose });
     const replacement = adapter("backend");
+    const sibling = adapter("sibling");
     const candidates = [previous, replacement];
     const cleanupFailure = vi.fn();
-    await registry.provision([dynamicFactory("backend", () => candidates.shift()!)]);
+    await registry.provision([
+      dynamicFactory("backend", () => candidates.shift()!),
+      factory("sibling", sibling)
+    ]);
 
     await expect(registry.replace("backend", {
-      drainPrevious: () => never.promise,
       onPreviousCleanupFailure: cleanupFailure
     })).resolves.toMatchObject({ generation: 2, state: "available" });
 
+    await retryEntered.promise;
     expect(registry.adapter("backend")).toBe(replacement);
+    expect(registry.adapter("sibling")).toBe(sibling);
     expect(store.getBackend("backend").descriptor.instanceGeneration).toBe(2);
     expect(cleanupFailure).toHaveBeenCalledExactlyOnceWith({ instanceId: "backend", generation: 1 });
+    expect(registry.retiredCleanupSnapshots()).toEqual([{
+      instanceId: "backend",
+      generation: 1,
+      state: "cleanup_unknown"
+    }]);
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(forceDispose).toHaveBeenCalledOnce();
+    expect(replacement.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
+
+    releaseRetry.resolve(undefined);
+    await vi.waitFor(() => expect(registry.retiredCleanupSnapshots()).toEqual([]));
+    expect(replacement.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
+    stalledDispose.resolve(undefined);
+  });
+
+  it("keeps exhausted retired cleanup ownership across a failed final check and deletes it only after confirmation", async () => {
+    const { registry, store } = fixture({
+      retirementStepTimeoutMs: 5,
+      retirementRetryDelayMs: 0,
+      retirementAttempts: 2
+    });
+    const dispose = vi.fn()
+      .mockRejectedValueOnce(new Error("private initial dispose detail"))
+      .mockRejectedValueOnce(new Error("private janitor dispose detail"))
+      .mockRejectedValueOnce(new Error("private final-check dispose detail"))
+      .mockResolvedValueOnce(undefined);
+    const forceDispose = vi.fn(async () => {
+      throw new Error("private force-dispose detail");
+    });
+    const previous = adapter("backend", {
+      dispose,
+      forceDispose
+    });
+    const replacement = adapter("backend");
+    const sibling = adapter("sibling");
+    const candidates = [previous, replacement];
+    await registry.provision([
+      dynamicFactory("backend", () => candidates.shift()!),
+      factory("sibling", sibling)
+    ]);
+
+    await expect(registry.replace("backend")).resolves.toMatchObject({ generation: 2, state: "available" });
     await vi.waitFor(() => expect(forceDispose).toHaveBeenCalledTimes(2));
+
+    expect(registry.adapter("backend")).toBe(replacement);
+    expect(registry.adapter("sibling")).toBe(sibling);
+    expect(store.getBackend("backend").descriptor.instanceGeneration).toBe(2);
+    expect(registry.retiredCleanupSnapshots()).toEqual([{
+      instanceId: "backend",
+      generation: 1,
+      state: "cleanup_unknown"
+    }]);
+
+    let finalCheckFailure: unknown;
+    try {
+      await registry.disposeRetainedCleanups();
+    } catch (error) {
+      finalCheckFailure = error;
+    }
+    expect(finalCheckFailure).toBeInstanceOf(AggregateError);
+    expect((finalCheckFailure as AggregateError).message).toBe("Backend retained cleanup remained unconfirmed.");
+    expect((finalCheckFailure as AggregateError).errors.map(String).join("\n"))
+      .toBe("Error: Backend retired cleanup remained unconfirmed: backend generation 1");
+    expect(registry.retiredCleanupSnapshots()).toEqual([{
+      instanceId: "backend",
+      generation: 1,
+      state: "cleanup_unknown"
+    }]);
+    expect(dispose).toHaveBeenCalledTimes(3);
+    expect(forceDispose).toHaveBeenCalledTimes(3);
+    expect(replacement.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
+
+    await expect(registry.disposeRetainedCleanups()).resolves.toBeUndefined();
+    expect(registry.retiredCleanupSnapshots()).toEqual([]);
+    expect(dispose).toHaveBeenCalledTimes(4);
+    expect(forceDispose).toHaveBeenCalledTimes(3);
+    expect(replacement.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
   });
 
   it("refreshes a live descriptor durably without changing its process generation", async () => {

@@ -218,7 +218,7 @@ describe("Orchestrator application composition", () => {
     }
   }, 20_000);
 
-  it("retries retained candidate cleanup before closing native Provider dependencies", async () => {
+  it("finalizes retained Backend cleanup owners after current Adapters and before native dependencies", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-application-close-candidate-cleanup-"));
     const workspace = join(root, "workspace");
     const dataDirectory = join(root, "data");
@@ -242,18 +242,29 @@ describe("Orchestrator application composition", () => {
       corsOrigins: []
     };
     const application = await createOrchestratorApplication(config);
-    const retryCandidates = vi.spyOn(BackendInstanceRegistry.prototype, "disposeRetainedCandidateCleanups");
+    const disposeCurrent = vi.spyOn(application.sessionHost, "dispose");
+    const retryRetained = vi.spyOn(BackendInstanceRegistry.prototype, "disposeRetainedCleanups")
+      .mockRejectedValueOnce(new Error("Backend retained cleanup remained unconfirmed."));
     const closeProviderProxy = vi.spyOn(ManagedProviderProxy.prototype, "close");
+    const closeStore = vi.spyOn(application.store, "close");
 
     try {
-      await application.close();
-      expect(retryCandidates).toHaveBeenCalledOnce();
+      await expect(application.close()).rejects.toThrow("Backend retained cleanup remained unconfirmed.");
+      expect(disposeCurrent).toHaveBeenCalledOnce();
+      expect(retryRetained).toHaveBeenCalledOnce();
       expect(closeProviderProxy).toHaveBeenCalledOnce();
-      expect(retryCandidates.mock.invocationCallOrder[0])
+      expect(closeStore).toHaveBeenCalledOnce();
+      expect(disposeCurrent.mock.invocationCallOrder[0])
+        .toBeLessThan(retryRetained.mock.invocationCallOrder[0]!);
+      expect(retryRetained.mock.invocationCallOrder[0])
         .toBeLessThan(closeProviderProxy.mock.invocationCallOrder[0]!);
+      expect(closeProviderProxy.mock.invocationCallOrder[0])
+        .toBeLessThan(closeStore.mock.invocationCallOrder[0]!);
     } finally {
-      retryCandidates.mockRestore();
+      disposeCurrent.mockRestore();
+      retryRetained.mockRestore();
       closeProviderProxy.mockRestore();
+      closeStore.mockRestore();
       await application.close().catch(() => undefined);
       await rm(root, { recursive: true, force: true, maxRetries: 3 });
     }

@@ -1396,7 +1396,7 @@ export async function createOrchestratorApplication(
         await attempt(() => backendInstances.dispose());
       } else {
         await attempt(() => startupSessionHost!.dispose());
-        await attempt(() => backendInstances.disposeRetainedCandidateCleanups());
+        await attempt(() => backendInstances.disposeRetainedCleanups());
       }
       await attempt(() => managedProviderProxy.close());
       return failures;
@@ -2555,7 +2555,7 @@ export async function createOrchestratorApplication(
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.
         await attempt(() => terminals.dispose());
         await attempt(() => sessionHost.dispose());
-        await attempt(() => backendInstances.disposeRetainedCandidateCleanups());
+        await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => managedProviderProxy.close());
         await attempt(() => sessionWorktrees.dispose());
         await generationGcTail.catch(() => undefined);

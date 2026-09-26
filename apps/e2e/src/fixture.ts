@@ -328,6 +328,15 @@ export class OrchestratorE2eFixture {
           activateCurrent: ({ adapter }) => {
             hooks.activateCurrent();
             if (adapter instanceof InstrumentedFakeAdapter) adapters.set(backendId, adapter);
+          },
+          onPreviousCleanupFailure: ({ instanceId, generation }) => {
+            store.appendDiagnostic({
+              severity: "warning",
+              component: "backend-instance",
+              code: "BACKEND_PREVIOUS_INSTANCE_CLEANUP_FAILED",
+              message: "A retired Backend instance could not be fully cleaned up after replacement.",
+              details: { backendId: instanceId, instanceGeneration: generation }
+            });
           }
         })
       });
@@ -374,10 +383,10 @@ export class OrchestratorE2eFixture {
         await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
         await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
         // Keep native transports and remote dependencies alive until exact
-        // current/candidate process cleanup has settled.
+        // current and retained process cleanup has settled.
         await attempt(() => options.terminals?.dispose());
         await attempt(() => sessionHost.dispose());
-        await attempt(() => backendInstances.disposeRetainedCandidateCleanups());
+        await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => auxiliaryServices?.mcpRouter?.dispose());
         await attempt(() => auxiliaryServices?.remoteHosts?.close());
         await attempt(() => auxiliaryServices?.browser?.stop());

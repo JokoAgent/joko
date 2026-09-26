@@ -1456,6 +1456,435 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
   }
 });
 
+it("keeps published replacements authoritative while exact old-generation cleanup is unconfirmed", { timeout: 180_000 }, async () => {
+  const setup = await startPairedFixture();
+  const retirementFailures = new RetiredCleanupFailureController();
+  try {
+    const fixture = setup.fixture;
+    const paired = await fixture.pair("Paired retired-generation cleanup client");
+    const backendIds = ["pi", "codex-paired", "claude-paired"] as const;
+    type BackendId = (typeof backendIds)[number];
+    const sessions = new Map<BackendId, string>();
+    for (const backendId of backendIds) {
+      const created = await submit(paired.clients.operation, paired.connectionId,
+        createSessionMutation({
+          backendId,
+          targetId: fixture.targetId(backendId),
+          displayName: `${backendId} retired cleanup task`,
+          ...(backendId === "pi"
+            ? { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off" }
+            : {})
+        }));
+      expect(created.state).toBe(OperationState.SUCCEEDED);
+      sessions.set(backendId, sessionIdFrom(created));
+    }
+
+    const send = async (backendId: BackendId, text: string): Promise<string> => {
+      const sessionId = sessions.get(backendId)!;
+      const projected = (await paired.clients.session.getSession({ sessionId })).session;
+      const generation = projected?.version?.generation;
+      if (generation === undefined) throw new Error(`${backendId} retired cleanup task has no public generation.`);
+      const accepted = await submit(paired.clients.operation, paired.connectionId,
+        sendInputMutation(sessionId, generation, text));
+      expect(accepted.state).toBe(OperationState.SUCCEEDED);
+      return queueRunIdFrom(accepted);
+    };
+    const waitForRun = (runId: string) => waitFor(
+      () => paired.clients.run.getRun({ runId }),
+      (value) => value.run?.state === RunState.SUCCEEDED,
+      `${runId} to complete`
+    );
+
+    const baselineRuns = new Map<BackendId, string>();
+    for (const backendId of backendIds) {
+      baselineRuns.set(backendId, await send(backendId, `${backendId} before retired cleanup failure`));
+    }
+    await waitFor(
+      async () => setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0,
+      (count) => count === 1,
+      "Codex baseline dispatch before retired cleanup failure"
+    );
+    await waitFor(
+      async () => setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0),
+      (count) => count === 1,
+      "Claude baseline dispatch before retired cleanup failure"
+    );
+    const codexSessionId = sessions.get("codex-paired")!;
+    const codexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
+    if (codexThreadId === undefined) throw new Error("Retired cleanup fixture Codex task has no native thread.");
+    setup.claude.queries.at(-1)!.complete("Claude baseline before retired cleanup failure");
+    await setup.codex.completeTurn(codexThreadId, "Codex baseline before retired cleanup failure");
+    for (const runId of baselineRuns.values()) await waitForRun(runId);
+    await waitForStableNumber(
+      () => setup.codex.transport?.requests.length ?? 0,
+      "settled Codex baseline before retired cleanup failure"
+    );
+    await waitForStableNumber(
+      () => setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0),
+      "settled Claude baseline before retired cleanup failure"
+    );
+
+    const nativeBindings = new Map(backendIds.map((backendId) => {
+      const binding = structuredClone(
+        fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding
+      );
+      if (binding.nativeSessionId === undefined) {
+        throw new Error(`${backendId} retired cleanup task has no native identity.`);
+      }
+      return [backendId, binding] as const;
+    }));
+
+    const runAndAssertIsolation = async (
+      backendId: BackendId,
+      text: string,
+      answer: string
+    ): Promise<string> => {
+      const sessionId = sessions.get(backendId)!;
+      const usageEventsBefore = fixture.application.store.listEvents({ sessionId })
+        .filter((event) => event.payload.type === "usage").length;
+      const providerRequestsBefore = setup.requests.length;
+      const codexStartsBefore = setup.codex.transport?.requests
+        .filter((request) => request.method === "turn/start").length ?? 0;
+      const claudeInputsBefore = setup.claude.queries
+        .reduce((count, query) => count + query.receivedInputs.length, 0);
+      const runId = await send(backendId, text);
+      if (backendId === "pi") {
+        await waitFor(
+          async () => setup.requests.length,
+          (count) => count === providerRequestsBefore + 1,
+          `Pi dispatch for ${text}`
+        );
+      } else if (backendId === "codex-paired") {
+        await waitFor(
+          async () => setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0,
+          (count) => count === codexStartsBefore + 1,
+          `Codex dispatch for ${text}`
+        );
+        await setup.codex.completeTurn(codexThreadId, answer);
+      } else {
+        await waitFor(
+          async () => setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0),
+          (count) => count === claudeInputsBefore + 1,
+          `Claude dispatch for ${text}`
+        );
+        setup.claude.queries.at(-1)!.complete(answer);
+      }
+      await waitForRun(runId);
+
+      const backendGeneration = fixture.application.store.getBackend(backendId).descriptor.instanceGeneration;
+      const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+      const queue = fixture.application.store.findQueueItemByRunId(sessionId, runId);
+      expect(queue).toMatchObject({
+        backendInstanceGeneration: backendGeneration,
+        state: "completed",
+        attemptId: expect.any(String)
+      });
+      expect(fixture.application.store.listAttempts(runId)).toHaveLength(1);
+      expect(fixture.application.store.getAttempt(queue!.attemptId!).descriptor).toMatchObject({
+        runId,
+        generation: binding.generation,
+        backendInstanceGeneration: backendGeneration,
+        endedAt: expect.any(Number)
+      });
+      const events = fixture.application.store.listEvents({ sessionId });
+      const assistantEvents = events.filter((event) =>
+        event.runId === runId
+        && event.payload.type === "message_complete"
+        && event.payload.role === "assistant");
+      const doneEvents = events.filter((event) => event.runId === runId && event.payload.type === "done");
+      const usageDelta = events.filter((event) => event.payload.type === "usage").slice(usageEventsBefore);
+      expect(assistantEvents).toHaveLength(1);
+      expect(jsonWithBigints(assistantEvents)).toContain(answer);
+      expect(assistantEvents[0]).toMatchObject({
+        backendId,
+        sessionId,
+        runId,
+        attemptId: queue!.attemptId,
+        generation: binding.generation
+      });
+      expect(doneEvents).toEqual([expect.objectContaining({
+        backendId,
+        sessionId,
+        runId,
+        attemptId: queue!.attemptId,
+        generation: binding.generation,
+        payload: { type: "done", outcome: "completed" }
+      })]);
+      expect(
+        usageDelta.some((event) => event.runId === runId && event.attemptId === queue!.attemptId)
+        || assistantEvents.some((event) =>
+          event.payload.type === "message_complete" && event.payload.usage !== undefined)
+      ).toBe(true);
+      for (const event of usageDelta) {
+        expect(event).toMatchObject({ backendId, sessionId, generation: binding.generation });
+        expect(
+          (event.runId === runId && event.attemptId === queue!.attemptId)
+          || (
+            event.runId === undefined
+            && event.attemptId === undefined
+            && event.metadata?.namespace === "joko.runtime_usage"
+            && event.metadata.fields.cumulative === true
+          )
+        ).toBe(true);
+      }
+      for (const [otherBackendId, otherSessionId] of sessions) {
+        if (otherBackendId === backendId) continue;
+        expect(fixture.application.store.listEvents({ sessionId: otherSessionId })
+          .some((event) => event.runId === runId || event.attemptId === queue!.attemptId)).toBe(false);
+      }
+      return runId;
+    };
+
+    for (const backendId of backendIds) {
+      const descriptorsBefore = new Map(backendIds.map((id) => [id, structuredClone(
+        fixture.application.store.getBackend(id).descriptor
+      )] as const));
+      const authoritiesBefore = new Map(backendIds.map((id) => [id, structuredClone(
+        fixture.application.store.getBackendInstanceGenerationAuthority(id)
+      )] as const));
+      const sessionsBefore = new Map(backendIds.map((id) => [id, structuredClone(
+        fixture.application.store.getSession(sessions.get(id)!).descriptor
+      )] as const));
+      const adaptersBefore = new Map(backendIds.map((id) => {
+        const adapter = fixture.application.adapters.find((candidate) => candidate.id === id);
+        if (adapter === undefined) throw new Error(`No current ${id} Adapter exists before retired cleanup failure.`);
+        return [id, adapter] as const;
+      }));
+      const previousGeneration = descriptorsBefore.get(backendId)!.instanceGeneration;
+      const authorityBefore = authoritiesBefore.get(backendId)!;
+      const diagnosticsBefore = new Set(
+        fixture.application.store.listDiagnostics().map((diagnostic) => diagnostic.id)
+      );
+      const lifecycleBefore = setup.lifecycle.length;
+      const sentinel = `retired-cleanup-secret-${backendId}-${randomUUID()}`;
+      const cleanupFailure = retirementFailures.arm({
+        backendId,
+        generation: previousGeneration,
+        adapter: adaptersBefore.get(backendId)!,
+        sentinel,
+        inspectCurrent: () => ({
+          generation: fixture.application.store.getBackend(backendId).descriptor.instanceGeneration,
+          adapter: fixture.application.adapters.find((candidate) => candidate.id === backendId)
+        })
+      });
+      const operationId = randomUUID();
+      const mutation = restartBackendMutation(backendId);
+      const restarted = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
+
+      expect(restarted.state).toBe(OperationState.SUCCEEDED);
+      const nextGeneration = previousGeneration + 1;
+      const currentAdapter = fixture.application.adapters.find((candidate) => candidate.id === backendId);
+      expect(currentAdapter).toBeDefined();
+      expect(currentAdapter).not.toBe(adaptersBefore.get(backendId));
+      expect(fixture.application.store.getBackend(backendId).descriptor.instanceGeneration).toBe(nextGeneration);
+      expect({
+        ...fixture.application.store.getBackend(backendId).descriptor,
+        instanceGeneration: previousGeneration
+      }).toEqual(descriptorsBefore.get(backendId));
+      expect(fixture.application.store.getBackendInstanceGenerationAuthority(backendId)).toMatchObject({
+        adapterKind: authorityBefore.adapterKind,
+        currentGeneration: nextGeneration,
+        highWaterGeneration: authorityBefore.highWaterGeneration + 1
+      });
+      expect(cleanupFailure).toMatchObject({
+        backendId,
+        generation: previousGeneration,
+        forceDisposeCalls: backendId === "pi" ? 0 : 1
+      });
+      expect(cleanupFailure.adapter).toBe(adaptersBefore.get(backendId));
+      expect(cleanupFailure.adapter).not.toBe(currentAdapter);
+      expect(cleanupFailure.disposeCalls).toBeGreaterThanOrEqual(1);
+      expect(cleanupFailure.disposeCalls).toBeLessThanOrEqual(2);
+      expect(cleanupFailure.attempts.slice(0, backendId === "pi" ? 1 : 2)
+        .map((attempt) => attempt.method)).toEqual(
+        backendId === "pi" ? ["dispose"] : ["dispose", "force_dispose"]
+      );
+      expect(cleanupFailure.attempts.every((attempt) =>
+        attempt.currentGeneration === nextGeneration && attempt.currentAdapter === currentAdapter
+      )).toBe(true);
+
+      const selectedAfter = fixture.application.store.getSession(sessions.get(backendId)!).descriptor;
+      expect(selectedAfter.binding.generation).toBe(sessionsBefore.get(backendId)!.binding.generation + 1);
+      expect({
+        ...selectedAfter.binding,
+        generation: sessionsBefore.get(backendId)!.binding.generation
+      }).toEqual(sessionsBefore.get(backendId)!.binding);
+      expect(selectedAfter.binding).toMatchObject({
+        nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId,
+        opaqueRef: nativeBindings.get(backendId)!.opaqueRef
+      });
+      expect((await paired.clients.session.getSession({
+        sessionId: sessions.get(backendId)!
+      })).session?.nativeBinding).toMatchObject({
+        backendId,
+        opaqueReference: nativeBindings.get(backendId)!.opaqueRef
+      });
+      for (const siblingId of backendIds) {
+        if (siblingId === backendId) continue;
+        expect(fixture.application.store.getBackend(siblingId).descriptor)
+          .toEqual(descriptorsBefore.get(siblingId));
+        expect(fixture.application.store.getBackendInstanceGenerationAuthority(siblingId))
+          .toEqual(authoritiesBefore.get(siblingId));
+        expect(fixture.application.store.getSession(sessions.get(siblingId)!).descriptor)
+          .toEqual(sessionsBefore.get(siblingId));
+        expect(fixture.application.adapters.find((candidate) => candidate.id === siblingId))
+          .toBe(adaptersBefore.get(siblingId));
+      }
+
+      const diagnosticDelta = fixture.application.store.listDiagnostics()
+        .filter((diagnostic) => !diagnosticsBefore.has(diagnostic.id));
+      expect(diagnosticDelta.filter((diagnostic) =>
+        diagnostic.code === "BACKEND_PREVIOUS_INSTANCE_CLEANUP_FAILED"
+      )).toEqual([expect.objectContaining({
+        severity: "warning",
+        component: "backend-instance",
+        code: "BACKEND_PREVIOUS_INSTANCE_CLEANUP_FAILED",
+        message: "A retired Backend instance could not be fully cleaned up after replacement.",
+        details: { backendId, instanceGeneration: previousGeneration }
+      })]);
+      expect(jsonWithBigints({
+        operation: restarted,
+        durableOperation: fixture.application.store.getOperation(operationId),
+        backends: fixture.application.store.listBackends(),
+        sessions: backendIds.map((id) => fixture.application.store.getSession(sessions.get(id)!)),
+        events: backendIds.flatMap((id) =>
+          fixture.application.store.listEvents({ sessionId: sessions.get(id)! })),
+        diagnostics: diagnosticDelta
+      })).not.toContain(sentinel);
+
+      await waitFor(
+        async () => cleanupFailure.disposeCalls,
+        (calls) => calls === 2,
+        `${backendId} exact retired Adapter cleanup janitor retry`
+      );
+      await cleanupFailure.cleanupRetryGate.entered;
+      expect(cleanupFailure).toMatchObject({
+        disposeCalls: 2,
+        forceDisposeCalls: backendId === "pi" ? 0 : 1
+      });
+      expect(cleanupFailure.attempts.map((attempt) => attempt.method)).toEqual(
+        backendId === "pi"
+          ? ["dispose", "dispose"]
+          : ["dispose", "force_dispose", "dispose"]
+      );
+      expect(cleanupFailure.attempts.every((attempt) =>
+        attempt.currentGeneration === nextGeneration && attempt.currentAdapter === currentAdapter
+      )).toBe(true);
+      expect(setup.lifecycle.slice(lifecycleBefore)).toEqual([
+        { backendId, generation: nextGeneration, phase: "created" },
+        {
+          backendId,
+          generation: previousGeneration,
+          phase: "close_completed",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        {
+          backendId,
+          generation: nextGeneration,
+          phase: "resume_started",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        {
+          backendId,
+          generation: nextGeneration,
+          phase: "resume_completed",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        }
+      ]);
+
+      await runAndAssertIsolation(
+        backendId,
+        `${backendId} while retired cleanup is unknown`,
+        backendId === "pi" ? REAL_PI_RESPONSE_TEXT : `${backendId} answer while retired cleanup is unknown`
+      );
+
+      const tracesBeforeReplay = {
+        providerRequests: setup.requests.length,
+        codexRequests: setup.codex.transport?.requests.length ?? 0,
+        claudeQueries: setup.claude.queries.length,
+        claudeInputs: setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0),
+        lifecycle: setup.lifecycle.length,
+        diagnostics: fixture.application.store.listDiagnostics().length,
+        disposeCalls: cleanupFailure.disposeCalls,
+        forceDisposeCalls: cleanupFailure.forceDisposeCalls
+      };
+      const authorityAfter = structuredClone(
+        fixture.application.store.getBackendInstanceGenerationAuthority(backendId)
+      );
+      const bindingAfter = structuredClone(
+        fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding
+      );
+      const replayed = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
+      expect(replayed.operationId).toBe(restarted.operationId);
+      expect(replayed.state).toBe(restarted.state);
+      expect(replayed.requestSha256Hex).toBe(restarted.requestSha256Hex);
+      expect(replayed.result).toEqual(restarted.result);
+      expect(fixture.application.store.getBackendInstanceGenerationAuthority(backendId)).toEqual(authorityAfter);
+      expect(fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding).toEqual(bindingAfter);
+      expect(fixture.application.adapters.find((candidate) => candidate.id === backendId)).toBe(currentAdapter);
+      expect(setup.requests).toHaveLength(tracesBeforeReplay.providerRequests);
+      expect(setup.codex.transport?.requests).toHaveLength(tracesBeforeReplay.codexRequests);
+      expect(setup.claude.queries).toHaveLength(tracesBeforeReplay.claudeQueries);
+      expect(setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0))
+        .toBe(tracesBeforeReplay.claudeInputs);
+      expect(setup.lifecycle).toHaveLength(tracesBeforeReplay.lifecycle);
+      expect(fixture.application.store.listDiagnostics()).toHaveLength(tracesBeforeReplay.diagnostics);
+      expect(cleanupFailure).toMatchObject({
+        disposeCalls: tracesBeforeReplay.disposeCalls,
+        forceDisposeCalls: tracesBeforeReplay.forceDisposeCalls
+      });
+
+      retirementFailures.release(cleanupFailure);
+      await waitFor(
+        async () => setup.lifecycle.slice(lifecycleBefore),
+        (events) => events.some((event) =>
+          event.backendId === backendId
+          && event.generation === previousGeneration
+          && event.phase === "dispose_completed"),
+        `${backendId} exact retired Adapter cleanup completion`
+      );
+      expect(setup.lifecycle.slice(lifecycleBefore)).toEqual([
+        { backendId, generation: nextGeneration, phase: "created" },
+        {
+          backendId,
+          generation: previousGeneration,
+          phase: "close_completed",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        {
+          backendId,
+          generation: nextGeneration,
+          phase: "resume_started",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        {
+          backendId,
+          generation: nextGeneration,
+          phase: "resume_completed",
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId
+        },
+        { backendId, generation: previousGeneration, phase: "dispose_completed" }
+      ]);
+    }
+
+    for (const backendId of backendIds) {
+      await runAndAssertIsolation(
+        backendId,
+        `${backendId} after retired cleanup confirmation`,
+        backendId === "pi" ? REAL_PI_RESPONSE_TEXT : `${backendId} answer after retired cleanup confirmation`
+      );
+      expect(fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding)
+        .toMatchObject({
+          nativeSessionId: nativeBindings.get(backendId)!.nativeSessionId,
+          opaqueRef: nativeBindings.get(backendId)!.opaqueRef
+        });
+    }
+  } finally {
+    retirementFailures.releaseCleanupGates();
+    await setup.close();
+  }
+});
+
 it("fences consumed native inputs with lost receipts without blocking sibling Backends", { timeout: 180_000 }, async () => {
   const setup = await startPairedFixture(undefined, { controlPiFault: true });
   try {
@@ -2472,6 +2901,99 @@ class CandidateCleanupRetryGate {
     if (this.#opened) return;
     this.#opened = true;
     this.#release();
+  }
+}
+
+interface RetiredCleanupAttempt {
+  readonly method: "dispose" | "force_dispose";
+  readonly currentGeneration: number;
+  readonly currentAdapter?: BackendAdapter;
+}
+
+interface RetiredCleanupFailureRecord {
+  readonly backendId: string;
+  readonly generation: number;
+  readonly adapter: BackendAdapter;
+  readonly sentinel: string;
+  disposeCalls: number;
+  forceDisposeCalls: number;
+  faulting: boolean;
+  readonly attempts: RetiredCleanupAttempt[];
+  readonly cleanupRetryGate: CandidateCleanupRetryGate;
+}
+
+class RetiredCleanupFailureController {
+  readonly #records: RetiredCleanupFailureRecord[] = [];
+
+  arm(input: {
+    readonly backendId: string;
+    readonly generation: number;
+    readonly adapter: BackendAdapter;
+    readonly sentinel: string;
+    readonly inspectCurrent: () => {
+      readonly generation: number;
+      readonly adapter?: BackendAdapter;
+    };
+  }): RetiredCleanupFailureRecord {
+    if (input.adapter.id !== input.backendId) {
+      throw new Error("A retired cleanup fault must target the exact Backend Adapter identity.");
+    }
+    const record: RetiredCleanupFailureRecord = {
+      backendId: input.backendId,
+      generation: input.generation,
+      adapter: input.adapter,
+      sentinel: input.sentinel,
+      disposeCalls: 0,
+      forceDisposeCalls: 0,
+      faulting: true,
+      attempts: [],
+      cleanupRetryGate: new CandidateCleanupRetryGate()
+    };
+    this.#records.push(record);
+
+    const observeAttempt = (method: RetiredCleanupAttempt["method"]): void => {
+      const current = input.inspectCurrent();
+      record.attempts.push({
+        method,
+        currentGeneration: current.generation,
+        ...(current.adapter === undefined ? {} : { currentAdapter: current.adapter })
+      });
+    };
+    const dispose = input.adapter.dispose.bind(input.adapter);
+    input.adapter.dispose = async () => {
+      record.disposeCalls++;
+      observeAttempt("dispose");
+      if (record.faulting && record.disposeCalls === 1) {
+        throw new Error(`Controlled retired Adapter dispose failure: ${record.sentinel}`);
+      }
+      if (record.faulting && record.disposeCalls === 2) {
+        record.cleanupRetryGate.markEntered();
+        await record.cleanupRetryGate.released;
+      }
+      return dispose();
+    };
+
+    if (input.adapter.forceDispose !== undefined) {
+      const forceDispose = input.adapter.forceDispose.bind(input.adapter);
+      input.adapter.forceDispose = async () => {
+        record.forceDisposeCalls++;
+        observeAttempt("force_dispose");
+        if (record.faulting && record.forceDisposeCalls === 1) {
+          throw new Error(`Controlled retired Adapter force-dispose failure: ${record.sentinel}`);
+        }
+        return forceDispose();
+      };
+    }
+    return record;
+  }
+
+  release(record: RetiredCleanupFailureRecord): void {
+    record.faulting = false;
+    record.cleanupRetryGate.open();
+  }
+
+  releaseCleanupGates(): void {
+    for (const record of this.#records) this.release(record);
   }
 }
 

@@ -29,6 +29,12 @@ export interface BackendCandidateCleanupSnapshot {
   readonly state: "cleanup_unknown";
 }
 
+export interface BackendRetiredCleanupSnapshot {
+  readonly instanceId: string;
+  readonly generation: number;
+  readonly state: "cleanup_unknown";
+}
+
 export interface BackendInstanceAuthority {
   reserveBackendInstanceGeneration(input: {
     readonly backendId: string;
@@ -51,6 +57,11 @@ interface UnavailableBackendInstance extends BackendInstanceSnapshot {
 }
 
 interface BackendCandidateCleanupOwner extends BackendCandidateCleanupSnapshot {
+  readonly adapter: BackendAdapter;
+  janitor?: Promise<void>;
+}
+
+interface BackendRetiredCleanupOwner extends BackendRetiredCleanupSnapshot {
   readonly adapter: BackendAdapter;
   janitor?: Promise<void>;
 }
@@ -93,12 +104,6 @@ export interface BackendInstanceReplacementOptions {
     readonly generation: number;
     readonly adapter: BackendAdapter;
   }) => void;
-  /** Fence and drain work still owned by the previous generation before disposal. */
-  readonly drainPrevious?: (input: {
-    readonly instanceId: string;
-    readonly generation: number;
-    readonly adapter: BackendAdapter;
-  }) => Promise<void>;
   /** Post-publication cleanup is diagnostic-only; the new current is authoritative. */
   readonly onPreviousCleanupFailure?: (input: {
     readonly instanceId: string;
@@ -116,7 +121,7 @@ export class BackendInstanceRegistry {
   readonly #instances = new Map<string, BackendInstance>();
   readonly #factories = new Map<string, BackendInstanceFactory>();
   readonly #candidateCleanupOwners = new Map<string, BackendCandidateCleanupOwner>();
-  readonly #retirementJanitors = new Map<string, Promise<void>>();
+  readonly #retiredCleanupOwners = new Map<string, BackendRetiredCleanupOwner>();
   readonly #retirementStepTimeoutMs: number;
   readonly #retirementRetryDelayMs: number;
   readonly #retirementAttempts: number;
@@ -197,6 +202,13 @@ export class BackendInstanceRegistry {
 
   candidateCleanupSnapshots(): readonly BackendCandidateCleanupSnapshot[] {
     return [...this.#candidateCleanupOwners.values()]
+      .map(({ instanceId, generation, state }) => ({ instanceId, generation, state }))
+      .sort((left, right) => left.instanceId.localeCompare(right.instanceId, "en")
+        || left.generation - right.generation);
+  }
+
+  retiredCleanupSnapshots(): readonly BackendRetiredCleanupSnapshot[] {
+    return [...this.#retiredCleanupOwners.values()]
       .map(({ instanceId, generation, state }) => ({ instanceId, generation, state }))
       .sort((left, right) => left.instanceId.localeCompare(right.instanceId, "en")
         || left.generation - right.generation);
@@ -349,12 +361,10 @@ export class BackendInstanceRegistry {
     this.#factories.clear();
     const failures: unknown[] = [];
     try {
-      await this.disposeRetainedCandidateCleanups();
+      await this.disposeRetainedCleanups();
     } catch (error) {
       failures.push(error);
     }
-    await Promise.allSettled(this.#retirementJanitors.values());
-    this.#retirementJanitors.clear();
     const results = await Promise.all(adapters.map((adapter) => this.#disposeAdapter(adapter)));
     failures.push(...results.flatMap((result, index) => result
       ? []
@@ -362,26 +372,36 @@ export class BackendInstanceRegistry {
     if (failures.length > 0) throw new AggregateError(failures, "Backend instance disposal failed.");
   }
 
-  async disposeRetainedCandidateCleanups(): Promise<void> {
-    await Promise.allSettled([...this.#candidateCleanupOwners.values()]
-      .flatMap((owner) => owner.janitor === undefined ? [] : [owner.janitor]));
-    const owners = [...this.#candidateCleanupOwners.values()];
-    const results = await Promise.all(owners.map((owner) => this.#disposeAdapter(owner.adapter)));
+  async disposeRetainedCleanups(): Promise<void> {
+    await Promise.allSettled([
+      ...[...this.#candidateCleanupOwners.values()]
+        .flatMap((owner) => owner.janitor === undefined ? [] : [owner.janitor]),
+      ...[...this.#retiredCleanupOwners.values()]
+        .flatMap((owner) => owner.janitor === undefined ? [] : [owner.janitor])
+    ]);
+    const owners = [
+      ...[...this.#candidateCleanupOwners.values()].map((owner) => ({ kind: "candidate" as const, owner })),
+      ...[...this.#retiredCleanupOwners.values()].map((owner) => ({ kind: "retired" as const, owner }))
+    ];
+    const results = await Promise.all(owners.map(({ owner }) => this.#disposeAdapter(owner.adapter)));
     const failures: Error[] = [];
     for (let index = 0; index < owners.length; index += 1) {
-      const owner = owners[index]!;
+      const { kind, owner } = owners[index]!;
       if (results[index]) {
-        if (this.#candidateCleanupOwners.get(candidateCleanupKey(owner)) === owner) {
-          this.#candidateCleanupOwners.delete(candidateCleanupKey(owner));
+        const key = cleanupKey(owner);
+        if (kind === "candidate") {
+          if (this.#candidateCleanupOwners.get(key) === owner) this.#candidateCleanupOwners.delete(key);
+        } else if (this.#retiredCleanupOwners.get(key) === owner) {
+          this.#retiredCleanupOwners.delete(key);
         }
       } else {
         failures.push(new Error(
-          `Backend candidate cleanup remained unconfirmed: ${owner.instanceId} generation ${owner.generation}`
+          `Backend ${kind} cleanup remained unconfirmed: ${owner.instanceId} generation ${owner.generation}`
         ));
       }
     }
     if (failures.length > 0) {
-      throw new AggregateError(failures, "Backend candidate cleanup remained unconfirmed.");
+      throw new AggregateError(failures, "Backend retained cleanup remained unconfirmed.");
     }
   }
 
@@ -389,8 +409,22 @@ export class BackendInstanceRegistry {
     previous: AvailableBackendInstance,
     options: BackendInstanceReplacementOptions
   ): Promise<void> {
-    const initialClean = await this.#retirementAttempt(previous, options, true);
-    if (initialClean) return;
+    if (await this.#disposeAdapter(previous.adapter)) return;
+    const key = cleanupKey(previous);
+    const existing = this.#retiredCleanupOwners.get(key);
+    if (existing !== undefined) {
+      if (existing.adapter !== previous.adapter) {
+        throw new Error(`Backend retired cleanup owner changed for ${previous.instanceId} generation ${previous.generation}.`);
+      }
+      return;
+    }
+    const owner: BackendRetiredCleanupOwner = {
+      instanceId: previous.instanceId,
+      generation: previous.generation,
+      state: "cleanup_unknown",
+      adapter: previous.adapter
+    };
+    this.#retiredCleanupOwners.set(key, owner);
     try {
       options.onPreviousCleanupFailure?.({
         instanceId: previous.instanceId,
@@ -400,46 +434,24 @@ export class BackendInstanceRegistry {
       // Diagnostic sinks cannot roll back a durably current generation.
     }
     if (this.#retirementAttempts <= 1) return;
-    const key = `${previous.instanceId}\0${previous.generation}`;
-    const janitor = this.#runRetirementJanitor(previous, options)
+    const janitor = this.#runRetiredCleanupJanitor(owner)
       .finally(() => {
-        if (this.#retirementJanitors.get(key) === janitor) this.#retirementJanitors.delete(key);
+        if (owner.janitor === janitor) owner.janitor = undefined;
       });
-    this.#retirementJanitors.set(key, janitor);
+    owner.janitor = janitor;
     // The new generation is already durable current. Cleanup retries retain
     // only the exact retired Adapter object and must not delay new dispatch.
     void janitor.catch(() => undefined);
   }
 
-  async #runRetirementJanitor(
-    previous: AvailableBackendInstance,
-    options: BackendInstanceReplacementOptions
-  ): Promise<void> {
+  async #runRetiredCleanupJanitor(owner: BackendRetiredCleanupOwner): Promise<void> {
     for (let attempt = 1; attempt < this.#retirementAttempts; attempt += 1) {
       await delay(this.#retirementRetryDelayMs);
-      if (await this.#retirementAttempt(previous, options, false)) return;
+      if (!await this.#disposeAdapter(owner.adapter)) continue;
+      const key = cleanupKey(owner);
+      if (this.#retiredCleanupOwners.get(key) === owner) this.#retiredCleanupOwners.delete(key);
+      return;
     }
-  }
-
-  async #retirementAttempt(
-    previous: AvailableBackendInstance,
-    options: BackendInstanceReplacementOptions,
-    drain: boolean
-  ): Promise<boolean> {
-    let clean = true;
-    if (drain && options.drainPrevious !== undefined) {
-      const drained = await settleBeforeDeadline(
-        Promise.resolve().then(() => options.drainPrevious!({
-          instanceId: previous.instanceId,
-          generation: previous.generation,
-          adapter: previous.adapter
-        })),
-        this.#retirementStepTimeoutMs
-      );
-      clean &&= drained;
-    }
-    const disposed = await this.#disposeAdapter(previous.adapter);
-    return clean && disposed;
   }
 
   async #disposeAdapter(adapter: BackendAdapter): Promise<boolean> {
@@ -455,7 +467,7 @@ export class BackendInstanceRegistry {
   }
 
   async #cleanupRejectedCandidate(candidate: AvailableBackendInstance): Promise<boolean> {
-    const key = candidateCleanupKey(candidate);
+    const key = cleanupKey(candidate);
     const existing = this.#candidateCleanupOwners.get(key);
     if (existing !== undefined) {
       if (existing.adapter !== candidate.adapter) {
@@ -495,7 +507,7 @@ export class BackendInstanceRegistry {
     for (let attempt = 1; attempt < this.#retirementAttempts; attempt += 1) {
       await delay(this.#retirementRetryDelayMs);
       if (!await this.#disposeAdapter(owner.adapter)) continue;
-      const key = candidateCleanupKey(owner);
+      const key = cleanupKey(owner);
       if (this.#candidateCleanupOwners.get(key) === owner) this.#candidateCleanupOwners.delete(key);
       return;
     }
@@ -581,7 +593,7 @@ function unavailableCurrent(current: StoredBackend): UnavailableBackendInstance 
   };
 }
 
-function candidateCleanupKey(input: Pick<BackendCandidateCleanupSnapshot, "instanceId" | "generation">): string {
+function cleanupKey(input: { readonly instanceId: string; readonly generation: number }): string {
   return `${input.instanceId}\0${input.generation}`;
 }
 
