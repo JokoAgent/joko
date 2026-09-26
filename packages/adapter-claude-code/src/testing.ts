@@ -13,8 +13,30 @@ export type {
   ClaudeSdkQueryOptions,
   ClaudeSdkQueryParams,
   ClaudeSdkRuntime,
+  ClaudeSdkStoredSessionRuntime,
   ClaudeSdkSessionInfo,
   ClaudeSdkSessionMessage,
   ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
 export { SessionSdkOwner, SessionSdkFailure } from "./session-sdk-owner.js";
+export {
+  adoptClaudeSessionStoreChild,
+  createClaudeDurableSessionStore,
+  createClaudeSessionStoreAuthority,
+  createClaudeSessionStoreSessionAccess,
+  createClaudeSessionStoreWorkspaceAccess,
+  discardClaudeSessionStoreImport,
+  prepareClaudeSessionStoreDerivation,
+  prepareClaudeSessionStoreImport,
+  readClaudeSessionStoreOperation,
+  rebindClaudeSessionStoreGeneration,
+  sealClaudeSessionStoreImport,
+  type ClaudeSessionStoreAccess,
+  type ClaudeSessionStoreAuthority,
+  type ClaudeSessionStoreChildReservation,
+  type ClaudeSessionStoreHooks,
+  type ClaudeSessionStoreOperationAccess,
+  type ClaudeSessionStoreOperationSnapshot,
+  type ClaudeSessionStoreSessionAccess,
+  type ClaudeSessionStoreWorkspaceAccess
+} from "./claude-session-store.js";

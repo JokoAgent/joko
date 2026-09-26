@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker, type WorkerOptions } from "node:worker_threads";
 import { describe, expect, test, vi } from "vitest";
+import {
+  createClaudeDurableSessionStore,
+  createClaudeSessionStoreAuthority,
+  sealClaudeSessionStoreImport
+} from "./claude-session-store.js";
 import { SessionSdkOwner } from "./session-sdk-owner.js";
 
 const sourceId = "11111111-1111-4111-8111-111111111111";
@@ -16,6 +21,7 @@ class FakeWorker extends EventEmitter {
   readonly stderr = null;
   readonly unref = vi.fn();
   readonly terminate = vi.fn(async () => 1);
+  readonly postMessage = vi.fn();
   result(value: unknown) { this.emit("message", { type: "result", json: JSON.stringify({ value }) }); }
 }
 
@@ -109,6 +115,68 @@ describe("SessionSdkOwner", () => {
     expect(record).toHaveBeenCalledTimes(boundary === "receipt-conflict" ? 1 : 0);
   });
 
+  test("rejects a stored child reservation when durable Host registration fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-session-reservation-owner-"));
+    const worker = new FakeWorker();
+    const authority = createClaudeSessionStoreAuthority({
+      rootDirectory: root,
+      namespace: "reservation-owner",
+      generation: 1
+    });
+    const owner = new SessionSdkOwner({
+      environment: { CLAUDE_CONFIG_DIR: join(root, "profile") },
+      timeoutMs: 1_000,
+      cleanupTimeoutMs: 100,
+      sessionStoreAuthority: authority,
+      workerFactory: () => worker as unknown as Worker
+    });
+    try {
+      const operation = owner.prepareSessionImport({
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: "workspace.source",
+        sourceSessionId: sourceId,
+        targetWorkspaceAuthority: "workspace.target"
+      });
+      const staging = createClaudeDurableSessionStore(authority, operation);
+      await staging.append(
+        { projectKey: "reservation-source", sessionId: sourceId },
+        [{ type: "user", uuid: randomUUID() }]
+      );
+      staging.close();
+      sealClaudeSessionStoreImport(authority, operation);
+      const pending = owner.run({
+        kind: "forkStoredSession",
+        sessionId: sourceId,
+        options: { dir: join(root, "target") },
+        access: operation
+      }, { recordSessionId: () => { throw new Error("private Host failure"); } });
+      worker.emit("message", {
+        type: "childReserved",
+        operationId: operation.operationId,
+        generation: operation.generation,
+        targetWorkspaceAuthority: operation.target.workspaceAuthority,
+        sessionId: derivedId
+      });
+      expect(worker.postMessage).toHaveBeenCalledExactlyOnceWith({
+        type: "childReservationAck",
+        operationId: operation.operationId,
+        generation: operation.generation,
+        sessionId: derivedId,
+        accepted: false
+      });
+      expect(owner.ownsSession(derivedId)).toBe(true);
+      worker.emit("exit", 1);
+      await expect(pending).rejects.toMatchObject({
+        code: "REGISTRATION_FAILED",
+        stateMayHaveChanged: true
+      });
+      expect(owner.ownsSession(derivedId)).toBe(false);
+    } finally {
+      await owner.retire();
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
   test.each(["full", "user", "assistant"] as const)("uses the published SDK for an isolated %s copy with inclusive boundaries and fresh message identities", { timeout: 30_000 }, async (boundary) => {
     const root = await mkdtemp(join(tmpdir(), "joko-session-sdk-owner-"));
     const profile = join(root, "profile");
@@ -195,6 +263,253 @@ describe("SessionSdkOwner", () => {
 
       expect(info.cwd).toBe(sourceWorkspace);
       expect(info.cwd).not.toBe(requestedWorkspace);
+    } finally {
+      await owner.retire();
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  test("uses the published durable store path for cross-project import, inclusive fork, reopen, refork and exact delete", { timeout: 30_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-session-sdk-store-"));
+    const profile = join(root, "profile");
+    const sourceWorkspace = join(root, "source-workspace");
+    const targetWorkspace = join(root, "target-workspace");
+    const secondWorkspace = join(root, "second-workspace");
+    const sourceProjectName = "store-source-project";
+    const sourceProject = join(profile, "projects", sourceProjectName);
+    await Promise.all([
+      mkdir(sourceProject, { recursive: true }),
+      mkdir(sourceWorkspace),
+      mkdir(targetWorkspace),
+      mkdir(secondWorkspace)
+    ]);
+    const messageIds: string[] = [randomUUID(), randomUUID(), randomUUID()];
+    const transcript = messageIds.map((uuid, index) => JSON.stringify({
+      type: index === 1 ? "assistant" : "user",
+      uuid,
+      parentUuid: index === 0 ? null : messageIds[index - 1],
+      sessionId: sourceId,
+      cwd: sourceWorkspace,
+      timestamp: new Date(index).toISOString(),
+      message: index === 1
+        ? { role: "assistant", content: [{ type: "text", text: "durable answer" }] }
+        : { role: "user", content: index === 0 ? "durable source" : "later durable question" }
+    })).join("\n") + "\n";
+    const sourcePath = join(sourceProject, `${sourceId}.jsonl`);
+    await writeFile(sourcePath, transcript);
+    const authority = createClaudeSessionStoreAuthority({
+      rootDirectory: join(root, "store"),
+      namespace: "sdk-conformance",
+      generation: 1
+    });
+    const owner = (projectName: string) => new SessionSdkOwner({
+      environment: { CLAUDE_CONFIG_DIR: profile, CLAUDE_CODE_PROJECT_DIR_NAME: projectName },
+      timeoutMs: 10_000,
+      cleanupTimeoutMs: 2_000,
+      sessionStoreAuthority: authority,
+      workerFactory: (_url, options) => new Worker(new URL("./session-sdk-worker.mts", import.meta.url), options)
+    });
+    const sourceOwner = owner(sourceProjectName);
+    const targetOwner = owner("store-target-project");
+    const secondOwner = owner("store-second-project");
+    try {
+      const operation = sourceOwner.prepareSessionImport({
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: "workspace.source",
+        sourceSessionId: sourceId,
+        targetWorkspaceAuthority: "workspace.target"
+      });
+      await sourceOwner.run({
+        kind: "importSessionToStore",
+        sessionId: sourceId,
+        options: { dir: sourceWorkspace },
+        access: operation
+      }).catch((error: unknown) => { throw new Error("Store conformance import failed.", { cause: error }); });
+      expect(sourceOwner.readStoredSessionOperation(operation)).toMatchObject({
+        state: "ready",
+        sourceProjectKeyCaptured: true,
+        targetProjectKeyCaptured: false,
+        sourceEntryCount: 3
+      });
+
+      let receiptObserved = false;
+      const fork = await targetOwner.run({
+        kind: "forkStoredSession",
+        sessionId: sourceId,
+        options: { dir: targetWorkspace, upToMessageId: messageIds[1] },
+        access: operation
+      }, {
+        recordSessionId: (sessionId) => {
+          expect(targetOwner.readStoredSessionOperation(operation)).toMatchObject({
+            state: "child_pending",
+            childSessionId: sessionId,
+            childReservationConfirmed: false
+          });
+          receiptObserved = true;
+        }
+      }).catch((error: unknown) => {
+        const state = targetOwner.readStoredSessionOperation(operation).state;
+        throw new Error(`Store conformance first fork failed (receipt=${receiptObserved}, state=${state}).`, { cause: error });
+      }) as { sessionId: string };
+      expect(receiptObserved).toBe(true);
+      expect(targetOwner.readStoredSessionOperation(operation)).toMatchObject({
+        state: "child_reserved",
+        childSessionId: fork.sessionId,
+        childReservationConfirmed: true
+      });
+      const beforeAdoption = await targetOwner.run({
+        kind: "getStoredSessionMessages",
+        sessionId: fork.sessionId,
+        options: { dir: targetWorkspace, limit: 10, offset: 0, includeSystemMessages: true },
+        access: operation
+      }) as { uuid: string; session_id: string; message: unknown }[];
+      expect(beforeAdoption).toHaveLength(2);
+      expect(beforeAdoption.every((message) => message.session_id === fork.sessionId
+        && !messageIds.includes(message.uuid))).toBe(true);
+      const adopted = targetOwner.adoptStoredSession(operation, fork.sessionId);
+
+      await targetOwner.retire();
+      const reopened = owner("store-target-project");
+      try {
+        const reopenedHistory = await reopened.run({
+          kind: "getStoredSessionMessages",
+          sessionId: fork.sessionId,
+          options: { dir: targetWorkspace, limit: 10, offset: 0, includeSystemMessages: true },
+          access: adopted
+        }) as { message: unknown }[];
+        expect(reopenedHistory.map((message) => message.message))
+          .toEqual(transcript.trim().split("\n").slice(0, 2).map((line) => (JSON.parse(line) as { message: unknown }).message));
+
+        const secondOperation = reopened.prepareStoredSessionDerivation({
+          operationId: randomUUID(),
+          sourceWorkspaceAuthority: "workspace.target",
+          sourceSessionId: fork.sessionId,
+          targetWorkspaceAuthority: "workspace.second"
+        });
+        const secondFork = await secondOwner.run({
+          kind: "forkStoredSession",
+          sessionId: fork.sessionId,
+          options: { dir: secondWorkspace },
+          access: secondOperation
+        }, { recordSessionId: () => undefined }) as { sessionId: string };
+        const secondHistory = await secondOwner.run({
+          kind: "getStoredSessionMessages",
+          sessionId: secondFork.sessionId,
+          options: { dir: secondWorkspace, limit: 10, offset: 0, includeSystemMessages: true },
+          access: secondOperation
+        }) as unknown[];
+        expect(secondHistory).toHaveLength(2);
+        const secondAccess = secondOwner.adoptStoredSession(secondOperation, secondFork.sessionId);
+        await secondOwner.run({
+          kind: "deleteStoredSession",
+          sessionId: secondFork.sessionId,
+          options: { dir: secondWorkspace },
+          access: secondAccess
+        });
+        expect(await secondOwner.run({
+          kind: "getStoredSessionInfo",
+          sessionId: secondFork.sessionId,
+          options: { dir: secondWorkspace },
+          access: secondAccess
+        })).toBeUndefined();
+      } finally {
+        await reopened.retire();
+      }
+      expect(await readFile(sourcePath, "utf8")).toBe(transcript);
+    } finally {
+      await Promise.allSettled([sourceOwner.retire(), targetOwner.retire(), secondOwner.retire()]);
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  test("keeps a fixed-SDK partial import staged and explicitly discardable", { timeout: 30_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-session-sdk-partial-import-"));
+    const profile = join(root, "profile");
+    const workspace = join(root, "workspace");
+    const projectName = "partial-import-project";
+    const project = join(profile, "projects", projectName);
+    await Promise.all([mkdir(project, { recursive: true }), mkdir(workspace)]);
+    const validLines = Array.from({ length: 500 }, (_, index) => JSON.stringify(index === 499
+      ? { type: "mode", mode: "plan", sessionId: sourceId, cwd: workspace }
+      : {
+          type: "user",
+          uuid: randomUUID(),
+          parentUuid: null,
+          sessionId: sourceId,
+          cwd: workspace,
+          timestamp: new Date(index).toISOString(),
+          message: { role: "user", content: `bounded-${index}` }
+        }));
+    const invalidLine = JSON.stringify({
+      type: "user",
+      uuid: randomUUID(),
+      parentUuid: null,
+      sessionId: sourceId,
+      cwd: workspace,
+      timestamp: new Date(501).toISOString(),
+      message: { role: "user", content: "x".repeat(4 * 1024 * 1024) }
+    });
+    const transcript = `${validLines.join("\n")}\n${invalidLine}\n`;
+    const sourcePath = join(project, `${sourceId}.jsonl`);
+    await writeFile(sourcePath, transcript);
+    const authority = createClaudeSessionStoreAuthority({
+      rootDirectory: join(root, "store"),
+      namespace: "sdk-partial-import",
+      generation: 1
+    });
+    const owner = new SessionSdkOwner({
+      environment: { CLAUDE_CONFIG_DIR: profile, CLAUDE_CODE_PROJECT_DIR_NAME: projectName },
+      timeoutMs: 10_000,
+      cleanupTimeoutMs: 2_000,
+      sessionStoreAuthority: authority,
+      workerFactory: (_url, options) => new Worker(new URL("./session-sdk-worker.mts", import.meta.url), options)
+    });
+    try {
+      const operation = owner.prepareSessionImport({
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: "workspace.partial-source",
+        sourceSessionId: sourceId,
+        targetWorkspaceAuthority: "workspace.partial-target"
+      });
+      await expect(owner.run({
+        kind: "importSessionToStore",
+        sessionId: sourceId,
+        options: { dir: workspace },
+        access: operation
+      })).rejects.toMatchObject({ code: "FAILED", stateMayHaveChanged: true });
+      expect(owner.readStoredSessionOperation(operation)).toMatchObject({
+        state: "importing",
+        sourceProjectKeyCaptured: true,
+        sourceEntryCount: 500
+      });
+      await expect(owner.run({
+        kind: "importSessionToStore",
+        sessionId: sourceId,
+        options: { dir: workspace },
+        access: operation
+      })).rejects.toMatchObject({ code: "UNAVAILABLE", stateMayHaveChanged: false });
+      expect(owner.readStoredSessionOperation(operation)).toMatchObject({
+        state: "importing",
+        sourceEntryCount: 500
+      });
+      await expect(owner.run({
+        kind: "forkStoredSession",
+        sessionId: sourceId,
+        options: { dir: workspace },
+        access: operation
+      }, { recordSessionId: () => undefined })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        stateMayHaveChanged: false
+      });
+      expect(() => owner.prepareStoredSessionDerivation({
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: "workspace.partial-source",
+        sourceSessionId: sourceId,
+        targetWorkspaceAuthority: "workspace.unreachable"
+      })).toThrow();
+      owner.discardSessionImport(operation);
+      expect(() => owner.readStoredSessionOperation(operation)).toThrow();
+      expect(await readFile(sourcePath, "utf8")).toBe(transcript);
     } finally {
       await owner.retire();
       await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -12,6 +13,12 @@ import {
 } from "@joko/runtime-governance";
 import { z } from "zod";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
+import {
+  createClaudeSessionStoreAuthority,
+  type ClaudeSessionStoreOperationAccess,
+  type ClaudeSessionStoreOperationSnapshot,
+  type ClaudeSessionStoreSessionAccess
+} from "./claude-session-store.js";
 
 export const CLAUDE_AGENT_SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.259";
@@ -312,6 +319,10 @@ export interface ClaudeSdkRuntime {
    * SDK runtime does not provide that migration primitive: ForkSessionOptions.dir
    * selects the source project store and does not rewrite the copied cwd. */
   readonly supportsWorkspaceDerivation?: boolean;
+  /** Private durable alpha-SDK bridge. Its presence is infrastructure only;
+   * the Adapter must not advertise workspace derivation until Host adoption,
+   * recovery and live-cwd proof are also configured. */
+  readonly storedSessions?: ClaudeSdkStoredSessionRuntime;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
   query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery>;
   /** Confirm retirement of this exact Query before resuming its native Session. */
@@ -328,6 +339,67 @@ export interface ClaudeSdkRuntime {
   closeSessionOperations(): Promise<void>;
   /** Confirm hard retirement of every exact local CLI process still owned by this runtime. */
   retireOwnedProcesses?(timeoutMs: number): Promise<void>;
+}
+
+export interface ClaudeSdkStoredSessionRuntime {
+  prepareImport(input: {
+    readonly operationId: string;
+    readonly sourceWorkspaceAuthority: string;
+    readonly sourceSessionId: string;
+    readonly targetWorkspaceAuthority: string;
+  }): ClaudeSessionStoreOperationAccess;
+  prepareDerivation(input: {
+    readonly operationId: string;
+    readonly sourceWorkspaceAuthority: string;
+    readonly sourceSessionId: string;
+    readonly targetWorkspaceAuthority: string;
+  }): ClaudeSessionStoreOperationAccess;
+  readOperation(access: ClaudeSessionStoreOperationAccess): ClaudeSessionStoreOperationSnapshot;
+  discardImport(access: ClaudeSessionStoreOperationAccess): void;
+  adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): ClaudeSessionStoreSessionAccess;
+  rebind(input: {
+    readonly workspaceAuthority: string;
+    readonly sessionId: string;
+    readonly expectedGeneration: number;
+  }): ClaudeSessionStoreSessionAccess;
+  importSession(
+    sessionId: string,
+    options: { readonly dir: string; readonly access: ClaudeSessionStoreOperationAccess; readonly signal?: AbortSignal }
+  ): Promise<void>;
+  forkSession(
+    sessionId: string,
+    options: {
+      readonly dir: string;
+      readonly access: ClaudeSessionStoreOperationAccess;
+      readonly upToMessageId?: string;
+      readonly signal: AbortSignal;
+      readonly recordSessionId: (sessionId: string) => void;
+    }
+  ): Promise<{ readonly sessionId: string }>;
+  getSessionInfo(
+    sessionId: string,
+    options: {
+      readonly dir: string;
+      readonly access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess;
+      readonly signal?: AbortSignal;
+    }
+  ): Promise<ClaudeSdkSessionInfo | undefined>;
+  getSessionMessages(
+    sessionId: string,
+    options: Omit<ClaudeSdkGetSessionMessagesOptions, "signal"> & {
+      readonly access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess;
+      readonly signal?: AbortSignal;
+    }
+  ): Promise<readonly ClaudeSdkSessionMessage[]>;
+  deleteSession(
+    sessionId: string,
+    options: {
+      readonly dir: string;
+      readonly access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess;
+      readonly signal?: AbortSignal;
+    }
+  ): Promise<void>;
+  ownsOperation(operationId: string): boolean;
 }
 
 /**
@@ -385,6 +457,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
   readonly bundledCliVersion = CLAUDE_AGENT_SDK_CLI_VERSION;
   readonly supportsWorkspaceDerivation = false;
+  readonly storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
   readonly #processOwner: DurableProcessOwner | undefined;
   readonly #retirementTimeoutMs: number;
   readonly #sessionOwner: SessionSdkOwner;
@@ -393,19 +466,44 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
 
   constructor(options: {
     readonly processOwner?: DurableProcessOwnerOptions;
+    /** Stable service-owned root for opaque native SessionStore data. This must
+     * be separate from the process-owner root, whose schema only admits numeric
+     * generation directories. */
+    readonly sessionStoreRootDirectory?: string;
     readonly retirementTimeoutMs?: number;
     readonly environment?: Readonly<Record<string, string | undefined>>;
     readonly sessionOperationTimeoutMs?: number;
   } = {}) {
+    if (options.sessionStoreRootDirectory !== undefined && options.processOwner === undefined) {
+      throw new TypeError("Claude SessionStore requires an exact process-owner generation.");
+    }
+    if (options.sessionStoreRootDirectory !== undefined && options.processOwner !== undefined) {
+      const processRoot = resolve(options.processOwner.rootDirectory);
+      const storeRoot = resolve(options.sessionStoreRootDirectory);
+      if (containsPath(processRoot, storeRoot) || containsPath(storeRoot, processRoot)) {
+        throw new TypeError("Claude SessionStore and process-owner roots must be disjoint.");
+      }
+    }
     this.#processOwner = options.processOwner === undefined
       ? undefined
       : new DurableProcessOwner(options.processOwner);
     this.#retirementTimeoutMs = positiveTimeout(options.retirementTimeoutMs, 5_000);
+    const sessionStoreAuthority = options.processOwner === undefined || options.sessionStoreRootDirectory === undefined
+      ? undefined
+      : createClaudeSessionStoreAuthority({
+          rootDirectory: options.sessionStoreRootDirectory,
+          namespace: `backend-${createHash("sha256").update(options.processOwner.instanceId, "utf8").digest("hex")}`,
+          generation: options.processOwner.generation
+        });
     this.#sessionOwner = new SessionSdkOwner({
       environment: options.environment ?? process.env,
       timeoutMs: positiveTimeout(options.sessionOperationTimeoutMs, 30_000),
-      cleanupTimeoutMs: this.#retirementTimeoutMs
+      cleanupTimeoutMs: this.#retirementTimeoutMs,
+      ...(sessionStoreAuthority === undefined ? {} : { sessionStoreAuthority })
     });
+    this.storedSessions = sessionStoreAuthority === undefined
+      ? undefined
+      : storedSessionRuntime(this.#sessionOwner);
   }
 
   async probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe> {
@@ -629,6 +727,65 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
     if (owner === undefined) throw new Error("Claude CLI process ownership is not configured.");
     return spawnOwnedClaudeCodeProcess(options, owner, this.#retirementTimeoutMs, recordLease);
   }
+}
+
+function storedSessionRuntime(owner: SessionSdkOwner): ClaudeSdkStoredSessionRuntime {
+  const runtime: ClaudeSdkStoredSessionRuntime = {
+    prepareImport: (input) => owner.prepareSessionImport(input),
+    prepareDerivation: (input) => owner.prepareStoredSessionDerivation(input),
+    readOperation: (access) => owner.readStoredSessionOperation(access),
+    discardImport: (access) => owner.discardSessionImport(access),
+    adopt: (access, sessionId) => owner.adoptStoredSession(access, sessionId),
+    rebind: (input) => owner.rebindStoredSession(input),
+    importSession: async (sessionId, options) => {
+      await owner.run({
+        kind: "importSessionToStore",
+        sessionId,
+        options: { dir: options.dir },
+        access: options.access
+      }, { ...(options.signal === undefined ? {} : { signal: options.signal }) });
+    },
+    forkSession: async (sessionId, options) => await owner.run({
+      kind: "forkStoredSession",
+      sessionId,
+      options: {
+        dir: options.dir,
+        ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId })
+      },
+      access: options.access
+    }, { signal: options.signal, recordSessionId: options.recordSessionId }) as { readonly sessionId: string },
+    getSessionInfo: async (sessionId, options) => await owner.run({
+      kind: "getStoredSessionInfo",
+      sessionId,
+      options: { dir: options.dir },
+      access: options.access
+    }, { ...(options.signal === undefined ? {} : { signal: options.signal }) }) as ClaudeSdkSessionInfo | undefined,
+    getSessionMessages: async (sessionId, options) => {
+      const { access, signal, ...nativeOptions } = options;
+      return await owner.run({
+        kind: "getStoredSessionMessages",
+        sessionId,
+        options: nativeOptions,
+        access
+      }, { ...(signal === undefined ? {} : { signal }) }) as readonly ClaudeSdkSessionMessage[];
+    },
+    deleteSession: async (sessionId, options) => {
+      await owner.run({
+        kind: "deleteStoredSession",
+        sessionId,
+        options: { dir: options.dir },
+        access: options.access
+      }, { ...(options.signal === undefined ? {} : { signal: options.signal }) });
+    },
+    ownsOperation: (operationId) => owner.ownsStoreOperation(operationId)
+  };
+  return Object.freeze(runtime);
+}
+
+function containsPath(parent: string, candidate: string): boolean {
+  const path = relative(parent, candidate);
+  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`)
+    && !isAbsolute(path));
 }
 
 async function loadSdkModule(): Promise<LoadedSdkModule> {

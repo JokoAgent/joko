@@ -15,6 +15,7 @@ export {
   type ClaudeRemoteRuntimePort,
   type ClaudeTargetRuntime,
   type ClaudeSdkRuntime,
+  type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkQuery,
   type ClaudeSdkQueryOptions,
   type ClaudeSdkQueryParams,
@@ -42,6 +43,11 @@ export {
   type ClaudeCanUseToolOptions,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
+export type {
+  ClaudeSessionStoreOperationAccess,
+  ClaudeSessionStoreOperationSnapshot,
+  ClaudeSessionStoreSessionAccess
+} from "./claude-session-store.js";
 export {
   type ClaudeTextResourceResolver,
   type ClaudeTextResourceSeed

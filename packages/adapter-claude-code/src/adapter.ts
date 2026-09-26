@@ -338,6 +338,9 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly pathToClaudeCodeExecutable?: string;
   /** Adapter-private exact local process authority for crash recovery. */
   readonly processOwner?: DurableProcessOwnerOptions;
+  /** Stable service-owned root for opaque native SessionStore data. It must be
+   * disjoint from processOwner.rootDirectory. */
+  readonly sessionStoreRootDirectory?: string;
   /** Workspace whose project/local native settings own Backend discovery. */
   readonly probeCwd?: string;
   readonly settingSources?: readonly ("user" | "project" | "local")[];
@@ -658,6 +661,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     this.#teardownTimeoutMs = positiveTimeout(options.teardownTimeoutMs, DEFAULT_TEARDOWN_TIMEOUT_MS);
     this.#runtime = options.runtime ?? new DefaultClaudeSdkRuntime({
       ...(options.processOwner === undefined ? {} : { processOwner: options.processOwner }),
+      ...(options.sessionStoreRootDirectory === undefined
+        ? {}
+        : { sessionStoreRootDirectory: options.sessionStoreRootDirectory }),
       retirementTimeoutMs: this.#teardownTimeoutMs,
       environment: this.#environment,
       sessionOperationTimeoutMs: this.#initializationTimeoutMs

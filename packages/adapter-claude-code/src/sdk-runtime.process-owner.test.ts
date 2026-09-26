@@ -80,7 +80,8 @@ describe("Claude SDK owned custom spawn", () => {
 
   it("confirms only the selected Query's exact process lease and does not retire a concurrent Query", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-claude-query-owner-"));
-    roots.push(root);
+    const sessionStoreRoot = await mkdtemp(join(tmpdir(), "joko-claude-session-store-"));
+    roots.push(root, sessionStoreRoot);
     const children: ReturnType<typeof spawnOwnedClaudeCodeProcess>[] = [];
     sdk.query.mockImplementation(({ options }: { options: { abortController: AbortController; spawnClaudeCodeProcess: (input: Parameters<typeof spawnOwnedClaudeCodeProcess>[0]) => ReturnType<typeof spawnOwnedClaudeCodeProcess> } }) => {
       const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ["-e", "setInterval(() => undefined, 1000)"],
@@ -94,9 +95,32 @@ describe("Claude SDK owned custom spawn", () => {
       try { process.kill(pid, "SIGKILL"); } catch { return "not_running" as const; }
       return "terminated" as const;
     });
-    const runtime = new DefaultClaudeSdkRuntime({ processOwner: { rootDirectory: root, instanceId: "query-owner", generation: 1,
-      recoverStale: false, supervisor: { capture: async (pid) => `fixture-${pid}`, captureSync: (pid) => `fixture-${pid}`, terminate } } });
+    expect(() => new DefaultClaudeSdkRuntime({
+      processOwner: { rootDirectory: root, instanceId: "query-owner", generation: 1,
+        recoverStale: false, supervisor: { capture: async () => "unused", captureSync: () => "unused", terminate } },
+      sessionStoreRootDirectory: root
+    })).toThrow("must be disjoint");
+    const runtime = new DefaultClaudeSdkRuntime({
+      processOwner: { rootDirectory: root, instanceId: "query-owner", generation: 1,
+        recoverStale: false, supervisor: { capture: async (pid) => `fixture-${pid}`, captureSync: (pid) => `fixture-${pid}`, terminate } },
+      sessionStoreRootDirectory: sessionStoreRoot
+    });
     try {
+      expect(runtime.supportsWorkspaceDerivation).toBe(false);
+      const storedSessions = runtime.storedSessions;
+      expect(storedSessions).toBeDefined();
+      const importAccess = storedSessions!.prepareImport({
+        operationId: "22222222-2222-4222-8222-222222222222",
+        sourceWorkspaceAuthority: "workspace-source",
+        sourceSessionId: "11111111-1111-4111-8111-111111111111",
+        targetWorkspaceAuthority: "workspace-target"
+      });
+      expect(storedSessions!.readOperation(importAccess)).toMatchObject({
+        operationId: "22222222-2222-4222-8222-222222222222",
+        state: "importing"
+      });
+      expect(await readdir(root)).toEqual([]);
+
       const first = await runtime.query(queryParams());
       const second = await runtime.query(queryParams());
       await expect(runtime.retireQuery(first, 100)).rejects.toThrow("hard retirement");
