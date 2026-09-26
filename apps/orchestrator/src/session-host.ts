@@ -10887,20 +10887,25 @@ export class SessionHost {
             this.#sessionLifecycleFences.has(sessionId)
             || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
           ) return;
-          const failure: PublicError = reviewReadOnly ? {
-            code: "REVIEWER_DISPATCH_FAILED",
-            message: "The isolated reviewer Backend did not accept the request.",
-            phase: "dispatch",
-            retryable: false,
-            stateMayHaveChanged: false,
-            recovery: "Start a new review after checking provider and artifact availability."
-          } : toPublicError(error, {
+          const adapterFailure = toPublicError(error, {
               code: "BACKEND_DISPATCH_FAILED",
               phase: "dispatch",
               retryable: true,
               stateMayHaveChanged: false,
               recovery: "Inspect Backend diagnostics and explicitly retry when safe."
             });
+          const failure: PublicError = reviewReadOnly ? {
+            code: "REVIEWER_DISPATCH_FAILED",
+            message: adapterFailure.stateMayHaveChanged
+              ? "The isolated reviewer Backend may have accepted the request, but admission could not be confirmed."
+              : "The isolated reviewer Backend did not accept the request.",
+            phase: "dispatch",
+            retryable: false,
+            stateMayHaveChanged: adapterFailure.stateMayHaveChanged,
+            recovery: adapterFailure.stateMayHaveChanged
+              ? "Inspect the exact native reviewer Session before starting another review."
+              : "Start a new review after checking provider and artifact availability."
+          } : adapterFailure;
           const uncertain = failure.stateMayHaveChanged;
           if (uncertain) {
             const active = this.#active.get(sessionId);

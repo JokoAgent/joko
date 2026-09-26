@@ -2279,6 +2279,92 @@ describe("SessionHost", () => {
       .rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_DISCOVERY_UNSUPPORTED", phase: "capability" } });
   });
 
+  it.each([
+    ["consumed unknown", true, "dispatch_unknown"],
+    ["pre-consume failure", false, "failed"]
+  ] as const)("preserves reviewer dispatch uncertainty for %s", async (_label, stateMayHaveChanged, expectedState) => {
+    const adapter = new BackgroundTaskRuntimeFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceSessionId = (await fixture.host.createSession({
+      operationId: `create-review-dispatch-source-${stateMayHaveChanged}`,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Review dispatch source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const created = fixture.store.createReviewRun({
+      id: `review-dispatch-${stateMayHaveChanged}`,
+      sourceSessionId,
+      targetKind: "task",
+      evidenceSeal: reviewSeal(),
+      attachments: []
+    });
+    const { reviewerSessionId } = await fixture.host.createFreshReviewer({
+      reviewRunId: created.run.id,
+      sourceSessionId,
+      sourceLeaseFencingToken: created.sourceLease.fencingToken,
+      targetId: "target-one",
+      runtimePolicy: "review_read_only",
+      nativeStart: { kind: "new" },
+      permissionMode: "ask",
+      planMode: false,
+      fastMode: false
+    });
+    fixture.store.attachReviewSession({
+      reviewRunId: created.run.id,
+      reviewerSessionId,
+      sourceLeaseFencingToken: created.sourceLease.fencingToken,
+      expectedRunRevision: created.run.revision
+    });
+    const send = vi.spyOn(adapter, "send").mockRejectedValue(new JokoError({
+      code: stateMayHaveChanged ? "NATIVE_DISPATCH_UNKNOWN" : "NATIVE_SESSION_CONTINUITY_GAP",
+      message: stateMayHaveChanged
+        ? "Native dispatch admission could not be confirmed."
+        : "The native Session identity changed before dispatch.",
+      phase: "dispatch",
+      retryable: stateMayHaveChanged,
+      stateMayHaveChanged,
+      recovery: stateMayHaveChanged ? "Inspect the native Session." : "Retry with the current native Session."
+    }));
+    const operationId = `review-initial:dispatch-${stateMayHaveChanged}`;
+    const dispatch = await fixture.host.enqueueInitialPrompt({
+      operationId,
+      reviewRunId: created.run.id,
+      reviewerSessionId,
+      prompt: { text: "Review without replay.", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    const rejectedAcceptance = expect(dispatch.accepted).rejects.toThrow("did not accept");
+
+    await rejectedAcceptance;
+    await expect(dispatch.outcome).resolves.toEqual({ state: "failed" });
+    const queue = fixture.store.listQueueItems({ sessionId: reviewerSessionId })
+      .find((candidate) => candidate.operationId === operationId)!;
+    const run = fixture.store.getRun(queue.runId).descriptor;
+    const expectedError = {
+      code: "REVIEWER_DISPATCH_FAILED",
+      stateMayHaveChanged
+    };
+    expect(queue).toMatchObject({ state: expectedState, error: expectedError });
+    expect(run).toMatchObject({ state: expectedState, error: expectedError });
+    expect(fixture.store.getAttempt(queue.attemptId!).descriptor).toMatchObject({
+      endedAt: expect.any(Number),
+      error: expectedError
+    });
+
+    const replay = await fixture.host.enqueueInitialPrompt({
+      operationId,
+      reviewRunId: created.run.id,
+      reviewerSessionId,
+      prompt: { text: "Review without replay.", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await expect(replay.accepted).rejects.toThrow("did not accept");
+    await expect(replay.outcome).resolves.toEqual({ state: "failed" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(fixture.store.listQueueItems({ sessionId: reviewerSessionId })).toHaveLength(1);
+  });
+
   it("caches completed native task scans while keeping refresh and invalidation generation-safe", async () => {
     let monotonicNow = 1_000;
     const adapter = new CatalogScanFakeAdapter();

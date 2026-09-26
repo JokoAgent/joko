@@ -3343,6 +3343,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   async #handleStreamFailure(runtime: NativeRuntime, cause?: unknown): Promise<void> {
     const turn = runtime.activeTurn;
+    let pendingAdmissionFailure: unknown;
     const publicError: PublicError = cause instanceof JokoError
       ? cause.publicError
       : cause instanceof ProjectionLimitError
@@ -3379,9 +3380,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           // error cannot prove that native state is unchanged. Preserve a
           // specific pre-consumption failure, but never let its false-state
           // classification release the durable unknown-dispatch fence.
-          turn.admission.reject(turn.inputConsumed
+          pendingAdmissionFailure = turn.inputConsumed
             ? admissionError
-            : cause instanceof JokoError ? cause : admissionError);
+            : cause instanceof JokoError ? cause : admissionError;
+          turn.admission.reject(pendingAdmissionFailure);
         } else if (this.#isTurnCurrent(runtime, turn) && !turn.terminalClaimed) {
           turn.terminalClaimed = true;
           await turn.eventsReady.promise;
@@ -3393,7 +3395,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     } catch {
       // The runtime fence and teardown remain authoritative if Host emission fails.
     } finally {
-      await this.#retireRuntime(runtime, false, publicError);
+      await this.#retireRuntime(runtime, false, publicError, undefined, pendingAdmissionFailure);
     }
   }
 
@@ -4615,7 +4617,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     runtime: NativeRuntime,
     waitForConsumer = true,
     taskFailure?: PublicError,
-    retirementError?: (stateMayHaveChanged: boolean) => JokoError
+    retirementError?: (stateMayHaveChanged: boolean) => JokoError,
+    pendingAdmissionFailure?: unknown
   ): Promise<void> {
     if (runtime.retirementConfirmed) return;
     if (!runtime.closed) {
@@ -4678,6 +4681,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       runtime.mcpLease?.release();
       runtime.closed = true;
       const reason = retirementError?.(runtime.activeTurn?.inputConsumed === true)
+        ?? pendingAdmissionFailure
         ?? new Error("The native runtime was retired.");
       runtime.activeTurn?.admission.reject(reason);
       runtime.activeTurn?.eventsReady.resolve(undefined);

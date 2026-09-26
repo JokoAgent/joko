@@ -1377,16 +1377,20 @@ describe("ClaudeCodeAdapter", () => {
     }), contextFor().context);
     runtime.sessions.clear();
     managed.revision = "revision-two";
+    const turn = contextFor(binding, { operationId: "mismatched-fresh-route" });
     await expect(adapter.send(textPrompt("must not continue on a mismatched route"), {
-      ...contextFor(binding, { operationId: "mismatched-fresh-route" }).context,
+      ...turn.context,
       modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
     })).rejects.toMatchObject({
-      publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
     expect(runtime.queries).toHaveLength(2);
     expect(runtime.queries[0]!.receivedInputs).toEqual([]);
     expect(runtime.queries[1]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[1]!.params.options.abortController.signal.aborted).toBe(true);
     expect(runtime.queries[1]!.closeCalls).toBe(1);
+    expect(runtime.queries[1]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
     expect(managed.activations).toHaveLength(1);
     expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     await adapter.dispose();
@@ -1887,10 +1891,14 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput(), contextFor().context);
     const turn = contextFor(binding, { operationId: "changed-native-priority" });
     await expect(adapter.send(textPrompt("Keep explicit models authoritative"), turn.context)).rejects.toMatchObject({
-      publicError: { code: "SUBAGENT_MODEL_DEFAULT_UNAVAILABLE", stateMayHaveChanged: true, recovery: expect.stringContaining("explicitly retry") }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
     expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
     expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
     await adapter.dispose();
   });
 
@@ -3024,13 +3032,21 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput({
       runtimePolicy: "review_read_only"
     }), creation.context);
-
-    await expect(adapter.send(textPrompt("Review."), contextFor(binding, {
+    const turn = contextFor(binding, {
       operationId: "unsafe-review-init",
       runtimePolicy: "review_read_only"
-    }).context)).rejects.toMatchObject({
-      publicError: { code: "CLAUDE_CODE_REVIEW_PROFILE_INVALID" }
     });
+
+    await expect(adapter.send(textPrompt("Review."), turn.context)).rejects.toMatchObject({
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
+    });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
+    await adapter.dispose();
   });
 
   test("does not advertise isolated review for a native CLI below the safe-profile floor", async () => {
@@ -3874,10 +3890,15 @@ describe("ClaudeCodeAdapter", () => {
     const active = contextFor(binding, { operationId: "unknown-permission-mode" });
 
     await expect(adapter.send(textPrompt("must fail closed"), active.context)).rejects.toMatchObject({
-      publicError: { code: "NATIVE_PERMISSION_MODE_UNSUPPORTED" }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
     expect(active.events).toEqual([]);
     expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    await adapter.dispose();
   });
 
   test("bounds prompt and streamed content retained by the Adapter", async () => {
@@ -4008,15 +4029,22 @@ describe("ClaudeCodeAdapter", () => {
     await expect(adapter.resumeSession(binding, contextFor(binding).context)).resolves.toMatchObject({
       binding
     });
+    const turn = contextFor(binding, { operationId: "mismatched-resume-init" });
     await expect(adapter.send(
       textPrompt("prove the resumed identity"),
-      contextFor(binding, { operationId: "mismatched-resume-init" }).context
+      turn.context
     )).rejects.toMatchObject({
-      publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP" }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
     expect(runtime.queries).toHaveLength(1);
     expect(runtime.queries[0]!.params.options.resume).toBe(nativeSessionId);
     expect(runtime.queries[0]!.params.options.sessionId).toBeUndefined();
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
+    await adapter.dispose();
   });
 
   test("marks consumed-but-unconfirmed dispatch admission as stateMayHaveChanged", async () => {
@@ -4061,6 +4089,33 @@ describe("ClaudeCodeAdapter", () => {
     expect(query.params.options.abortController.signal.aborted).toBe(true);
     expect(query.closeCalls).toBe(1);
     expect(query.interruptCalls).toBe(0);
+  });
+
+  test("preserves a typed stream failure when the SDK has not consumed the native prompt", async () => {
+    const runtime = new FakeSdkRuntime({ deferInputConsumption: true });
+    const adapter = adapterFor(runtime, { admissionTimeoutMs: 1_000 });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const turn = contextFor(binding, { operationId: "typed-before-native-consumption" });
+    const query = runtime.queries[0]!;
+
+    const sending = adapter.send(textPrompt("not consumed"), turn.context);
+    const rejected = expect(sending).rejects.toMatchObject({
+      publicError: {
+        code: "NATIVE_SESSION_CONTINUITY_GAP",
+        stateMayHaveChanged: false
+      }
+    });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    query.push(systemInit(randomUUID()));
+
+    await rejected;
+    expect(runtime.queries).toHaveLength(1);
+    expect(query.receivedInputs).toEqual([]);
+    expect(query.params.options.abortController.signal.aborted).toBe(true);
+    expect(query.closeCalls).toBe(1);
+    expect(query.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
+    await adapter.dispose();
   });
 
   test("resumes the Host's previous binding into the exact next product generation", async () => {
@@ -5220,6 +5275,7 @@ describe("ClaudeCodeAdapter", () => {
 interface FakeRuntimeOptions {
   readonly autoAdmitTurns?: boolean;
   readonly autoReplayInputs?: boolean;
+  readonly deferInputConsumption?: boolean;
   readonly pauseAfterFirstInput?: boolean;
   readonly initialSessionIdOverride?: string;
   readonly initialPermissionMode?: string;
@@ -5360,27 +5416,29 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
       this.options.pauseAfterFirstInput ?? false);
     this.queries.push(query);
     if (params.options.sessionId !== undefined) this.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
-    void query.consumeInput((message) => {
-      if (this.admitTurns) {
-        query.push({
-          ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
-          ...(Array.isArray(params.options.tools) ? { tools: [...params.options.tools] } : {}),
-          ...(this.options.initialPermissionMode === undefined
-            ? {}
-            : { permissionMode: this.options.initialPermissionMode }),
-          ...this.options.initialFrameOverrides,
-          ...(params.options.persistSession ? {} : {
-              cwd: params.options.cwd,
-              model: params.options.model,
-              permissionMode: params.options.permissionMode
-            })
-        });
-      }
-      if (this.options.autoReplayInputs !== false && params.options.extraArgs?.["replay-user-messages"] === null) {
-        query.push({ ...message, isReplay: true, session_id: nativeSessionId });
-      }
-      return message;
-    });
+    if (this.options.deferInputConsumption !== true) {
+      void query.consumeInput((message) => {
+        if (this.admitTurns) {
+          query.push({
+            ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
+            ...(Array.isArray(params.options.tools) ? { tools: [...params.options.tools] } : {}),
+            ...(this.options.initialPermissionMode === undefined
+              ? {}
+              : { permissionMode: this.options.initialPermissionMode }),
+            ...this.options.initialFrameOverrides,
+            ...(params.options.persistSession ? {} : {
+                cwd: params.options.cwd,
+                model: params.options.model,
+                permissionMode: params.options.permissionMode
+              })
+          });
+        }
+        if (this.options.autoReplayInputs !== false && params.options.extraArgs?.["replay-user-messages"] === null) {
+          query.push({ ...message, isReplay: true, session_id: nativeSessionId });
+        }
+        return message;
+      });
+    }
     return Promise.resolve(query);
   }
 
