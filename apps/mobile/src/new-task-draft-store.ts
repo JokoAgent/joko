@@ -120,6 +120,18 @@ export class MobileNewTaskDraftStore {
     }
   }
 
+  async readDurable(identity: MobileNewTaskDraftIdentity): Promise<MobileNewTaskDraft | null> {
+    const exact = normalizeIdentity(identity);
+    try {
+      const stored = await this.driver.getItem(storageKey(exact));
+      return stored === null ? null : cloneDraft(readRecord(stored, exact));
+    } catch (cause) {
+      const error = storageError("read", cause);
+      this.#notify(exact, error);
+      throw error;
+    }
+  }
+
   save(identity: MobileNewTaskDraftIdentity, draft: MobileNewTaskEditableDraft): void {
     const exact = normalizeIdentity(identity);
     const key = identityKey(exact);

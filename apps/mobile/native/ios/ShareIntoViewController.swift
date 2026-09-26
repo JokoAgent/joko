@@ -8,6 +8,9 @@ private let inboxDirectoryName = "JokoIncomingShareV1"
 private let manifestFileName = "manifest.json"
 private let maximumItems = 20
 private let maximumItemBytes = 30 * 1024 * 1024
+private let maximumTextItemBytes = 32 * 1024
+private let maximumURLItemBytes = 8 * 1024
+private let maximumTextBatchBytes = 128 * 1024
 
 private struct ShareManifest: Codable {
   let version: Int
@@ -22,17 +25,26 @@ private struct ShareManifestItem: Codable {
   let itemId: String
   let ordinal: Int
   let state: String
+  let kind: String?
   let fileName: String?
   let mediaType: String?
   let byteSize: Int?
   let sha256Hex: String?
   let relativePath: String?
+  let text: String?
   let reason: String?
 }
 
 private enum StoredProviderResult {
-  case ready(fileName: String, mediaType: String, byteSize: Int, sha256Hex: String, relativePath: String)
+  case readyFile(fileName: String, mediaType: String, byteSize: Int, sha256Hex: String, relativePath: String)
+  case readyText(kind: String, text: String, byteSize: Int, sha256Hex: String)
   case rejected(fileName: String?, reason: String)
+}
+
+private enum PreferredShareContent {
+  case file(UTType)
+  case text(UTType)
+  case url(UTType)
 }
 
 final class ShareIntoViewController: SLComposeServiceViewController {
@@ -90,7 +102,7 @@ final class ShareIntoViewController: SLComposeServiceViewController {
       throw shareError("The Joko App Group container is unavailable.")
     }
     let providers = inputItems.flatMap { $0.attachments ?? [] }
-    guard !providers.isEmpty else { throw shareError("No file or image was shared.") }
+    guard !providers.isEmpty else { throw shareError("No file, image, text, or web URL was shared.") }
 
     let batchId = UUID().uuidString.lowercased()
     let createdAt = Date()
@@ -116,23 +128,46 @@ final class ShareIntoViewController: SLComposeServiceViewController {
     }
 
     var manifestItems: [ShareManifestItem] = []
+    var textBatchBytes = 0
     for (ordinal, provider) in providers.prefix(maximumItems).enumerated() {
       let itemId = UUID().uuidString.lowercased()
       let itemDirectory = staging
         .appendingPathComponent("items", isDirectory: true)
         .appendingPathComponent(itemId, isDirectory: true)
-      let result = await store(provider: provider, itemDirectory: itemDirectory, itemId: itemId)
+      let result = await store(
+        provider: provider,
+        itemDirectory: itemDirectory,
+        itemId: itemId,
+        remainingTextBytes: maximumTextBatchBytes - textBatchBytes
+      )
       switch result {
-      case let .ready(fileName, mediaType, byteSize, sha256Hex, relativePath):
+      case let .readyFile(fileName, mediaType, byteSize, sha256Hex, relativePath):
         manifestItems.append(ShareManifestItem(
           itemId: itemId,
           ordinal: ordinal,
           state: "ready",
+          kind: "file",
           fileName: fileName,
           mediaType: mediaType,
           byteSize: byteSize,
           sha256Hex: sha256Hex,
           relativePath: relativePath,
+          text: nil,
+          reason: nil
+        ))
+      case let .readyText(kind, text, byteSize, sha256Hex):
+        textBatchBytes += byteSize
+        manifestItems.append(ShareManifestItem(
+          itemId: itemId,
+          ordinal: ordinal,
+          state: "ready",
+          kind: kind,
+          fileName: nil,
+          mediaType: nil,
+          byteSize: byteSize,
+          sha256Hex: sha256Hex,
+          relativePath: nil,
+          text: text,
           reason: nil
         ))
       case let .rejected(fileName, reason):
@@ -140,11 +175,13 @@ final class ShareIntoViewController: SLComposeServiceViewController {
           itemId: itemId,
           ordinal: ordinal,
           state: "rejected",
+          kind: nil,
           fileName: fileName,
           mediaType: nil,
           byteSize: nil,
           sha256Hex: nil,
           relativePath: nil,
+          text: nil,
           reason: reason
         ))
       }
@@ -170,22 +207,34 @@ final class ShareIntoViewController: SLComposeServiceViewController {
   private func store(
     provider: NSItemProvider,
     itemDirectory: URL,
-    itemId: String
+    itemId: String,
+    remainingTextBytes: Int
   ) async -> StoredProviderResult {
-    guard let type = preferredType(for: provider) else {
-      return .rejected(fileName: safeOptionalName(provider.suggestedName), reason: "Only files and still images can be added to a new task.")
+    guard let content = preferredContent(for: provider) else {
+      return .rejected(fileName: safeOptionalName(provider.suggestedName), reason: "Only files, still images, text, and web URLs can be shared with Joko.")
     }
     do {
-      try FileManager.default.createDirectory(at: itemDirectory, withIntermediateDirectories: true)
-      let stored = try await loadAndCopy(provider: provider, type: type, itemDirectory: itemDirectory)
-      let relativePath = "items/\(itemId)/\(stored.fileName)"
-      return .ready(
-        fileName: stored.fileName,
-        mediaType: stored.mediaType,
-        byteSize: stored.byteSize,
-        sha256Hex: stored.sha256Hex,
-        relativePath: relativePath
-      )
+      switch content {
+      case let .file(type):
+        try FileManager.default.createDirectory(at: itemDirectory, withIntermediateDirectories: true)
+        let stored = try await loadAndCopy(provider: provider, type: type, itemDirectory: itemDirectory)
+        let relativePath = "items/\(itemId)/\(stored.fileName)"
+        return .readyFile(
+          fileName: stored.fileName,
+          mediaType: stored.mediaType,
+          byteSize: stored.byteSize,
+          sha256Hex: stored.sha256Hex,
+          relativePath: relativePath
+        )
+      case let .text(type):
+        let text = try await loadText(provider: provider, type: type)
+        return try storedText(text, kind: "text", maximumBytes: maximumTextItemBytes,
+                              remainingBatchBytes: remainingTextBytes)
+      case let .url(type):
+        let text = try await loadText(provider: provider, type: type)
+        return try storedText(text, kind: "url", maximumBytes: maximumURLItemBytes,
+                              remainingBatchBytes: remainingTextBytes)
+      }
     } catch {
       try? FileManager.default.removeItem(at: itemDirectory)
       return .rejected(
@@ -195,10 +244,15 @@ final class ShareIntoViewController: SLComposeServiceViewController {
     }
   }
 
-  private func preferredType(for provider: NSItemProvider) -> UTType? {
+  private func preferredContent(for provider: NSItemProvider) -> PreferredShareContent? {
     let types = provider.registeredTypeIdentifiers.compactMap(UTType.init)
-    if let image = types.first(where: { $0.conforms(to: .image) }) { return image }
-    return types.first(where: isAllowedFileType)
+    if let image = types.first(where: { $0.conforms(to: .image) }) { return .file(image) }
+    if let fileURL = types.first(where: { $0.conforms(to: .fileURL) }) { return .file(fileURL) }
+    if let webURL = types.first(where: { $0.conforms(to: .url) }) { return .url(webURL) }
+    if let text = types.first(where: { $0.conforms(to: .plainText) }) { return .text(text) }
+    if types.contains(.text) { return .text(.text) }
+    if let file = types.first(where: isAllowedFileType) { return .file(file) }
+    return nil
   }
 
   private func isAllowedFileType(_ type: UTType) -> Bool {
@@ -207,6 +261,55 @@ final class ShareIntoViewController: SLComposeServiceViewController {
     }
     if type.conforms(to: .url) && !type.conforms(to: .fileURL) { return false }
     return type.conforms(to: .data) || type.conforms(to: .fileURL)
+  }
+
+  private func loadText(provider: NSItemProvider, type: UTType) async throws -> String {
+    try await withCheckedThrowingContinuation { continuation in
+      provider.loadItem(forTypeIdentifier: type.identifier, options: nil) { item, error in
+        if let error { continuation.resume(throwing: error); return }
+        if let url = item as? URL {
+          continuation.resume(returning: url.absoluteString)
+        } else if let string = item as? String {
+          continuation.resume(returning: string)
+        } else if let data = item as? Data, let string = String(data: data, encoding: .utf8) {
+          continuation.resume(returning: string)
+        } else {
+          continuation.resume(throwing: self.shareError("The shared text or web URL could not be read."))
+        }
+      }
+    }
+  }
+
+  private func storedText(
+    _ text: String,
+    kind: String,
+    maximumBytes: Int,
+    remainingBatchBytes: Int
+  ) throws -> StoredProviderResult {
+    let bytes = Data(text.utf8)
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          bytes.count <= maximumBytes else {
+      throw shareError("The shared text or web URL exceeds its size limit or is empty.")
+    }
+    guard bytes.count <= remainingBatchBytes else {
+      throw shareError("The shared text and web URLs exceed the batch size limit.")
+    }
+    guard !text.unicodeScalars.contains(where: { $0.value == 0 }) else {
+      throw shareError("The shared text or web URL contains an invalid character.")
+    }
+    if kind == "url" {
+      guard text.hasPrefix("http://") || text.hasPrefix("https://"),
+            !text.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7f }) else {
+        throw shareError("Only HTTP and HTTPS web URLs are supported.")
+      }
+      guard let components = URLComponents(string: text),
+            let scheme = components.scheme, ["http", "https"].contains(scheme),
+            let host = components.host, !host.isEmpty, components.url != nil else {
+        throw shareError("Only HTTP and HTTPS web URLs are supported.")
+      }
+    }
+    let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    return .readyText(kind: kind, text: text, byteSize: bytes.count, sha256Hex: digest)
   }
 
   private struct StoredFile {

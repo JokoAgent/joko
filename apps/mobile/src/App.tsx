@@ -262,8 +262,10 @@ import {
   mobileIncomingShareClaimMatches,
   mobileIncomingShareProfileRetired,
   planMobileIncomingShare,
-  type MobileIncomingShareReadyBatch
+  type MobileIncomingShareReadyBatch,
+  type MobileIncomingShareSnapshot
 } from "./mobile-incoming-share";
+import { mobileIncomingShareTaskDestinations } from "./mobile-incoming-share-destinations";
 
 const client = new MobileClient(
   mobileNetwork,
@@ -555,6 +557,7 @@ export function App() {
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
   const [homeSearchFocusRequest, setHomeSearchFocusRequest] = useState(0);
   const [focusTaskComposer, setFocusTaskComposer] = useState(false);
+  const [incomingShareRequestRevision, setIncomingShareRequestRevision] = useState(0);
   const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
   const [nativeIntentRecovery, setNativeIntentRecovery] = useState<MobileNativeIntentRecovery>();
   const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus>();
@@ -654,6 +657,7 @@ export function App() {
         externalIntentFenceRef.current!.offerShare();
         nativeIntentDeliveryRef.current!.invalidate();
         if (nativeIntentConnectingRef.current) client.cancel();
+        setIncomingShareRequestRevision((value) => value + 1);
         void mobileIncomingShare.refresh().catch(() => undefined);
         return true;
       }
@@ -736,11 +740,15 @@ export function App() {
 
   useEffect(() => {
     const batch = incomingShare.batch;
-    if (!foreground || !batch || openedIncomingShareRef.current === batch.batchId || !state.activeProfileId
+    const navigationKey = batch
+      ? `${batch.batchId}\u001f${incomingShareRequestRevision}`
+      : incomingShareRequestRevision > 0 && !incomingShare.busy
+        ? `empty\u001f${incomingShareRequestRevision}` : undefined;
+    if (!foreground || !navigationKey || openedIncomingShareRef.current === navigationKey || !state.activeProfileId
       || !externalIntentFenceRef.current!.shareMayNavigate()) return;
-    openedIncomingShareRef.current = batch.batchId;
+    openedIncomingShareRef.current = navigationKey;
     setPage("new");
-  }, [foreground, incomingShare.batch, state.activeProfileId]);
+  }, [foreground, incomingShare.batch, incomingShare.busy, incomingShareRequestRevision, state.activeProfileId]);
 
   useEffect(() => {
     const batch = incomingShare.batch;
@@ -813,7 +821,27 @@ export function App() {
               onBack={connectionRequired ? undefined : () => { client.cancel(); setPage("home"); }}
               onConnected={() => setPage("home")} /> :
             <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
-              {page === "new" ? <NewTaskScreen {...common} onBack={() => setPage("home")} onCreated={() => setPage("task")} /> :
+              {page === "new" ? <NewTaskScreen {...common} showIncomingShareEmpty={incomingShareRequestRevision > 0}
+                onBack={() => {
+                  openedIncomingShareRef.current = mobileIncomingShare.snapshot.batch
+                    ? `${mobileIncomingShare.snapshot.batch.batchId}\u001f0` : undefined;
+                  setIncomingShareRequestRevision(0);
+                  setPage("home");
+                }} onCreated={() => {
+                  const nextBatch = mobileIncomingShare.snapshot.batch;
+                  openedIncomingShareRef.current = nextBatch
+                    ? `${nextBatch.batchId}\u001f${incomingShareRequestRevision}`
+                    : `empty\u001f${incomingShareRequestRevision}`;
+                  setPage("task");
+                }}
+                onImportedExistingTask={() => {
+                  const nextBatch = mobileIncomingShare.snapshot.batch;
+                  openedIncomingShareRef.current = nextBatch
+                    ? `${nextBatch.batchId}\u001f${incomingShareRequestRevision}`
+                    : `empty\u001f${incomingShareRequestRevision}`;
+                  setFocusTaskComposer(true);
+                  setPage("task");
+                }} /> :
                 page === "task" ? <TaskScreen {...common}
                   onBack={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
                   onHome={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
@@ -877,6 +905,7 @@ export function App() {
                   onDevice={(id) => { setDeviceId(id); setPage("device"); }} /> :
                 page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")} /> :
                 <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={() => setPage("task")}
+                  incomingShare={incomingShare} onOpenShare={() => setPage("new")}
                   menuButtonRef={homeMenuButtonRef} searchFocusRequest={homeSearchFocusRequest}
                   onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
             </SafeAreaView>}
@@ -1104,8 +1133,10 @@ function ConnectionScreen({ colors, state, locale, dark, onBack, onConnected }: 
   </MobileConnectionStage>;
 }
 
-function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuButtonRef, searchFocusRequest }: ScreenProps & {
+function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomingShare, onOpenShare,
+  menuButtonRef, searchFocusRequest }: ScreenProps & {
   onNew: () => void; onSelect: () => void; onMenu: () => void;
+  incomingShare: MobileIncomingShareSnapshot; onOpenShare: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
 }) {
   const [search, setSearch] = useState("");
@@ -1265,6 +1296,22 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
       </View>
       <Action label={mobileMessage(locale, "common.new")} onPress={onNew} colors={colors} compact disabled={state.status !== "connected"} />
     </View>
+    {(incomingShare.batch || incomingShare.error) && <View style={[styles.card,
+      { marginHorizontal: 16, marginBottom: 8, backgroundColor: colors.surface, borderColor: colors.border }]}>
+      <Text accessibilityRole="alert" style={[styles.caption, { color: incomingShare.error ? colors.negative : colors.ink }]}>
+        {incomingShare.error ? mobileMessage(locale, "incoming.inboxError") : mobileMessage(locale, "incoming.waiting", {
+          count: incomingShare.batch?.status === "ready"
+            ? incomingShare.batch.items.length + incomingShare.batch.overflowCount : 1,
+          items: mobileMessage(locale, "incoming.items")
+        })}
+      </Text>
+      <View style={styles.actionRow}>
+        {incomingShare.batch && <Action colors={colors} compact label={mobileMessage(locale, "incoming.open")}
+          onPress={onOpenShare} disabled={!state.activeProfileId} />}
+        {incomingShare.error && <Action colors={colors} compact label={mobileMessage(locale, "incoming.retry")}
+          disabled={incomingShare.busy} onPress={() => void mobileIncomingShare.refresh().catch(() => undefined)} />}
+      </View>
+    </View>}
     {(state.status === "connecting" || state.status === "offline") && <View
       accessibilityRole="alert"
       style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}
@@ -1622,7 +1669,11 @@ function SavedPendingOperations({ profile, colors, locale }: {
   </Text>;
 }
 
-function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps & { onBack: () => void; onCreated: () => void }) {
+function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExistingTask,
+  showIncomingShareEmpty }: ScreenProps & {
+  onBack: () => void; onCreated: () => void; onImportedExistingTask: () => void;
+  showIncomingShareEmpty: boolean;
+}) {
   const incomingShareState = useSyncExternalStore(
     (listener) => mobileIncomingShare.subscribe(listener),
     () => mobileIncomingShare.snapshot
@@ -1642,6 +1693,13 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
   const [draftReady, setDraftReady] = useState(false);
   const [error, setError] = useState("");
   const [incomingShareNotice, setIncomingShareNotice] = useState("");
+  const [incomingDestinationKind, setIncomingDestinationKind] = useState<"new_task" | "existing_task">("new_task");
+  const [incomingSessionId, setIncomingSessionId] = useState<string>();
+  const [incomingSessionSearch, setIncomingSessionSearch] = useState("");
+  const [incomingSelectingTask, setIncomingSelectingTask] = useState(false);
+  const [incomingExistingDraft, setIncomingExistingDraft] = useState<MobileComposerDraft>();
+  const [incomingExistingDraftReady, setIncomingExistingDraftReady] = useState(false);
+  const [expandedIncomingItemIds, setExpandedIncomingItemIds] = useState<ReadonlySet<string>>(() => new Set());
   const [imageOutputNotice, setImageOutputNotice] = useState("");
   const [sessionMentionsVisible, setSessionMentionsVisible] = useState(false);
   const [sessionMentionError, setSessionMentionError] = useState("");
@@ -1879,14 +1937,81 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     && retained === undefined;
   referencesEditableRef.current = referencesEditable;
   const incomingShareBatch = incomingShareState.batch;
+  const incomingBatchIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (incomingBatchIdRef.current === incomingShareBatch?.batchId) return;
+    incomingBatchIdRef.current = incomingShareBatch?.batchId;
+    const claim = incomingShareBatch?.status === "ready" ? incomingShareBatch.claim : undefined;
+    setIncomingDestinationKind(claim?.destinationKind ?? "new_task");
+    setIncomingSessionId(claim?.sessionId);
+    setIncomingSessionSearch("");
+    setIncomingExistingDraft(undefined);
+    setIncomingExistingDraftReady(false);
+    setExpandedIncomingItemIds(new Set());
+  }, [incomingShareBatch?.batchId]);
+  useEffect(() => {
+    if (!incomingShareBatch && !showIncomingShareEmpty) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (Keyboard.isVisible()) Keyboard.dismiss();
+      else onBack();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [incomingShareBatch, onBack, showIncomingShareEmpty]);
+  useEffect(() => {
+    if (incomingDestinationKind !== "existing_task" || !profileId || !incomingSessionId
+      || state.selectedId !== incomingSessionId || state.status !== "connected") {
+      setIncomingExistingDraft(undefined);
+      setIncomingExistingDraftReady(false);
+      return;
+    }
+    let current = true;
+    const draftIdentity = { profileId, sessionId: incomingSessionId };
+    setIncomingExistingDraftReady(false);
+    void mobileComposerDrafts.read(draftIdentity).then((stored) => {
+      if (!current || !mountedRef.current || client.state.activeProfileId !== profileId
+        || client.state.selectedId !== incomingSessionId) return;
+      setIncomingExistingDraft(stored ?? emptyMobileComposerDraft());
+      setIncomingExistingDraftReady(true);
+    }).catch((failure) => {
+      if (!current || !mountedRef.current) return;
+      setError(errorText(failure));
+      setIncomingExistingDraftReady(false);
+    });
+    return () => { current = false; };
+  }, [incomingDestinationKind, incomingSessionId, profileId, state.selectedId, state.status]);
+  const incomingSessions = useMemo(() => mobileIncomingShareTaskDestinations(state.owner), [state.owner]);
+  const incomingSelectedSession = incomingSessions.find((session) => session.sessionId === incomingSessionId);
+  const incomingTaskControls = incomingDestinationKind === "existing_task" && incomingSelectedSession
+    && state.selectedId === incomingSelectedSession.sessionId && incomingExistingDraftReady
+    ? client.taskIncomingShareControls() : undefined;
+  const incomingControls = incomingDestinationKind === "new_task"
+    ? client.newTaskIncomingShareControls(draft.targetId) : incomingTaskControls;
+  const incomingCurrentAttachments = incomingDestinationKind === "new_task"
+    ? draft.input.attachments : incomingExistingDraft?.attachments;
+  const incomingCurrentAtoms = incomingDestinationKind === "new_task"
+    ? draft.input.atoms : incomingExistingDraft?.atoms;
+  const incomingDestination = incomingDestinationKind === "new_task"
+    ? { kind: "new_task" as const, targetId: draft.targetId }
+    : incomingSelectedSession
+      ? { kind: "existing_task" as const, targetId: incomingSelectedSession.targetId,
+        sessionId: incomingSelectedSession.sessionId }
+      : undefined;
   const incomingSharePlan = useMemo(() => incomingShareBatch?.status === "ready"
-    && incomingShareBatch.boundProfileId === profileId && attachmentControls
-    ? planMobileIncomingShare(incomingShareBatch, draft.input.attachments, attachmentControls.policy)
-    : undefined, [attachmentControls, draft.input.attachments, incomingShareBatch, profileId]);
+    && incomingShareBatch.boundProfileId === profileId && incomingControls && incomingCurrentAttachments && incomingCurrentAtoms
+    ? planMobileIncomingShare(incomingShareBatch, incomingCurrentAttachments, incomingControls.policy, incomingCurrentAtoms)
+    : undefined, [incomingControls, incomingCurrentAttachments, incomingCurrentAtoms, incomingShareBatch, profileId]);
   const incomingShareClaimCurrent = incomingShareBatch?.status === "ready" && incomingShareBatch.claim
-    && incomingSharePlan && attachmentControls
-    ? mobileIncomingShareClaimMatches(incomingShareBatch, draft.targetId, attachmentControls, incomingSharePlan)
+    && incomingSharePlan && incomingControls && incomingDestination
+    ? mobileIncomingShareClaimMatches(incomingShareBatch, incomingDestination, incomingControls, incomingSharePlan)
     : undefined;
+  const incomingSearch = incomingSessionSearch.trim().toLocaleLowerCase();
+  const incomingMatchingSessions = incomingSessions.filter((session) => {
+    if (!incomingSearch) return true;
+    const target = state.owner?.targets.find((candidate) => candidate.targetId === session.targetId);
+    return `${session.displayName} ${target?.displayName ?? ""} ${session.sessionId}`
+      .toLocaleLowerCase().includes(incomingSearch);
+  });
   const insertSessionMention = (candidate: MobileSessionMentionCandidate): void => {
     const controls = sessionMentionControls;
     const targetId = draft.targetId;
@@ -2279,6 +2404,30 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       }
     }
   };
+  const chooseIncomingExistingTask = async (sessionId: string): Promise<void> => {
+    const batch = incomingShareBatch;
+    const matching = incomingSessions.filter((session) => session.sessionId === sessionId);
+    if (!batch || batch.status !== "ready" || matching.length !== 1 || !ownerReady
+      || state.status !== "connected" || AppState.currentState !== "active"
+      || batch.claim && (batch.claim.destinationKind !== "existing_task" || batch.claim.sessionId !== sessionId)) {
+      setError(mobileMessage(locale, "incoming.authorityChanged"));
+      return;
+    }
+    setIncomingSelectingTask(true);
+    setError("");
+    try {
+      await client.select(sessionId);
+      if (!mountedRef.current || client.state.selectedId !== sessionId
+        || client.state.activeProfileId !== profileIdRef.current || client.state.status !== "connected"
+        || AppState.currentState !== "active") throw new Error(mobileMessage(locale, "incoming.authorityChanged"));
+      setIncomingSessionId(sessionId);
+      setIncomingDestinationKind("existing_task");
+    } catch {
+      if (mountedRef.current) setError(mobileMessage(locale, "incoming.actionFailed"));
+    } finally {
+      if (mountedRef.current) setIncomingSelectingTask(false);
+    }
+  };
   const bindIncomingShare = async (batch: MobileIncomingShareReadyBatch): Promise<void> => {
     const ownerProfileId = profileIdRef.current;
     if (!ownerProfileId || !ownerReady || state.status !== "connected" || AppState.currentState !== "active") {
@@ -2289,8 +2438,8 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     setIncomingShareNotice("");
     try {
       await mobileIncomingShare.bind(batch.batchId, ownerProfileId);
-    } catch (failure) {
-      if (mountedRef.current) setError(errorText(failure));
+    } catch {
+      if (mountedRef.current) setError(mobileMessage(locale, "incoming.actionFailed"));
     }
   };
   const discardIncomingShare = async (batchId: string): Promise<void> => {
@@ -2299,17 +2448,24 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     try {
       await mobileIncomingShare.discard(batchId);
       if (mountedRef.current) setIncomingShareNotice(mobileMessage(locale, "incoming.discarded"));
-    } catch (failure) {
-      if (mountedRef.current) setError(errorText(failure));
+    } catch {
+      if (mountedRef.current) setError(mobileMessage(locale, "incoming.actionFailed"));
     }
   };
   const importIncomingShare = async (batch: MobileIncomingShareReadyBatch): Promise<void> => {
-    const controls = attachmentControls;
+    const controls = incomingControls;
+    const destination = incomingDestination;
     const ownerProfileId = profileIdRef.current;
-    const targetId = draftRef.current.targetId;
-    if (!controls || !ownerProfileId || controls.profileId !== ownerProfileId
-      || batch.boundProfileId !== ownerProfileId || attachmentOwnerRef.current !== controls.surfaceOwnerKey
-      || !referencesEditable || attachmentNativeActivityRef.current || AppState.currentState !== "active") {
+    const destinationReady = destination?.kind === "new_task"
+      ? destination.targetId === draftRef.current.targetId && referencesEditable
+        && client.newTaskIncomingShareControls(destination.targetId)?.surfaceOwnerKey === controls?.surfaceOwnerKey
+      : destination?.kind === "existing_task"
+        && incomingExistingDraftReady && state.selectedId === destination.sessionId
+        && client.taskIncomingShareControls()?.surfaceOwnerKey === controls?.surfaceOwnerKey;
+    if (!controls || !destination || !destinationReady || !ownerProfileId
+      || controls.profileId !== ownerProfileId || batch.boundProfileId !== ownerProfileId
+      || attachmentNativeActivityRef.current || incomingSelectingTask
+      || state.status !== "connected" || AppState.currentState !== "active") {
       setError(mobileMessage(locale, "incoming.authorityChanged"));
       return;
     }
@@ -2323,11 +2479,16 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     setError("");
     setIncomingShareNotice("");
     try {
-      const preview = planMobileIncomingShare(batch, draftRef.current.input.attachments, controls.policy);
+      const currentAttachments = destination.kind === "new_task"
+        ? draftRef.current.input.attachments : incomingExistingDraft?.attachments;
+      const currentAtoms = destination.kind === "new_task"
+        ? draftRef.current.input.atoms : incomingExistingDraft?.atoms;
+      if (!currentAttachments || !currentAtoms) throw new Error(mobileMessage(locale, "incoming.authorityChanged"));
+      const preview = planMobileIncomingShare(batch, currentAttachments, controls.policy, currentAtoms);
       const claimedBatch = await mobileIncomingShare.claim(
         batch.batchId,
         ownerProfileId,
-        targetId,
+        destination,
         controls,
         preview
       );
@@ -2336,31 +2497,46 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       const result = await commitMobileIncomingShare({
         batch: claimedBatch,
         profileId: ownerProfileId,
-        targetId,
+        destination,
         controls,
-        draftStore: mobileNewTaskDrafts,
+        newTaskDraftStore: mobileNewTaskDrafts,
+        composerDraftStore: mobileComposerDrafts,
         attachmentFiles: mobileAttachmentFiles,
         signal: controller.signal,
+        allowFreshClaim: batch.claim === undefined,
         validateAuthority: async () => {
           const latest = await waitForMobileAttachmentAuthority(
             { profileId: ownerProfileId, surfaceOwnerKey: controls.surfaceOwnerKey },
-            () => client.newTaskAttachmentControls(targetId),
+            () => destination.kind === "new_task"
+              ? client.newTaskIncomingShareControls(destination.targetId)
+              : client.state.selectedId === destination.sessionId
+                ? client.taskIncomingShareControls() : undefined,
             (listener) => client.subscribe(() => listener()),
             {
               signal: controller.signal,
               retired: () => {
                 const current = client.state;
-                return profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
-                  || current.activeProfileId !== ownerProfileId
+                if (profileIdRef.current !== ownerProfileId || current.activeProfileId !== ownerProfileId
                   || current.status === "revoked" || current.status === "unpaired"
-                  || AppState.currentState !== "active"
-                  || current.status === "connected" && client.newTaskAttachmentControls(targetId) === undefined;
+                  || AppState.currentState !== "active") return true;
+                if (destination.kind === "new_task") {
+                  return draftRef.current.targetId !== destination.targetId
+                    || current.status === "connected"
+                      && client.newTaskIncomingShareControls(destination.targetId) === undefined;
+                }
+                const sessions = current.owner?.sessions.filter((session) => session.sessionId === destination.sessionId);
+                return current.selectedId !== destination.sessionId || sessions?.length !== 1
+                  || sessions[0]?.targetId !== destination.targetId
+                  || current.status === "connected" && client.taskIncomingShareControls() === undefined;
               }
             }
           );
           if (!mountedRef.current || attachmentGenerationRef.current !== generation
-            || profileIdRef.current !== ownerProfileId || draftRef.current.targetId !== targetId
-            || attachmentOwnerRef.current !== controls.surfaceOwnerKey) {
+            || profileIdRef.current !== ownerProfileId
+            || destination.kind === "new_task" && (draftRef.current.targetId !== destination.targetId
+              || client.newTaskIncomingShareControls(destination.targetId)?.surfaceOwnerKey !== controls.surfaceOwnerKey)
+            || destination.kind === "existing_task" && (client.state.selectedId !== destination.sessionId
+              || client.taskIncomingShareControls()?.surfaceOwnerKey !== controls.surfaceOwnerKey)) {
             throw new Error(mobileMessage(locale, "incoming.authorityAdding"));
           }
           return latest;
@@ -2369,15 +2545,29 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       });
       if (!mountedRef.current || profileIdRef.current !== ownerProfileId
         || attachmentGenerationRef.current !== generation) return;
-      const next = { targetId: result.draft.targetId, name: result.draft.name, input: result.draft.input };
-      draftRef.current = next;
-      setDraft(next);
+      const currentControls = destination.kind === "new_task"
+        ? client.newTaskIncomingShareControls(destination.targetId)
+        : client.state.selectedId === destination.sessionId ? client.taskIncomingShareControls() : undefined;
+      if (client.state.activeProfileId !== ownerProfileId || client.state.status !== "connected"
+        || !sameMobileAttachmentControls(currentControls, controls)
+        || destination.kind === "new_task" && draftRef.current.targetId !== destination.targetId) {
+        setIncomingShareNotice(mobileMessage(locale,
+          result.plan.accepted.length > 0 ? "incoming.importedElsewhere" : "incoming.noneAdded"));
+        return;
+      }
+      if (result.destinationKind === "new_task") {
+        const next = { targetId: result.draft.targetId, name: result.draft.name, input: result.draft.input };
+        draftRef.current = next;
+        setDraft(next);
+      } else {
+        setIncomingExistingDraft(result.draft);
+        onImportedExistingTask();
+      }
       setIncomingShareNotice([
         result.plan.accepted.length > 0
           ? mobileMessage(locale, "incoming.result", {
             verb: mobileMessage(locale, result.replayed ? "incoming.confirmed" : "incoming.added"),
-            count: result.plan.accepted.length,
-            files: mobileMessage(locale, result.plan.accepted.length === 1 ? "incoming.file" : "incoming.files")
+            count: result.plan.accepted.length
           })
           : mobileMessage(locale, "incoming.noneAdded"),
         result.plan.rejected.length > 0
@@ -2387,15 +2577,22 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
           })
           : ""
       ].filter(Boolean).join(" "));
-    } catch (failure) {
-      const retainedDraft = mobileNewTaskDrafts.readSync({ profileId: ownerProfileId });
-      if (mountedRef.current && profileIdRef.current === ownerProfileId && retainedDraft
-        && retainedDraft.submission === undefined) {
-        const next = { targetId: retainedDraft.targetId, name: retainedDraft.name, input: retainedDraft.input };
-        draftRef.current = next;
-        setDraft(next);
+    } catch {
+      if (destination.kind === "new_task") {
+        const retainedDraft = mobileNewTaskDrafts.readSync({ profileId: ownerProfileId });
+        if (mountedRef.current && profileIdRef.current === ownerProfileId && retainedDraft
+          && retainedDraft.submission === undefined) {
+          const next = { targetId: retainedDraft.targetId, name: retainedDraft.name, input: retainedDraft.input };
+          draftRef.current = next;
+          setDraft(next);
+        }
+      } else if (mountedRef.current && profileIdRef.current === ownerProfileId) {
+        setIncomingExistingDraft(mobileComposerDrafts.readSync({ profileId: ownerProfileId,
+          sessionId: destination.sessionId }) ?? emptyMobileComposerDraft());
       }
-      if (mountedRef.current && attachmentGenerationRef.current === generation) setError(errorText(failure));
+      if (mountedRef.current && attachmentGenerationRef.current === generation) {
+        setError(mobileMessage(locale, "incoming.actionFailed"));
+      }
     } finally {
       if (attachmentAbortRef.current === controller) {
         attachmentAbortRef.current = undefined;
@@ -2599,16 +2796,29 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
     <Back label={mobileMessage(locale, "common.tasks")}
       accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
       onPress={() => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); }} colors={colors} />
-    <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "newTask.title")}</Text>
-    <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "newTask.description")}</Text>
+    <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale,
+      incomingShareBatch?.status === "ready" && incomingDestinationKind === "existing_task"
+        ? "incoming.title" : "newTask.title")}</Text>
+    {!(incomingShareBatch?.status === "ready" && incomingDestinationKind === "existing_task") &&
+      <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "newTask.description")}</Text>}
     {incomingShareNotice && <Banner text={incomingShareNotice} colors={colors} />}
-    {incomingShareState.error && !incomingShareBatch && <Banner text={incomingShareState.error} colors={colors} />}
+    {incomingShareState.error && !incomingShareBatch && <View style={styles.field}>
+      <Banner text={mobileMessage(locale, "incoming.inboxError")} colors={colors} />
+      <Action label={mobileMessage(locale, "incoming.retry")} colors={colors} compact
+        disabled={incomingShareState.busy} onPress={() => void mobileIncomingShare.refresh().catch(() => undefined)} />
+    </View>}
+    {showIncomingShareEmpty && !incomingShareBatch && !incomingShareState.busy && !incomingShareState.error &&
+      <View style={styles.field}>
+        <Banner text={mobileMessage(locale, "incoming.empty")} colors={colors} />
+        <Action label={mobileMessage(locale, "incoming.retry")} colors={colors} compact
+          onPress={() => void mobileIncomingShare.refresh().catch(() => undefined)} />
+      </View>}
     {incomingShareBatch && <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}
       accessibilityRole="summary" accessibilityLabel={mobileMessage(locale, "incoming.summary")}>
       <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "incoming.title")}</Text>
       {incomingShareBatch.status === "invalid" ? <>
         <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
-          {incomingShareBatch.invalidReason} {mobileMessage(locale, "incoming.invalidKept")}
+          {mobileMessage(locale, "incoming.invalidBatch")}
         </Text>
         <Action label={mobileMessage(locale, incomingShareState.busy ? "incoming.discarding" : "incoming.discardInvalid")} colors={colors} compact
           disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
@@ -2635,49 +2845,129 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
           </Text>
           <Action label={mobileMessage(locale, incomingShareState.busy ? "incoming.discarding" : "incoming.discardBound")} colors={colors} compact
             disabled={incomingShareState.busy} onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
-        </> : incomingShareClaimCurrent === false ? <>
-          <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
-            {mobileMessage(locale, "incoming.claimedMismatch")}
-          </Text>
-          <Action label={mobileMessage(locale, "incoming.discardClaimed")} colors={colors} compact
-            disabled={incomingShareState.busy || attachmentBusy}
-            onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
-        </> : !attachmentControls || !targetAvailable || !incomingSharePlan ? <>
-          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.chooseCompatible")}</Text>
-          {incomingShareBatch.items.filter((item) => item.state === "rejected").map((rejection) => <Text
-            key={rejection.itemId} accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
-            {rejection.fileName ? `${rejection.fileName}: ` : ""}{rejection.reason}
-          </Text>)}
-          {incomingShareBatch.overflowCount > 0 && <Text accessibilityRole="alert"
-            style={[styles.caption, { color: colors.negative }]}>{mobileMessage(locale, "incoming.overflow", {
-              count: incomingShareBatch.overflowCount,
-              items: mobileMessage(locale, incomingShareBatch.overflowCount === 1 ? "incoming.itemWas" : "incoming.itemsWere")
-            })}</Text>}
-          <Action label={mobileMessage(locale, "common.discard")} colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
-            onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
         </> : <>
-          <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.preview", {
-            accepted: incomingSharePlan.accepted.length,
-            files: mobileMessage(locale, incomingSharePlan.accepted.length === 1 ? "incoming.fileMatches" : "incoming.filesMatch"),
-            skipped: incomingSharePlan.rejected.length
-          })}</Text>
-          {incomingSharePlan.rejected.map((rejection, index) => <Text key={`${rejection.itemId ?? "overflow"}-${index}`}
-            accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
-            {rejection.fileName ? `${rejection.fileName}: ` : ""}{rejection.reason}
-          </Text>)}
-          <View style={styles.actionRow}>
-            <Action label={mobileMessage(locale, attachmentBusy || incomingShareState.busy ? "incoming.adding"
-              : incomingSharePlan.accepted.length > 0 ? "incoming.add" : "incoming.confirmClear")}
-              colors={colors} compact disabled={!referencesEditable || incomingShareState.busy}
-              onPress={() => void importIncomingShare(incomingShareBatch)} />
+          <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "incoming.destination")}</Text>
+          <View style={[styles.modeTabs, { borderColor: colors.border, backgroundColor: colors.background }]} accessibilityRole="radiogroup">
+            <Pressable accessibilityRole="radio" accessibilityState={{ selected: incomingDestinationKind === "new_task",
+              disabled: incomingShareState.busy || attachmentBusy || incomingShareBatch.claim?.destinationKind === "existing_task" }}
+              disabled={incomingShareState.busy || attachmentBusy || incomingShareBatch.claim?.destinationKind === "existing_task"}
+              style={[styles.modeTab, { minHeight: 44, backgroundColor: incomingDestinationKind === "new_task" ? colors.surface : "transparent" }]}
+              onPress={() => { setIncomingDestinationKind("new_task"); setIncomingSessionId(undefined); setError(""); }}>
+              <Text style={[styles.modeTabText, { color: colors.ink }]}>{mobileMessage(locale, "incoming.newTaskDraft")}</Text>
+            </Pressable>
+            <Pressable accessibilityRole="radio" accessibilityState={{ selected: incomingDestinationKind === "existing_task",
+              disabled: incomingShareState.busy || attachmentBusy || incomingShareBatch.claim?.destinationKind === "new_task" }}
+              disabled={incomingShareState.busy || attachmentBusy || incomingShareBatch.claim?.destinationKind === "new_task"}
+              style={[styles.modeTab, { minHeight: 44, backgroundColor: incomingDestinationKind === "existing_task" ? colors.surface : "transparent" }]}
+              onPress={() => { setIncomingDestinationKind("existing_task"); setError(""); }}>
+              <Text style={[styles.modeTabText, { color: colors.ink }]}>{mobileMessage(locale, "incoming.existingTaskDraft")}</Text>
+            </Pressable>
+          </View>
+          {incomingDestinationKind === "existing_task" && <>
+            <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.chooseTask")}</Text>
+            {incomingSelectedSession && <Text accessibilityRole="summary" style={[styles.body, { color: colors.ink }]}>
+              {mobileMessage(locale, "incoming.taskSelected", {
+                name: incomingSelectedSession.displayName || mobileMessage(locale, "home.untitledTask")
+              })}
+            </Text>}
+            {!incomingShareBatch.claim && <TextInput value={incomingSessionSearch} onChangeText={setIncomingSessionSearch}
+              placeholder={mobileMessage(locale, "incoming.searchTask")} placeholderTextColor={colors.muted}
+              accessibilityLabel={mobileMessage(locale, "incoming.searchTask")}
+              style={[styles.input, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]}
+              autoCorrect={false} returnKeyType="search" />}
+            {(incomingShareBatch.claim ? incomingSessions.filter((session) => session.sessionId === incomingShareBatch.claim?.sessionId)
+              : incomingMatchingSessions.slice(0, 20)).map((session) => {
+              const target = state.owner?.targets.find((candidate) => candidate.targetId === session.targetId);
+              const label = `${session.displayName || mobileMessage(locale, "home.untitledTask")} · ${target?.displayName ?? ""} · ${session.sessionId.slice(0, 8)}`;
+              return <Pressable key={session.sessionId} accessibilityRole="radio"
+                accessibilityLabel={label} accessibilityState={{ selected: incomingSessionId === session.sessionId,
+                  disabled: incomingSelectingTask || attachmentBusy || incomingShareState.busy }}
+                disabled={incomingSelectingTask || attachmentBusy || incomingShareState.busy}
+                onPress={() => void chooseIncomingExistingTask(session.sessionId)}
+                style={[styles.choice, { minHeight: 48, paddingVertical: 8, borderBottomWidth: 1, borderColor: colors.border }]}>
+                <Text style={[styles.body, { color: colors.ink, flex: 1 }]}>{label}</Text>
+                {incomingSessionId === session.sessionId && <Text style={[styles.body, { color: colors.accent }]}>✓</Text>}
+              </Pressable>;
+            })}
+            {incomingMatchingSessions.length === 0 && <Text style={[styles.caption, { color: colors.muted }]}>
+              {mobileMessage(locale, "incoming.noTask")}</Text>}
+            {!incomingShareBatch.claim && incomingMatchingSessions.length > 20 && <Text style={[styles.caption, { color: colors.muted }]}>
+              {mobileMessage(locale, "incoming.moreTasks")}</Text>}
+            {(incomingSelectingTask || incomingSessionId && !incomingExistingDraftReady) &&
+              <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.taskLoading")}</Text>}
+          </>}
+          {incomingShareClaimCurrent === false ? <>
+            <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
+              {mobileMessage(locale, "incoming.claimedMismatch")}
+            </Text>
+            <Action label={mobileMessage(locale, "incoming.discardClaimed")} colors={colors} compact
+              disabled={incomingShareState.busy || attachmentBusy}
+              onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+          </> : !incomingControls || !incomingDestination || !incomingSharePlan
+            || incomingDestination.kind === "new_task" && !targetAvailable ? <>
+            <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.chooseCompatible")}</Text>
+            {incomingShareBatch.items.filter((item) => item.state === "rejected").map((rejection) => <Text
+              key={rejection.itemId} accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
+              {mobileMessage(locale, "incoming.itemNumber", { index: rejection.ordinal + 1 })}
+              {rejection.fileName ? ` · ${rejection.fileName}` : ""}: {mobileMessage(locale, "incoming.rejectedItem")}
+            </Text>)}
+            {incomingShareBatch.overflowCount > 0 && <Text accessibilityRole="alert"
+              style={[styles.caption, { color: colors.negative }]}>{mobileMessage(locale, "incoming.overflow", {
+                count: incomingShareBatch.overflowCount,
+                items: mobileMessage(locale, incomingShareBatch.overflowCount === 1 ? "incoming.itemWas" : "incoming.itemsWere")
+              })}</Text>}
             <Action label={mobileMessage(locale, "common.discard")} colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
               onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
-          </View>
+          </> : <>
+            <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "incoming.preview", {
+              accepted: incomingSharePlan.accepted.length, skipped: incomingSharePlan.rejected.length
+            })}</Text>
+            {incomingSharePlan.accepted.map((item) => <View key={item.itemId} style={{ paddingVertical: 6 }}>
+              <Text style={[styles.caption, { color: colors.ink, fontWeight: "600" }]}>
+                {mobileMessage(locale, "incoming.itemNumber", { index: item.ordinal + 1 })} · {item.kind === "file"
+                ? mobileMessage(locale, "incoming.previewFile", { name: item.fileName,
+                  size: formatMobileAttachmentBytes(item.byteSize) })
+                : mobileMessage(locale, item.kind === "url" ? "incoming.previewUrl" : "incoming.previewText")}</Text>
+              {item.kind !== "file" && <>
+                <Text selectable style={[styles.body, { color: colors.ink }]}>
+                  {expandedIncomingItemIds.has(item.itemId) ? item.text : item.text.slice(0, 300)}
+                </Text>
+                {item.text.length > 300 && <Action compact colors={colors}
+                  label={mobileMessage(locale, expandedIncomingItemIds.has(item.itemId)
+                    ? "incoming.previewLess" : "incoming.previewMore")}
+                  onPress={() => setExpandedIncomingItemIds((current) => {
+                    const next = new Set(current);
+                    if (next.has(item.itemId)) next.delete(item.itemId); else next.add(item.itemId);
+                    return next;
+                  })} />}
+              </>}
+            </View>)}
+            {incomingSharePlan.rejected.map((rejection, index) => <Text key={`${rejection.itemId ?? "overflow"}-${index}`}
+              accessibilityRole="alert" style={[styles.caption, { color: colors.negative }]}>
+              {rejection.itemId === undefined
+                ? mobileMessage(locale, "incoming.overflow", { count: incomingShareBatch.overflowCount,
+                  items: mobileMessage(locale, incomingShareBatch.overflowCount === 1 ? "incoming.itemWas" : "incoming.itemsWere") })
+                : `${mobileMessage(locale, "incoming.itemNumber", { index: rejection.ordinal + 1 })}`
+                  + `${rejection.fileName ? ` · ${rejection.fileName}` : ""}: ${mobileMessage(locale, "incoming.rejectedItem")}`}
+            </Text>)}
+            <View style={styles.actionRow}>
+              <Action label={mobileMessage(locale, attachmentBusy || incomingShareState.busy ? "incoming.adding"
+                : incomingSharePlan.accepted.length > 0 ? "incoming.add" : "incoming.confirmClear")}
+                colors={colors} compact disabled={incomingShareState.busy || incomingSelectingTask || attachmentBusy
+                  || incomingDestination.kind === "new_task" && !referencesEditable
+                  || incomingDestination.kind === "existing_task" && (!incomingExistingDraftReady || state.busy)}
+                onPress={() => void importIncomingShare(incomingShareBatch)} />
+              <Action label={mobileMessage(locale, "common.discard")} colors={colors} compact disabled={incomingShareState.busy || attachmentBusy}
+                onPress={() => void discardIncomingShare(incomingShareBatch.batchId)} />
+            </View>
+          </>}
         </>}
         {incomingShareState.error && <Text accessibilityRole="alert"
-          style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>{incomingShareState.error}</Text>}
+          style={[styles.warning, { color: colors.negative, paddingHorizontal: 0 }]}>
+          {mobileMessage(locale, "incoming.actionFailed")}</Text>}
       </>}
     </View>}
+    {!(incomingShareBatch?.status === "ready" && incomingDestinationKind === "existing_task") && <>
     <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "newTask.project")}</Text>
     {targets.length === 0 && <Text style={[styles.description, { color: colors.muted }]}>{mobileMessage(locale, "newTask.noProject")}</Text>}
     {targets.map((target) => <Pressable key={target.targetId} accessibilityRole="radio" accessibilityState={{ selected: draft.targetId === target.targetId }}
@@ -2800,6 +3090,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
       colors={colors} onPress={submit} />
     {retained?.phase === "sending" && state.selectedId === retained.sessionId
       && <Action label={mobileMessage(locale, "newTask.openCreated")} onPress={onCreated} colors={colors} />}
+    </>}
     {(error || state.error) && <Banner text={error || state.error || ""} colors={colors} />}
     {imageOutputNotice && <Notice text={imageOutputNotice} colors={colors} locale={locale}
       onDismiss={() => setImageOutputNotice("")} />}

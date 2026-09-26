@@ -30,6 +30,8 @@ class JokoIncomingShareModule : Module() {
     AsyncFunction("claimBatch") Coroutine {
         batchId: String,
         profileId: String,
+        destinationKind: String,
+        sessionId: String?,
         targetId: String,
         surfaceOwnerKey: String,
         policyKey: String,
@@ -40,6 +42,8 @@ class JokoIncomingShareModule : Module() {
             applicationContext(),
             batchId,
             profileId,
+            destinationKind,
+            sessionId,
             targetId,
             surfaceOwnerKey,
             policyKey,

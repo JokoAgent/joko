@@ -25,13 +25,11 @@ const moduleConfig = JSON.parse(readFileSync(
   new URL("modules/joko-incoming-share/expo-module.config.json", project),
   "utf8"
 ));
-const bridge = readFileSync(new URL("src/mobile-incoming-share.ts", project), "utf8");
 const nativeIntent = readFileSync(new URL("src/mobile-native-intent.ts", project), "utf8");
 const surface = readFileSync(new URL("src/App.tsx", project), "utf8");
-const messages = readFileSync(new URL("src/mobile-task-messages.ts", project), "utf8");
 
 describe("iOS incoming-share native boundary", () => {
-  it("declares only the bounded iOS file/image target and composes the Joko source as the final dangerous mod", () => {
+  it("declares the bounded iOS text, web URL, file, and image target and composes the Joko source as the final dangerous mod", () => {
     const sharingIndex = app.plugins.findIndex((entry) => Array.isArray(entry) && entry[0] === "expo-sharing");
     const boundaryIndex = app.plugins.indexOf("./with-joko-incoming-share.cjs");
     expect(sharingIndex).toBeGreaterThanOrEqual(0);
@@ -42,6 +40,8 @@ describe("iOS incoming-share native boundary", () => {
         enabled: true,
         appGroupId: "group.app.joko.mobile",
         activationRule: {
+          supportsText: true,
+          supportsWebUrlWithMaxCount: 20,
           supportsImageWithMaxCount: 20,
           supportsFileWithMaxCount: 20
         }
@@ -84,19 +84,23 @@ describe("iOS incoming-share native boundary", () => {
     }
   });
 
-  it("generates an extension plist with file/image activation only", () => {
+  it("generates an extension plist with bounded supported activation types", () => {
     const nativeRoot = mkdtempSync(join(tmpdir(), "joko-share-plist-"));
     try {
       createShareInfoPlist(nativeRoot, "group.app.joko.mobile", "joko", {
+        supportsText: true,
+        supportsWebUrlWithMaxCount: 20,
         supportsImageWithMaxCount: 20,
         supportsFileWithMaxCount: 20
       });
       const info = readFileSync(join(nativeRoot, "Info.plist"), "utf8");
+      expect(info).toContain("NSExtensionActivationSupportsText");
+      expect(info).toContain("NSExtensionActivationSupportsWebURLWithMaxCount");
       expect(info).toContain("NSExtensionActivationSupportsImageWithMaxCount");
       expect(info).toContain("NSExtensionActivationSupportsFileWithMaxCount");
       expect(info).toContain("group.app.joko.mobile");
       expect(info).toContain("joko");
-      expect(info).not.toMatch(/Supports(Text|Movie|WebURL|WebPage|Attachments)/u);
+      expect(info).not.toMatch(/Supports(Movie|WebPage|Attachments)/u);
     } finally {
       rmSync(nativeRoot, { recursive: true, force: true });
     }
@@ -107,6 +111,9 @@ describe("iOS incoming-share native boundary", () => {
     expect(extension).toContain("guard !processing else { return }");
     expect(extension).toContain('private let maximumItems = 20');
     expect(extension).toContain('private let maximumItemBytes = 30 * 1024 * 1024');
+    expect(extension).toContain('private let maximumTextItemBytes = 32 * 1024');
+    expect(extension).toContain('private let maximumURLItemBytes = 8 * 1024');
+    expect(extension).toContain('private let maximumTextBatchBytes = 128 * 1024');
     expect(extension).toContain('root.appendingPathComponent("staging-\\(batchId)"');
     expect(extension).toContain('.appendingPathComponent(itemId, isDirectory: true)');
     expect(extension).toContain('let relativePath = "items/\\(itemId)/\\(stored.fileName)"');
@@ -118,8 +125,13 @@ describe("iOS incoming-share native boundary", () => {
     expect(extension).not.toMatch(/credential|accessToken|refreshToken|draft/iu);
   });
 
-  it("rejects raw URLs and non-file media while retaining bounded per-item rejection results", () => {
-    expect(extension).toContain("Only files and still images can be added to a new task.");
+  it("accepts bounded exact text and HTTP(S) URLs while isolating rejected providers", () => {
+    expect(extension).toContain("provider.loadItem(forTypeIdentifier: type.identifier, options: nil)");
+    expect(extension).toContain('return .readyText(kind: kind, text: text, byteSize: bytes.count, sha256Hex: digest)');
+    expect(extension).toContain('!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty');
+    expect(extension).toContain('text.hasPrefix("http://") || text.hasPrefix("https://")');
+    expect(extension).toContain('let scheme = components.scheme, ["http", "https"].contains(scheme)');
+    expect(extension).toContain('!text.unicodeScalars.contains(where: { $0.value == 0 })');
     expect(extension).toContain("type.conforms(to: .audio)");
     expect(extension).toContain("type.conforms(to: .movie)");
     expect(extension).toContain("type.conforms(to: .url) && !type.conforms(to: .fileURL)");
@@ -127,6 +139,7 @@ describe("iOS incoming-share native boundary", () => {
     expect(extension).toContain("providers.prefix(maximumItems)");
     expect(extension).toContain("providers.count - maximumItems");
     expect(extension).toContain("try? FileManager.default.removeItem(at: itemDirectory)");
+    expect(extension).not.toContain('print(');
   });
 
   it("autolinks the Apple implementation that revalidates App Group containment, file identity, MIME, and SHA", () => {
@@ -149,6 +162,10 @@ describe("iOS incoming-share native boundary", () => {
     expect(moduleSource).toContain('relativePath == "items/\\(item.itemId)/\\(fileName)"');
     expect(moduleSource).toContain("digest == sha256Hex");
     expect(moduleSource).toContain("assertMediaType(mediaType, matches: fileURL)");
+    expect(moduleSource).toContain('textBatchBytes <= incomingShareMaximumTextBatchBytes');
+    expect(moduleSource).toContain('if kind == "url" { try assertWebURL(text) }');
+    expect(moduleSource).toContain('"text": text');
+    expect(moduleSource).toContain('claim.acceptedItemProofs == (try acceptedProofs(');
   });
 
   it("durably profile-binds before consumption and removes only an exact batch after ack or discard", () => {
@@ -161,13 +178,17 @@ describe("iOS incoming-share native boundary", () => {
     expect(moduleSource).toContain("batch.binding?.profileId == profileId");
     expect(moduleSource).toContain("batch.claim?.claimId == claimId");
     expect(moduleSource).toContain("claim.surfaceOwnerKey == surfaceOwnerKey");
+    expect(moduleSource).toContain('CharacterSet(charactersIn: "\\u{001e}\\u{001f}")');
+    expect(moduleSource).toContain("claim.destinationKind == destinationKind");
+    expect(moduleSource).toContain("claim.sessionId == sessionId");
     expect(moduleSource).toContain("claim.acceptedItemIds == acceptedItemIds");
     expect(moduleSource).toContain("try assertContainedRegularDirectory(directory, root: root)");
     expect(moduleSource).toContain("FileManager.default.removeItem(at: directory)");
     expect(moduleSource).not.toMatch(/removeItem\(at:\s*(root|container)\)/u);
   });
 
-  it("routes cold, warm, foreground, and deep-link discovery only into the retained new-task transaction", () => {
+  it("keeps the native share handoff distinct from public task links", () => {
+    expect(extension).toContain('url = URL(string: "\\(hostAppScheme)://expo-sharing")');
     expect(surface).toContain("void mobileIncomingShare.refresh()");
     expect(surface).toContain('AppState.addEventListener("change"');
     expect(surface).toContain("installMobileNativeIntentLinking(Linking, offerUrl)");
@@ -176,20 +197,5 @@ describe("iOS incoming-share native boundary", () => {
     expect(nativeIntent).toContain('source.addEventListener("url"');
     expect(nativeIntent).toContain("source.getInitialURL()");
     expect(nativeIntent).toContain("acceptedWarmUrlBeforeInitial");
-    expect(surface).toContain("commitMobileIncomingShare({");
-    expect(surface).toContain("mobileNewTaskDrafts");
-    expect(surface).toContain('"incoming.useConnection"');
-    expect(surface).toContain('"incoming.preview"');
-    expect(surface).toContain('"incoming.add"');
-    expect(surface).toContain('"incoming.discardClaimed"');
-    expect(messages).toContain("Use with this connection");
-    expect(messages).toContain("Before you continue:");
-    expect(messages).toContain("Add shared files");
-    expect(messages).toContain("Discard claimed share");
-    expect(surface).toContain("mobileIncomingShareProfileRetired");
-    expect(bridge).toContain("saveIfRevision(identity, next, snapshot.revision)");
-    expect(bridge).toContain("await draftStore.flush(identity)");
-    expect(bridge).toContain("await request.acknowledge()");
-    expect(bridge).not.toMatch(/client\.create|\.send\(|credential|accessToken|refreshToken/u);
   });
 });

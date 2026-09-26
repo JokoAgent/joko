@@ -560,6 +560,15 @@ function backendAuthorityKey(backend: BackendDescriptor): string {
   ].join("\u001e");
 }
 
+const textOnlyIncomingSharePolicy: MobileAttachmentControls["policy"] = {
+  images: false,
+  files: false,
+  maximumItems: 0,
+  maximumBytes: 0,
+  imageMediaTypes: [],
+  fileMediaTypes: []
+};
+
 export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
@@ -5445,6 +5454,19 @@ export class MobileClient {
     };
   }
 
+  newTaskIncomingShareControls(targetId: string): MobileAttachmentControls | undefined {
+    const attachments = this.newTaskAttachmentControls(targetId);
+    if (attachments) return attachments;
+    const authorityKey = this.#newTaskAuthorityKey(targetId);
+    const credential = this.#credential;
+    if (!authorityKey || !credential) return undefined;
+    return {
+      profileId: credential.profileId,
+      surfaceOwnerKey: `${authorityKey}\u001fincoming-share-text`,
+      policy: textOnlyIncomingSharePolicy
+    };
+  }
+
   newTaskSessionMentionControls(targetId: string): MobileSessionMentionControls | undefined {
     const owner = this.#state.owner;
     const authorityKey = this.#newTaskAuthorityKey(targetId);
@@ -5712,6 +5734,19 @@ export class MobileClient {
       profileId: credential.profileId,
       surfaceOwnerKey: `${authorityKey}\u001fattachments\u001f${model?.authorityKey ?? "native-default"}`,
       policy
+    };
+  }
+
+  taskIncomingShareControls(): MobileAttachmentControls | undefined {
+    const attachments = this.taskAttachmentControls();
+    if (attachments) return attachments;
+    const authorityKey = this.#taskAuthorityKey();
+    const credential = this.#credential;
+    if (!authorityKey || !credential) return undefined;
+    return {
+      profileId: credential.profileId,
+      surfaceOwnerKey: `${authorityKey}\u001fincoming-share-text`,
+      policy: textOnlyIncomingSharePolicy
     };
   }
 

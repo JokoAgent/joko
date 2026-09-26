@@ -27,6 +27,18 @@ describe("mobile message catalogs", () => {
     expect(mobileMessage("ko", "devices.open", { name: "Phone" })).toBe("Phone 기기 열기");
   });
 
+  it("localizes inbound-share rejection and retry guidance in every supported locale", () => {
+    for (const locale of MOBILE_SUPPORTED_LOCALES) {
+      for (const key of ["incoming.invalidBatch", "incoming.rejectedItem", "incoming.inboxError",
+        "incoming.empty", "incoming.importedElsewhere", "incoming.actionFailed", "incoming.retry", "incoming.itemNumber"] as const) {
+        const variables = key === "incoming.itemNumber" ? { index: 2 } : undefined;
+        const message = mobileMessage(locale, key, variables);
+        expect(message.length).toBeGreaterThan(3);
+        if (locale !== "en") expect(message).not.toBe(mobileMessage("en", key, variables));
+      }
+    }
+  });
+
   it("keeps product branding Joko-owned", () => {
     for (const catalog of Object.values(mobileMessagesTesting.catalogs)) {
       expect(Object.values(catalog).join("\n")).not.toMatch(/cindy|xdt|maker/iu);

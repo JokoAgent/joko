@@ -83,6 +83,21 @@ describe("Android incoming-share native boundary", () => {
     expect(store).not.toContain("cacheDir");
   });
 
+  it("keeps text-only shares independent of URI grants and verifies bounded private text and URL payloads", () => {
+    expect(store).toContain("Intent.EXTRA_TEXT");
+    expect(store).toContain("item.text?.toString()");
+    expect(store).toContain("hasReadGrant");
+    expect(store).toContain('kind = "file"');
+    expect(store).toContain('kind = if (declaredMediaType == "text/uri-list" || validUrl) "url" else "text"');
+    expect(store).toContain("MAXIMUM_TEXT_ITEM_BYTES = 32 * 1024");
+    expect(store).toContain("MAXIMUM_URL_ITEM_BYTES = 8 * 1024");
+    expect(store).toContain("MAXIMUM_TEXT_BATCH_BYTES = 128 * 1024");
+    expect(store).toContain('relativePath = "items/$itemId/payload.txt"');
+    expect(store).toContain("readBoundedRegularFile(payload, stagingDirectory, itemLimit)");
+    expect(store).toContain("decoded.toByteArray(StandardCharsets.UTF_8).contentEquals(bytes)");
+    expect(store).not.toMatch(/openConnection|java\.net\.URL\(/u);
+  });
+
   it("fsyncs bounded copies, verifies SHA, and atomically publishes manifest and batch directories", () => {
     expect(store).toContain("output.fd.sync()");
     expect(store).toContain('MessageDigest.getInstance("SHA-256")');
@@ -106,6 +121,18 @@ describe("Android incoming-share native boundary", () => {
     expect(store).toContain("removeExactBatch(context, directory)");
     expect(store).toContain("deleteTreeWithoutFollowingLinks(directory, root)");
     expect(store).not.toMatch(/deleteTreeWithoutFollowingLinks\((?:root|context\.noBackupFilesDir)/u);
+  });
+
+  it("binds claims to exact destination and verified accepted content before acknowledgement", () => {
+    expect(moduleSource).toContain("destinationKind: String,");
+    expect(moduleSource).toContain("sessionId: String?,");
+    expect(store).toContain('destinationKind == "new_task" || destinationKind == "existing_task"');
+    expect(store).toContain('put("acceptedItemProofs", JSONArray(acceptedProofs.map(::proofJson)))');
+    expect(store).toContain('require(acceptedProofs == expectedProofs)');
+    expect(store).toContain('batch.claim.claimId == claimId');
+    expect(store).toContain('assertOpaqueText(surfaceOwnerKey, allowOwnerSeparators = true)');
+    expect(store).toContain('assertOpaqueText(policyKey, allowOwnerSeparators = false)');
+    expect(store).toContain('(character.code != 30 && character.code != 31)');
   });
 
   it("exposes the same bind, claim, acknowledge, and discard contract without create or send authority", () => {

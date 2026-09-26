@@ -1,5 +1,6 @@
 import { Platform } from "react-native";
 import { requireOptionalNativeModule } from "expo";
+import { CryptoDigestAlgorithm, digestStringAsync } from "expo-crypto";
 import {
   appendMobileComposerAttachments,
   assertMobileAttachmentCandidate,
@@ -11,6 +12,16 @@ import {
   type MobilePickedAttachmentCandidate
 } from "./mobile-attachments";
 import type { MobileAttachmentFiles } from "./mobile-attachment-files";
+import {
+  emptyMobileComposerDraft,
+  insertMobilePastedText,
+  mobileComposerMaximumAtoms,
+  normalizeMobileComposerDraft,
+  replaceMobileComposerRange,
+  type MobileComposerAtom,
+  type MobileComposerDraft
+} from "./mobile-composer-document";
+import type { MobileComposerDraftStore } from "./composer-draft-store";
 import type {
   MobileNewTaskDraft,
   MobileNewTaskDraftIdentity,
@@ -19,8 +30,9 @@ import type {
   MobileNewTaskEditableDraft
 } from "./new-task-draft-store";
 
-export interface MobileIncomingShareReadyItem {
+export interface MobileIncomingShareReadyFileItem {
   readonly state: "ready";
+  readonly kind: "file";
   readonly itemId: string;
   readonly ordinal: number;
   readonly uri: string;
@@ -29,6 +41,18 @@ export interface MobileIncomingShareReadyItem {
   readonly byteSize: number;
   readonly sha256Hex: string;
 }
+
+export interface MobileIncomingShareReadyTextItem {
+  readonly state: "ready";
+  readonly kind: "text" | "url";
+  readonly itemId: string;
+  readonly ordinal: number;
+  readonly text: string;
+  readonly byteSize: number;
+  readonly sha256Hex: string;
+}
+
+export type MobileIncomingShareReadyItem = MobileIncomingShareReadyFileItem | MobileIncomingShareReadyTextItem;
 
 export interface MobileIncomingShareRejectedItem {
   readonly state: "rejected";
@@ -49,11 +73,22 @@ interface MobileIncomingShareBatchBase {
 
 export interface MobileIncomingShareClaim {
   readonly claimId: string;
+  readonly destinationKind: "new_task" | "existing_task";
+  readonly sessionId?: string;
   readonly targetId: string;
   readonly surfaceOwnerKey: string;
   readonly policyKey: string;
   readonly acceptedItemIds: readonly string[];
+  readonly acceptedItemProofs: readonly MobileIncomingShareItemProof[];
 }
+
+export type MobileIncomingShareItemProof =
+  | { readonly itemId: string; readonly kind: "file"; readonly byteSize: number; readonly sha256Hex: string; readonly fileName: string; readonly mediaType: string }
+  | { readonly itemId: string; readonly kind: "text" | "url"; readonly byteSize: number; readonly sha256Hex: string };
+
+export type MobileIncomingShareDestination =
+  | { readonly kind: "new_task"; readonly targetId: string }
+  | { readonly kind: "existing_task"; readonly targetId: string; readonly sessionId: string };
 
 export interface MobileIncomingShareReadyBatch extends MobileIncomingShareBatchBase {
   readonly status: "ready";
@@ -83,6 +118,8 @@ export interface MobileIncomingShareNativeDriver {
   claimBatch(
     batchId: string,
     profileId: string,
+    destinationKind: MobileIncomingShareDestination["kind"],
+    sessionId: string | null,
     targetId: string,
     surfaceOwnerKey: string,
     policyKey: string,
@@ -92,12 +129,24 @@ export interface MobileIncomingShareNativeDriver {
   discardBatch(batchId: string): Promise<void>;
 }
 
-export interface MobileIncomingShareAcceptedItem extends MobilePickedAttachmentCandidate {
+interface MobileIncomingShareAcceptedBase {
   readonly itemId: string;
   readonly ordinal: number;
   readonly sha256Hex: string;
   readonly storageId: string;
 }
+
+export interface MobileIncomingShareAcceptedFileItem extends MobileIncomingShareAcceptedBase, MobilePickedAttachmentCandidate {
+  readonly kind: "file";
+}
+
+export interface MobileIncomingShareAcceptedTextItem extends MobileIncomingShareAcceptedBase {
+  readonly kind: "text" | "url";
+  readonly text: string;
+  readonly byteSize: number;
+}
+
+export type MobileIncomingShareAcceptedItem = MobileIncomingShareAcceptedFileItem | MobileIncomingShareAcceptedTextItem;
 
 export interface MobileIncomingSharePlanRejection {
   readonly itemId?: string;
@@ -156,11 +205,12 @@ export class MobileIncomingShareInbox {
   claim(
     batchId: string,
     profileId: string,
-    targetId: string,
+    destination: MobileIncomingShareDestination,
     controls: MobileAttachmentControls,
     plan: MobileIncomingSharePlan
   ): Promise<MobileIncomingShareReadyBatch> {
     return this.run(async () => {
+      assertDestination(destination);
       const batch = this.requiredBatch(batchId);
       if (batch.status !== "ready" || batch.boundProfileId !== profileId
         || controls.profileId !== profileId) {
@@ -171,13 +221,15 @@ export class MobileIncomingShareInbox {
       const next = normalizeBatch(await this.driver.claimBatch(
         batchId,
         profileId,
-        targetId,
+        destination.kind,
+        destination.kind === "existing_task" ? destination.sessionId : null,
+        destination.targetId,
         controls.surfaceOwnerKey,
         policyKey,
         acceptedItemIds
       ));
       if (next.status !== "ready" || next.batchId !== batchId || next.boundProfileId !== profileId
-        || !mobileIncomingShareClaimMatches(next, targetId, controls, plan)) {
+        || !mobileIncomingShareClaimMatches(next, destination, controls, plan)) {
         throw new Error("The native incoming-share target claim could not be confirmed.");
       }
       this.publish({ supported: true, busy: true, batch: next });
@@ -248,15 +300,21 @@ export class MobileIncomingShareInbox {
 export function planMobileIncomingShare(
   batch: MobileIncomingShareReadyBatch,
   current: readonly MobileComposerAttachment[],
-  policy: MobileAttachmentPolicy
+  policy: MobileAttachmentPolicy,
+  currentAtoms: readonly MobileComposerAtom[] = []
 ): MobileIncomingSharePlan {
   const accepted: MobileIncomingShareAcceptedItem[] = [];
   const rejected: MobileIncomingSharePlanRejection[] = [];
   const batchStorageIds = new Set(batch.items.filter(
-    (item): item is MobileIncomingShareReadyItem => item.state === "ready"
+    (item): item is MobileIncomingShareReadyFileItem => item.state === "ready" && item.kind === "file"
   ).map((item) => incomingShareStorageId(batch.batchId, item.itemId)));
   const occupiedByOtherInputs = current.filter((attachment) => !batchStorageIds.has(attachment.attachmentId)).length;
   let remaining = Math.max(0, policy.maximumItems - occupiedByOtherInputs);
+  const batchTextIds = new Set(batch.items.filter(
+    (item): item is MobileIncomingShareReadyTextItem => item.state === "ready" && item.kind !== "file"
+  ).map((item) => incomingShareStorageId(batch.batchId, item.itemId)));
+  let remainingAtoms = Math.max(0, mobileComposerMaximumAtoms
+    - currentAtoms.filter((atom) => !batchTextIds.has(atom.atomId)).length);
   for (const item of batch.items) {
     if (item.state === "rejected") {
       rejected.push({
@@ -265,6 +323,24 @@ export function planMobileIncomingShare(
         ...(item.fileName === undefined ? {} : { fileName: item.fileName }),
         reason: item.reason
       });
+      continue;
+    }
+    if (item.kind !== "file") {
+      if (remainingAtoms <= 0) {
+        rejected.push({ itemId: item.itemId, ordinal: item.ordinal,
+          reason: `A message can contain at most ${mobileComposerMaximumAtoms} structured text items.` });
+        continue;
+      }
+      accepted.push({
+        kind: item.kind,
+        itemId: item.itemId,
+        ordinal: item.ordinal,
+        text: item.text,
+        byteSize: item.byteSize,
+        sha256Hex: item.sha256Hex,
+        storageId: incomingShareStorageId(batch.batchId, item.itemId)
+      });
+      remainingAtoms -= 1;
       continue;
     }
     try {
@@ -279,6 +355,7 @@ export function planMobileIncomingShare(
         continue;
       }
       accepted.push({
+        kind: "file",
         itemId: item.itemId,
         ordinal: item.ordinal,
         uri: item.uri,
@@ -334,84 +411,137 @@ export function mobileIncomingSharePolicyKey(policy: MobileAttachmentPolicy): st
 
 export function mobileIncomingShareClaimMatches(
   batch: MobileIncomingShareReadyBatch,
-  targetId: string,
+  destination: MobileIncomingShareDestination,
   controls: MobileAttachmentControls,
   plan: MobileIncomingSharePlan
 ): boolean {
   const claim = batch.claim;
-  return claim !== undefined && claim.targetId === targetId
+  return claim !== undefined && claim.destinationKind === destination.kind
+    && claim.sessionId === (destination.kind === "existing_task" ? destination.sessionId : undefined)
+    && claim.targetId === destination.targetId
     && claim.surfaceOwnerKey === controls.surfaceOwnerKey
     && claim.policyKey === mobileIncomingSharePolicyKey(controls.policy)
-    && equalStrings(claim.acceptedItemIds, plan.accepted.map((item) => item.itemId));
+    && equalStrings(claim.acceptedItemIds, plan.accepted.map((item) => item.itemId))
+    && sameProofs(claim.acceptedItemProofs, plan.accepted.map(itemProof));
 }
 
 export interface MobileIncomingShareCommitRequest {
   readonly batch: MobileIncomingShareReadyBatch;
   readonly profileId: string;
-  readonly targetId: string;
+  readonly destination: MobileIncomingShareDestination;
   readonly controls: MobileAttachmentControls;
-  readonly draftStore: Pick<MobileNewTaskDraftStore, "readSnapshot" | "saveIfRevision" | "flush" | "readSync">;
+  readonly newTaskDraftStore: Pick<MobileNewTaskDraftStore, "readSnapshot" | "saveIfRevision" | "flush" | "readDurable">;
+  readonly composerDraftStore: Pick<MobileComposerDraftStore, "readSnapshot" | "saveIfRevision" | "flush" | "readDurable">;
   readonly attachmentFiles: Pick<MobileAttachmentFiles, "stageCandidates" | "removeOwnedBytes">;
   readonly validateAuthority: () => Promise<MobileAttachmentControls>;
   readonly acknowledge: () => Promise<void>;
+  readonly allowFreshClaim: boolean;
   readonly signal?: AbortSignal;
 }
 
-export interface MobileIncomingShareCommitResult {
-  readonly draft: MobileNewTaskEditableDraft;
+interface MobileIncomingShareCommitResultBase {
   readonly plan: MobileIncomingSharePlan;
   readonly replayed: boolean;
 }
 
+export type MobileIncomingShareCommitResult = MobileIncomingShareCommitResultBase & (
+  | { readonly destinationKind: "new_task"; readonly draft: MobileNewTaskEditableDraft }
+  | { readonly destinationKind: "existing_task"; readonly draft: MobileComposerDraft }
+);
+
 export async function commitMobileIncomingShare(
   request: MobileIncomingShareCommitRequest
 ): Promise<MobileIncomingShareCommitResult> {
-  const { batch, profileId, targetId, controls, draftStore, attachmentFiles, signal } = request;
+  const { batch, profileId, destination, controls, attachmentFiles, signal } = request;
   assertProfileId(profileId);
+  assertDestination(destination);
   if (batch.boundProfileId !== profileId || controls.profileId !== profileId) {
     throw new Error("The incoming share is not bound to the active Joko connection profile.");
   }
   signal?.throwIfAborted();
-  const identity = { profileId } satisfies MobileNewTaskDraftIdentity;
-  const snapshot = await draftStore.readSnapshot(identity);
+  await assertIncomingShareAuthority(request, controls);
+  const newTaskIdentity = { profileId } satisfies MobileNewTaskDraftIdentity;
+  const composerIdentity = destination.kind === "existing_task"
+    ? { profileId, sessionId: destination.sessionId }
+    : undefined;
+  const snapshot = destination.kind === "new_task"
+    ? await request.newTaskDraftStore.readSnapshot(newTaskIdentity)
+    : await request.composerDraftStore.readSnapshot(composerIdentity!);
   signal?.throwIfAborted();
-  const draft = requiredEditableDraft(snapshot, targetId);
-  const plan = planMobileIncomingShare(batch, draft.input.attachments, controls.policy);
-  if (!mobileIncomingShareClaimMatches(batch, targetId, controls, plan)) {
+  await assertIncomingShareAuthority(request, controls);
+  const newTaskDraft = destination.kind === "new_task"
+    ? requiredEditableDraft(snapshot as MobileNewTaskDraftSnapshot, destination.targetId)
+    : undefined;
+  const draftInput = newTaskDraft?.input
+    ?? (snapshot as Awaited<ReturnType<MobileComposerDraftStore["readSnapshot"]>>).draft
+    ?? emptyMobileComposerDraft();
+  const plan = planMobileIncomingShare(batch, draftInput.attachments, controls.policy, draftInput.atoms);
+  if (!mobileIncomingShareClaimMatches(batch, destination, controls, plan)) {
     throw new Error("The incoming share target, model, or attachment policy changed after it was claimed.");
   }
-  const existing = expectedExistingAttachments(plan.accepted, draft.input.attachments);
+  for (const item of plan.accepted) {
+    if (item.kind === "file") continue;
+    await verifyIncomingShareText(item);
+    await assertIncomingShareAuthority(request, controls);
+  }
+  const existing = expectedExistingItems(plan.accepted, draftInput);
   if (existing === "all") {
     await assertIncomingShareAuthority(request, controls);
-    await draftStore.flush(identity);
+    if (destination.kind === "new_task") await request.newTaskDraftStore.flush(newTaskIdentity);
+    else await request.composerDraftStore.flush(composerIdentity!);
+    const durableNewTask = destination.kind === "new_task"
+      ? await request.newTaskDraftStore.readDurable(newTaskIdentity) : null;
+    if (destination.kind === "new_task" && durableNewTask === null) {
+      throw new Error("The imported share could not be confirmed in the retained draft.");
+    }
+    const durable = destination.kind === "new_task"
+      ? requiredEditableDraft({ revision: 0, ...(durableNewTask === null ? {} : { draft: durableNewTask }) }, destination.targetId).input
+      : await request.composerDraftStore.readDurable(composerIdentity!);
+    if (!durable || expectedExistingItems(plan.accepted, durable) !== "all") {
+      throw new Error("The imported share could not be confirmed in the retained draft.");
+    }
+    const current = destination.kind === "new_task"
+      ? requiredEditableDraft(await request.newTaskDraftStore.readSnapshot(newTaskIdentity), destination.targetId).input
+      : (await request.composerDraftStore.readSnapshot(composerIdentity!)).draft;
+    if (!current || expectedExistingItems(plan.accepted, current) !== "all") {
+      throw new Error("The shared-content draft changed before native acknowledgement.");
+    }
     await assertIncomingShareAuthority(request, controls);
     await request.acknowledge();
-    return { draft: requiredEditableDraft(await draftStore.readSnapshot(identity), targetId), plan, replayed: true };
+    return destination.kind === "new_task"
+      ? { destinationKind: "new_task", draft: editableDraft(durableNewTask!), plan, replayed: true }
+      : { destinationKind: "existing_task", draft: durable, plan, replayed: true };
   }
   if (existing === "partial-or-mismatch") {
-    throw new Error("The retained new-task draft contains an inconsistent prior import of this share.");
+    throw new Error("The retained draft contains an inconsistent prior import of this share.");
   }
   if (plan.accepted.length === 0) {
     await assertIncomingShareAuthority(request, controls);
     await request.acknowledge();
-    return { draft, plan, replayed: false };
+    return destination.kind === "new_task"
+      ? { destinationKind: "new_task", draft: newTaskDraft!, plan, replayed: false }
+      : { destinationKind: "existing_task", draft: draftInput, plan, replayed: false };
+  }
+  if (!request.allowFreshClaim) {
+    throw new Error("The prior shared-content write is uncertain; discard this claimed share before sharing again.");
   }
 
-  for (const item of plan.accepted) await attachmentFiles.removeOwnedBytes(profileId, item.storageId);
+  const fileItems = plan.accepted.filter((item): item is MobileIncomingShareAcceptedFileItem => item.kind === "file");
+  for (const item of fileItems) {
+    await attachmentFiles.removeOwnedBytes(profileId, item.storageId);
+    await assertIncomingShareAuthority(request, controls);
+  }
   let staged: readonly MobileLocalComposerAttachment[] = [];
   let draftCommitted = false;
   try {
     let identityIndex = 0;
-    staged = await attachmentFiles.stageCandidates(
-      profileId,
-      draft.input.attachments,
-      controls.policy,
-      plan.accepted,
-      () => plan.accepted[identityIndex++]?.storageId ?? "invalid",
-      signal
+    if (fileItems.length > 0) staged = await attachmentFiles.stageCandidates(
+      profileId, draftInput.attachments, controls.policy, fileItems,
+      () => fileItems[identityIndex++]?.storageId ?? "invalid", signal
     );
-    if (staged.length !== plan.accepted.length || staged.some((attachment, index) => {
-      const expected = plan.accepted[index];
+    if (staged.length !== fileItems.length || staged.some((attachment, index) => {
+      const expected = fileItems[index];
+      if (!expected) return true;
       return attachment.attachmentId !== expected?.storageId || attachment.fileName !== expected.fileName
         || attachment.mediaType !== expected.mediaType || attachment.byteSize !== expected.byteSize
         || attachment.sha256Hex !== expected.sha256Hex;
@@ -419,29 +549,59 @@ export async function commitMobileIncomingShare(
       throw new Error("A shared file changed while it was copied into Joko.");
     }
     const latest = await assertIncomingShareAuthority(request, controls);
-    const latestPlan = planMobileIncomingShare(batch, draft.input.attachments, latest.policy);
+    const latestPlan = planMobileIncomingShare(batch, draftInput.attachments, latest.policy, draftInput.atoms);
     if (!incomingSharePlansEqual(plan, latestPlan)) {
       throw new Error("The project attachment policy changed while the shared files were being copied.");
     }
-    const next: MobileNewTaskEditableDraft = {
-      ...draft,
-      input: {
-        ...draft.input,
-        attachments: appendMobileComposerAttachments(draft.input.attachments, staged, latest.policy)
-      }
-    };
-    if (!draftStore.saveIfRevision(identity, next, snapshot.revision)) {
-      throw new Error("The new-task draft changed while the shared files were being added.");
+    let nextInput = normalizeMobileComposerDraft({
+      ...draftInput,
+      attachments: staged.length === 0 ? draftInput.attachments
+        : appendMobileComposerAttachments(draftInput.attachments, staged, latest.policy)
+    });
+    for (const item of plan.accepted) {
+      if (item.kind === "file") continue;
+      if (nextInput.text.length > 0) nextInput = replaceMobileComposerRange(nextInput, {
+        start: nextInput.text.length, end: nextInput.text.length
+      }, "\n\n").draft;
+      nextInput = insertMobilePastedText(nextInput, {
+        start: nextInput.text.length, end: nextInput.text.length
+      }, item.text, item.storageId).draft;
+    }
+    const saved = destination.kind === "new_task"
+      ? request.newTaskDraftStore.saveIfRevision(newTaskIdentity, { ...newTaskDraft!, input: nextInput }, snapshot.revision)
+      : request.composerDraftStore.saveIfRevision(composerIdentity!, nextInput, snapshot.revision);
+    if (!saved) {
+      throw new Error("The draft changed while the shared content was being added.");
     }
     draftCommitted = true;
-    await draftStore.flush(identity);
-    const durable = draftStore.readSync(identity);
-    if (!durable || expectedExistingAttachments(plan.accepted, durable.input.attachments) !== "all") {
-      throw new Error("The imported shared files could not be confirmed in the retained new-task draft.");
+    if (destination.kind === "new_task") await request.newTaskDraftStore.flush(newTaskIdentity);
+    else await request.composerDraftStore.flush(composerIdentity!);
+    const retained = destination.kind === "new_task"
+      ? await request.newTaskDraftStore.readDurable(newTaskIdentity)
+      : await request.composerDraftStore.readDurable(composerIdentity!);
+    if (retained === null) {
+      throw new Error("The imported shared content could not be confirmed in the retained draft.");
+    }
+    if (destination.kind === "new_task") {
+      requiredEditableDraft({ revision: 0, ...(retained === null ? {} : { draft: retained as MobileNewTaskDraft }) }, destination.targetId);
+    }
+    const durable: MobileComposerDraft | undefined = destination.kind === "new_task"
+      ? (retained as MobileNewTaskDraft | null)?.input
+      : (retained as MobileComposerDraft | null) ?? undefined;
+    if (!durable || expectedExistingItems(plan.accepted, durable) !== "all") {
+      throw new Error("The imported shared content could not be confirmed in the retained draft.");
+    }
+    const current = destination.kind === "new_task"
+      ? requiredEditableDraft(await request.newTaskDraftStore.readSnapshot(newTaskIdentity), destination.targetId).input
+      : (await request.composerDraftStore.readSnapshot(composerIdentity!)).draft;
+    if (!current || expectedExistingItems(plan.accepted, current) !== "all") {
+      throw new Error("The shared-content draft changed before native acknowledgement.");
     }
     await assertIncomingShareAuthority(request, controls);
     await request.acknowledge();
-    return { draft: editableDraft(durable), plan, replayed: false };
+    return destination.kind === "new_task"
+      ? { destinationKind: "new_task", draft: editableDraft(retained as MobileNewTaskDraft), plan, replayed: false }
+      : { destinationKind: "existing_task", draft: durable, plan, replayed: false };
   } catch (failure) {
     if (!draftCommitted) {
       const cleanupFailures = await cleanupStagedAttachments(attachmentFiles, profileId, staged);
@@ -479,13 +639,20 @@ async function assertIncomingShareAuthority(
   return latest;
 }
 
-function expectedExistingAttachments(
+function expectedExistingItems(
   expected: readonly MobileIncomingShareAcceptedItem[],
-  current: readonly MobileComposerAttachment[]
+  current: MobileComposerDraft
 ): "none" | "all" | "partial-or-mismatch" {
   let matches = 0;
   for (const item of expected) {
-    const attachment = current.find((candidate) => candidate.attachmentId === item.storageId);
+    if (item.kind !== "file") {
+      const atom = current.atoms.find((candidate) => candidate.atomId === item.storageId);
+      if (!atom) continue;
+      if (atom.kind !== "pasted-text" || atom.text !== item.text) return "partial-or-mismatch";
+      matches += 1;
+      continue;
+    }
+    const attachment = current.attachments.find((candidate) => candidate.attachmentId === item.storageId);
     if (!attachment) continue;
     if (attachment.state !== "local" || attachment.fileName !== item.fileName
       || attachment.mediaType !== item.mediaType || attachment.byteSize !== item.byteSize
@@ -494,6 +661,38 @@ function expectedExistingAttachments(
   }
   if (matches === 0) return "none";
   return matches === expected.length ? "all" : "partial-or-mismatch";
+}
+
+async function verifyIncomingShareText(item: MobileIncomingShareAcceptedTextItem): Promise<void> {
+  let sha256Hex: string;
+  try {
+    sha256Hex = await digestStringAsync(CryptoDigestAlgorithm.SHA256, item.text);
+  } catch {
+    throw new Error("The shared text could not be verified before import.");
+  }
+  if (sha256Hex !== item.sha256Hex) throw new Error("The shared text changed before import.");
+}
+
+function assertDestination(destination: MobileIncomingShareDestination): void {
+  assertProfileId(destination.targetId);
+  if (destination.kind === "existing_task") assertProfileId(destination.sessionId);
+}
+
+function itemProof(item: MobileIncomingShareReadyItem | MobileIncomingShareAcceptedItem): MobileIncomingShareItemProof {
+  return item.kind === "file"
+    ? { itemId: item.itemId, kind: "file", byteSize: item.byteSize, sha256Hex: item.sha256Hex,
+      fileName: item.fileName, mediaType: item.mediaType }
+    : { itemId: item.itemId, kind: item.kind, byteSize: item.byteSize, sha256Hex: item.sha256Hex };
+}
+
+function sameProofs(left: readonly MobileIncomingShareItemProof[], right: readonly MobileIncomingShareItemProof[]): boolean {
+  return left.length === right.length && left.every((proof, index) => {
+    const candidate = right[index];
+    return candidate !== undefined && proof.itemId === candidate.itemId && proof.kind === candidate.kind
+      && proof.byteSize === candidate.byteSize && proof.sha256Hex === candidate.sha256Hex
+      && (proof.kind === "file" ? candidate.kind === "file"
+        && proof.fileName === candidate.fileName && proof.mediaType === candidate.mediaType : true);
+  });
 }
 
 async function cleanupStagedAttachments(
@@ -551,6 +750,7 @@ function normalizeBatch(raw: unknown): MobileIncomingShareBatch {
   }
   const itemIds = new Set<string>();
   const ordinals = new Set<number>();
+  let textBytes = 0;
   const items = value.items.map((rawItem) => {
     const item = record(rawItem, "native incoming-share item");
     const itemId = textField(item, "itemId", 36);
@@ -572,6 +772,24 @@ function normalizeBatch(raw: unknown): MobileIncomingShareBatch {
       };
     }
     if (item.state !== "ready") throw new Error("The native incoming-share item state is invalid.");
+    if (item.kind === "text" || item.kind === "url") {
+      const text = item.text;
+      if (typeof text !== "string" || text.length === 0 || text.length > 32 * 1024
+        || text.trim().length === 0 || text.includes("\u0000")) {
+        throw new Error("The native incoming-share text is invalid.");
+      }
+      const byteSize = integerField(item, "byteSize", 1, item.kind === "url" ? 8_192 : 32 * 1024);
+      if (new TextEncoder().encode(text).byteLength !== byteSize) {
+        throw new Error("The native incoming-share text byte size is invalid.");
+      }
+      if (item.kind === "url") assertSharedUrl(text);
+      textBytes += byteSize;
+      if (textBytes > 128 * 1024) throw new Error("The native incoming-share text batch is too large.");
+      const sha256Hex = textField(item, "sha256Hex", 64);
+      if (!/^[0-9a-f]{64}$/u.test(sha256Hex)) throw new Error("The native incoming-share SHA-256 is invalid.");
+      return { state: "ready" as const, kind: item.kind as "text" | "url", itemId, ordinal, text, byteSize, sha256Hex };
+    }
+    if (item.kind !== "file") throw new Error("The native incoming-share item kind is invalid.");
     const uri = textField(item, "uri", 4_096);
     if (!/^file:\/\/\//u.test(uri) || /[\u0000-\u001f\u007f]/u.test(uri)) {
       throw new Error("The native incoming-share file URI is invalid.");
@@ -585,6 +803,7 @@ function normalizeBatch(raw: unknown): MobileIncomingShareBatch {
     if (!/^[0-9a-f]{64}$/u.test(sha256Hex)) throw new Error("The native incoming-share SHA-256 is invalid.");
     return {
       state: "ready" as const,
+      kind: "file" as const,
       itemId,
       ordinal,
       uri,
@@ -611,6 +830,16 @@ function normalizeClaim(raw: unknown, items: readonly MobileIncomingShareItem[])
   const value = record(raw, "native incoming-share claim");
   const claimId = textField(value, "claimId", 36);
   assertUuid(claimId, "incoming-share claim");
+  const destinationKind = value.destinationKind;
+  if (destinationKind !== "new_task" && destinationKind !== "existing_task") {
+    throw new Error("The native incoming-share destination kind is invalid.");
+  }
+  const sessionId = optionalTextField(value, "sessionId", 128);
+  if (destinationKind === "existing_task" && sessionId === undefined
+    || destinationKind === "new_task" && sessionId !== undefined) {
+    throw new Error("The native incoming-share task destination is invalid.");
+  }
+  if (sessionId !== undefined) assertProfileId(sessionId);
   const targetId = textField(value, "targetId", 128);
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(targetId)) {
     throw new Error("The native incoming-share target identity is invalid.");
@@ -632,7 +861,46 @@ function normalizeClaim(raw: unknown, items: readonly MobileIncomingShareItem[])
     || !equalStrings(acceptedItemIds, readyIds.filter((itemId) => acceptedItemIds.includes(itemId)))) {
     throw new Error("The native incoming-share accepted item order is invalid.");
   }
-  return { claimId, targetId, surfaceOwnerKey, policyKey, acceptedItemIds };
+  if (!Array.isArray(value.acceptedItemProofs) || value.acceptedItemProofs.length !== acceptedItemIds.length) {
+    throw new Error("The native incoming-share accepted item proofs are invalid.");
+  }
+  const acceptedItemProofs: MobileIncomingShareItemProof[] = value.acceptedItemProofs.map((rawProof, index) => {
+    const proof = record(rawProof, "native incoming-share item proof");
+    const itemId = textField(proof, "itemId", 36);
+    assertUuid(itemId, "incoming-share proof item");
+    if (itemId !== acceptedItemIds[index]) throw new Error("The native incoming-share proof order is invalid.");
+    const kind = proof.kind;
+    if (kind !== "file" && kind !== "text" && kind !== "url") {
+      throw new Error("The native incoming-share proof kind is invalid.");
+    }
+    const sha256Hex = textField(proof, "sha256Hex", 64);
+    if (!/^[0-9a-f]{64}$/u.test(sha256Hex)) throw new Error("The native incoming-share proof SHA-256 is invalid.");
+    const byteSize = integerField(proof, "byteSize", 1, kind === "file" ? 30 * 1024 * 1024 : kind === "url" ? 8_192 : 32 * 1024);
+    if (kind === "file") {
+      return { itemId, kind: "file" as const, byteSize, sha256Hex,
+        fileName: normalizeMobileAttachmentFileName(textField(proof, "fileName", 512)),
+        mediaType: textField(proof, "mediaType", 255) };
+    }
+    return { itemId, kind: kind as "text" | "url", byteSize, sha256Hex };
+  });
+  const acceptedItems = items.filter((item): item is MobileIncomingShareReadyItem => item.state === "ready")
+    .filter((item) => acceptedItemIds.includes(item.itemId));
+  if (!sameProofs(acceptedItemProofs, acceptedItems.map(itemProof))) {
+    throw new Error("The native incoming-share accepted content proof changed.");
+  }
+  return { claimId, destinationKind, ...(sessionId === undefined ? {} : { sessionId }),
+    targetId, surfaceOwnerKey, policyKey, acceptedItemIds, acceptedItemProofs };
+}
+
+function assertSharedUrl(text: string): void {
+  if (!/^https?:\/\//u.test(text) || /[\u0000-\u0020\u007f]/u.test(text)) {
+    throw new Error("The native incoming-share URL is invalid.");
+  }
+  let value: URL;
+  try { value = new URL(text); } catch { throw new Error("The native incoming-share URL is invalid."); }
+  if ((value.protocol !== "http:" && value.protocol !== "https:") || !value.hostname) {
+    throw new Error("The native incoming-share URL is invalid.");
+  }
 }
 
 function incomingShareStorageId(batchId: string, itemId: string): string {
@@ -661,11 +929,11 @@ function opaqueTextField(
   value: Record<string, unknown>,
   field: string,
   maximum: number,
-  allowUnitSeparator: boolean
+  allowAuthoritySeparators: boolean
 ): string {
   const result = value[field];
-  const invalid = allowUnitSeparator ? /[\u0000-\u001e\u007f]/u : /[\u0000-\u001f\u007f]/u;
-  if (typeof result !== "string" || result.length < 1 || result.length > maximum
+  const invalid = allowAuthoritySeparators ? /[\u0000-\u001d\u007f]/u : /[\u0000-\u001f\u007f]/u;
+  if (typeof result !== "string" || result.length < 1 || new TextEncoder().encode(result).byteLength > maximum
     || invalid.test(result)) {
     throw new Error(`The native incoming-share ${field} is invalid.`);
   }
@@ -705,6 +973,8 @@ interface NativeIncomingShareModule {
   claimBatch(
     batchId: string,
     profileId: string,
+    destinationKind: MobileIncomingShareDestination["kind"],
+    sessionId: string | null,
     targetId: string,
     surfaceOwnerKey: string,
     policyKey: string,
@@ -724,8 +994,8 @@ const nativeIncomingShareDriver: MobileIncomingShareNativeDriver = {
   supported: Platform.OS === "ios" || Platform.OS === "android",
   getNextBatch: () => appleNativeModule().getNextBatch(),
   bindBatch: (batchId, profileId) => appleNativeModule().bindBatch(batchId, profileId),
-  claimBatch: (batchId, profileId, targetId, surfaceOwnerKey, policyKey, acceptedItemIds) =>
-    appleNativeModule().claimBatch(batchId, profileId, targetId, surfaceOwnerKey, policyKey, acceptedItemIds),
+  claimBatch: (batchId, profileId, destinationKind, sessionId, targetId, surfaceOwnerKey, policyKey, acceptedItemIds) =>
+    appleNativeModule().claimBatch(batchId, profileId, destinationKind, sessionId, targetId, surfaceOwnerKey, policyKey, acceptedItemIds),
   acknowledgeBatch: (batchId, profileId, claimId) =>
     appleNativeModule().acknowledgeBatch(batchId, profileId, claimId),
   discardBatch: (batchId) => appleNativeModule().discardBatch(batchId)
