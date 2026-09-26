@@ -175,10 +175,12 @@ describe("HistoryMaintenance", () => {
     const receipt = reserveDerivedBinding(fixture.store, "active-old", "reserved-replacement", {
       opaqueRef: "native/reserved.jsonl", nativeSessionId: "reserved", generation: 1
     });
+    const replacement = receipt.binding;
+    if (replacement === undefined) throw new Error("Expected the reserved derivation binding.");
     const maintenance = new HistoryMaintenance({
       store: fixture.store,
       activeSessions: {
-        prepare: async () => [{ sessionId: "active-old", source, replacement: receipt.binding }],
+        prepare: async () => [{ sessionId: "active-old", source, replacement }],
         release: () => undefined
       },
       now: () => NOW,
@@ -391,6 +393,7 @@ function reserveDerivedBinding(
     sessionId: `derived-${operationId}`, backendId: source.backendId, backendInstanceGeneration: 0,
     targetId: source.targetId, effectiveWorkspaceRoot: "D:/workspace", binding
   });
+  if (receipt.binding === undefined) throw new Error("Recorded derivation binding is missing.");
   store.failEffectOperation(operationId, claim.operation.bodyHash, new Error("Derived product was not adopted."));
   return receipt;
 }

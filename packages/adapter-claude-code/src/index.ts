@@ -2,7 +2,8 @@ export {
   ClaudeCodeAdapter,
   CLAUDE_MANAGED_PROVIDER_SUPPORT,
   createClaudeCodeAdapter,
-  type ClaudeCodeAdapterOptions
+  type ClaudeCodeAdapterOptions,
+  type ProviderAuthenticationRevocation
 } from "./adapter.js";
 export {
   CLAUDE_AGENT_SDK_PACKAGE,
@@ -14,6 +15,7 @@ export {
   type ClaudeRemoteRuntimePort,
   type ClaudeTargetRuntime,
   type ClaudeSdkRuntime,
+  type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkQuery,
   type ClaudeSdkQueryOptions,
   type ClaudeSdkQueryParams,
@@ -41,6 +43,12 @@ export {
   type ClaudeCanUseToolOptions,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
+export {
+  ClaudeSessionStoreError,
+  type ClaudeSessionStoreOperationAccess,
+  type ClaudeSessionStoreOperationSnapshot,
+  type ClaudeSessionStoreSessionAccess
+} from "./claude-session-store.js";
 export {
   type ClaudeTextResourceResolver,
   type ClaudeTextResourceSeed

@@ -1,4 +1,8 @@
-import type { BackendAdapter, BackendDescriptor } from "@joko/core";
+import type {
+  BackendAdapter,
+  BackendAuthenticationState,
+  BackendDescriptor
+} from "@joko/core";
 import type {
   BackendDescriptorPublication,
   BackendInstanceGenerationReservation,
@@ -23,6 +27,18 @@ export interface BackendInstanceSnapshot {
   readonly descriptor: BackendDescriptor;
 }
 
+export interface BackendCandidateCleanupSnapshot {
+  readonly instanceId: string;
+  readonly generation: number;
+  readonly state: "cleanup_unknown";
+}
+
+export interface BackendRetiredCleanupSnapshot {
+  readonly instanceId: string;
+  readonly generation: number;
+  readonly state: "cleanup_unknown";
+}
+
 export interface BackendInstanceAuthority {
   reserveBackendInstanceGeneration(input: {
     readonly backendId: string;
@@ -44,15 +60,29 @@ interface UnavailableBackendInstance extends BackendInstanceSnapshot {
   readonly state: "unavailable";
 }
 
+interface BackendCandidateCleanupOwner extends BackendCandidateCleanupSnapshot {
+  readonly adapter: BackendAdapter;
+  janitor?: Promise<void>;
+}
+
+interface BackendRetiredCleanupOwner extends BackendRetiredCleanupSnapshot {
+  readonly adapter: BackendAdapter;
+  janitor?: Promise<void>;
+}
+
 type BackendInstance = AvailableBackendInstance | UnavailableBackendInstance;
 
 export interface BackendInstanceRegistryOptions {
+  /** Deterministic Host-owned capability composition applied before every durable descriptor publication. */
+  readonly projectDescriptor?: (descriptor: BackendDescriptor) => BackendDescriptor;
   /** Deadline for each graceful or hard old-generation cleanup step. */
   readonly retirementStepTimeoutMs?: number;
   /** Delay between detached exact-owner janitor attempts. */
   readonly retirementRetryDelayMs?: number;
   /** Total cleanup attempts, including the synchronous first attempt. */
   readonly retirementAttempts?: number;
+  /** Stable, content-free notification that an exact unpublished candidate still needs cleanup. */
+  readonly onCandidateCleanupUnknown?: (input: BackendCandidateCleanupSnapshot) => void;
 }
 
 export interface BackendInstanceReplacementOptions {
@@ -78,12 +108,6 @@ export interface BackendInstanceReplacementOptions {
     readonly generation: number;
     readonly adapter: BackendAdapter;
   }) => void;
-  /** Fence and drain work still owned by the previous generation before disposal. */
-  readonly drainPrevious?: (input: {
-    readonly instanceId: string;
-    readonly generation: number;
-    readonly adapter: BackendAdapter;
-  }) => Promise<void>;
   /** Post-publication cleanup is diagnostic-only; the new current is authoritative. */
   readonly onPreviousCleanupFailure?: (input: {
     readonly instanceId: string;
@@ -100,15 +124,19 @@ export interface BackendInstanceReplacementOptions {
 export class BackendInstanceRegistry {
   readonly #instances = new Map<string, BackendInstance>();
   readonly #factories = new Map<string, BackendInstanceFactory>();
-  readonly #retirementJanitors = new Map<string, Promise<void>>();
+  readonly #candidateCleanupOwners = new Map<string, BackendCandidateCleanupOwner>();
+  readonly #retiredCleanupOwners = new Map<string, BackendRetiredCleanupOwner>();
   readonly #retirementStepTimeoutMs: number;
   readonly #retirementRetryDelayMs: number;
   readonly #retirementAttempts: number;
+  readonly #projectDescriptor: (descriptor: BackendDescriptor) => BackendDescriptor;
+  readonly #onCandidateCleanupUnknown?: (input: BackendCandidateCleanupSnapshot) => void;
 
   constructor(
     private readonly authority: BackendInstanceAuthority,
     options: BackendInstanceRegistryOptions = {}
   ) {
+    this.#projectDescriptor = options.projectDescriptor ?? ((descriptor) => descriptor);
     this.#retirementStepTimeoutMs = positiveSafeInteger(
       options.retirementStepTimeoutMs ?? 10_000,
       "Backend retirement step timeout"
@@ -121,6 +149,7 @@ export class BackendInstanceRegistry {
       options.retirementAttempts ?? 3,
       "Backend retirement attempt count"
     );
+    this.#onCandidateCleanupUnknown = options.onCandidateCleanupUnknown;
   }
 
   async provision(factories: readonly BackendInstanceFactory[]): Promise<readonly BackendInstanceSnapshot[]> {
@@ -149,10 +178,9 @@ export class BackendInstanceRegistry {
         this.#instances.set(published.instanceId, published);
       }
     } catch (error) {
-      const adapters = new Set(prepared
-        .filter((candidate): candidate is AvailableBackendInstance => candidate.state === "available")
-        .map((candidate) => candidate.adapter));
-      await Promise.all([...adapters].map((adapter) => this.#disposeAdapter(adapter)));
+      const candidates = prepared
+        .filter((candidate): candidate is AvailableBackendInstance => candidate.state === "available");
+      await Promise.all(candidates.map((candidate) => this.#cleanupRejectedCandidate(candidate)));
       this.#instances.clear();
       this.#factories.clear();
       throw error;
@@ -174,6 +202,20 @@ export class BackendInstanceRegistry {
     return [...this.#instances.values()]
       .filter((instance): instance is AvailableBackendInstance => instance.state === "available")
       .map((instance) => instance.adapter);
+  }
+
+  candidateCleanupSnapshots(): readonly BackendCandidateCleanupSnapshot[] {
+    return [...this.#candidateCleanupOwners.values()]
+      .map(({ instanceId, generation, state }) => ({ instanceId, generation, state }))
+      .sort((left, right) => left.instanceId.localeCompare(right.instanceId, "en")
+        || left.generation - right.generation);
+  }
+
+  retiredCleanupSnapshots(): readonly BackendRetiredCleanupSnapshot[] {
+    return [...this.#retiredCleanupOwners.values()]
+      .map(({ instanceId, generation, state }) => ({ instanceId, generation, state }))
+      .sort((left, right) => left.instanceId.localeCompare(right.instanceId, "en")
+        || left.generation - right.generation);
   }
 
   get(instanceId: string): BackendInstanceSnapshot {
@@ -210,7 +252,7 @@ export class BackendInstanceRegistry {
     }
     const refreshed: AvailableBackendInstance = {
       ...current,
-      descriptor: normalizeDescriptor(described, current.descriptor.adapterKind, current.generation)
+      descriptor: this.#normalizeDescriptor(described, current.descriptor.adapterKind, current.generation)
     };
     const publication = this.authority.publishBackendInstanceDescriptor({
       descriptor: refreshed.descriptor,
@@ -223,6 +265,67 @@ export class BackendInstanceRegistry {
     // Durable publication precedes the process-local pointer update and no
     // await separates the two authority changes.
     this.#instances.set(instanceId, refreshed);
+    return this.get(instanceId);
+  }
+
+  /**
+   * Publish a credential-free, fail-closed Provider projection for the exact
+   * current process generation. This is used when the credential owner has
+   * changed state but native descriptor discovery cannot be trusted to
+   * complete. It deliberately keeps the current Adapter object reachable so
+   * public re-authentication can recover the same process generation.
+   */
+  projectProviderAuthentication(
+    instanceId: string,
+    providerId: string,
+    authenticationState: BackendAuthenticationState
+  ): BackendInstanceSnapshot {
+    const current = this.#instances.get(instanceId);
+    if (current === undefined) throw new Error(`Unknown Backend instance: ${instanceId}`);
+    if (current.state !== "available") {
+      throw new Error(`Unavailable Backend instance cannot project Provider authentication: ${instanceId}`);
+    }
+    const normalizedProviderId = providerId.trim();
+    if (normalizedProviderId === "" || normalizedProviderId !== providerId) {
+      throw new Error("Provider identity must be a non-empty normalized string.");
+    }
+    const providerOwned = current.descriptor.providers?.some((provider) =>
+      provider.providerId === normalizedProviderId) === true;
+    const modelOwned = current.descriptor.models.some((model) =>
+      model.providerId === normalizedProviderId);
+    if (!providerOwned && !modelOwned) {
+      throw new Error(`Backend Provider is not owned by the current descriptor: ${instanceId}/${normalizedProviderId}`);
+    }
+
+    const providers = current.descriptor.providers?.map((provider) => provider.providerId === normalizedProviderId
+      ? { ...provider, authenticationState }
+      : provider);
+    const available = authenticationAvailable(authenticationState);
+    const projectedDescriptor = this.#normalizeDescriptor({
+      ...current.descriptor,
+      authenticationState: aggregateAuthenticationState(
+        providers,
+        current.descriptor.models.some((model) => model.providerId !== normalizedProviderId)
+          ? current.descriptor.authenticationState
+          : authenticationState
+      ),
+      ...(providers === undefined ? {} : { providers }),
+      models: available
+        ? current.descriptor.models
+        : current.descriptor.models.filter((model) => model.providerId !== normalizedProviderId)
+    }, current.descriptor.adapterKind, current.generation);
+    const publication = this.authority.publishBackendInstanceDescriptor({
+      descriptor: projectedDescriptor,
+      expectedCurrentGeneration: current.generation
+    });
+    if (publication.status === "stale") {
+      throw new Error(`Backend Provider authentication projection lost its current-generation fence: ${instanceId}`);
+    }
+    if (this.#instances.get(instanceId) !== current) {
+      throw new Error(`Backend instance changed while Provider authentication was being projected: ${instanceId}`);
+    }
+    const projected: AvailableBackendInstance = { ...current, descriptor: projectedDescriptor };
+    this.#instances.set(instanceId, projected);
     return this.get(instanceId);
   }
 
@@ -244,16 +347,17 @@ export class BackendInstanceRegistry {
     if (reservation.expectedCurrentGeneration !== previous.generation) {
       throw new Error(`Backend durable current generation changed before replacement: ${factory.instanceId}`);
     }
-    let candidate = await this.#prepare(factory, reservation.generation);
+    const protectedAdapters = new Set(this.availableAdapters());
+    let candidate = await this.#prepare(factory, reservation.generation, protectedAdapters);
     if (previous.state === "available" && candidate.state === "available" && candidate.adapter === previous.adapter) {
       throw new Error(`Backend replacement factory reused the current Adapter object: ${instanceId}`);
     }
     if (candidate.state === "unavailable" || !replacementCandidateAccepted(candidate.descriptor)) {
-      if (candidate.state === "available") await this.#disposeAdapter(candidate.adapter);
+      if (candidate.state === "available") await this.#cleanupRejectedCandidate(candidate);
       throw new Error(`Backend replacement candidate failed validation: ${instanceId}`);
     }
     if (this.#instances.get(factory.instanceId) !== previous) {
-      await this.#disposeAdapter(candidate.adapter);
+      await this.#cleanupRejectedCandidate(candidate);
       throw new Error(`Backend instance changed during replacement: ${factory.instanceId}`);
     }
 
@@ -277,7 +381,7 @@ export class BackendInstanceRegistry {
       }
       candidate = {
         ...candidate,
-        descriptor: normalizeDescriptor(refreshedDescriptor, factory.adapterKind, candidate.generation)
+        descriptor: this.#normalizeDescriptor(refreshedDescriptor, factory.adapterKind, candidate.generation)
       };
       if (!replacementCandidateAccepted(candidate.descriptor)) {
         throw new Error(`Backend replacement candidate failed validation after preparation: ${instanceId}`);
@@ -293,11 +397,11 @@ export class BackendInstanceRegistry {
       });
       published = publication.status === "published";
     } catch (error) {
-      if (!published) await this.#disposeAdapter(candidate.adapter);
+      if (!published) await this.#cleanupRejectedCandidate(candidate);
       throw error;
     }
     if (publication.status === "stale") {
-      await this.#disposeAdapter(candidate.adapter);
+      await this.#cleanupRejectedCandidate(candidate);
       throw new Error(`Backend descriptor publication lost its current-generation fence: ${factory.instanceId}`);
     }
 
@@ -320,21 +424,72 @@ export class BackendInstanceRegistry {
     const adapters = this.availableAdapters();
     this.#instances.clear();
     this.#factories.clear();
-    await Promise.allSettled(this.#retirementJanitors.values());
-    this.#retirementJanitors.clear();
+    const failures: unknown[] = [];
+    try {
+      await this.disposeRetainedCleanups();
+    } catch (error) {
+      failures.push(error);
+    }
     const results = await Promise.all(adapters.map((adapter) => this.#disposeAdapter(adapter)));
-    const failures = results.flatMap((result, index) => result
+    failures.push(...results.flatMap((result, index) => result
       ? []
-      : [new Error(`Backend instance cleanup remained unconfirmed: ${adapters[index]!.id}`)]);
+      : [new Error(`Backend instance cleanup remained unconfirmed: ${adapters[index]!.id}`)]));
     if (failures.length > 0) throw new AggregateError(failures, "Backend instance disposal failed.");
+  }
+
+  async disposeRetainedCleanups(): Promise<void> {
+    await Promise.allSettled([
+      ...[...this.#candidateCleanupOwners.values()]
+        .flatMap((owner) => owner.janitor === undefined ? [] : [owner.janitor]),
+      ...[...this.#retiredCleanupOwners.values()]
+        .flatMap((owner) => owner.janitor === undefined ? [] : [owner.janitor])
+    ]);
+    const owners = [
+      ...[...this.#candidateCleanupOwners.values()].map((owner) => ({ kind: "candidate" as const, owner })),
+      ...[...this.#retiredCleanupOwners.values()].map((owner) => ({ kind: "retired" as const, owner }))
+    ];
+    const results = await Promise.all(owners.map(({ owner }) => this.#disposeAdapter(owner.adapter)));
+    const failures: Error[] = [];
+    for (let index = 0; index < owners.length; index += 1) {
+      const { kind, owner } = owners[index]!;
+      if (results[index]) {
+        const key = cleanupKey(owner);
+        if (kind === "candidate") {
+          if (this.#candidateCleanupOwners.get(key) === owner) this.#candidateCleanupOwners.delete(key);
+        } else if (this.#retiredCleanupOwners.get(key) === owner) {
+          this.#retiredCleanupOwners.delete(key);
+        }
+      } else {
+        failures.push(new Error(
+          `Backend ${kind} cleanup remained unconfirmed: ${owner.instanceId} generation ${owner.generation}`
+        ));
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Backend retained cleanup remained unconfirmed.");
+    }
   }
 
   async #retirePrevious(
     previous: AvailableBackendInstance,
     options: BackendInstanceReplacementOptions
   ): Promise<void> {
-    const initialClean = await this.#retirementAttempt(previous, options, true);
-    if (initialClean) return;
+    if (await this.#disposeAdapter(previous.adapter)) return;
+    const key = cleanupKey(previous);
+    const existing = this.#retiredCleanupOwners.get(key);
+    if (existing !== undefined) {
+      if (existing.adapter !== previous.adapter) {
+        throw new Error(`Backend retired cleanup owner changed for ${previous.instanceId} generation ${previous.generation}.`);
+      }
+      return;
+    }
+    const owner: BackendRetiredCleanupOwner = {
+      instanceId: previous.instanceId,
+      generation: previous.generation,
+      state: "cleanup_unknown",
+      adapter: previous.adapter
+    };
+    this.#retiredCleanupOwners.set(key, owner);
     try {
       options.onPreviousCleanupFailure?.({
         instanceId: previous.instanceId,
@@ -344,46 +499,24 @@ export class BackendInstanceRegistry {
       // Diagnostic sinks cannot roll back a durably current generation.
     }
     if (this.#retirementAttempts <= 1) return;
-    const key = `${previous.instanceId}\0${previous.generation}`;
-    const janitor = this.#runRetirementJanitor(previous, options)
+    const janitor = this.#runRetiredCleanupJanitor(owner)
       .finally(() => {
-        if (this.#retirementJanitors.get(key) === janitor) this.#retirementJanitors.delete(key);
+        if (owner.janitor === janitor) owner.janitor = undefined;
       });
-    this.#retirementJanitors.set(key, janitor);
+    owner.janitor = janitor;
     // The new generation is already durable current. Cleanup retries retain
     // only the exact retired Adapter object and must not delay new dispatch.
     void janitor.catch(() => undefined);
   }
 
-  async #runRetirementJanitor(
-    previous: AvailableBackendInstance,
-    options: BackendInstanceReplacementOptions
-  ): Promise<void> {
+  async #runRetiredCleanupJanitor(owner: BackendRetiredCleanupOwner): Promise<void> {
     for (let attempt = 1; attempt < this.#retirementAttempts; attempt += 1) {
       await delay(this.#retirementRetryDelayMs);
-      if (await this.#retirementAttempt(previous, options, false)) return;
+      if (!await this.#disposeAdapter(owner.adapter)) continue;
+      const key = cleanupKey(owner);
+      if (this.#retiredCleanupOwners.get(key) === owner) this.#retiredCleanupOwners.delete(key);
+      return;
     }
-  }
-
-  async #retirementAttempt(
-    previous: AvailableBackendInstance,
-    options: BackendInstanceReplacementOptions,
-    drain: boolean
-  ): Promise<boolean> {
-    let clean = true;
-    if (drain && options.drainPrevious !== undefined) {
-      const drained = await settleBeforeDeadline(
-        Promise.resolve().then(() => options.drainPrevious!({
-          instanceId: previous.instanceId,
-          generation: previous.generation,
-          adapter: previous.adapter
-        })),
-        this.#retirementStepTimeoutMs
-      );
-      clean &&= drained;
-    }
-    const disposed = await this.#disposeAdapter(previous.adapter);
-    return clean && disposed;
   }
 
   async #disposeAdapter(adapter: BackendAdapter): Promise<boolean> {
@@ -398,6 +531,53 @@ export class BackendInstanceRegistry {
     );
   }
 
+  async #cleanupRejectedCandidate(candidate: AvailableBackendInstance): Promise<boolean> {
+    const key = cleanupKey(candidate);
+    const existing = this.#candidateCleanupOwners.get(key);
+    if (existing !== undefined) {
+      if (existing.adapter !== candidate.adapter) {
+        throw new Error(`Backend candidate cleanup owner changed for ${candidate.instanceId} generation ${candidate.generation}.`);
+      }
+      return false;
+    }
+    if (await this.#disposeAdapter(candidate.adapter)) return true;
+
+    const owner: BackendCandidateCleanupOwner = {
+      instanceId: candidate.instanceId,
+      generation: candidate.generation,
+      state: "cleanup_unknown",
+      adapter: candidate.adapter
+    };
+    this.#candidateCleanupOwners.set(key, owner);
+    try {
+      this.#onCandidateCleanupUnknown?.({
+        instanceId: owner.instanceId,
+        generation: owner.generation,
+        state: owner.state
+      });
+    } catch {
+      // Diagnostic sinks cannot replace the original candidate failure.
+    }
+    if (this.#retirementAttempts > 1) {
+      const janitor = this.#runCandidateCleanupJanitor(owner).finally(() => {
+        if (owner.janitor === janitor) owner.janitor = undefined;
+      });
+      owner.janitor = janitor;
+      void janitor.catch(() => undefined);
+    }
+    return false;
+  }
+
+  async #runCandidateCleanupJanitor(owner: BackendCandidateCleanupOwner): Promise<void> {
+    for (let attempt = 1; attempt < this.#retirementAttempts; attempt += 1) {
+      await delay(this.#retirementRetryDelayMs);
+      if (!await this.#disposeAdapter(owner.adapter)) continue;
+      const key = cleanupKey(owner);
+      if (this.#candidateCleanupOwners.get(key) === owner) this.#candidateCleanupOwners.delete(key);
+      return;
+    }
+  }
+
   async #publishProvisioned(
     candidate: BackendInstance,
     reservation: BackendInstanceGenerationReservation
@@ -410,14 +590,18 @@ export class BackendInstanceRegistry {
     });
     if (publication.status === "published") return candidate;
 
-    if (candidate.state === "available") await this.#disposeAdapter(candidate.adapter);
+    if (candidate.state === "available") await this.#cleanupRejectedCandidate(candidate);
     if (publication.current === undefined) {
       throw new Error(`Backend descriptor publication has no durable current: ${candidate.instanceId}`);
     }
     return unavailableCurrent(publication.current);
   }
 
-  async #prepare(factory: BackendInstanceFactory, generation: number): Promise<BackendInstance> {
+  async #prepare(
+    factory: BackendInstanceFactory,
+    generation: number,
+    protectedAdapters: ReadonlySet<BackendAdapter> = new Set()
+  ): Promise<BackendInstance> {
     validateFactory(factory);
     let adapter: BackendAdapter | undefined;
     try {
@@ -433,11 +617,19 @@ export class BackendInstanceRegistry {
         instanceId: factory.instanceId,
         generation,
         state: "available",
-        descriptor: normalizeDescriptor(descriptor, factory.adapterKind, generation),
+        descriptor: this.#normalizeDescriptor(descriptor, factory.adapterKind, generation),
         adapter
       };
     } catch {
-      if (adapter !== undefined) await this.#disposeAdapter(adapter);
+      if (adapter !== undefined && !protectedAdapters.has(adapter)) {
+        await this.#cleanupRejectedCandidate({
+          instanceId: factory.instanceId,
+          generation,
+          state: "available",
+          descriptor: unavailableDescriptor(factory, generation),
+          adapter
+        });
+      }
       return {
         instanceId: factory.instanceId,
         generation,
@@ -445,6 +637,15 @@ export class BackendInstanceRegistry {
         descriptor: unavailableDescriptor(factory, generation)
       };
     }
+  }
+
+  #normalizeDescriptor(descriptor: BackendDescriptor, adapterKind: string, generation: number): BackendDescriptor {
+    const normalized = normalizeDescriptor(descriptor, adapterKind, generation);
+    const projected = this.#projectDescriptor(normalized);
+    if (projected.id !== normalized.id) {
+      throw new Error("Backend descriptor projection changed its registered identity.");
+    }
+    return normalizeDescriptor(projected, adapterKind, generation);
   }
 }
 
@@ -455,6 +656,10 @@ function unavailableCurrent(current: StoredBackend): UnavailableBackendInstance 
     state: "unavailable",
     descriptor: current.descriptor
   };
+}
+
+function cleanupKey(input: { readonly instanceId: string; readonly generation: number }): string {
+  return `${input.instanceId}\0${input.generation}`;
 }
 
 function assertUniqueFactories(factories: readonly BackendInstanceFactory[]): void {
@@ -518,6 +723,30 @@ function normalizeDescriptor(
 function replacementCandidateAccepted(descriptor: BackendDescriptor): boolean {
   return descriptor.health !== "unavailable"
     && (descriptor.installationState === "installed" || descriptor.installationState === "update_available");
+}
+
+function authenticationAvailable(state: BackendAuthenticationState): boolean {
+  return state === "authenticated" || state === "not_required";
+}
+
+function aggregateAuthenticationState(
+  providers: BackendDescriptor["providers"],
+  fallback: BackendAuthenticationState
+): BackendAuthenticationState {
+  if (providers === undefined || providers.length === 0) return fallback;
+  const states = new Set(providers.map((provider) => provider.authenticationState));
+  for (const state of [
+    "authenticated",
+    "not_required",
+    "refreshing",
+    "pending",
+    "expired",
+    "error",
+    "signed_out"
+  ] as const) {
+    if (states.has(state)) return state;
+  }
+  return fallback;
 }
 
 async function settleBeforeDeadline(task: Promise<unknown>, timeoutMs: number): Promise<boolean> {

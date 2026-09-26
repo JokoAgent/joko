@@ -130,6 +130,9 @@ export interface NativeAuthRecoveryPort {
     readonly publicKey: string;
     readonly expiresAt: number;
   }): Promise<{ readonly reservationId: string; readonly expiresAt: number }>;
+  revokeReservation(input: NativeAuthRecoveryScope & {
+    readonly reservationId: string;
+  }): Promise<boolean>;
   verifyRunnerProof(input: NativeAuthRecoveryScope & {
     readonly action: "acquire" | "validate" | "release";
     readonly proof: NativeAuthRunnerProof;
@@ -177,6 +180,7 @@ export interface NativeAuthRecoveryPort {
   abortTransition(transitionId: string | undefined): Promise<void>;
   complete(recoveryId: string, expiresAt: number): Promise<void>;
   revoke(recoveryId: string): Promise<void>;
+  revokeProvider(providerId: string): Promise<number>;
   revokeScope(input: {
     readonly sessionId: string;
     readonly targetId: string;
@@ -371,6 +375,27 @@ export class NativeAuthRecoveryStore implements NativeAuthRecoveryPort {
       return reservation;
     });
     return { reservationId: stored.id, expiresAt: stored.expiresAt };
+  }
+
+  async revokeReservation(input: NativeAuthRecoveryScope & {
+    readonly reservationId: string;
+  }): Promise<boolean> {
+    this.#assertInitialized();
+    if (!validScope(input) || !UUID_PATTERN.test(input.reservationId)) {
+      throw new Error("Native auth runner reservation revocation scope is invalid.");
+    }
+    return await this.#withLock(async () => {
+      this.#purgeExpired();
+      const index = this.#catalog.reservations.findIndex((candidate) => candidate.id === input.reservationId);
+      if (index < 0) return false;
+      const reservation = this.#catalog.reservations[index];
+      if (reservation === undefined || !reservationScopeMatches(reservation, input)) {
+        throw new Error("Native auth runner reservation revocation scope is stale or mismatched.");
+      }
+      this.#catalog.reservations.splice(index, 1);
+      await this.#writeCatalog();
+      return true;
+    });
   }
 
   verifyRunnerProof(input: NativeAuthRecoveryScope & {
@@ -719,6 +744,29 @@ export class NativeAuthRecoveryStore implements NativeAuthRecoveryPort {
       const before = this.#catalog.records.length;
       this.#removeRecord(recoveryId);
       if (this.#catalog.records.length !== before) await this.#writeCatalog();
+    });
+  }
+
+  async revokeProvider(providerId: string): Promise<number> {
+    this.#assertInitialized();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(providerId)) {
+      throw new Error("Native auth recovery Provider revocation scope is invalid.");
+    }
+    return await this.#withLock(async () => {
+      this.#purgeExpired();
+      const removedDigests = new Set(this.#catalog.records
+        .filter((record) => record.providerId === providerId)
+        .map((record) => record.digest));
+      const reservationCount = this.#catalog.reservations.filter((reservation) =>
+        reservation.providerId === providerId).length;
+      if (removedDigests.size === 0 && reservationCount === 0) return 0;
+      this.#catalog.records = this.#catalog.records.filter((record) => !removedDigests.has(record.digest));
+      this.#catalog.transitions = this.#catalog.transitions.filter((transition) =>
+        !removedDigests.has(transition.sourceDigest) && transition.providerId !== providerId);
+      this.#catalog.reservations = this.#catalog.reservations.filter((reservation) =>
+        reservation.providerId !== providerId);
+      await this.#writeCatalog();
+      return removedDigests.size + reservationCount;
     });
   }
 

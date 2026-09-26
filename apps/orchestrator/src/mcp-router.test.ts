@@ -1271,6 +1271,178 @@ describe("McpRouter", () => {
     }
   });
 
+  it("fences in-flight native-auth reservations and restores only a post-reconciliation grant", async () => {
+    const durable = await createNativeRecoveryRun();
+    try {
+      const credential = {
+        type: "oauth",
+        access: `fenced-access-${randomUUID()}`,
+        refresh: `fenced-refresh-${randomUUID()}`
+      };
+      const nativeAuth: PiNativeAuthLeaseSource = {
+        describe: (providerId) => ({
+          accountId: `${providerId}-account`,
+          authGeneration: `${providerId}-auth`,
+          catalogGeneration: 49,
+          authenticated: true
+        }),
+        load: ({ providerIds }) => ({
+          catalogGeneration: 49,
+          credentials: Object.fromEntries(providerIds.map((providerId) => [providerId, credential]))
+        }),
+        persist: async () => ({ catalogGeneration: 49 })
+      };
+      const realRecovery = nativeRecoveryFor(durable, Date.now, false);
+      const reservationStarted = deferred<void>();
+      const finishReservation = deferred<void>();
+      let gateFirstReservation = false;
+      const recovery = new Proxy(realRecovery, {
+        get(target, property, receiver) {
+          if (property === "reserve") {
+            return async (input: Parameters<NativeAuthRecoveryPort["reserve"]>[0]) => {
+              if (gateFirstReservation) {
+                gateFirstReservation = false;
+                reservationStarted.resolve();
+                await finishReservation.promise;
+              }
+              return target.reserve(input);
+            };
+          }
+          const value = Reflect.get(target, property, receiver) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      }) as NativeAuthRecoveryPort;
+      const current = await fixture({
+        nativeAuth,
+        nativeAuthRecovery: recovery,
+        trustedManagedRunnerScriptSha256: durable.runnerScriptSha256
+      });
+      const snapshot = () => current.router.createPiBridgeSnapshot({
+        endpoint: "http://127.0.0.1:4318/internal/mcp",
+        expectedPiGeneration: 1,
+        nativeAuthLease: {
+          endpoint: "http://127.0.0.1:4318/internal/pi-native-auth",
+          catalogGeneration: 49,
+          providerIds: ["native-provider", "sibling-provider"],
+          authenticatedProviderIds: ["native-provider", "sibling-provider"]
+        }
+      });
+      const oldBridge = snapshot();
+      const reservationInput = (bridge: typeof oldBridge, providerId: string, publicKey?: string) => ({
+        authorization: `Bearer ${bridge.mcpBridge.token}`,
+        launchAuthorization: bridge.mcpBridge.nativeAuthReservationToken,
+        generation: 1,
+        runnerProductGeneration: 1,
+        sessionId: "session-1",
+        targetId: "target-1",
+        providerId,
+        catalogGeneration: 49,
+        runId: randomUUID(),
+        runnerFence: randomUUID(),
+        publicKey: publicKey ?? generateKeyPairSync("ed25519").publicKey
+          .export({ format: "der", type: "spki" }).toString("base64url")
+      });
+      const targetKeys = generateKeyPairSync("ed25519");
+      const siblingKeys = generateKeyPairSync("ed25519");
+      const targetReservationInput = reservationInput(
+        oldBridge,
+        "native-provider",
+        targetKeys.publicKey.export({ format: "der", type: "spki" }).toString("base64url")
+      );
+      const siblingReservationInput = reservationInput(
+        oldBridge,
+        "sibling-provider",
+        siblingKeys.publicKey.export({ format: "der", type: "spki" }).toString("base64url")
+      );
+      const targetReservation = await current.router.reserveNativeAuthRunner(targetReservationInput);
+      const siblingReservation = await current.router.reserveNativeAuthRunner(siblingReservationInput);
+      const verifyReservation = (
+        input: typeof targetReservationInput,
+        reservationId: string,
+        privateKey: KeyObject
+      ) => realRecovery.verifyRunnerProof({
+        sessionId: input.sessionId,
+        targetId: input.targetId,
+        serviceGeneration: input.generation,
+        runnerProductGeneration: input.runnerProductGeneration,
+        providerId: input.providerId,
+        catalogGeneration: input.catalogGeneration,
+        runId: input.runId,
+        runnerFence: input.runnerFence,
+        action: "acquire",
+        proof: signedRouterProof(input, { reservationId, privateKey, runnerPid: durable.runnerPid }, "acquire"),
+        credentialDigest: createHash("sha256").update("").digest("hex"),
+        location: "local"
+      });
+      expect(() => verifyReservation(
+        targetReservationInput,
+        targetReservation.reservationId,
+        targetKeys.privateKey
+      )).not.toThrow();
+      expect(() => verifyReservation(
+        siblingReservationInput,
+        siblingReservation.reservationId,
+        siblingKeys.privateKey
+      )).not.toThrow();
+
+      gateFirstReservation = true;
+      const crossedReservationInput = reservationInput(oldBridge, "native-provider");
+      const pending = current.router.reserveNativeAuthRunner(crossedReservationInput);
+      await reservationStarted.promise;
+
+      const fence = current.router.fenceNativeAuthProvider("native-provider");
+      let settled = false;
+      void fence.settlement.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      const duringFenceBridge = snapshot();
+      await expect(current.router.reserveNativeAuthRunner(reservationInput(oldBridge, "native-provider")))
+        .rejects.toThrow(/route is revoked/iu);
+      await expect(current.router.reserveNativeAuthRunner(reservationInput(oldBridge, "sibling-provider")))
+        .resolves.toMatchObject({ reserved: true });
+
+      finishReservation.resolve();
+      await expect(pending).rejects.toThrow(/route changed/iu);
+      await fence.settlement;
+      expect(settled).toBe(true);
+      expect(current.router.reconcileNativeAuthProvider("native-provider", {})).toBe(false);
+      expect(current.router.reconcileNativeAuthProvider("native-provider", fence.routeToken)).toBe(true);
+      expect(() => verifyReservation(
+        targetReservationInput,
+        targetReservation.reservationId,
+        targetKeys.privateKey
+      )).toThrow(/outside its reservation scope/iu);
+      expect(() => verifyReservation(
+        siblingReservationInput,
+        siblingReservation.reservationId,
+        siblingKeys.privateKey
+      )).not.toThrow();
+      const catalogAfterFence = JSON.parse(await readFile(join(durable.stateRoot, "leases.json"), "utf8")) as {
+        reservations: Array<{ readonly providerId: string; readonly runId: string }>;
+      };
+      expect(catalogAfterFence.reservations).toContainEqual(
+        expect.objectContaining({ providerId: "sibling-provider", runId: siblingReservationInput.runId })
+      );
+      expect(catalogAfterFence.reservations.every((reservation) =>
+        reservation.providerId === "sibling-provider")).toBe(true);
+      expect(catalogAfterFence.reservations.some((reservation) =>
+        reservation.runId === crossedReservationInput.runId
+        || reservation.runId === targetReservationInput.runId)).toBe(false);
+      await expect(current.router.reserveNativeAuthRunner(reservationInput(oldBridge, "native-provider")))
+        .rejects.toThrow(/outside this runtime snapshot/iu);
+      await expect(current.router.reserveNativeAuthRunner(reservationInput(duringFenceBridge, "native-provider")))
+        .rejects.toThrow(/outside this runtime snapshot/iu);
+      const freshBridge = snapshot();
+      await expect(current.router.reserveNativeAuthRunner(reservationInput(freshBridge, "native-provider")))
+        .resolves.toMatchObject({ reserved: true });
+
+      await current.router.dispose();
+      current.store.close();
+    } finally {
+      await rm(durable.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    }
+  });
+
   it("accepts only MAC-attested remote runners across a service bearer rotation", async () => {
     let now = 70_000;
     const durable = await createNativeRecoveryRun();

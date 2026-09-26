@@ -4,6 +4,8 @@ import { PassThrough, Writable } from "node:stream";
 
 import { loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
 import type {
+  ClaudeSessionStoreOperationAccess,
+  ClaudeSessionStoreSessionAccess,
   ClaudePermissionResult,
   ClaudeSdkQueryOptions,
   ClaudeSdkQueryParams,
@@ -403,6 +405,164 @@ describe("RemoteClaudeRuntimeResolver", () => {
     });
     expect(fixture.processes.frames.filter((frame) => frame.method === "owner.reconcile")).toHaveLength(0);
   });
+
+  it("keeps the primary installation root while importing and forking a stored Session in an exact derived cwd", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const source = await fixture.resolver.resolve(fixture.target);
+    const derivedTarget: TargetDescriptor = { ...fixture.target, workspaceRoot: "/srv/worktrees/child" };
+    const derived = await fixture.resolver.resolve(derivedTarget);
+    const sourceStore = source.runtime.storedSessions;
+    const targetStore = derived.runtime.storedSessions;
+    expect(source.runtime.supportsWorkspaceDerivation).toBe(true);
+    expect(sourceStore).toBeDefined();
+    expect(targetStore).toBeDefined();
+    expect(derived.workspaceRoot).toBe("/srv/worktrees/child");
+    expect(fixture.processes.requests.filter((request) => request.executable === "/bin/sh")
+      .map((request) => request.cwd)).toEqual(["/srv/project", "/srv/project"]);
+    const sourceWorkspaceAuthority = workspaceAuthority(fixture.target);
+    const targetWorkspaceAuthority = workspaceAuthority(derivedTarget);
+    const operationId = "99999999-9999-4999-8999-999999999991";
+    const access = await sourceStore!.prepareImport({
+      operationId, sourceWorkspaceAuthority, sourceSessionId: SESSION_ID, targetWorkspaceAuthority
+    });
+    expect(sourceStore!.ownsOperation(operationId)).toBe(true);
+    await sourceStore!.importSession(SESSION_ID, {
+      access, dir: source.workspaceRoot, signal: new AbortController().signal
+    });
+    const recorded: string[] = [];
+    const result = await targetStore!.forkSession(SESSION_ID, {
+      access, dir: derived.workspaceRoot, signal: new AbortController().signal,
+      recordSessionId: (sessionId) => recorded.push(sessionId)
+    });
+    expect(result).toEqual({ sessionId: FORK_ID });
+    expect(recorded).toEqual([FORK_ID]);
+    expect(fixture.processes.storeReservationAcks).toEqual([{ ok: true, value: { accepted: true } }]);
+    expect(await targetStore!.readOperation(access)).toMatchObject({
+      state: "child_reserved", childSessionId: FORK_ID, childReservationConfirmed: true
+    });
+    const sessionAccess = await targetStore!.adopt(access, FORK_ID);
+    expect(sessionAccess).toEqual({
+      kind: "session", generation: 7, workspaceAuthority: targetWorkspaceAuthority, sessionId: FORK_ID
+    });
+    await expect(targetStore!.getSessionInfo(FORK_ID, {
+      access: sessionAccess, dir: derived.workspaceRoot
+    })).resolves.toMatchObject({ sessionId: FORK_ID, cwd: derived.workspaceRoot });
+    await expect(targetStore!.getSessionMessages(FORK_ID, {
+      access: sessionAccess, dir: derived.workspaceRoot,
+      limit: 10, offset: 0, includeSystemMessages: true
+    })).resolves.toHaveLength(1);
+    const query = await derived.runtime.query(queryParams(undefined, undefined, false, undefined, {
+      cwd: derived.workspaceRoot, sessionId: FORK_ID, sessionStoreAccess: sessionAccess
+    }));
+    const startOptions = record(fixture.processes.startRequests.at(-1)?.params.options);
+    expect(startOptions.sessionStoreAccess).toEqual(sessionAccess);
+    expect(startOptions.sessionStoreAuthority).toMatchObject({
+      schemaVersion: 1, generation: 7, namespace: expect.stringMatching(/^backend-[0-9a-f]{64}$/u)
+    });
+    const authorities = fixture.processes.storeRequests.map((request) => record(request.params.authority));
+    expect(new Set(authorities.map((authority) => authority.namespace))).toHaveProperty("size", 1);
+    await derived.runtime.retireQuery(query, 2_000);
+  });
+
+  it("fences wrong Store access, checkout drift, and stale Target authority before remote Store effects", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const derived = await fixture.resolver.resolve({ ...fixture.target, workspaceRoot: "/srv/worktrees/child" });
+    const store = derived.runtime.storedSessions!;
+    const wrongAccess: ClaudeSessionStoreSessionAccess = {
+      kind: "session", generation: 7, workspaceAuthority: workspaceAuthority(fixture.target), sessionId: SESSION_ID
+    };
+    const initialEffects = fixture.processes.storeRequests.length;
+    await expect(store.getSessionInfo(SESSION_ID, {
+      access: wrongAccess, dir: derived.workspaceRoot
+    })).rejects.toMatchObject({ code: "store_access_mismatch" });
+    expect(fixture.processes.storeRequests).toHaveLength(initialEffects);
+    await expect(store.recoverOperation({
+      operationId: "99999999-9999-4999-8999-999999999992",
+      targetWorkspaceAuthority: workspaceAuthority({ ...fixture.target, workspaceRoot: "/srv/worktrees/child" })
+    })).rejects.toMatchObject({ code: "NOT_FOUND", stateMayHaveChanged: false });
+    fixture.checkoutCurrent = false;
+    const afterMissing = fixture.processes.storeRequests.length;
+    await expect(store.claim({
+      workspaceAuthority: workspaceAuthority({ ...fixture.target, workspaceRoot: "/srv/worktrees/child" }),
+      sessionId: SESSION_ID
+    })).rejects.toThrow("Remote checkout");
+    expect(fixture.processes.storeRequests).toHaveLength(afterMissing);
+    fixture.checkoutCurrent = true;
+    fixture.stored = { ...fixture.stored, revision: fixture.stored.revision + 1n };
+    await expect(store.claim({
+      workspaceAuthority: workspaceAuthority({ ...fixture.target, workspaceRoot: "/srv/worktrees/child" }),
+      sessionId: SESSION_ID
+    })).rejects.toMatchObject({ code: "authority_changed" });
+    expect(fixture.processes.storeRequests).toHaveLength(afterMissing);
+  });
+
+  it("rejects a reservation from a different operation before confirming the SDK fork", async () => {
+    const fixture = createFixture({ mismatchedStoreReservation: true });
+    cleanups.push(() => fixture.resolver.close());
+    const source = await fixture.resolver.resolve(fixture.target);
+    const derivedTarget: TargetDescriptor = { ...fixture.target, workspaceRoot: "/srv/worktrees/child" };
+    const derived = await fixture.resolver.resolve(derivedTarget);
+    const access = await source.runtime.storedSessions!.prepareImport({
+      operationId: "99999999-9999-4999-8999-999999999993",
+      sourceWorkspaceAuthority: workspaceAuthority(fixture.target),
+      sourceSessionId: SESSION_ID,
+      targetWorkspaceAuthority: workspaceAuthority(derivedTarget)
+    });
+    const recorded = vi.fn();
+    await expect(derived.runtime.storedSessions!.forkSession(SESSION_ID, {
+      access, dir: derived.workspaceRoot, signal: new AbortController().signal, recordSessionId: recorded
+    })).rejects.toMatchObject({ code: "RESERVATION_FAILED", stateMayHaveChanged: true });
+    expect(recorded).not.toHaveBeenCalled();
+    expect(fixture.processes.storeReservationAcks).toEqual([{ ok: false, value: undefined }]);
+  });
+
+  it("normalizes a coordinator-derived remote binding to its stored primary installation root", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const derivedRoot = "/srv/worktrees/child";
+    const derivedTarget: TargetDescriptor = {
+      ...fixture.target,
+      workspaceRoot: derivedRoot,
+      remoteWorkspace: { ...fixture.target.remoteWorkspace!, workspaceRoot: derivedRoot }
+    };
+    const binding = await fixture.resolver.resolve(derivedTarget);
+    expect(binding.workspaceRoot).toBe(derivedRoot);
+    expect(fixture.processes.requests[0]?.cwd).toBe("/srv/project");
+    expect(fixture.processes.requests[1]?.cwd).toBe("/srv/project");
+    await expect(binding.runtime.getSessionInfo(SESSION_ID, { dir: derivedRoot })).resolves.toMatchObject({ sessionId: SESSION_ID });
+  });
+
+  it("does not probe or dispatch for an unauthorized derived cwd", async () => {
+    const fixture = createFixture({ rejectDerivedAuthorization: true });
+    cleanups.push(() => fixture.resolver.close());
+    await expect(fixture.resolver.resolve({
+      ...fixture.target, workspaceRoot: "/srv/worktrees/unowned"
+    })).rejects.toThrow("Remote checkout is not owned");
+    expect(fixture.capture).not.toHaveBeenCalled();
+    expect(fixture.processes.requests).toHaveLength(0);
+  });
+
+  it("passes the persisted Backend generation into Store recovery and rebind", async () => {
+    const fixture = createFixture({ storeGeneration: 8 });
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const workspace = workspaceAuthority(fixture.target);
+    const rebound = await binding.runtime.storedSessions!.rebind({
+      workspaceAuthority: workspace, sessionId: SESSION_ID, expectedGeneration: 7
+    });
+    expect(rebound).toEqual({
+      kind: "session", generation: 8, workspaceAuthority: workspace, sessionId: SESSION_ID
+    });
+    expect(fixture.processes.storeRequests.at(-1)).toMatchObject({
+      method: "store.rebind",
+      params: {
+        authority: { schemaVersion: 1, generation: 8 },
+        input: { workspaceAuthority: workspace, sessionId: SESSION_ID, expectedGeneration: 7 }
+      }
+    });
+  });
 });
 
 interface FixtureOptions {
@@ -412,6 +572,9 @@ interface FixtureOptions {
   readonly loseQueryOnDisconnect?: boolean;
   readonly restartManagerOnStartDrop?: boolean;
   readonly managerSha256?: string;
+  readonly storeGeneration?: number;
+  readonly mismatchedStoreReservation?: boolean;
+  readonly rejectDerivedAuthorization?: boolean;
 }
 
 function createFixture(options: FixtureOptions = {}) {
@@ -419,7 +582,7 @@ function createFixture(options: FixtureOptions = {}) {
     id: "target-claude",
     backendId: "claude-code",
     displayName: "Remote Claude",
-    workspaceRoot: "D:\\service-owned-placeholder",
+    workspaceRoot: "/srv/project",
     managed: false,
     trusted: true,
     remoteWorkspace: { hostTargetId: "target-claude", hostId: "host-a", workspaceRoot: "/srv/project" }
@@ -470,6 +633,7 @@ function createFixture(options: FixtureOptions = {}) {
       revision: 11n
     } satisfies StoredTarget,
     authorityCurrent: true,
+    checkoutCurrent: true,
     capture: vi.fn()
   };
   fixture.capture.mockImplementation(async () => ({
@@ -481,8 +645,16 @@ function createFixture(options: FixtureOptions = {}) {
     assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
   const resolver = new RemoteClaudeRuntimeResolver({
+    storeGeneration: options.storeGeneration ?? 7,
     store: { getTarget: () => fixture.stored },
-    registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">
+    registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">,
+    authorizeDerivedWorkspace: async () => {
+      if (options.rejectDerivedAuthorization === true) throw new Error("Remote checkout is not owned");
+      return {
+      assertCurrent: () => { if (!fixture.checkoutCurrent) throw new Error("Remote checkout authority changed"); },
+      verifyExact: async () => { if (!fixture.checkoutCurrent) throw new Error("Remote checkout changed"); }
+      };
+    }
   });
   return Object.assign(fixture, { resolver });
 }
@@ -493,6 +665,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
   readonly startRequests: Array<{ readonly id: string; readonly params: Record<string, unknown> }> = [];
   readonly inputRequests: Array<{ readonly id: string; readonly params: Record<string, unknown> }> = [];
   readonly attachRequests: Array<Record<string, unknown>> = [];
+  readonly storeRequests: Array<{ readonly method: string; readonly params: Record<string, unknown> }> = [];
+  readonly storeReservationAcks: Array<{ readonly ok: boolean; readonly value: unknown }> = [];
   queryStartEffects = 0;
   inputEffects = 0;
   retireEffects = 0;
@@ -501,6 +675,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
   readonly #inputReceipts = new Set<string>();
   readonly #events: Array<Record<string, unknown>> = [];
   readonly #callbacks = new Map<string, { readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void }>();
+  readonly #storeOperations = new Map<string, { access: ClaudeSessionStoreOperationAccess; state: string; childSessionId?: string }>();
+  #storeFork: { readonly id: string; readonly process: FixtureProcess } | undefined;
   #query: { queryId: string; sessionId: string; ownerKey: string; ownerGeneration: string; attachmentId: string; process: FixtureProcess } | undefined;
   #lostQuery: { queryId: string; ownerKey: string; ownerGeneration: string } | undefined;
   #startDropped = false;
@@ -550,20 +726,29 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
         : callback === "productMcpTool"
           ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         : "66666666-6666-4666-8666-666666666666";
-    query.process.send({ v: 1, kind: "callback", callbackId, queryId: query.queryId, callback, value });
+    query.process.send({ v: 2, kind: "callback", callbackId, queryId: query.queryId, callback, value });
     return new Promise((resolve, reject) => this.#callbacks.set(callbackId, { resolve, reject }));
   }
 
   cancelCallback(callbackId: string): void {
     const query = this.#query;
     if (query === undefined) throw new Error("No query is attached.");
-    query.process.send({ v: 1, kind: "callback_cancel", callbackId });
+    query.process.send({ v: 2, kind: "callback_cancel", callbackId });
   }
 
   #accept(frame: Record<string, unknown>, process: FixtureProcess): void {
     this.frames.push(frame);
     if (frame.kind === "callback_result") {
       const callbackId = String(frame.callbackId);
+      if (callbackId === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab" && this.#storeFork !== undefined) {
+        this.storeReservationAcks.push({ ok: frame.ok === true, value: frame.value });
+        const pendingFork = this.#storeFork;
+        this.#storeFork = undefined;
+        if (frame.ok === true && record(frame.value).accepted === true) {
+          return pendingFork.process.respond(pendingFork.id, { sessionId: FORK_ID });
+        }
+        return pendingFork.process.rejectResponse(pendingFork.id, "RESERVATION_FAILED", true);
+      }
       const pending = this.#callbacks.get(callbackId);
       if (pending === undefined) return;
       this.#callbacks.delete(callbackId);
@@ -574,12 +759,16 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     if (frame.kind !== "request" || typeof frame.id !== "string" || typeof frame.method !== "string") return;
     const params = record(frame.params);
     if (frame.method === "hello") return process.respond(frame.id, {
-      protocolVersion: 1,
-      managerVersion: "1.0.0",
+      protocolVersion: 2,
+      managerVersion: "2.0.0",
       managerSha256: this.#options.managerSha256 ?? MANAGER_SHA256,
       managerGeneration: this.#managerGeneration
     });
     if (frame.method === "owner.reconcile") return process.respond(frame.id, { reconciled: true });
+    if (frame.method.startsWith("store.")) {
+      this.storeRequests.push({ method: frame.method, params });
+      return this.#acceptStore(frame.id, frame.method, params, process);
+    }
     if (frame.method === "query.start") {
       this.startRequests.push({ id: frame.id, params });
       if (this.#query === undefined) {
@@ -687,6 +876,97 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     process.rejectResponse(frame.id, "method_unsupported", false);
   }
 
+  #acceptStore(id: string, method: string, params: Record<string, unknown>, process: FixtureProcess): void {
+    const authority = record(params.authority);
+    if (method === "store.prepareImport" || method === "store.prepareDerivation") {
+      const input = record(params.input);
+      const access: ClaudeSessionStoreOperationAccess = {
+        kind: "operation",
+        operationId: String(input.operationId),
+        generation: Number(authority.generation),
+        source: {
+          kind: method === "store.prepareImport" ? "import" : "durable",
+          workspaceAuthority: String(input.sourceWorkspaceAuthority),
+          sessionId: String(input.sourceSessionId)
+        },
+        target: { workspaceAuthority: String(input.targetWorkspaceAuthority) }
+      };
+      this.#storeOperations.set(access.operationId, { access, state: "ready" });
+      return process.respond(id, access);
+    }
+    if (method === "store.recoverOperation") {
+      const input = record(params.input);
+      const operation = this.#storeOperations.get(String(input.operationId));
+      if (operation === undefined) return process.rejectResponse(id, "NOT_FOUND", false);
+      const access = { ...operation.access, generation: Number(authority.generation) };
+      operation.access = access;
+      return process.respond(id, access);
+    }
+    if (method === "store.readOperation" || method === "store.cleanupOperation") {
+      const access = params.access as ClaudeSessionStoreOperationAccess;
+      const operation = this.#storeOperations.get(access.operationId);
+      if (operation === undefined) return process.rejectResponse(id, "NOT_FOUND", false);
+      if (method === "store.cleanupOperation") operation.state = "cleaned";
+      return process.respond(id, {
+        operationId: access.operationId,
+        generation: access.generation,
+        sourceKind: access.source.kind,
+        sourceWorkspaceAuthority: access.source.workspaceAuthority,
+        targetWorkspaceAuthority: access.target.workspaceAuthority,
+        sourceSessionId: access.source.sessionId,
+        state: operation.state,
+        sourceProjectKeyCaptured: true,
+        targetProjectKeyCaptured: true,
+        sourceEntryCount: 1,
+        sourceBytes: 100,
+        ...(operation.childSessionId === undefined ? {} : { childSessionId: operation.childSessionId }),
+        childReservationConfirmed: operation.childSessionId !== undefined,
+        revision: 1
+      });
+    }
+    if (method === "store.import") return process.respond(id, { imported: true });
+    if (method === "store.discardImport") return process.respond(id, { discarded: true });
+    if (method === "store.fork") {
+      const access = params.access as ClaudeSessionStoreOperationAccess;
+      const operation = this.#storeOperations.get(access.operationId);
+      if (operation === undefined) return process.rejectResponse(id, "NOT_FOUND", false);
+      operation.state = "child_reserved";
+      operation.childSessionId = FORK_ID;
+      this.#storeFork = { id, process };
+      process.send({
+        v: 2,
+        kind: "callback",
+        callbackId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+        callback: "storeChildReserved",
+        value: {
+          operationId: this.#options.mismatchedStoreReservation === true
+            ? "99999999-9999-4999-8999-999999999994" : access.operationId,
+          generation: access.generation,
+          targetWorkspaceAuthority: access.target.workspaceAuthority,
+          sessionId: FORK_ID
+        }
+      });
+      return;
+    }
+    if (method === "store.adopt" || method === "store.claim" || method === "store.rebind") {
+      const access = params.access as ClaudeSessionStoreOperationAccess | undefined;
+      const input = params.input === undefined ? undefined : record(params.input);
+      const sessionId = String(params.sessionId ?? input?.sessionId);
+      const workspaceAuthority = String(access?.target.workspaceAuthority ?? input?.workspaceAuthority);
+      const result: ClaudeSessionStoreSessionAccess = {
+        kind: "session", generation: Number(authority.generation), workspaceAuthority, sessionId
+      };
+      return process.respond(id, result);
+    }
+    if (method === "store.info") return process.respond(id, sessionInfo(String(params.sessionId), String(params.dir)));
+    if (method === "store.messages") return process.respond(id, [{
+      type: "assistant", uuid: MESSAGE_ID, session_id: String(params.sessionId),
+      message: { role: "assistant", content: [] }, parent_tool_use_id: null, parent_agent_id: null
+    }]);
+    if (method === "store.delete") return process.respond(id, undefined);
+    process.rejectResponse(id, "method_unsupported", false);
+  }
+
   #attachment(): Record<string, unknown> {
     if (this.#query === undefined) throw new Error("Missing fixture query.");
     return {
@@ -702,7 +982,7 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
   #emit(event: "message" | "retired", value?: unknown): void {
     if (this.#query === undefined) return;
     const frame: Record<string, unknown> = {
-      v: 1,
+      v: 2,
       kind: "event",
       queryId: this.#query.queryId,
       seq: this.#sequence++,
@@ -748,11 +1028,11 @@ class FixtureProcess extends EventEmitter implements RemoteProcessHandle {
   }
 
   respond(id: string, value: unknown): void {
-    this.send({ v: 1, kind: "response", id, ok: true, value });
+    this.send({ v: 2, kind: "response", id, ok: true, value });
   }
 
   rejectResponse(id: string, code: string, stateMayHaveChanged: boolean): void {
-    this.send({ v: 1, kind: "response", id, ok: false, error: { code, stateMayHaveChanged } });
+    this.send({ v: 2, kind: "response", id, ok: false, error: { code, stateMayHaveChanged } });
   }
 
   send(value: unknown): void {
@@ -827,8 +1107,27 @@ function initialization() {
   };
 }
 
-function sessionInfo(sessionId: string) {
-  return { sessionId, summary: "Fixture", lastModified: 1, cwd: "/srv/project" };
+function sessionInfo(sessionId: string, cwd = "/srv/project") {
+  return { sessionId, summary: "Fixture", lastModified: 1, cwd };
+}
+
+function workspaceAuthority(target: TargetDescriptor): string {
+  const remote = target.remoteWorkspace!;
+  return `workspace-${createHash("sha256")
+    .update("joko-claude-workspace\0", "utf8")
+    .update(target.backendId, "utf8")
+    .update("\0", "utf8")
+    .update(target.id, "utf8")
+    .update("\0", "utf8")
+    .update("remote\0", "utf8")
+    .update(remote.hostTargetId, "utf8")
+    .update("\0", "utf8")
+    .update(remote.hostId, "utf8")
+    .update("\0", "utf8")
+    .update(remote.workspaceRoot, "utf8")
+    .update("\0", "utf8")
+    .update(target.workspaceRoot, "utf8")
+    .digest("hex")}`;
 }
 
 function probeOutput(): Buffer {

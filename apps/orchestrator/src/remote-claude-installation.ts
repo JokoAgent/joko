@@ -10,8 +10,8 @@ import type { RemoteProcessHandle, RemoteProcessTransportPort } from "@joko/remo
 
 export const REMOTE_CLAUDE_NODE_VERSION = "22.13.0";
 export const REMOTE_CLAUDE_CLI_VERSION = "2.1.259";
-export const REMOTE_CLAUDE_MANAGER_VERSION = "1.0.0";
-export const REMOTE_CLAUDE_PROTOCOL_VERSION = 1;
+export const REMOTE_CLAUDE_MANAGER_VERSION = "2.0.0";
+export const REMOTE_CLAUDE_PROTOCOL_VERSION = 2;
 export const REMOTE_CLAUDE_EXPECTED_VERSION =
   `sdk-${CLAUDE_AGENT_SDK_VERSION}+cli-${REMOTE_CLAUDE_CLI_VERSION}+manager-${REMOTE_CLAUDE_MANAGER_VERSION}`;
 export const REMOTE_CLAUDE_RUNTIME_SUFFIX = ".joko/runtime/v1/claude-code";

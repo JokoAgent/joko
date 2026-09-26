@@ -25,6 +25,7 @@ import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./manag
 const FORMAT = 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const TERMINAL_STATES = new Set(["completed", "failed", "aborted"]);
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const MAX_JSON_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 256 * 1024;
 // The runner accepts up to 50 MiB and may still append one final bounded
@@ -58,6 +59,7 @@ interface LogicalProjection {
   readonly run: SubagentRunDetail;
   readonly transcript: readonly SubagentTranscriptEntry[];
   readonly latest: PhysicalRun;
+  readonly physicalRuns: readonly PhysicalRun[];
 }
 
 interface DurableProjectionState {
@@ -189,6 +191,27 @@ export class ManagedSubagentObserver {
   async stopAndDrain(): Promise<void> {
     this.stop();
     await this.#refreshing?.catch(() => undefined);
+  }
+
+  /**
+   * Uses the remote durable mailbox authority to stop only live runs whose
+   * immutable route received the revoked Provider credential. Returning means
+   * every matching runner published a terminal snapshot after child cleanup.
+   */
+  async stopCredentialedRunsByProvider(providerId: string, timeoutMs: number): Promise<void> {
+    if (this.#durableStore === undefined) return;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(providerId)
+        || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new Error("managed Subagent Provider revocation scope is invalid");
+    }
+    await stopDurableRunsByProvider({
+      root: this.#root,
+      durableStore: this.#durableStore,
+      productSessionId: this.#context.sessionId,
+      productGeneration: this.#context.generation,
+      providerId,
+      timeoutMs
+    });
   }
 
   async refresh(): Promise<number> {
@@ -532,7 +555,7 @@ export async function assertManagedSubagentControlTarget(input: {
   readonly runId: string;
   readonly childId?: string;
   readonly action: SubagentControlAction;
-}): Promise<void> {
+}): Promise<string | undefined> {
   const projections = await readLogicalProjections(
     normalizedRoot(input.root),
     input.productSessionId,
@@ -546,7 +569,8 @@ export async function assertManagedSubagentControlTarget(input: {
       ? undefined
       : { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS }
   );
-  assertOwnedManagedSubagentControlTarget(projections, input);
+  const projection = assertOwnedManagedSubagentControlTarget(projections, input);
+  return currentProviderId(projection.latest.config["route"]);
 }
 
 export async function writeManagedSubagentDurableControl(input: {
@@ -632,6 +656,90 @@ export async function writeManagedSubagentDurableControl(input: {
     const receipt = managedControlReceipt(projection.latest.status, requestId);
     if (receipt === true) return;
     if (receipt === false) throw new Error("managed Subagent runner rejected the durable control request");
+  }
+}
+
+async function stopDurableRunsByProvider(input: {
+  readonly root: string;
+  readonly durableStore: PiManagedDurableStore;
+  readonly productSessionId: string;
+  readonly productGeneration: number;
+  readonly providerId: string;
+  readonly timeoutMs: number;
+}): Promise<void> {
+  const transcriptCache = new Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>();
+  const resultCache = new Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>();
+  const durableState: DurableProjectionState = { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS };
+  const read = (): Promise<readonly LogicalProjection[]> => readLogicalProjections(
+    normalizedRoot(input.root),
+    input.productSessionId,
+    input.productGeneration,
+    true,
+    [],
+    transcriptCache,
+    input.durableStore,
+    resultCache,
+    durableState
+  );
+  const deadline = Date.now() + Math.max(1_000, input.timeoutMs);
+  let projections = await read();
+  const targets: LogicalProjection[] = [];
+  for (const projection of projections) {
+    const active = projection.physicalRuns.filter((physical) =>
+      physical.status["state"] === "queued" || physical.status["state"] === "running");
+    for (const physical of active) {
+      const physicalProviderId = currentProviderId(physical.config["route"]);
+      if (physicalProviderId === undefined) {
+        throw new Error("managed Subagent Provider ownership is invalid for a possibly-live current-v1 durable child");
+      }
+      if (physical !== projection.latest && physicalProviderId === input.providerId) {
+        throw new Error("managed Subagent Provider retirement found a non-current live durable child");
+      }
+    }
+    if (active.includes(projection.latest)
+        && currentProviderId(projection.latest.config["route"]) === input.providerId) {
+      targets.push(projection);
+    }
+  }
+  for (const target of targets) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("managed Subagent Provider revocation timed out before control delivery");
+    await writeManagedSubagentDurableControl({
+      root: input.root,
+      durableStore: input.durableStore,
+      productSessionId: input.productSessionId,
+      productGeneration: input.productGeneration,
+      runId: target.run.id,
+      action: "stop",
+      operationId: deterministicUuid([
+        "provider-auth-revoke",
+        input.productSessionId,
+        String(input.productGeneration),
+        input.providerId,
+        target.run.id
+      ].join("\u0000")),
+      timeoutMs: remaining
+    });
+  }
+  if (targets.length === 0) return;
+
+  const targetIds = new Set(targets.map((target) => target.run.id));
+  for (;;) {
+    projections = await read();
+    let pending = false;
+    for (const targetId of targetIds) {
+      const projection = projections.find((candidate) => candidate.run.id === targetId);
+      if (projection === undefined) {
+        throw new Error("managed Subagent Provider revocation lost its durable run before terminal confirmation");
+      }
+      if (projection.run.state === "queued" || projection.run.state === "running") pending = true;
+    }
+    if (!pending) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error("managed Subagent Provider revocation did not confirm terminal child cleanup");
+    }
+    await abortableDelay(Math.min(remaining, durableState.retryAfterMs));
   }
 }
 
@@ -1198,8 +1306,22 @@ function projectLogicalRun(
     taskId,
     run,
     transcript: transcriptOf(taskId, physicalRuns, redactValues),
-    latest
+    latest,
+    physicalRuns
   };
+}
+
+function currentProviderId(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const providerId = value["provider"];
+  const modelId = value["model"];
+  const effort = value["effort"];
+  if (typeof providerId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(providerId)
+      || typeof modelId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:@/+=-]{0,499}$/u.test(modelId)
+      || typeof effort !== "string" || !THINKING_LEVELS.has(effort)) {
+    return undefined;
+  }
+  return providerId;
 }
 
 function transcriptOf(

@@ -119,6 +119,19 @@ export interface WorktreeReleaseOptions extends WorktreeCallOptions {
   readonly retainForRestore?: boolean;
 }
 
+/** Exact durable lease identity used when replaying an already-authorized
+ * destructive release. A missing owner is success only when its former path
+ * is also absent; a different lease or surviving path fails closed. */
+export interface WorktreeExactReleaseRequest {
+  readonly sessionId: string;
+  readonly leaseId: string;
+  readonly path: string;
+  readonly repositoryRoot: string;
+  readonly branch: string;
+  readonly source: WorktreeSourceResolution;
+  readonly acquiredAt: number;
+}
+
 export interface WorktreeSourceOption {
   readonly ref: string;
   readonly commit: string;

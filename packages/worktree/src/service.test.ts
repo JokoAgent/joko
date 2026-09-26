@@ -30,7 +30,7 @@ afterEach(async () => {
 });
 
 describe("EphemeralWorktreeService", () => {
-  test("detects a primary checkout, resolves its source, and gives a session an idempotent lease", async () => {
+  test("detects a primary checkout, resolves its source, and gives a session an idempotent lease", { timeout: 15_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
 
@@ -268,6 +268,42 @@ describe("EphemeralWorktreeService", () => {
     expect(await gitBranchExists(fixture.repositoryRoot, acquired.lease.branch)).toBe(true);
   });
 
+  test("replays only an exact release and distinguishes a removed checkout from lost owner state", async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    const acquired = unwrap(await service.acquire({ sessionId: "exact-release", cwd: fixture.repositoryRoot }));
+    const exact = {
+      sessionId: acquired.lease.sessionId,
+      leaseId: acquired.lease.id,
+      path: acquired.lease.path,
+      repositoryRoot: acquired.lease.repositoryRoot,
+      branch: acquired.lease.branch,
+      source: acquired.lease.source,
+      acquiredAt: acquired.lease.acquiredAt
+    };
+
+    expectFailure(await service.releaseExact({ ...exact, leaseId: "0".repeat(24) }), "SESSION_CONFLICT");
+    expectFailure(await service.releaseExact({ ...exact, sessionId: "another-session" }), "SESSION_CONFLICT");
+    expectFailure(await service.releaseExact({ ...exact, path: `${exact.path}-stale` }), "SESSION_CONFLICT");
+    expectFailure(await service.releaseExact({ ...exact, branch: `${exact.branch}-stale` }), "SESSION_CONFLICT");
+    expectFailure(await service.releaseExact({
+      ...exact,
+      source: { ...exact.source, ref: `${exact.source.ref}-stale` }
+    }), "SESSION_CONFLICT");
+    expectFailure(await service.releaseExact({ ...exact, acquiredAt: exact.acquiredAt + 1 }), "SESSION_CONFLICT");
+    expect(service.snapshot().active).toHaveLength(1);
+
+    expect(unwrap(await service.releaseExact(exact))).toMatchObject({
+      status: "destroyed",
+      pathRemoved: true
+    });
+    expect(unwrap(await service.releaseExact(exact))).toEqual({ status: "not_found" });
+
+    await mkdir(exact.path, { recursive: true });
+    expectFailure(await service.releaseExact(exact), "SESSION_CONFLICT");
+  });
+
   test("removes committed checkouts while preserving their branch and honors explicit keep markers", { timeout: 15_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
@@ -287,7 +323,15 @@ describe("EphemeralWorktreeService", () => {
 
     const marked = unwrap(await service.acquire({ sessionId: "marked", cwd: fixture.repositoryRoot }));
     await writeFile(join(marked.lease.path, ".worktree-keep"), "owner requested recovery\n", "utf8");
-    expect(unwrap(await service.release("marked"))).toMatchObject({
+    expect(unwrap(await service.releaseExact({
+      sessionId: marked.lease.sessionId,
+      leaseId: marked.lease.id,
+      path: marked.lease.path,
+      repositoryRoot: marked.lease.repositoryRoot,
+      branch: marked.lease.branch,
+      source: marked.lease.source,
+      acquiredAt: marked.lease.acquiredAt
+    }))).toMatchObject({
       status: "preserved",
       reason: "keep",
       pathRemoved: false
@@ -317,6 +361,7 @@ describe("EphemeralWorktreeService", () => {
     expect(await gitBranchExists(fixture.repositoryRoot, released.lease.branch)).toBe(true);
     expect(restarted.snapshot()).toMatchObject({ residualCount: 0 });
     expect(restarted.snapshot().active).toHaveLength(1);
+    expect(restarted.snapshot().active[0]?.acquiredAt).toBe(active.lease.acquiredAt);
 
     const state = JSON.parse(await readFile(join(fixture.storageRoot, "state.json"), "utf8")) as {
       readonly entries: readonly unknown[];

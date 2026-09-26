@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as FS_CONSTANTS } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { piError } from "./errors.js";
 
@@ -14,6 +14,7 @@ const PRIVATE_FILE_READ_RETRY_MS = 2;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SESSION_KEY_PATTERN = /^[0-9a-f]{40}$/u;
 const TERMINAL_STATES = new Set(["completed", "failed", "aborted"]);
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 interface DurableRunStatus {
   readonly format: number;
@@ -32,6 +33,8 @@ interface DurableRunStatus {
 interface ValidatedDurableRun {
   readonly directory: string;
   readonly status: DurableRunStatus;
+  readonly config: Readonly<Record<string, unknown>>;
+  readonly providerId?: string;
   readonly claimPid?: number;
   readonly hasRunnerClaim: boolean;
 }
@@ -331,6 +334,113 @@ export async function stopAndRemoveManagedSubagentRuns(
   await removeManagedSubagentAuthSession(root, productSessionId);
 }
 
+/**
+ * Provider-auth revocation keeps durable run history but synchronously stops
+ * every exact local runner which received that Provider route's credential.
+ * The authenticated runner mailbox remains the only stop authority; disk PIDs
+ * are never signalled directly.
+ */
+export async function stopManagedSubagentRunsByProvider(
+  root: string,
+  providerId: string,
+  timeoutMs: number
+): Promise<void> {
+  const normalizedRoot = resolve(root);
+  if (!isAbsolute(root) || normalizedRoot !== root
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(providerId)) {
+    throw piError("PI_SUBAGENT_AUTH_REVOKE_SCOPE_INVALID", "Managed background auth-revocation scope is invalid", "session");
+  }
+  const rootInfo = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (rootInfo === undefined) return;
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || !samePath(await realpath(root), root)) {
+    throw piError("PI_SUBAGENT_ROOT_UNSAFE", "Managed background run storage is not a canonical private directory", "session");
+  }
+
+  const targets: Array<{ readonly sessionKey: string; readonly productSessionId: string; readonly run: ValidatedDurableRun }> = [];
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (!SESSION_KEY_PATTERN.test(entry.name)) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw piError("PI_SUBAGENT_SESSION_ROOT_UNSAFE", "Managed background session storage is not a canonical private directory", "session");
+    }
+    const sessionDirectory = join(root, entry.name);
+    assertContained(root, sessionDirectory);
+    if (!samePath(await realpath(sessionDirectory), sessionDirectory)) {
+      throw piError("PI_SUBAGENT_SESSION_ROOT_UNSAFE", "Managed background session storage contains a path alias", "session");
+    }
+    const productSessionId = await discoverProductSessionId(sessionDirectory, entry.name);
+    if (productSessionId === undefined) continue;
+    const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId));
+    for (const run of runs) {
+      if ((!TERMINAL_STATES.has(run.status.state) || ownedRunnerIsAlive(run))
+          && run.providerId === undefined) {
+        throw piError(
+          "PI_SUBAGENT_AUTH_REVOKE_ROUTE_UNKNOWN",
+          "Managed background Provider ownership could not be proven for a possibly-live child",
+          "session",
+          {
+            retryable: true,
+            stateMayHaveChanged: true,
+            recovery: "Keep the Provider fenced and repair or quarantine the invalid current-v1 durable child manifest."
+          }
+        );
+      }
+      if (run.providerId === providerId) {
+        targets.push({ sessionKey: entry.name, productSessionId, run });
+      }
+    }
+  }
+
+  const requestedAt = Date.now();
+  await Promise.all(targets.flatMap(({ productSessionId, run }, index) => {
+    if (TERMINAL_STATES.has(run.status.state)) return [];
+    return [atomicWriteJson(join(run.directory, "control.json"), {
+      format: RUN_FORMAT,
+      seq: requestedAt * 1000 + index,
+      requestId: randomUUID(),
+      runId: run.status.runId,
+      launchToken: run.status.launchToken,
+      productSessionId,
+      taskId: run.status.taskId,
+      action: "stop",
+      requestedAt
+    })];
+  }));
+
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
+  for (;;) {
+    let pending = false;
+    for (const target of targets) {
+      const sessionDirectory = join(root, target.sessionKey);
+      const current = (await reconcileDeadRunOwners(
+        await readRunStatuses(sessionDirectory, target.productSessionId)
+      )).find((entry) => entry.status.runId === target.run.status.runId);
+      if (current !== undefined && (!TERMINAL_STATES.has(current.status.state) || ownedRunnerIsAlive(current))) {
+        pending = true;
+      }
+    }
+    if (!pending) break;
+    if (Date.now() >= deadline) {
+      throw piError(
+        "PI_SUBAGENT_AUTH_REVOKE_STOP_UNCONFIRMED",
+        "Provider revocation could not confirm that every credential-bearing background child stopped",
+        "session",
+        {
+          retryable: true,
+          stateMayHaveChanged: true,
+          recovery: "Keep the Provider fenced, inspect the managed runner health, and retry revocation. No disk PID was signalled."
+        }
+      );
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  await Promise.all(targets.map(async ({ sessionKey, run }) => {
+    await removeManagedSubagentAuthRun(root, sessionKey, run.status.runId);
+  }));
+}
+
 async function removeManagedSubagentAuthSession(runRoot: string, productSessionId: string): Promise<void> {
   const authRoot = join(resolve(runRoot, ".."), "subagent-native-auth");
   const authSessionDirectory = join(authRoot, managedSubagentSessionKey(productSessionId));
@@ -468,9 +578,14 @@ async function readRunStatuses(
         || !isRunnerClaim(claim, status, runnerScriptSha256, owner)) {
       throw piError("PI_SUBAGENT_RUNNER_IDENTITY_INVALID", "Managed background runner identity failed its content or process claim", "session");
     }
+    const configRecord = config as Record<string, unknown>;
+    const route = configRecord["route"];
+    const providerId = currentProviderId(route);
     values.push({
       directory,
       status,
+      config: configRecord,
+      ...(providerId === undefined ? {} : { providerId }),
       hasRunnerClaim: claim !== undefined,
       ...((claim !== null && typeof claim === "object" && !Array.isArray(claim)
         && Number.isSafeInteger((claim as Record<string, unknown>)["runnerPid"]))
@@ -499,6 +614,7 @@ async function reconcileDeadRunOwners(
       if (!claimed) return entry;
       claimedEntry = { ...entry, claimPid: 0, hasRunnerClaim: true };
     }
+    await removeDeadRunNativeSessions(claimedEntry);
     const failed: DurableRunStatus = {
       ...claimedEntry.status,
       state: "failed",
@@ -507,6 +623,123 @@ async function reconcileDeadRunOwners(
     await atomicWriteJson(join(claimedEntry.directory, "status.json"), failed, MAX_STATUS_BYTES);
     return { ...claimedEntry, status: failed };
   }));
+}
+
+function currentProviderId(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const route = value as Record<string, unknown>;
+  if (typeof route["provider"] !== "string"
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(route["provider"])
+      || typeof route["model"] !== "string"
+      || !/^[A-Za-z0-9][A-Za-z0-9._:@/+=-]{0,499}$/u.test(route["model"])
+      || typeof route["effort"] !== "string" || !THINKING_LEVELS.has(route["effort"])) {
+    return undefined;
+  }
+  return route["provider"];
+}
+
+async function removeDeadRunNativeSessions(entry: ValidatedDurableRun): Promise<void> {
+  try {
+    const expectedSessionDirectory = join(entry.directory, "sessions");
+    const childSessionDirectory = entry.config["childSessionDir"];
+    const nativeSessionId = entry.config["nativeSessionId"];
+    if (childSessionDirectory !== expectedSessionDirectory || typeof nativeSessionId !== "string"
+        || !UUID_PATTERN.test(nativeSessionId)) {
+      throw new Error("current-v1 native child Session ownership is unavailable");
+    }
+    const resumeSessionPath = entry.config["resumeSessionPath"];
+    if (resumeSessionPath !== undefined) {
+      if (typeof resumeSessionPath !== "string" || !isAbsolute(resumeSessionPath)) {
+        throw new Error("current-v1 native child resume ownership is invalid");
+      }
+      const resolvedResumePath = resolve(resumeSessionPath);
+      const sessionDirectory = dirname(entry.directory);
+      const segments = relative(sessionDirectory, resolvedResumePath).split(sep);
+      const fileName = segments[2] ?? "";
+      if (segments.length !== 3 || !UUID_PATTERN.test(segments[0] ?? "")
+          || segments[0] === basename(entry.directory) || segments[1] !== "sessions"
+          || (fileName !== `${nativeSessionId}.jsonl` && !fileName.endsWith(`_${nativeSessionId}.jsonl`))) {
+        throw new Error("current-v1 native child resume ownership is invalid");
+      }
+      await removeExactPrivateSessionFile(resolvedResumePath);
+    }
+    const publishedSessionPath = entry.status as unknown as Record<string, unknown>;
+    const nativeSessionPath = publishedSessionPath["nativeSessionPath"];
+    if (nativeSessionPath !== undefined) {
+      if (typeof nativeSessionPath !== "string" || !isAbsolute(nativeSessionPath)) {
+        throw new Error("published native child Session ownership is invalid");
+      }
+      const resolvedNativePath = resolve(nativeSessionPath);
+      const resumePath = typeof resumeSessionPath === "string" ? resolve(resumeSessionPath) : undefined;
+      if (!isContained(expectedSessionDirectory, resolvedNativePath)
+          && (resumePath === undefined || !samePath(resolvedNativePath, resumePath))) {
+        throw new Error("published native child Session escaped private storage");
+      }
+    }
+    await removeExactPrivateSessionDirectory(expectedSessionDirectory);
+  } catch (cause) {
+    throw piError(
+      "PI_SUBAGENT_NATIVE_SESSION_RETIREMENT_UNKNOWN",
+      "A dead managed child could not prove removal of its private native Session",
+      "session",
+      {
+        retryable: true,
+        stateMayHaveChanged: true,
+        recovery: "Keep Provider authentication fenced and repair or quarantine the exact private child Session before retrying.",
+        cause
+      }
+    );
+  }
+}
+
+async function removeExactPrivateSessionFile(path: string): Promise<void> {
+  const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (info === undefined) return;
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || !samePath(await realpath(path), path)) {
+    throw new Error("private native child Session file is unsafe");
+  }
+  await rm(path, { force: false });
+  const remaining = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (remaining !== undefined) throw new Error("private native child Session removal was not confirmed");
+}
+
+async function removeExactPrivateSessionDirectory(path: string): Promise<void> {
+  const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (info === undefined) return;
+  if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(path), path)) {
+    throw new Error("private native child Session directory is unsafe");
+  }
+  await assertPrivateSessionTree(path);
+  await rm(path, { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
+  const remaining = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (remaining !== undefined) throw new Error("private native child Session directory removal was not confirmed");
+}
+
+async function assertPrivateSessionTree(root: string): Promise<void> {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const candidate = join(root, entry.name);
+    assertContained(root, candidate);
+    const info = await lstat(candidate);
+    if (info.isSymbolicLink() || !samePath(await realpath(candidate), candidate)) {
+      throw new Error("private native child Session tree contains an unsafe entry");
+    }
+    if (info.isDirectory()) await assertPrivateSessionTree(candidate);
+    else if (!info.isFile() || info.nlink !== 1) {
+      throw new Error("private native child Session tree contains a special entry");
+    }
+  }
 }
 
 async function claimAbandonedLaunch(entry: ValidatedDurableRun): Promise<boolean> {
@@ -682,6 +915,11 @@ function assertContained(root: string, candidate: string): void {
   const suffix = relative(root, candidate);
   if (suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix))) return;
   throw piError("PI_SUBAGENT_PATH_ESCAPE", "Managed background run path escaped its service-owned root", "session");
+}
+
+function isContained(root: string, candidate: string): boolean {
+  const suffix = relative(root, candidate);
+  return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix));
 }
 
 function samePath(left: string, right: string): boolean {
