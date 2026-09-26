@@ -3,6 +3,7 @@ import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { CodexBackendAdapter } from "@joko/adapter-codex";
 import { PiBackendAdapter } from "@joko/adapter-pi";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -13,7 +14,9 @@ import {
   createOrchestratorApplication,
   providerUsageMoneyKind
 } from "./application.js";
+import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { OrchestratorConfig } from "./config.js";
+import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { createInternalServer, createPublicServer } from "./server.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -166,6 +169,95 @@ describe("Orchestrator application composition", () => {
     expect(resolve({ sessionId: "session-c", backendId: "fixture-unknown", targetId: "target-a" }))
       .toBeUndefined();
   });
+
+  it("retries exact candidate cleanup when post-provision initialization fails before Host ownership", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-initialization-cleanup-"));
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    await mkdir(dataDirectory, { recursive: true });
+    await writeFile(join(dataDirectory, "workspace-snapshots"), "blocks the snapshot directory");
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1",
+      port: 4218,
+      internalPort: 4217,
+      publicOrigin: "http://127.0.0.1:4218",
+      internalOrigin: "http://127.0.0.1:4217",
+      dataDirectory,
+      databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true,
+      allowInsecureLan: false,
+      lanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"),
+      piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-initialization-cleanup", root: workspace, displayName: "Cleanup", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"),
+      webDirectory: join(root, "no-web-build"),
+      corsOrigins: []
+    };
+    const probeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "describe")
+      .mockRejectedValue(new Error("controlled candidate probe failure"));
+    const disposeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "dispose")
+      .mockRejectedValue(new Error("controlled candidate dispose failure"));
+    const forceDisposeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "forceDispose")
+      .mockRejectedValue(new Error("controlled candidate force-dispose failure"));
+    const closeProviderProxy = vi.spyOn(ManagedProviderProxy.prototype, "close");
+
+    try {
+      await expect(createOrchestratorApplication(config))
+        .rejects.toThrow("Orchestrator initialization failed and cleanup remained incomplete.");
+      expect(disposeCandidate).toHaveBeenCalledTimes(4);
+      expect(forceDisposeCandidate).toHaveBeenCalledTimes(4);
+      expect(closeProviderProxy).toHaveBeenCalledOnce();
+    } finally {
+      probeCandidate.mockRestore();
+      disposeCandidate.mockRestore();
+      forceDisposeCandidate.mockRestore();
+      closeProviderProxy.mockRestore();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+  }, 20_000);
+
+  it("retries retained candidate cleanup before closing native Provider dependencies", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-close-candidate-cleanup-"));
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1",
+      port: 4268,
+      internalPort: 4267,
+      publicOrigin: "http://127.0.0.1:4268",
+      internalOrigin: "http://127.0.0.1:4267",
+      dataDirectory,
+      databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true,
+      allowInsecureLan: false,
+      lanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"),
+      piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-close-candidate-cleanup", root: workspace, displayName: "Cleanup", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"),
+      webDirectory: join(root, "no-web-build"),
+      corsOrigins: []
+    };
+    const application = await createOrchestratorApplication(config);
+    const retryCandidates = vi.spyOn(BackendInstanceRegistry.prototype, "disposeRetainedCandidateCleanups");
+    const closeProviderProxy = vi.spyOn(ManagedProviderProxy.prototype, "close");
+
+    try {
+      await application.close();
+      expect(retryCandidates).toHaveBeenCalledOnce();
+      expect(closeProviderProxy).toHaveBeenCalledOnce();
+      expect(retryCandidates.mock.invocationCallOrder[0])
+        .toBeLessThan(closeProviderProxy.mock.invocationCallOrder[0]!);
+    } finally {
+      retryCandidates.mockRestore();
+      closeProviderProxy.mockRestore();
+      await application.close().catch(() => undefined);
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+  }, 20_000);
 
   it("boots the managed provisioning stack and rotates Pi without moving native sessions", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-application-"));
@@ -519,8 +611,37 @@ describe("Orchestrator application composition", () => {
     await reopened.close();
     const differentRoot = join(root, "different-workspace");
     await mkdir(differentRoot, { recursive: true });
-    await expect(createOrchestratorApplication({ ...config, workspace: { ...config.workspace, root: differentRoot } }))
-      .rejects.toThrow("does not match its persisted Target");
+    const probeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "describe")
+      .mockRejectedValue(new Error("controlled startup candidate probe failure"));
+    const disposeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "dispose")
+      .mockRejectedValue(new Error("controlled startup candidate dispose failure"));
+    const forceDisposeCandidate = vi.spyOn(CodexBackendAdapter.prototype, "forceDispose")
+      .mockRejectedValue(new Error("controlled startup candidate force-dispose failure"));
+    const closeProviderProxy = vi.spyOn(ManagedProviderProxy.prototype, "close");
+    let startupFailure: unknown;
+    let disposeCalls = 0;
+    let forceDisposeCalls = 0;
+    let proxyCloseCalls = 0;
+    try {
+      await createOrchestratorApplication({ ...config, workspace: { ...config.workspace, root: differentRoot } });
+    } catch (error) {
+      startupFailure = error;
+    } finally {
+      disposeCalls = disposeCandidate.mock.calls.length;
+      forceDisposeCalls = forceDisposeCandidate.mock.calls.length;
+      proxyCloseCalls = closeProviderProxy.mock.calls.length;
+      probeCandidate.mockRestore();
+      disposeCandidate.mockRestore();
+      forceDisposeCandidate.mockRestore();
+      closeProviderProxy.mockRestore();
+    }
+    expect(startupFailure).toBeInstanceOf(AggregateError);
+    expect((startupFailure as AggregateError).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: expect.stringContaining("does not match its persisted Target") })
+    ]));
+    expect(disposeCalls).toBe(4);
+    expect(forceDisposeCalls).toBe(4);
+    expect(proxyCloseCalls).toBe(1);
   }, 20_000);
 
   it("rejects a busy Pi replacement before refreshing or republishing its retained instance", async () => {

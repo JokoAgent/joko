@@ -534,6 +534,7 @@ export async function createOrchestratorApplication(
     throw error;
   }
   let backendInstances!: BackendInstanceRegistry;
+  let sessionWorktrees!: SessionWorktreeCoordinator;
   let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
   const subagentModels = new SubagentModelSettings({
     store,
@@ -1171,7 +1172,18 @@ export async function createOrchestratorApplication(
     claudeCodeBackendId
   );
   const claudeCodeOAuthFetch = createOutboundFetch(dependencies.resolveOutboundProxy);
-  backendInstances = new BackendInstanceRegistry(store, { projectDescriptor: withSessionReferenceCapability });
+  backendInstances = new BackendInstanceRegistry(store, {
+    projectDescriptor: withSessionReferenceCapability,
+    onCandidateCleanupUnknown: ({ instanceId, generation }) => {
+      store.appendDiagnostic({
+        severity: "warning",
+        component: "backend-instance",
+        code: "BACKEND_CANDIDATE_CLEANUP_UNCONFIRMED",
+        message: "An unpublished Backend instance candidate could not be fully cleaned up.",
+        details: { backendId: instanceId, instanceGeneration: generation }
+      });
+    }
+  });
   const managedProviderProxy = new ManagedProviderProxy({
     providers,
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy),
@@ -1343,15 +1355,56 @@ export async function createOrchestratorApplication(
       })
     }
   ]).catch(async (error) => {
-    await managedProviderProxy.close();
+    const cleanupErrors: unknown[] = [];
+    try { await backendInstances.dispose(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    try { await managedProviderProxy.close(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        "Backend instance provisioning failed and cleanup remained incomplete."
+      );
+    }
     throw error;
   });
   const piCandidate = backendInstances.adapter(piBackendId);
   if (piCandidate === undefined) {
-    await backendInstances.dispose().catch(() => undefined);
-    await managedProviderProxy.close();
-    throw new Error("The required Pi Backend instance is unavailable.");
+    const unavailable = new Error("The required Pi Backend instance is unavailable.");
+    const cleanupErrors: unknown[] = [];
+    try { await backendInstances.dispose(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    try { await managedProviderProxy.close(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [unavailable, ...cleanupErrors],
+        "The required Pi Backend is unavailable and cleanup remained incomplete."
+      );
+    }
+    throw unavailable;
   }
+  let startupSessionHost: SessionHost | undefined;
+  let startupSessionWorktrees: SessionWorktreeCoordinator | undefined;
+  let startupCleanupHandled = false;
+  let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
+  const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
+    if (startupBackendCleanup !== undefined) return startupBackendCleanup;
+    startupBackendCleanup = (async () => {
+      const failures: unknown[] = [];
+      const attempt = async (cleanup: () => unknown): Promise<void> => {
+        try { await cleanup(); } catch (error) { failures.push(error); }
+      };
+      await attempt(() => terminals.dispose());
+      if (startupSessionHost === undefined) {
+        await attempt(() => backendInstances.dispose());
+      } else {
+        await attempt(() => startupSessionHost!.dispose());
+        await attempt(() => backendInstances.disposeRetainedCandidateCleanups());
+      }
+      await attempt(() => managedProviderProxy.close());
+      return failures;
+    })();
+    return startupBackendCleanup;
+  };
+  let closed = false;
+  try {
   const currentPi = (): ReturnType<typeof createPiAdapter> => {
     const current = backendInstances.adapter(piBackendId);
     if (current === undefined) throw new Error("The required Pi Backend instance is unavailable.");
@@ -1384,7 +1437,7 @@ export async function createOrchestratorApplication(
     changeJournal: new OperationalWorkspaceChangeJournal(store),
     remoteDelegate: remoteWorkspaceFiles
   });
-  const sessionWorktrees = new SessionWorktreeCoordinator({
+  sessionWorktrees = startupSessionWorktrees = new SessionWorktreeCoordinator({
     store,
     workspaces,
     storageRoot: join(config.dataDirectory, "worktrees")
@@ -1398,7 +1451,7 @@ export async function createOrchestratorApplication(
     if (backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true) return true;
     return providers.list(backendId).find((provider) => provider.provider.id === providerId)?.enabled !== false;
   };
-  const sessionHost = new SessionHost(store, artifacts, initialAdapters, {
+  const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
     backendDescriptors: backendInstances.descriptors(),
     backendDescriptorsAlreadyPublished: true,
     workspaceCapture,
@@ -1798,7 +1851,6 @@ export async function createOrchestratorApplication(
   const browserActivity = browserState.activities;
   let maintenanceTimer: NodeJS.Timeout | undefined;
   let maintenanceTail: Promise<void> = Promise.resolve();
-  let closed = false;
   let closePromise: Promise<void> | undefined;
   const serviceCleanups = new Set<() => void>();
   let refreshTail: Promise<void> = Promise.resolve();
@@ -2290,68 +2342,85 @@ export async function createOrchestratorApplication(
       });
     });
   } catch (error) {
+    startupCleanupHandled = true;
+    const cleanupErrors: unknown[] = [];
+    const attempt = async (cleanup: () => unknown): Promise<void> => {
+      try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    };
     closed = true;
-    deferredBackendRestarts?.dispose();
-    commandConcurrencyGate.close();
-    stopExtensionLibraryAuthorityNotifications();
-    await skillMarketSync.close().catch(() => undefined);
-    await skillPublication.close().catch(() => undefined);
-    await skills.close().catch(() => undefined);
-    await skillMarket.close().catch(() => undefined);
-    await extensionLibraries.close().catch(() => undefined);
-    await extensionMainViews.close().catch(() => undefined);
-    await extensionPackagePublisher.close().catch(() => undefined);
-    scheduler.stop();
-    await mobilePush.close().catch(() => undefined);
-    providerAuth.beginShutdown();
-    providerAccountUsage.invalidate();
-    await managedModelRuntimeSystem.close().catch(() => undefined);
-    await collaborationGoals.close().catch(() => undefined);
-    await messaging.close().catch(() => undefined);
-    await sessionHost.dispose().catch(() => undefined);
-    sessionWorktrees.dispose();
-    await generationGcTail.catch(() => undefined);
-    await providerAuth.close().catch(() => undefined);
-    browserSettings?.setBackendHealth({ active: false, status: "unavailable", canRecover: false, reason: "disposing" });
-    await browser?.stop().catch(() => undefined);
-    await computerBridge?.close().catch(() => undefined);
-    await computerRuntime.dispose().catch(() => undefined);
-    await androidRuntime.dispose().catch(() => undefined);
-    await lanDiscovery.stop().catch(() => undefined);
-    unregisterBrowserBridge?.();
-    unregisterComputerBridge?.();
-    unregisterAndroidBridge?.();
-    unregisterImageGenerationBridge();
-    unregisterSessionHelperTools();
-    unregisterContactTools();
-    unregisterCollaborationGoalTools();
-    unregisterPartnerTools();
-    unregisterLspBridge();
-    unregisterRemoteHostTools();
-    unregisterDocumentTools();
-    unregisterIosSimulatorTools();
-    await simulatorRecording?.close().catch(() => undefined);
-    lspBridge.dispose();
-    unregisterSchedulerBridgeTools();
-    unregisterVisionBridgeTools();
-    unregisterMakerMemoryBridge();
-    if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
-    await maintenanceTail.catch(() => undefined);
-    await messageSearch.stop().catch(() => undefined);
-    sessionNavigation.dispose();
-    auxiliaryText.dispose();
-    await mcpRouter.dispose().catch(() => undefined);
-    await terminals.dispose().catch(() => undefined);
-    await voiceInput.close().catch(() => undefined);
-    sshKeys.close();
-    await remoteBackendRuntimeSetup.close().catch(() => undefined);
-    await remoteHosts.close().catch(() => undefined);
-    runtimeActivity.close();
-    contactSync.close();
-    contacts.close();
-    contactStore.close();
-    partnerStore.close();
-    store.close();
+    await attempt(() => deferredBackendRestarts?.dispose());
+    await attempt(() => commandConcurrencyGate.close());
+    await attempt(() => stopExtensionLibraryAuthorityNotifications());
+    await attempt(() => skillMarketSync.close());
+    await attempt(() => skillPublication.close());
+    await attempt(() => skills.close());
+    await attempt(() => skillMarket.close());
+    await attempt(() => extensionLibraries.close());
+    await attempt(() => extensionMainViews.close());
+    await attempt(() => extensionPackagePublisher.close());
+    await attempt(() => scheduler.stop());
+    await attempt(() => mobilePush.close());
+    await attempt(() => providerAuth.beginShutdown());
+    await attempt(() => providerAccountUsage.invalidate());
+    await attempt(() => managedModelRuntimeSystem.close());
+    await attempt(() => collaborationGoals.close());
+    await attempt(() => messaging.close());
+    await attempt(() => refreshTail);
+    await attempt(() => backendLifecycleTail);
+    await attempt(async () => { cleanupErrors.push(...await cleanupStartupBackendOwners()); });
+    await attempt(() => sessionWorktrees.dispose());
+    await attempt(() => generationGcTail);
+    await attempt(() => providerAuth.close());
+    await attempt(() => browserSettings?.setBackendHealth({
+      active: false,
+      status: "unavailable",
+      canRecover: false,
+      reason: "disposing"
+    }));
+    await attempt(() => browser?.stop());
+    await attempt(() => computerBridge?.close());
+    await attempt(() => computerRuntime.dispose());
+    await attempt(() => androidRuntime.dispose());
+    await attempt(() => lanDiscovery.stop());
+    await attempt(() => unregisterBrowserBridge?.());
+    await attempt(() => unregisterComputerBridge?.());
+    await attempt(() => unregisterAndroidBridge?.());
+    await attempt(() => unregisterImageGenerationBridge());
+    await attempt(() => unregisterSessionHelperTools());
+    await attempt(() => unregisterContactTools());
+    await attempt(() => unregisterCollaborationGoalTools());
+    await attempt(() => unregisterPartnerTools());
+    await attempt(() => unregisterLspBridge());
+    await attempt(() => unregisterRemoteHostTools());
+    await attempt(() => unregisterDocumentTools());
+    await attempt(() => unregisterIosSimulatorTools());
+    await attempt(() => simulatorRecording?.close());
+    await attempt(() => lspBridge.dispose());
+    await attempt(() => unregisterSchedulerBridgeTools());
+    await attempt(() => unregisterVisionBridgeTools());
+    await attempt(() => unregisterMakerMemoryBridge());
+    await attempt(() => { if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer); });
+    await attempt(() => maintenanceTail);
+    await attempt(() => messageSearch.stop());
+    await attempt(() => sessionNavigation.dispose());
+    await attempt(() => auxiliaryText.dispose());
+    await attempt(() => mcpRouter.dispose());
+    await attempt(() => voiceInput.close());
+    await attempt(() => sshKeys.close());
+    await attempt(() => remoteBackendRuntimeSetup.close());
+    await attempt(() => remoteHosts.close());
+    await attempt(() => runtimeActivity.close());
+    await attempt(() => contactSync.close());
+    await attempt(() => contacts.close());
+    await attempt(() => contactStore.close());
+    await attempt(() => partnerStore.close());
+    await attempt(() => store.close());
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        "Orchestrator startup failed and cleanup remained incomplete."
+      );
+    }
     throw error;
   }
 
@@ -2486,6 +2555,7 @@ export async function createOrchestratorApplication(
         // Keep the remote transports alive while terminals attempt confirmed process cleanup.
         await attempt(() => terminals.dispose());
         await attempt(() => sessionHost.dispose());
+        await attempt(() => backendInstances.disposeRetainedCandidateCleanups());
         await attempt(() => managedProviderProxy.close());
         await attempt(() => sessionWorktrees.dispose());
         await generationGcTail.catch(() => undefined);
@@ -2535,6 +2605,50 @@ export async function createOrchestratorApplication(
       return closePromise;
     }
   };
+  } catch (error) {
+    if (startupCleanupHandled) throw error;
+    closed = true;
+    const cleanupErrors: unknown[] = [];
+    const attempt = async (cleanup: () => unknown): Promise<void> => {
+      try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+    };
+    await attempt(() => deferredBackendRestarts?.dispose());
+    await attempt(() => commandConcurrencyGate.close());
+    await attempt(() => stopExtensionLibraryAuthorityNotifications());
+    await attempt(() => simulatorControl?.dispose());
+    await attempt(() => providerAuth.beginShutdown());
+    await attempt(() => providerAccountUsage.invalidate());
+    cleanupErrors.push(...await cleanupStartupBackendOwners());
+    await attempt(() => startupSessionWorktrees?.dispose());
+    await attempt(() => generationGcTail.catch(() => undefined));
+    await attempt(() => providerAuth.close());
+    await attempt(() => mcpRouter.dispose());
+    await attempt(() => voiceInput.close());
+    await attempt(() => remoteBackendRuntimeSetup.close());
+    await attempt(() => remoteHosts.close());
+    await attempt(() => mobilePush.close());
+    await attempt(() => skillMarketSync.close());
+    await attempt(() => skillPublication.close());
+    await attempt(() => skills.close());
+    await attempt(() => skillMarket.close());
+    await attempt(() => extensionLibraries.close());
+    await attempt(() => extensionMainViews.close());
+    await attempt(() => extensionPackagePublisher.close());
+    await attempt(() => sshKeys.close());
+    await attempt(() => runtimeActivity.close());
+    await attempt(() => contactSync.close());
+    await attempt(() => contacts.close());
+    await attempt(() => contactStore.close());
+    await attempt(() => partnerStore.close());
+    await attempt(() => store.close());
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        "Orchestrator initialization failed and cleanup remained incomplete."
+      );
+    }
+    throw error;
+  }
 }
 
 function contactSyncDisplayName(): string {

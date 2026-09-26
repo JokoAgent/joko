@@ -187,7 +187,16 @@ export class OrchestratorE2eFixture {
     const adapters = new Map<string, InstrumentedFakeAdapter>();
     const store = new OperationalStore(databasePath);
     const backendInstances = new BackendInstanceRegistry(store, {
-      projectDescriptor: withSessionReferenceCapability
+      projectDescriptor: withSessionReferenceCapability,
+      onCandidateCleanupUnknown: ({ instanceId, generation }) => {
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "backend-instance",
+          code: "BACKEND_CANDIDATE_CLEANUP_UNCONFIRMED",
+          message: "An unpublished Backend instance candidate could not be fully cleaned up.",
+          details: { backendId: instanceId, instanceGeneration: generation }
+        });
+      }
     });
     const factories: readonly BackendInstanceFactory[] = [...profiles.map((profile) => ({
       instanceId: profile.id,
@@ -357,21 +366,29 @@ export class OrchestratorE2eFixture {
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
       async close() {
-        scheduler.stop();
-        auxiliaryServices?.sessionNavigation?.dispose();
-        auxiliaryServices?.auxiliaryText?.dispose();
-        await auxiliaryServices?.mcpRouter?.dispose();
-        auxiliaryServices?.sshKeys?.close();
-        await auxiliaryServices?.remoteHosts?.close();
-        await auxiliaryServices?.browser?.stop();
-        await auxiliaryServices?.voiceInput?.close();
-        await lanDiscovery.stop();
-        await options.terminals?.dispose();
-        contacts.close();
-        contactStore.close();
-        await sessionHost.dispose();
-        sessionWorktrees.dispose();
-        store.close();
+        const failures: unknown[] = [];
+        const attempt = async (cleanup: () => unknown): Promise<void> => {
+          try { await cleanup(); } catch (error) { failures.push(error); }
+        };
+        await attempt(() => scheduler.stop());
+        await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
+        await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
+        // Keep native transports and remote dependencies alive until exact
+        // current/candidate process cleanup has settled.
+        await attempt(() => options.terminals?.dispose());
+        await attempt(() => sessionHost.dispose());
+        await attempt(() => backendInstances.disposeRetainedCandidateCleanups());
+        await attempt(() => auxiliaryServices?.mcpRouter?.dispose());
+        await attempt(() => auxiliaryServices?.remoteHosts?.close());
+        await attempt(() => auxiliaryServices?.browser?.stop());
+        await attempt(() => auxiliaryServices?.voiceInput?.close());
+        await attempt(() => lanDiscovery.stop());
+        await attempt(() => auxiliaryServices?.sshKeys?.close());
+        await attempt(() => contacts.close());
+        await attempt(() => contactStore.close());
+        await attempt(() => sessionWorktrees.dispose());
+        await attempt(() => store.close());
+        if (failures.length > 0) throw new AggregateError(failures, "The E2E application did not close cleanly.");
       }
     };
     const server = await createPublicServer(application);

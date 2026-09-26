@@ -88,6 +88,151 @@ describe("BackendInstanceRegistry", () => {
     expect(store.getBackend("backend").descriptor.instanceGeneration).toBe(3);
   });
 
+  it("never cleans the retained Adapter when a replacement factory reuses it and probing fails", async () => {
+    const { registry, store } = fixture();
+    const describe = vi.fn()
+      .mockResolvedValueOnce(descriptor("backend"))
+      .mockRejectedValueOnce(new Error("reused Adapter probe failed"));
+    const current = adapter("backend", { describe });
+    await registry.provision([dynamicFactory("backend", () => current)]);
+
+    await expect(registry.replace("backend"))
+      .rejects.toThrow("Backend replacement candidate failed validation: backend");
+
+    expect(registry.adapter("backend")).toBe(current);
+    expect(current.dispose).not.toHaveBeenCalled();
+    expect(registry.candidateCleanupSnapshots()).toEqual([]);
+    expect(store.getBackendInstanceGenerationAuthority("backend")).toMatchObject({
+      currentGeneration: 1,
+      highWaterGeneration: 2
+    });
+  });
+
+  it("never cleans a sibling Adapter returned by a faulty replacement factory", async () => {
+    const { registry, store } = fixture();
+    const current = adapter("backend");
+    const sibling = adapter("sibling");
+    const candidates = [current, sibling];
+    await registry.provision([
+      dynamicFactory("backend", () => candidates.shift()!),
+      factory("sibling", sibling)
+    ]);
+
+    await expect(registry.replace("backend"))
+      .rejects.toThrow("Backend replacement candidate failed validation: backend");
+
+    expect(registry.adapter("backend")).toBe(current);
+    expect(registry.adapter("sibling")).toBe(sibling);
+    expect(current.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
+    expect(registry.candidateCleanupSnapshots()).toEqual([]);
+    expect(store.getBackendInstanceGenerationAuthority("backend")).toMatchObject({
+      currentGeneration: 1,
+      highWaterGeneration: 2
+    });
+  });
+
+  it("retains the exact rejected candidate while a bounded janitor retries unconfirmed cleanup", async () => {
+    const cleanupUnknown = vi.fn();
+    const { registry, store } = fixture({
+      retirementStepTimeoutMs: 5,
+      retirementRetryDelayMs: 100,
+      retirementAttempts: 2,
+      onCandidateCleanupUnknown: cleanupUnknown
+    });
+    const current = adapter("backend");
+    const sibling = adapter("sibling");
+    const stalledDispose = deferred<void>();
+    const dispose = vi.fn()
+      .mockReturnValueOnce(stalledDispose.promise)
+      .mockResolvedValueOnce(undefined);
+    const forceDispose = vi.fn()
+      .mockRejectedValueOnce(new Error("private-candidate-force-secret"));
+    const rejected = adapter("backend", {
+      describe: async () => { throw new Error("private-candidate-probe-secret"); },
+      dispose,
+      forceDispose
+    });
+    const candidates = [current, rejected];
+    await registry.provision([
+      dynamicFactory("backend", () => candidates.shift()!),
+      factory("sibling", sibling)
+    ]);
+
+    await expect(registry.replace("backend"))
+      .rejects.toThrow("Backend replacement candidate failed validation: backend");
+
+    expect(registry.candidateCleanupSnapshots()).toEqual([{
+      instanceId: "backend",
+      generation: 2,
+      state: "cleanup_unknown"
+    }]);
+    expect(cleanupUnknown).toHaveBeenCalledExactlyOnceWith({
+      instanceId: "backend",
+      generation: 2,
+      state: "cleanup_unknown"
+    });
+    expect(JSON.stringify(cleanupUnknown.mock.calls)).not.toContain("private-candidate");
+    expect(store.getBackendInstanceGenerationAuthority("backend")).toMatchObject({
+      currentGeneration: 1,
+      highWaterGeneration: 2
+    });
+    expect(registry.adapter("backend")).toBe(current);
+    expect(registry.adapter("sibling")).toBe(sibling);
+    expect(current.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(forceDispose).toHaveBeenCalledOnce();
+
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(registry.candidateCleanupSnapshots()).toEqual([]));
+    expect(forceDispose).toHaveBeenCalledOnce();
+    expect(current.dispose).not.toHaveBeenCalled();
+    expect(sibling.dispose).not.toHaveBeenCalled();
+    stalledDispose.resolve(undefined);
+  });
+
+  it("keeps exhausted candidate cleanup ownership for an exact retry during registry disposal", async () => {
+    const { registry, store } = fixture({
+      retirementStepTimeoutMs: 5,
+      retirementRetryDelayMs: 0,
+      retirementAttempts: 2
+    });
+    const current = adapter("backend");
+    const dispose = vi.fn(async () => { throw new Error("private-dispose-secret"); });
+    const forceDispose = vi.fn(async () => { throw new Error("private-force-secret"); });
+    const rejected = adapter("backend", {
+      describe: async () => { throw new Error("private-probe-secret"); },
+      dispose,
+      forceDispose
+    });
+    const candidates = [current, rejected];
+    await registry.provision([dynamicFactory("backend", () => candidates.shift()!)]);
+
+    await expect(registry.replace("backend"))
+      .rejects.toThrow("Backend replacement candidate failed validation: backend");
+    await vi.waitFor(() => expect(forceDispose).toHaveBeenCalledTimes(2));
+    expect(registry.candidateCleanupSnapshots()).toEqual([{
+      instanceId: "backend",
+      generation: 2,
+      state: "cleanup_unknown"
+    }]);
+    expect(store.getBackendInstanceGenerationAuthority("backend")).toMatchObject({
+      currentGeneration: 1,
+      highWaterGeneration: 2
+    });
+
+    await expect(registry.dispose()).rejects.toThrow("Backend instance disposal failed");
+    expect(dispose).toHaveBeenCalledTimes(3);
+    expect(forceDispose).toHaveBeenCalledTimes(3);
+    expect(current.dispose).toHaveBeenCalledOnce();
+    expect(registry.candidateCleanupSnapshots()).toEqual([{
+      instanceId: "backend",
+      generation: 2,
+      state: "cleanup_unknown"
+    }]);
+  });
+
   it("publishes a new unavailable generation when startup cannot reconstruct the durable current", async () => {
     const { registry, store } = fixture();
     store.upsertBackend({
