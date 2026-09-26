@@ -8,6 +8,7 @@ import {
   FileKind, FilePreviewSchema, FileRevisionSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   WorkspaceSearchMatchSchema,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
+  ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
   EventCursorSchema, EventSchema, ImageRefSchema, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
@@ -919,6 +920,11 @@ function fakeNetwork(): MobileNetwork {
     requestPairing: vi.fn(async () => ({ challengeId: "challenge", identity: node })),
     completePairing: vi.fn(async () => ({ credential, identity: node })),
     readOwner: vi.fn(async () => ({ connection, device, snapshot })),
+    listPartners: vi.fn(async () => []),
+    listPartnerSessions: vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [] })),
+    listPartnerPrivateThreads: vi.fn(async () => []),
+    getPartnerPrivateThread: vi.fn(async () => { throw new Error("No private thread fixture was configured."); }),
+    markPartnerPrivateThreadRead: vi.fn(async () => { throw new Error("No private read fixture was configured."); }),
     getMobilePushCapability: vi.fn(async () => ({ supported: true })),
     registerMobilePush: vi.fn(async (_credential, input) => ({
       registrationId: input.ticket.registrationId,
@@ -1627,6 +1633,73 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
   return instance;
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); });
+
+describe("mobile Partner private authority", () => {
+  it("revalidates a task preview against its exact canonical Partner Session and target participant", async () => {
+    const network = fakeNetwork();
+    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 1,
+      canonicalSessionId: "session" }]);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        available: true, readOnly: false, deleted: false, archived: false }]
+    }));
+    network.listPartnerPrivateThreads = vi.fn(async () => [{
+      threadId: "private-thread", firstPartnerId: "partner-a", secondPartnerId: "partner-b",
+      otherPartnerId: "partner-b", status: "active" as const, messageCount: 0, maxMessages: 12,
+      createdAt: 1_000, updatedAt: 1_000, expiresAt: 900_000
+    }]);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openPartnerPrivateFromSession("session", "private-thread", "partner-c");
+    expect(network.listPartnerSessions).toHaveBeenCalledWith(credential, "partner-a", expect.any(AbortSignal));
+    expect(network.getPartnerPrivateThread).not.toHaveBeenCalled();
+    expect(app.state.partnerPrivate.detailStatus).toBe("error");
+  });
+
+  it("opens authenticated detail without marking read and retires a late visible-read response on background", async () => {
+    const network = fakeNetwork();
+    const thread = {
+      threadId: "private-thread", firstPartnerId: "partner-a", secondPartnerId: "partner-b",
+      otherPartnerId: "partner-b", status: "active" as const, messageCount: 1, maxMessages: 12,
+      createdAt: 1_000, updatedAt: 2_000, expiresAt: 900_000
+    };
+    const detail = {
+      thread,
+      messages: [{ messageId: "private-message", threadId: thread.threadId, sequence: 1,
+        senderPartnerId: "partner-a", recipientPartnerId: "partner-b", content: "Private text",
+        deliveryStatus: "pending" as const, createdAt: 2_000 }]
+    };
+    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
+      lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 1,
+      canonicalSessionId: "session" }]);
+    network.listPartnerPrivateThreads = vi.fn(async () => [thread]);
+    network.getPartnerPrivateThread = vi.fn(async () => detail);
+    let resolveRead!: (value: Awaited<ReturnType<MobileNetwork["markPartnerPrivateThreadRead"]>>) => void;
+    let readSignal: AbortSignal | undefined;
+    network.markPartnerPrivateThreadRead = vi.fn((_credential, _partnerId, _threadId, _through, _maximum, signal) => {
+      readSignal = signal;
+      return new Promise<Awaited<ReturnType<MobileNetwork["markPartnerPrivateThreadRead"]>>>(
+        (resolve) => { resolveRead = resolve; }
+      );
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.openPartnerDirectory();
+    await app.selectPartnerPrivatePartner("partner-a");
+    await app.openPartnerPrivateThread("partner-a", thread.threadId);
+    expect(app.state.partnerPrivate.detail?.messages[0]?.content).toBe("Private text");
+    expect(network.markPartnerPrivateThreadRead).not.toHaveBeenCalled();
+    const mark = app.markPartnerPrivateVisible("partner-a", thread.threadId, 1);
+    await vi.waitFor(() => expect(readSignal).toBeDefined());
+    app.setForeground(false);
+    expect(readSignal?.aborted).toBe(true);
+    resolveRead({ threadId: thread.threadId, partnerId: "partner-a", throughSequence: 1, updatedAt: 3_000 });
+    await mark;
+    expect(app.state.partnerPrivate.detail).toBeUndefined();
+    expect(app.state.partnerPrivate.status).toBe("offline");
+  });
+});
 
 describe("native mobile push authority", () => {
   it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {

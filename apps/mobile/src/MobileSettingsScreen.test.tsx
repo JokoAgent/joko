@@ -14,6 +14,7 @@ import {
 import { emptyMobileAutomationsState } from "./mobile-automation";
 import type { MobileState, SavedMobileConnection } from "./mobile-client";
 import { emptyMobileFilesState } from "./workspace-files";
+import { emptyMobilePartnerPrivateState } from "./mobile-partner-private";
 import {
   MobileSettingsScreen,
   resolveMobileSettingsCurrentDevice,
@@ -190,6 +191,7 @@ function mobileState(patch: Partial<MobileState> = {}): MobileState {
     homeSearchSessionIds: [],
     files: emptyMobileFilesState(),
     automations: emptyMobileAutomationsState(),
+    partnerPrivate: emptyMobilePartnerPrivateState(),
     ...patch
   };
 }

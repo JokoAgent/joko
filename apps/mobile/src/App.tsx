@@ -245,6 +245,7 @@ import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-sha
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
+import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import {
@@ -307,7 +308,7 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "settings" | "connections" | "devices" | "device";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "partners" | "settings" | "connections" | "devices" | "device";
 
 interface MobilePhotoLibraryLease {
   readonly controls: MobileAttachmentControls;
@@ -549,6 +550,7 @@ export function App() {
     () => mobilePush.snapshot
   );
   const [page, setPage] = useState<Page>("home");
+  const [partnerReturnPage, setPartnerReturnPage] = useState<"home" | "task">("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
   const [homeSearchFocusRequest, setHomeSearchFocusRequest] = useState(0);
@@ -772,6 +774,10 @@ export function App() {
   }, [state.status, state.activeProfileId, state.selectedId, state.owner?.devices, deviceId, page]);
 
   useEffect(() => {
+    if (page !== "partners" && state.partnerPrivate.open) client.closePartnerPrivate();
+  }, [page, state.partnerPrivate.open]);
+
+  useEffect(() => {
     if (nativeIntentMessageFocus && nativeIntentMessageFocus.sessionId !== state.selectedId) {
       setNativeIntentMessageFocus(undefined);
     }
@@ -813,6 +819,12 @@ export function App() {
                   onHome={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
                   onNew={() => { setNativeIntentMessageFocus(undefined); setPage("new"); }}
                   onFiles={() => { setNativeIntentMessageFocus(undefined); setFocusTaskComposer(false); setPage("files"); }}
+                  onOpenPartnerThread={(preview) => {
+                    if (state.selectedId === undefined || state.status !== "connected") return;
+                    setPartnerReturnPage("task");
+                    void client.openPartnerPrivateFromSession(state.selectedId, preview.threadId, preview.targetPartnerId);
+                    setPage("partners");
+                  }}
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
                   messageFocus={nativeIntentMessageFocus} /> :
                 page === "files" ? <FilesScreen {...common} onBack={() => setPage("task")}
@@ -823,6 +835,21 @@ export function App() {
                 page === "automations" ? <MobileAutomationsScreen colors={colors} state={state} client={client}
                   locale={locale.effectiveLocale}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
+                page === "partners" ? <MobilePartnersScreen colors={colors} locale={locale.effectiveLocale}
+                  view={state.partnerPrivate}
+                  onBack={() => {
+                    client.closePartnerPrivate();
+                    setPage(partnerReturnPage === "task" && state.selectedId !== undefined ? "task" : "home");
+                  }}
+                  onOpenPartner={(partnerId) => { void client.selectPartnerPrivatePartner(partnerId); }}
+                  onClosePartner={() => client.closePartnerPrivatePartner()}
+                  onOpenThread={(partnerId, threadId) => { void client.openPartnerPrivateThread(partnerId, threadId); }}
+                  onCloseThread={() => client.closePartnerPrivateThread()}
+                  onRefresh={() => { void client.refreshPartnerPrivate(); }}
+                  onDetailVisible={(partnerId, threadId, throughSequence) => {
+                    if (!foreground || updates.prompt || updates.forced || page !== "partners") return;
+                    void client.markPartnerPrivateVisible(partnerId, threadId, throughSequence);
+                  }} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
                   theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
                   updates={updates} updateActions={mobileUpdateActions} push={push} client={client}
@@ -867,6 +894,11 @@ export function App() {
           }}
           onSearch={() => queueHomeMenuAction(() => setHomeSearchFocusRequest((value) => value + 1))}
           onAutomations={() => queueHomeMenuAction(() => setPage("automations"))}
+          onPartners={() => queueHomeMenuAction(() => {
+            setPartnerReturnPage("home");
+            void client.openPartnerDirectory();
+            setPage("partners");
+          })}
           onSwitch={() => queueHomeMenuAction(() => { client.setConnectionMode("saved"); setPage("connection"); })}
           onSettings={() => queueHomeMenuAction(() => setPage("settings"))}
           onDevices={() => queueHomeMenuAction(() => setPage("devices"))} />
@@ -1358,9 +1390,9 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, menuBu
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete";
 
-function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onSwitch, onSettings, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onPartners, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
-  onSearch: () => void; onAutomations: () => void; onSwitch: () => void; onSettings: () => void; onDevices: () => void;
+  onSearch: () => void; onAutomations: () => void; onPartners: () => void; onSwitch: () => void; onSettings: () => void; onDevices: () => void;
 }) {
   const { width } = useWindowDimensions();
   const closeRef = useRef<View>(null);
@@ -1383,6 +1415,8 @@ function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMounted
           onPress={onSearch} colors={colors} />
         <MenuRow label={mobileMessage(locale, "home.menu.automations")}
           description={mobileMessage(locale, "home.menu.automationsDescription")} onPress={onAutomations} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "partner.title")}
+          description={mobileMessage(locale, "partner.menuDescription")} onPress={onPartners} colors={colors} />
         <MenuRow label={mobileMessage(locale, "home.menu.switch")} description={mobileMessage(locale, "home.menu.switchDescription")}
           onPress={onSwitch} colors={colors} />
         <MenuRow label={mobileMessage(locale, "common.devices")} description={mobileMessage(locale, "home.menu.devicesDescription")}
@@ -2826,9 +2860,10 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated }: ScreenProps
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, focusComposer, onComposerFocused,
+function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, focusComposer, onComposerFocused,
   messageFocus }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: () => void;
+  onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
 }) {
@@ -4844,6 +4879,23 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, foc
         </Text>}
         <Text style={[styles.caption, { color: colors.muted }]}>{item.label}</Text>
         <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>
+        {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
+          accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
+          accessibilityHint={mobileMessage(locale, "partner.readOnly")}
+          disabled={state.status !== "connected" || state.selectedId === undefined}
+          onPress={() => onOpenPartnerThread(item.partnerPrivatePreview!)}
+          style={[styles.messageImageTile, { borderColor: colors.border, backgroundColor: colors.background },
+            (state.status !== "connected" || state.selectedId === undefined) && styles.disabled]}>
+          <View style={styles.fill}>
+            <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>
+              {item.partnerPrivatePreview.targetName}
+            </Text>
+            {item.partnerPrivatePreview.preview && <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={2}>
+              {item.partnerPrivatePreview.preview}
+            </Text>}
+          </View>
+          <Text style={[styles.caption, { color: colors.accent }]}>{mobileMessage(locale, "partner.openThread")}</Text>
+        </Pressable>}
         {item.images && item.images.length > 0 && <View accessibilityLabel={`${item.label} · ${mobileMessage(locale, "task.images", { count: item.images.length })}`} style={styles.messageImages}>
           {item.images.map((image, index) => <Pressable key={image.pageId} accessibilityRole="imagebutton"
             accessibilityLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: item.images!.length, name: image.title })}

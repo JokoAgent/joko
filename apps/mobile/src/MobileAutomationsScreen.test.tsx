@@ -24,6 +24,7 @@ import {
   type Snapshot
 } from "@joko/contracts";
 import { emptyMobileFilesState } from "./workspace-files";
+import { emptyMobilePartnerPrivateState } from "./mobile-partner-private";
 import type { MobileState } from "./mobile-client";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type {
@@ -278,6 +279,7 @@ function mobileState(automationPatch: Partial<MobileAutomationsState> = {}, stat
     homeSearchSessionIds: [],
     files: emptyMobileFilesState(),
     automations: automations(automationPatch),
+    partnerPrivate: emptyMobilePartnerPrivateState(),
     ...statePatch
   };
 }

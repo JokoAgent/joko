@@ -38,6 +38,10 @@ import {
   type MobilePushRegistrationResult, type MobilePushRevocationTicket, type NodeIdentity, type PairedCredential
 } from "./network";
 import {
+  assertMobileCanonicalPartnerSession, emptyMobilePartnerPrivateState,
+  validMobilePartnerId, type MobilePartnerPrivateState, type MobilePrivateDetail
+} from "./mobile-partner-private";
+import {
   artifactTitle,
   bytesToDataUri,
   canonicalWorkspacePath,
@@ -349,6 +353,7 @@ export interface MobileState {
   readonly timelinePreview?: MobileFilePreview;
   readonly files: MobileFilesState;
   readonly automations: MobileAutomationsState;
+  readonly partnerPrivate: MobilePartnerPrivateState;
   readonly offlineSnapshotAt?: number;
   readonly error?: string;
 }
@@ -560,7 +565,7 @@ export class MobileClient {
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
     homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState(),
-    automations: emptyMobileAutomationsState() };
+    automations: emptyMobileAutomationsState(), partnerPrivate: emptyMobilePartnerPrivateState() };
   #credential?: PairedCredential;
   #profiles: MobileConnectionProfile[] = [];
   #automaticProfileId?: string;
@@ -612,6 +617,22 @@ export class MobileClient {
   #automationAbort?: AbortController;
   #automationHistoryAbort?: AbortController;
   #automationHistoryPageTokens = new Set<string>();
+  #partnerPrivateEpoch = 0;
+  #partnerPrivateAbort?: AbortController;
+  #partnerPrivateReadAbort?: AbortController;
+  #partnerPrivateReadFlight?: Promise<void>;
+  #partnerPrivateReadTarget?: number;
+  #partnerPrivateDetailLease?: symbol;
+  #partnerPrivateRefreshTimer?: ReturnType<typeof setTimeout>;
+  #partnerPrivateSourceSessionId?: string;
+  #partnerPrivateSourceTargetId?: string;
+  #partnerPrivateResume?: {
+    readonly credentialKey: string;
+    readonly selectedPartnerId?: string;
+    readonly selectedThreadId?: string;
+    readonly sourceSessionId?: string;
+    readonly sourceTargetId?: string;
+  };
 
   constructor(
     private readonly network: MobileNetwork,
@@ -716,8 +737,35 @@ export class MobileClient {
   #set(patch: Partial<MobileState>): void {
     if (this.#disposed) return;
     const previousAuthority = this.filesAuthorityKey();
+    const previousPartnerAuthority = this.#partnerPrivateAuthorityKey(this.#state);
     let next = { ...this.#state, ...patch };
     const nextAuthority = this.#filesAuthorityKey(next);
+    const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
+    const sourceSessionChanged = this.#partnerPrivateSourceSessionId !== undefined
+      && next.selectedId !== this.#partnerPrivateSourceSessionId;
+    const partnerAuthorityChanged = previousPartnerAuthority !== undefined && nextPartnerAuthority !== undefined
+      && previousPartnerAuthority !== nextPartnerAuthority;
+    if (next.partnerPrivate.open && (previousPartnerAuthority !== nextPartnerAuthority || sourceSessionChanged)) {
+      if (partnerAuthorityChanged) {
+        this.#partnerPrivateResume = {
+          credentialKey: this.#partnerPrivateCredentialKey(this.#credential)!,
+          ...(this.#state.partnerPrivate.selectedPartnerId === undefined ? {}
+            : { selectedPartnerId: this.#state.partnerPrivate.selectedPartnerId }),
+          ...(this.#state.partnerPrivate.selectedThreadId === undefined ? {}
+            : { selectedThreadId: this.#state.partnerPrivate.selectedThreadId }),
+          ...(this.#partnerPrivateSourceSessionId === undefined ? {}
+            : { sourceSessionId: this.#partnerPrivateSourceSessionId }),
+          ...(this.#partnerPrivateSourceTargetId === undefined ? {}
+            : { sourceTargetId: this.#partnerPrivateSourceTargetId })
+        };
+      }
+      this.#cancelPartnerPrivateRequests();
+      this.#partnerPrivateSourceSessionId = undefined;
+      this.#partnerPrivateSourceTargetId = undefined;
+      if (sourceSessionChanged) this.#partnerPrivateResume = undefined;
+      next = { ...next, partnerPrivate: emptyMobilePartnerPrivateState(true,
+        nextPartnerAuthority === undefined ? "offline" : "idle") };
+    }
     if (next.files.open && previousAuthority !== nextAuthority) {
       this.#cancelFilesRequests();
       next = {
@@ -766,9 +814,33 @@ export class MobileClient {
       this.#fileShareLease.controller.abort();
     }
     for (const listener of this.#listeners) listener(this.#state);
+    if (partnerAuthorityChanged && next.partnerPrivate.open) this.#schedulePartnerPrivateRefresh(250);
+    else if (next.partnerPrivate.open && nextPartnerAuthority !== undefined
+      && this.#partnerPrivateRefreshTimer === undefined) {
+      this.#schedulePartnerPrivateRefresh(next.partnerPrivate.detail?.messages.some(
+        (item) => item.deliveryStatus === "pending") ? 4_000 : 30_000);
+    }
   }
 
   #retire(): number {
+    const partnerPrivate = this.#state.partnerPrivate;
+    const credentialKey = this.#partnerPrivateCredentialKey(this.#credential);
+    if (partnerPrivate.open && credentialKey
+      && (partnerPrivate.selectedPartnerId !== undefined || partnerPrivate.selectedThreadId !== undefined
+        || this.#partnerPrivateResume?.credentialKey !== credentialKey)) {
+      this.#partnerPrivateResume = {
+        credentialKey,
+        ...(partnerPrivate.selectedPartnerId === undefined ? {} : { selectedPartnerId: partnerPrivate.selectedPartnerId }),
+        ...(partnerPrivate.selectedThreadId === undefined ? {} : { selectedThreadId: partnerPrivate.selectedThreadId }),
+        ...(this.#partnerPrivateSourceSessionId === undefined ? {} : { sourceSessionId: this.#partnerPrivateSourceSessionId }),
+        ...(this.#partnerPrivateSourceTargetId === undefined ? {} : { sourceTargetId: this.#partnerPrivateSourceTargetId })
+      };
+    }
+    this.#cancelPartnerPrivateRequests();
+    if (this.#partnerPrivateRefreshTimer !== undefined) clearTimeout(this.#partnerPrivateRefreshTimer);
+    this.#partnerPrivateRefreshTimer = undefined;
+    this.#partnerPrivateSourceSessionId = undefined;
+    this.#partnerPrivateSourceTargetId = undefined;
     this.#abort?.abort();
     this.#streamAbort?.abort();
     this.#streamAbort = undefined;
@@ -798,6 +870,8 @@ export class MobileClient {
       homeSearchSessionIds: [],
       homeSearchError: undefined,
       timelinePreview: undefined,
+      partnerPrivate: emptyMobilePartnerPrivateState(partnerPrivate.open,
+        partnerPrivate.open ? "offline" : "idle"),
       ...(this.#state.files.preview?.kind === "media" || this.#state.files.preview?.kind === "pdf"
         || this.#state.files.preview?.kind === "model"
         ? { files: { ...this.#state.files, preview: undefined } }
@@ -808,6 +882,335 @@ export class MobileClient {
   }
 
   #current(epoch: number): boolean { return !this.#disposed && this.#foreground && this.#epoch === epoch; }
+
+  #partnerPrivateCredentialKey(credential: PairedCredential | undefined): string | undefined {
+    return credential === undefined ? undefined : [credential.profileId, credential.origin, credential.serverId,
+      credential.connectionId, credential.deviceId].join("\u001f");
+  }
+
+  #partnerPrivateAuthorityKey(state: MobileState): string | undefined {
+    const credential = this.#credential;
+    const node = state.node;
+    const owner = state.owner;
+    if (this.#disposed || !this.#foreground || !credential || !node || !owner
+      || state.status !== "connected" || state.activeProfileId !== credential.profileId
+      || this.#activeProfileId !== credential.profileId || state.origin !== credential.origin
+      || node.serverId !== credential.serverId || owner.server?.serverId !== credential.serverId
+      || owner.server.apiVersion !== node.apiVersion) return undefined;
+    const connections = owner.connections.filter((item) => item.connectionId === credential.connectionId);
+    const devices = owner.devices.filter((item) => item.deviceId === credential.deviceId);
+    if (connections.length !== 1 || devices.length !== 1) return undefined;
+    const connection = connections[0]!;
+    const device = devices[0]!;
+    if (connection.connectionProfileId !== credential.profileId || connection.deviceId !== credential.deviceId
+      || connection.state !== ConnectionState.CONNECTED || device.kind !== DeviceKind.MOBILE
+      || device.revoked || !device.connectionIds.includes(credential.connectionId)) return undefined;
+    return [this.#partnerPrivateCredentialKey(credential), owner.generation.toString(10),
+      entityVersionKey(connection.version), entityVersionKey(device.version)].join("\u001f");
+  }
+
+  #partnerPrivateContext(): { readonly credential: PairedCredential; readonly authorityKey: string } | undefined {
+    const credential = this.#credential;
+    const authorityKey = this.#partnerPrivateAuthorityKey(this.#state);
+    return credential && authorityKey ? { credential, authorityKey } : undefined;
+  }
+
+  #cancelPartnerPrivateRequests(): void {
+    this.#partnerPrivateAbort?.abort();
+    this.#partnerPrivateReadAbort?.abort();
+    this.#partnerPrivateAbort = undefined;
+    this.#partnerPrivateReadAbort = undefined;
+    this.#partnerPrivateReadTarget = undefined;
+    this.#partnerPrivateReadFlight = undefined;
+    this.#partnerPrivateDetailLease = undefined;
+    this.#partnerPrivateEpoch += 1;
+  }
+
+  #schedulePartnerPrivateRefresh(delay: number): void {
+    if (this.#partnerPrivateRefreshTimer !== undefined) clearTimeout(this.#partnerPrivateRefreshTimer);
+    this.#partnerPrivateRefreshTimer = setTimeout(() => {
+      this.#partnerPrivateRefreshTimer = undefined;
+      if (!this.#state.partnerPrivate.open || !this.#partnerPrivateContext()) return;
+      if (this.#partnerPrivateResume) void this.#resumePartnerPrivate();
+      else void this.refreshPartnerPrivate();
+    }, delay);
+  }
+
+  #beginPartnerPrivateRequest(): { readonly generation: number; readonly controller: AbortController } {
+    this.#cancelPartnerPrivateRequests();
+    const controller = new AbortController();
+    this.#partnerPrivateAbort = controller;
+    return { generation: this.#partnerPrivateEpoch, controller };
+  }
+
+  #partnerPrivateRequestCurrent(
+    generation: number, controller: AbortController, authorityKey: string
+  ): boolean {
+    return this.#partnerPrivateEpoch === generation && this.#partnerPrivateAbort === controller
+      && !controller.signal.aborted && this.#partnerPrivateAuthorityKey(this.#state) === authorityKey
+      && this.#state.partnerPrivate.open;
+  }
+
+  async openPartnerDirectory(): Promise<void> {
+    const context = this.#partnerPrivateContext();
+    const { generation, controller } = this.#beginPartnerPrivateRequest();
+    this.#partnerPrivateSourceSessionId = undefined;
+    this.#partnerPrivateSourceTargetId = undefined;
+    this.#set({ partnerPrivate: emptyMobilePartnerPrivateState(true, context ? "loading" : "offline") });
+    if (!context) return;
+    try {
+      const partners = await this.network.listPartners(context.credential, controller.signal);
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)) return;
+      this.#set({ partnerPrivate: { ...emptyMobilePartnerPrivateState(true, "ready"), partners } });
+    } catch (error) {
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)) return;
+      this.#set({ partnerPrivate: { ...emptyMobilePartnerPrivateState(true, "error"), error: message(error) } });
+    }
+  }
+
+  async selectPartnerPrivatePartner(partnerId: string): Promise<void> {
+    const context = this.#partnerPrivateContext();
+    const current = this.#state.partnerPrivate;
+    if (!context || !current.open) {
+      this.#set({ partnerPrivate: emptyMobilePartnerPrivateState(true, "offline") });
+      return;
+    }
+    const partner = current.partners.filter((item) => item.partnerId === partnerId);
+    if (!validMobilePartnerId(partnerId) || partner.length !== 1) {
+      this.#set({ partnerPrivate: { ...current, status: "error", error: "The selected Partner is no longer in this directory." } });
+      return;
+    }
+    const { generation, controller } = this.#beginPartnerPrivateRequest();
+    this.#set({ partnerPrivate: { ...current, status: "loading", selectedPartnerId: partnerId,
+      threads: [], selectedThreadId: undefined, detail: undefined, detailStatus: "idle", detailError: undefined,
+      error: undefined } });
+    try {
+      const threads = await this.network.listPartnerPrivateThreads(context.credential, partnerId, controller.signal);
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)
+        || this.#state.partnerPrivate.selectedPartnerId !== partnerId) return;
+      this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, status: "ready", threads } });
+    } catch (error) {
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)) return;
+      this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, status: "error", error: message(error) } });
+    }
+  }
+
+  async openPartnerPrivateThread(partnerId: string, threadId: string): Promise<void> {
+    const context = this.#partnerPrivateContext();
+    const current = this.#state.partnerPrivate;
+    if (!context || !current.open) {
+      this.#set({ partnerPrivate: emptyMobilePartnerPrivateState(true, "offline") });
+      return;
+    }
+    if (current.selectedPartnerId !== partnerId || current.status !== "ready") {
+      await this.selectPartnerPrivatePartner(partnerId);
+    }
+    const selected = this.#state.partnerPrivate;
+    if (selected.status !== "ready" || selected.selectedPartnerId !== partnerId) return;
+    const threads = selected.threads.filter((item) => item.threadId === threadId);
+    if (!validMobilePartnerId(threadId) || threads.length !== 1) {
+      this.#set({ partnerPrivate: { ...selected, detailStatus: "error",
+        detailError: "The selected private thread is no longer in this Partner's list." } });
+      return;
+    }
+    const { generation, controller } = this.#beginPartnerPrivateRequest();
+    this.#set({ partnerPrivate: { ...selected, selectedThreadId: threadId, detail: undefined,
+      detailStatus: "loading", detailError: undefined } });
+    try {
+      const detail = await this.network.getPartnerPrivateThread(context.credential, partnerId, threadId, controller.signal);
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)
+        || this.#state.partnerPrivate.selectedPartnerId !== partnerId
+        || this.#state.partnerPrivate.selectedThreadId !== threadId) return;
+      if (detail.thread.otherPartnerId !== threads[0]!.otherPartnerId
+        || detail.thread.firstPartnerId !== threads[0]!.firstPartnerId
+        || detail.thread.secondPartnerId !== threads[0]!.secondPartnerId) {
+        throw new Error("The selected private thread participants changed.");
+      }
+      this.#partnerPrivateDetailLease = Symbol("partner-private-detail");
+      this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, detailStatus: "ready", detail,
+        threads: this.#state.partnerPrivate.threads.map((item) => item.threadId === threadId ? detail.thread : item) } });
+      if (detail.messages.some((item) => item.deliveryStatus === "pending")) {
+        this.#schedulePartnerPrivateRefresh(4_000);
+      }
+    } catch (error) {
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)) return;
+      this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, detail: undefined,
+        detailStatus: "error", detailError: message(error) } });
+    }
+  }
+
+  async openPartnerPrivateFromSession(sessionId: string, threadId: string, targetPartnerId?: string): Promise<void> {
+    const sourceCurrent = (): boolean => this.#state.selectedId === sessionId
+      && this.#state.owner?.sessions.filter((session) => session.sessionId === sessionId).length === 1;
+    if (!validMobilePartnerId(sessionId) || !validMobilePartnerId(threadId) || !sourceCurrent()) {
+      this.#set({ partnerPrivate: { ...emptyMobilePartnerPrivateState(true, "error"),
+        error: "Open the current Partner task before inspecting its private thread." } });
+      return;
+    }
+    await this.openPartnerDirectory();
+    const context = this.#partnerPrivateContext();
+    const directory = this.#state.partnerPrivate;
+    if (!context || directory.status !== "ready" || !sourceCurrent()) return;
+    const matching = directory.partners.filter((partner) => partner.canonicalSessionId === sessionId);
+    if (matching.length !== 1 || targetPartnerId !== undefined
+      && (!validMobilePartnerId(targetPartnerId) || targetPartnerId === matching[0]?.partnerId)) {
+      this.#set({ partnerPrivate: { ...directory, status: "error",
+        error: "This task does not have a unique current Partner owner." } });
+      return;
+    }
+    const viewer = matching[0]!;
+    const { generation, controller } = this.#beginPartnerPrivateRequest();
+    try {
+      const sessions = await this.network.listPartnerSessions(context.credential, viewer.partnerId, controller.signal);
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey) || !sourceCurrent()) return;
+      assertMobileCanonicalPartnerSession(viewer, sessionId, sessions);
+      this.#partnerPrivateSourceSessionId = sessionId;
+      this.#partnerPrivateSourceTargetId = targetPartnerId;
+    } catch (error) {
+      if (!this.#partnerPrivateRequestCurrent(generation, controller, context.authorityKey)) return;
+      this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, status: "error", error: message(error) } });
+      return;
+    }
+    await this.selectPartnerPrivatePartner(viewer.partnerId);
+    if (!sourceCurrent() || this.#state.partnerPrivate.status !== "ready") return;
+    const listed = this.#state.partnerPrivate.threads.filter((thread) => thread.threadId === threadId);
+    if (listed.length !== 1 || targetPartnerId !== undefined && listed[0]?.otherPartnerId !== targetPartnerId) {
+      this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, detailStatus: "error",
+        detailError: "This private thread does not belong to the current Partner pair." } });
+      return;
+    }
+    await this.openPartnerPrivateThread(viewer.partnerId, threadId);
+    if (!sourceCurrent()) {
+      this.closePartnerPrivate();
+    }
+  }
+
+  async refreshPartnerPrivate(): Promise<void> {
+    const current = this.#state.partnerPrivate;
+    if (!current.open) return;
+    const sourceSessionId = this.#partnerPrivateSourceSessionId;
+    const sourceTargetId = this.#partnerPrivateSourceTargetId;
+    const selectedPartnerId = current.selectedPartnerId;
+    const selectedThreadId = current.selectedThreadId;
+    if (sourceSessionId !== undefined && selectedThreadId !== undefined) {
+      await this.openPartnerPrivateFromSession(sourceSessionId, selectedThreadId, sourceTargetId);
+      return;
+    }
+    await this.openPartnerDirectory();
+    if (this.#state.partnerPrivate.status !== "ready" || selectedPartnerId === undefined) return;
+    await this.selectPartnerPrivatePartner(selectedPartnerId);
+    if (this.#state.partnerPrivate.status !== "ready" || selectedThreadId === undefined) return;
+    await this.openPartnerPrivateThread(selectedPartnerId, selectedThreadId);
+  }
+
+  closePartnerPrivateThread(): void {
+    this.#cancelPartnerPrivateRequests();
+    const current = this.#state.partnerPrivate;
+    this.#set({ partnerPrivate: { ...current, selectedThreadId: undefined, detail: undefined,
+      detailStatus: "idle", detailError: undefined } });
+  }
+
+  closePartnerPrivatePartner(): void {
+    this.#cancelPartnerPrivateRequests();
+    this.#partnerPrivateSourceSessionId = undefined;
+    this.#partnerPrivateSourceTargetId = undefined;
+    const current = this.#state.partnerPrivate;
+    this.#set({ partnerPrivate: { ...current, selectedPartnerId: undefined, threads: [],
+      selectedThreadId: undefined, detail: undefined, detailStatus: "idle", detailError: undefined,
+      status: this.#partnerPrivateContext() ? "ready" : "offline" } });
+  }
+
+  async #resumePartnerPrivate(): Promise<void> {
+    const current = this.#state.partnerPrivate;
+    if (!current.open) { this.#partnerPrivateResume = undefined; return; }
+    const resume = this.#partnerPrivateResume;
+    this.#partnerPrivateResume = undefined;
+    if (!resume) {
+      await this.openPartnerDirectory();
+      return;
+    }
+    if (resume.credentialKey !== this.#partnerPrivateCredentialKey(this.#credential)) {
+      this.closePartnerPrivate();
+      return;
+    }
+    if (resume.sourceSessionId !== undefined) {
+      if (resume.sourceSessionId !== this.#state.selectedId || resume.selectedThreadId === undefined) {
+        this.closePartnerPrivate();
+        return;
+      }
+      await this.openPartnerPrivateFromSession(resume.sourceSessionId, resume.selectedThreadId, resume.sourceTargetId);
+      return;
+    }
+    await this.openPartnerDirectory();
+    if (this.#state.partnerPrivate.status !== "ready" || resume.selectedPartnerId === undefined) return;
+    await this.selectPartnerPrivatePartner(resume.selectedPartnerId);
+    if (this.#state.partnerPrivate.status !== "ready" || resume.selectedThreadId === undefined) return;
+    await this.openPartnerPrivateThread(resume.selectedPartnerId, resume.selectedThreadId);
+  }
+
+  closePartnerPrivate(): void {
+    this.#cancelPartnerPrivateRequests();
+    if (this.#partnerPrivateRefreshTimer !== undefined) clearTimeout(this.#partnerPrivateRefreshTimer);
+    this.#partnerPrivateRefreshTimer = undefined;
+    this.#partnerPrivateSourceSessionId = undefined;
+    this.#partnerPrivateSourceTargetId = undefined;
+    this.#partnerPrivateResume = undefined;
+    this.#set({ partnerPrivate: emptyMobilePartnerPrivateState() });
+  }
+
+  async markPartnerPrivateVisible(partnerId: string, threadId: string, throughSequence: number): Promise<void> {
+    const context = this.#partnerPrivateContext();
+    const state = this.#state.partnerPrivate;
+    const detail = state.detail;
+    const lease = this.#partnerPrivateDetailLease;
+    if (!context || !lease || !detail || !state.open || state.detailStatus !== "ready"
+      || state.selectedPartnerId !== partnerId || state.selectedThreadId !== threadId
+      || detail.thread.threadId !== threadId || !Number.isSafeInteger(throughSequence)
+      || throughSequence < 1 || !detail.messages.some((item) => item.sequence === throughSequence)) return;
+    if (throughSequence <= (detail.readState?.throughSequence ?? 0)) return;
+    this.#partnerPrivateReadTarget = Math.max(throughSequence, this.#partnerPrivateReadTarget ?? 0);
+    if (this.#partnerPrivateReadFlight) {
+      await this.#partnerPrivateReadFlight;
+      return;
+    }
+    const controller = new AbortController();
+    this.#partnerPrivateReadAbort = controller;
+    const flight = (async () => {
+      while (this.#partnerPrivateReadTarget !== undefined) {
+        const current = this.#state.partnerPrivate;
+        const exact = current.detail;
+        const target = this.#partnerPrivateReadTarget;
+        this.#partnerPrivateReadTarget = undefined;
+        if (controller.signal.aborted || this.#partnerPrivateDetailLease !== lease
+          || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey
+          || current.selectedPartnerId !== partnerId || current.selectedThreadId !== threadId
+          || current.detailStatus !== "ready" || !exact || !exact.messages.some((item) => item.sequence === target)) return;
+        if (target <= (exact.readState?.throughSequence ?? 0)) continue;
+        try {
+          const maximum = exact.messages.at(-1)!.sequence;
+          const readState = await this.network.markPartnerPrivateThreadRead(context.credential,
+            partnerId, threadId, target, maximum, controller.signal);
+          if (controller.signal.aborted || this.#partnerPrivateDetailLease !== lease
+            || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey) return;
+          const latest = this.#state.partnerPrivate;
+          if (latest.detailStatus !== "ready" || latest.selectedPartnerId !== partnerId
+            || latest.selectedThreadId !== threadId || !latest.detail) return;
+          this.#set({ partnerPrivate: { ...latest, detail: { ...latest.detail, readState }, detailError: undefined } });
+        } catch (error) {
+          if (controller.signal.aborted || this.#partnerPrivateDetailLease !== lease
+            || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey) return;
+          this.#set({ partnerPrivate: { ...this.#state.partnerPrivate, detailError: message(error) } });
+          return;
+        }
+      }
+    })();
+    this.#partnerPrivateReadFlight = flight;
+    try { await flight; }
+    finally {
+      if (this.#partnerPrivateReadFlight === flight) this.#partnerPrivateReadFlight = undefined;
+      if (this.#partnerPrivateReadAbort === controller) this.#partnerPrivateReadAbort = undefined;
+    }
+  }
 
   #cancelAutomationRequests(): void {
     this.#automationAbort?.abort();
@@ -1287,6 +1690,7 @@ export class MobileClient {
       error: preferenceError
     });
     this.#beginStream(epoch, credential, owner.snapshot);
+    if (this.#state.partnerPrivate.open) void this.#resumePartnerPrivate();
     await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
     await this.reconcile(epoch);
     if (this.#current(epoch) && this.#state.automations.open) await this.refreshAutomations();
@@ -1728,6 +2132,7 @@ export class MobileClient {
         offlineSnapshotAt: undefined,
         saved: this.#savedViews(credential.profileId, "available") });
       this.#beginStream(epoch, credential, owner.snapshot);
+      if (this.#state.partnerPrivate.open) void this.#resumePartnerPrivate();
       await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
       await this.reconcile(epoch);
       if (this.#current(epoch) && this.#state.automations.open) await this.refreshAutomations();
