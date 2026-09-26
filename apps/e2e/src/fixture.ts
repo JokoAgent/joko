@@ -21,6 +21,8 @@ import {
   RemoteWorkspaceService,
   ScheduleCoordinator,
   SessionHost,
+  availableBackendProviderIds,
+  withSessionReferenceCapability,
   SessionWorktreeCoordinator,
   WorkspaceChangeSetService,
   WorkspaceService,
@@ -40,6 +42,11 @@ import { createE2eClients, type E2eClients, type PairedClient } from "./connect-
 
 export type { E2eClients, PairedClient } from "./connect-clients.js";
 
+type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
+  "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "providerAuth"
+  | "refreshPiGeneration" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser"
+  | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
+
 export interface FixtureOptions {
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
@@ -48,7 +55,17 @@ export interface FixtureOptions {
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
   readonly terminals?: OrchestratorApplication["terminals"];
-  readonly createAuxiliaryServices?: (store: OperationalStore, dataDirectory: string, artifacts: ArtifactStore) => Promise<Pick<OrchestratorApplication, "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser" | "browserSettings" | "browserState" | "voiceInput">>;
+  readonly createAuxiliaryServices?: (
+    store: OperationalStore,
+    dataDirectory: string,
+    artifacts: ArtifactStore
+  ) => Promise<FixtureAuxiliaryServices>;
+  /** Only for factories whose Adapter construction requires the returned owners. */
+  readonly createAuxiliaryServicesBeforeBackendProvision?: (
+    store: OperationalStore,
+    dataDirectory: string,
+    artifacts: ArtifactStore
+  ) => Promise<FixtureAuxiliaryServices>;
 }
 
 export class InstrumentedFakeAdapter extends FakeBackendAdapter {
@@ -185,17 +202,18 @@ export class OrchestratorE2eFixture {
     }));
     const adapters = new Map<string, InstrumentedFakeAdapter>();
     const store = new OperationalStore(databasePath);
-    const backendInstances = new BackendInstanceRegistry(store);
-    const factories: readonly BackendInstanceFactory[] = [...profiles.map((profile) => ({
-      instanceId: profile.id,
-      adapterKind: "fake",
-      displayName: profile.displayName,
-      create: () => options.createAdapter?.(profile) ?? new InstrumentedFakeAdapter(profile)
-    })), ...(options.backendFactories ?? [])];
-    await backendInstances.provision(factories);
-    for (const adapter of backendInstances.availableAdapters()) {
-      if (adapter instanceof InstrumentedFakeAdapter) adapters.set(adapter.id, adapter);
-    }
+    const backendInstances = new BackendInstanceRegistry(store, {
+      projectDescriptor: withSessionReferenceCapability,
+      onCandidateCleanupUnknown: ({ instanceId, generation }) => {
+        store.appendDiagnostic({
+          severity: "warning",
+          component: "backend-instance",
+          code: "BACKEND_CANDIDATE_CLEANUP_UNCONFIRMED",
+          message: "An unpublished Backend instance candidate could not be fully cleaned up.",
+          details: { backendId: instanceId, instanceGeneration: generation }
+        });
+      }
+    });
     const artifactRepository = new OperationalArtifactRepository(store);
     const artifacts = new ArtifactStore({
       rootDirectory: artifactDirectory,
@@ -209,7 +227,27 @@ export class OrchestratorE2eFixture {
     });
     await artifactMaintenance.initialize();
     const blobTransfers = new BlobTransferCoordinator(artifacts);
-    const auxiliaryServices = await options.createAuxiliaryServices?.(store, dataDirectory, artifacts);
+    const factoryAuxiliaryServices = await options.createAuxiliaryServicesBeforeBackendProvision?.(
+      store,
+      dataDirectory,
+      artifacts
+    );
+    const factories: readonly BackendInstanceFactory[] = [...profiles.map((profile) => ({
+      instanceId: profile.id,
+      adapterKind: "fake",
+      displayName: profile.displayName,
+      create: () => options.createAdapter?.(profile) ?? new InstrumentedFakeAdapter(profile)
+    })), ...(options.backendFactories ?? [])];
+    await backendInstances.provision(factories);
+    const postProvisionAuxiliaryServices = await options.createAuxiliaryServices?.(store, dataDirectory, artifacts);
+    const auxiliaryServices = factoryAuxiliaryServices === undefined
+      ? postProvisionAuxiliaryServices
+      : postProvisionAuxiliaryServices === undefined
+        ? factoryAuxiliaryServices
+        : { ...factoryAuxiliaryServices, ...postProvisionAuxiliaryServices };
+    for (const adapter of backendInstances.availableAdapters()) {
+      if (adapter instanceof InstrumentedFakeAdapter) adapters.set(adapter.id, adapter);
+    }
     const workspaces = new WorkspaceService(auxiliaryServices?.remoteHosts === undefined
       ? undefined
       : { remoteDelegate: new RemoteWorkspaceService(auxiliaryServices.remoteHosts) });
@@ -233,8 +271,17 @@ export class OrchestratorE2eFixture {
     await sessionWorktrees.initialize();
     const sessionHost = new SessionHost(store, artifacts, backendInstances.availableAdapters(), {
       backendDescriptors: backendInstances.descriptors(),
+      backendDescriptorsAlreadyPublished: true,
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
-      worktrees: sessionWorktrees
+      worktrees: sessionWorktrees,
+      ...(auxiliaryServices?.providers === undefined ? {} : {
+        sessionRuntimeFallbackContext: (backendId: string) => ({
+          availableProviderIds: availableBackendProviderIds(
+            store.getBackend(backendId).descriptor,
+            auxiliaryServices.providers!.list(backendId)
+          )
+        })
+      })
     });
     const reviewCoordinator = new ReviewCoordinator({
       store,
@@ -315,12 +362,28 @@ export class OrchestratorE2eFixture {
           activateCurrent: ({ adapter }) => {
             hooks.activateCurrent();
             if (adapter instanceof InstrumentedFakeAdapter) adapters.set(backendId, adapter);
+          },
+          onPreviousCleanupFailure: ({ instanceId, generation }) => {
+            store.appendDiagnostic({
+              severity: "warning",
+              component: "backend-instance",
+              code: "BACKEND_PREVIOUS_INSTANCE_CLEANUP_FAILED",
+              message: "A retired Backend instance could not be fully cleaned up after replacement.",
+              details: { backendId: instanceId, instanceGeneration: generation }
+            });
           }
         })
       });
     };
     const refreshBackendDescriptor = async (backendId: string): Promise<void> => {
       await backendInstances.refresh(backendId);
+    };
+    const projectBackendProviderAuthentication: OrchestratorApplication["projectBackendProviderAuthentication"] = (
+      backendId,
+      providerId,
+      authenticationState
+    ) => {
+      backendInstances.projectProviderAuthentication(backendId, providerId, authenticationState);
     };
     const contactStore = new ContactStore(join(dataDirectory, "contacts.db"));
     const contacts = new ContactManager(contactStore);
@@ -346,6 +409,7 @@ export class OrchestratorE2eFixture {
       },
       restartBackend,
       refreshBackendDescriptor,
+      projectBackendProviderAuthentication,
       holdSubagentSmartRoutingDispatch: () => undefined,
       refreshSubagentSmartRouting: restartBackend,
       browserActivity: [],
@@ -353,21 +417,31 @@ export class OrchestratorE2eFixture {
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
       async close() {
-        scheduler.stop();
-        auxiliaryServices?.sessionNavigation?.dispose();
-        auxiliaryServices?.auxiliaryText?.dispose();
-        await auxiliaryServices?.mcpRouter?.dispose();
-        auxiliaryServices?.sshKeys?.close();
-        await auxiliaryServices?.remoteHosts?.close();
-        await auxiliaryServices?.browser?.stop();
-        await auxiliaryServices?.voiceInput?.close();
-        await lanDiscovery.stop();
-        await options.terminals?.dispose();
-        contacts.close();
-        contactStore.close();
-        await sessionHost.dispose();
-        sessionWorktrees.dispose();
-        store.close();
+        const failures: unknown[] = [];
+        const attempt = async (cleanup: () => unknown): Promise<void> => {
+          try { await cleanup(); } catch (error) { failures.push(error); }
+        };
+        await attempt(() => scheduler.stop());
+        await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
+        await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
+        await attempt(() => auxiliaryServices?.providerAuth?.beginShutdown());
+        // Keep native transports and remote dependencies alive until exact
+        // current and retained process cleanup has settled.
+        await attempt(() => options.terminals?.dispose());
+        await attempt(() => sessionHost.dispose());
+        await attempt(() => backendInstances.disposeRetainedCleanups());
+        await attempt(() => auxiliaryServices?.mcpRouter?.dispose());
+        await attempt(() => auxiliaryServices?.remoteHosts?.close());
+        await attempt(() => auxiliaryServices?.browser?.stop());
+        await attempt(() => auxiliaryServices?.voiceInput?.close());
+        await attempt(() => auxiliaryServices?.providerAuth?.close());
+        await attempt(() => lanDiscovery.stop());
+        await attempt(() => auxiliaryServices?.sshKeys?.close());
+        await attempt(() => contacts.close());
+        await attempt(() => contactStore.close());
+        await attempt(() => sessionWorktrees.dispose());
+        await attempt(() => store.close());
+        if (failures.length > 0) throw new AggregateError(failures, "The E2E application did not close cleanly.");
       }
     };
     const server = await createPublicServer(application);

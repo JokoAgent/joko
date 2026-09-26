@@ -53,6 +53,27 @@ describe("managed Pi subagent extension", () => {
     expect(MANAGED_SUBAGENT_SOURCE).not.toMatch(/from\s+["'](?:\.\.?[\\/]|[A-Za-z]:)/u);
   });
 
+  it("passes a child only the selected managed Provider credential while retaining common bridge authority", () => {
+    const scope = inheritedCredentialScopeHelper();
+    const credentials = new Map([
+      ["PROVIDER_A_KEY", "secret-a"],
+      ["PROVIDER_B_KEY", "secret-b"],
+      ["JOKO_PI_MCP_TOKEN", "bridge-token"]
+    ]);
+    const ownership = new Map([
+      ["provider-a", new Set(["PROVIDER_A_KEY"])],
+      ["provider-b", new Set(["PROVIDER_B_KEY"])]
+    ]);
+
+    expect(Object.fromEntries(scope(credentials, ownership, "provider-b"))).toEqual({
+      PROVIDER_B_KEY: "secret-b",
+      JOKO_PI_MCP_TOKEN: "bridge-token"
+    });
+    expect(Object.fromEntries(scope(credentials, ownership, "unknown-provider"))).toEqual({
+      JOKO_PI_MCP_TOKEN: "bridge-token"
+    });
+  });
+
   it("binds a durable resume status path and identity to its immutable launch config", async () => {
     const validate = resumeSessionValidationHelper();
     const sessionRoot = await mkdtemp(join(tmpdir(), "joko-pi-resume-fence-"));
@@ -403,6 +424,25 @@ interface InvocationHelpers {
     task: { provider: string; model: string; thinking: string }
   ): { provider: string; model: string; effort: string };
   timeoutMs(params: Record<string, unknown>): number;
+}
+
+function inheritedCredentialScopeHelper(): (
+  inheritedCredentials: Map<string, string>,
+  providerCredentialNames: Map<string, Set<string>>,
+  providerId: string
+) => Map<string, string> {
+  const start = MANAGED_SUBAGENT_SOURCE.indexOf("function inheritedCredentialsForProvider");
+  const end = MANAGED_SUBAGENT_SOURCE.indexOf("\n\nfunction readDepth", start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  const body = `${MANAGED_SUBAGENT_SOURCE.slice(start, end)}\nreturn inheritedCredentialsForProvider;`;
+  return (inheritedCredentials, providerCredentialNames, providerId) => {
+    const scope = Function("inheritedCredentials", "providerCredentialNames", body)(
+      inheritedCredentials,
+      providerCredentialNames
+    ) as (value: string) => Map<string, string>;
+    return scope(providerId);
+  };
 }
 
 function invocationHelpers(): InvocationHelpers {

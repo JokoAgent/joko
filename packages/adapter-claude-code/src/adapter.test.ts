@@ -9,6 +9,7 @@ import {
   type EventPayload,
   type InteractionDecision,
   type InteractionPayload,
+  type NativeSessionDerivationLifecycle,
   type NativeSessionBinding,
   type ManagedProviderRuntimePort,
   type ManagedProviderRouteBinding,
@@ -17,6 +18,12 @@ import {
 } from "@joko/core";
 import { describe, expect, test, vi } from "vitest";
 import { ClaudeCodeAdapter, type ClaudeCodeAdapterOptions } from "./adapter.js";
+import {
+  ClaudeSessionStoreError,
+  type ClaudeSessionStoreOperationAccess,
+  type ClaudeSessionStoreOperationSnapshot,
+  type ClaudeSessionStoreSessionAccess
+} from "./claude-session-store.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpRuntimeLease } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import {
@@ -34,6 +41,7 @@ import {
   type ClaudeSdkRuntime,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
+  type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
 
@@ -99,7 +107,7 @@ describe("ClaudeCodeAdapter", () => {
 
   test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
     const remoteTarget: TargetDescriptor = {
-      ...target, id: "remote-mcp-target", workspaceRoot: "D:\\service-owned-placeholder",
+      ...target, id: "remote-mcp-target", workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
@@ -159,7 +167,7 @@ describe("ClaudeCodeAdapter", () => {
   test.each(["local", "remote"] as const)("keeps a no-tool %s Query isolated, retries at idle, and fails closed on uncertain retirement", async (location) => {
     const remote = location === "remote";
     const selectedTarget: TargetDescriptor = remote ? {
-      ...target, id: "remote-no-tool", workspaceRoot: "D:\\service-owned-placeholder",
+      ...target, id: "remote-no-tool", workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
     } : target;
     const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
@@ -270,7 +278,7 @@ describe("ClaudeCodeAdapter", () => {
       ? {
           ...target,
           id: "target-remote-managed-effort",
-          workspaceRoot: "D:\\service-owned-placeholder",
+          workspaceRoot: "/srv/effort",
           remoteWorkspace: { hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
         }
       : target;
@@ -939,7 +947,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "target-remote-managed-limits",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
@@ -1377,16 +1385,20 @@ describe("ClaudeCodeAdapter", () => {
     }), contextFor().context);
     runtime.sessions.clear();
     managed.revision = "revision-two";
+    const turn = contextFor(binding, { operationId: "mismatched-fresh-route" });
     await expect(adapter.send(textPrompt("must not continue on a mismatched route"), {
-      ...contextFor(binding, { operationId: "mismatched-fresh-route" }).context,
+      ...turn.context,
       modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
     })).rejects.toMatchObject({
-      publicError: { code: "MANAGED_PROVIDER_ROUTE_UNAVAILABLE", stateMayHaveChanged: true }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
     expect(runtime.queries).toHaveLength(2);
     expect(runtime.queries[0]!.receivedInputs).toEqual([]);
     expect(runtime.queries[1]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[1]!.params.options.abortController.signal.aborted).toBe(true);
     expect(runtime.queries[1]!.closeCalls).toBe(1);
+    expect(runtime.queries[1]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
     expect(managed.activations).toHaveLength(1);
     expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     await adapter.dispose();
@@ -1887,10 +1899,14 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput(), contextFor().context);
     const turn = contextFor(binding, { operationId: "changed-native-priority" });
     await expect(adapter.send(textPrompt("Keep explicit models authoritative"), turn.context)).rejects.toMatchObject({
-      publicError: { code: "SUBAGENT_MODEL_DEFAULT_UNAVAILABLE", stateMayHaveChanged: true, recovery: expect.stringContaining("explicitly retry") }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
     expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
     expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
     await adapter.dispose();
   });
 
@@ -3024,13 +3040,21 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput({
       runtimePolicy: "review_read_only"
     }), creation.context);
-
-    await expect(adapter.send(textPrompt("Review."), contextFor(binding, {
+    const turn = contextFor(binding, {
       operationId: "unsafe-review-init",
       runtimePolicy: "review_read_only"
-    }).context)).rejects.toMatchObject({
-      publicError: { code: "CLAUDE_CODE_REVIEW_PROFILE_INVALID" }
     });
+
+    await expect(adapter.send(textPrompt("Review."), turn.context)).rejects.toMatchObject({
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
+    });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
+    await adapter.dispose();
   });
 
   test("does not advertise isolated review for a native CLI below the safe-profile floor", async () => {
@@ -3076,7 +3100,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "target-remote",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const localRuntime = new FakeSdkRuntime();
@@ -3172,7 +3196,7 @@ describe("ClaudeCodeAdapter", () => {
     const remoteTarget: TargetDescriptor = {
       ...target,
       id: "target-remote-manager-replacement",
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: "/srv/project",
       remoteWorkspace: { hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const runtime = new FakeSdkRuntime();
@@ -3874,10 +3898,15 @@ describe("ClaudeCodeAdapter", () => {
     const active = contextFor(binding, { operationId: "unknown-permission-mode" });
 
     await expect(adapter.send(textPrompt("must fail closed"), active.context)).rejects.toMatchObject({
-      publicError: { code: "NATIVE_PERMISSION_MODE_UNSUPPORTED" }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
+    expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
     expect(active.events).toEqual([]);
     expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    await adapter.dispose();
   });
 
   test("bounds prompt and streamed content retained by the Adapter", async () => {
@@ -4008,15 +4037,22 @@ describe("ClaudeCodeAdapter", () => {
     await expect(adapter.resumeSession(binding, contextFor(binding).context)).resolves.toMatchObject({
       binding
     });
+    const turn = contextFor(binding, { operationId: "mismatched-resume-init" });
     await expect(adapter.send(
       textPrompt("prove the resumed identity"),
-      contextFor(binding, { operationId: "mismatched-resume-init" }).context
+      turn.context
     )).rejects.toMatchObject({
-      publicError: { code: "NATIVE_SESSION_CONTINUITY_GAP" }
+      publicError: { code: "NATIVE_DISPATCH_UNKNOWN", stateMayHaveChanged: true }
     });
     expect(runtime.queries).toHaveLength(1);
     expect(runtime.queries[0]!.params.options.resume).toBe(nativeSessionId);
     expect(runtime.queries[0]!.params.options.sessionId).toBeUndefined();
+    expect(runtime.queries[0]!.receivedInputs).toHaveLength(1);
+    expect(runtime.queries[0]!.params.options.abortController.signal.aborted).toBe(true);
+    expect(runtime.queries[0]!.closeCalls).toBe(1);
+    expect(runtime.queries[0]!.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
+    await adapter.dispose();
   });
 
   test("marks consumed-but-unconfirmed dispatch admission as stateMayHaveChanged", async () => {
@@ -4036,6 +4072,58 @@ describe("ClaudeCodeAdapter", () => {
     expect(query.params.options.abortController.signal.aborted).toBe(true);
     expect(query.closeCalls).toBe(1);
     expect(query.interruptCalls).toBe(0);
+  });
+
+  test("keeps consumed dispatch unknown when an admission-time stream error claims native state is unchanged", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: false });
+    const adapter = adapterFor(runtime, { admissionTimeoutMs: 1_000 });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const query = runtime.queries[0]!;
+
+    const sending = adapter.send(
+      textPrompt("consumed before the stream identity failed"),
+      contextFor(binding, { operationId: "consumed-before-false-state-stream-error" }).context
+    );
+    await vi.waitFor(() => expect(query.receivedInputs).toHaveLength(1));
+    query.push(systemInit(randomUUID()));
+
+    await expect(sending).rejects.toMatchObject({
+      publicError: {
+        code: "NATIVE_DISPATCH_UNKNOWN",
+        stateMayHaveChanged: true
+      }
+    });
+    expect(query.receivedInputs).toHaveLength(1);
+    expect(query.params.options.abortController.signal.aborted).toBe(true);
+    expect(query.closeCalls).toBe(1);
+    expect(query.interruptCalls).toBe(0);
+  });
+
+  test("preserves a typed stream failure when the SDK has not consumed the native prompt", async () => {
+    const runtime = new FakeSdkRuntime({ deferInputConsumption: true });
+    const adapter = adapterFor(runtime, { admissionTimeoutMs: 1_000 });
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const turn = contextFor(binding, { operationId: "typed-before-native-consumption" });
+    const query = runtime.queries[0]!;
+
+    const sending = adapter.send(textPrompt("not consumed"), turn.context);
+    const rejected = expect(sending).rejects.toMatchObject({
+      publicError: {
+        code: "NATIVE_SESSION_CONTINUITY_GAP",
+        stateMayHaveChanged: false
+      }
+    });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    query.push(systemInit(randomUUID()));
+
+    await rejected;
+    expect(runtime.queries).toHaveLength(1);
+    expect(query.receivedInputs).toEqual([]);
+    expect(query.params.options.abortController.signal.aborted).toBe(true);
+    expect(query.closeCalls).toBe(1);
+    expect(query.interruptCalls).toBe(0);
+    expect(turn.events).toEqual([]);
+    await adapter.dispose();
   });
 
   test("resumes the Host's previous binding into the exact next product generation", async () => {
@@ -4487,10 +4575,12 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.forks).toHaveLength(1);
     expect(runtime.forks[0]!.sourceId).toBe(binding.nativeSessionId);
     expect(runtime.forks[0]!.options.dir).toBe(derivedTarget.workspaceRoot);
-    expect(runtime.infoOptions.at(-1)).toMatchObject({
-      sessionId: derived.nativeSessionId,
-      options: { dir: derivedTarget.workspaceRoot }
-    });
+    expect(runtime.infoOptions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionId: derived.nativeSessionId,
+        options: expect.objectContaining({ dir: derivedTarget.workspaceRoot })
+      })
+    ]));
     expect(runtime.forks[0]!.options).not.toHaveProperty("upToMessageId");
     expect(runtime.queries).toHaveLength(1);
     await adapter.send(textPrompt("continue source"), source.context);
@@ -4504,6 +4594,378 @@ describe("ClaudeCodeAdapter", () => {
     expect(runtime.messages.get(derived.nativeSessionId!)![0]!.uuid).not.toBe(oldMessageId);
     expect(runtime.queries[0]!.closeCalls).toBe(0);
     await adapter.dispose();
+  });
+
+  test("rejects a completed clone receipt when the native source changes during the copy", async () => {
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const source = contextFor(binding, { operationId: "clone-source-change" });
+    const originalInfo = runtime.getSessionInfo.bind(runtime);
+    let sourceReads = 0;
+    vi.spyOn(runtime, "getSessionInfo").mockImplementation(async (sessionId, options) => {
+      const info = await originalInfo(sessionId, options);
+      if (sessionId !== binding.nativeSessionId || info === undefined) return info;
+      sourceReads += 1;
+      return sourceReads === 1 ? info : { ...info, lastModified: info.lastModified + 1 };
+    });
+    const recordBinding = vi.fn();
+
+    await expect(adapter.clone(source.context, {
+      sessionId: "changed-clone-product",
+      target: source.context.target,
+      recordBinding
+    })).rejects.toMatchObject({
+      publicError: { code: "NATIVE_SESSION_CLONE_UNKNOWN", stateMayHaveChanged: true }
+    });
+    expect(recordBinding).toHaveBeenCalledOnce();
+    expect(sourceReads).toBe(2);
+    await adapter.dispose();
+  });
+
+  test("adopts cross-workspace Store copies and keeps resume, history, refork, and delete on the durable facade", async () => {
+    const derivedWorkspace = await mkdtemp(join(tmpdir(), "joko-claude-stored-clone-"));
+    const reforkWorkspace = await mkdtemp(join(tmpdir(), "joko-claude-stored-refork-"));
+    const derivedTarget = { ...target, workspaceRoot: derivedWorkspace };
+    const reforkTarget = { ...target, workspaceRoot: reforkWorkspace };
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: derivedWorkspace } });
+    const storedSessions = new FakeStoredSessionRuntime(runtime);
+    runtime.storedSessions = storedSessions;
+    const adapter = adapterFor(runtime);
+    try {
+      const sourceBinding = await adapter.createSession(createInput(), contextFor().context);
+      runtime.messages.set(sourceBinding.nativeSessionId!, forkHistory(sourceBinding.nativeSessionId!));
+      const cloneOperationId = "stored-cross-workspace-clone";
+      const source = contextFor(sourceBinding, { operationId: cloneOperationId });
+      const cloneBinding = await adapter.clone(source.context, {
+        sessionId: "stored-clone-product",
+        target: derivedTarget,
+        recordBinding: vi.fn()
+      });
+
+      expect(cloneBinding).toMatchObject({
+        nativeSessionId: expect.any(String),
+        generation: source.context.generation
+      });
+      expect(cloneBinding.opaqueRef).toMatch(/^claude-code:stored-session:workspace-[0-9a-f]{64}:[0-9a-f-]{36}$/u);
+      expect(storedSessions.prepareImportCalls).toHaveLength(1);
+      expect(storedSessions.importCalls).toHaveLength(1);
+      expect(storedSessions.forkCalls).toHaveLength(1);
+      expect(runtime.forks).toEqual([]);
+
+      const cloneLifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding } = {
+        operationId: cloneOperationId,
+        kind: "clone",
+        sourceSessionId: source.context.sessionId,
+        sourceBinding,
+        sessionId: "stored-clone-product",
+        sourceTarget: target,
+        target: derivedTarget,
+        binding: cloneBinding
+      };
+      expect(adapter.ownsNativeSessionDerivationLifecycle(cloneLifecycle)).toBe(true);
+      expect(adapter.ownsNativeSessionDerivationLifecycle({
+        ...cloneLifecycle,
+        target: {
+          ...derivedTarget,
+          remoteWorkspace: {
+            hostTargetId: derivedTarget.id,
+            hostId: "remote-host",
+            workspaceRoot: "/srv/project"
+          }
+        }
+      })).toBe(false);
+      await adapter.adoptNativeSessionDerivation(cloneLifecycle, new AbortController().signal);
+
+      const clonedRecord = storedSessions.sessions.get(cloneBinding.nativeSessionId!)!;
+      expect(clonedRecord.adopted).toBe(true);
+      // Store metadata cannot prove the live Query cwd. Only the consumed
+      // system/init below carries that authority.
+      clonedRecord.info = { ...clonedRecord.info, cwd: target.workspaceRoot };
+      const filesystemInfoCalls = runtime.infoOptions.length;
+      const filesystemMessageCalls = runtime.messageOptions.length;
+      const derivedContext = {
+        ...contextFor(cloneBinding, {
+          operationId: "stored-second-refork",
+          target: derivedTarget
+        }).context,
+        sessionId: "stored-clone-product"
+      };
+      await expect(adapter.resumeSession(cloneBinding, derivedContext)).resolves.toMatchObject({
+        binding: cloneBinding
+      });
+      const storedQuery = runtime.queries.at(-1)!;
+      expect(storedQuery.params.options).toMatchObject({
+        resume: cloneBinding.nativeSessionId,
+        cwd: derivedWorkspace,
+        sessionStoreAccess: {
+          kind: "session",
+          workspaceAuthority: clonedRecord.workspaceAuthority,
+          sessionId: cloneBinding.nativeSessionId
+        }
+      });
+      expect(storedQuery.params.options.sessionId).toBeUndefined();
+
+      const history = await adapter.getNativeHistoryProjection(derivedContext);
+      expect(history.activeLineage).toHaveLength(3);
+      expect(storedSessions.messageCalls.some((call) => call.sessionId === cloneBinding.nativeSessionId)).toBe(true);
+      expect(runtime.infoOptions).toHaveLength(filesystemInfoCalls);
+      expect(runtime.messageOptions).toHaveLength(filesystemMessageCalls);
+
+      const forkBoundary = clonedRecord.messages[1]!.uuid;
+      let reforkBinding: NativeSessionBinding | undefined;
+      const secondBinding = (await adapter.fork(forkBoundary, derivedContext, {
+        sessionId: "stored-refork-product",
+        target: reforkTarget,
+        recordBinding: (binding) => { reforkBinding = binding; }
+      })).binding;
+      expect(reforkBinding).toEqual(secondBinding);
+      expect(secondBinding.opaqueRef).toMatch(/^claude-code:stored-session:workspace-[0-9a-f]{64}:[0-9a-f-]{36}$/u);
+      expect(storedSessions.prepareDerivationCalls).toHaveLength(1);
+      expect(storedSessions.forkCalls).toHaveLength(2);
+      expect(runtime.forks).toEqual([]);
+      expect(runtime.infoOptions).toHaveLength(filesystemInfoCalls);
+      expect(runtime.messageOptions).toHaveLength(filesystemMessageCalls);
+
+      const reforkLifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding } = {
+        operationId: "stored-second-refork",
+        kind: "fork",
+        sourceSessionId: derivedContext.sessionId,
+        sourceBinding: cloneBinding,
+        sessionId: "stored-refork-product",
+        sourceTarget: derivedTarget,
+        target: reforkTarget,
+        binding: secondBinding
+      };
+      expect(adapter.ownsNativeSessionDerivationLifecycle(reforkLifecycle)).toBe(true);
+      await adapter.adoptNativeSessionDerivation(reforkLifecycle, new AbortController().signal);
+      await adapter.deleteSession(secondBinding, {
+        ...contextFor(secondBinding, { target: reforkTarget }).context,
+        sessionId: "stored-refork-product"
+      });
+      expect(storedSessions.deleteCalls).toEqual([
+        expect.objectContaining({ sessionId: secondBinding.nativeSessionId })
+      ]);
+      expect(storedSessions.sessions.has(secondBinding.nativeSessionId!)).toBe(false);
+      expect(runtime.deleted).toEqual([]);
+      expect(runtime.infoOptions).toHaveLength(filesystemInfoCalls);
+      expect(runtime.messageOptions).toHaveLength(filesystemMessageCalls);
+    } finally {
+      await adapter.dispose();
+      await rm(derivedWorkspace, { recursive: true, force: true, maxRetries: 3 });
+      await rm(reforkWorkspace, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
+  test("derives a remote stored Session through the exact source and child POSIX runtimes", async () => {
+    const sourceTarget: TargetDescriptor = {
+      ...target,
+      id: "remote-stored-target",
+      workspaceRoot: "/srv/source",
+      remoteWorkspace: {
+        hostTargetId: "remote-stored-target",
+        hostId: "remote-store-host",
+        workspaceRoot: "/srv/source"
+      }
+    };
+    const derivedTarget: TargetDescriptor = { ...sourceTarget, workspaceRoot: "/srv/derived" };
+    const sourceRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/source" } });
+    const derivedRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/derived" } });
+    const storedSessions = new FakeStoredSessionRuntime(sourceRuntime);
+    sourceRuntime.storedSessions = storedSessions;
+    derivedRuntime.storedSessions = storedSessions;
+    const resolved: string[] = [];
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      remoteRuntimes: {
+        resolve: async (selected) => {
+          resolved.push(selected.workspaceRoot);
+          return {
+            runtime: selected.workspaceRoot === derivedTarget.workspaceRoot ? derivedRuntime : sourceRuntime,
+            workspaceRoot: selected.workspaceRoot,
+            remote: true,
+            assertCurrent: () => undefined
+          };
+        },
+        close: async () => undefined
+      }
+    });
+    const sourceBinding = await adapter.createSession(
+      createInput({ target: sourceTarget }),
+      contextFor(undefined, { target: sourceTarget }).context
+    );
+    sourceRuntime.sessions.set(sourceBinding.nativeSessionId!, {
+      ...sessionInfo(sourceBinding.nativeSessionId!),
+      cwd: "/srv/source"
+    });
+    sourceRuntime.messages.set(sourceBinding.nativeSessionId!, forkHistory(sourceBinding.nativeSessionId!));
+    const operationId = "remote-stored-clone";
+    const source = contextFor(sourceBinding, { operationId, target: sourceTarget });
+    const binding = await adapter.clone(source.context, {
+      sessionId: "remote-stored-product",
+      target: derivedTarget,
+      recordBinding: vi.fn()
+    });
+    expect(storedSessions.importCalls).toEqual([
+      expect.objectContaining({ sessionId: sourceBinding.nativeSessionId })
+    ]);
+    expect(storedSessions.forkCalls).toEqual([
+      expect.objectContaining({ sessionId: sourceBinding.nativeSessionId, dir: "/srv/derived" })
+    ]);
+    expect(sourceRuntime.forks).toEqual([]);
+    expect(derivedRuntime.forks).toEqual([]);
+    const lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding } = {
+      operationId,
+      kind: "clone",
+      sourceSessionId: source.context.sessionId,
+      sourceBinding,
+      sessionId: "remote-stored-product",
+      sourceTarget,
+      target: derivedTarget,
+      binding
+    };
+    expect(adapter.ownsNativeSessionDerivationLifecycle(lifecycle)).toBe(true);
+    await adapter.adoptNativeSessionDerivation(lifecycle, new AbortController().signal);
+    const derivedContext = {
+      ...contextFor(binding, { target: derivedTarget }).context,
+      sessionId: "remote-stored-product"
+    };
+    await adapter.resumeSession(binding, derivedContext);
+    expect(derivedRuntime.queries.at(-1)?.params.options).toMatchObject({
+      cwd: "/srv/derived",
+      resume: binding.nativeSessionId,
+      sessionStoreAccess: expect.objectContaining({
+        kind: "session",
+        sessionId: binding.nativeSessionId
+      })
+    });
+    expect(resolved).toContain("/srv/source");
+    expect(resolved).toContain("/srv/derived");
+    await adapter.dispose();
+  });
+
+  test("accepts a missing prepared Store operation only before a child binding was recorded", async () => {
+    const runtime = new FakeSdkRuntime();
+    const storedSessions = new FakeStoredSessionRuntime(runtime);
+    runtime.storedSessions = storedSessions;
+    const adapter = adapterFor(runtime);
+    const sourceBinding = await adapter.createSession(createInput(), contextFor().context);
+    const recoverOperation = vi.spyOn(storedSessions, "recoverOperation").mockImplementation(() => {
+      throw new ClaudeSessionStoreError("NOT_FOUND");
+    });
+    const lifecycle: NativeSessionDerivationLifecycle = {
+      operationId: "missing-prepared-store-operation",
+      kind: "clone",
+      sourceSessionId: "source-product",
+      sourceBinding,
+      sessionId: "prepared-product",
+      sourceTarget: target,
+      target: { ...target, workspaceRoot: join(target.workspaceRoot, "prepared-cleanup-target") }
+    };
+
+    await expect(adapter.cleanupNativeSessionDerivation(lifecycle, new AbortController().signal))
+      .resolves.toBeUndefined();
+    expect(recoverOperation).toHaveBeenCalledOnce();
+    expect(recoverOperation.mock.calls[0]![0]).not.toHaveProperty("expectedChildSessionId");
+    await adapter.dispose();
+  });
+
+  test("fails cleanup closed when a recorded Store binding loses its operation catalog entry", async () => {
+    const derivedWorkspace = await mkdtemp(join(tmpdir(), "joko-claude-stored-cleanup-"));
+    const derivedTarget = { ...target, workspaceRoot: derivedWorkspace };
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: derivedWorkspace } });
+    const storedSessions = new FakeStoredSessionRuntime(runtime);
+    runtime.storedSessions = storedSessions;
+    const adapter = adapterFor(runtime);
+    try {
+      const sourceBinding = await adapter.createSession(createInput(), contextFor().context);
+      runtime.messages.set(sourceBinding.nativeSessionId!, forkHistory(sourceBinding.nativeSessionId!));
+      const operationId = "missing-recorded-store-operation";
+      const source = contextFor(sourceBinding, { operationId });
+      const binding = await adapter.clone(source.context, {
+        sessionId: "recorded-product",
+        target: derivedTarget,
+        recordBinding: vi.fn()
+      });
+      const recoverOperation = vi.spyOn(storedSessions, "recoverOperation").mockImplementation(() => {
+        throw new ClaudeSessionStoreError("NOT_FOUND");
+      });
+      const cleanupOperation = vi.spyOn(storedSessions, "cleanupOperation");
+
+      await expect(adapter.cleanupNativeSessionDerivation({
+        operationId,
+        kind: "clone",
+        sourceSessionId: source.context.sessionId,
+        sourceBinding,
+        sessionId: "recorded-product",
+        sourceTarget: target,
+        target: derivedTarget,
+        binding
+      }, new AbortController().signal)).rejects.toMatchObject({
+        publicError: {
+          code: "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
+          stateMayHaveChanged: true
+        }
+      });
+      expect(recoverOperation).toHaveBeenCalledWith(expect.objectContaining({
+        expectedChildSessionId: binding.nativeSessionId
+      }));
+      expect(cleanupOperation).not.toHaveBeenCalled();
+    } finally {
+      await adapter.dispose();
+      await rm(derivedWorkspace, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
+  test("fails a Store-backed resume closed when the consumed system/init reports another workspace", async () => {
+    const derivedWorkspace = await mkdtemp(join(tmpdir(), "joko-claude-stored-cwd-"));
+    const derivedTarget = { ...target, workspaceRoot: derivedWorkspace };
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: target.workspaceRoot } });
+    const storedSessions = new FakeStoredSessionRuntime(runtime);
+    runtime.storedSessions = storedSessions;
+    const adapter = adapterFor(runtime);
+    try {
+      const sourceBinding = await adapter.createSession(createInput(), contextFor().context);
+      runtime.messages.set(sourceBinding.nativeSessionId!, forkHistory(sourceBinding.nativeSessionId!));
+      const operationId = "stored-cwd-mismatch";
+      const source = contextFor(sourceBinding, { operationId });
+      const binding = await adapter.clone(source.context, {
+        sessionId: "stored-cwd-product",
+        target: derivedTarget,
+        recordBinding: vi.fn()
+      });
+      await adapter.adoptNativeSessionDerivation({
+        operationId,
+        kind: "clone",
+        sourceSessionId: source.context.sessionId,
+        sourceBinding,
+        sessionId: "stored-cwd-product",
+        sourceTarget: target,
+        target: derivedTarget,
+        binding
+      }, new AbortController().signal);
+      const context = {
+        ...contextFor(binding, { target: derivedTarget }).context,
+        sessionId: "stored-cwd-product"
+      };
+
+      const failure = await adapter.resumeSession(binding, context).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(JokoError);
+      expect((failure as JokoError).publicError).toMatchObject({ stateMayHaveChanged: false });
+      const query = runtime.queries.at(-1)!;
+      expect(query.params.options.sessionStoreAccess).toMatchObject({
+        kind: "session",
+        sessionId: binding.nativeSessionId
+      });
+      expect(query.closeCalls).toBe(1);
+      expect(runtime.retiredQueries).toContain(query);
+      await expect(adapter.send(textPrompt("must remain fenced"), {
+        ...context,
+        operationId: "after-stored-cwd-mismatch"
+      })).rejects.toMatchObject({ publicError: { code: "SESSION_NOT_ATTACHED" } });
+    } finally {
+      await adapter.dispose();
+      await rm(derivedWorkspace, { recursive: true, force: true, maxRetries: 3 });
+    }
   });
 
   test("does not advertise or dispatch cross-workspace derivation without a native migration primitive", async () => {
@@ -4950,11 +5412,252 @@ describe("ClaudeCodeAdapter", () => {
     expect(active.events).toEqual([]);
     oldQuery.endOutput();
   });
+
+  test("retires only native OAuth Queries before logout and preserves independent managed routes", async () => {
+    let serialized: string | undefined = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: "native-access-secret",
+      refreshToken: "native-refresh-secret",
+      expiresAt: Date.now() + 60 * 60 * 1_000,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+    const credentialPort = {
+      readSerialized: async () => serialized,
+      compareAndSet: async (input: { readonly expected: string | undefined; readonly value: string }) => {
+        if (serialized !== input.expected) return false;
+        serialized = input.value;
+        return true;
+      },
+      restoreExact: async () => false,
+      deleteExact: async (expected: string) => {
+        if (serialized !== expected) return false;
+        serialized = undefined;
+        return true;
+      }
+    };
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model" }
+    });
+    const remoteTarget: TargetDescriptor = {
+      ...target,
+      id: "native-oauth-remote-target",
+      workspaceRoot: "/srv/auth",
+      remoteWorkspace: {
+        hostTargetId: "native-oauth-remote-target",
+        hostId: "host-auth",
+        workspaceRoot: "/srv/auth"
+      }
+    };
+    const remoteRuntime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { cwd: "/srv/auth", model: "configured-model" }
+    });
+    const adapter = adapterFor(runtime, {
+      credentialPort,
+      managedProviders: managed.port,
+      remoteRuntimes: {
+        resolve: async () => ({
+          runtime: remoteRuntime,
+          workspaceRoot: "/srv/auth",
+          remote: true,
+          assertCurrent: () => undefined
+        }),
+        close: async () => undefined
+      }
+    });
+    const nativeOwner = contextFor();
+    const nativeContext = { ...nativeOwner.context, sessionId: "native-oauth-session" };
+    const remoteContext = {
+      ...contextFor(undefined, { target: remoteTarget }).context,
+      sessionId: "native-oauth-remote-session"
+    };
+    const managedContext = {
+      ...contextFor().context,
+      sessionId: "managed-route-session",
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    const remoteManagedContext = {
+      ...contextFor(undefined, { target: remoteTarget }).context,
+      sessionId: "remote-managed-route-session",
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    const nativeBinding = await adapter.createSession(createInput({
+      providerId: "claude-code", modelId: "model-a"
+    }), nativeContext);
+    await adapter.createSession(createInput({
+      target: remoteTarget, providerId: "claude-code", modelId: "model-a"
+    }), remoteContext);
+    const managedBinding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), managedContext);
+    const remoteManagedBinding = await adapter.createSession(createInput({
+      target: remoteTarget, providerId: "configured-provider", modelId: "configured-model"
+    }), remoteManagedContext);
+    const nativeQuery = runtime.queries[0]!;
+    const managedQuery = runtime.queries[1]!;
+    const remoteNativeQuery = remoteRuntime.queries[0]!;
+    const remoteManagedQuery = remoteRuntime.queries[1]!;
+
+    await adapter.send(textPrompt("keep one native turn active during logout"), {
+      ...nativeContext,
+      binding: nativeBinding,
+      operationId: "native-active-before-logout"
+    });
+
+    await adapter.logout();
+
+    expect(serialized).toBeUndefined();
+    expect(runtime.retiredQueries).toEqual([nativeQuery]);
+    expect(remoteRuntime.retiredQueries).toEqual([remoteNativeQuery]);
+    expect(nativeQuery.closeCalls).toBe(1);
+    expect(managedQuery.closeCalls).toBe(0);
+    expect(remoteNativeQuery.closeCalls).toBe(1);
+    expect(remoteManagedQuery.closeCalls).toBe(0);
+    expect(nativeOwner.events.filter((event) => event.type === "error" && event.terminal)).toEqual([
+      expect.objectContaining({
+        type: "error",
+        terminal: true,
+        error: expect.objectContaining({
+          code: "CLAUDE_CODE_PROVIDER_AUTHENTICATION_REVOKED",
+          stateMayHaveChanged: true
+        })
+      })
+    ]);
+    expect(nativeOwner.events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "failed" }
+    ]);
+    nativeQuery.push(resultMessage(nativeBinding.nativeSessionId!, { result: "late native result", totalCostUsd: 0 }));
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    expect(nativeOwner.events.filter((event) => event.type === "error" && event.terminal)).toHaveLength(1);
+    expect(nativeOwner.events.filter((event) => event.type === "done")).toHaveLength(1);
+    await adapter.send(textPrompt("managed route remains usable"), {
+      ...managedContext,
+      binding: managedBinding,
+      operationId: "managed-after-native-logout"
+    });
+    expect(managedQuery.receivedInputs).toHaveLength(1);
+    await adapter.send(textPrompt("remote managed owner remains usable"), {
+      ...remoteManagedContext,
+      binding: remoteManagedBinding,
+      operationId: "remote-managed-after-native-logout"
+    });
+    expect(remoteManagedQuery.receivedInputs).toHaveLength(1);
+    await adapter.closeSession(managedBinding, { ...managedContext, binding: managedBinding });
+    await adapter.closeSession(remoteManagedBinding, { ...remoteManagedContext, binding: remoteManagedBinding });
+    expect(nativeBinding.nativeSessionId).not.toBe(managedBinding.nativeSessionId);
+  });
+
+  test("fails an unconsumed native prompt with typed Provider auth revocation during logout", async () => {
+    let serialized: string | undefined = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: "native-access-secret",
+      refreshToken: "native-refresh-secret",
+      expiresAt: Date.now() + 60 * 60 * 1_000,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+    const credentialPort = {
+      readSerialized: async () => serialized,
+      compareAndSet: async (input: { readonly expected: string | undefined; readonly value: string }) => {
+        if (serialized !== input.expected) return false;
+        serialized = input.value;
+        return true;
+      },
+      restoreExact: async () => false,
+      deleteExact: async (expected: string) => {
+        if (serialized !== expected) return false;
+        serialized = undefined;
+        return true;
+      }
+    };
+    let resolveImage!: (value: { readonly data: Uint8Array }) => void;
+    const readBlob = vi.fn(() => new Promise<{ readonly data: Uint8Array }>((resolvePromise) => {
+      resolveImage = resolvePromise;
+    }));
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { credentialPort, readBlob });
+    const binding = await adapter.createSession(
+      createInput({ providerId: "claude-code", modelId: "model-a" }),
+      contextFor().context
+    );
+    const sending = adapter.send(
+      { ...textPrompt(""), images: [{ blob: imageAttachment().blob }] },
+      contextFor(binding, { operationId: "logout-during-image-preparation" }).context
+    );
+    const rejected = expect(sending).rejects.toMatchObject({
+      publicError: {
+        code: "CLAUDE_CODE_PROVIDER_AUTHENTICATION_REVOKED",
+        stateMayHaveChanged: false,
+        recovery: expect.stringContaining("Sign in again")
+      }
+    });
+    await eventually(() => readBlob.mock.calls.length === 1);
+
+    await expect(adapter.logout()).resolves.toBeUndefined();
+    await rejected;
+    resolveImage({ data: imageAttachment().data });
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+
+    expect(serialized).toBeUndefined();
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+  });
+
+  test("keeps the OAuth credential and an exact retry handle when native Query retirement is unconfirmed", async () => {
+    let serialized: string | undefined = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: "native-access-secret",
+      refreshToken: "native-refresh-secret",
+      expiresAt: Date.now() + 60 * 60 * 1_000,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+    const credentialPort = {
+      readSerialized: async () => serialized,
+      compareAndSet: async (input: { readonly expected: string | undefined; readonly value: string }) => {
+        if (serialized !== input.expected) return false;
+        serialized = input.value;
+        return true;
+      },
+      restoreExact: async () => false,
+      deleteExact: async (expected: string) => {
+        if (serialized !== expected) return false;
+        serialized = undefined;
+        return true;
+      }
+    };
+    const runtime = new FakeSdkRuntime();
+    runtime.retirementFailure = true;
+    const adapter = adapterFor(runtime, { credentialPort });
+    await adapter.createSession(createInput(), contextFor().context);
+    const query = runtime.queries[0]!;
+
+    await expect(adapter.logout()).rejects.toMatchObject({
+      publicError: { code: "CLAUDE_CODE_AUTH_RUNTIME_RETIREMENT_UNKNOWN" }
+    });
+    expect(serialized).toBeDefined();
+    expect(query.closeCalls).toBe(1);
+
+    runtime.retirementFailure = false;
+    await expect(adapter.logout()).resolves.toBeUndefined();
+    expect(serialized).toBeUndefined();
+    expect(runtime.retiredQueries).toEqual([query, query]);
+  });
 });
 
 interface FakeRuntimeOptions {
   readonly autoAdmitTurns?: boolean;
   readonly autoReplayInputs?: boolean;
+  readonly deferInputConsumption?: boolean;
   readonly pauseAfterFirstInput?: boolean;
   readonly initialSessionIdOverride?: string;
   readonly initialPermissionMode?: string;
@@ -5037,6 +5740,7 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
   bundledCliVersion: string | undefined;
   supportsWorkspaceDerivation = true;
+  storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
   readonly queries: FakeQuery[] = [];
   retirementFailure = false;
   readonly retiredQueries: ClaudeSdkQuery[] = [];
@@ -5095,27 +5799,35 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
       this.options.pauseAfterFirstInput ?? false);
     this.queries.push(query);
     if (params.options.sessionId !== undefined) this.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
-    void query.consumeInput((message) => {
-      if (this.admitTurns) {
-        query.push({
-          ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
-          ...(Array.isArray(params.options.tools) ? { tools: [...params.options.tools] } : {}),
-          ...(this.options.initialPermissionMode === undefined
-            ? {}
-            : { permissionMode: this.options.initialPermissionMode }),
-          ...this.options.initialFrameOverrides,
-          ...(params.options.persistSession ? {} : {
-              cwd: params.options.cwd,
-              model: params.options.model,
-              permissionMode: params.options.permissionMode
-            })
-        });
-      }
-      if (this.options.autoReplayInputs !== false && params.options.extraArgs?.["replay-user-messages"] === null) {
-        query.push({ ...message, isReplay: true, session_id: nativeSessionId });
-      }
-      return message;
-    });
+    if (params.options.sessionStoreAccess !== undefined) {
+      queueMicrotask(() => query.push({
+        ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
+        ...this.options.initialFrameOverrides
+      }));
+    }
+    if (this.options.deferInputConsumption !== true) {
+      void query.consumeInput((message) => {
+        if (this.admitTurns) {
+          query.push({
+            ...systemInit(this.options.initialSessionIdOverride ?? nativeSessionId),
+            ...(Array.isArray(params.options.tools) ? { tools: [...params.options.tools] } : {}),
+            ...(this.options.initialPermissionMode === undefined
+              ? {}
+              : { permissionMode: this.options.initialPermissionMode }),
+            ...this.options.initialFrameOverrides,
+            ...(params.options.persistSession ? {} : {
+                cwd: params.options.cwd,
+                model: params.options.model,
+                permissionMode: params.options.permissionMode
+              })
+          });
+        }
+        if (this.options.autoReplayInputs !== false && params.options.extraArgs?.["replay-user-messages"] === null) {
+          query.push({ ...message, isReplay: true, session_id: nativeSessionId });
+        }
+        return message;
+      });
+    }
     return Promise.resolve(query);
   }
 
@@ -5162,6 +5874,278 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     this.messages.set(derived, selected.map((message) => ({ ...message, uuid: randomUUID(), session_id: derived })));
     options.recordSessionId(derived);
     return { sessionId: derived };
+  }
+}
+
+interface FakeStoredSessionRecord {
+  workspaceAuthority: string;
+  generation: number;
+  adopted: boolean;
+  info: ClaudeSdkSessionInfo;
+  messages: readonly ClaudeSdkSessionMessage[];
+}
+
+interface FakeStoredOperation {
+  access: ClaudeSessionStoreOperationAccess;
+  state: ClaudeSessionStoreOperationSnapshot["state"];
+  childSessionId?: string;
+  childReservationConfirmed: boolean;
+}
+
+class FakeStoredSessionRuntime implements ClaudeSdkStoredSessionRuntime {
+  readonly sessions = new Map<string, FakeStoredSessionRecord>();
+  readonly operations = new Map<string, FakeStoredOperation>();
+  readonly prepareImportCalls: Parameters<ClaudeSdkStoredSessionRuntime["prepareImport"]>[0][] = [];
+  readonly prepareDerivationCalls: Parameters<ClaudeSdkStoredSessionRuntime["prepareDerivation"]>[0][] = [];
+  readonly importCalls: { readonly sessionId: string; readonly access: ClaudeSessionStoreOperationAccess }[] = [];
+  readonly forkCalls: {
+    readonly sessionId: string;
+    readonly dir: string;
+    readonly access: ClaudeSessionStoreOperationAccess;
+    readonly upToMessageId?: string;
+  }[] = [];
+  readonly infoCalls: { readonly sessionId: string; readonly access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess }[] = [];
+  readonly messageCalls: { readonly sessionId: string; readonly access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess }[] = [];
+  readonly deleteCalls: { readonly sessionId: string; readonly access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess }[] = [];
+  readonly claimCalls: { readonly workspaceAuthority: string; readonly sessionId: string }[] = [];
+  readonly #runtime: FakeSdkRuntime;
+
+  constructor(runtime: FakeSdkRuntime) {
+    this.#runtime = runtime;
+  }
+
+  async prepareImport(input: Parameters<ClaudeSdkStoredSessionRuntime["prepareImport"]>[0]): Promise<ClaudeSessionStoreOperationAccess> {
+    this.prepareImportCalls.push(input);
+    return this.#prepare(input, "import");
+  }
+
+  async prepareDerivation(input: Parameters<ClaudeSdkStoredSessionRuntime["prepareDerivation"]>[0]): Promise<ClaudeSessionStoreOperationAccess> {
+    this.prepareDerivationCalls.push(input);
+    return this.#prepare(input, "durable");
+  }
+
+  async readOperation(access: ClaudeSessionStoreOperationAccess): Promise<ClaudeSessionStoreOperationSnapshot> {
+    const operation = this.#operation(access);
+    const source = this.sessions.get(access.source.sessionId);
+    return {
+      operationId: access.operationId,
+      generation: access.generation,
+      sourceKind: access.source.kind,
+      sourceWorkspaceAuthority: access.source.workspaceAuthority,
+      targetWorkspaceAuthority: access.target.workspaceAuthority,
+      sourceSessionId: access.source.sessionId,
+      state: operation.state,
+      sourceProjectKeyCaptured: true,
+      targetProjectKeyCaptured: true,
+      sourceEntryCount: source?.messages.length ?? 0,
+      sourceBytes: 0,
+      ...(operation.childSessionId === undefined ? {} : { childSessionId: operation.childSessionId }),
+      childReservationConfirmed: operation.childReservationConfirmed,
+      revision: 1
+    };
+  }
+
+  async recoverOperation(input: Parameters<ClaudeSdkStoredSessionRuntime["recoverOperation"]>[0]): Promise<ClaudeSessionStoreOperationAccess> {
+    const operation = this.operations.get(input.operationId);
+    if (operation === undefined
+      || operation.access.target.workspaceAuthority !== input.targetWorkspaceAuthority
+      || input.expectedChildSessionId !== undefined && operation.childSessionId !== input.expectedChildSessionId) {
+      throw new Error("Stored operation is unavailable.");
+    }
+    return operation.access;
+  }
+
+  async cleanupOperation(
+    access: ClaudeSessionStoreOperationAccess,
+    input: { readonly expectedChildSessionId?: string } = {}
+  ): Promise<ClaudeSessionStoreOperationSnapshot> {
+    const operation = this.#operation(access);
+    if (input.expectedChildSessionId !== undefined && operation.childSessionId !== input.expectedChildSessionId) {
+      throw new Error("Stored operation child changed.");
+    }
+    if (operation.state !== "adopted" && operation.childSessionId !== undefined) {
+      this.sessions.delete(operation.childSessionId);
+    }
+    operation.state = "cleaned";
+    return await this.readOperation(access);
+  }
+
+  async discardImport(access: ClaudeSessionStoreOperationAccess): Promise<void> {
+    await this.cleanupOperation(access);
+  }
+
+  async adopt(access: ClaudeSessionStoreOperationAccess, sessionId: string): Promise<ClaudeSessionStoreSessionAccess> {
+    const operation = this.#operation(access);
+    const record = this.sessions.get(sessionId);
+    if (operation.childSessionId !== sessionId || record === undefined
+      || record.workspaceAuthority !== access.target.workspaceAuthority) {
+      throw new Error("Stored child is unavailable for adoption.");
+    }
+    operation.state = "adopted";
+    record.adopted = true;
+    return this.#sessionAccess(record, sessionId);
+  }
+
+  async claim(input: Parameters<ClaudeSdkStoredSessionRuntime["claim"]>[0]): Promise<ClaudeSessionStoreSessionAccess> {
+    this.claimCalls.push(input);
+    const record = this.sessions.get(input.sessionId);
+    if (record === undefined || !record.adopted || record.workspaceAuthority !== input.workspaceAuthority) {
+      throw new Error("Stored Session is unavailable.");
+    }
+    return this.#sessionAccess(record, input.sessionId);
+  }
+
+  async rebind(input: Parameters<ClaudeSdkStoredSessionRuntime["rebind"]>[0]): Promise<ClaudeSessionStoreSessionAccess> {
+    const record = this.sessions.get(input.sessionId);
+    if (record === undefined || !record.adopted || record.workspaceAuthority !== input.workspaceAuthority
+      || record.generation !== input.expectedGeneration) throw new Error("Stored Session generation changed.");
+    record.generation = INSTANCE_GENERATION;
+    return this.#sessionAccess(record, input.sessionId);
+  }
+
+  async importSession(
+    sessionId: string,
+    options: Parameters<ClaudeSdkStoredSessionRuntime["importSession"]>[1]
+  ): Promise<void> {
+    this.importCalls.push({ sessionId, access: options.access });
+    const operation = this.#operation(options.access);
+    const info = this.#runtime.sessions.get(sessionId);
+    if (info === undefined || options.access.source.kind !== "import") throw new Error("Filesystem source is unavailable.");
+    this.sessions.set(sessionId, {
+      workspaceAuthority: options.access.source.workspaceAuthority,
+      generation: INSTANCE_GENERATION,
+      adopted: false,
+      info: { ...info },
+      messages: [...(this.#runtime.messages.get(sessionId) ?? [])]
+    });
+    operation.state = "ready";
+  }
+
+  async forkSession(
+    sessionId: string,
+    options: Parameters<ClaudeSdkStoredSessionRuntime["forkSession"]>[1]
+  ): Promise<{ readonly sessionId: string }> {
+    this.forkCalls.push({
+      sessionId,
+      dir: options.dir,
+      access: options.access,
+      ...(options.upToMessageId === undefined ? {} : { upToMessageId: options.upToMessageId })
+    });
+    const operation = this.#operation(options.access);
+    const source = this.sessions.get(sessionId);
+    if (source === undefined || source.workspaceAuthority !== options.access.source.workspaceAuthority) {
+      throw new Error("Stored source is unavailable.");
+    }
+    const boundary = options.upToMessageId === undefined
+      ? source.messages.length
+      : source.messages.findIndex((message) => message.uuid === options.upToMessageId) + 1;
+    if (boundary < 1 && options.upToMessageId !== undefined) throw new Error("Stored fork boundary is unavailable.");
+    const childSessionId = randomUUID();
+    this.sessions.set(childSessionId, {
+      workspaceAuthority: options.access.target.workspaceAuthority,
+      generation: INSTANCE_GENERATION,
+      adopted: false,
+      info: { ...source.info, sessionId: childSessionId, cwd: options.dir },
+      messages: source.messages.slice(0, boundary).map((message) => ({
+        ...message,
+        uuid: randomUUID(),
+        session_id: childSessionId
+      }))
+    });
+    operation.childSessionId = childSessionId;
+    operation.childReservationConfirmed = true;
+    operation.state = "child_reserved";
+    options.recordSessionId(childSessionId);
+    return { sessionId: childSessionId };
+  }
+
+  getSessionInfo(
+    sessionId: string,
+    options: Parameters<ClaudeSdkStoredSessionRuntime["getSessionInfo"]>[1]
+  ): Promise<ClaudeSdkSessionInfo | undefined> {
+    this.infoCalls.push({ sessionId, access: options.access });
+    this.#assertAccess(sessionId, options.access);
+    return Promise.resolve(this.sessions.get(sessionId)?.info);
+  }
+
+  getSessionMessages(
+    sessionId: string,
+    options: Parameters<ClaudeSdkStoredSessionRuntime["getSessionMessages"]>[1]
+  ): Promise<readonly ClaudeSdkSessionMessage[]> {
+    this.messageCalls.push({ sessionId, access: options.access });
+    this.#assertAccess(sessionId, options.access);
+    return Promise.resolve(this.sessions.get(sessionId)?.messages ?? []);
+  }
+
+  deleteSession(
+    sessionId: string,
+    options: Parameters<ClaudeSdkStoredSessionRuntime["deleteSession"]>[1]
+  ): Promise<void> {
+    this.deleteCalls.push({ sessionId, access: options.access });
+    this.#assertAccess(sessionId, options.access);
+    this.sessions.delete(sessionId);
+    return Promise.resolve();
+  }
+
+  ownsOperation(operationId: string): boolean {
+    return this.operations.has(operationId);
+  }
+
+  #prepare(
+    input: Parameters<ClaudeSdkStoredSessionRuntime["prepareImport"]>[0],
+    sourceKind: "import" | "durable"
+  ): ClaudeSessionStoreOperationAccess {
+    const existing = this.operations.get(input.operationId);
+    if (existing !== undefined) return existing.access;
+    const access: ClaudeSessionStoreOperationAccess = {
+      kind: "operation",
+      operationId: input.operationId,
+      generation: INSTANCE_GENERATION,
+      source: {
+        kind: sourceKind,
+        workspaceAuthority: input.sourceWorkspaceAuthority,
+        sessionId: input.sourceSessionId
+      },
+      target: { workspaceAuthority: input.targetWorkspaceAuthority }
+    };
+    this.operations.set(input.operationId, {
+      access,
+      state: sourceKind === "import" ? "importing" : "ready",
+      childReservationConfirmed: false
+    });
+    return access;
+  }
+
+  #operation(access: ClaudeSessionStoreOperationAccess): FakeStoredOperation {
+    const operation = this.operations.get(access.operationId);
+    if (operation === undefined || operation.access !== access) throw new Error("Stored operation access changed.");
+    return operation;
+  }
+
+  #assertAccess(
+    sessionId: string,
+    access: ClaudeSessionStoreSessionAccess | ClaudeSessionStoreOperationAccess
+  ): void {
+    const record = this.sessions.get(sessionId);
+    if (record === undefined) return;
+    if (access.kind === "session") {
+      if (!record.adopted || access.sessionId !== sessionId
+        || access.workspaceAuthority !== record.workspaceAuthority) throw new Error("Stored Session access changed.");
+      return;
+    }
+    const operation = this.#operation(access);
+    const permitted = access.source.sessionId === sessionId
+      || operation.childSessionId === sessionId;
+    if (!permitted) throw new Error("Stored operation does not own this Session.");
+  }
+
+  #sessionAccess(record: FakeStoredSessionRecord, sessionId: string): ClaudeSessionStoreSessionAccess {
+    return {
+      kind: "session",
+      generation: record.generation,
+      workspaceAuthority: record.workspaceAuthority,
+      sessionId
+    };
   }
 }
 

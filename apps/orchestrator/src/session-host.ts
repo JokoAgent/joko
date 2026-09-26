@@ -21,6 +21,7 @@ import type {
   NativeSessionCatalogEntry,
   NativeSessionCatalogResult,
   NativeSessionDerivation,
+  NativeSessionDerivationLifecycle,
   NativeSessionForkResult,
   NativeSessionNavigationResult,
   NativeHistoryProjection,
@@ -38,6 +39,7 @@ import type {
   RuntimeToolCatalog,
   SessionDescriptor,
   SessionReferenceSnapshot,
+  SessionWorktreeBinding,
   SubagentControlInput,
   SubagentRunDetail,
   TargetDescriptor,
@@ -683,12 +685,39 @@ export interface BackendInstanceReplacementHooks {
   readonly activateCurrent: () => void;
 }
 
+/** Process-local proof that one public authentication attempt began in the
+ * current Provider logout epoch. It contains no credential material. */
+export interface BackendProviderAuthenticationEvidence {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly routeToken: symbol;
+  readonly sequence: number;
+  /** Exact process-local Adapter authority captured before the public auth effect. */
+  readonly adapter?: BackendAdapter;
+  readonly backendInstanceGeneration?: number;
+  /** Adapter-owned opaque route epoch and managed-generation publication fence. */
+  readonly adapterEvidence?: unknown;
+}
+
+interface BackendProviderAuthenticationReconciliation {
+  beginProviderAuthenticationReconciliation(providerId: string): unknown;
+  reconcileProviderAuthentication(providerId: string, evidence: unknown): boolean;
+}
+
+/** Exact logout-retirement ownership returned by the synchronous fence. */
+export interface BackendProviderAuthenticationRetirement {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly retirementToken: symbol;
+}
+
 export class SessionHost {
   readonly #store: OperationalStore;
   readonly #artifactStore: ArtifactStore;
   readonly #adapters = new Map<string, BackendAdapter>();
   readonly #adapterGenerations = new Map<string, number>();
   readonly #initialBackendDescriptors = new Map<string, BackendDescriptor>();
+  readonly #initialBackendDescriptorsAlreadyPublished: boolean;
   readonly #active = new Map<string, ActiveSession>();
   /** Ephemeral authority populated only by the formal task-scoped live read. */
   readonly #activeResourceCatalogs = new Map<string, ActiveResourceCatalog>();
@@ -704,6 +733,22 @@ export class SessionHost {
   readonly #runtimeRestartFlights = new Map<string, Promise<void>>();
   readonly #runtimeRestartFences = new Set<string>();
   readonly #backendReplacementFences = new Map<string, symbol>();
+  /** Provider-scoped barriers installed synchronously before credential logout. */
+  readonly #backendProviderAuthenticationFences = new Map<string, Set<string>>();
+  readonly #backendProviderAuthenticationEpochs = new Map<string, Map<string, {
+    routeToken: symbol;
+    retirementToken?: symbol;
+    retirementRuntimeOwners?: ReadonlyMap<string, ActiveSession>;
+    lastReconciledSequence: number;
+  }>>();
+  #nextBackendProviderAuthenticationEvidence = 0;
+  /** Existing native handles retired by an auth owner are evicted only after
+   * their exact native-owned Queue work has reached a terminal boundary. */
+  readonly #providerAuthenticationRuntimeInvalidations = new Map<string, {
+    readonly backendId: string;
+    readonly providerId: string;
+    readonly runtimeOwner?: ActiveSession;
+  }>();
   readonly #backendAdmissionEffects = new Map<string, number>();
   /** A managed Target deletion owns this fence from its durable claim until
    * the workspace effect and final Target tombstone have both settled. */
@@ -767,6 +812,7 @@ export class SessionHost {
   readonly #activeEffectFlights = new Map<string, Set<Promise<void>>>();
   readonly #backendSideEffectFlights = new Map<string, Set<Promise<void>>>();
   readonly #nativeDerivationCleanupCalls = new Map<string, Set<AbortController>>();
+  readonly #nativeDerivationAdoptionFlights = new Map<string, Promise<void>>();
   readonly #backgroundTasks = new Map<string, Map<string, TrackedBackgroundTask>>();
   readonly #runSilenceWatchdogs = new Map<string, RunSilenceWatchdog>();
   readonly #runSilenceRecoveries = new Map<string, Promise<boolean>>();
@@ -800,6 +846,7 @@ export class SessionHost {
     readonly availableProviderIds: ReadonlySet<string>;
     readonly explicitDefault?: { readonly providerId: string; readonly modelId: string };
   };
+  readonly #sessionRuntimeFallbackContextOwnsAvailability: boolean;
   readonly #sessionRuntimeRecoveryDelayMs: (attempt: number) => number;
   readonly #backendDispatchBlocked: (backendId: string) => boolean;
   readonly #onBackendMayBeIdle: ((backendId: string) => void) | undefined;
@@ -892,6 +939,12 @@ export class SessionHost {
       }) => Promise<void> | void;
       /** Registry-probed descriptors, including unavailable instance shadows. */
       readonly backendDescriptors?: readonly BackendDescriptor[];
+      /**
+       * The Backend registry has already published these identities and owns
+       * subsequent same-generation descriptor refreshes. Initialization must
+       * validate that authority without reseeding its captured snapshot.
+       */
+      readonly backendDescriptorsAlreadyPublished?: boolean;
     } = {}
   ) {
     this.#store = store;
@@ -912,6 +965,7 @@ export class SessionHost {
     this.#modelAccessRestricted = options.modelAccessRestricted ?? (() => false);
     this.#sessionRuntimeFallbackContext = options.sessionRuntimeFallbackContext
       ?? (() => ({ availableProviderIds: new Set<string>() }));
+    this.#sessionRuntimeFallbackContextOwnsAvailability = options.sessionRuntimeFallbackContext !== undefined;
     this.#sessionRuntimeRecoveryDelayMs = options.sessionRuntimeRecoveryDelayMs
       ?? sessionRuntimeRecoveryDelayMs;
     this.#backendDispatchBlocked = options.backendDispatchBlocked ?? (() => false);
@@ -932,6 +986,7 @@ export class SessionHost {
     }
     this.#backendRetirementTimeoutMs = backendRetirementTimeoutMs;
     this.extraDirectories = new ExtraDirectoryManager(store);
+    this.#initialBackendDescriptorsAlreadyPublished = options.backendDescriptorsAlreadyPublished ?? false;
     for (const descriptor of options.backendDescriptors ?? []) {
       if (this.#initialBackendDescriptors.has(descriptor.id)) {
         throw new Error(`Duplicate Backend descriptor ID: ${descriptor.id}`);
@@ -1019,7 +1074,19 @@ export class SessionHost {
     this.#assertOpen();
     this.#store.recoverStartup();
     this.#store.recoverPendingContextRebuilds();
-    for (const descriptor of this.#initialBackendDescriptors.values()) this.#store.upsertBackend(descriptor);
+    for (const descriptor of this.#initialBackendDescriptors.values()) {
+      if (!this.#initialBackendDescriptorsAlreadyPublished) {
+        this.#store.upsertBackend(descriptor);
+        continue;
+      }
+      const published = this.#store.getBackend(descriptor.id).descriptor;
+      if (
+        published.adapterKind !== descriptor.adapterKind
+        || published.instanceGeneration !== descriptor.instanceGeneration
+      ) {
+        throw new Error(`Published Backend descriptor authority changed before Host initialization: ${descriptor.id}`);
+      }
+    }
     const unprobed = [...this.#adapters.values()]
       .filter((adapter) => !this.#initialBackendDescriptors.has(adapter.id));
     const probes = await Promise.allSettled(unprobed.map((adapter) => adapter.describe()));
@@ -1044,7 +1111,15 @@ export class SessionHost {
           });
     }
     for (const record of this.#store.listUnadoptedNativeSessionDerivations()) {
-      if (record.state === "recorded") await this.cleanupNativeSessionDerivation(record.operationId);
+      if (record.state === "product_adopted") {
+        await this.adoptNativeSessionDerivation(record.operationId).catch((error: unknown) => {
+          this.recordDerivationFailure("native_session_derivation_adoption_recovery", error);
+        });
+      } else if (record.state === "prepared" || record.state === "recorded") {
+        await this.cleanupNativeSessionDerivation(record.operationId);
+      } else if (record.state === "workspace_cleanup_pending") {
+        await this.cleanupNativeSessionDerivation(record.operationId);
+      }
     }
     // Native runtimes are lazy. Accepted durable work below is sufficient to
     // reactivate its owning session; merely having a product Session must not
@@ -1573,6 +1648,7 @@ export class SessionHost {
           "The requested same-Backend model, effort, or Fast combination is unavailable."
         );
       }
+      this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
       if (
         routeExplicit
         && (profile.providerId !== current.providerId || profile.modelId !== current.modelId)
@@ -2106,6 +2182,172 @@ export class SessionHost {
     }
   }
 
+  /**
+   * Install the synchronous half of a Provider logout boundary. The caller
+   * must do this before its first credential-owner await. Work that has not
+   * reached native dispatch is failed deterministically; work already handed
+   * to the Backend retains its existing accepted/unknown ownership.
+   */
+  fenceBackendProviderAuthentication(
+    backendId: string,
+    providerId: string
+  ): BackendProviderAuthenticationRetirement {
+    this.#assertOpen();
+    this.#store.getBackend(backendId);
+    const normalizedProviderId = providerId.trim();
+    if (normalizedProviderId.length === 0) throw new StoreError("Provider ID must not be empty.");
+    const epochs = this.#backendProviderAuthenticationEpochs.get(backendId) ?? new Map();
+    const current = epochs.get(normalizedProviderId) ?? {
+      routeToken: Symbol("provider-authentication-route"),
+      lastReconciledSequence: 0
+    };
+    const retirementToken = Symbol("provider-authentication-retirement");
+    const retirementRuntimeOwners = new Map(current.retirementRuntimeOwners);
+    for (const session of this.#store.listSessions({ includeArchived: true })) {
+      const active = this.#active.get(session.descriptor.id);
+      const ownsTargetDispatch = listAllQueueItems(this.#store, {
+        sessionId: session.descriptor.id,
+        states: ["backend_accepted", "dispatch_unknown"]
+      }).some((item) => this.effectiveQueueProviderId(item, session) === normalizedProviderId);
+      if (
+        active === undefined
+        || session.descriptor.backendId !== backendId
+        || (this.activeSessionProviderId(session) !== normalizedProviderId && !ownsTargetDispatch)
+      ) continue;
+      retirementRuntimeOwners.set(session.descriptor.id, active);
+    }
+    epochs.set(normalizedProviderId, {
+      ...current,
+      routeToken: Symbol("provider-authentication-route"),
+      retirementToken,
+      retirementRuntimeOwners
+    });
+    this.#backendProviderAuthenticationEpochs.set(backendId, epochs);
+    const fences = this.#backendProviderAuthenticationFences.get(backendId) ?? new Set<string>();
+    fences.add(normalizedProviderId);
+    this.#backendProviderAuthenticationFences.set(backendId, fences);
+    for (const session of this.#store.listSessions({ includeArchived: true })) {
+      if (session.descriptor.backendId !== backendId) continue;
+      for (const item of listAllQueueItems(this.#store, { sessionId: session.descriptor.id, states: ["accepted"] })) {
+        if (this.effectiveQueueProviderId(item, session) !== normalizedProviderId) continue;
+        this.failQueueItemForAuthentication(item, providerAuthenticationRequiredFailure());
+      }
+    }
+    return { backendId, providerId: normalizedProviderId, retirementToken };
+  }
+
+  /** Rotate the route epoch only after exact runtime retirement and the final
+   * credential/catalog/descriptor state are known. The auth fence remains. */
+  completeBackendProviderAuthenticationRetirement(
+    retirement: BackendProviderAuthenticationRetirement
+  ): void {
+    this.#assertOpen();
+    const epochs = this.#backendProviderAuthenticationEpochs.get(retirement.backendId);
+    const current = epochs?.get(retirement.providerId);
+    if (current?.retirementToken !== retirement.retirementToken) return;
+    epochs!.set(retirement.providerId, {
+      routeToken: Symbol("provider-authentication-route"),
+      lastReconciledSequence: current.lastReconciledSequence
+    });
+    this.scheduleBackendProviderAuthenticationRuntimeInvalidations(
+      retirement.backendId,
+      retirement.providerId,
+      current.retirementRuntimeOwners
+    );
+  }
+
+  /** Capture before a public login/refresh effect. A later logout changes the
+   * epoch, so an older or concurrent observation cannot release its fence. */
+  beginBackendProviderAuthenticationEvidence(
+    backendId: string,
+    providerId: string
+  ): BackendProviderAuthenticationEvidence {
+    this.#assertOpen();
+    this.#store.getBackend(backendId);
+    const normalizedProviderId = providerId.trim();
+    if (normalizedProviderId.length === 0) throw new StoreError("Provider ID must not be empty.");
+    if (this.#nextBackendProviderAuthenticationEvidence >= Number.MAX_SAFE_INTEGER) {
+      throw new StoreError("Provider authentication evidence sequence is exhausted.");
+    }
+    const epochs = this.#backendProviderAuthenticationEpochs.get(backendId) ?? new Map();
+    const current = epochs.get(normalizedProviderId) ?? {
+      routeToken: Symbol("provider-authentication-route"),
+      lastReconciledSequence: 0
+    };
+    epochs.set(normalizedProviderId, current);
+    this.#backendProviderAuthenticationEpochs.set(backendId, epochs);
+    const adapter = this.requireAdapter(backendId);
+    const backendInstanceGeneration = this.requireAdapterGeneration(backendId, adapter);
+    const reconciliation = providerAuthenticationReconciliation(adapter);
+    const adapterEvidence = reconciliation?.beginProviderAuthenticationReconciliation(
+      normalizedProviderId
+    );
+    this.#nextBackendProviderAuthenticationEvidence += 1;
+    return {
+      backendId,
+      providerId: normalizedProviderId,
+      routeToken: current.routeToken,
+      sequence: this.#nextBackendProviderAuthenticationEvidence,
+      adapter,
+      backendInstanceGeneration,
+      ...(adapterEvidence === undefined ? {} : { adapterEvidence })
+    };
+  }
+
+  /**
+   * Reconcile a retained logout fence only after the caller has confirmed
+   * current credential/catalog generation and descriptor publication. A stale
+   * or signed-out projection deliberately leaves the fence installed.
+   */
+  reconcileBackendProviderAuthentication(
+    backendId: string,
+    providerId: string,
+    evidence: BackendProviderAuthenticationEvidence
+  ): void {
+    this.#assertOpen();
+    this.#store.getBackend(backendId);
+    const normalizedProviderId = providerId.trim();
+    if (normalizedProviderId.length === 0) throw new StoreError("Provider ID must not be empty.");
+    const epochs = this.#backendProviderAuthenticationEpochs.get(backendId);
+    const current = epochs?.get(normalizedProviderId);
+    if (
+      current === undefined
+      || evidence.backendId !== backendId
+      || evidence.providerId !== normalizedProviderId
+      || evidence.routeToken !== current.routeToken
+      || current.retirementToken !== undefined
+      || evidence.sequence <= current.lastReconciledSequence
+      || !Number.isSafeInteger(evidence.sequence)
+    ) return;
+    if (!this.providerAuthenticationAvailable(backendId, normalizedProviderId, true)) return;
+    const adapter = this.#adapters.get(backendId);
+    const backendInstanceGeneration = this.#adapterGenerations.get(backendId);
+    if (
+      adapter === undefined
+      || adapter !== evidence.adapter
+      || backendInstanceGeneration === undefined
+      || backendInstanceGeneration !== evidence.backendInstanceGeneration
+    ) return;
+    const reconciliation = providerAuthenticationReconciliation(adapter);
+    if (
+      reconciliation !== undefined
+      && (
+        evidence.adapterEvidence === undefined
+        || !reconciliation.reconcileProviderAuthentication(
+          normalizedProviderId,
+          evidence.adapterEvidence
+        )
+      )
+    ) return;
+    epochs!.set(normalizedProviderId, { ...current, lastReconciledSequence: evidence.sequence });
+    const fences = this.#backendProviderAuthenticationFences.get(backendId);
+    if (fences?.delete(normalizedProviderId) === true && fences.size === 0) {
+      this.#backendProviderAuthenticationFences.delete(backendId);
+    }
+    this.scheduleBackendProviderAuthenticationRuntimeInvalidations(backendId, normalizedProviderId);
+    this.wakeBackendQueues(backendId);
+  }
+
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   commitQueuedInput(store: OperationalStore, input: QueuedInput): EnqueueResult {
     this.#assertOpen();
@@ -2413,6 +2655,9 @@ export class SessionHost {
     readonly preserveClaimOnEffectFailure?: (error: unknown) => boolean;
   }): Promise<OperationExecution<T>> {
     this.#assertOpen();
+    if (input.sessionLifecycleFenceId !== undefined) {
+      await this.adoptPendingNativeSessionDerivationForSession(input.sessionLifecycleFenceId);
+    }
     if (input.effect === undefined) {
       const execution = this.#store.runAuthorizedOperation(
         input.connection.id,
@@ -2826,7 +3071,9 @@ export class SessionHost {
     this.#clearSessionRuntimeRecovery(sessionId);
     const run = this.#store.getRun(runId);
     if (run.descriptor.sessionId !== sessionId) throw new Error("Run does not belong to the task.");
-    const active = await this.activate(sessionId);
+    const stored = this.#store.getSession(sessionId);
+    const active = this.fencedProviderAuthenticationCleanupOwner(stored, runId)
+      ?? await this.activate(sessionId);
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
       await active.adapter.abort(this.contextFor(
@@ -2863,9 +3110,10 @@ export class SessionHost {
 
     let stored = this.#store.getSession(sessionId);
     this.assertBackgroundTaskCancellationAvailable(stored, this.requireAdapter(stored.descriptor.backendId));
-    this.requireDurableBackgroundTaskOwnership(stored, taskId);
+    const initialObserved = this.requireDurableBackgroundTaskOwnership(stored, taskId);
 
-    const active = await this.activate(sessionId);
+    const retainedCleanupOwner = this.fencedProviderAuthenticationCleanupOwner(stored, initialObserved.runId);
+    const active = retainedCleanupOwner ?? await this.activate(sessionId);
     stored = this.#store.getSession(sessionId);
     this.assertBackgroundTaskCancellationAvailable(stored, active.adapter);
     const observed = this.requireDurableBackgroundTaskOwnership(stored, taskId);
@@ -2954,8 +3202,31 @@ export class SessionHost {
       projection.event.attemptId,
       operationId
     );
+    const controlledProviderId = resolved.childId === undefined
+      ? projection.run.route?.providerId
+      : projection.run.children?.find((child) => child.id === resolved.childId)?.route?.providerId
+        ?? projection.run.route?.providerId;
+    const retainedCleanupOwner = this.fencedProviderAuthenticationCleanupOwner(
+      stored,
+      projection.event.runId,
+      controlledProviderId,
+      resolved.action === "stop"
+    );
     if (adapter.controlSubagent !== undefined
         && adapter.supportsDetachedSubagentControl?.(resolved.action, detachedContext) === true) {
+      if (retainedCleanupOwner !== undefined) {
+        const lease = this.beginActiveBackendSideEffect(sessionId, retainedCleanupOwner, operationId);
+        try {
+          await adapter.controlSubagent(resolved, {
+            ...detachedContext,
+            backendInstanceGeneration: lease.backendInstanceGeneration
+          });
+          this.assertActiveBackendSideEffectLease(lease);
+        } finally {
+          lease.release();
+        }
+        return;
+      }
       const generation = stored.descriptor.binding.generation;
       const backendGeneration = this.requireAdapterGeneration(stored.descriptor.backendId, adapter);
       const release = this.beginBackendAdmissionEffect(stored.descriptor.backendId);
@@ -2976,7 +3247,7 @@ export class SessionHost {
       return;
     }
 
-    const active = await this.activate(sessionId);
+    const active = retainedCleanupOwner ?? await this.activate(sessionId);
     stored = this.#store.getSession(sessionId);
     adapter = active.adapter;
     this.assertSubagentControlAvailable(stored, adapter, input.action);
@@ -3093,6 +3364,7 @@ export class SessionHost {
    */
   async prepareSessionLifecycleClose(sessionId: string, disposition: "archive" | "delete"): Promise<void> {
     this.#assertOpen();
+    await this.adoptPendingNativeSessionDerivationForSession(sessionId);
     if (disposition === "archive") {
       this.assertSessionLifecycleIdle(sessionId);
       // The claimed durable lifecycle fence prevents new work from entering.
@@ -3145,7 +3417,9 @@ export class SessionHost {
   }
 
   async deleteNativeSession(sessionId: string, lifecycleOperationId?: string): Promise<void> {
+    this.#assertOpen();
     if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer native Sessions cannot be deleted through task controls.");
+    await this.adoptPendingNativeSessionDerivationForSession(sessionId);
     this.#clearSessionRuntimeRecovery(sessionId);
     this.clearRunSilenceWatchdog(sessionId);
     const detachedStored = this.#store.getSession(sessionId);
@@ -3480,16 +3754,17 @@ export class SessionHost {
       }
     );
     if (!claim.claimed) {
+      await this.adoptNativeSessionDerivation(claim.operation.id);
       return { replayed: true, value: claim.value, operation: claim.operation };
     }
 
+    const sessionId = stableId("session", input.operationId);
     let releaseBackendAdmission: (() => void) | undefined;
     let sideEffectLease: ActiveBackendSideEffectLease | undefined;
-    let acquiredDerivedWorktreeSessionId: string | undefined;
+    let acquiredDerivedWorktree: SessionWorktreeBinding | undefined;
     try {
       const admittedSource = this.#store.getSession(input.sourceSessionId);
       const admittedTarget = this.#store.getTarget(admittedSource.descriptor.targetId);
-      const sessionId = stableId("session", input.operationId);
       this.assertInheritedSessionCreationReady(
         admittedSource.descriptor.backendId,
         {
@@ -3515,7 +3790,14 @@ export class SessionHost {
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
       const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
         .descriptor.capabilities.get("workspace.derive")?.supported === true;
-      const derivedWorktree = source.descriptor.worktree !== undefined
+      const remotePlan = derivesWorkspace && source.descriptor.remoteWorkspace !== undefined
+        ? await this.#worktrees!.planRemoteDerivation({
+            sessionId,
+            sourceSessionId: source.descriptor.id
+          })
+        : undefined;
+      let derivedWorktree = source.descriptor.worktree !== undefined
+        && source.descriptor.remoteWorkspace === undefined
         ? await this.#worktrees!.derive({
             sessionId,
             sourceSessionId: source.descriptor.id
@@ -3526,10 +3808,61 @@ export class SessionHost {
               sourceSessionId: source.descriptor.id
             })
           : undefined;
-      if (derivedWorktree !== undefined) acquiredDerivedWorktreeSessionId = sessionId;
+      if (derivedWorktree !== undefined) acquiredDerivedWorktree = derivedWorktree;
       const derivationTarget = derivedWorktree === undefined
-        ? sourceContext.target
+        ? remotePlan === undefined
+          ? sourceContext.target
+          : { ...admittedTarget.descriptor, workspaceRoot: remotePlan.path }
         : { ...admittedTarget.descriptor, workspaceRoot: derivedWorktree.path };
+      const lifecycle: NativeSessionDerivationLifecycle = {
+        operationId: claim.operation.id,
+        kind: input.kind,
+        sourceSessionId: source.descriptor.id,
+        sourceBinding: source.descriptor.binding,
+        sessionId,
+        sourceTarget: sourceContext.target,
+        target: derivationTarget
+      };
+      const ownsDurableLifecycle = active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
+      if (remotePlan !== undefined && !ownsDurableLifecycle) {
+        throw new StoreError("The remote Backend cannot adopt an isolated native derivation safely.");
+      }
+      if (ownsDurableLifecycle) {
+        if (active.adapter.adoptNativeSessionDerivation === undefined
+          || active.adapter.cleanupNativeSessionDerivation === undefined) {
+          throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");
+        }
+        const prepared = this.#store.prepareNativeSessionDerivation({
+          operationId: claim.operation.id,
+          expectedBodyHash: claim.operation.bodyHash,
+          sourceSessionId: source.descriptor.id,
+          sourceBinding: source.descriptor.binding,
+          sourceSessionRevision: source.revision,
+          sessionId,
+          backendId: source.descriptor.backendId,
+          backendInstanceGeneration: active.backendInstanceGeneration,
+          targetId: source.descriptor.targetId,
+          targetRevision: admittedTarget.revision,
+          effectiveWorkspaceRoot: derivationTarget.workspaceRoot,
+          ...(sourceContext.target.remoteWorkspace === undefined
+            ? {}
+            : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+          ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
+          ...(remotePlan === undefined ? {} : { remoteWorktreePlan: remotePlan })
+        });
+        if (remotePlan !== undefined) {
+          derivedWorktree = await this.#worktrees!.acquirePlannedRemoteDerivation(remotePlan);
+          acquiredDerivedWorktree = derivedWorktree;
+          this.#store.attachNativeSessionDerivationWorktree({
+            operationId: claim.operation.id,
+            expectedRevision: prepared.revision,
+            worktree: derivedWorktree
+          });
+          this.assertActiveBackendSideEffectLease(sideEffectLease);
+          this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
+          await this.#worktrees!.assertActiveRemoteWorktree(sessionId, derivedWorktree);
+        }
+      }
       const derivation: NativeSessionDerivation = {
         sessionId,
         target: derivationTarget,
@@ -3547,6 +3880,7 @@ export class SessionHost {
             ...(sourceContext.target.remoteWorkspace === undefined
               ? {}
               : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+            ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
             binding
           });
         }
@@ -3558,7 +3892,7 @@ export class SessionHost {
         ? forkResult!.binding
         : await active.adapter.clone(sourceContext, derivation);
       const receipt = this.#store.findNativeSessionDerivation(claim.operation.id);
-      if (receipt === undefined || !sameNativeBinding(receipt.binding, binding)) {
+      if (receipt?.binding === undefined || !sameNativeBinding(receipt.binding, binding)) {
         throw new StoreError("The Backend did not register the returned derived native binding.");
       }
       this.assertActiveBackendSideEffectLease(sideEffectLease);
@@ -3645,17 +3979,23 @@ export class SessionHost {
           return { sessionId };
         }
       );
-      acquiredDerivedWorktreeSessionId = undefined;
+      acquiredDerivedWorktree = undefined;
+      await this.adoptNativeSessionDerivation(claim.operation.id);
       return execution;
     } catch (error) {
+      if (this.#store.getOperation(claim.operation.id).status === "completed") {
+        this.recordDerivationFailure(`${input.kind}_session_adoption`, error);
+        throw error;
+      }
       const failure = nestedOperationFailure(error);
       const failed = this.#store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, failure);
-      await this.cleanupNativeSessionDerivation(claim.operation.id);
+      await this.cleanupNativeSessionDerivation(claim.operation.id, acquiredDerivedWorktree);
       const derivationReceipt = this.#store.findNativeSessionDerivation(claim.operation.id);
-      if (acquiredDerivedWorktreeSessionId !== undefined
-        && (derivationReceipt === undefined || derivationReceipt.state === "cleaned")
+      if (derivationReceipt?.state === "cleaned") acquiredDerivedWorktree = undefined;
+      if (acquiredDerivedWorktree !== undefined
+        && derivationReceipt === undefined
         && this.#worktrees !== undefined) {
-        await this.#worktrees.release(acquiredDerivedWorktreeSessionId)
+        await this.#worktrees.release(sessionId, acquiredDerivedWorktree)
           .catch((cleanupError: unknown) => this.recordDerivationFailure("derived_worktree_cleanup", cleanupError));
       }
       this.recordDerivationFailure(`${input.kind}_session`, failure);
@@ -3684,9 +4024,8 @@ export class SessionHost {
     }
     const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
       .descriptor.capabilities.get("workspace.derive")?.supported === true;
-    const requiresLocalIsolation = worktree !== undefined
-      || (source.descriptor.remoteWorkspace === undefined && derivesWorkspace);
-    if (!requiresLocalIsolation) return;
+    const requiresIsolation = worktree !== undefined || derivesWorkspace;
+    if (!requiresIsolation) return;
     if (this.#worktrees === undefined || !derivesWorkspace) {
       throw new JokoError({
         code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED",
@@ -3734,104 +4073,322 @@ export class SessionHost {
     }
   }
 
-  private async cleanupNativeSessionDerivation(operationId: string): Promise<void> {
+  private async nativeSessionDerivationLifecycle(
+    record: NativeSessionDerivationRecord,
+    expectedWorktree?: SessionWorktreeBinding
+  ): Promise<NativeSessionDerivationLifecycle> {
+    const target = this.#store.getTarget(record.targetId).descriptor;
+    if (target.backendId !== record.backendId
+      || target.remoteWorkspace?.hostTargetId !== record.remoteWorkspace?.hostTargetId
+      || target.remoteWorkspace?.hostId !== record.remoteWorkspace?.hostId
+      || target.remoteWorkspace?.workspaceRoot !== record.remoteWorkspace?.workspaceRoot) {
+      throw new StoreError("The native derivation lifecycle target authority changed.");
+    }
+    if (record.worktree !== undefined && expectedWorktree !== undefined
+      && !sameSessionWorktreeBinding(record.worktree, expectedWorktree)) {
+      throw new StoreError("The native derivation lifecycle worktree authority changed.");
+    }
+    const worktree = record.worktree ?? expectedWorktree;
+    let effectiveTarget = target;
+    if (target.workspaceRoot !== record.effectiveWorkspaceRoot) {
+      if (worktree === undefined || (worktree.remote === undefined
+        ? resolve(worktree.path) !== resolve(record.effectiveWorkspaceRoot)
+        : worktree.path !== record.effectiveWorkspaceRoot)) {
+        throw new StoreError("The native derivation lifecycle has no exact worktree authority.");
+      }
+      const activePath = worktree.remote === undefined
+        ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree)
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree);
+      if (activePath === undefined || (target.remoteWorkspace === undefined) !== (worktree.remote === undefined)) {
+        throw new StoreError("The native derivation lifecycle workspace authority changed.");
+      }
+      effectiveTarget = { ...target, workspaceRoot: activePath };
+    } else if (worktree !== undefined
+      && (worktree.remote === undefined
+        ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree) === undefined
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree) === undefined)) {
+      throw new StoreError("The native derivation lifecycle worktree is no longer active.");
+    }
+    if (record.state === "product_adopted") {
+      const productWorktree = this.#store.getSession(record.sessionId).descriptor.worktree;
+      if ((worktree === undefined) !== (productWorktree === undefined)
+        || (worktree !== undefined && productWorktree !== undefined
+          && !sameSessionWorktreeBinding(worktree, productWorktree))) {
+        throw new StoreError("The native derivation lifecycle Product worktree authority changed.");
+      }
+    }
+    const source = this.#store.getSession(record.sourceSessionId).descriptor;
+    if (source.backendId !== record.backendId || source.targetId !== record.targetId) {
+      throw new StoreError("The native derivation lifecycle source authority changed.");
+    }
+    const sourceTarget = source.worktree === undefined
+      ? target
+      : { ...target, workspaceRoot: source.worktree.path };
+    const operationKind = this.#store.getOperation(record.operationId).kind;
+    const kind = operationKind === "fork_session"
+      ? "fork"
+      : operationKind === "clone_session"
+        ? "clone"
+        : operationKind === "navigate_session" || operationKind === "navigateSessionBranch"
+          ? "navigate"
+          : undefined;
+    if (kind === undefined) throw new StoreError("The native derivation lifecycle operation kind changed.");
+    return {
+      operationId: record.operationId,
+      kind,
+      sourceSessionId: record.sourceSessionId,
+      sourceBinding: record.sourceBinding,
+      sessionId: record.sessionId,
+      sourceTarget,
+      target: effectiveTarget,
+      ...(record.binding === undefined ? {} : { binding: record.binding })
+    };
+  }
+
+  private beginNativeDerivationLifecycleCall(backendId: string): {
+    readonly controller: AbortController;
+    readonly release: () => void;
+  } {
+    const controller = new AbortController();
+    const calls = this.#nativeDerivationCleanupCalls.get(backendId) ?? new Set<AbortController>();
+    calls.add(controller);
+    this.#nativeDerivationCleanupCalls.set(backendId, calls);
+    return {
+      controller,
+      release: () => {
+        calls.delete(controller);
+        if (calls.size === 0 && this.#nativeDerivationCleanupCalls.get(backendId) === calls) {
+          this.#nativeDerivationCleanupCalls.delete(backendId);
+        }
+      }
+    };
+  }
+
+  private claimCurrentNativeSessionDerivationLifecycleOwner(
+    record: NativeSessionDerivationRecord,
+    adapter: BackendAdapter
+  ): NativeSessionDerivationRecord {
+    const currentGeneration = this.requireAdapterGeneration(record.backendId, adapter);
+    this.assertCurrentAdapterGeneration(record.backendId, adapter, currentGeneration);
+    if (record.lifecycleOwnerGeneration === currentGeneration) return record;
+    const claimed = this.#store.claimNativeSessionDerivationLifecycleOwner({
+      operationId: record.operationId,
+      expectedRevision: record.revision,
+      expectedOwnerGeneration: record.lifecycleOwnerGeneration,
+      nextGeneration: currentGeneration
+    });
+    this.assertCurrentAdapterGeneration(record.backendId, adapter, currentGeneration);
+    return claimed;
+  }
+
+  private adoptNativeSessionDerivation(operationId: string): Promise<void> {
+    const existing = this.#nativeDerivationAdoptionFlights.get(operationId);
+    if (existing !== undefined) return existing;
+    const flight = this.adoptNativeSessionDerivationOnce(operationId).finally(() => {
+      if (this.#nativeDerivationAdoptionFlights.get(operationId) === flight) {
+        this.#nativeDerivationAdoptionFlights.delete(operationId);
+      }
+    });
+    this.#nativeDerivationAdoptionFlights.set(operationId, flight);
+    return flight;
+  }
+
+  private async adoptPendingNativeSessionDerivationForSession(sessionId: string): Promise<void> {
+    for (;;) {
+      const pending = this.#store.findProductAdoptedNativeSessionDerivation(sessionId);
+      if (pending === undefined) return;
+      await this.adoptNativeSessionDerivation(pending.operationId);
+      const unresolved = this.#store.findProductAdoptedNativeSessionDerivation(sessionId);
+      if (unresolved?.operationId === pending.operationId) {
+        throw new StoreError("The task's durable native derivation adoption did not settle.");
+      }
+    }
+  }
+
+  private async adoptNativeSessionDerivationOnce(operationId: string): Promise<void> {
+    const pending = this.#store.findNativeSessionDerivation(operationId);
+    if (pending === undefined || pending.state === "adopted") return;
+    if (pending.state !== "product_adopted") return;
+    if (!pending.externalLifecycle || pending.binding === undefined) {
+      throw new StoreError("The Product-adopted native derivation has no external lifecycle authority.");
+    }
+    const adapter = this.requireAdapter(pending.backendId);
+    if (adapter.adoptNativeSessionDerivation === undefined) {
+      throw new StoreError("The Backend cannot adopt its durable native derivation lifecycle.");
+    }
+    const releaseAdmission = this.beginBackendAdmissionEffect(pending.backendId);
+    try {
+      const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(pending, adapter);
+      if (record.binding === undefined) {
+        throw new StoreError("The Product-adopted native derivation lost its recorded binding.");
+      }
+      const lifecycle = await this.nativeSessionDerivationLifecycle(record);
+      const call = this.beginNativeDerivationLifecycleCall(record.backendId);
+      let adoption: Promise<void>;
+      try {
+        adoption = adapter.adoptNativeSessionDerivation({ ...lifecycle, binding: record.binding }, call.controller.signal);
+      } catch (error) {
+        call.release();
+        throw error;
+      }
+      void adoption.then(call.release, call.release);
+      await nativeDerivationCleanupDeadline(adoption, call.controller);
+      call.controller.signal.throwIfAborted();
+      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.lifecycleOwnerGeneration);
+      this.#store.finishNativeSessionDerivationAdoption({
+        operationId,
+        expectedRevision: record.revision
+      });
+    } finally {
+      releaseAdmission();
+    }
+  }
+
+  private async cleanupNativeSessionDerivation(
+    operationId: string,
+    expectedWorktree?: SessionWorktreeBinding
+  ): Promise<void> {
     let claim: { readonly record: NativeSessionDerivationRecord; readonly token: string } | undefined;
     let releaseAdmission: (() => void) | undefined;
-    let derivedWorktreeSessionId: string | undefined;
     try {
       const current = this.#store.findNativeSessionDerivation(operationId);
-      if (current?.state !== "recorded") return;
-      const record = current;
-      const adapter = this.requireAdapter(record.backendId);
-      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.backendInstanceGeneration);
+      if (current === undefined) return;
+      if (current.state === "workspace_cleanup_pending") {
+        await this.finishNativeSessionDerivationWorkspaceCleanup(current);
+        return;
+      }
+      if (current.state !== "prepared" && current.state !== "recorded") return;
+      if (current.state === "prepared" && current.remoteWorktreePlan !== undefined
+        && current.worktree === undefined && current.binding === undefined) {
+        const pending = this.#store.confirmUnstartedRemoteDerivationCleanup({
+          operationId,
+          expectedRevision: current.revision
+        });
+        await this.finishNativeSessionDerivationWorkspaceCleanup(pending);
+        return;
+      }
+      const adapter = this.requireAdapter(current.backendId);
+      if (current.externalLifecycle) {
+        if (adapter.cleanupNativeSessionDerivation === undefined) {
+          throw new StoreError("The Backend cannot clean up its durable native derivation lifecycle.");
+        }
+      } else if (current.binding === undefined) {
+        throw new StoreError("A detached native deletion requires its recorded binding.");
+      }
       // A failed live derivation still holds its original backend flight during
       // shutdown. Startup cleanup instead acquires its own admission authority.
-      if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(record.backendId);
-      const target = this.#store.getTarget(record.targetId).descriptor;
-      const activeDerivedWorkspace = target.workspaceRoot === record.effectiveWorkspaceRoot
-        ? undefined
-        : this.#worktrees?.activeWorkspacePath(record.sessionId, record.effectiveWorkspaceRoot);
-      if (
-        target.backendId !== record.backendId
-        || (target.workspaceRoot !== record.effectiveWorkspaceRoot && activeDerivedWorkspace === undefined)
-        || (activeDerivedWorkspace !== undefined && target.remoteWorkspace !== undefined)
-        || target.remoteWorkspace?.hostId !== record.remoteWorkspace?.hostId
-        || target.remoteWorkspace?.workspaceRoot !== record.remoteWorkspace?.workspaceRoot
-      ) throw new StoreError("The derived native cleanup workspace authority changed.");
-      const effectiveTarget = activeDerivedWorkspace === undefined
-        ? target
-        : { ...target, workspaceRoot: activeDerivedWorkspace };
-      if (activeDerivedWorkspace !== undefined) derivedWorktreeSessionId = record.sessionId;
-      const controller = new AbortController();
-      const context: AdapterContext = {
-        sessionId: record.sessionId,
-        generation: record.binding.generation,
-        backendInstanceGeneration: record.backendInstanceGeneration,
-        target: effectiveTarget,
-        binding: record.binding,
-        operationId: record.operationId,
-        signal: controller.signal,
-        emit: async () => undefined,
-        requestInteraction: async () => {
-          throw new StoreError("Native derivation cleanup cannot request an interaction.");
-        },
-        artifactCapacityBytes: this.#artifactStore.maximumBlobBytes,
-        storeArtifact: async () => {
-          throw new StoreError("Native derivation cleanup cannot create an artifact.");
-        }
-      };
-      if (adapter.supportsDetachedSessionDeletion?.(context) !== true) {
-        throw new StoreError("The Backend cannot clean up a detached derived native task.");
-      }
-      claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: current.revision });
-      const calls = this.#nativeDerivationCleanupCalls.get(record.backendId) ?? new Set<AbortController>();
-      calls.add(controller);
-      this.#nativeDerivationCleanupCalls.set(record.backendId, calls);
-      const releaseCall = () => {
-        calls.delete(controller);
-        if (calls.size === 0 && this.#nativeDerivationCleanupCalls.get(record.backendId) === calls) {
-          this.#nativeDerivationCleanupCalls.delete(record.backendId);
-        }
-      };
+      if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
+      const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(current, adapter);
+      const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree);
+      const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let deletion: Promise<void>;
       try {
-        deletion = adapter.deleteSession(record.binding, context);
+        if (record.externalLifecycle) {
+          claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: record.revision });
+          deletion = adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal);
+        } else {
+          const binding = record.binding;
+          if (binding === undefined) {
+            throw new StoreError("A detached native deletion requires its recorded binding.");
+          }
+          const context: AdapterContext = {
+            sessionId: record.sessionId,
+            generation: binding.generation,
+            backendInstanceGeneration: record.lifecycleOwnerGeneration,
+            target: lifecycle.target,
+            binding,
+            operationId: record.operationId,
+            signal: call.controller.signal,
+            emit: async () => undefined,
+            requestInteraction: async () => {
+              throw new StoreError("Native derivation cleanup cannot request an interaction.");
+            },
+            artifactCapacityBytes: this.#artifactStore.maximumBlobBytes,
+            storeArtifact: async () => {
+              throw new StoreError("Native derivation cleanup cannot create an artifact.");
+            }
+          };
+          if (adapter.supportsDetachedSessionDeletion?.(context) !== true) {
+            throw new StoreError("The Backend cannot clean up a detached derived native task.");
+          }
+          claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: record.revision });
+          deletion = adapter.deleteSession(binding, context);
+        }
       } catch (error) {
-        releaseCall();
+        call.release();
         throw error;
       }
       // A timed-out call still fences replacement until its native promise
       // settles. Its late handlers only release this memory owner, never Store.
-      void deletion.then(releaseCall, releaseCall);
-      await nativeDerivationCleanupDeadline(deletion, controller);
-      controller.signal.throwIfAborted();
-      this.#store.finishNativeSessionDerivationCleanup({ operationId, token: claim.token, outcome: "cleaned" });
-      if (derivedWorktreeSessionId !== undefined && this.#worktrees !== undefined) {
-        await this.#worktrees.release(derivedWorktreeSessionId)
-          .catch((cleanupError: unknown) => this.recordDerivationFailure("derived_worktree_cleanup", cleanupError));
-        derivedWorktreeSessionId = undefined;
-      }
+      void deletion.then(call.release, call.release);
+      await nativeDerivationCleanupDeadline(deletion, call.controller);
+      call.controller.signal.throwIfAborted();
+      this.assertCurrentAdapterGeneration(record.backendId, adapter, record.lifecycleOwnerGeneration);
+      const workspaceCleanup = this.#store.confirmNativeSessionDerivationNativeCleanup({
+        operationId,
+        token: claim.token
+      });
+      await this.finishNativeSessionDerivationWorkspaceCleanup(workspaceCleanup);
     } catch (error) {
       if (claim !== undefined) {
-        try {
-          this.#store.finishNativeSessionDerivationCleanup({
-            operationId,
-            token: claim.token,
-            outcome: "cleanup_unknown",
-            failureCode: "native_session_derivation_cleanup_unknown"
-          });
-        } catch {
-          // The durable claim remains reserved; startup converts an unfinished
-          // claim to unknown instead of repeating a possibly completed delete.
+        const current = this.#store.findNativeSessionDerivation(operationId);
+        if (current?.state === "cleanup_claimed") {
+          try {
+            this.#store.finishNativeSessionDerivationCleanup({
+              operationId,
+              token: claim.token,
+              outcome: "cleanup_unknown",
+              failureCode: "native_session_derivation_cleanup_unknown"
+            });
+          } catch {
+            // The durable claim remains reserved; startup converts an unfinished
+            // claim to unknown instead of repeating a possibly completed delete.
+          }
         }
-        // An unknown detached-native deletion still owns its exact workspace.
-        // Keep the lease across restart; releasing it here could destroy a cwd
-        // that the native task may still be using.
+        // cleanup_claimed/cleanup_unknown retain the lease because native use
+        // may be uncertain. workspace_cleanup_pending instead records a known
+        // native result and exact, replayable worktree-release intent.
       }
       this.recordDerivationFailure("native_session_derivation_cleanup", error);
     } finally {
       releaseAdmission?.();
     }
+  }
+
+  private async finishNativeSessionDerivationWorkspaceCleanup(
+    record: NativeSessionDerivationRecord
+  ): Promise<void> {
+    if (record.state !== "workspace_cleanup_pending" || record.cleanupToken === undefined) return;
+    const operationKind = this.#store.getOperation(record.operationId).kind;
+    const releasesDerivedWorktree = operationKind !== "navigate_session"
+      && operationKind !== "navigateSessionBranch"
+      && record.worktree !== undefined;
+    if (record.remoteWorktreePlan !== undefined && record.worktree === undefined) {
+      if (this.#worktrees === undefined) {
+        throw new StoreError("The remote checkout cleanup owner is unavailable.");
+      }
+      const inspection = await this.#worktrees.inspectPlannedRemoteDerivation(record.remoteWorktreePlan);
+      if (inspection.status === "active") {
+        const outcome = await this.#worktrees.releasePlannedRemoteDerivation(
+          record.remoteWorktreePlan, inspection.lease
+        );
+        if (outcome !== "released") throw new StoreError("The remote checkout cannot be released safely.");
+      } else if (inspection.status === "pending") {
+        const outcome = await this.#worktrees.cleanupPendingRemoteDerivation(record.remoteWorktreePlan);
+        if (outcome === "preserved") throw new StoreError("The remote checkout cleanup is uncertain.");
+      }
+    }
+    if (releasesDerivedWorktree) {
+      if (this.#worktrees === undefined) {
+        throw new StoreError("The native derivation workspace cleanup owner is unavailable.");
+      }
+      await this.#worktrees.release(record.sessionId, record.worktree!);
+    }
+    this.#store.finishNativeSessionDerivationCleanup({
+      operationId: record.operationId,
+      token: record.cleanupToken,
+      outcome: "cleaned"
+    });
   }
 
   #sessionRuntimeMutationMustDefer(sessionId: string): boolean {
@@ -3857,6 +4414,12 @@ export class SessionHost {
         states: ["running", "waiting", "retrying", "dispatch_unknown"],
         limit: 1
       }).length > 0 || this.#dispatchPreparations.has(sessionId)) return false;
+      // A logout may revoke an already accepted deferred route. Keep that
+      // mutation pending so an explicit post-login resend can apply it; never
+      // resume or mutate the native runtime with the revoked credential.
+      if (!this.providerAuthenticationAvailable(stored.descriptor.backendId, pending.profile.providerId)) {
+        return false;
+      }
       this.#sessionRuntimeControlEffects.add(sessionId);
       try {
         const active = await this.activate(sessionId);
@@ -3889,6 +4452,7 @@ export class SessionHost {
       throw new SessionRuntimeControlError("ROUTE_UNAVAILABLE", "The task has no complete runtime profile.");
     }
     const backend = this.#store.getBackend(durable.descriptor.backendId).descriptor;
+    this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
     const changes = runtimeProfileChanges(current, profile);
     if (changes.model && !this.#modelRoutingEnabled(backend.id, profile.providerId, profile.modelId)) {
       throw new SessionRuntimeControlError("ROUTE_UNAVAILABLE", "The pending model was disabled before it could be applied.");
@@ -3900,21 +4464,26 @@ export class SessionHost {
     try {
       if (changes.fastMode && !profile.fastMode) {
         await active.adapter.setFastMode(false, context);
+        this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.model) {
         await active.adapter.setModel(profile.providerId, profile.modelId, context);
+        this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.effort && profile.effort !== undefined) {
         await active.adapter.setEffort(profile.effort, context);
+        this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.fastMode && profile.fastMode) {
         await active.adapter.setFastMode(true, context);
+        this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       const observed = await this.refreshNativeStateObservation(sessionId, active);
+      this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
       this.assertActiveBackendSideEffectLease(lease);
       if (
         observed.providerId !== profile.providerId || observed.modelId !== profile.modelId
@@ -3952,6 +4521,10 @@ export class SessionHost {
     patch: SessionRuntimeAxisPatch
   ): Promise<NativeSessionState> {
     const durable = this.#store.getSession(sessionId);
+    // Activation is an async boundary. A Provider logout can install its fence
+    // after activate() resolves but before this continuation starts, so admit
+    // the first runtime-axis effect against the current effective route again.
+    this.assertSessionProviderAuthenticationAvailable(durable);
     const changes = runtimeProfileChanges(current, profile);
     this.assertSessionRuntimeProfileCapabilities(
       this.#store.getBackend(durable.descriptor.backendId).descriptor,
@@ -3963,17 +4536,21 @@ export class SessionHost {
     try {
       if (changes.fastMode && !profile.fastMode) {
         await active.adapter.setFastMode(false, context);
+        this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.effort && patch.effort !== undefined && profile.effort !== undefined) {
         await active.adapter.setEffort(profile.effort, context);
+        this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.fastMode && profile.fastMode) {
         await active.adapter.setFastMode(true, context);
+        this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
       }
       const observed = await this.refreshNativeStateObservation(sessionId, active);
+      this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
       this.assertActiveBackendSideEffectLease(lease);
       if (
         observed.providerId !== profile.providerId || observed.modelId !== profile.modelId
@@ -4323,6 +4900,7 @@ export class SessionHost {
         "The selected task model is not present in the current Backend catalog."
       );
     }
+    if (providerId !== undefined) this.assertProviderAuthenticationAvailable(backend.id, providerId);
     if (
       modelChanged && providerId !== undefined && modelId !== undefined
       && !this.#modelRoutingEnabled(backend.id, providerId, modelId)
@@ -5918,7 +6496,7 @@ export class SessionHost {
       recovery: "Refresh the task history before further changes. Do not repeat the native navigation automatically."
     });
     try {
-      return await this.mutate({
+      const execution = await this.mutate({
         connection: authority.connection, operationId: authority.operationId,
         kind: authority.protocol.kind === "internal" ? "navigate_session" : "navigateSessionBranch",
         body: authority.protocol.kind === "connect" ? authority.protocol.body
@@ -5963,10 +6541,44 @@ export class SessionHost {
           if (this.#store.getTarget(admittedTarget.descriptor.id).revision !== admittedTarget.revision) {
             throw new StoreError("The navigation workspace authority changed before dispatch.");
           }
+          const operation = this.#store.getOperation(authority.operationId);
+          const lifecycle: NativeSessionDerivationLifecycle = {
+            operationId: authority.operationId,
+            kind: "navigate",
+            sourceSessionId: sessionId,
+            sourceBinding: lease.stored.descriptor.binding,
+            sessionId,
+            sourceTarget: lease.context.target,
+            target: lease.context.target
+          };
+          if (active.adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
+            if (active.adapter.adoptNativeSessionDerivation === undefined
+              || active.adapter.cleanupNativeSessionDerivation === undefined) {
+              throw new StoreError("The Backend declared a native derivation lifecycle without adoption and cleanup owners.");
+            }
+            this.#store.prepareNativeSessionDerivation({
+              operationId: operation.id,
+              expectedBodyHash: operation.bodyHash,
+              sourceSessionId: sessionId,
+              sourceBinding: lease.stored.descriptor.binding,
+              sourceSessionRevision: lease.stored.revision,
+              sessionId,
+              backendId: lease.backendId,
+              backendInstanceGeneration: lease.backendInstanceGeneration,
+              targetId: lease.stored.descriptor.targetId,
+              targetRevision: admittedTarget.revision,
+              effectiveWorkspaceRoot: lease.context.target.workspaceRoot,
+              ...(lease.context.target.remoteWorkspace === undefined
+                ? {}
+                : { remoteWorkspace: lease.context.target.remoteWorkspace }),
+              ...(lease.stored.descriptor.worktree === undefined
+                ? {}
+                : { worktree: lease.stored.descriptor.worktree })
+            });
+          }
           try {
             navigation = await active.adapter.navigateTree(target, summarize, lease.context, customInstructions, {
               recordBinding: (binding) => {
-                const operation = this.#store.getOperation(authority.operationId);
                 this.#store.recordNativeSessionDerivation({
                   operationId: operation.id, expectedBodyHash: operation.bodyHash,
                   sourceSessionId: sessionId, sessionId,
@@ -5975,6 +6587,7 @@ export class SessionHost {
                   targetId: lease!.stored.descriptor.targetId,
                   effectiveWorkspaceRoot: lease!.context.target.workspaceRoot,
                   ...(lease!.context.target.remoteWorkspace === undefined ? {} : { remoteWorkspace: lease!.context.target.remoteWorkspace }),
+                  ...(lease!.stored.descriptor.worktree === undefined ? {} : { worktree: lease!.stored.descriptor.worktree }),
                   binding
                 });
               }
@@ -5983,7 +6596,7 @@ export class SessionHost {
             this.assertActiveBackendSideEffectLease(lease);
             if (navigation.kind === "replacement") {
               const receipt = this.#store.findNativeSessionDerivation(authority.operationId);
-              if (receipt === undefined || !sameNativeBinding(receipt.binding, navigation.binding)) {
+              if (receipt?.binding === undefined || !sameNativeBinding(receipt.binding, navigation.binding)) {
                 throw new StoreError("Native navigation did not register its exact replacement binding.");
               }
               // Validate the projection before retiring the source runtime. Adoption
@@ -6033,6 +6646,8 @@ export class SessionHost {
           catch (error) { if (nativeNavigationConfirmed) throw syncUnknown(); throw error; }
         }
       });
+      await this.adoptNativeSessionDerivation(authority.operationId);
+      return execution;
     } catch (error) {
       await this.cleanupNativeSessionDerivation(authority.operationId);
       throw error;
@@ -6056,9 +6671,11 @@ export class SessionHost {
 
   async inspect(sessionId: string) {
     const active = await this.activate(sessionId);
+    this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
       const state = await this.refreshNativeStateObservation(sessionId, active);
+      this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
       this.assertActiveBackendSideEffectLease(lease);
       this.persistRuntimeUsage(sessionId, state.binding.generation, state.usage, false, state.providerId, state.modelId);
       return state;
@@ -6070,11 +6687,13 @@ export class SessionHost {
   async getCommands(sessionId: string): Promise<readonly RuntimeCommand[]> {
     if (this.isReviewReadOnlySession(sessionId)) return [];
     const active = await this.activate(sessionId);
+    this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
     // This RPC is an explicit live observation. Adapter failures are surfaced
     // to the caller, while the last durable truth remains untouched.
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
       const commands = await this.refreshRuntimeCommands(sessionId, active);
+      this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
       return commands;
     } finally {
       lease.release();
@@ -6097,12 +6716,16 @@ export class SessionHost {
     }
   }
 
-  async getResources(sessionId: string) {
+  async getResources(sessionId: string, providerAuthenticationRouteId?: string) {
     if (this.isReviewReadOnlySession(sessionId)) {
       this.#activeResourceCatalogs.delete(sessionId);
       return [];
     }
-    const active = await this.activate(sessionId);
+    const active = await this.activate(sessionId, providerAuthenticationRouteId);
+    this.assertSessionProviderAuthenticationAvailable(
+      this.#store.getSession(sessionId),
+      providerAuthenticationRouteId
+    );
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
       if (!this.activeResourceCatalogIsCurrent(active)) {
@@ -6113,9 +6736,17 @@ export class SessionHost {
         );
       }
       const resources = await active.adapter.getResources(lease.context);
+      this.assertSessionProviderAuthenticationAvailable(
+        this.#store.getSession(sessionId),
+        providerAuthenticationRouteId
+      );
       this.assertActiveBackendSideEffectLease(lease);
       await this.refreshRuntimeCommands(sessionId, active)
         .catch((error: unknown) => this.recordFailure("runtime_commands_resource_sync", error));
+      this.assertSessionProviderAuthenticationAvailable(
+        this.#store.getSession(sessionId),
+        providerAuthenticationRouteId
+      );
       this.assertActiveBackendSideEffectLease(lease);
       if (!this.activeResourceCatalogIsCurrent(active)) {
         throw inputCapabilityError(
@@ -6340,6 +6971,10 @@ export class SessionHost {
   }
 
   #assertBackendReplacementIdle(backendId: string): void {
+    if (this.#store.listUnadoptedNativeSessionDerivations()
+      .some((record) => record.backendId === backendId)) {
+      throw new StoreError("A Backend cannot be replaced while a durable native derivation lifecycle is unresolved.");
+    }
     if ((this.#nativeDerivationCleanupCalls.get(backendId)?.size ?? 0) > 0) {
       throw new StoreError("A Backend cannot be replaced while a derived native cleanup has not settled.");
     }
@@ -6566,7 +7201,10 @@ export class SessionHost {
         sessionFlights?.delete(flight);
         if (sessionFlights?.size === 0) this.#activeEffectFlights.delete(sessionId);
         const remaining = (this.#activeEffects.get(sessionId) ?? 1) - 1;
-        if (remaining <= 0) this.#activeEffects.delete(sessionId);
+        if (remaining <= 0) {
+          this.#activeEffects.delete(sessionId);
+          this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
+        }
         else this.#activeEffects.set(sessionId, remaining);
       }
       settle();
@@ -7738,7 +8376,7 @@ export class SessionHost {
     if (this.#disposed) return;
     this.#disposed = true;
     for (const calls of this.#nativeDerivationCleanupCalls.values()) {
-      for (const controller of calls) controller.abort(new StoreError("Native derivation cleanup was interrupted by shutdown."));
+      for (const controller of calls) controller.abort(new StoreError("Native derivation lifecycle work was interrupted by shutdown."));
     }
     for (const pending of this.#pendingInteractions.values()) {
       clearPendingInteractionExpiry(pending);
@@ -7773,10 +8411,15 @@ export class SessionHost {
     this.#runtimeRestartFlights.clear();
     this.#runtimeRestartFences.clear();
     this.#backendReplacementFences.clear();
+    this.#backendProviderAuthenticationFences.clear();
+    this.#backendProviderAuthenticationEpochs.clear();
+    this.#providerAuthenticationRuntimeInvalidations.clear();
     await Promise.allSettled(
       [...this.#backendSideEffectFlights.values()].flatMap((flights) => [...flights])
     );
     this.#backendSideEffectFlights.clear();
+    await Promise.allSettled([...this.#nativeDerivationAdoptionFlights.values()]);
+    this.#nativeDerivationAdoptionFlights.clear();
     this.#nativeDerivationCleanupCalls.clear();
     this.#activeEffectFlights.clear();
     this.#sessionLifecycleBackendAdmissions.clear();
@@ -8766,6 +9409,252 @@ export class SessionHost {
     }
   }
 
+  private providerAuthenticationAvailable(
+    backendId: string,
+    providerId: string,
+    ignoreFence = false
+  ): boolean {
+    if (!ignoreFence && this.#backendProviderAuthenticationFences.get(backendId)?.has(providerId) === true) {
+      return false;
+    }
+    const fallback = this.#sessionRuntimeFallbackContext(backendId);
+    if (this.#sessionRuntimeFallbackContextOwnsAvailability) {
+      return fallback.availableProviderIds.has(providerId);
+    }
+    const backend = this.#store.getBackend(backendId).descriptor;
+    const provider = backend.providers?.find((candidate) => candidate.providerId === providerId);
+    const state = provider?.authenticationState ?? backend.authenticationState;
+    return state === "authenticated" || state === "not_required";
+  }
+
+  private assertProviderAuthenticationAvailable(backendId: string, providerId: string): void {
+    if (this.providerAuthenticationAvailable(backendId, providerId)) return;
+    throw providerAuthenticationRequiredError();
+  }
+
+  private effectiveQueueProviderId(item: QueueItemRecord, stored: StoredSession): string | undefined {
+    if (item.executionOverrides?.providerId !== undefined) return item.executionOverrides.providerId;
+    const baseline = sessionRuntimeBaseline(stored.descriptor);
+    const runtime = this.#sessionRuntimeControl.snapshot(stored.descriptor.id, baseline);
+    // Pending runtime control describes the next unclaimed turn. Once an item
+    // has been claimed, its native route is the then-effective profile (or its
+    // immutable per-turn override); a later deferred switch must never rewrite
+    // an accepted/unknown native owner's Provider identity.
+    return (item.state === "accepted" && !hasTurnOverrides(item.executionOverrides)
+      ? runtime.pending?.profile.providerId
+      : undefined)
+      ?? runtime.effective?.providerId
+      ?? stored.descriptor.providerId
+      ?? this.#sessionRuntimeFallbackContext(stored.descriptor.backendId).explicitDefault?.providerId;
+  }
+
+  private activeSessionProviderId(stored: StoredSession): string | undefined {
+    const baseline = sessionRuntimeBaseline(stored.descriptor);
+    return this.#sessionRuntimeControl.snapshot(stored.descriptor.id, baseline).effective?.providerId
+      ?? stored.descriptor.providerId
+      ?? this.#sessionRuntimeFallbackContext(stored.descriptor.backendId).explicitDefault?.providerId;
+  }
+
+  private assertSessionProviderAuthenticationAvailable(
+    stored: StoredSession,
+    providerAuthenticationRouteId?: string
+  ): void {
+    const providerId = providerAuthenticationRouteId ?? this.activeSessionProviderId(stored);
+    if (providerId !== undefined) {
+      this.assertProviderAuthenticationAvailable(stored.descriptor.backendId, providerId);
+    }
+  }
+
+  /**
+   * A retained native dispatch owner may still be cleaned up after its Provider
+   * is fenced. This never activates or resumes a runtime: authority exists only
+   * for the exact ActiveSession captured by the logout boundary, while a
+   * backend-accepted or outcome-unknown Queue item still owns native work.
+   */
+  private fencedProviderAuthenticationCleanupOwner(
+    stored: StoredSession,
+    runId: string | undefined,
+    providerAuthenticationRouteId?: string,
+    cleanupAllowed = true
+  ): ActiveSession | undefined {
+    const backendId = stored.descriptor.backendId;
+    const item = runId === undefined
+      ? undefined
+      : this.#store.findQueueItemByRunId(
+        stored.descriptor.id,
+        runId,
+        { includeCleared: true }
+      );
+    if (item === undefined) {
+      const fences = this.#backendProviderAuthenticationFences.get(backendId);
+      if (
+        providerAuthenticationRouteId === undefined
+          ? (fences?.size ?? 0) > 0
+          : fences?.has(providerAuthenticationRouteId) === true
+      ) {
+        throw providerAuthenticationRequiredError();
+      }
+      return undefined;
+    }
+    const providerId = providerAuthenticationRouteId ?? this.effectiveQueueProviderId(item, stored);
+    if (
+      providerId === undefined
+      || this.#backendProviderAuthenticationFences.get(backendId)?.has(providerId) !== true
+    ) return undefined;
+    if (!cleanupAllowed) throw providerAuthenticationRequiredError();
+    if (!["backend_accepted", "dispatch_unknown"].includes(item.state)) {
+      throw providerAuthenticationRequiredError();
+    }
+
+    const epochOwner = this.#backendProviderAuthenticationEpochs
+      .get(backendId)
+      ?.get(providerId)
+      ?.retirementRuntimeOwners
+      ?.get(stored.descriptor.id);
+    const invalidation = this.#providerAuthenticationRuntimeInvalidations.get(stored.descriptor.id);
+    const invalidationOwner = invalidation?.backendId === backendId
+      && invalidation.providerId === providerId
+      ? invalidation.runtimeOwner
+      : undefined;
+    const owner = epochOwner ?? invalidationOwner;
+    if (owner === undefined || this.#active.get(stored.descriptor.id) !== owner) {
+      throw providerAuthenticationRequiredError();
+    }
+    return owner;
+  }
+
+  private scheduleBackendProviderAuthenticationRuntimeInvalidations(
+    backendId: string,
+    providerId: string,
+    retirementRuntimeOwners?: ReadonlyMap<string, ActiveSession>
+  ): void {
+    for (const [sessionId, runtimeOwner] of retirementRuntimeOwners ?? []) {
+      if (this.#active.get(sessionId) !== runtimeOwner) continue;
+      this.#providerAuthenticationRuntimeInvalidations.set(sessionId, {
+        backendId,
+        providerId,
+        runtimeOwner
+      });
+      this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
+    }
+    for (const session of this.#store.listSessions({ includeArchived: true })) {
+      if (
+        session.descriptor.backendId !== backendId
+        || this.activeSessionProviderId(session) !== providerId
+        || this.#providerAuthenticationRuntimeInvalidations.has(session.descriptor.id)
+      ) continue;
+      this.#providerAuthenticationRuntimeInvalidations.set(session.descriptor.id, {
+        backendId,
+        providerId
+      });
+      this.tryApplyProviderAuthenticationRuntimeInvalidation(session.descriptor.id);
+    }
+  }
+
+  private tryApplyProviderAuthenticationRuntimeInvalidation(sessionId: string): boolean {
+    const invalidation = this.#providerAuthenticationRuntimeInvalidations.get(sessionId);
+    if (invalidation === undefined) return false;
+    const stored = this.#store.listSessions({ includeArchived: true, includeDeleted: true })
+      .find((candidate) => candidate.descriptor.id === sessionId);
+    const active = this.#active.get(sessionId);
+    if (
+      stored === undefined
+      || stored.descriptor.backendId !== invalidation.backendId
+      || (invalidation.runtimeOwner === undefined
+        ? this.activeSessionProviderId(stored) !== invalidation.providerId
+        : active !== invalidation.runtimeOwner)
+    ) {
+      this.#providerAuthenticationRuntimeInvalidations.delete(sessionId);
+      return true;
+    }
+    if (
+      this.#activating.has(sessionId)
+      || this.#dispatchPreparations.has(sessionId)
+      || (this.#activeEffects.get(sessionId) ?? 0) > 0
+      || [...this.#turnOverrideLeases.values()].some((lease) => lease.sessionId === sessionId)
+      || listAllQueueItems(this.#store, {
+        sessionId,
+        states: ["dispatching", "backend_accepted", "dispatch_unknown"]
+      }).length > 0
+    ) return false;
+    this.#providerAuthenticationRuntimeInvalidations.delete(sessionId);
+    if (active !== undefined) {
+      this.clearRunSilenceWatchdog(sessionId);
+      this.deleteActiveSession(sessionId, active);
+      this.#nativeCompactions.delete(sessionId);
+      this.clearTurnOverrideLeases(sessionId);
+      this.failBackgroundTasksForRuntimeLoss(stored, stored.descriptor.binding.generation);
+      this.#releaseSessionTools(sessionId);
+    }
+    queueMicrotask(() => {
+      if (!this.#disposed) void this.drain(sessionId);
+    });
+    return true;
+  }
+
+  private queueProviderAuthenticationFailure(
+    item: QueueItemRecord,
+    stored: StoredSession
+  ): PublicError | undefined {
+    const providerId = this.effectiveQueueProviderId(item, stored);
+    if (providerId !== undefined) {
+      return this.providerAuthenticationAvailable(stored.descriptor.backendId, providerId)
+        ? undefined
+        : providerAuthenticationRequiredFailure();
+    }
+    const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+    return backend.authenticationState === "authenticated" || backend.authenticationState === "not_required"
+      ? undefined
+      : backendAuthenticationRequiredFailure(backend);
+  }
+
+  private assertQueueProviderAuthentication(item: QueueItemRecord, stored: StoredSession): void {
+    const failure = this.queueProviderAuthenticationFailure(item, stored);
+    if (failure !== undefined) throw new JokoError(failure);
+  }
+
+  private failQueueItemForAuthentication(item: QueueItemRecord, failure: PublicError): void {
+    let failedRunId: string | undefined;
+    this.#store.transaction((store) => {
+      const current = store.getQueueItem(item.id);
+      if (current.state !== "accepted") return;
+      store.updateQueueState({
+        queueItemId: current.id,
+        state: "failed",
+        attemptId: current.attemptId,
+        error: failure,
+        traceId: `provider-auth:${current.id}:failed`
+      });
+      const run = store.getRun(current.runId);
+      if (run.descriptor.state === "queued") {
+        store.updateRunState({
+          runId: current.runId,
+          state: "failed",
+          activeAttemptId: current.attemptId,
+          error: failure,
+          traceId: `provider-auth:${current.runId}:failed`,
+          operationId: current.operationId
+        });
+      }
+      if (current.attemptId !== undefined) {
+        const attempt = store.getAttempt(current.attemptId);
+        if (attempt.descriptor.endedAt === undefined) store.finishAttempt(current.attemptId, failure);
+      }
+      failedRunId = current.runId;
+    });
+    if (failedRunId !== undefined) {
+      void this.notifyServiceRunSettled(item.sessionId, failedRunId, "failed");
+    }
+  }
+
+  private failAcceptedQueueItemsForAuthentication(sessionId: string): void {
+    const stored = this.#store.getSession(sessionId);
+    for (const item of listAllQueueItems(this.#store, { sessionId, states: ["accepted"] })) {
+      const failure = this.queueProviderAuthenticationFailure(item, stored);
+      if (failure !== undefined) this.failQueueItemForAuthentication(item, failure);
+    }
+  }
+
   private resolveNewSessionRoute(backendId: string, input: SessionCreationInput): SessionCreationInput {
     if (
       input.catalogImport !== undefined
@@ -8798,7 +9687,7 @@ export class SessionHost {
     }
     const backend = this.#store.getBackend(backendId).descriptor;
     const authenticatedProviders = (backend.providers ?? []).filter((provider) =>
-      provider.authenticationState === "authenticated" || provider.authenticationState === "not_required");
+      this.providerAuthenticationAvailable(backendId, provider.providerId));
     if (backend.capabilities.get("model.switch")?.supported !== true) {
       if (
         authenticatedProviders.length > 0
@@ -8810,11 +9699,8 @@ export class SessionHost {
       return input;
     }
     const candidates = backend.models.filter((model) => {
-      const provider = backend.providers?.find((item) => item.providerId === model.providerId);
-      const authenticated = provider === undefined
-        ? backend.authenticationState === "authenticated" || backend.authenticationState === "not_required"
-        : provider.authenticationState === "authenticated" || provider.authenticationState === "not_required";
-      return authenticated && this.#modelRoutingEnabled(backendId, model.providerId, model.modelId);
+      return this.providerAuthenticationAvailable(backendId, model.providerId)
+        && this.#modelRoutingEnabled(backendId, model.providerId, model.modelId);
     });
     if (backend.models.length === 0) {
       if (accessRestricted) {
@@ -8829,7 +9715,9 @@ export class SessionHost {
     const nativeDefault = configured ?? backend.models[0]!;
     const nativeDefaultCandidate = candidates.find((model) =>
       model.providerId === nativeDefault.providerId && model.modelId === nativeDefault.modelId);
-    if (!accessRestricted && nativeDefaultCandidate !== undefined) return input;
+    const aggregateAuthenticated = backend.authenticationState === "authenticated"
+      || backend.authenticationState === "not_required";
+    if (!accessRestricted && nativeDefaultCandidate !== undefined && aggregateAuthenticated) return input;
     const selected = nativeDefaultCandidate ?? candidates[0]!;
     return { ...input, providerId: selected.providerId, modelId: selected.modelId };
   }
@@ -8882,16 +9770,6 @@ export class SessionHost {
         recovery: backend.error?.recovery ?? "Repair the native runtime in Settings and retry its readiness probe."
       });
     }
-    if (backend.authenticationState !== "authenticated" && backend.authenticationState !== "not_required") {
-      throw new JokoError({
-        code: "BACKEND_AUTHENTICATION_REQUIRED",
-        message: "This Backend is not authenticated for new tasks.",
-        phase: "capability",
-        retryable: true,
-        stateMayHaveChanged: false,
-        recovery: backend.error?.recovery ?? "Complete the Backend authorization in Settings and retry."
-      });
-    }
     if (backend.capabilities.get("input.text")?.supported !== true) {
       throw new JokoError({
         code: "BACKEND_TEXT_INPUT_UNAVAILABLE",
@@ -8902,7 +9780,26 @@ export class SessionHost {
         recovery: "Choose a Backend that advertises text input support."
       });
     }
-    if (input.nativeStart?.kind === "attach") return;
+    if (input.nativeStart?.kind === "attach") {
+      const hasProvider = input.providerId !== undefined;
+      const hasModel = input.modelId !== undefined;
+      if (hasProvider !== hasModel) {
+        throw new JokoError({
+          code: "MODEL_SELECTION_INCOMPLETE",
+          message: "A model selection must include both Provider and model identity.",
+          phase: "capability",
+          retryable: false,
+          stateMayHaveChanged: false,
+          recovery: "Refresh this Backend's model catalog and choose one advertised model."
+        });
+      }
+      if (hasProvider) {
+        this.assertProviderAuthenticationAvailable(backendId, input.providerId!);
+      } else if (backend.authenticationState !== "authenticated" && backend.authenticationState !== "not_required") {
+        throw new JokoError(backendAuthenticationRequiredFailure(backend));
+      }
+      return;
+    }
     const hasProvider = input.providerId !== undefined;
     const hasModel = input.modelId !== undefined;
     if (hasProvider !== hasModel) {
@@ -8927,6 +9824,15 @@ export class SessionHost {
         stateMayHaveChanged: false,
         recovery: "Refresh this Backend's model catalog and select one of its current models."
       });
+    }
+    if (hasProvider) this.assertProviderAuthenticationAvailable(backendId, input.providerId!);
+    else {
+      const explicitDefault = this.#sessionRuntimeFallbackContext(backendId).explicitDefault;
+      if (explicitDefault !== undefined) {
+        this.assertProviderAuthenticationAvailable(backendId, explicitDefault.providerId);
+      } else if (backend.authenticationState !== "authenticated" && backend.authenticationState !== "not_required") {
+        throw new JokoError(backendAuthenticationRequiredFailure(backend));
+      }
     }
     if (
       hasProvider && hasModel
@@ -8965,8 +9871,19 @@ export class SessionHost {
     }
   }
 
-  private async activate(sessionId: string): Promise<ActiveSession> {
-    return this.activateWithPolicy(sessionId, false);
+  private async activate(
+    sessionId: string,
+    providerAuthenticationRouteId?: string
+  ): Promise<ActiveSession> {
+    return this.activateWithPolicy(
+      sessionId,
+      false,
+      false,
+      undefined,
+      false,
+      false,
+      providerAuthenticationRouteId
+    );
   }
 
   private async activateForSessionReset(sessionId: string): Promise<ActiveSession> {
@@ -8979,10 +9896,13 @@ export class SessionHost {
     allowSessionReset = false,
     lifecycleOperationId?: string,
     allowRuntimeRestart = false,
-    allowBackendReplacement = false
+    allowBackendReplacement = false,
+    providerAuthenticationRouteId?: string
   ): Promise<ActiveSession> {
     this.#assertOpen();
+    await this.adoptPendingNativeSessionDerivationForSession(sessionId);
     const session = this.#store.getSession(sessionId);
+    this.assertSessionProviderAuthenticationAvailable(session, providerAuthenticationRouteId);
     if (session.descriptor.deletedAt !== undefined || session.descriptor.archived) {
       throw new StoreError("Archived or deleted tasks cannot activate a native runtime.");
     }
@@ -9031,6 +9951,10 @@ export class SessionHost {
     if (reaping !== undefined) {
       await reaping.catch(() => undefined);
       this.#assertOpen();
+      this.assertSessionProviderAuthenticationAvailable(
+        this.#store.getSession(sessionId),
+        providerAuthenticationRouteId
+      );
     }
     const inflight = this.#activating.get(sessionId);
     if (inflight !== undefined) return inflight;
@@ -9048,12 +9972,18 @@ export class SessionHost {
         return active;
       }
       const task = this.refreshPrivatePromptRuntime(sessionId, active)
-        .then(() => this.activateOnce(sessionId, allowance))
-        .finally(() => this.#activating.delete(sessionId));
+        .then(() => this.activateOnce(sessionId, allowance, providerAuthenticationRouteId))
+        .finally(() => {
+          this.#activating.delete(sessionId);
+          this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
+        });
       this.#activating.set(sessionId, task);
       return task;
     }
-    const task = this.activateOnce(sessionId, allowance).finally(() => this.#activating.delete(sessionId));
+    const task = this.activateOnce(sessionId, allowance, providerAuthenticationRouteId).finally(() => {
+      this.#activating.delete(sessionId);
+      this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
+    });
     this.#activating.set(sessionId, task);
     return task;
   }
@@ -9136,9 +10066,11 @@ export class SessionHost {
 
   private async activateOnce(
     sessionId: string,
-    allowance: BackendSideEffectAdmissionAllowance
+    allowance: BackendSideEffectAdmissionAllowance,
+    providerAuthenticationRouteId?: string
   ): Promise<ActiveSession> {
     let stored = this.#store.getSession(sessionId);
+    this.assertSessionProviderAuthenticationAvailable(stored, providerAuthenticationRouteId);
     if (this.isReviewReadOnlySession(sessionId)) {
       throw new StoreError("Reviewer runtimes are fresh-only and cannot resume native state.");
     }
@@ -9161,6 +10093,10 @@ export class SessionHost {
       let reprovisionedBlank = false;
       try {
         state = await adapter.resumeSession(previousBinding, context);
+        this.assertSessionProviderAuthenticationAvailable(
+          this.#store.getSession(sessionId),
+          providerAuthenticationRouteId
+        );
       } catch (error) {
         if (!blankContinuityGapWithoutSideEffects(error)
           || !this.#store.nativeBlankRecoveryEligible(sessionId)) throw error;
@@ -9194,21 +10130,48 @@ export class SessionHost {
         sessionRuntimeBaseline(stored.descriptor)
       ).effective;
       const capabilities = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities;
-      if (runtimeProfile !== undefined && capabilities.get("model.switch")?.supported === true) {
+      if (
+        runtimeProfile !== undefined
+        && capabilities.get("model.switch")?.supported === true
+        && (providerAuthenticationRouteId === undefined
+          || runtimeProfile.providerId === providerAuthenticationRouteId)
+      ) {
         await adapter.setModel(runtimeProfile.providerId, runtimeProfile.modelId, restoredContext);
+        this.assertSessionProviderAuthenticationAvailable(
+          this.#store.getSession(sessionId),
+          providerAuthenticationRouteId
+        );
       }
       if (
         runtimeProfile?.effort !== undefined &&
         capabilities.get("model.effort")?.supported === true
-      ) await adapter.setEffort(runtimeProfile.effort, restoredContext);
+      ) {
+        await adapter.setEffort(runtimeProfile.effort, restoredContext);
+        this.assertSessionProviderAuthenticationAvailable(
+          this.#store.getSession(sessionId),
+          providerAuthenticationRouteId
+        );
+      }
       if (capabilities.get("model.fast_mode")?.supported === true) {
         await adapter.setFastMode(runtimeProfile?.fastMode ?? stored.descriptor.fastMode, restoredContext);
+        this.assertSessionProviderAuthenticationAvailable(
+          this.#store.getSession(sessionId),
+          providerAuthenticationRouteId
+        );
       }
       if (capabilities.get("permission.change")?.supported === true) {
         await adapter.setPermissionMode(stored.descriptor.permissionMode, restoredContext);
+        this.assertSessionProviderAuthenticationAvailable(
+          this.#store.getSession(sessionId),
+          providerAuthenticationRouteId
+        );
       }
       if (capabilities.get("plan_mode")?.supported === true) {
         await adapter.setPlanMode(stored.descriptor.planMode, restoredContext);
+        this.assertSessionProviderAuthenticationAvailable(
+          this.#store.getSession(sessionId),
+          providerAuthenticationRouteId
+        );
       }
       this.assertCurrentAdapterGeneration(
         stored.descriptor.backendId,
@@ -9219,9 +10182,21 @@ export class SessionHost {
       this.setActiveSession(sessionId, result);
       this.persistRuntimeUsage(sessionId, stored.descriptor.binding.generation, state.usage, false, state.providerId, state.modelId);
       await this.refreshNativeStateBestEffort(sessionId, result, "native_state_activation_sync", allowance);
+      this.assertSessionProviderAuthenticationAvailable(
+        this.#store.getSession(sessionId),
+        providerAuthenticationRouteId
+      );
       if (!reprovisionedBlank) await this.synchronizeNativeHistory(sessionId, allowance);
+      this.assertSessionProviderAuthenticationAvailable(
+        this.#store.getSession(sessionId),
+        providerAuthenticationRouteId
+      );
       await this.refreshRuntimeCommands(sessionId, result, allowance)
         .catch((error: unknown) => this.recordFailure("runtime_commands_activation_sync", error));
+      this.assertSessionProviderAuthenticationAvailable(
+        this.#store.getSession(sessionId),
+        providerAuthenticationRouteId
+      );
       return result;
     } catch (error) {
       this.deleteActiveSession(sessionId);
@@ -9245,6 +10220,7 @@ export class SessionHost {
     adapter: BackendAdapter,
     backendInstanceGeneration: number
   ): Promise<{ readonly stored: StoredSession; readonly state: NativeSessionState }> {
+    this.assertSessionProviderAuthenticationAvailable(expected);
     if (!this.#store.nativeBlankRecoveryEligible(expected.descriptor.id)) {
       throw new StoreError("The native Session is no longer eligible for blank-runtime recovery.");
     }
@@ -9274,6 +10250,7 @@ export class SessionHost {
           : { appendSystemPrompt: expected.descriptor.appendSystemPrompt }),
         nativeStart: { kind: "new" }
       }, context);
+      this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(expected.descriptor.id));
       if (
         createdBinding.generation !== generation
         || createdBinding.opaqueRef === expected.descriptor.binding.opaqueRef
@@ -9282,6 +10259,7 @@ export class SessionHost {
       }
       const boundContext = { ...context, binding: createdBinding };
       const state = await adapter.inspectSession(createdBinding, boundContext);
+      this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(expected.descriptor.id));
       assertAttachedNativeState(createdBinding, state, generation);
       this.assertCurrentAdapterGeneration(
         expected.descriptor.backendId,
@@ -9603,6 +10581,7 @@ export class SessionHost {
     if (this.#dispatchPreparations.get(sessionId) !== preparation) return;
     this.#dispatchPreparations.delete(sessionId);
     preparation.resolve();
+    this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
     void this.#applyPendingSessionRuntimeControl(sessionId).then((applied) => {
       if (applied) void this.drain(sessionId);
     }).catch((error: unknown) => this.recordFailure("session_runtime_control_boundary", error));
@@ -9923,8 +10902,16 @@ export class SessionHost {
   }
 
   private async drain(sessionId: string): Promise<void> {
+    // This synchronous prelude also runs when an older dispatcher still owns
+    // the per-Session settlement. Newly committed work must become a durable
+    // auth failure immediately instead of waiting behind that native turn.
+    this.failAcceptedQueueItemsForAuthentication(sessionId);
     const existingSettlement = this.#drainSettlements.get(sessionId);
     if (existingSettlement !== undefined) return existingSettlement;
+    if (
+      this.#providerAuthenticationRuntimeInvalidations.has(sessionId)
+      && !this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId)
+    ) return;
     if (
       this.#runSilenceRecoveries.has(sessionId)
       || this.#runtimeRestartFences.has(sessionId)
@@ -9940,6 +10927,10 @@ export class SessionHost {
     try {
       while (!this.#disposed) {
         if (
+          this.#providerAuthenticationRuntimeInvalidations.has(sessionId)
+          && !this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId)
+        ) return;
+        if (
           this.#runSilenceRecoveries.has(sessionId)
           || this.#runtimeRestartFences.has(sessionId)
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
@@ -9951,6 +10942,18 @@ export class SessionHost {
         if (this.#store.getQueueControl(sessionId).paused) return;
         let pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
         if (pending === undefined) return;
+        // Authentication is an admission fence, not a turn-serialization
+        // concern. Fail a newly durable item before any context rebuild,
+        // compaction, pending route change, or older native-accepted turn can
+        // keep it queued behind an authority that has already been revoked.
+        const initialAuthenticationFailure = this.queueProviderAuthenticationFailure(
+          pending,
+          this.#store.getSession(sessionId)
+        );
+        if (initialAuthenticationFailure !== undefined) {
+          this.failQueueItemForAuthentication(pending, initialAuthenticationFailure);
+          continue;
+        }
         // The accepted prompt remains durable while the old native context is
         // replaced. A failed rebuild releases only its claim and exits; the
         // queue item is never moved to dispatching or dropped.
@@ -9970,7 +10973,11 @@ export class SessionHost {
         const compactionDecision = await this.compactionDispatchDecision(sessionId);
         if (this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) return;
         if (compactionDecision.kind === "blocked") return;
-        if (!await this.#applyPendingSessionRuntimeControl(sessionId)) return;
+        // A complete per-turn override owns this queued turn independently of
+        // a deferred default-route mutation. An unavailable pending Provider
+        // must not strand an authenticated sibling override behind it.
+        if (!hasTurnOverrides(pending.executionOverrides)
+            && !await this.#applyPendingSessionRuntimeControl(sessionId)) return;
         const bypassQueueItemId = compactionDecision.kind === "bypass"
           ? compactionDecision.queueItemId
           : undefined;
@@ -9997,6 +11004,11 @@ export class SessionHost {
         if (!bypassesCompaction && this.compactionBlocksDispatch(sessionId)) return;
         const claimSession = this.#store.getSession(sessionId);
         if (this.#backendDispatchBlocked(claimSession.descriptor.backendId)) return;
+        const authenticationFailure = this.queueProviderAuthenticationFailure(pending, claimSession);
+        if (authenticationFailure !== undefined) {
+          this.failQueueItemForAuthentication(pending, authenticationFailure);
+          continue;
+        }
         const claimBackendInstanceGeneration = this.#store
           .getBackend(claimSession.descriptor.backendId).descriptor.instanceGeneration;
         const claimedItem = this.#store.claimNextQueueItem({
@@ -10015,7 +11027,10 @@ export class SessionHost {
         try {
           let active: ActiveSession | undefined;
           try {
-            active = await this.activate(sessionId);
+            active = await this.activate(
+              sessionId,
+              this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
+            );
           } finally {
             // Accepted work may survive while its runtime does not. Runtime
             // activation advances the Session generation, so dispatch must
@@ -10031,6 +11046,7 @@ export class SessionHost {
             attemptId = item.attemptId;
           }
           if (active === undefined) throw new Error("Session activation returned no active runtime.");
+          this.assertQueueProviderAuthentication(item, this.#store.getSession(sessionId));
           if (
             item.backendInstanceGeneration === undefined ||
             active.backendInstanceGeneration !== item.backendInstanceGeneration
@@ -10053,9 +11069,13 @@ export class SessionHost {
           ).descriptor.capabilities.get("runtime.resources");
           const dispatchResources: readonly RuntimeResource[] = reviewReadOnly || resourceCapability?.supported !== true
             ? []
-            : await this.getResources(sessionId);
+            : await this.getResources(
+                sessionId,
+                this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
+              );
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const stored = this.#store.getSession(sessionId);
+          this.assertQueueProviderAuthentication(item, stored);
           const target = this.targetForSession(stored);
           if (this.#workspaceCapture !== undefined && !reviewReadOnly) {
             let navigationAnchor: import("@joko/core").NativeNavigationAnchor | undefined;
@@ -10083,6 +11103,7 @@ export class SessionHost {
           }
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
+          this.assertQueueProviderAuthentication(item, stored);
           const baseContext = await this.beginTurnOverrideLease(item, active, stored);
           const context: AdapterContext = artifactReferenceSnapshots.length === 0
             ? baseContext
@@ -10094,6 +11115,7 @@ export class SessionHost {
             active,
             stored.descriptor.binding.generation
           );
+          this.assertQueueProviderAuthentication(item, stored);
           const dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, item.body);
           assertPromptInlineTextRanges(dispatchBody);
           dispatchPreparation.phase = "sending";
@@ -10107,6 +11129,7 @@ export class SessionHost {
                 active,
                 stored.descriptor.binding.generation
               );
+              this.assertQueueProviderAuthentication(item, stored);
               return this.persistNativeDispatchRecoveryBaseline(
                 item,
                 stored,
@@ -10208,20 +11231,25 @@ export class SessionHost {
             this.#sessionLifecycleFences.has(sessionId)
             || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
           ) return;
-          const failure: PublicError = reviewReadOnly ? {
-            code: "REVIEWER_DISPATCH_FAILED",
-            message: "The isolated reviewer Backend did not accept the request.",
-            phase: "dispatch",
-            retryable: false,
-            stateMayHaveChanged: false,
-            recovery: "Start a new review after checking provider and artifact availability."
-          } : toPublicError(error, {
+          const adapterFailure = toPublicError(error, {
               code: "BACKEND_DISPATCH_FAILED",
               phase: "dispatch",
               retryable: true,
               stateMayHaveChanged: false,
               recovery: "Inspect Backend diagnostics and explicitly retry when safe."
             });
+          const failure: PublicError = reviewReadOnly ? {
+            code: "REVIEWER_DISPATCH_FAILED",
+            message: adapterFailure.stateMayHaveChanged
+              ? "The isolated reviewer Backend may have accepted the request, but admission could not be confirmed."
+              : "The isolated reviewer Backend did not accept the request.",
+            phase: "dispatch",
+            retryable: false,
+            stateMayHaveChanged: adapterFailure.stateMayHaveChanged,
+            recovery: adapterFailure.stateMayHaveChanged
+              ? "Inspect the exact native reviewer Session before starting another review."
+              : "Start a new review after checking provider and artifact availability."
+          } : adapterFailure;
           const uncertain = failure.stateMayHaveChanged;
           if (uncertain) {
             const active = this.#active.get(sessionId);
@@ -10986,6 +12014,7 @@ export class SessionHost {
       await this.notifyServiceRunSettled(sessionId, run.descriptor.id, outcome);
     }
     if (outcome === "failed") this.ensureContextOverflowReplay(sessionId);
+    this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
     await this.#applyPendingSessionRuntimeControl(sessionId);
     for (const failure of runtimeRecoveryFailures) {
       this.#scheduleSessionRuntimeRecovery(sessionId, failure.runId, failure.error);
@@ -11986,6 +13015,7 @@ export class SessionHost {
       current.runId !== admitted.runId ||
       current.backendInstanceGeneration === undefined ||
       current.backendInstanceGeneration !== admitted.backendInstanceGeneration ||
+      this.#active.get(admitted.sessionId) !== active ||
       active.sessionId !== admitted.sessionId ||
       active.backendInstanceGeneration !== current.backendInstanceGeneration ||
       session.descriptor.binding.generation !== productGeneration ||
@@ -12636,6 +13666,25 @@ function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBindi
   return left.opaqueRef === right.opaqueRef
     && left.nativeSessionId === right.nativeSessionId
     && left.generation === right.generation;
+}
+
+function sameSessionWorktreeBinding(left: SessionWorktreeBinding, right: SessionWorktreeBinding): boolean {
+  return left.leaseId === right.leaseId
+    && left.workspaceId === right.workspaceId
+    && (left.remote === undefined && right.remote === undefined
+      ? resolve(left.path) === resolve(right.path)
+        && resolve(left.repositoryRoot) === resolve(right.repositoryRoot)
+      : left.path === right.path && left.repositoryRoot === right.repositoryRoot)
+    && left.branch === right.branch
+    && left.sourceRef === right.sourceRef
+    && left.sourceCommit === right.sourceCommit
+    && left.sourceStrategy === right.sourceStrategy
+    && left.sourceRefreshed === right.sourceRefreshed
+    && left.sourceRemote === right.sourceRemote
+    && JSON.stringify(left.remote ?? null) === JSON.stringify(right.remote ?? null)
+    && left.state === right.state
+    && left.acquiredAt === right.acquiredAt
+    && left.updatedAt === right.updatedAt;
 }
 
 function sameEventIds(left: readonly string[], right: readonly string[]): boolean {
@@ -13984,7 +15033,7 @@ function truncateUnicodeText(value: string, maximumCharacters: number): string {
 /** Session-reference hydration is Host-owned and reaches every text-capable
  * adapter as ordinary bounded text. Publish that composed behavior without
  * teaching individual adapters a Joko Queue concern. */
-function withSessionReferenceCapability(descriptor: BackendDescriptor): BackendDescriptor {
+export function withSessionReferenceCapability(descriptor: BackendDescriptor): BackendDescriptor {
   const mention = descriptor.capabilities.get("input.mention");
   if (mention?.supported !== true || descriptor.capabilities.get("input.text")?.supported !== true) return descriptor;
   const options = [...new Set([...(mention.options ?? []), "session"])];
@@ -14003,6 +15052,32 @@ function inputCapabilityError(code: string, message: string): JokoError {
     stateMayHaveChanged: false,
     recovery: "Refresh task capabilities and submit input supported by the selected Backend."
   });
+}
+
+function providerAuthenticationRequiredFailure(): PublicError {
+  return {
+    code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED",
+    message: "The selected Provider is no longer authenticated for this input.",
+    phase: "capability",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Authenticate the Provider, refresh its current status, and submit the input again."
+  };
+}
+
+function providerAuthenticationRequiredError(): JokoError {
+  return new JokoError(providerAuthenticationRequiredFailure());
+}
+
+function backendAuthenticationRequiredFailure(backend: BackendDescriptor): PublicError {
+  return {
+    code: "BACKEND_AUTHENTICATION_REQUIRED",
+    message: "This Backend is not authenticated for this input.",
+    phase: "capability",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: backend.error?.recovery ?? "Complete the Backend authorization in Settings and submit the input again."
+  };
 }
 
 function modelUsageCostRates(model: ProviderModel, usage: UsageSnapshot) {
@@ -14537,6 +15612,16 @@ async function sameServicePath(left: string, right: string): Promise<boolean> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function providerAuthenticationReconciliation(
+  adapter: BackendAdapter
+): BackendProviderAuthenticationReconciliation | undefined {
+  const candidate = adapter as BackendAdapter & Partial<BackendProviderAuthenticationReconciliation>;
+  return typeof candidate.beginProviderAuthenticationReconciliation === "function"
+    && typeof candidate.reconcileProviderAuthentication === "function"
+    ? candidate as BackendAdapter & BackendProviderAuthenticationReconciliation
+    : undefined;
 }
 
 function derivationSourceMessageFromOperationBody(value: unknown): {

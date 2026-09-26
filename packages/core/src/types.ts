@@ -665,6 +665,20 @@ export interface SessionWorktreeBinding {
   readonly sourceStrategy: SessionWorktreeSourceStrategy;
   readonly sourceRefreshed: boolean;
   readonly sourceRemote?: string;
+  /** Stable remote checkout authority. Absent only for a service-node checkout. */
+  readonly remote?: {
+    readonly hostOwnerId: string;
+    readonly hostTargetId: string;
+    readonly hostId: string;
+    /** Digest of the exact trusted SSH Host routing identity. */
+    readonly hostIdentity: string;
+    readonly targetId: string;
+    /** Canonical decimal revisions at checkout acquisition. */
+    readonly targetRevision: string;
+    readonly hostRevision: string;
+    /** Identity of the remote owner manifest, distinct from a path or branch. */
+    readonly manifestId: string;
+  };
   readonly state: "active" | "preserved";
   readonly acquiredAt: UnixMillis;
   readonly updatedAt: UnixMillis;

@@ -113,7 +113,7 @@ describe("managed Subagent public observation", () => {
       runId: taskId,
       childId: `${taskId}:child`,
       action: "resume"
-    })).resolves.toBeUndefined();
+    })).resolves.toBe("local");
     await expect(assertManagedSubagentControlTarget({
       root,
       productSessionId: sessionId,
@@ -178,7 +178,7 @@ describe("managed Subagent public observation", () => {
         runId: taskId,
         childId: `${taskId}:child`,
         action
-      })).resolves.toBeUndefined();
+      })).resolves.toBe("local");
     }
     await expect(assertManagedSubagentControlTarget({
       root,
@@ -255,6 +255,76 @@ describe("managed Subagent public observation", () => {
       }
     });
     expect(store.controls[0]!.value).not.toHaveProperty("seq");
+  });
+
+  it("stops only the remote durable runs holding the revoked Provider route", async () => {
+    const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-remote-auth-revoke-")), "subagent-runs");
+    const revokedSessionId = `session-${randomUUID()}`;
+    const siblingSessionId = `session-${randomUUID()}`;
+    const revokedStore = new DurableStoreFixture(
+      revokedSessionId,
+      "remote-revoked:1",
+      `approval-${randomUUID()}`,
+      { providerId: "revoked-provider", terminateOnStop: true }
+    );
+    const siblingStore = new DurableStoreFixture(
+      siblingSessionId,
+      "remote-sibling:1",
+      `approval-${randomUUID()}`,
+      { providerId: "sibling-provider", terminateOnStop: true }
+    );
+    const revokedObserver = new ManagedSubagentObserver({
+      root,
+      durableStore: revokedStore,
+      context: context(revokedSessionId, 3, []),
+      intervalMs: 60_000
+    });
+    const siblingObserver = new ManagedSubagentObserver({
+      root,
+      durableStore: siblingStore,
+      context: context(siblingSessionId, 3, []),
+      intervalMs: 60_000
+    });
+
+    await Promise.all([
+      revokedObserver.stopCredentialedRunsByProvider("revoked-provider", 2_000),
+      siblingObserver.stopCredentialedRunsByProvider("revoked-provider", 2_000)
+    ]);
+
+    expect(revokedStore.controls).toHaveLength(1);
+    expect(revokedStore.controls[0]).toMatchObject({
+      kind: "control",
+      value: { action: "stop", productSessionId: revokedSessionId }
+    });
+    expect(siblingStore.controls).toEqual([]);
+    revokedObserver.stop();
+    siblingObserver.stop();
+  });
+
+  it.each([
+    ["absent", { omitRoute: true }],
+    ["malformed", { route: { provider: 42, model: "fixture", effort: "high" } }],
+    ["illegal Provider", { route: { provider: "invalid provider", model: "fixture", effort: "high" } }]
+  ])("fails Provider retirement closed for a live remote child with an %s immutable route", async (_label, routeOptions) => {
+    const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-remote-auth-route-")), "subagent-runs");
+    const sessionId = `session-${randomUUID()}`;
+    const store = new DurableStoreFixture(
+      sessionId,
+      "remote-unknown-route:1",
+      `approval-${randomUUID()}`,
+      { providerId: "revoked-provider", ...routeOptions }
+    );
+    const observer = new ManagedSubagentObserver({
+      root,
+      durableStore: store,
+      context: context(sessionId, 3, []),
+      intervalMs: 60_000
+    });
+
+    await expect(observer.stopCredentialedRunsByProvider("revoked-provider", 2_000))
+      .rejects.toThrow(/Provider ownership is invalid/iu);
+    expect(store.controls).toEqual([]);
+    observer.stop();
   });
 
   it("backs off repeated remote scan failures and publishes only one visible outage edge", async () => {
@@ -431,7 +501,7 @@ describe("managed Subagent public observation", () => {
       runId: taskId,
       childId: `${taskId}:child`,
       action: "stop"
-    })).resolves.toBeUndefined();
+    })).resolves.toBe("remote");
     observer.stop();
     restarted.stop();
   });
@@ -557,16 +627,35 @@ class DurableStoreFixture implements PiManagedDurableStore {
   readonly #runnerScriptSha256 = createHash("sha256").update("remote fixture runner\n").digest("hex");
   readonly #transcript: Buffer;
   readonly #approvalId: string;
+  readonly #providerId: string;
+  readonly #terminateOnStop: boolean;
+  readonly #route?: unknown;
+  readonly #omitRoute: boolean;
   #revision = createHash("sha256").update("remote fixture revision:0").digest("hex");
   #controlRevision = createHash("sha256").update("remote fixture control:0").digest("hex");
   readonly #transcriptRevision = createHash("sha256").update("remote fixture transcript:0").digest("hex");
   readonly #resultRevision = createHash("sha256").update("remote fixture result:absent").digest("hex");
   #lastControl: Readonly<Record<string, unknown>> | undefined;
+  #state: "running" | "aborted" = "running";
 
-  constructor(sessionId: string, taskId: string, approvalId: string) {
+  constructor(
+    sessionId: string,
+    taskId: string,
+    approvalId: string,
+    options: {
+      readonly providerId?: string;
+      readonly terminateOnStop?: boolean;
+      readonly route?: unknown;
+      readonly omitRoute?: boolean;
+    } = {}
+  ) {
     this.#sessionId = sessionId;
     this.#taskId = taskId;
     this.#approvalId = approvalId;
+    this.#providerId = options.providerId ?? "remote";
+    this.#terminateOnStop = options.terminateOnStop ?? false;
+    this.#route = options.route;
+    this.#omitRoute = options.omitRoute === true;
     this.#transcript = Buffer.from(`${JSON.stringify({
       type: "joko.subagent.parent",
       message: "Inspect the remote fixture",
@@ -612,7 +701,9 @@ class DurableStoreFixture implements PiManagedDurableStore {
       title: "Remote fixture task",
       readOnly: false,
       contextMode: "fork",
-      route: { provider: "remote", model: "fixture", effort: "high" },
+      ...(this.#omitRoute ? {} : {
+        route: this.#route ?? { provider: this.#providerId, model: "fixture", effort: "high" }
+      }),
       nativeSessionId: randomUUID(),
       turnCount: 1,
       transcriptPath
@@ -646,10 +737,11 @@ class DurableStoreFixture implements PiManagedDurableStore {
       runnerScriptSha256: this.#runnerScriptSha256,
       runnerPid: 42,
       runnerInstanceId: this.#runnerInstanceId,
-      state: "running",
+      state: this.#state,
       summary: "running",
       createdAt: 1_000,
       startedAt: 1_001,
+      ...(this.#state === "aborted" ? { endedAt: Date.now() } : {}),
       heartbeatAt: 1_002,
       nativeSessionId: config.nativeSessionId,
       nativeSessionPath: `${runDirectory}/sessions/${config.nativeSessionId}.jsonl`,
@@ -758,6 +850,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
         accepted: true,
         observedAt: Date.now()
       };
+      if (this.#terminateOnStop && input.value["action"] === "stop") this.#state = "aborted";
     }
     const receipt = createHash("sha256").update(JSON.stringify(input)).digest("hex");
     this.#controlRevision = createHash("sha256").update(`${this.#controlRevision}:${receipt}`).digest("hex");

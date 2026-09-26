@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,14 @@ import {
   type ClaudeSdkQuery,
   type ClaudeSdkQueryParams
 } from "./sdk-runtime.js";
+import {
+  adoptClaudeSessionStoreChild,
+  createClaudeDurableSessionStore,
+  createClaudeSessionStoreAuthority,
+  prepareClaudeSessionStoreImport,
+  sealClaudeSessionStoreImport,
+  type ClaudeSessionStoreSessionAccess
+} from "./claude-session-store.js";
 
 const sdk = vi.hoisted(() => ({
   query: vi.fn(),
@@ -80,9 +89,18 @@ describe("Claude SDK owned custom spawn", () => {
 
   it("confirms only the selected Query's exact process lease and does not retire a concurrent Query", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-claude-query-owner-"));
-    roots.push(root);
+    const sessionStoreRoot = await mkdtemp(join(tmpdir(), "joko-claude-session-store-"));
+    roots.push(root, sessionStoreRoot);
     const children: ReturnType<typeof spawnOwnedClaudeCodeProcess>[] = [];
-    sdk.query.mockImplementation(({ options }: { options: { abortController: AbortController; spawnClaudeCodeProcess: (input: Parameters<typeof spawnOwnedClaudeCodeProcess>[0]) => ReturnType<typeof spawnOwnedClaudeCodeProcess> } }) => {
+    let observedSessionStore: {
+      load(key: { readonly projectKey: string; readonly sessionId: string }): Promise<unknown[] | null>;
+    } | undefined;
+    sdk.query.mockImplementation(({ options }: { options: {
+      abortController: AbortController;
+      sessionStore?: typeof observedSessionStore;
+      spawnClaudeCodeProcess: (input: Parameters<typeof spawnOwnedClaudeCodeProcess>[0]) => ReturnType<typeof spawnOwnedClaudeCodeProcess>;
+    } }) => {
+      observedSessionStore = options.sessionStore;
       const child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ["-e", "setInterval(() => undefined, 1000)"],
         cwd: process.cwd(), env: { ...process.env }, signal: options.abortController.signal });
       children.push(child);
@@ -94,17 +112,87 @@ describe("Claude SDK owned custom spawn", () => {
       try { process.kill(pid, "SIGKILL"); } catch { return "not_running" as const; }
       return "terminated" as const;
     });
-    const runtime = new DefaultClaudeSdkRuntime({ processOwner: { rootDirectory: root, instanceId: "query-owner", generation: 1,
-      recoverStale: false, supervisor: { capture: async (pid) => `fixture-${pid}`, captureSync: (pid) => `fixture-${pid}`, terminate } } });
+    expect(() => new DefaultClaudeSdkRuntime({
+      processOwner: { rootDirectory: root, instanceId: "query-owner", generation: 1,
+        recoverStale: false, supervisor: { capture: async () => "unused", captureSync: () => "unused", terminate } },
+      sessionStoreRootDirectory: root
+    })).toThrow("must be disjoint");
+    const runtime = new DefaultClaudeSdkRuntime({
+      processOwner: { rootDirectory: root, instanceId: "query-owner", generation: 1,
+        recoverStale: false, supervisor: { capture: async (pid) => `fixture-${pid}`, captureSync: (pid) => `fixture-${pid}`, terminate } },
+      sessionStoreRootDirectory: sessionStoreRoot
+    });
     try {
-      const first = await runtime.query(queryParams());
+      expect(runtime.supportsWorkspaceDerivation).toBe(true);
+      const storedSessions = runtime.storedSessions;
+      expect(storedSessions).toBeDefined();
+      const importAccess = await storedSessions!.prepareImport({
+        operationId: "22222222-2222-4222-8222-222222222222",
+        sourceWorkspaceAuthority: "workspace-source",
+        sourceSessionId: "11111111-1111-4111-8111-111111111111",
+        targetWorkspaceAuthority: "workspace-target"
+      });
+      await expect(storedSessions!.readOperation(importAccess)).resolves.toMatchObject({
+        operationId: "22222222-2222-4222-8222-222222222222",
+        state: "importing"
+      });
+      const recovered = await storedSessions!.recoverOperation({
+        operationId: importAccess.operationId,
+        targetWorkspaceAuthority: importAccess.target.workspaceAuthority
+      });
+      expect(recovered).toEqual(importAccess);
+      expect((await storedSessions!.cleanupOperation(recovered)).state).toBe("cleaned");
+      expect((await storedSessions!.cleanupOperation(recovered)).state).toBe("cleaned");
+      expect(storedSessions).toMatchObject({
+        claim: expect.any(Function),
+        recoverOperation: expect.any(Function),
+        cleanupOperation: expect.any(Function)
+      });
+      expect(await readdir(root)).toEqual([]);
+
+      const authority = createClaudeSessionStoreAuthority({
+        rootDirectory: sessionStoreRoot,
+        namespace: `backend-${createHash("sha256").update("query-owner", "utf8").digest("hex")}`,
+        generation: 1
+      });
+      const storedOperation = prepareClaudeSessionStoreImport(authority, {
+        operationId: randomUUID(),
+        sourceWorkspaceAuthority: "workspace-query-source",
+        sourceSessionId: randomUUID(),
+        targetWorkspaceAuthority: "workspace-query-target"
+      });
+      const staging = createClaudeDurableSessionStore(authority, storedOperation, {
+        onChildReserved: async () => undefined
+      });
+      const sourceProjectKey = "query-source-project";
+      const targetProjectKey = "query-target-project";
+      const childSessionId = randomUUID();
+      await staging.append(
+        { projectKey: sourceProjectKey, sessionId: storedOperation.source.sessionId },
+        [{ type: "user", uuid: randomUUID() }]
+      );
+      sealClaudeSessionStoreImport(authority, storedOperation);
+      await staging.load({ projectKey: targetProjectKey, sessionId: storedOperation.source.sessionId });
+      await staging.append(
+        { projectKey: targetProjectKey, sessionId: childSessionId },
+        [{ type: "assistant", uuid: randomUUID(), value: "query-owned store" }]
+      );
+      const storedAccess = adoptClaudeSessionStoreChild(authority, storedOperation, childSessionId);
+      staging.close();
+
+      const first = await runtime.query(queryParams(storedAccess));
+      const firstSessionStore = observedSessionStore!;
+      expect(await firstSessionStore.load({ projectKey: targetProjectKey, sessionId: childSessionId })).toHaveLength(1);
       const second = await runtime.query(queryParams());
       await expect(runtime.retireQuery(first, 100)).rejects.toThrow("hard retirement");
+      expect(await firstSessionStore.load({ projectKey: targetProjectKey, sessionId: childSessionId })).toHaveLength(1);
       expect(await readdir(join(root, "1"))).toHaveLength(2);
       unconfirmed = false;
       const firstExit = new Promise<void>((resolvePromise) => children[0]!.once("exit", () => resolvePromise()));
       await runtime.retireQuery(first, 1_000);
       await firstExit;
+      await expect(firstSessionStore.load({ projectKey: targetProjectKey, sessionId: childSessionId }))
+        .rejects.toMatchObject({ code: "STORAGE_UNAVAILABLE" });
       expect(children[1]!.exitCode).toBeNull();
       expect(await readdir(join(root, "1"))).toHaveLength(1);
       await expect(runtime.retireQuery(first, 1_000)).rejects.toThrow("cannot be confirmed");
@@ -173,11 +261,12 @@ describe("Claude SDK owned custom spawn", () => {
   });
 });
 
-function queryParams(): ClaudeSdkQueryParams {
+function queryParams(sessionStoreAccess?: ClaudeSessionStoreSessionAccess): ClaudeSdkQueryParams {
   return { prompt: (async function* () {})(), options: {
     abortController: new AbortController(), additionalDirectories: [], allowDangerouslySkipPermissions: false,
     canUseTool: async () => ({ behavior: "deny", message: "No tool is admitted by this process fixture." }),
     cwd: process.cwd(), env: {}, includePartialMessages: true, permissionMode: "default", persistSession: false,
+    ...(sessionStoreAccess === undefined ? {} : { sessionStoreAccess }),
     settingSources: [], systemPrompt: { type: "preset", preset: "claude_code" }, tools: []
   } };
 }

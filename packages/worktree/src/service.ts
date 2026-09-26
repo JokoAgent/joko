@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, realpath, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
 import { runGit } from "./git.js";
@@ -36,6 +36,7 @@ import {
   type WorktreeCheckoutDeriveRequest,
   type WorktreeCwdDetection,
   type WorktreeDeriveRequest,
+  type WorktreeExactReleaseRequest,
   type WorktreeInitialization,
   type WorktreeInitializeOptions,
   type WorktreeLease,
@@ -909,6 +910,44 @@ export class EphemeralWorktreeService {
     return snapshotSha;
   }
 
+  /** Reconcile a release whose intent was durably recorded by the caller
+   * before the first destructive effect. The lease id fences Session-id reuse;
+   * the path check distinguishes a completed release from lost owner state. */
+  releaseExact(
+    input: WorktreeExactReleaseRequest,
+    options?: WorktreeReleaseOptions
+  ): Promise<WorktreeResult<WorktreeRelease>> {
+    return this.#serialize(options, true, async (control) => {
+      if (options?.retainForRestore !== undefined && typeof options.retainForRestore !== "boolean") {
+        throw invalidArgument("retainForRestore", "retainForRestore must be a boolean.");
+      }
+      const accepted = validateExactReleaseRequest(input);
+      const store = this.#requireStore();
+      if (!pathInside(store.root, accepted.path)) {
+        throw new WorktreeServiceError("PATH_UNSAFE", "The exact worktree release path escaped storage.");
+      }
+      const byId = store.get(accepted.leaseId);
+      const bySession = store.entries().find((candidate) => candidate.sessionId === accepted.sessionId);
+      if (byId === undefined && bySession === undefined) {
+        if (await pathExists(accepted.path)) {
+          throw new WorktreeServiceError(
+            "SESSION_CONFLICT",
+            "The exact worktree release lost its owner while the checkout still exists."
+          );
+        }
+        return Object.freeze({ status: "not_found" });
+      }
+      if (byId === undefined || bySession === undefined || byId.id !== bySession.id
+        || !sameExactReleaseLease(leaseFromEntry(byId), accepted)) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The exact worktree release owner changed.");
+      }
+      if (byId.status === "creating") {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The Session worktree is changing ownership.");
+      }
+      return this.#releaseEntry(byId, options?.retainForRestore === true, control);
+    });
+  }
+
   async #sourceSnapshotStillCurrent(
     entry: WorktreeSnapshotSource,
     expectedHead: string,
@@ -1753,6 +1792,75 @@ function validateRemovalPreviewRequest(value: unknown): WorktreeRemovalPreviewRe
   return { sessionId, leaseId };
 }
 
+function validateExactReleaseRequest(value: unknown): WorktreeExactReleaseRequest {
+  if (!isRecord(value) || hasUnsupportedKeys(value, [
+    "sessionId", "leaseId", "path", "repositoryRoot", "branch", "source", "acquiredAt"
+  ])) {
+    throw invalidArgument("request", "The exact worktree release request is invalid.");
+  }
+  const sessionId = validateSessionId(value["sessionId"]);
+  const leaseId = value["leaseId"];
+  const path = value["path"];
+  const repositoryRoot = value["repositoryRoot"];
+  const branch = value["branch"];
+  const source = value["source"];
+  const acquiredAt = value["acquiredAt"];
+  if (typeof leaseId !== "string" || !ENTRY_ID_PATTERN.test(leaseId)) {
+    throw invalidArgument("leaseId", "The worktree lease id is invalid.");
+  }
+  if (typeof path !== "string" || path.length === 0 || path.length > 32_768
+    || path.includes("\0") || !isAbsolute(path)) {
+    throw invalidArgument("path", "The worktree release path is invalid.");
+  }
+  if (typeof repositoryRoot !== "string" || repositoryRoot.length === 0 || repositoryRoot.length > 32_768
+    || repositoryRoot.includes("\0") || !isAbsolute(repositoryRoot)) {
+    throw invalidArgument("repositoryRoot", "The worktree repository root is invalid.");
+  }
+  if (typeof branch !== "string" || branch.length === 0 || branch.length > 1_024
+    || branch.includes("\0") || /[\r\n]/u.test(branch)) {
+    throw invalidArgument("branch", "The worktree branch is invalid.");
+  }
+  if (!isRecord(source) || hasUnsupportedKeys(source, ["ref", "commit", "refreshed", "strategy", "remote", "reason"])) {
+    throw invalidArgument("source", "The worktree source is invalid.");
+  }
+  const ref = source["ref"];
+  const commit = source["commit"];
+  const refreshed = source["refreshed"];
+  const strategy = source["strategy"];
+  const remote = source["remote"];
+  const reason = source["reason"];
+  if (typeof ref !== "string" || ref.length === 0 || ref.length > 1_024 || ref.includes("\0")
+    || typeof commit !== "string" || !/^[a-f0-9]{40,64}$/u.test(commit)
+    || typeof refreshed !== "boolean"
+    || !["explicit", "remote_default_refreshed", "remote_default_local", "current_branch", "local_default", "head"]
+      .includes(String(strategy))
+    || (remote !== undefined && (typeof remote !== "string" || remote.length === 0 || remote.length > 1_024
+      || remote.includes("\0")))
+    || (reason !== undefined && (typeof reason !== "string" || reason.length === 0 || reason.length > 1_024
+      || reason.includes("\0")))) {
+    throw invalidArgument("source", "The worktree source is invalid.");
+  }
+  if (!Number.isSafeInteger(acquiredAt) || (acquiredAt as number) < 0) {
+    throw invalidArgument("acquiredAt", "The worktree acquisition time is invalid.");
+  }
+  return {
+    sessionId,
+    leaseId,
+    path: resolve(path),
+    repositoryRoot: resolve(repositoryRoot),
+    branch,
+    source: {
+      ref,
+      commit,
+      refreshed,
+      strategy: strategy as WorktreeSourceResolution["strategy"],
+      ...(remote === undefined ? {} : { remote }),
+      ...(reason === undefined ? {} : { reason })
+    },
+    acquiredAt: acquiredAt as number
+  };
+}
+
 function validateSessionId(value: unknown): string {
   if (typeof value !== "string" || value.trim() !== value || value.length === 0
     || value.length > MAXIMUM_WORKTREE_SESSION_ID_CHARACTERS || value.includes("\0") || /[\r\n]/u.test(value)) {
@@ -1819,8 +1927,22 @@ function leaseFromEntry(entry: ManagedWorktreeEntry): WorktreeLease {
     repositoryRoot: entry.repositoryRoot,
     branch: entry.branch,
     source: Object.freeze({ ...entry.source }),
-    acquiredAt: entry.updatedAt
+    acquiredAt: entry.createdAt
   });
+}
+
+function sameExactReleaseLease(lease: WorktreeLease, expected: WorktreeExactReleaseRequest): boolean {
+  return lease.id === expected.leaseId
+    && lease.sessionId === expected.sessionId
+    && samePath(lease.path, expected.path)
+    && samePath(lease.repositoryRoot, expected.repositoryRoot)
+    && lease.branch === expected.branch
+    && lease.source.ref === expected.source.ref
+    && lease.source.commit === expected.source.commit
+    && lease.source.refreshed === expected.source.refreshed
+    && lease.source.strategy === expected.source.strategy
+    && lease.source.remote === expected.source.remote
+    && lease.acquiredAt === expected.acquiredAt;
 }
 
 function sweepRecord(

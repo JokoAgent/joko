@@ -32,6 +32,7 @@ import {
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
   type NativeSessionDerivation,
+  type NativeSessionDerivationLifecycle,
   type NativeSessionForkResult,
   type NativeSessionState,
   type PermissionMode,
@@ -67,6 +68,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import {
   createPortableSessionManifest,
   decodePortableSessionPackage,
@@ -122,6 +124,16 @@ const BLANK_NATIVE_RECOVERY_PROFILE: FakeAdapterProfile = {
   capabilities: MUTABLE_RUNTIME_POLICY_PROFILE.capabilities.map((capability) =>
     capability.key === "model.fast_mode" ? { key: capability.key, supported: true } : capability),
   models: MUTABLE_RUNTIME_POLICY_PROFILE.models.map((model) => ({ ...model, supportsFastMode: true }))
+};
+
+const PROVIDER_AUTH_FENCE_PROFILE: FakeAdapterProfile = {
+  ...PI_LIKE_PROFILE,
+  id: "provider-auth-fence",
+  displayName: "Provider auth fence",
+  models: [
+    { ...PI_LIKE_PROFILE.models[0]!, providerId: "provider-a", modelId: "model-a" },
+    { ...PI_LIKE_PROFILE.models[0]!, providerId: "provider-b", modelId: "model-b" }
+  ]
 };
 
 function switchWithoutFastProfile(
@@ -207,6 +219,52 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("retains a Registry-owned descriptor refresh performed before Host initialization", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-host-published-backend-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const repository = new OperationalArtifactRepository(store);
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(directory, "artifacts"),
+      repository,
+      ingestRoots: [directory]
+    });
+    await artifacts.initialize();
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const described = await adapter.describe();
+    let diagnostics = ["provisioned"];
+    vi.spyOn(adapter, "describe").mockImplementation(async () => ({ ...described, diagnostics }));
+    const registry = new BackendInstanceRegistry(store);
+    await registry.provision([{
+      instanceId: adapter.id,
+      adapterKind: described.adapterKind,
+      displayName: described.displayName,
+      create: () => adapter
+    }]);
+    const host = new SessionHost(store, artifacts, registry.availableAdapters(), {
+      backendDescriptors: registry.descriptors(),
+      backendDescriptorsAlreadyPublished: true
+    });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+
+    diagnostics = ["refreshed-before-host-initialize"];
+    await registry.refresh(adapter.id);
+    expect(registry.get(adapter.id).descriptor.diagnostics).toEqual(diagnostics);
+
+    await host.initialize();
+
+    expect(store.getBackend(adapter.id).descriptor.diagnostics).toEqual(diagnostics);
+    expect(store.getBackend(adapter.id).descriptor).toMatchObject({
+      id: registry.get(adapter.id).descriptor.id,
+      adapterKind: registry.get(adapter.id).descriptor.adapterKind,
+      instanceGeneration: registry.get(adapter.id).descriptor.instanceGeneration,
+      diagnostics: registry.get(adapter.id).descriptor.diagnostics
+    });
+  });
+
   it("publishes a fresh Task projection in its creation transaction for already-connected owners", async () => {
     const fixture = await createFixture();
     const observed: Array<{ readonly event: PersistedEvent; readonly visibleRevision: bigint }> = [];
@@ -2220,6 +2278,92 @@ describe("SessionHost", () => {
     const undiscoverable = await createFixture(new FakeBackendAdapter(MINIMAL_PROFILE));
     await expect(undiscoverable.host.listNativeSessions("target-one"))
       .rejects.toMatchObject({ publicError: { code: "NATIVE_SESSION_DISCOVERY_UNSUPPORTED", phase: "capability" } });
+  });
+
+  it.each([
+    ["consumed unknown", true, "dispatch_unknown"],
+    ["pre-consume failure", false, "failed"]
+  ] as const)("preserves reviewer dispatch uncertainty for %s", async (_label, stateMayHaveChanged, expectedState) => {
+    const adapter = new BackgroundTaskRuntimeFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceSessionId = (await fixture.host.createSession({
+      operationId: `create-review-dispatch-source-${stateMayHaveChanged}`,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Review dispatch source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const created = fixture.store.createReviewRun({
+      id: `review-dispatch-${stateMayHaveChanged}`,
+      sourceSessionId,
+      targetKind: "task",
+      evidenceSeal: reviewSeal(),
+      attachments: []
+    });
+    const { reviewerSessionId } = await fixture.host.createFreshReviewer({
+      reviewRunId: created.run.id,
+      sourceSessionId,
+      sourceLeaseFencingToken: created.sourceLease.fencingToken,
+      targetId: "target-one",
+      runtimePolicy: "review_read_only",
+      nativeStart: { kind: "new" },
+      permissionMode: "ask",
+      planMode: false,
+      fastMode: false
+    });
+    fixture.store.attachReviewSession({
+      reviewRunId: created.run.id,
+      reviewerSessionId,
+      sourceLeaseFencingToken: created.sourceLease.fencingToken,
+      expectedRunRevision: created.run.revision
+    });
+    const send = vi.spyOn(adapter, "send").mockRejectedValue(new JokoError({
+      code: stateMayHaveChanged ? "NATIVE_DISPATCH_UNKNOWN" : "NATIVE_SESSION_CONTINUITY_GAP",
+      message: stateMayHaveChanged
+        ? "Native dispatch admission could not be confirmed."
+        : "The native Session identity changed before dispatch.",
+      phase: "dispatch",
+      retryable: stateMayHaveChanged,
+      stateMayHaveChanged,
+      recovery: stateMayHaveChanged ? "Inspect the native Session." : "Retry with the current native Session."
+    }));
+    const operationId = `review-initial:dispatch-${stateMayHaveChanged}`;
+    const dispatch = await fixture.host.enqueueInitialPrompt({
+      operationId,
+      reviewRunId: created.run.id,
+      reviewerSessionId,
+      prompt: { text: "Review without replay.", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    const rejectedAcceptance = expect(dispatch.accepted).rejects.toThrow("did not accept");
+
+    await rejectedAcceptance;
+    await expect(dispatch.outcome).resolves.toEqual({ state: "failed" });
+    const queue = fixture.store.listQueueItems({ sessionId: reviewerSessionId })
+      .find((candidate) => candidate.operationId === operationId)!;
+    const run = fixture.store.getRun(queue.runId).descriptor;
+    const expectedError = {
+      code: "REVIEWER_DISPATCH_FAILED",
+      stateMayHaveChanged
+    };
+    expect(queue).toMatchObject({ state: expectedState, error: expectedError });
+    expect(run).toMatchObject({ state: expectedState, error: expectedError });
+    expect(fixture.store.getAttempt(queue.attemptId!).descriptor).toMatchObject({
+      endedAt: expect.any(Number),
+      error: expectedError
+    });
+
+    const replay = await fixture.host.enqueueInitialPrompt({
+      operationId,
+      reviewRunId: created.run.id,
+      reviewerSessionId,
+      prompt: { text: "Review without replay.", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await expect(replay.accepted).rejects.toThrow("did not accept");
+    await expect(replay.outcome).resolves.toEqual({ state: "failed" });
+    expect(send).toHaveBeenCalledOnce();
+    expect(fixture.store.listQueueItems({ sessionId: reviewerSessionId })).toHaveLength(1);
   });
 
   it("caches completed native task scans while keeping refresh and invalidation generation-safe", async () => {
@@ -4483,6 +4627,965 @@ describe("SessionHost", () => {
     expect(adapter.sendCalls).toBe(0);
     expect(replacement.sendCalls).toBe(1);
     expect(onBackendMayBeIdle).toHaveBeenCalledWith(adapter.id);
+  });
+
+  it("fails only the fenced Provider's accepted input while user and service work on an authenticated sibling remain dispatchable", async () => {
+    const adapter = new ProviderAuthFenceFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const onSessionRuntimeClosed = vi.fn();
+    const fixture = await createFixture(adapter, {
+      onSessionRuntimeClosed,
+      sessionRuntimeFallbackContext: () => ({
+        availableProviderIds,
+        explicitDefault: { providerId: "provider-a", modelId: "model-a" }
+      })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-fence",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider auth fence",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    fixture.store.setQueuePaused({
+      sessionId,
+      paused: true,
+      reason: "Install auth boundary",
+      connectionId: fixture.connection.id,
+      traceId: "test:provider-auth:pause"
+    });
+    const revoked = fixture.host.enqueueInput({
+      operationId: "provider-auth-revoked-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "must not dispatch", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    const siblingRoute = fixture.host.enqueueInput({
+      operationId: "provider-auth-independent-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "independent route", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-b", modelId: "model-b" }
+    });
+    const siblingServiceRoute = fixture.host.enqueueServiceInput({
+      operationId: "provider-auth-independent-service-input",
+      sessionId,
+      source: "system",
+      prompt: { text: "independent service route", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-b", modelId: "model-b" }
+    });
+
+    const staleAuthenticationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(
+      adapter.id,
+      "provider-a"
+    );
+    availableProviderIds.delete("provider-a");
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    const retirementAuthenticationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(
+      adapter.id,
+      "provider-a"
+    );
+
+    expect(fixture.store.getQueueItem(revoked.value.queueItemId)).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    expect(fixture.store.getRun(revoked.value.runId).descriptor).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    expect(fixture.store.getAttempt(revoked.value.attemptId).descriptor).toMatchObject({
+      endedAt: expect.any(Number),
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    expect(fixture.store.getQueueItem(siblingRoute.value.queueItemId).state).toBe("accepted");
+    expect(fixture.store.getQueueItem(siblingServiceRoute.value.queueItemId).state).toBe("accepted");
+    expect(fixture.store.getRun(siblingServiceRoute.value.runId).descriptor.source).toBe("system");
+    expect(adapter.sendCalls).toBe(0);
+    expect(onSessionRuntimeClosed).not.toHaveBeenCalled();
+
+    const replay = fixture.host.enqueueInput({
+      operationId: "provider-auth-revoked-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "must not dispatch", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.value).toEqual(revoked.value);
+
+    fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:provider-auth:resume" });
+    fixture.host.requestQueueDrain(sessionId);
+    await eventually(() => [siblingRoute, siblingServiceRoute].every((execution) =>
+      fixture.store.getRun(execution.value.runId).descriptor.state === "completed"));
+    expect(adapter.sendCalls).toBe(2);
+    expect(onSessionRuntimeClosed).not.toHaveBeenCalled();
+
+    fixture.host.reconcileBackendProviderAuthentication(
+      adapter.id,
+      "provider-a",
+      retirementAuthenticationEvidence
+    );
+    availableProviderIds.add("provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", staleAuthenticationEvidence);
+    fixture.host.reconcileBackendProviderAuthentication(
+      adapter.id,
+      "provider-a",
+      retirementAuthenticationEvidence
+    );
+    expect(onSessionRuntimeClosed).not.toHaveBeenCalled();
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    expect(onSessionRuntimeClosed).toHaveBeenCalledExactlyOnceWith(sessionId);
+    fixture.host.reconcileBackendProviderAuthentication(
+      adapter.id,
+      "provider-a",
+      retirementAuthenticationEvidence
+    );
+    await expect(fixture.host.inspect(sessionId)).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    const currentAuthenticationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(
+      adapter.id,
+      "provider-a"
+    );
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", currentAuthenticationEvidence);
+    expect(onSessionRuntimeClosed).toHaveBeenCalledExactlyOnceWith(sessionId);
+    const resent = fixture.host.enqueueInput({
+      operationId: "provider-auth-explicit-resend",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "explicit resend", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(resent.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(3);
+    expect(fixture.store.getQueueItem(revoked.value.queueItemId).state).toBe("failed");
+  });
+
+  it("requires an exact post-fence Adapter generation publication before public auth evidence can release the route", async () => {
+    const adapter = new ProviderAuthEvidenceFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-evidence",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider auth evidence",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+
+    const staleEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(adapter.id, "provider-a");
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    adapter.revokeProviderRoute("provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    adapter.publishManagedGeneration();
+    availableProviderIds.add("provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", staleEvidence);
+    await expect(fixture.host.inspect(sessionId)).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+
+    const noPublicationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(adapter.id, "provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", noPublicationEvidence);
+    await expect(fixture.host.inspect(sessionId)).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+
+    adapter.publishManagedGeneration();
+    await expect(fixture.host.inspect(sessionId)).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", noPublicationEvidence);
+    await expect(fixture.host.inspect(sessionId)).resolves.toBeDefined();
+  });
+
+  it("retains the Provider fence when public auth evidence belongs to a replaced Adapter instance", async () => {
+    const adapter = new ProviderAuthEvidenceFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    adapter.revokeProviderRoute("provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    const evidence = fixture.host.beginBackendProviderAuthenticationEvidence(adapter.id, "provider-a");
+    adapter.publishManagedGeneration();
+
+    const current = fixture.store.getBackend(adapter.id).descriptor;
+    const reservation = fixture.store.reserveBackendInstanceGeneration({
+      backendId: adapter.id,
+      adapterKind: current.adapterKind
+    });
+    const replacement = new ProviderAuthEvidenceFakeAdapter();
+    await fixture.host.replaceBackendInstance({
+      backendId: adapter.id,
+      expectedCurrentGeneration: current.instanceGeneration,
+      perform: async (hooks) => {
+        await hooks.preparePrevious(replacement, reservation.generation);
+        const publication = fixture.store.publishBackendInstanceDescriptor({
+          descriptor: { ...current, instanceGeneration: reservation.generation },
+          expectedCurrentGeneration: current.instanceGeneration
+        });
+        if (publication.status !== "published") throw new Error("Fixture replacement publication lost its fence.");
+        hooks.activateCurrent();
+      }
+    });
+    availableProviderIds.add("provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", evidence);
+
+    await expect(fixture.host.createSession({
+      operationId: "create-provider-auth-after-replacement-drift",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Replacement drift",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).rejects.toMatchObject({
+      storedError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+  });
+
+  it("invalidates a retired existing runtime on retirement completion and resumes its original native binding for explicit resend", async () => {
+    const adapter = new ProviderAuthRuntimeRetirementFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-runtime-resume",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider runtime resume",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const baselineBinding = fixture.store.getSession(sessionId).descriptor.binding;
+    const baseline = fixture.host.enqueueInput({
+      operationId: "provider-auth-runtime-baseline",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "baseline", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(baseline.value.runId).descriptor.state === "completed");
+
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    adapter.retireRuntime(sessionId);
+    availableProviderIds.add("provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
+    const authenticationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(adapter.id, "provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", authenticationEvidence);
+
+    const resent = fixture.host.enqueueInput({
+      operationId: "provider-auth-runtime-explicit-resend",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "after re-auth", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(resent.value.runId).descriptor.state === "completed");
+
+    expect(adapter.resumeCalls).toBe(1);
+    expect(adapter.sendCalls).toBe(2);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toMatchObject({
+      opaqueRef: baselineBinding.opaqueRef,
+      nativeSessionId: baselineBinding.nativeSessionId
+    });
+  });
+
+  it("lets a same-Session sibling Provider override create and reuse a runtime before target re-auth", async () => {
+    const adapter = new ProviderAuthRuntimeRetirementFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-sibling-runtime",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider sibling runtime",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const baseline = fixture.host.enqueueInput({
+      operationId: "provider-auth-sibling-runtime-baseline",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "baseline", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(baseline.value.runId).descriptor.state === "completed");
+
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    adapter.retireRuntime(sessionId);
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
+
+    const sendOnSibling = (operationId: string) => fixture.host.enqueueInput({
+      operationId,
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: operationId, images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-b", modelId: "model-b" }
+    });
+    const firstSibling = sendOnSibling("provider-auth-sibling-runtime-first");
+    await eventually(() => fixture.store.getRun(firstSibling.value.runId).descriptor.state === "completed");
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(adapter.resumeCalls).toBe(1);
+
+    const secondSibling = sendOnSibling("provider-auth-sibling-runtime-second");
+    await eventually(() => fixture.store.getRun(secondSibling.value.runId).descriptor.state === "completed");
+    expect(adapter.resumeCalls).toBe(1);
+    expect(adapter.sendCalls).toBe(3);
+  });
+
+  it("invalidates the retirement-time runtime owner when a sibling Provider switch settles during logout", async () => {
+    const adapter = new GatedProviderAuthRuntimeSwitchFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-switch-retirement",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider switch retirement",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const baseline = fixture.host.enqueueInput({
+      operationId: "provider-auth-switch-retirement-baseline",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "baseline", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(baseline.value.runId).descriptor.state === "completed");
+
+    const switching = fixture.host.setSessionRuntimeControl({
+      sessionId,
+      expectedGeneration: fixture.host.getSessionRuntimeControl(sessionId).generation,
+      patch: { providerId: "provider-b", modelId: "model-b" }
+    });
+    await adapter.setModelGate.entered;
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    adapter.retireRuntime(sessionId);
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+
+    adapter.setModelGate.release();
+    await expect(switching).resolves.toMatchObject({
+      status: "applied",
+      effective: { providerId: "provider-b", modelId: "model-b" }
+    });
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
+
+    const sent = fixture.host.enqueueInput({
+      operationId: "provider-auth-switch-retirement-send",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "use sibling", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(sent.value.runId).descriptor.state === "completed");
+    expect(adapter.resumeCalls).toBe(1);
+    expect(adapter.sendCalls).toBe(2);
+  });
+
+  it("closes a target runtime whose inactive activation crosses the logout fence while allowing a sibling Provider to activate", async () => {
+    const adapter = new GatedProviderAuthResumeFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const create = async (operationId: string, providerId: string, modelId: string) => (await fixture.host.createSession({
+      operationId,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: operationId,
+      providerId,
+      modelId,
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const targetSessionId = await create("create-provider-auth-activation-target", "provider-a", "model-a");
+    const siblingSessionId = await create("create-provider-auth-activation-sibling", "provider-b", "model-b");
+    await fixture.host.closeIfActive(targetSessionId);
+    await fixture.host.closeIfActive(siblingSessionId);
+    const baselineCloseCalls = adapter.closeCalls;
+
+    const activation = fixture.host.inspect(targetSessionId);
+    await adapter.resumeGate.entered;
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    adapter.resumeGate.release();
+
+    await expect(activation).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    expect(fixture.host.isSessionActive(targetSessionId)).toBe(false);
+    expect(adapter.closeCalls).toBe(baselineCloseCalls + 1);
+    const resumeCallsAfterRace = adapter.resumeCalls;
+    await expect(fixture.host.inspect(targetSessionId)).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    expect(adapter.resumeCalls).toBe(resumeCallsAfterRace);
+
+    await expect(fixture.host.inspect(siblingSessionId)).resolves.toBeDefined();
+    expect(adapter.resumeCalls).toBe(resumeCallsAfterRace + 1);
+  });
+
+  it("does not start a runtime-axis effect when logout fences the effective Provider after activation", async () => {
+    const adapter = new ProviderAuthRuntimeAxesFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-runtime-axes",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider runtime axes",
+      providerId: "provider-a",
+      modelId: "model-a",
+      effort: "medium",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+
+    const mutation = fixture.host.applyUserSessionRuntimeAxes(sessionId, { effort: "off" });
+    // Let the runtime-control action reach its await activate() boundary, then
+    // fence before that continuation is allowed to start an Adapter setter.
+    await Promise.resolve();
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+
+    await expect(mutation).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    expect(adapter.setEffortCalls).toBe(0);
+  });
+
+  it("closes a runtime switch when logout fences its target Provider during the first Adapter effect", async () => {
+    const adapter = new GatedProviderAuthRuntimeProfileFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-runtime-profile",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider runtime profile",
+      providerId: "provider-a",
+      modelId: "model-a",
+      effort: "medium",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+
+    const mutation = fixture.host.setSessionRuntimeControl({
+      sessionId,
+      expectedGeneration: 0,
+      patch: { providerId: "provider-b", modelId: "model-b" }
+    });
+    await adapter.setModelGate.entered;
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-b");
+    adapter.setModelGate.release();
+
+    await expect(mutation).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+    expect(adapter.setModelCalls).toBe(1);
+    expect(adapter.closeCalls).toBe(1);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
+    expect(fixture.host.getSessionRuntimeControl(sessionId).effective).toMatchObject({
+      providerId: "provider-a",
+      modelId: "model-a"
+    });
+  });
+
+  it("preserves a native-accepted owner instead of invalidating it during auth reconciliation", async () => {
+    const adapter = new ProviderAuthRuntimeRetirementFakeAdapter();
+    adapter.holdNativeAcceptance = true;
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-native-owner",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider native owner",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const owned = fixture.host.enqueueInput({
+      operationId: "provider-auth-native-owned-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "native accepted", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getQueueItem(owned.value.queueItemId).state === "backend_accepted");
+    adapter.holdNativeAcceptance = false;
+    const unknownSessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-unknown-owner",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider unknown owner",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    adapter.injectFault(unknownSessionId, "dispatch_unknown");
+    const unknown = fixture.host.enqueueInput({
+      operationId: "provider-auth-unknown-owned-input",
+      connection: fixture.connection,
+      sessionId: unknownSessionId,
+      prompt: { text: "native outcome unknown", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getQueueItem(unknown.value.queueItemId).state === "dispatch_unknown");
+
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    availableProviderIds.add("provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    const authenticationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(adapter.id, "provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", authenticationEvidence);
+
+    expect(fixture.store.getQueueItem(owned.value.queueItemId).state).toBe("backend_accepted");
+    expect(fixture.store.getRun(owned.value.runId).descriptor.state).toBe("running");
+    expect(fixture.store.getQueueItem(unknown.value.queueItemId).state).toBe("dispatch_unknown");
+    expect(fixture.store.getRun(unknown.value.runId).descriptor.state).toBe("dispatch_unknown");
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.host.isSessionActive(unknownSessionId)).toBe(true);
+    expect(adapter.resumeCalls).toBe(0);
+
+    const afterOwner = fixture.host.enqueueInput({
+      operationId: "provider-auth-after-native-owner",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "after native owner", images: [], files: [], mentions: [], disposition: "follow_up" }
+    });
+    expect(fixture.store.getQueueItem(afterOwner.value.queueItemId).state).toBe("accepted");
+    await adapter.settleHeld(sessionId);
+    await eventually(() => fixture.store.getRun(afterOwner.value.runId).descriptor.state === "completed");
+    expect(adapter.resumeCalls).toBe(1);
+  });
+
+  it("keeps a claimed Provider route exact when a later runtime switch is deferred", async () => {
+    const adapter = new ProviderAuthRuntimeRetirementFakeAdapter();
+    adapter.holdNativeAcceptance = true;
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-deferred-route-owner",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Deferred route owner",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const owned = fixture.host.enqueueInput({
+      operationId: "provider-auth-deferred-route-owned-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "native accepted on a", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getQueueItem(owned.value.queueItemId).state === "backend_accepted");
+
+    await expect(fixture.host.setSessionRuntimeControl({
+      sessionId,
+      expectedGeneration: fixture.host.getSessionRuntimeControl(sessionId).generation,
+      patch: { providerId: "provider-b", modelId: "model-b" }
+    })).resolves.toMatchObject({
+      status: "deferred",
+      effective: { providerId: "provider-a" },
+      pending: { profile: { providerId: "provider-b" } }
+    });
+
+    availableProviderIds.delete("provider-b");
+    const siblingRetirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-b");
+    fixture.host.completeBackendProviderAuthenticationRetirement(siblingRetirement);
+    await adapter.settleHeld(sessionId);
+    await eventually(() => fixture.store.getRun(owned.value.runId).descriptor.state === "completed");
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(adapter.resumeCalls).toBe(0);
+
+    const nextOwned = fixture.host.enqueueInput({
+      operationId: "provider-auth-deferred-route-next-owned-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "explicit a while b remains pending", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-a", modelId: "model-a" }
+    });
+    await eventually(() => fixture.store.getQueueItem(nextOwned.value.queueItemId).state === "backend_accepted");
+    availableProviderIds.delete("provider-a");
+    const ownerRetirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(ownerRetirement);
+    await fixture.host.abort(sessionId, nextOwned.value.runId);
+    await eventually(() => fixture.store.getRun(nextOwned.value.runId).descriptor.state === "aborted");
+    expect(adapter.abortCalls).toBe(1);
+  });
+
+  it("allows only the exact retained native owner to abort while its Provider fence remains", async () => {
+    const adapter = new ProviderAuthRuntimeRetirementFakeAdapter();
+    adapter.holdNativeAcceptance = true;
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const create = async (operationId: string, providerId: string, modelId: string) => (await fixture.host.createSession({
+      operationId,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: operationId,
+      providerId,
+      modelId,
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const targetSessionId = await create("create-provider-auth-abort-target", "provider-b", "model-b");
+    const siblingSessionId = await create("create-provider-auth-abort-sibling", "provider-b", "model-b");
+    const owned = fixture.host.enqueueInput({
+      operationId: "provider-auth-abort-owned-input",
+      connection: fixture.connection,
+      sessionId: targetSessionId,
+      prompt: { text: "native accepted", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-a", modelId: "model-a" }
+    });
+    await eventually(() => fixture.store.getQueueItem(owned.value.queueItemId).state === "backend_accepted");
+
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    const blocked = fixture.host.enqueueInput({
+      operationId: "provider-auth-abort-blocked-input",
+      connection: fixture.connection,
+      sessionId: targetSessionId,
+      prompt: { text: "must stay blocked", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-a", modelId: "model-a" }
+    });
+    await eventually(() => fixture.store.getQueueItem(blocked.value.queueItemId).state === "failed");
+    expect(fixture.store.getQueueItem(blocked.value.queueItemId)).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    expect(fixture.store.getRun(blocked.value.runId).descriptor).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    expect(fixture.store.getAttempt(blocked.value.attemptId).descriptor).toMatchObject({
+      endedAt: expect.any(Number),
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    const blockedReplay = fixture.host.enqueueInput({
+      operationId: "provider-auth-abort-blocked-input",
+      connection: fixture.connection,
+      sessionId: targetSessionId,
+      prompt: { text: "must stay blocked", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-a", modelId: "model-a" }
+    });
+    expect(blockedReplay).toMatchObject({ replayed: true, value: blocked.value });
+    expect(adapter.sendCalls).toBe(1);
+
+    await fixture.host.abort(targetSessionId, owned.value.runId);
+    await eventually(() => fixture.store.getRun(owned.value.runId).descriptor.state === "aborted");
+    expect(adapter.abortCalls).toBe(1);
+    expect(fixture.host.isSessionActive(targetSessionId)).toBe(false);
+    await expect(fixture.host.abort(targetSessionId, owned.value.runId)).rejects.toMatchObject({
+      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+    });
+
+    adapter.holdNativeAcceptance = false;
+    const sibling = fixture.host.enqueueInput({
+      operationId: "provider-auth-abort-sibling-input",
+      connection: fixture.connection,
+      sessionId: siblingSessionId,
+      prompt: { text: "independent sibling", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(sibling.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(2);
+  });
+
+  it("does not strand accepted work when a retained auth invalidation becomes irrelevant after a route change", async () => {
+    const adapter = new ProviderAuthRuntimeRetirementFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-route-invalidation",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider route invalidation",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    adapter.injectFault(sessionId, "dispatch_unknown");
+    const unknown = fixture.host.enqueueInput({
+      operationId: "provider-auth-route-unknown",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "unknown route", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getQueueItem(unknown.value.queueItemId).state === "dispatch_unknown");
+    availableProviderIds.delete("provider-a");
+    const retirement = fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    availableProviderIds.add("provider-a");
+    fixture.host.completeBackendProviderAuthenticationRetirement(retirement);
+    const authenticationEvidence = fixture.host.beginBackendProviderAuthenticationEvidence(adapter.id, "provider-a");
+    fixture.host.reconcileBackendProviderAuthentication(adapter.id, "provider-a", authenticationEvidence);
+
+    adapter.clearFault(sessionId);
+    await fixture.host.applySessionSettings(sessionId, { providerId: "provider-b", modelId: "model-b" });
+    const stored = fixture.store.getSession(sessionId);
+    fixture.store.updateSession(
+      sessionId,
+      { providerId: "provider-b", modelId: "model-b" },
+      stored.revision
+    );
+    fixture.host.recordUserSessionRuntimeSelection(sessionId);
+    const reconciledFailure = {
+      code: "DISPATCH_OUTCOME_RECONCILED",
+      message: "The prior native dispatch was reconciled independently.",
+      phase: "dispatch",
+      retryable: false,
+      stateMayHaveChanged: true,
+      recovery: "Submit new work explicitly."
+    } as const;
+    fixture.store.updateQueueState({
+      queueItemId: unknown.value.queueItemId,
+      state: "failed",
+      attemptId: unknown.value.attemptId,
+      error: reconciledFailure,
+      traceId: "test:provider-auth:unknown-reconciled"
+    });
+    fixture.store.updateRunState({
+      runId: unknown.value.runId,
+      state: "failed",
+      activeAttemptId: unknown.value.attemptId,
+      error: reconciledFailure,
+      traceId: "test:provider-auth:unknown-run-reconciled"
+    });
+    fixture.store.finishAttempt(unknown.value.attemptId, reconciledFailure);
+
+    const next = fixture.host.enqueueInput({
+      operationId: "provider-auth-new-route-after-invalidation",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "new route", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(next.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(2);
+  });
+
+  it("fences a claimed pre-send turn without calling the Adapter and preserves the independent route", async () => {
+    const adapter = new ProviderAuthFenceFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const capture = new GatedWorkspaceRunCapture();
+    const fixture = await createFixture(adapter, {
+      workspaceCapture: capture,
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-claimed",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Claimed auth fence",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const queued = fixture.host.enqueueInput({
+      operationId: "provider-auth-claimed-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "claimed before logout", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await capture.beforeRunGate.entered;
+
+    availableProviderIds.delete("provider-a");
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    capture.beforeRunGate.release();
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "failed");
+
+    expect(adapter.sendCalls).toBe(0);
+    expect(fixture.store.getQueueItem(queued.value.queueItemId)).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+  });
+
+  it("resolves auth admission from turn override before runtime control and durable baseline", async () => {
+    const adapter = new ProviderAuthFenceFakeAdapter();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds })
+    });
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-provider-auth-route-order",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Provider route order",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const snapshot = fixture.host.getSessionRuntimeControl(sessionId);
+    await expect(fixture.host.setSessionRuntimeControl({
+      sessionId,
+      expectedGeneration: snapshot.generation,
+      patch: { providerId: "provider-b", modelId: "model-b" }
+    })).resolves.toMatchObject({ status: "applied", effective: { providerId: "provider-b" } });
+
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a");
+    const effectiveRuntime = fixture.host.enqueueInput({
+      operationId: "provider-auth-effective-runtime",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "runtime provider wins", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(effectiveRuntime.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(1);
+
+    const revokedOverride = fixture.host.enqueueInput({
+      operationId: "provider-auth-turn-override-wins",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "revoked override", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-a", modelId: "model-a" }
+    });
+    await eventually(() => fixture.store.getQueueItem(revokedOverride.value.queueItemId).state === "failed");
+    expect(fixture.store.getQueueItem(revokedOverride.value.queueItemId)).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    expect(fixture.store.getRun(revokedOverride.value.runId).descriptor).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    expect(fixture.store.getAttempt(revokedOverride.value.attemptId).descriptor).toMatchObject({
+      endedAt: expect.any(Number),
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    const replay = fixture.host.enqueueInput({
+      operationId: "provider-auth-turn-override-wins",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "revoked override", images: [], files: [], mentions: [], disposition: "prompt" },
+      overrides: { providerId: "provider-a", modelId: "model-a" }
+    });
+    expect(replay.replayed).toBe(true);
+    expect(replay.value).toEqual(revokedOverride.value);
+    expect(adapter.sendCalls).toBe(1);
+  });
+
+  it("admits an authenticated managed route when aggregate Backend auth is signed out", async () => {
+    const adapter = new ProviderAuthFenceFakeAdapter(true);
+    const availableProviderIds = new Set(["provider-b"]);
+    const fixture = await createFixture(adapter, {
+      sessionRuntimeFallbackContext: () => ({
+        availableProviderIds,
+        explicitDefault: { providerId: "provider-b", modelId: "model-b" }
+      })
+    });
+
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-managed-route-while-native-signed-out",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Managed route",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({
+      providerId: "provider-b",
+      modelId: "model-b"
+    });
+    const sent = fixture.host.enqueueInput({
+      operationId: "managed-route-input",
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "managed auth", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await eventually(() => fixture.store.getRun(sent.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(1);
+
+    const resolveNativeSessionReference = vi.spyOn(adapter, "resolveNativeSessionReference");
+    const attachedSessionId = (await fixture.host.createSession({
+      operationId: "attach-managed-route-while-native-signed-out",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Attached managed route",
+      providerId: "provider-b",
+      modelId: "model-b",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false,
+      nativeStart: { kind: "attach", nativeReference: "fake://discovery/resumable" }
+    })).value.sessionId;
+    expect(fixture.store.getSession(attachedSessionId).descriptor).toMatchObject({
+      providerId: "provider-b",
+      modelId: "model-b"
+    });
+    expect(resolveNativeSessionReference).toHaveBeenCalled();
+
+    await expect(fixture.host.createSession({
+      operationId: "create-revoked-explicit-route",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Revoked route",
+      providerId: "provider-a",
+      modelId: "model-a",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).rejects.toMatchObject({
+      storedError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
   });
 
   it("keeps an idle prompt durably accepted throughout manual compaction, then dispatches it exactly once", async () => {
@@ -8404,6 +9507,554 @@ describe("SessionHost", () => {
       .toHaveLength(1);
   });
 
+  it("orders an Adapter-owned derivation around Product adoption before reporting success", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "owned-lifecycle-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "owned-lifecycle-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const operationId = "owned-lifecycle-derive";
+    const observed: string[] = [];
+    adapter.beforeDurableFork = () => {
+      const prepared = fixture.store.findNativeSessionDerivation(operationId);
+      expect(prepared).toMatchObject({
+        state: "prepared",
+        externalLifecycle: true
+      });
+      expect(prepared?.binding).toBeUndefined();
+      expect(fixture.store.getOperation(operationId).status).toBe("started");
+      observed.push("prepared");
+    };
+    adapter.afterFork = async () => {
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "recorded",
+        externalLifecycle: true,
+        binding: expect.objectContaining({ opaqueRef: expect.stringContaining("/fork/root") })
+      });
+      expect(fixture.store.getOperation(operationId).status).toBe("started");
+      observed.push("recorded");
+    };
+    adapter.onAdopt = (lifecycle) => {
+      const product = fixture.store.getSession(lifecycle.sessionId);
+      expect(product.descriptor.binding).toEqual(lifecycle.binding);
+      expect(fixture.store.getOperation(operationId).status).toBe("completed");
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "product_adopted",
+        binding: lifecycle.binding
+      });
+      observed.push("product_adopted");
+    };
+
+    const derived = await fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Durably owned child",
+      kind: "fork",
+      entryId: "root",
+      sourceMessage: { messageId: "owned-lifecycle-message", eventId: "owned-lifecycle-message" }
+    });
+
+    expect(observed).toEqual(["prepared", "recorded", "product_adopted"]);
+    expect(adapter.adoptCalls).toHaveLength(1);
+    expect(adapter.cleanupCalls).toHaveLength(0);
+    expect(fixture.store.getSession(derived.value.sessionId).descriptor.binding)
+      .toEqual(adapter.adoptCalls[0]?.binding);
+    expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+      state: "adopted",
+      externalLifecycle: true,
+      adoptedAt: expect.any(Number)
+    });
+  });
+
+  it("retries only Adapter adoption after Product commit without replaying the native derivation", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 1;
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "adoption-retry-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "adoption-retry-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const input = {
+      operationId: "adoption-retry-derive",
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Committed before adoption",
+      kind: "fork" as const,
+      entryId: "root",
+      sourceMessage: { messageId: "adoption-retry-message", eventId: "adoption-retry-message" }
+    };
+
+    await expect(fixture.host.deriveSession(input)).rejects.toThrow("Adapter adoption failed");
+    const pendingAdoption = fixture.store.findNativeSessionDerivation(input.operationId)!;
+    expect(fixture.store.getOperation(input.operationId).status).toBe("completed");
+    expect(fixture.store.getSession(pendingAdoption.sessionId).descriptor.binding)
+      .toEqual(pendingAdoption.binding);
+    expect(pendingAdoption).toMatchObject({ state: "product_adopted", externalLifecycle: true });
+    expect(adapter.forkCalls).toBe(1);
+    expect(adapter.adoptCalls).toHaveLength(1);
+
+    const replay = await fixture.host.deriveSession(input);
+
+    expect(replay).toMatchObject({ replayed: true, value: { sessionId: pendingAdoption.sessionId } });
+    expect(adapter.forkCalls).toBe(1);
+    expect(adapter.adoptCalls).toHaveLength(2);
+    expect(adapter.cleanupCalls).toHaveLength(0);
+    expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("adopted");
+  });
+
+  it("adopts a Product-committed derivation before activation and detached deletion", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "adoption-use-gate-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+
+    adapter.adoptionFailuresRemaining = 1;
+    const resumeOperationId = "adoption-use-gate-resume";
+    await expect(fixture.host.deriveSession({
+      operationId: resumeOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Resume-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const resumePending = fixture.store.findNativeSessionDerivation(resumeOperationId)!;
+    const resumeNative = vi.spyOn(adapter, "resumeSession");
+
+    await fixture.host.resume(resumePending.sessionId);
+
+    expect(fixture.store.findNativeSessionDerivation(resumeOperationId)?.state).toBe("adopted");
+    expect(adapter.adoptCalls.filter((call) => call.operationId === resumeOperationId)).toHaveLength(2);
+    expect(resumeNative).toHaveBeenCalledOnce();
+
+    adapter.adoptionFailuresRemaining = 2;
+    const deleteOperationId = "adoption-use-gate-delete";
+    await expect(fixture.host.deriveSession({
+      operationId: deleteOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Delete-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const deletePending = fixture.store.findNativeSessionDerivation(deleteOperationId)!;
+    const deleteNative = vi.spyOn(adapter, "deleteSession");
+
+    await expect(fixture.host.deleteNativeSession(deletePending.sessionId)).rejects.toThrow("Adapter adoption failed");
+    expect(deleteNative).not.toHaveBeenCalled();
+    expect(fixture.store.findNativeSessionDerivation(deleteOperationId)?.state).toBe("product_adopted");
+
+    await fixture.host.deleteNativeSession(deletePending.sessionId);
+    expect(fixture.store.findNativeSessionDerivation(deleteOperationId)?.state).toBe("adopted");
+    expect(deleteNative).toHaveBeenCalledOnce();
+  });
+
+  it("settles pending native adoption before claiming a task lifecycle operation", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 2;
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "adoption-lifecycle-gate-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const derivationOperationId = "adoption-lifecycle-gate-derive";
+    await expect(fixture.host.deriveSession({
+      operationId: derivationOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Lifecycle-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const pending = fixture.store.findNativeSessionDerivation(derivationOperationId)!;
+    const lifecycleEffect = vi.fn(async () => undefined);
+    const lifecycleInput = {
+      operationId: "adoption-lifecycle-gate-archive",
+      connection: fixture.connection,
+      kind: "archiveSession",
+      body: { sessionId: pending.sessionId },
+      sessionLifecycleFenceId: pending.sessionId,
+      effect: lifecycleEffect,
+      commit: () => ({ accepted: true as const })
+    };
+
+    await expect(fixture.host.mutate(lifecycleInput)).rejects.toThrow("Adapter adoption failed");
+    expect(lifecycleEffect).not.toHaveBeenCalled();
+    expect(fixture.store.findOperation(lifecycleInput.operationId)).toBeUndefined();
+    expect(fixture.store.findNativeSessionDerivation(derivationOperationId)?.state).toBe("product_adopted");
+
+    await expect(fixture.host.mutate(lifecycleInput)).resolves.toMatchObject({
+      replayed: false,
+      value: { accepted: true }
+    });
+    expect(lifecycleEffect).toHaveBeenCalledOnce();
+    expect(fixture.store.findNativeSessionDerivation(derivationOperationId)?.state).toBe("adopted");
+  });
+
+  it("fails and cleans an Adapter-owned navigation that returns in-place after durable prepare", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "owned-navigation-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Navigation source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const operationId = "owned-navigation-in-place";
+
+    await expect(fixture.host.navigateTree(
+      sessionId,
+      { kind: "native_entry", entryId: "root" },
+      false,
+      undefined,
+      undefined,
+      { connection: fixture.connection, operationId, protocol: { kind: "internal" } }
+    )).rejects.toMatchObject({ storedError: expect.objectContaining({ code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" }) });
+
+    expect(adapter.cleanupCalls.map((call) => call.operationId)).toContain(operationId);
+    const cleaned = fixture.store.findNativeSessionDerivation(operationId);
+    expect(cleaned).toMatchObject({
+      state: "cleaned",
+      externalLifecycle: true
+    });
+    expect(cleaned?.binding).toBeUndefined();
+  });
+
+  it("recovers Adapter-owned prepared, recorded, and Product-adopted derivations without retrying unknown cleanup", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 1;
+    const fixture = await createFixture(adapter);
+    const attemptGeneration = fixture.store.getBackend(adapter.id).descriptor.instanceGeneration;
+    const sourceId = (await fixture.host.createSession({
+      operationId: "owned-recovery-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const productAdoptionOperationId = "owned-recovery-product-adopted";
+    await expect(fixture.host.deriveSession({
+      operationId: productAdoptionOperationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Committed child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+
+    const prepare = (operationId: string, binding?: NativeSessionBinding) => {
+      const source = fixture.store.getSession(sourceId);
+      const target = fixture.store.getTarget(source.descriptor.targetId);
+      const claim = fixture.store.claimAuthorizedDeferredEffectOperation(
+        fixture.connection.id,
+        fixture.connection.authKeyDigest,
+        { id: operationId, kind: "clone_session", body: { sourceSessionId: sourceId } }
+      );
+      const common = {
+        operationId,
+        expectedBodyHash: claim.operation.bodyHash,
+        sourceSessionId: sourceId,
+        sourceBinding: source.descriptor.binding,
+        sessionId: `child-${operationId}`,
+        backendId: source.descriptor.backendId,
+        backendInstanceGeneration: fixture.store.getBackend(source.descriptor.backendId).descriptor.instanceGeneration,
+        targetId: source.descriptor.targetId,
+        effectiveWorkspaceRoot: target.descriptor.workspaceRoot
+      };
+      const prepared = fixture.store.prepareNativeSessionDerivation({
+        ...common,
+        sourceSessionRevision: source.revision,
+        targetRevision: target.revision
+      });
+      const record = binding === undefined
+        ? prepared
+        : fixture.store.recordNativeSessionDerivation({ ...common, binding });
+      return { claim, record };
+    };
+    const preparedOperationId = "owned-recovery-prepared";
+    const recordedOperationId = "owned-recovery-recorded";
+    const cleanupUnknownOperationId = "owned-recovery-cleanup-unknown";
+    prepare(preparedOperationId);
+    const recordedBinding = {
+      opaqueRef: "fake://recovery/recorded",
+      nativeSessionId: "owned-recovery-recorded-native",
+      generation: 0
+    };
+    prepare(recordedOperationId, recordedBinding);
+    const unknown = prepare(cleanupUnknownOperationId);
+    fixture.store.failEffectOperation(
+      cleanupUnknownOperationId,
+      unknown.claim.operation.bodyHash,
+      new Error("Prepared effect outcome is unknown.")
+    );
+    const unknownCleanup = fixture.store.claimNativeSessionDerivationCleanup({
+      operationId: cleanupUnknownOperationId,
+      expectedRevision: unknown.record.revision
+    });
+    fixture.store.finishNativeSessionDerivationCleanup({
+      operationId: cleanupUnknownOperationId,
+      token: unknownCleanup.token,
+      outcome: "cleanup_unknown",
+      failureCode: "native_cleanup_unknown"
+    });
+
+    await fixture.host.dispose();
+    const recoveryGeneration = advanceBackendInstanceGeneration(fixture.store, adapter.id);
+    expect(recoveryGeneration).toBe(attemptGeneration + 1);
+    const recoveryDescriptor = fixture.store.getBackend(adapter.id).descriptor;
+    const recoveredAdapter = new AdapterOwnedDerivationFakeAdapter();
+    const cloneNative = vi.spyOn(recoveredAdapter, "clone");
+    const resumeNative = vi.spyOn(recoveredAdapter, "resumeSession");
+    const restarted = new SessionHost(fixture.store, fixture.artifacts, [recoveredAdapter], {
+      backendDescriptors: [recoveryDescriptor],
+      backendDescriptorsAlreadyPublished: true
+    });
+    try {
+      await restarted.initialize();
+
+      expect(fixture.store.findNativeSessionDerivation(preparedOperationId)).toMatchObject({
+        state: "cleaned",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(fixture.store.findNativeSessionDerivation(recordedOperationId)).toMatchObject({
+        state: "cleaned",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(fixture.store.findNativeSessionDerivation(productAdoptionOperationId)).toMatchObject({
+        state: "adopted",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(fixture.store.findNativeSessionDerivation(cleanupUnknownOperationId)).toMatchObject({
+        state: "cleanup_unknown",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: attemptGeneration
+      });
+      expect(recoveredAdapter.cleanupCalls.map((lifecycle) => lifecycle.operationId).sort())
+        .toEqual([preparedOperationId, recordedOperationId].sort());
+      expect(recoveredAdapter.cleanupCalls.find((lifecycle) => lifecycle.operationId === preparedOperationId)?.binding)
+        .toBeUndefined();
+      expect(recoveredAdapter.cleanupCalls.find((lifecycle) => lifecycle.operationId === recordedOperationId)?.binding)
+        .toEqual(recordedBinding);
+      expect(recoveredAdapter.adoptCalls.map((lifecycle) => lifecycle.operationId))
+        .toEqual([productAdoptionOperationId]);
+      expect(cloneNative).not.toHaveBeenCalled();
+      expect(resumeNative).not.toHaveBeenCalled();
+      expect(fixture.store.getOperation(preparedOperationId)).toMatchObject({
+        status: "failed",
+        error: { code: "EFFECT_OUTCOME_UNKNOWN" }
+      });
+      expect(fixture.store.getOperation(recordedOperationId)).toMatchObject({
+        status: "failed",
+        error: { code: "EFFECT_OUTCOME_UNKNOWN" }
+      });
+    } finally {
+      await restarted.dispose();
+    }
+  });
+
+  it("keeps replacement and native use gated while a successor generation adopts a Product-committed derivation", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.adoptionFailuresRemaining = 1;
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "successor-adoption-gate-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const operationId = "successor-adoption-gate-derive";
+    await expect(fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Successor-gated child",
+      kind: "clone"
+    })).rejects.toThrow("Adapter adoption failed");
+    const pending = fixture.store.findNativeSessionDerivation(operationId)!;
+    const attemptGeneration = pending.backendInstanceGeneration;
+
+    await fixture.host.dispose();
+    const recoveryGeneration = advanceBackendInstanceGeneration(fixture.store, adapter.id);
+    expect(recoveryGeneration).toBe(attemptGeneration + 1);
+    const recoveredAdapter = new AdapterOwnedDerivationFakeAdapter();
+    recoveredAdapter.adoptionFailuresRemaining = 1;
+    const resumeNative = vi.spyOn(recoveredAdapter, "resumeSession");
+    recoveredAdapter.onAdopt = () => {
+      expect(resumeNative).not.toHaveBeenCalled();
+    };
+    const restarted = new SessionHost(fixture.store, fixture.artifacts, [recoveredAdapter], {
+      backendDescriptors: [fixture.store.getBackend(adapter.id).descriptor],
+      backendDescriptorsAlreadyPublished: true
+    });
+    try {
+      await restarted.initialize();
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "product_adopted",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(() => fixture.store.recordNativeSessionDerivation({
+        operationId: pending.operationId,
+        expectedBodyHash: pending.expectedBodyHash,
+        sourceSessionId: pending.sourceSessionId,
+        sourceBinding: pending.sourceBinding,
+        sessionId: pending.sessionId,
+        backendId: pending.backendId,
+        backendInstanceGeneration: attemptGeneration,
+        targetId: pending.targetId,
+        effectiveWorkspaceRoot: pending.effectiveWorkspaceRoot,
+        binding: pending.binding!
+      })).toThrow("stale Backend generation");
+
+      const replacementEffect = vi.fn(async () => undefined);
+      await expect(restarted.replaceBackendInstance({
+        backendId: adapter.id,
+        expectedCurrentGeneration: recoveryGeneration,
+        perform: replacementEffect
+      })).rejects.toThrow("durable native derivation lifecycle is unresolved");
+      expect(replacementEffect).not.toHaveBeenCalled();
+
+      await restarted.resume(pending.sessionId);
+
+      expect(fixture.store.findNativeSessionDerivation(operationId)).toMatchObject({
+        state: "adopted",
+        backendInstanceGeneration: attemptGeneration,
+        lifecycleOwnerGeneration: recoveryGeneration
+      });
+      expect(recoveredAdapter.adoptCalls.map((lifecycle) => lifecycle.operationId))
+        .toEqual([operationId, operationId]);
+      expect(resumeNative).toHaveBeenCalledOnce();
+    } finally {
+      await restarted.dispose();
+    }
+  });
+
+  it("cleans an Adapter-owned prepared attempt without requiring a reserved binding", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.forkFailure = new Error("Fork failed before reserving a child.");
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "prepared-cleanup-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "prepared-cleanup-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const operationId = "prepared-cleanup-derive";
+
+    await expect(fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Never reserved",
+      kind: "fork",
+      entryId: "root",
+      sourceMessage: { messageId: "prepared-cleanup-message", eventId: "prepared-cleanup-message" }
+    })).rejects.toMatchObject({ storedError: { message: "Fork failed before reserving a child." } });
+
+    expect(adapter.cleanupCalls).toHaveLength(1);
+    expect(adapter.cleanupCalls[0]).toMatchObject({ operationId, sessionId: expect.any(String) });
+    expect(adapter.cleanupCalls[0]?.binding).toBeUndefined();
+    const cleaned = fixture.store.findNativeSessionDerivation(operationId);
+    expect(cleaned).toMatchObject({
+      state: "cleaned",
+      externalLifecycle: true
+    });
+    expect(cleaned?.binding).toBeUndefined();
+  });
+
+  it("blocks Backend replacement while an Adapter-owned cleanup outcome remains durably unknown", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    adapter.forkFailure = new Error("Fork failed before reserving a child.");
+    adapter.cleanupFailure = new Error("Cleanup acknowledgement was lost.");
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "unresolved-lifecycle-source",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceId, "unresolved-lifecycle-message", 10, {
+      type: "message_complete",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Durable source boundary" }]
+    });
+    const operationId = "unresolved-lifecycle-derive";
+    await expect(fixture.host.deriveSession({
+      operationId,
+      connection: fixture.connection,
+      sourceSessionId: sourceId,
+      title: "Unknown cleanup",
+      kind: "fork",
+      entryId: "root",
+      sourceMessage: { messageId: "unresolved-lifecycle-message", eventId: "unresolved-lifecycle-message" }
+    })).rejects.toMatchObject({ storedError: { message: "Fork failed before reserving a child." } });
+    const unresolved = fixture.store.findNativeSessionDerivation(operationId);
+    expect(unresolved).toMatchObject({ state: "cleanup_unknown" });
+    expect(unresolved?.binding).toBeUndefined();
+
+    const current = fixture.store.getBackend(adapter.id).descriptor;
+    const perform = vi.fn(async () => undefined);
+    await expect(fixture.host.replaceBackendInstance({
+      backendId: adapter.id,
+      expectedCurrentGeneration: current.instanceGeneration,
+      perform
+    })).rejects.toThrow("durable native derivation lifecycle is unresolved");
+    expect(perform).not.toHaveBeenCalled();
+    expect(adapter.cleanupCalls).toHaveLength(1);
+  });
+
   it.each(["native_validation", "authorization", "source_deleted", "store_commit"] as const)(
     "cleans only the registered derived binding after %s fails and preserves source emissions",
     async (failurePoint) => {
@@ -8435,11 +10086,12 @@ describe("SessionHost", () => {
       };
       await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
       const receipt = fixture.store.findNativeSessionDerivation(input.operationId)!;
+      const receiptBinding = receipt.binding!;
       expect(receipt.state).toBe("cleaned");
-      expect(receipt.binding.opaqueRef).not.toBe(sourceBinding.opaqueRef);
+      expect(receiptBinding.opaqueRef).not.toBe(sourceBinding.opaqueRef);
       expect(deleteNative).toHaveBeenCalledOnce();
-      expect(deleteNative).toHaveBeenCalledWith(receipt.binding, expect.objectContaining({
-        sessionId: receipt.sessionId, binding: receipt.binding, generation: receipt.binding.generation,
+      expect(deleteNative).toHaveBeenCalledWith(receiptBinding, expect.objectContaining({
+        sessionId: receipt.sessionId, binding: receiptBinding, generation: receiptBinding.generation,
         operationId: input.operationId, target: expect.objectContaining({ workspaceRoot: fixture.directory })
       }));
       expect(fixture.store.listSessions({ includeDeleted: true, includeArchived: true })).toHaveLength(1);
@@ -8613,7 +10265,7 @@ describe("SessionHost", () => {
           const perform = vi.fn(async () => undefined);
           await expect(fixture.host.replaceBackendInstance({
             backendId: adapter.id, expectedCurrentGeneration: current.instanceGeneration, perform
-          })).rejects.toThrow("derived native cleanup has not settled");
+          })).rejects.toThrow("durable native derivation lifecycle is unresolved");
           expect(perform).not.toHaveBeenCalled();
           await expect(fixture.host.deriveSession(input)).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
         }
@@ -8667,11 +10319,15 @@ describe("SessionHost", () => {
       await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
         storedError: { message: "Original derived validation failure." }
       });
-      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_claimed");
+      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe(
+        cleanupOutcome === "resolved" ? "workspace_cleanup_pending" : "cleanup_claimed"
+      );
       finish.mockRestore();
       diagnostic.mockRestore();
       fixture.store.recoverStartup();
-      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe("cleanup_unknown");
+      expect(fixture.store.findNativeSessionDerivation(input.operationId)?.state).toBe(
+        cleanupOutcome === "resolved" ? "workspace_cleanup_pending" : "cleanup_unknown"
+      );
       await expect(fixture.host.deriveSession(input)).rejects.toMatchObject({
         storedError: { message: "Original derived validation failure." }
       });
@@ -8708,6 +10364,36 @@ describe("SessionHost", () => {
     expect(cloneNative).not.toHaveBeenCalled();
     expect(adapter.forkCalls).toBe(0);
     expect(fixture.store.getSession(source.descriptor.id).descriptor.worktree).toEqual(source.descriptor.worktree);
+  });
+
+  it("does not treat a local workspace capability as remote derivation authority", async () => {
+    const adapter = new GatedFakeAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "workspace.derive", supported: true }]
+    });
+    const fixture = await createFixture(adapter);
+    await fixture.host.registerTarget({
+      id: "remote-derive-target",
+      backendId: adapter.id,
+      displayName: "Remote source",
+      workspaceRoot: "/workspace",
+      remoteWorkspace: { hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" },
+      managed: true,
+      trusted: true
+    });
+    const sourceId = (await fixture.host.createSession({
+      operationId: "remote-derive-source", connection: fixture.connection,
+      targetId: "remote-derive-target", title: "Source", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const cloneNative = vi.spyOn(adapter, "clone");
+    await expect(fixture.host.deriveSession({
+      operationId: "remote-derive-without-coordinator", connection: fixture.connection,
+      sourceSessionId: sourceId, title: "Derived", kind: "clone"
+    })).rejects.toMatchObject({
+      publicError: { code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED", stateMayHaveChanged: false }
+    });
+    expect(cloneNative).not.toHaveBeenCalled();
   });
 
   it("snapshots a private append prompt and safely advances a service-owned runtime identity", async () => {
@@ -12186,6 +13872,7 @@ async function createFixture(
     readonly workspaceCapture?: WorkspaceRunCapture;
     readonly worktrees?: SessionWorktreeCoordinator;
     readonly closeSessionTerminals?: (sessionId: string) => Promise<void>;
+    readonly onSessionRuntimeClosed?: (sessionId: string) => void;
     readonly monotonicNow?: () => number;
     readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
     readonly runSilenceTimeoutMs?: number;
@@ -12506,6 +14193,172 @@ class SendCountingFakeAdapter extends FakeBackendAdapter {
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     this.sendCalls += 1;
     await super.send(input, context);
+  }
+}
+
+class ProviderAuthFenceFakeAdapter extends SendCountingFakeAdapter {
+  readonly aggregateSignedOut: boolean;
+
+  constructor(aggregateSignedOut = false) {
+    super(PROVIDER_AUTH_FENCE_PROFILE);
+    this.aggregateSignedOut = aggregateSignedOut;
+  }
+
+  override async describe() {
+    const descriptor = await super.describe();
+    return this.aggregateSignedOut
+      ? { ...descriptor, authenticationState: "signed_out" as const }
+      : descriptor;
+  }
+
+  async getNativeHistoryProjection(_context: AdapterContext): Promise<NativeHistoryProjection> {
+    return { events: [] };
+  }
+
+  override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+    const state = await super.inspectSession(binding, context);
+    return binding.opaqueRef === "fake://discovery/resumable"
+      ? { ...state, providerId: "provider-b", modelId: "model-b" }
+      : state;
+  }
+}
+
+class ProviderAuthEvidenceFakeAdapter extends ProviderAuthFenceFakeAdapter {
+  readonly #routeTokens = new Map<string, symbol>();
+  #publishedGenerationSequence = 0;
+
+  beginProviderAuthenticationReconciliation(providerId: string) {
+    return {
+      providerId,
+      routeToken: this.routeToken(providerId),
+      startedGenerationSequence: this.#publishedGenerationSequence
+    };
+  }
+
+  reconcileProviderAuthentication(providerId: string, evidence: unknown): boolean {
+    if (evidence === null || typeof evidence !== "object") return false;
+    const candidate = evidence as {
+      readonly providerId?: unknown;
+      readonly routeToken?: unknown;
+      readonly startedGenerationSequence?: unknown;
+    };
+    return candidate.providerId === providerId
+      && candidate.routeToken === this.routeToken(providerId)
+      && typeof candidate.startedGenerationSequence === "number"
+      && this.#publishedGenerationSequence > candidate.startedGenerationSequence;
+  }
+
+  revokeProviderRoute(providerId: string): void {
+    this.#routeTokens.set(providerId, Symbol("provider-authentication-route"));
+  }
+
+  publishManagedGeneration(): void {
+    this.#publishedGenerationSequence += 1;
+  }
+
+  private routeToken(providerId: string): symbol {
+    const current = this.#routeTokens.get(providerId);
+    if (current !== undefined) return current;
+    const created = Symbol("provider-authentication-route");
+    this.#routeTokens.set(providerId, created);
+    return created;
+  }
+}
+
+class GatedProviderAuthResumeFakeAdapter extends ProviderAuthFenceFakeAdapter {
+  readonly resumeGate = new AsyncGate();
+  resumeCalls = 0;
+  closeCalls = 0;
+
+  override async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+    this.resumeCalls += 1;
+    this.resumeGate.enter();
+    await this.resumeGate.wait;
+    return super.resumeSession(binding, context);
+  }
+
+  override async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+    this.closeCalls += 1;
+    await super.closeSession(binding, context);
+  }
+}
+
+class ProviderAuthRuntimeAxesFakeAdapter extends ProviderAuthFenceFakeAdapter {
+  setEffortCalls = 0;
+
+  override async setEffort(level: string, context: AdapterContext): Promise<void> {
+    this.setEffortCalls += 1;
+    await super.setEffort(level, context);
+  }
+}
+
+class GatedProviderAuthRuntimeProfileFakeAdapter extends ProviderAuthFenceFakeAdapter {
+  readonly setModelGate = new AsyncGate();
+  setModelCalls = 0;
+  closeCalls = 0;
+
+  override async setModel(providerId: string, modelId: string, context: AdapterContext) {
+    this.setModelCalls += 1;
+    this.setModelGate.enter();
+    await this.setModelGate.wait;
+    return super.setModel(providerId, modelId, context);
+  }
+
+  override async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+    this.closeCalls += 1;
+    await super.closeSession(binding, context);
+  }
+}
+
+class ProviderAuthRuntimeRetirementFakeAdapter extends ProviderAuthFenceFakeAdapter {
+  readonly retiredSessionIds = new Set<string>();
+  readonly heldContexts = new Map<string, AdapterContext>();
+  resumeCalls = 0;
+  abortCalls = 0;
+  holdNativeAcceptance = false;
+
+  retireRuntime(sessionId: string): void {
+    this.retiredSessionIds.add(sessionId);
+  }
+
+  async settleHeld(sessionId: string): Promise<void> {
+    const context = this.heldContexts.get(sessionId);
+    if (context === undefined) throw new Error("No Provider runtime acceptance is held.");
+    this.heldContexts.delete(sessionId);
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+
+  override async resumeSession(binding: NativeSessionBinding, context: AdapterContext) {
+    this.resumeCalls += 1;
+    this.retiredSessionIds.delete(context.sessionId);
+    return super.resumeSession(binding, context);
+  }
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    if (this.retiredSessionIds.has(context.sessionId)) {
+      throw new Error("retired Provider runtime was reused without resume");
+    }
+    if (this.holdNativeAcceptance) {
+      this.sendCalls += 1;
+      this.heldContexts.set(context.sessionId, context);
+      return;
+    }
+    await super.send(input, context);
+  }
+
+  override async abort(context: AdapterContext): Promise<void> {
+    this.abortCalls += 1;
+    await super.abort(context);
+  }
+}
+
+class GatedProviderAuthRuntimeSwitchFakeAdapter extends ProviderAuthRuntimeRetirementFakeAdapter {
+  readonly setModelGate = new AsyncGate();
+
+  override async setModel(providerId: string, modelId: string, context: AdapterContext) {
+    this.setModelGate.enter();
+    await this.setModelGate.wait;
+    return super.setModel(providerId, modelId, context);
   }
 }
 
@@ -14040,6 +15893,62 @@ class GatedFakeAdapter extends FakeBackendAdapter {
     const result = await super.fork(entryId, context, derivation);
     await this.afterFork?.();
     return this.forkEditorText === undefined ? result : { ...result, editorText: this.forkEditorText };
+  }
+}
+
+class AdapterOwnedDerivationFakeAdapter extends GatedFakeAdapter {
+  readonly adoptCalls: Array<NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding }> = [];
+  readonly cleanupCalls: NativeSessionDerivationLifecycle[] = [];
+  beforeDurableFork: ((derivation: NativeSessionDerivation) => Promise<void> | void) | undefined;
+  onAdopt: ((lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding }) => Promise<void> | void) | undefined;
+  onCleanup: ((lifecycle: NativeSessionDerivationLifecycle) => Promise<void> | void) | undefined;
+  adoptionFailuresRemaining = 0;
+  cleanupFailure: Error | undefined;
+
+  ownsNativeSessionDerivationLifecycle(_lifecycle: NativeSessionDerivationLifecycle): boolean {
+    return true;
+  }
+
+  async adoptNativeSessionDerivation(
+    lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding },
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    this.adoptCalls.push(lifecycle);
+    await this.onAdopt?.(lifecycle);
+    if (this.adoptionFailuresRemaining > 0) {
+      this.adoptionFailuresRemaining -= 1;
+      throw new Error("Adapter adoption failed.");
+    }
+  }
+
+  async cleanupNativeSessionDerivation(
+    lifecycle: NativeSessionDerivationLifecycle,
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    this.cleanupCalls.push(lifecycle);
+    await this.onCleanup?.(lifecycle);
+    if (this.cleanupFailure !== undefined) throw this.cleanupFailure;
+  }
+
+  override async fork(
+    entryId: string,
+    context: AdapterContext,
+    derivation: NativeSessionDerivation
+  ): Promise<NativeSessionForkResult> {
+    await this.beforeDurableFork?.(derivation);
+    return super.fork(entryId, context, derivation);
+  }
+
+  override async navigateTree(
+    _target: import("@joko/core").NativeNavigationTarget,
+    _summarize: boolean,
+    _context: AdapterContext,
+    _instructions: string | undefined,
+    _navigation: import("@joko/core").NativeSessionNavigation
+  ): Promise<import("@joko/core").NativeSessionNavigationResult> {
+    return { kind: "in_place" };
   }
 }
 

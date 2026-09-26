@@ -5,6 +5,7 @@ export const MANAGED_SUBAGENT_COMMAND_NAME = "subagents";
 export const MANAGED_SUBAGENT_CONTROL_COMMAND_NAME = "joko-stop-background-task";
 export const MANAGED_SUBAGENT_PRODUCT_SESSION_ENV = "JOKO_PI_PRODUCT_SESSION_ID";
 export const MANAGED_SUBAGENT_CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES";
+export const MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_PROVIDER_CREDENTIAL_ENV_NAMES";
 export const MANAGED_SUBAGENT_DEPTH_ENV = "JOKO_PI_SUBAGENT_DEPTH";
 export const MANAGED_SUBAGENT_PARENT_PID_ENV = "JOKO_PI_SUBAGENT_PARENT_PID";
 export const MANAGED_SUBAGENT_ACTIVITY_MARKER = "__jokoSubagentActivity";
@@ -52,6 +53,7 @@ const MARKER = "__jokoSubagentActivity";
 const DEPTH_ENV = "JOKO_PI_SUBAGENT_DEPTH";
 const PARENT_PID_ENV = "JOKO_PI_SUBAGENT_PARENT_PID";
 const CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES";
+const PROVIDER_CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_PROVIDER_CREDENTIAL_ENV_NAMES";
 const SOFT_LIMIT_ENV = "JOKO_PI_WORKER_SOFT_LIMIT";
 const HARD_LIMIT_ENV = "JOKO_PI_WORKER_HARD_LIMIT";
 const IDLE_RELEASE_ENV = "JOKO_PI_WORKER_IDLE_RELEASE_MINUTES";
@@ -180,6 +182,7 @@ delete process.env[SOFT_LIMIT_ENV];
 delete process.env[HARD_LIMIT_ENV];
 delete process.env[IDLE_RELEASE_ENV];
 const credentialNames = readCredentialNames();
+const providerCredentialNames = readProviderCredentialNames();
 const nativeAuthReservationToken = typeof process.env[NATIVE_AUTH_RESERVATION_TOKEN_ENV] === "string"
   && /^[A-Za-z0-9_-]{43}$/.test(process.env[NATIVE_AUTH_RESERVATION_TOKEN_ENV])
   ? process.env[NATIVE_AUTH_RESERVATION_TOKEN_ENV]
@@ -213,6 +216,7 @@ const nativeAuthLeaseConfiguration = readNativeAuthLeaseConfiguration();
 delete process.env[NATIVE_AUTH_PROVIDER_IDS_ENV];
 delete process.env[NATIVE_AUTHENTICATED_PROVIDER_IDS_ENV];
 delete process.env[CREDENTIAL_NAMES_ENV];
+delete process.env[PROVIDER_CREDENTIAL_NAMES_ENV];
 
 function boundedEnvironmentInteger(name, fallback, minimum, maximum) {
   const raw = process.env[name];
@@ -231,6 +235,41 @@ function readCredentialNames() {
   } catch {
     return [];
   }
+}
+
+function readProviderCredentialNames() {
+  try {
+    const value = JSON.parse(process.env[PROVIDER_CREDENTIAL_NAMES_ENV] || "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid map");
+    const result = new Map();
+    for (const entry of Object.entries(value)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(entry[0]) || !Array.isArray(entry[1])) {
+        throw new Error("invalid Provider entry");
+      }
+      const names = new Set();
+      for (const name of entry[1]) {
+        if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) {
+          throw new Error("invalid environment name");
+        }
+        names.add(name);
+      }
+      result.set(entry[0], names);
+    }
+    return result;
+  } catch {
+    throw new Error("managed Provider credential ownership snapshot is invalid");
+  }
+}
+
+function inheritedCredentialsForProvider(providerId) {
+  const providerSpecificNames = new Set();
+  for (const names of providerCredentialNames.values()) {
+    for (const name of names) providerSpecificNames.add(name);
+  }
+  const selectedNames = providerCredentialNames.get(providerId) || new Set();
+  return new Map(Array.from(inheritedCredentials.entries()).filter(function (entry) {
+    return !providerSpecificNames.has(entry[0]) || selectedNames.has(entry[0]);
+  }));
 }
 
 function readDepth() {
@@ -701,16 +740,17 @@ function extensionPaths() {
   return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, modelCatalog: modelCatalog, runner: runner };
 }
 
-function childEnvironment(childHome) {
+function childEnvironment(childHome, providerId) {
   const environment = {};
+  const credentials = inheritedCredentialsForProvider(providerId);
   for (const name of SAFE_ENV_NAMES) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
-  for (const entry of inheritedCredentials.entries()) environment[entry[0]] = entry[1];
+  for (const entry of credentials.entries()) environment[entry[0]] = entry[1];
   for (const name of ["JOKO_PI_CONTROL_FILE", "JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE", "JOKO_PI_WORKSPACE_ROOT", "JOKO_PI_GENERATION"]) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
-  environment.JOKO_PI_SECRET_ENV_NAMES = JSON.stringify(Array.from(inheritedCredentials.keys()));
+  environment.JOKO_PI_SECRET_ENV_NAMES = JSON.stringify(Array.from(credentials.keys()));
   environment.PI_CODING_AGENT_DIR = childHome;
   environment.PI_SKIP_VERSION_CHECK = "1";
   environment[DEPTH_ENV] = String(readDepth() + 1);
@@ -721,14 +761,18 @@ function childEnvironment(childHome) {
   return environment;
 }
 
-function durableRunnerEnvironment() {
+function durableRunnerEnvironment(providerId) {
   const environment = {};
+  const credentials = inheritedCredentialsForProvider(providerId);
   for (const name of SAFE_ENV_NAMES) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
-  for (const entry of inheritedCredentials.entries()) environment[entry[0]] = entry[1];
-  environment[CREDENTIAL_NAMES_ENV] = JSON.stringify(Array.from(inheritedCredentials.keys()));
-  environment.JOKO_PI_SECRET_ENV_NAMES = JSON.stringify(Array.from(inheritedCredentials.keys()));
+  for (const entry of credentials.entries()) environment[entry[0]] = entry[1];
+  environment[CREDENTIAL_NAMES_ENV] = JSON.stringify(Array.from(credentials.keys()));
+  environment[PROVIDER_CREDENTIAL_NAMES_ENV] = JSON.stringify(Object.fromEntries(
+    Array.from(providerCredentialNames.entries()).map(function (entry) { return [entry[0], Array.from(entry[1])]; })
+  ));
+  environment.JOKO_PI_SECRET_ENV_NAMES = JSON.stringify(Array.from(credentials.keys()));
   if (nativeAuthLeaseConfiguration) {
     environment.JOKO_PI_NATIVE_AUTH_ENDPOINT = nativeAuthLeaseConfiguration.endpoint;
     environment.JOKO_PI_NATIVE_AUTH_CATALOG_GENERATION = String(nativeAuthLeaseConfiguration.catalogGeneration);
@@ -1353,7 +1397,7 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     atomicWritePrivateJson(join(runDirectory, "status.json"), queued);
     const runner = spawn(nodeExecutable, [runnerScript, join(runDirectory, "config.json")], {
       cwd: runDirectory,
-      env: durableRunnerEnvironment(),
+      env: durableRunnerEnvironment(job.route.provider),
       shell: false,
       windowsHide: true,
       detached: true,
@@ -2099,7 +2143,7 @@ async function startController(job, onProgress, ctx) {
   try {
     child = spawn(launch.command, launch.args, {
       cwd: process.cwd(),
-      env: childEnvironment(prepared.childHome),
+      env: childEnvironment(prepared.childHome, job.route.provider),
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"]

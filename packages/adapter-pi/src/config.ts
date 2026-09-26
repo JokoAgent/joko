@@ -219,11 +219,23 @@ export async function provisionManagedCatalog(
   const secretEnvironmentNames = new Set<string>();
   const providerIds = new Set<string>();
   const keylessNames = new Set<string>();
+  const secretEnvironmentOwners = new Map<string, string>();
 
   for (const provider of providers) {
     validateProvider(provider);
     if (providerIds.has(provider.id)) throw piError("PI_MODEL_DUPLICATE_PROVIDER", `Duplicate provider '${provider.id}'`, "provision");
     providerIds.add(provider.id);
+    for (const name of providerCredentialEnvironmentNames(provider)) {
+      const owner = secretEnvironmentOwners.get(name);
+      if (owner !== undefined && owner !== provider.id) {
+        throw piError(
+          "PI_MODEL_AUTH_ENV_COLLISION",
+          `Provider '${provider.id}' reuses credential environment name '${name}' owned by Provider '${owner}'`,
+          "provision"
+        );
+      }
+      secretEnvironmentOwners.set(name, provider.id);
+    }
     const apiKeyEnv = provider.apiKeyEnv ?? (provider.keyless ? keylessEnvName(provider.id) : undefined);
     if (apiKeyEnv) {
       assertEnvironmentName(apiKeyEnv);
@@ -623,12 +635,7 @@ function materializeModelOverrides(
       const headers: Record<string, string> = Object.create(null) as Record<string, string>;
       for (const [name, rawReference] of Object.entries(override.headers)) {
         assertHeaderName(name);
-        const env =
-          isPlainObject(rawReference) && typeof rawReference.env === "string"
-            ? rawReference.env
-            : typeof rawReference === "string" && /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(rawReference)
-              ? rawReference.slice(1)
-              : undefined;
+        const env = managedEnvironmentReferenceName(rawReference);
         if (!env) {
           throw piError("PI_MODEL_INLINE_SECRET_DENIED", `Model override '${modelId}' header '${name}' must use an environment reference`, "provision");
         }
@@ -642,6 +649,29 @@ function materializeModelOverrides(
     result[modelId] = override;
   }
   return result;
+}
+
+function providerCredentialEnvironmentNames(provider: PiManagedProvider): readonly string[] {
+  const names = new Set<string>();
+  if (provider.apiKeyEnv !== undefined) names.add(provider.apiKeyEnv);
+  for (const reference of Object.values(provider.headers ?? {})) names.add(reference.env);
+  for (const override of Object.values(provider.modelOverrides ?? {})) {
+    if (!isPlainObject(override) || !isPlainObject(override.headers)) continue;
+    for (const reference of Object.values(override.headers)) {
+      const name = managedEnvironmentReferenceName(reference);
+      if (name !== undefined) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+/** Resolve the two credential-reference shapes accepted in model overrides. */
+export function managedEnvironmentReferenceName(value: unknown): string | undefined {
+  return isPlainObject(value) && typeof value.env === "string"
+    ? value.env
+    : typeof value === "string" && /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(value)
+      ? value.slice(1)
+      : undefined;
 }
 
 function assertNoInlineSecrets(value: unknown, label: string): void {
