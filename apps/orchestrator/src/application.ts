@@ -369,6 +369,12 @@ export interface OrchestratorApplication {
   readonly restartBackend: (backendId: string) => Promise<void>;
   /** Refresh volatile native account/model state for the current generation. */
   readonly refreshBackendDescriptor: (backendId: string) => Promise<void>;
+  /** Publish a fail-closed Provider auth projection for the exact current generation. */
+  readonly projectBackendProviderAuthentication: (
+    backendId: string,
+    providerId: string,
+    authenticationState: BackendAuthenticationState
+  ) => void;
   /** Install a process-local queue hold synchronously after the desired revision commits. */
   readonly holdSubagentSmartRoutingDispatch: (backendId: string) => void;
   /** Apply the durable smart-routing preference through an idle process-generation replacement. */
@@ -1084,6 +1090,10 @@ export async function createOrchestratorApplication(
     processFactory: remotePiProcesses.create,
     managedDurableStoreRegistry: remotePiProcesses,
     onManagedSubagentLineageRemoved: (input) => mcpRouter.revokeNativeAuthSession(input),
+    fenceManagedSubagentProviderAuthentication: (providerId) =>
+      mcpRouter.fenceNativeAuthProvider(providerId),
+    reconcileManagedSubagentProviderAuthentication: (providerId, routeToken) =>
+      mcpRouter.reconcileNativeAuthProvider(providerId, routeToken),
     processSupervisor: createDefaultPiManagedProcessSupervisor(),
     validateRemoteWorkspace: async (target, signal) => {
       const binding = target.remoteWorkspace;
@@ -1756,6 +1766,13 @@ export async function createOrchestratorApplication(
     // the native Sol/Terra catalog cannot leave the current smart generation
     // running with the catalog prepared for the previous account state.
     await applyDesiredSubagentSmartRouting(backendId);
+  };
+  const projectBackendProviderAuthentication = (
+    backendId: string,
+    providerId: string,
+    authenticationState: BackendAuthenticationState
+  ): void => {
+    backendInstances.projectProviderAuthentication(backendId, providerId, authenticationState);
   };
   const refreshSubagentSmartRouting = async (backendId: string): Promise<void> => {
     try {
@@ -2458,6 +2475,7 @@ export async function createOrchestratorApplication(
     },
     restartBackend,
     refreshBackendDescriptor,
+    projectBackendProviderAuthentication,
     holdSubagentSmartRoutingDispatch: (backendId) => deferredBackendRestarts!.request(backendId),
     refreshSubagentSmartRouting,
     credentials,

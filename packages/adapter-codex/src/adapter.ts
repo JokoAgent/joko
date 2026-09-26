@@ -220,10 +220,16 @@ export interface CodexNativeAccountOperations {
   logout(): Promise<void>;
 }
 
+/** Capability-neutral seam used before one Provider credential is revoked. */
+export interface ProviderAuthenticationRevocation {
+  revokeProviderAuthentication(providerId: string): Promise<void>;
+}
+
 interface SessionRuntime {
   readonly host: AppServerHost;
   readonly profileKey: string;
   readonly remote: boolean;
+  readonly nativeAuthenticationAdmission: number | undefined;
   readonly assertExecutionCurrent: () => void;
   managedRoute: ManagedProviderRouteBinding | undefined;
   smartRoute: ManagedProviderSmartRoutingBinding | undefined;
@@ -238,6 +244,7 @@ interface SessionRuntime {
   readonly backendInstanceGeneration: number;
   readonly dispatchLifetime: AbortController;
   context: AdapterContext;
+  activeTurnContext?: AdapterContext;
   hostGeneration: number;
   subscription?: HostSubscription;
   subscriptionFlight?: Promise<HostSubscription>;
@@ -414,7 +421,7 @@ const REVIEW_CREDENTIAL_GLOB_PATTERNS = [
   "**/node_modules/**"
 ] as const;
 
-export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implements CodexNativeAccountOperations {
+export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implements CodexNativeAccountOperations, ProviderAuthenticationRevocation {
   readonly id: string;
   readonly #instanceGeneration: number;
   readonly #providerId: string;
@@ -463,6 +470,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #smartRoutingHostReady = false;
   #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
+  #nativeAuthenticationEpoch = 0;
+  #nativeAuthenticationRevoked = false;
+  #nativeAuthenticationLogoutCompletedEpoch: number | undefined;
   #disposed = false;
   #disposeFlight: Promise<void> | undefined;
   #forceDisposeFlight: Promise<void> | undefined;
@@ -706,16 +716,23 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #probeNativeAccountAvailability(host: AppServerHost): Promise<boolean> {
+    const observationEpoch = this.#nativeAuthenticationEpoch;
+    const replacementEvidenceEpoch = this.#nativeAuthenticationLogoutCompletedEpoch === observationEpoch
+      ? observationEpoch
+      : undefined;
     try {
       const response = await host.request("account/read", { refreshToken: false });
       const record = objectValue(response.value, "account read result");
       const snapshot = accountSnapshot(record["account"], record["requiresOpenaiAuth"] === true);
-      this.#account = snapshot;
+      this.#observeNativeAccountSnapshot(observationEpoch, replacementEvidenceEpoch, snapshot);
       if (!codexAccountModelsAvailable(snapshot.authenticationState)) this.#models = [];
       return codexAccountModelsAvailable(snapshot.authenticationState);
     } catch {
-      this.#account = undefined;
-      this.#models = [];
+      if (observationEpoch === this.#nativeAuthenticationEpoch
+        && replacementEvidenceEpoch === this.#nativeAuthenticationLogoutCompletedEpoch) {
+        this.#account = undefined;
+        this.#models = [];
+      }
       return false;
     }
   }
@@ -900,6 +917,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
     this.#assertOpen();
+    const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
     const runtimePolicy = reviewRuntimePolicy(input, context);
     this.#assertContextTarget(context, input.target);
     if (input.target.remoteWorkspace !== undefined && input.nativeStart?.kind !== "attach") {
@@ -984,6 +1002,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           throw error;
         })
       : undefined;
+    const nativeAuthenticationAdmission = this.#nativeAuthenticationAdmission(
+      scope.remote,
+      managedRoute,
+      smartRoute,
+      nativeAuthenticationEpoch
+    );
     let nativeConfiguration: JsonObject | undefined;
     if (runtimePolicy === "standard" && (scope.remote || scope.openMcpBridge !== undefined)) {
       try {
@@ -1009,7 +1033,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       response = await scope.host.request(request.method, request.params, {
         mutation: true,
         signal: context.signal,
-        beforeDispatch: scope.assertCurrent
+        beforeDispatch: () => {
+          scope.assertCurrent();
+          this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
+        }
       });
     } catch (error) {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
@@ -1023,6 +1050,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let runtime: SessionRuntime;
     let createdThreadId: string | undefined;
     try {
+      this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
       thread = parseThreadResult(response.value);
       createdThreadId = thread.id;
       if (request.method === "thread/start" && thread.historyMode !== "paginated") {
@@ -1071,6 +1099,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : input.fastMode,
         observedFastMode: observedFastServiceTier(record),
         name: input.name ?? thread.name ?? undefined,
+        nativeAuthenticationAdmission,
         ...(reviewWorkingDirectory === undefined ? {} : { reviewWorkingDirectory })
       });
     } catch (error) {
@@ -1086,9 +1115,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       await scope.host.request("thread/name/set", { threadId: thread.id, name: input.name }, {
         mutation: true,
         signal: context.signal,
-        beforeDispatch: scope.assertCurrent
+        beforeDispatch: () => {
+          scope.assertCurrent();
+          this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
+        }
       }).catch(() => undefined);
       if (this.#isRuntimeCurrent(runtime, response.hostGeneration)) runtime.name = input.name;
+    }
+    try {
+      this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
+    } catch (error) {
+      await this.#retireNativeAuthenticationRuntime(runtime).catch(() => undefined);
+      throw error;
     }
     return binding;
   }
@@ -1103,6 +1141,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     deferLocalMcpUntilSessionCommit = false
   ): Promise<NativeSessionState> {
     this.#assertOpen();
+    const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
     assertStandardReviewContext(context, "resume native Session history");
     this.#assertContextTarget(context, context.target);
     await this.validateTarget(context.target);
@@ -1126,6 +1165,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && this.#matchesCoreFence(current, context)
       && this.#isRuntimeCurrent(current, current.hostGeneration)
       && this.#mcpCanRemain(current)) {
+      this.#assertNativeAuthenticationAdmission(this.#runtimeNativeAuthenticationAdmission(current));
       current.context = context;
       return stateFromRuntime(current);
     }
@@ -1136,6 +1176,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const managedRoute = inspection.scope.remote || smartRoute !== undefined
       ? undefined
       : await this.#prepareManagedRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
+    const nativeAuthenticationAdmission = this.#nativeAuthenticationAdmission(
+      inspection.scope.remote,
+      managedRoute,
+      smartRoute,
+      nativeAuthenticationEpoch
+    );
     const mustReloadConfiguration = managedRoute !== undefined || smartRoute !== undefined
       || (!inspection.scope.remote && inspection.scope.openMcpBridge !== undefined);
     if (mustReloadConfiguration) {
@@ -1179,7 +1225,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       managedRoute,
       nativeConfiguration,
       smartRoute,
-      context.appendSystemPrompt
+      context.appendSystemPrompt,
+      nativeAuthenticationAdmission
     ).catch(async (error) => {
       managedRoute?.dispose();
       smartRoute?.dispose();
@@ -1239,7 +1286,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
         fastMode: isFastServiceTier(record["serviceTier"]),
         observedFastMode: observedFastServiceTier(record),
-        name: thread.name ?? undefined
+        name: thread.name ?? undefined,
+        nativeAuthenticationAdmission
       });
       return stateFromRuntime(runtime);
     } catch (error) {
@@ -1625,6 +1673,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (!runtime.state.terminalTurnIds.has(startedTurn.id)
         && (runtime.state.activeTurnId === undefined || runtime.state.activeTurnId === startedTurn.id)) {
         runtime.state.activeTurnId = startedTurn.id;
+        runtime.activeTurnContext = context;
       } else if (!runtime.state.terminalTurnIds.has(startedTurn.id)) {
         throw new ProtocolShapeError("turn start result conflicts with the active turn");
       }
@@ -1637,6 +1686,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         const reconciled = await this.#reconcileClientMessage(runtime, context, clientUserMessageId, expectedTurnId);
         if (reconciled) {
           if (input.disposition !== "steer" && runtime.state.activeTurnId !== undefined) {
+            runtime.activeTurnContext = context;
             bindPlanTurnIntent(runtime, runtime.state.activeTurnId, collaborationMode?.mode === "plan", context);
           }
           if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
@@ -2160,19 +2210,28 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async readAccount(refreshToken = false): Promise<CodexAccountSnapshot> {
+    let observationEpoch = this.#nativeAuthenticationEpoch;
+    let replacementEvidenceEpoch: number | undefined;
     try {
       await this.#ensureLocalHostStarted();
+      observationEpoch = this.#nativeAuthenticationEpoch;
+      replacementEvidenceEpoch = this.#nativeAuthenticationLogoutCompletedEpoch === observationEpoch
+        ? observationEpoch
+        : undefined;
       const response = await this.#host.request("account/read", { refreshToken });
       const record = objectValue(response.value, "account read result");
       const account = record["account"];
       const requiresAuthentication = record["requiresOpenaiAuth"] === true;
       const snapshot = accountSnapshot(account, requiresAuthentication);
-      this.#account = snapshot;
+      this.#observeNativeAccountSnapshot(observationEpoch, replacementEvidenceEpoch, snapshot);
       if (!codexAccountModelsAvailable(snapshot.authenticationState)) this.#models = [];
       return snapshot;
     } catch (error) {
-      this.#account = undefined;
-      this.#models = [];
+      if (observationEpoch === this.#nativeAuthenticationEpoch
+        && replacementEvidenceEpoch === this.#nativeAuthenticationLogoutCompletedEpoch) {
+        this.#account = undefined;
+        this.#models = [];
+      }
       throw error;
     }
   }
@@ -2197,12 +2256,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async beginLogin(input: CodexLoginInput): Promise<CodexLoginResult> {
     await this.#ensureLocalHostStarted();
+    const authenticationEpoch = this.#nativeAuthenticationEpoch;
     const params: JsonObject = input.method === "api_key"
       ? { type: "apiKey", apiKey: input.apiKey }
       : input.method === "oauth_browser"
         ? { type: "chatgpt" }
         : { type: "chatgptDeviceCode" };
     const response = await this.#host.request("account/login/start", params, { mutation: true });
+    if (authenticationEpoch !== this.#nativeAuthenticationEpoch) throw nativeAuthenticationObservationStale();
     const record = objectValue(response.value, "account login result");
     const type = stringValue(record["type"], "account login type");
     let result: CodexLoginResult;
@@ -2248,10 +2309,79 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async logout(): Promise<void> {
+    await this.revokeProviderAuthentication(this.#providerId);
+    const revocationEpoch = this.#nativeAuthenticationEpoch;
     await this.#ensureLocalHostStarted();
     await this.#host.request("account/logout", undefined, { mutation: true });
+    if (!this.#nativeAuthenticationRevoked || revocationEpoch !== this.#nativeAuthenticationEpoch) {
+      throw nativeAuthenticationObservationStale();
+    }
+    this.#nativeAuthenticationLogoutCompletedEpoch = revocationEpoch;
     this.#account = accountSnapshot(null, true);
     this.#models = [];
+  }
+
+  async revokeProviderAuthentication(providerId: string): Promise<void> {
+    if (providerId !== this.#providerId) return;
+    this.#nativeAuthenticationEpoch += 1;
+    this.#nativeAuthenticationRevoked = true;
+    this.#nativeAuthenticationLogoutCompletedEpoch = undefined;
+    const runtimes = [...this.#sessions.values()].filter((runtime) =>
+      this.#runtimeUsesProviderAuthentication(runtime, providerId));
+    for (const runtime of runtimes) await this.#retireNativeAuthenticationRuntime(runtime);
+  }
+
+  #nativeAuthenticationAdmission(
+    remote: boolean,
+    managedRoute: ManagedProviderRouteBinding | undefined,
+    smartRoute: ManagedProviderSmartRoutingBinding | undefined,
+    epoch: number
+  ): number | undefined {
+    if (remote || managedRoute !== undefined) return undefined;
+    if (smartRoute !== undefined && !smartRoute.routes.some((route) =>
+      route.native && route.providerId === this.#providerId)) return undefined;
+    return epoch;
+  }
+
+  #runtimeNativeAuthenticationAdmission(runtime: SessionRuntime): number | undefined {
+    return this.#runtimeUsesProviderAuthentication(runtime, this.#providerId)
+      ? runtime.nativeAuthenticationAdmission
+      : undefined;
+  }
+
+  #runtimeUsesProviderAuthentication(runtime: SessionRuntime, providerId: string): boolean {
+    return providerId === this.#providerId && runtime.nativeAuthenticationAdmission !== undefined;
+  }
+
+  #assertNativeAuthenticationAdmission(admission: number | undefined): void {
+    if (admission === undefined) return;
+    if (!this.#nativeAuthenticationRevoked && admission === this.#nativeAuthenticationEpoch) return;
+    throw adapterError({
+      code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED",
+      message: "The native Codex Provider credential is unavailable for this runtime.",
+      phase: "provision",
+      retryable: true,
+      stateMayHaveChanged: false,
+      recovery: "Complete native sign-in, refresh the Backend descriptor, and explicitly resume the Session."
+    });
+  }
+
+  #observeNativeAccountSnapshot(
+    observationEpoch: number,
+    replacementEvidenceEpoch: number | undefined,
+    snapshot: CodexAccountSnapshot
+  ): void {
+    if (observationEpoch !== this.#nativeAuthenticationEpoch) throw nativeAuthenticationObservationStale();
+    if (this.#nativeAuthenticationRevoked
+      && this.#nativeAuthenticationLogoutCompletedEpoch === observationEpoch
+      && replacementEvidenceEpoch !== observationEpoch) throw nativeAuthenticationObservationStale();
+    this.#account = snapshot;
+    if (!this.#nativeAuthenticationRevoked
+      || replacementEvidenceEpoch !== observationEpoch
+      || !codexAccountModelsAvailable(snapshot.authenticationState)) return;
+    this.#nativeAuthenticationRevoked = false;
+    this.#nativeAuthenticationLogoutCompletedEpoch = undefined;
+    this.#nativeAuthenticationEpoch += 1;
   }
 
   async listModels(): Promise<readonly ProviderModel[]> {
@@ -2390,9 +2520,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     managedRoute?: ManagedProviderRouteBinding,
     nativeConfiguration?: JsonObject,
     smartRoute?: ManagedProviderSmartRoutingBinding,
-    developerInstructions?: string
+    developerInstructions?: string,
+    nativeAuthenticationAdmission?: number
   ) {
-    scope.assertCurrent();
+    const assertCurrent = () => {
+      scope.assertCurrent();
+      this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
+    };
+    assertCurrent();
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
     const configuration = managedConfiguration === undefined && nativeConfiguration === undefined
       ? undefined
@@ -2406,8 +2541,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         : { modelProvider: smartRoute?.modelProviderId ?? selection.providerId, model: selection.modelId }),
       ...(developerInstructions === undefined ? {} : { developerInstructions }),
       ...(configuration === undefined ? {} : { config: configuration })
-    }, { mutation: false, beforeDispatch: scope.assertCurrent });
-    scope.assertCurrent();
+    }, { mutation: false, beforeDispatch: assertCurrent });
+    assertCurrent();
     if (response.hostGeneration !== expectedHostGeneration) {
       throw adapterError({
         code: "CODEX_RUNTIME_GENERATION_STALE",
@@ -2419,7 +2554,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const thread = parseThreadResult(response.value);
     await assertNativeThreadTarget(thread, threadId, workspaceRoot, "provision", scope.remote);
-    scope.assertCurrent();
+    assertCurrent();
     this.#assertManagedRouteResponse(objectValue(response.value, "resume response"), managedRoute);
     return response;
   }
@@ -2992,9 +3127,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #switchNativeRoute(runtime: SessionRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<SessionRuntime> {
+    const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
     if (runtime.state.activeTurnId !== undefined || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
     const smartRoute = await this.#prepareSmartRoute(providerId, modelId, context);
     const route = smartRoute === undefined ? await this.#prepareManagedRoute(providerId, modelId, context) : undefined;
+    const nativeAuthenticationAdmission = this.#nativeAuthenticationAdmission(
+      runtime.remote,
+      route,
+      smartRoute,
+      nativeAuthenticationEpoch
+    );
     const generation = runtime.hostGeneration;
     let mcp: CodexMcpRuntimeLease | undefined;
     const assertCurrent = () => {
@@ -3003,6 +3145,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     };
     try {
       assertCurrent();
+      this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
       // Native resume on an already loaded thread ignores changed Provider config.
       await this.#releaseRuntimeSubscription(runtime, false);
       assertCurrent();
@@ -3019,7 +3162,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         route,
         preparedMcp.nativeConfiguration,
         smartRoute,
-        context.appendSystemPrompt
+        context.appendSystemPrompt,
+        nativeAuthenticationAdmission
       );
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
@@ -3034,7 +3178,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         thread: parseThreadResult(response.value), binding: runtime.binding, context, hostGeneration: generation,
         permissionMode: runtime.permissionMode, providerId, modelId, managedRoute: route, smartRoute,
         mcp, nativeConfiguration: preparedMcp.nativeConfiguration,
-        effort: runtime.effort, fastMode: runtime.fastMode, name: runtime.name
+        effort: runtime.effort, fastMode: runtime.fastMode, name: runtime.name,
+        nativeAuthenticationAdmission
       });
       next.planMode = runtime.planMode;
       next.collaborationTouched = runtime.collaborationTouched;
@@ -3045,6 +3190,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       route?.dispose();
       smartRoute?.dispose();
       runtime.routeUnknown = true;
+      if (error instanceof Error
+        && "publicError" in error
+        && (error as { readonly publicError?: { readonly code?: unknown } }).publicError?.code
+          === "CODEX_PROVIDER_AUTHENTICATION_REVOKED") throw error;
       throw smartRoute === undefined ? managedRouteUnavailable(true) : smartRouteUnavailable(true);
     }
   }
@@ -3305,9 +3454,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly fastMode?: boolean;
     readonly observedFastMode?: boolean;
     readonly name?: string;
+    readonly nativeAuthenticationAdmission: number | undefined;
     readonly reviewWorkingDirectory?: string;
   }): Promise<SessionRuntime> {
     input.scope.assertCurrent();
+    this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
     if (input.scope.remote && (input.managedRoute !== undefined || input.smartRoute !== undefined
       || input.reviewWorkingDirectory !== undefined)) {
       throw remoteMutationUnsupported("apply a local Provider or Review runtime profile");
@@ -3327,6 +3478,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       input.scope.remote
     );
     input.scope.assertCurrent();
+    this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
     const previous = this.#sessions.get(input.context.sessionId);
     if (previous !== undefined) {
       previous.dispatchLifetime.abort();
@@ -3338,6 +3490,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         false,
         false
       ).catch(() => undefined);
+      this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
       previous.closed = true;
       this.#settleCompaction(previous, adapterError({
         code: "CODEX_COMPACTION_INTERRUPTED",
@@ -3349,6 +3502,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       this.#sessions.delete(input.context.sessionId);
       this.#cancelPendingServerRequests(previous);
       await this.#releaseRuntimeSubscription(previous, false);
+      this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
     }
     const state = createTranslatorState();
     if (input.thread.status?.["type"] === "active") {
@@ -3377,6 +3531,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       host: input.scope.host,
       profileKey: input.scope.profileKey,
       remote: input.scope.remote,
+      nativeAuthenticationAdmission: input.nativeAuthenticationAdmission,
       assertExecutionCurrent: input.scope.assertAuthorityCurrent,
       managedRoute: input.managedRoute,
       smartRoute: input.smartRoute,
@@ -3391,6 +3546,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       backendInstanceGeneration: backendGeneration(input.context),
       dispatchLifetime: new AbortController(),
       context: input.context,
+      ...(state.activeTurnId === undefined ? {} : { activeTurnContext: input.context }),
       hostGeneration: input.hostGeneration,
       state,
       pendingServerRequests: new Map(),
@@ -3418,6 +3574,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       rewindUnknown: false,
       disconnectTerminalEmitted: false
     };
+    this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
     this.#sessions.set(input.context.sessionId, runtime);
     runtime.state.observedFastMode = input.observedFastMode;
     try {
@@ -3643,6 +3800,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const subscription = await subscriptionFlight;
       runtime.subscriptionFlight = undefined;
       runtime.subscription = subscription;
+      this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
       if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) {
         await subscription.release({ unsubscribe: false });
         this.#assertOpen();
@@ -3660,7 +3818,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           lineage.parentThreadId,
           input.hostGeneration
         );
+        this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
       }
+      this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
       return runtime;
     } catch (error) {
       runtime.dispatchLifetime.abort();
@@ -4086,6 +4246,99 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
+  async #retireNativeAuthenticationRuntime(runtime: SessionRuntime): Promise<void> {
+    if (runtime.closed || this.#sessions.get(runtime.sessionId) !== runtime) return;
+    const activeTurnId = runtime.state.activeTurnId;
+    const revokedTurnFailure = activeTurnId === undefined
+      ? undefined
+      : nativeAuthenticationRevokedTurnFailure();
+    if (activeTurnId !== undefined) {
+      try {
+        const response = await runtime.host.request("turn/interrupt", {
+          threadId: runtime.threadId,
+          turnId: activeTurnId
+        }, {
+          mutation: true,
+          signal: runtime.dispatchLifetime.signal,
+          beforeDispatch: () => {
+            runtime.assertExecutionCurrent();
+            if (runtime.closed || this.#sessions.get(runtime.sessionId) !== runtime) {
+              throw new Error("The credential-bearing Codex runtime is no longer current.");
+            }
+          }
+        });
+        if (response.hostGeneration !== runtime.hostGeneration) {
+          throw new Error("The credential-bearing Codex runtime generation changed during retirement.");
+        }
+      } catch (error) {
+        throw adapterError({
+          code: "CODEX_AUTH_RUNTIME_RETIREMENT_UNKNOWN",
+          message: "The credential-bearing Codex runtime did not confirm native turn retirement.",
+          phase: "shutdown",
+          retryable: true,
+          stateMayHaveChanged: true,
+          recovery: "Keep the Provider fenced and inspect the exact native thread before retrying sign-out."
+        });
+      }
+    } else if (runtime.nativeTasks.hasActiveTasks()) {
+      throw adapterError({
+        code: "CODEX_AUTH_RUNTIME_RETIREMENT_UNKNOWN",
+        message: "The credential-bearing Codex runtime still owns native background work without a stoppable root turn.",
+        phase: "shutdown",
+        retryable: true,
+        stateMayHaveChanged: true,
+        recovery: "Keep the Provider fenced and inspect the exact native thread before retrying sign-out."
+      });
+    }
+    let terminalContext: AdapterContext | undefined;
+    if (activeTurnId !== undefined
+      && runtime.state.activeTurnId === activeTurnId
+      && !runtime.state.terminalTurnIds.has(activeTurnId)) {
+      // Claim the exact root terminal before any awaited publication so a
+      // late native turn/completed notification cannot publish a second one.
+      runtime.state.terminalTurnIds.add(activeTurnId);
+      runtime.state.activeTurnId = undefined;
+      terminalContext = runtime.activeTurnContext ?? runtime.context;
+    }
+    runtime.dispatchLifetime.abort();
+    await this.#emitNativeTaskPayloads(
+      runtime,
+      runtime.nativeTasks.terminateActive(
+        revokedTurnFailure === undefined ? "stopped" : "failed",
+        revokedTurnFailure
+      ),
+      runtime.hostGeneration,
+      "runtime/auth_revoked",
+      false,
+      false
+    ).catch(() => undefined);
+    if (terminalContext !== undefined && revokedTurnFailure !== undefined) {
+      await terminalContext.emit({
+        type: "error",
+        error: revokedTurnFailure,
+        terminal: true
+      }, {
+        namespace: "codex.app_server",
+        fields: { method: "runtime/auth_revoked" }
+      }).catch(() => undefined);
+      await terminalContext.emit({ type: "done", outcome: "failed" }, {
+        namespace: "codex.app_server",
+        fields: { method: "runtime/auth_revoked" }
+      }).catch(() => undefined);
+    }
+    runtime.closed = true;
+    this.#settleCompaction(runtime, adapterError({
+      code: "CODEX_COMPACTION_INTERRUPTED",
+      message: "The Codex Provider credential was revoked during native compaction.",
+      phase: "shutdown",
+      stateMayHaveChanged: true,
+      recovery: "Sign in again, resume the native thread, and inspect its compaction state."
+    }));
+    if (this.#sessions.get(runtime.sessionId) === runtime) this.#sessions.delete(runtime.sessionId);
+    this.#cancelPendingServerRequests(runtime);
+    await this.#releaseRuntimeSubscription(runtime, true);
+  }
+
   async #readRemoteCompleteHistory(
     scope: CodexReadScope,
     binding: NativeSessionBinding,
@@ -4456,6 +4709,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     context: AdapterContext,
     hostGeneration: number
   ): void {
+    this.#assertNativeAuthenticationAdmission(runtime.nativeAuthenticationAdmission);
     let executionCurrent = true;
     try { runtime.assertExecutionCurrent(); }
     catch { executionCurrent = false; }
@@ -5490,6 +5744,28 @@ const CODEX_LOGIN_METHODS = Object.freeze([
   "oauth_browser",
   "device_code"
 ] as const);
+
+function nativeAuthenticationObservationStale() {
+  return adapterError({
+    code: "CODEX_PROVIDER_AUTHENTICATION_STATE_STALE",
+    message: "The native Codex authentication state changed while it was being observed.",
+    phase: "probe",
+    retryable: true,
+    stateMayHaveChanged: false,
+    recovery: "Refresh the current Backend descriptor before continuing the authentication flow."
+  });
+}
+
+function nativeAuthenticationRevokedTurnFailure() {
+  return adapterError({
+    code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED",
+    message: "The Codex Provider credential was revoked after native dispatch may have started.",
+    phase: "dispatch",
+    retryable: true,
+    stateMayHaveChanged: true,
+    recovery: "Inspect the native Session, sign in again, and explicitly resend only after its outcome is known."
+  }).publicError;
+}
 
 function accountSnapshot(account: JsonValue | undefined, requiresAuthentication: boolean): CodexAccountSnapshot {
   const authenticated = isJsonObject(account) || !requiresAuthentication;

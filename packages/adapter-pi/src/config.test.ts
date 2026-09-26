@@ -173,6 +173,20 @@ describe("managed Pi catalog", () => {
     await expect(provisionManagedCatalog(duplicateHome, [provider, provider])).rejects.toMatchObject({
       publicError: { code: "PI_MODEL_DUPLICATE_PROVIDER" }
     });
+    await expect(provisionManagedCatalog(
+      await mkdtemp(join(tmpdir(), "joko-pi-catalog-credential-owner-collision-")),
+      [{
+        ...provider,
+        id: "provider-a",
+        keyless: undefined,
+        apiKeyEnv: "SHARED_PROVIDER_SECRET"
+      }, {
+        ...provider,
+        id: "provider-b",
+        keyless: undefined,
+        apiKeyEnv: "SHARED_PROVIDER_SECRET"
+      }]
+    )).rejects.toMatchObject({ publicError: { code: "PI_MODEL_AUTH_ENV_COLLISION" } });
 
     const secretHome = await mkdtemp(join(tmpdir(), "joko-pi-catalog-inline-secret-"));
     await expect(

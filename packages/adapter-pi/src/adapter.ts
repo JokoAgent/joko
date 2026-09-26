@@ -86,6 +86,7 @@ import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_DEFAULT,
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM,
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM,
+  managedEnvironmentReferenceName,
   provisionManagedCatalog,
   piModelOutputTokenLimit,
   supportedPiThinkingLevels,
@@ -104,6 +105,7 @@ import {
   MANAGED_SUBAGENT_NODE_ENV,
   MANAGED_SUBAGENT_RUN_ROOT_ENV,
   reconcileManagedSubagentAuthHomes,
+  stopManagedSubagentRunsByProvider,
   stopAndRemoveManagedSubagentRuns
 } from "./durable-subagent-runs.js";
 import { handleExtensionUiRequest } from "./interactions.js";
@@ -117,7 +119,8 @@ import type { PiManagedDurableStore, PiManagedDurableStoreRegistry } from "./man
 import { MANAGED_SUBAGENT_TOOL_DESCRIPTORS, provisionManagedSubagent } from "./managed-subagent.js";
 import {
   MANAGED_SUBAGENT_CONTROL_COMMAND_NAME,
-  MANAGED_SUBAGENT_PRODUCT_SESSION_ENV
+  MANAGED_SUBAGENT_PRODUCT_SESSION_ENV,
+  MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV
 } from "./managed-subagent-source.js";
 import { isExtensionUiRequest, isRecord, type PiRpcCommand, type PiRpcCommandDescriptor, type PiRpcEntry, type PiRpcEvent, type PiRpcModel, type PiRpcState, type PiRpcTreeNode } from "./protocol.js";
 import {
@@ -344,6 +347,16 @@ export interface PiAdapterOptions {
   readonly includeManagedSubagentTools?: (context: AdapterContext) => boolean;
   /** Host-owned remote durable-run control plane. Local Targets never use it. */
   readonly managedDurableStoreRegistry?: PiManagedDurableStoreRegistry;
+  /** Synchronously fences host-owned Provider reservations for every managed
+   * child before the Adapter begins credential-bearing runtime retirement. */
+  readonly fenceManagedSubagentProviderAuthentication?: (
+    providerId: string
+  ) => PiManagedSubagentProviderAuthenticationFence;
+  /** Releases only the exact host fence captured above. */
+  readonly reconcileManagedSubagentProviderAuthentication?: (
+    providerId: string,
+    routeToken: unknown
+  ) => boolean;
   /** Revokes only detached native-auth recovery after every owned runner is terminal. */
   readonly onManagedSubagentLineageRemoved?: (input: {
     readonly sessionId: string;
@@ -420,6 +433,40 @@ export interface PiManagedGenerationOptions {
   readonly releaseManagedGeneration?: () => void;
 }
 
+/** Capability-neutral seam used before one Provider credential is revoked. */
+export interface ProviderAuthenticationRevocation {
+  revokeProviderAuthentication(providerId: string): Promise<void>;
+}
+
+export interface PiManagedSubagentProviderAuthenticationFence {
+  readonly routeToken: unknown;
+  readonly settlement: Promise<void>;
+}
+
+/** Content-free proof that a public Provider auth attempt began before a
+ * later immutable managed generation was published. The Adapter, not an
+ * environment value or descriptor projection, owns both opaque fences. */
+export interface ProviderAuthenticationReconciliationEvidence {
+  readonly providerId: string;
+  readonly routeToken: symbol;
+  /** All managed-generation attempts which had already started when the
+   * public auth effect began. A late publish from any of them is stale. */
+  readonly startedGenerationSequence: number;
+  /** Exact host-owned managed-child reservation epoch, when this route has
+   * been revoked. It contains no credential or reservation grant. */
+  readonly managedSubagentRouteToken?: unknown;
+}
+
+export interface ProviderAuthenticationReconciliation {
+  beginProviderAuthenticationReconciliation(
+    providerId: string
+  ): ProviderAuthenticationReconciliationEvidence;
+  reconcileProviderAuthentication(
+    providerId: string,
+    evidence: ProviderAuthenticationReconciliationEvidence
+  ): boolean;
+}
+
 interface SessionSpawnProfile {
   readonly providerId?: string;
   readonly modelId?: string;
@@ -433,6 +480,8 @@ interface SessionSpawnProfile {
 
 function restoredSpawnProfile(context: AdapterContext): SessionSpawnProfile {
   return {
+    ...(context.modelSelection?.providerId === undefined ? {} : { providerId: context.modelSelection.providerId }),
+    ...(context.modelSelection?.modelId === undefined ? {} : { modelId: context.modelSelection.modelId }),
     ...(context.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: context.appendSystemPrompt }),
     initialPermissionMode: "ask",
     initialPlanMode: false,
@@ -443,6 +492,9 @@ function restoredSpawnProfile(context: AdapterContext): SessionSpawnProfile {
 
 interface PiRuntime {
   readonly key: string;
+  /** Immutable launch route. Undefined means the upstream native default may
+   * have received every credential in this managed generation. */
+  readonly spawnProviderId: string | undefined;
   readonly transport: PiRpcTransport;
   /** OS identity never crosses the Adapter boundary. */
   readonly processIdentity?: string;
@@ -457,6 +509,7 @@ interface PiRuntime {
   readonly runtimeDirectory: string;
   readonly runtimeRoot: string;
   readonly nativeAuth?: PiRuntimeNativeAuth;
+  nativeAuthPersistenceRevoked: boolean;
   readonly controlPath: string;
   readonly silentEncryptedRetryControlPath: string;
   readonly artifactDirectory: string;
@@ -608,7 +661,10 @@ export interface PiProjectedMessage {
   };
 }
 
-export class PiBackendAdapter implements BackendAdapter {
+export class PiBackendAdapter implements
+  BackendAdapter,
+  ProviderAuthenticationRevocation,
+  ProviderAuthenticationReconciliation {
   readonly id = "pi";
   #options: PiAdapterOptions;
   #agentHome: string;
@@ -627,6 +683,15 @@ export class PiBackendAdapter implements BackendAdapter {
   readonly #spawnProfiles = new Map<string, SessionSpawnProfile>();
   readonly #artifactRefsBySession = new Map<string, Map<string, BlobRef>>();
   readonly #subagentObservers = new Map<string, ManagedSubagentObserver>();
+  readonly #unresolvedRemoteSubagentOwners = new Map<string, number>();
+  readonly #revokedProviderRoutes = new Set<string>();
+  readonly #providerAuthenticationRouteTokens = new Map<string, symbol>();
+  readonly #managedSubagentProviderAuthenticationFences = new Map<
+    string,
+    PiManagedSubagentProviderAuthenticationFence
+  >();
+  #startedGenerationSequence = 0;
+  #publishedGenerationStartSequence = 0;
   #silentEncryptedRetryEnabled: boolean;
   #silentEncryptedRetryPreferenceRevision = 0;
   #sessionInitialization: Promise<void> | undefined;
@@ -674,6 +739,7 @@ export class PiBackendAdapter implements BackendAdapter {
       throw piError("PI_MCP_CREDENTIAL_MISSING", "MCP bridge token must be supplied through the managed credential channel", "provision");
     }
     validateNativeAuthOptions(this.#options);
+    validateManagedSubagentProviderAuthenticationOptions(this.#options);
   }
 
   async describe(): Promise<BackendDescriptor> {
@@ -1048,6 +1114,7 @@ export class PiBackendAdapter implements BackendAdapter {
     }
     this.#spawnProfiles.delete(context.sessionId);
     this.#artifactRefsBySession.delete(context.sessionId);
+    this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
   }
 
   supportsDetachedSessionDeletion(context: AdapterContext): boolean {
@@ -1582,8 +1649,9 @@ export class PiBackendAdapter implements BackendAdapter {
           stateMayHaveChanged: false
         });
       }
+      let providerId: string | undefined;
       try {
-        await assertManagedSubagentControlTarget({
+        providerId = await assertManagedSubagentControlTarget({
           root: managedSubagentRunRoot(this.#sessionStore.root),
           durableStore,
           productSessionId: context.sessionId,
@@ -1601,6 +1669,7 @@ export class PiBackendAdapter implements BackendAdapter {
           cause: error
         });
       }
+      this.#assertManagedSubagentControlProviderAuthentication(input.action, providerId);
       try {
         await writeManagedSubagentDurableControl({
           root: managedSubagentRunRoot(this.#sessionStore.root),
@@ -1630,8 +1699,9 @@ export class PiBackendAdapter implements BackendAdapter {
     if (runtime.control.runtimePolicy === "review_read_only") {
       throw piError("PI_SUBAGENT_CONTROL_UNAVAILABLE", "Subagent control is unavailable in the reviewer runtime", "dispatch");
     }
+    let providerId: string | undefined;
     try {
-      await assertManagedSubagentControlTarget({
+      providerId = await assertManagedSubagentControlTarget({
         root: managedSubagentRunRoot(this.#sessionStore.root),
         ...(runtime.managedDurableStore === undefined ? {} : { durableStore: runtime.managedDurableStore }),
         productSessionId: context.sessionId,
@@ -1648,6 +1718,7 @@ export class PiBackendAdapter implements BackendAdapter {
         cause: error
       });
     }
+    this.#assertManagedSubagentControlProviderAuthentication(input.action, providerId);
     const payload = Buffer.from(JSON.stringify({
       sessionId: context.sessionId,
       generation: context.generation,
@@ -1685,6 +1756,7 @@ export class PiBackendAdapter implements BackendAdapter {
     if (context.target.remoteWorkspace === undefined || context.runtimePolicy === "review_read_only") return;
     const binding = context.binding;
     if (binding === undefined) return;
+    this.#unresolvedRemoteSubagentOwners.set(context.sessionId, context.generation);
     const pendingDeletion = await findRemoteSubagentDeletionReceipt(this.#sessionStore.root, {
       sessionId: context.sessionId,
       targetId: context.target.id,
@@ -1704,20 +1776,15 @@ export class PiBackendAdapter implements BackendAdapter {
       } else {
         existing.update(context, [], 0);
         existing.start();
+        this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
         return;
       }
     }
-    const durableStore = existing?.durableStore ?? await this.#options.managedDurableStoreRegistry?.storeFor({
-      sessionId: context.sessionId,
-      targetId: context.target.id,
-      bindingOpaqueRef: binding.opaqueRef,
-      generation: context.generation
-    });
+    const durableStore = existing?.durableStore ?? await this.#remoteManagedDurableStore(binding, context);
     if (durableStore === undefined) {
-      if (pendingDeletion === undefined) return;
       throw piError(
         "PI_REMOTE_SUBAGENT_STORE_UNAVAILABLE",
-        "Remote managed Subagent deletion recovery lacks a binding authority",
+        "Remote managed Subagent storage could not recover its launch authority",
         "session",
         { retryable: true, stateMayHaveChanged: true }
       );
@@ -1754,6 +1821,7 @@ export class PiBackendAdapter implements BackendAdapter {
           recovery: "Retry service startup with the same Session binding so the retained deletion receipt can finish cleanup."
         });
       }
+      this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
       return;
     }
     const observer = new ManagedSubagentObserver({
@@ -1770,9 +1838,11 @@ export class PiBackendAdapter implements BackendAdapter {
       if (activeRuns === 0) {
         observer.stop();
         await durableStore.dispose();
+        this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
         return;
       }
       this.#subagentObservers.set(context.sessionId, observer);
+      this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
       observer.start();
     } catch (error) {
       observer.stop();
@@ -2908,6 +2978,10 @@ export class PiBackendAdapter implements BackendAdapter {
         recovery: "Wait for the current generation update to settle before submitting another snapshot."
       });
     }
+    if (this.#startedGenerationSequence >= Number.MAX_SAFE_INTEGER) {
+      throw piError("PI_RECONFIGURE_SEQUENCE_EXHAUSTED", "Managed Pi generation sequence is exhausted", "provision");
+    }
+    const generationStartSequence = ++this.#startedGenerationSequence;
     const nextAgentHome = normalizedAbsolutePath(options.agentHome, "PI_INVALID_AGENT_HOME", "Pi Agent Home");
     if (options.mcpBridge && !options.mcpBridge.token) {
       throw piError("PI_MCP_CREDENTIAL_MISSING", "MCP bridge token must be supplied through the managed credential channel", "provision");
@@ -2940,6 +3014,7 @@ export class PiBackendAdapter implements BackendAdapter {
       this.#options.sessionRoot
     );
     validateNativeAuthOptions(nextOptions);
+    validateManagedSubagentProviderAuthenticationOptions(nextOptions);
 
     const nextGeneration: PiManagedGeneration = {
       agentHome: nextAgentHome,
@@ -2973,6 +3048,7 @@ export class PiBackendAdapter implements BackendAdapter {
       this.#managedGeneration = nextGeneration;
       this.#agentHome = nextAgentHome;
       this.#options = nextOptions;
+      this.#publishedGenerationStartSequence = generationStartSequence;
       if (
         options.silentEncryptedRetryEnabled !== undefined
         && preferenceRevision === this.#silentEncryptedRetryPreferenceRevision
@@ -2992,6 +3068,158 @@ export class PiBackendAdapter implements BackendAdapter {
 
   async reconfigure(options: PiManagedGenerationOptions): Promise<void> {
     return this.updateManagedGeneration(options);
+  }
+
+  beginProviderAuthenticationReconciliation(
+    providerId: string
+  ): ProviderAuthenticationReconciliationEvidence {
+    assertProviderId(providerId);
+    const managedSubagentFence = this.#managedSubagentProviderAuthenticationFences.get(providerId);
+    return {
+      providerId,
+      routeToken: this.#providerAuthenticationRouteToken(providerId),
+      startedGenerationSequence: this.#startedGenerationSequence,
+      ...(managedSubagentFence === undefined
+        ? {}
+        : { managedSubagentRouteToken: managedSubagentFence.routeToken })
+    };
+  }
+
+  reconcileProviderAuthentication(
+    providerId: string,
+    evidence: ProviderAuthenticationReconciliationEvidence
+  ): boolean {
+    assertProviderId(providerId);
+    if (
+      evidence.providerId !== providerId
+      || evidence.routeToken !== this.#providerAuthenticationRouteToken(providerId)
+      || !Number.isSafeInteger(evidence.startedGenerationSequence)
+      || evidence.startedGenerationSequence < 0
+      || this.#publishedGenerationStartSequence <= evidence.startedGenerationSequence
+      || !providerAuthenticationRouteExists(this.#options, providerId)
+      || !providerAuthenticationAvailable(this.#options, providerId)
+    ) return false;
+    const managedSubagentFence = this.#managedSubagentProviderAuthenticationFences.get(providerId);
+    if (managedSubagentFence !== undefined) {
+      if (
+        evidence.managedSubagentRouteToken !== managedSubagentFence.routeToken
+        || this.#options.reconcileManagedSubagentProviderAuthentication === undefined
+      ) return false;
+      try {
+        if (!this.#options.reconcileManagedSubagentProviderAuthentication(
+          providerId,
+          managedSubagentFence.routeToken
+        )) return false;
+      } catch {
+        return false;
+      }
+      this.#managedSubagentProviderAuthenticationFences.delete(providerId);
+    }
+    this.#revokedProviderRoutes.delete(providerId);
+    return true;
+  }
+
+  async revokeProviderAuthentication(providerId: string): Promise<void> {
+    assertProviderId(providerId);
+    // Install the startup fence before the first await. A start which already
+    // captured the old snapshot is awaited and included in the rescan below.
+    this.#providerAuthenticationRouteTokens.set(providerId, Symbol("provider-authentication-route"));
+    this.#revokedProviderRoutes.add(providerId);
+    const managedSubagentFenceOwner = this.#options.fenceManagedSubagentProviderAuthentication;
+    const managedSubagentFence = managedSubagentFenceOwner?.(providerId);
+    if (managedSubagentFenceOwner !== undefined) {
+      if (
+        managedSubagentFence === undefined
+        || managedSubagentFence.routeToken === undefined
+        || managedSubagentFence.routeToken === null
+        || managedSubagentFence.settlement === undefined
+        || managedSubagentFence.settlement === null
+        || typeof (managedSubagentFence.settlement as PromiseLike<void>).then !== "function"
+      ) {
+        throw piError(
+          "PI_AUTH_CHILD_FENCE_INVALID",
+          "The managed child Provider authentication fence is invalid",
+          "shutdown",
+          { stateMayHaveChanged: true }
+        );
+      }
+      this.#managedSubagentProviderAuthenticationFences.set(providerId, managedSubagentFence!);
+    }
+    const stopCredentialedChildren = async (): Promise<void> => {
+      try {
+        const timeoutMs = this.#options.shutdownTimeoutMs ?? 5_000;
+        if (managedSubagentFence !== undefined) await managedSubagentFence.settlement;
+        if (this.#unresolvedRemoteSubagentOwners.size > 0) {
+          throw new Error("Remote managed Subagent Provider ownership has not been scanned successfully.");
+        }
+        await Promise.all([
+          stopManagedSubagentRunsByProvider(
+            managedSubagentRunRoot(this.#sessionStore.root),
+            providerId,
+            timeoutMs
+          ),
+          ...[...this.#subagentObservers.values()].map((observer) =>
+            observer.stopCredentialedRunsByProvider(providerId, timeoutMs))
+        ]);
+      } catch (error) {
+        throw piError(
+          "PI_AUTH_CHILD_RETIREMENT_UNKNOWN",
+          "A credential-bearing Pi background child did not confirm retirement",
+          "shutdown",
+          {
+            retryable: true,
+            stateMayHaveChanged: true,
+            recovery: "Keep the Provider fenced and inspect the exact managed background run before retrying sign-out.",
+            cause: error
+          }
+        );
+      }
+    };
+    await stopCredentialedChildren();
+    for (;;) {
+      await Promise.allSettled([...this.#runtimeStarts.values()]);
+      // The first scan may have raced an admission which crossed the fence
+      // before its reservation settled. Rescan only after the real Router
+      // authority confirms every pre-fence operation has retired.
+      await stopCredentialedChildren();
+      const runtimes = [...this.#runtimes.values()].filter((runtime) =>
+        (runtime.spawnProviderId === providerId
+          && providerRequiresAuthentication(runtime.generationLease.generation.options, providerId))
+        || (runtime.spawnProviderId === undefined
+          && providerRequiresAuthentication(runtime.generationLease.generation.options, providerId))
+        || (runtime.context.modelSelection?.providerId === providerId
+          && providerRequiresAuthentication(runtime.generationLease.generation.options, providerId))
+        || runtime.nativeAuth?.providerIds.includes(providerId) === true);
+      if (runtimes.length === 0 && this.#runtimeStarts.size === 0) {
+        // Require one stable, post-settlement observation before returning.
+        await stopCredentialedChildren();
+        await Promise.allSettled([...this.#runtimeStarts.values()]);
+        if (this.#runtimeStarts.size === 0) return;
+        continue;
+      }
+      const results = await Promise.allSettled(runtimes.map(async (runtime) => {
+        // A logout must not commit a credential refresh observed while the
+        // revoked generation was shutting down; that could advance the vault
+        // generation before the host deletes the credential authority.
+        runtime.nativeAuthPersistenceRevoked = true;
+        await this.#stopRuntime(runtime.key, runtime.transport.generation);
+      }));
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure !== undefined) {
+        throw piError(
+          "PI_AUTH_RUNTIME_RETIREMENT_UNKNOWN",
+          "A credential-bearing Pi runtime did not confirm retirement",
+          "shutdown",
+          {
+            retryable: true,
+            stateMayHaveChanged: true,
+            recovery: "Keep the Provider fenced and inspect the exact managed runtime before retrying sign-out.",
+            cause: failure.reason
+          }
+        );
+      }
+      await stopCredentialedChildren();
+    }
   }
 
   async dispose(): Promise<void> {
@@ -3943,6 +4171,7 @@ export class PiBackendAdapter implements BackendAdapter {
       throw error;
     });
     try {
+      this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
       await this.validateTarget(context.target);
       if (binding) await this.#sessionStore.assertManagedSession(binding.opaqueRef);
       const agentResourceSettings = readAgentResourceSettings(options.readAgentResourceSettings);
@@ -4102,9 +4331,10 @@ export class PiBackendAdapter implements BackendAdapter {
     if (appendPrompt) args.push("--append-system-prompt", appendPrompt);
 
     const baseEnvironment = this.#baseEnvironment();
+    const providerEnvironment = scopedManagedProviderEnvironment(options, catalog, profile.providerId);
     const configuredEnvironment: NodeJS.ProcessEnv = {
       ...baseEnvironment,
-      ...options.environment,
+      ...providerEnvironment,
       ...catalog.keylessEnvironment
     };
     const proxySecrets = credentialedProxySecrets(configuredEnvironment);
@@ -4122,7 +4352,7 @@ export class PiBackendAdapter implements BackendAdapter {
     ]);
     const env: NodeJS.ProcessEnv = {
       ...baseEnvironment,
-      ...options.environment,
+      ...providerEnvironment,
       ...catalog.keylessEnvironment,
       PI_CODING_AGENT_DIR: runtimeAgentHomePath,
       PI_CODING_AGENT_SESSION_DIR: this.#sessionStore.sessionsRoot,
@@ -4150,7 +4380,13 @@ export class PiBackendAdapter implements BackendAdapter {
         [MANAGED_SUBAGENT_NODE_ENV]: process.execPath,
         JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify(options.nativeAuthProviderIds ?? []),
         JOKO_PI_NATIVE_AUTHENTICATED_PROVIDER_IDS: JSON.stringify(options.nativeAuthenticatedProviderIds ?? []),
-        JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES: JSON.stringify([...subagentCredentialNames].sort())
+        JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES: JSON.stringify([...subagentCredentialNames].sort()),
+        [MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV]: JSON.stringify(Object.fromEntries(
+          (options.providers ?? []).map((provider) => [
+            provider.id,
+            managedProviderCredentialEnvironmentNames(provider)
+          ])
+        ))
       } : {})
     };
     if (context.target.remoteWorkspace === undefined) {
@@ -4182,7 +4418,12 @@ export class PiBackendAdapter implements BackendAdapter {
     let acquiredManagedDurableStore: PiManagedDurableStore | undefined;
     let redactValues: string[] = [...proxySecrets.values];
     try {
-      preparedAgentHome = await this.#prepareRuntimeAgentHome(runtimeDirectory, context.generation, managedGeneration);
+      preparedAgentHome = await this.#prepareRuntimeAgentHome(
+        runtimeDirectory,
+        context.generation,
+        managedGeneration,
+        profile.providerId
+      );
       redactValues = [
         ...[...secretNames]
           .map((name) => env[name])
@@ -4191,6 +4432,10 @@ export class PiBackendAdapter implements BackendAdapter {
         ...preparedAgentHome.redactValues
       ];
       if (mcpBridge?.token) redactValues.push(mcpBridge.token);
+      // Recheck without an await before handing credential-bearing material to
+      // the process factory. A revocation that raced earlier provisioning must
+      // fence an unresolved native default before it can receive the snapshot.
+      this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
       const process = await this.#processFactory({
         command: this.#command,
         args,
@@ -4292,6 +4537,7 @@ export class PiBackendAdapter implements BackendAdapter {
       }
       const runtime: PiRuntime = {
         key: context.sessionId,
+        spawnProviderId: profile.providerId,
         transport,
         ...(processIdentity === undefined ? {} : { processIdentity }),
         ...(processInstanceId === undefined ? {} : { processInstanceId }),
@@ -4302,6 +4548,7 @@ export class PiBackendAdapter implements BackendAdapter {
         runtimeDirectory,
         runtimeRoot,
         ...(preparedAgentHome.nativeAuth === undefined ? {} : { nativeAuth: preparedAgentHome.nativeAuth }),
+        nativeAuthPersistenceRevoked: false,
         controlPath,
         silentEncryptedRetryControlPath,
         artifactDirectory,
@@ -4780,6 +5027,9 @@ export class PiBackendAdapter implements BackendAdapter {
       commandConcurrencyGate: runtime.generationLease.generation.options.commandConcurrencyGate
     });
     this.#subagentObservers.set(runtime.key, observer);
+    if (runtime.context.target.remoteWorkspace !== undefined) {
+      this.#unresolvedRemoteSubagentOwners.delete(runtime.key);
+    }
     observer.start();
   }
 
@@ -4811,6 +5061,9 @@ export class PiBackendAdapter implements BackendAdapter {
       commandConcurrencyGate: this.#managedGeneration.options.commandConcurrencyGate
     });
     this.#subagentObservers.set(context.sessionId, observer);
+    if (context.target.remoteWorkspace !== undefined && durableStore !== undefined) {
+      this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
+    }
     observer.start();
   }
 
@@ -4903,6 +5156,7 @@ export class PiBackendAdapter implements BackendAdapter {
         cause: error
       });
     }
+    this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
   }
 
   async #stopRuntime(sessionId: string, generation: number): Promise<void> {
@@ -4918,13 +5172,15 @@ export class PiBackendAdapter implements BackendAdapter {
   async #prepareRuntimeAgentHome(
     runtimeDirectory: string,
     runtimeGeneration: number,
-    managedGeneration: PiManagedGeneration
+    managedGeneration: PiManagedGeneration,
+    providerId: string | undefined
   ): Promise<PreparedRuntimeAgentHome> {
     const options = managedGeneration.options;
     const agentHome = managedGeneration.agentHome;
     const path = join(runtimeDirectory, "agent-home");
     assertContained(runtimeDirectory, path, "runtime Agent Home");
     try {
+      this.#assertProviderAuthenticationNotRevoked(options, providerId);
       await mkdir(path, { recursive: true, mode: 0o700 });
       await chmod(path, 0o700);
       for (const name of ["models.json", "settings.json"] as const) {
@@ -4946,7 +5202,10 @@ export class PiBackendAdapter implements BackendAdapter {
       // This allowlist is sourced from ModelRuntime's native OAuth registry.
       // BYOM/keyless providers in models.json use environment bindings and must
       // never be sent through the native credential callback.
-      const providerIds = [...new Set(options.nativeAuthProviderIds ?? [])].sort();
+      const nativeProviderIds = new Set(options.nativeAuthProviderIds ?? []);
+      const providerIds = providerId === undefined
+        ? [...nativeProviderIds].sort()
+        : nativeProviderIds.has(providerId) ? [providerId] : [];
       let loaded: PiNativeAuthSnapshot;
       try {
         loaded = options.loadNativeAuth({ providerIds, expectedCatalogGeneration });
@@ -5000,7 +5259,7 @@ export class PiBackendAdapter implements BackendAdapter {
     runtime.generationLease.generation.options.commandConcurrencyGate?.releaseSession(runtime.key, "runtime_closed");
     let updates: readonly { readonly providerId: string; readonly credential: PiNativeCredential }[] = [];
     let readError: unknown;
-    if (runtime.nativeAuth?.persist !== undefined) {
+    if (!runtime.nativeAuthPersistenceRevoked && runtime.nativeAuth?.persist !== undefined) {
       try {
         updates = await readNativeAuthUpdates(runtime.nativeAuth);
       } catch (error) {
@@ -5011,6 +5270,7 @@ export class PiBackendAdapter implements BackendAdapter {
     // The process is confirmed stopped before this method is called. Remove
     // auth.json before invoking host callbacks that may rotate this Adapter.
     await this.#removeRuntimeDirectory(runtime.runtimeRoot, runtime.runtimeDirectory);
+    if (runtime.nativeAuthPersistenceRevoked) return;
     if (readError !== undefined) {
       throw piError("PI_NATIVE_AUTH_REFRESH_INVALID", "Pi produced an invalid runtime-scoped native credential snapshot", "shutdown", {
         stateMayHaveChanged: true,
@@ -5284,6 +5544,50 @@ export class PiBackendAdapter implements BackendAdapter {
     sections.push(...projected.supplemental);
     if (sections.length === 0 && input.images.length === 0) throw piError("PI_PROMPT_EMPTY", "Pi prompt has no text, image, file, or mention content", "dispatch");
     return sections.join("\n\n");
+  }
+
+  #assertProviderAuthenticationNotRevoked(
+    options: PiAdapterOptions,
+    providerId: string | undefined
+  ): void {
+    const revokedProviderId = providerId === undefined
+      ? [...this.#revokedProviderRoutes].find((candidate) =>
+          providerAuthenticationRouteExists(options, candidate)
+          && providerRequiresAuthentication(options, candidate))
+      : this.#revokedProviderRoutes.has(providerId) ? providerId : undefined;
+    if (revokedProviderId === undefined) return;
+    throw piError(
+      "PI_PROVIDER_AUTHENTICATION_REVOKED",
+      providerId === undefined
+        ? "The native default route cannot be proven independent of a revoked Provider credential"
+        : "The selected Provider credential has been revoked",
+      "provision",
+      { retryable: true, recovery: "Sign in again and refresh the current Provider catalog before resuming this Session." }
+    );
+  }
+
+  #assertManagedSubagentControlProviderAuthentication(
+    action: SubagentControlInput["action"],
+    providerId: string | undefined
+  ): void {
+    if (action !== "steer" && action !== "follow_up") return;
+    if (providerId === undefined) {
+      throw piError(
+        "PI_SUBAGENT_CONTROL_OWNERSHIP_UNCONFIRMED",
+        "The Subagent Provider route cannot be proven from its immutable current-v1 owner",
+        "dispatch",
+        { retryable: false, stateMayHaveChanged: false }
+      );
+    }
+    this.#assertProviderAuthenticationNotRevoked(this.#options, providerId);
+  }
+
+  #providerAuthenticationRouteToken(providerId: string): symbol {
+    const current = this.#providerAuthenticationRouteTokens.get(providerId);
+    if (current !== undefined) return current;
+    const created = Symbol("provider-authentication-route");
+    this.#providerAuthenticationRouteTokens.set(providerId, created);
+    return created;
   }
 
   async #resolveResourceMentionBlocks(
@@ -7145,6 +7449,86 @@ function validateNativeAuthOptions(options: PiAdapterOptions): void {
       );
     }
   }
+}
+
+function validateManagedSubagentProviderAuthenticationOptions(options: PiAdapterOptions): void {
+  if (
+    (options.fenceManagedSubagentProviderAuthentication === undefined)
+    !== (options.reconcileManagedSubagentProviderAuthentication === undefined)
+  ) {
+    throw piError(
+      "PI_AUTH_CHILD_FENCE_INCOMPLETE",
+      "Managed child Provider authentication fencing requires matching fence and reconcile owners",
+      "provision"
+    );
+  }
+}
+
+function providerAuthenticationRouteExists(options: PiAdapterOptions, providerId: string): boolean {
+  return (options.nativeAuthProviderIds ?? []).includes(providerId)
+    || (options.providers ?? []).some((provider) => provider.id === providerId);
+}
+
+function providerRequiresAuthentication(options: PiAdapterOptions, providerId: string): boolean {
+  if ((options.nativeAuthProviderIds ?? []).includes(providerId)) return true;
+  const provider = (options.providers ?? []).find((candidate) => candidate.id === providerId);
+  return provider !== undefined && managedProviderCredentialEnvironmentNames(provider).length > 0;
+}
+
+function providerAuthenticationAvailable(options: PiAdapterOptions, providerId: string): boolean {
+  if ((options.nativeAuthenticatedProviderIds ?? []).includes(providerId)) return true;
+  const provider = (options.providers ?? []).find((candidate) => candidate.id === providerId);
+  if (provider === undefined) return false;
+  const names = managedProviderCredentialEnvironmentNames(provider);
+  return names.length > 0 && names.every((name) => {
+    const value = options.environment?.[name];
+    return typeof value === "string" && value.length > 0;
+  });
+}
+
+function assertProviderId(providerId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(providerId)) {
+    throw piError("PI_PROVIDER_ID_INVALID", "The Provider identity is invalid", "provision");
+  }
+}
+
+function managedProviderCredentialEnvironmentNames(provider: PiManagedProvider): readonly string[] {
+  const names = new Set<string>();
+  if (provider.apiKeyEnv !== undefined) names.add(provider.apiKeyEnv);
+  for (const reference of Object.values(provider.headers ?? {})) names.add(reference.env);
+  for (const override of Object.values(provider.modelOverrides ?? {})) {
+    if (override === null || typeof override !== "object" || Array.isArray(override)) continue;
+    const headers = override["headers"];
+    if (headers === null || typeof headers !== "object" || Array.isArray(headers)) continue;
+    for (const reference of Object.values(headers)) {
+      const name = managedEnvironmentReferenceName(reference);
+      if (name !== undefined) names.add(name);
+    }
+  }
+  return [...names].sort();
+}
+
+/**
+ * A runtime receives only the catalog credential environment for its selected
+ * Provider route. This keeps an independent keyless/managed route alive when
+ * another Provider is revoked without leaving that sibling holding the
+ * revoked route's immutable-generation secret.
+ */
+function scopedManagedProviderEnvironment(
+  options: PiAdapterOptions,
+  catalog: ManagedCatalogResult,
+  providerId: string | undefined
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { ...options.environment };
+  if (providerId === undefined) return environment;
+  for (const name of catalog.secretEnvironmentNames) delete environment[name];
+  const provider = (options.providers ?? []).find((candidate) => candidate.id === providerId);
+  if (provider === undefined) return environment;
+  for (const name of managedProviderCredentialEnvironmentNames(provider)) {
+    const value = options.environment?.[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  return environment;
 }
 
 function normalizeNativeAuthMap(

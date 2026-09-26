@@ -2,7 +2,8 @@ export {
   ClaudeCodeAdapter,
   CLAUDE_MANAGED_PROVIDER_SUPPORT,
   createClaudeCodeAdapter,
-  type ClaudeCodeAdapterOptions
+  type ClaudeCodeAdapterOptions,
+  type ProviderAuthenticationRevocation
 } from "./adapter.js";
 export {
   CLAUDE_AGENT_SDK_PACKAGE,

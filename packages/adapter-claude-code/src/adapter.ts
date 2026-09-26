@@ -572,7 +572,12 @@ interface CatalogBindingSource {
   readonly entry: NativeSessionCatalogEntry;
 }
 
-export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
+/** Capability-neutral seam used before one Provider credential is revoked. */
+export interface ProviderAuthenticationRevocation {
+  revokeProviderAuthentication(providerId: string): Promise<void>;
+}
+
+export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements ProviderAuthenticationRevocation {
   override readonly id: string;
   readonly #runtime: ClaudeSdkRuntime;
   readonly #remoteRuntimes: ClaudeRemoteRuntimePort | undefined;
@@ -945,13 +950,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
       );
     }
     await this.#oauthAccount.logout({
-      beforeDelete: () => this.#retireAuthorizedRuntimes(),
+      beforeDelete: () => this.revokeProviderAuthentication(PROVIDER_ID),
       onDeleted: () => {
         this.#ownsCredential = false;
         this.#authenticationState = "signed_out";
         this.#models.clear();
       }
     });
+  }
+
+  async revokeProviderAuthentication(providerId: string): Promise<void> {
+    if (providerId !== PROVIDER_ID) return;
+    await this.#retireAuthorizedRuntimes();
   }
 
   async listModels(): Promise<readonly ProviderModel[]> {
@@ -4604,24 +4614,34 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   async #retireRuntime(
     runtime: NativeRuntime,
     waitForConsumer = true,
-    taskFailure?: PublicError
+    taskFailure?: PublicError,
+    retirementError?: (stateMayHaveChanged: boolean) => JokoError
   ): Promise<void> {
     if (runtime.retirementConfirmed) return;
     if (!runtime.closed) {
       const retiringTurn = runtime.activeTurn;
+      const retiringTurnFailure = retirementError !== undefined
+        && retiringTurn?.nativeIdentityConfirmed === true
+        && !retiringTurn.terminalClaimed
+        ? taskFailure ?? retirementError(true).publicError
+        : undefined;
       if (retiringTurn !== undefined) {
         retiringTurn.stopping = true;
+        // Own the terminal synchronously before retirement awaits native or
+        // Host work. A late Result will observe this latch and be discarded.
         retiringTurn.terminalClaimed = true;
+        if (retiringTurnFailure !== undefined) retiringTurn.eventsReady.resolve(undefined);
         retiringTurn.mcpCallCancellation.abort();
         const restoration = this.#releaseManagedTurnLeases(runtime, retiringTurn, false);
         if (restoration !== undefined) await restoration;
         retiringTurn.interruptConfirmation?.reject(turnAbortUnknown("The runtime retired before interrupt confirmation.")());
         for (const steer of retiringTurn.steers.values()) {
-          steer.admission.reject(dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
-          steer.cancellation.abort(steerNotActive());
+          steer.admission.reject(retirementError?.(steer.consumed)
+            ?? dispatchError("The runtime retired before same-turn admission was confirmed.", steer.consumed));
+          steer.cancellation.abort(retirementError?.(steer.consumed) ?? steerNotActive());
         }
       }
-      runtime.inputPreparation?.abort(claudeCodeError(
+      runtime.inputPreparation?.abort(retirementError?.(false) ?? claudeCodeError(
         "BACKEND_GENERATION_MISMATCH",
         "The native runtime was retired before input preparation finished.",
         "generation",
@@ -4638,14 +4658,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
           // Runtime retirement remains authoritative when terminal task publication fails.
         }
       }
+      if (retiringTurn !== undefined && retiringTurnFailure !== undefined) {
+        try {
+          await this.#emit(runtime, retiringTurn, {
+            type: "error",
+            error: retiringTurnFailure,
+            terminal: true
+          });
+        } catch {
+          // The claimed terminal still prevents a competing native Result.
+        }
+        try {
+          await this.#emit(runtime, retiringTurn, { type: "done", outcome: "failed" });
+        } catch {
+          // Retirement remains authoritative if terminal publication fails.
+        }
+      }
       runtime.managedRoute?.dispose();
       runtime.mcpLease?.release();
       runtime.closed = true;
-      const reason = new Error("The native runtime was retired.");
+      const reason = retirementError?.(runtime.activeTurn?.inputConsumed === true)
+        ?? new Error("The native runtime was retired.");
       runtime.activeTurn?.admission.reject(reason);
       runtime.activeTurn?.eventsReady.resolve(undefined);
       runtime.gate.close(reason);
-      runtime.abortController.abort();
+      runtime.abortController.abort(reason);
       try {
         runtime.query.close();
       } catch {
@@ -4677,10 +4714,43 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   async #retireAuthorizedRuntimes(): Promise<void> {
-    const runtimes = [...this.#sessions.values()];
-    await Promise.all(runtimes.map(async (runtime) => this.#retireRuntime(runtime)));
-    await Promise.all([...this.#resolvedTargetRuntimes].map(async (sdkRuntime) =>
-      sdkRuntime.retireOwnedProcesses?.(this.#teardownTimeoutMs)));
+    const runtimes = [...this.#sessions.values()].filter((runtime) => runtime.managedRoute === undefined);
+    await Promise.all(runtimes.map(async (runtime) => {
+      await this.#retireRuntime(
+        runtime,
+        false,
+        providerAuthenticationRevoked(true).publicError,
+        providerAuthenticationRevoked
+      );
+      // Remote Queries already receive exact process retirement inside the
+      // ordinary runtime-retirement owner. Local Queries need the additional
+      // SDK confirmation before their credential may be deleted.
+      if (runtime.remote) return;
+      try {
+        await runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs);
+        runtime.assertRuntimeCurrent();
+      } catch {
+        // Preserve the exact closed runtime as a retry handle until process
+        // retirement is confirmed; managed routes remain independently owned.
+        if (!this.#sessions.has(runtime.productSessionId)) {
+          this.#sessions.set(runtime.productSessionId, runtime);
+        }
+        throw claudeCodeError(
+          "CLAUDE_CODE_AUTH_RUNTIME_RETIREMENT_UNKNOWN",
+          "The credential-bearing Claude Code Query did not confirm exact process retirement.",
+          "session_close",
+          {
+            retryable: true,
+            stateMayHaveChanged: true,
+            recovery: "Keep the Provider fenced and inspect the exact native Query before retrying sign-out."
+          }
+        );
+      }
+      if (this.#sessions.get(runtime.productSessionId) === runtime) {
+        this.#sessions.delete(runtime.productSessionId);
+      }
+      await settleWithin(runtime.consumer, this.#teardownTimeoutMs);
+    }));
   }
 
   async #sessionInfo(
@@ -5970,6 +6040,23 @@ function dispatchError(message: string, stateMayHaveChanged: boolean): JokoError
       ? "Inspect the native Session before retrying."
       : "Retry the durable queue item."
   });
+}
+
+function providerAuthenticationRevoked(stateMayHaveChanged: boolean): JokoError {
+  return claudeCodeError(
+    "CLAUDE_CODE_PROVIDER_AUTHENTICATION_REVOKED",
+    stateMayHaveChanged
+      ? "The Claude Code Provider credential was revoked after native dispatch may have started."
+      : "The Claude Code Provider credential was revoked before native dispatch.",
+    "dispatch",
+    {
+      retryable: true,
+      stateMayHaveChanged,
+      recovery: stateMayHaveChanged
+        ? "Inspect the native Session, sign in again, and explicitly resend only after its outcome is known."
+        : "Sign in again, refresh the Backend descriptor, and explicitly resend this input."
+    }
+  );
 }
 
 function assertResultOwnership(

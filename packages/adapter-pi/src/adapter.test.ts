@@ -5,7 +5,7 @@ import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PolicySnapshot, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
 import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashCommand, isRuntimeResourceProvenLoaded, mergeManagedResourceSnapshots, projectPiTreeNodes, resolvePiComposerSlashCommand } from "./adapter.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
@@ -6030,6 +6030,651 @@ describe("PiBackendAdapter", () => {
     await adapter.dispose();
   });
 
+  it("revokes only credential-bearing Provider runtimes and resumes from a fresh authenticated generation", async () => {
+    const firstHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-revoke-one-"));
+    const secondHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-revoke-two-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-auth-revoke-workspace-"));
+    const localProvider = {
+      id: "local-byom",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      api: "openai-completions" as const,
+      keyless: true,
+      models: [{ id: "local-model" }]
+    };
+    const nativeModel: ProviderModel = {
+      providerId: "native-oauth", modelId: "native-model", displayName: "Native",
+      api: "openai-responses", contextWindow: 100_000, maxOutputTokens: 16_000,
+      supportsImages: true, supportsFastMode: false, thinkingLevels: ["medium"],
+      cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }
+    };
+    const oldCredential = { type: "oauth" as const, access: "old-access-secret", refresh: "old-refresh-secret", expires: 10_000 };
+    const newCredential = { type: "oauth" as const, access: "new-access-secret", refresh: "new-refresh-secret", expires: 20_000 };
+    const refreshedDuringLogout = {
+      type: "oauth" as const,
+      access: "must-not-persist-access",
+      refresh: "must-not-persist-refresh",
+      expires: 15_000
+    };
+    const persistNativeAuth = vi.fn(async () => ({
+      catalogGeneration: 2,
+      credentialReferenceId: "must-not-be-created",
+      expiresAt: refreshedDuringLogout.expires
+    }));
+    const specs: PiProcessSpec[] = [];
+    const processes: ScriptedPiProcess[] = [];
+    const processFactory = (spec: PiProcessSpec): PiProcessHandle => {
+      specs.push(spec);
+      const process = new ScriptedPiProcess(spec);
+      processes.push(process);
+      return process as unknown as PiProcessHandle;
+    };
+    const load = (catalogGeneration: number, credential: typeof oldCredential) =>
+      ({ providerIds, expectedCatalogGeneration }: { readonly providerIds: readonly string[]; readonly expectedCatalogGeneration: number }) => {
+        expect(expectedCatalogGeneration).toBe(catalogGeneration);
+        const credentials: Record<string, typeof oldCredential> = {};
+        if (providerIds.includes("native-oauth")) credentials["native-oauth"] = credential;
+        return {
+          catalogGeneration,
+          credentials
+        };
+      };
+    const adapter = createPiAdapter({
+      agentHome: firstHome,
+      sessionRoot: firstHome,
+      catalogGeneration: 1,
+      providers: [localProvider],
+      nativeAuthProviderIds: ["native-oauth"],
+      nativeAuthenticatedProviderIds: ["native-oauth"],
+      nativeModels: [nativeModel],
+      loadNativeAuth: load(1, oldCredential),
+      persistNativeAuth,
+      versionProbe: async () => "pi 99.99.99-auth-revoke-test",
+      processFactory
+    });
+    const target: TargetDescriptor = {
+      id: "target-auth-revoke", backendId: "pi", displayName: "Auth revoke",
+      workspaceRoot: workspace, managed: true, trusted: false
+    };
+    const nativeContext = { ...makeContext(target, []), sessionId: "native-auth-runtime" };
+    const managedContext = { ...makeContext(target, []), sessionId: "managed-route-runtime" };
+    const nativeDefaultContext = { ...makeContext(target, []), sessionId: "native-default-runtime" };
+    const nativeBinding = await adapter.createSession({
+      target, providerId: "native-oauth", modelId: "native-model", fastMode: false, permissionMode: "ask"
+    }, nativeContext);
+    const managedBinding = await adapter.createSession({
+      target, providerId: "local-byom", modelId: "local-model", fastMode: false, permissionMode: "ask"
+    }, managedContext);
+    const nativeDefaultBinding = await adapter.createSession({
+      target, fastMode: false, permissionMode: "ask"
+    }, nativeDefaultContext);
+    const nativeHome = String(specs[0]!.env.PI_CODING_AGENT_DIR);
+    const managedHome = String(specs[1]!.env.PI_CODING_AGENT_DIR);
+    const nativeDefaultHome = String(specs[2]!.env.PI_CODING_AGENT_DIR);
+    expect(JSON.parse(await readFile(join(nativeHome, "auth.json"), "utf8"))).toEqual({ "native-oauth": oldCredential });
+    expect(JSON.parse(await readFile(join(managedHome, "auth.json"), "utf8"))).toEqual({});
+    expect(JSON.parse(await readFile(join(nativeDefaultHome, "auth.json"), "utf8"))).toEqual({ "native-oauth": oldCredential });
+    await writeFile(join(nativeHome, "auth.json"), `${JSON.stringify({ "native-oauth": refreshedDuringLogout })}\n`, { mode: 0o600 });
+
+    const staleAuthenticationEvidence = adapter.beginProviderAuthenticationReconciliation("native-oauth");
+    await adapter.revokeProviderAuthentication("native-oauth");
+
+    expect(processes[0]!.exitCode).not.toBeNull();
+    expect(persistNativeAuth).not.toHaveBeenCalled();
+    expect(processes[1]!.exitCode).toBeNull();
+    expect(processes[2]!.exitCode).not.toBeNull();
+    await expect(access(dirname(nativeHome))).rejects.toBeDefined();
+    await expect(access(dirname(nativeDefaultHome))).rejects.toBeDefined();
+    await expect(adapter.getState({ ...managedContext, binding: managedBinding })).resolves.toBeDefined();
+    await expect(adapter.resumeSession(nativeBinding, { ...nativeContext, binding: nativeBinding }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+    await expect(adapter.resumeSession(nativeDefaultBinding, {
+      ...nativeDefaultContext,
+      binding: nativeDefaultBinding
+    })).rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+    await expect(adapter.createSession({
+      target, fastMode: false, permissionMode: "ask"
+    }, { ...makeContext(target, []), sessionId: "native-default-after-revoke" }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+    expect(processes).toHaveLength(3);
+
+    const freshAuthenticationEvidence = adapter.beginProviderAuthenticationReconciliation("native-oauth");
+    await adapter.updateManagedGeneration({
+      agentHome: secondHome,
+      providers: [localProvider],
+      catalogGeneration: 2,
+      nativeAuthProviderIds: ["native-oauth"],
+      nativeAuthenticatedProviderIds: ["native-oauth"],
+      nativeModels: [nativeModel],
+      loadNativeAuth: load(2, newCredential)
+    });
+    expect(adapter.reconcileProviderAuthentication("native-oauth", staleAuthenticationEvidence)).toBe(false);
+    await expect(adapter.resumeSession(nativeBinding, { ...nativeContext, binding: nativeBinding }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+    expect(adapter.reconcileProviderAuthentication("native-oauth", freshAuthenticationEvidence)).toBe(true);
+    await adapter.resumeSession(nativeBinding, { ...nativeContext, binding: nativeBinding });
+    const replacementHome = String(specs[3]!.env.PI_CODING_AGENT_DIR);
+    expect(replacementHome).toContain(secondHome);
+    expect(JSON.parse(await readFile(join(replacementHome, "auth.json"), "utf8"))).toEqual({ "native-oauth": newCredential });
+    expect(await readFile(join(replacementHome, "auth.json"), "utf8")).not.toContain(oldCredential.access);
+    expect(processes[1]!.exitCode).toBeNull();
+    await adapter.dispose();
+  });
+
+  it("retires managed credential routes, keeps keyless siblings secret-free, and requires a credentialed new generation", async () => {
+    const firstHome = await mkdtemp(join(tmpdir(), "joko-pi-managed-auth-revoke-one-"));
+    const missingHome = await mkdtemp(join(tmpdir(), "joko-pi-managed-auth-revoke-missing-"));
+    const restoredHome = await mkdtemp(join(tmpdir(), "joko-pi-managed-auth-revoke-restored-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-managed-auth-revoke-workspace-"));
+    const managedProvider = {
+      id: "managed-secret",
+      baseUrl: "https://managed.example.invalid/v1",
+      api: "openai-completions" as const,
+      apiKeyEnv: "MANAGED_SECRET_KEY",
+      headers: { "x-managed-auth": { env: "MANAGED_HEADER_SECRET" } },
+      modelOverrides: {
+        "managed-model": { headers: { "x-model-auth": "$MANAGED_MODEL_SECRET" } }
+      },
+      models: [{ id: "managed-model" }]
+    };
+    const keylessProvider = {
+      id: "local-keyless",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      api: "openai-completions" as const,
+      keyless: true,
+      models: [{ id: "local-model" }]
+    };
+    const providers = [managedProvider, keylessProvider];
+    const credentials = {
+      MANAGED_SECRET_KEY: "managed-api-secret",
+      MANAGED_HEADER_SECRET: "managed-header-secret",
+      MANAGED_MODEL_SECRET: "managed-model-secret"
+    };
+    const specs: PiProcessSpec[] = [];
+    const processes: ScriptedPiProcess[] = [];
+    const processFactory = (spec: PiProcessSpec): PiProcessHandle => {
+      specs.push(spec);
+      const process = new ScriptedPiProcess(spec);
+      processes.push(process);
+      return process as unknown as PiProcessHandle;
+    };
+    const adapter = createPiAdapter({
+      agentHome: firstHome,
+      sessionRoot: firstHome,
+      providers,
+      environment: credentials,
+      versionProbe: async () => "pi 99.99.99-managed-auth-revoke-test",
+      processFactory
+    });
+    const target: TargetDescriptor = {
+      id: "target-managed-auth-revoke", backendId: "pi", displayName: "Managed auth revoke",
+      workspaceRoot: workspace, managed: true, trusted: false
+    };
+    const managedContext = { ...makeContext(target, []), sessionId: "managed-secret-runtime" };
+    const keylessContext = { ...makeContext(target, []), sessionId: "managed-keyless-runtime" };
+    const unresolvedContext = { ...makeContext(target, []), sessionId: "managed-unresolved-runtime" };
+    const managedBinding = await adapter.createSession({
+      target, providerId: "managed-secret", modelId: "managed-model", fastMode: false, permissionMode: "ask"
+    }, managedContext);
+    const keylessBinding = await adapter.createSession({
+      target, providerId: "local-keyless", modelId: "local-model", fastMode: false, permissionMode: "ask"
+    }, keylessContext);
+    await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, unresolvedContext);
+
+    expect(specs[0]!.env.MANAGED_SECRET_KEY).toBe(credentials.MANAGED_SECRET_KEY);
+    expect(specs[0]!.env.MANAGED_HEADER_SECRET).toBe(credentials.MANAGED_HEADER_SECRET);
+    expect(specs[0]!.env.MANAGED_MODEL_SECRET).toBe(credentials.MANAGED_MODEL_SECRET);
+    expect(specs[1]!.env.MANAGED_SECRET_KEY).toBeUndefined();
+    expect(specs[1]!.env.MANAGED_HEADER_SECRET).toBeUndefined();
+    expect(specs[1]!.env.MANAGED_MODEL_SECRET).toBeUndefined();
+    expect(specs[2]!.env.MANAGED_SECRET_KEY).toBe(credentials.MANAGED_SECRET_KEY);
+    expect(specs[2]!.env.MANAGED_HEADER_SECRET).toBe(credentials.MANAGED_HEADER_SECRET);
+    expect(specs[2]!.env.MANAGED_MODEL_SECRET).toBe(credentials.MANAGED_MODEL_SECRET);
+    await adapter.revokeProviderAuthentication("local-keyless");
+    expect(processes[1]!.exitCode).toBeNull();
+
+    await adapter.revokeProviderAuthentication("managed-secret");
+
+    expect(processes[0]!.exitCode).not.toBeNull();
+    expect(processes[1]!.exitCode).toBeNull();
+    expect(processes[2]!.exitCode).not.toBeNull();
+    await expect(adapter.getState({ ...keylessContext, binding: keylessBinding })).resolves.toBeDefined();
+    await expect(adapter.resumeSession(managedBinding, { ...managedContext, binding: managedBinding }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+
+    const detachedTaskId = "revoked-provider-child:1";
+    await writeDurableSubagentControlFixture(
+      firstHome,
+      keylessContext.sessionId,
+      keylessContext.generation,
+      detachedTaskId,
+      "running",
+      { provider: "managed-secret", model: "managed-model", effort: "medium" }
+    );
+    await expect(adapter.controlSubagent({
+      runId: detachedTaskId,
+      action: "steer",
+      message: "must remain fenced"
+    }, { ...keylessContext, binding: keylessBinding })).rejects.toMatchObject({
+      publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" }
+    });
+    await expect(adapter.controlSubagent({
+      runId: detachedTaskId,
+      action: "follow_up",
+      message: "must remain fenced"
+    }, { ...keylessContext, binding: keylessBinding })).rejects.toMatchObject({
+      publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" }
+    });
+    await expect(adapter.controlSubagent({
+      runId: detachedTaskId,
+      action: "stop"
+    }, { ...keylessContext, binding: keylessBinding })).resolves.toBeUndefined();
+
+    await adapter.updateManagedGeneration({
+      agentHome: missingHome,
+      providers,
+      environment: {
+        MANAGED_SECRET_KEY: credentials.MANAGED_SECRET_KEY,
+        MANAGED_HEADER_SECRET: credentials.MANAGED_HEADER_SECRET
+      }
+    });
+    await expect(adapter.resumeSession(managedBinding, { ...managedContext, binding: managedBinding }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+
+    const authenticationEvidence = adapter.beginProviderAuthenticationReconciliation("managed-secret");
+    await adapter.updateManagedGeneration({
+      agentHome: restoredHome,
+      providers,
+      environment: credentials
+    });
+    await expect(adapter.resumeSession(managedBinding, { ...managedContext, binding: managedBinding }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+    expect(adapter.reconcileProviderAuthentication("managed-secret", authenticationEvidence)).toBe(true);
+    await adapter.resumeSession(managedBinding, { ...managedContext, binding: managedBinding });
+    expect(specs[3]!.env.MANAGED_SECRET_KEY).toBe(credentials.MANAGED_SECRET_KEY);
+    expect(specs[3]!.env.MANAGED_HEADER_SECRET).toBe(credentials.MANAGED_HEADER_SECRET);
+    expect(specs[3]!.env.MANAGED_MODEL_SECRET).toBe(credentials.MANAGED_MODEL_SECRET);
+    expect(String(specs[3]!.env.PI_CODING_AGENT_DIR)).toContain(restoredHome);
+    expect(processes[1]!.exitCode).toBeNull();
+    await adapter.dispose();
+  });
+
+  it("keeps a revoked route fenced across an in-flight or unrelated managed-generation publication", async () => {
+    const firstHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-epoch-one-"));
+    const staleHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-epoch-stale-"));
+    const unrelatedHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-epoch-unrelated-"));
+    const freshHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-epoch-fresh-"));
+    const provider = {
+      id: "managed-auth",
+      baseUrl: "https://managed.example.invalid/v1",
+      api: "openai-completions" as const,
+      apiKeyEnv: "MANAGED_AUTH_KEY",
+      models: [{ id: "managed-model" }]
+    };
+    const generation = (agentHome: string) => ({
+      agentHome,
+      providers: [provider],
+      environment: { MANAGED_AUTH_KEY: "credential-is-not-auth-evidence" }
+    });
+    let routerFenceToken: symbol | undefined;
+    let issuedRouterFenceToken: symbol | undefined;
+    let releaseRouterSettlement!: () => void;
+    const routerSettlement = new Promise<void>((resolve) => { releaseRouterSettlement = resolve; });
+    const fenceManagedSubagentProviderAuthentication = vi.fn(() => {
+      routerFenceToken = Symbol("managed-subagent-provider-route");
+      issuedRouterFenceToken = routerFenceToken;
+      return { routeToken: routerFenceToken, settlement: routerSettlement };
+    });
+    const reconcileManagedSubagentProviderAuthentication = vi.fn((
+      providerId: string,
+      routeToken: unknown
+    ) => {
+      if (providerId !== "managed-auth" || routeToken !== routerFenceToken) return false;
+      routerFenceToken = undefined;
+      return true;
+    });
+    const adapter = createPiAdapter({
+      agentHome: firstHome,
+      sessionRoot: firstHome,
+      providers: [provider],
+      environment: { MANAGED_AUTH_KEY: "credential-is-not-auth-evidence" },
+      fenceManagedSubagentProviderAuthentication,
+      reconcileManagedSubagentProviderAuthentication,
+      versionProbe: async () => "pi 99.99.99-auth-epoch-test"
+    });
+
+    const stalePublication = adapter.updateManagedGeneration(generation(staleHome));
+    const retirement = adapter.revokeProviderAuthentication("managed-auth");
+    // The update has synchronously reserved its start sequence, but its first
+    // filesystem await has not published. Evidence captured after revocation
+    // must reject that late stale publication.
+    const staleEvidence = adapter.beginProviderAuthenticationReconciliation("managed-auth");
+    await stalePublication;
+    releaseRouterSettlement();
+    await retirement;
+
+    expect(adapter.reconcileProviderAuthentication("managed-auth", staleEvidence)).toBe(false);
+    expect(reconcileManagedSubagentProviderAuthentication).not.toHaveBeenCalled();
+    const noPublicationEvidence = adapter.beginProviderAuthenticationReconciliation("managed-auth");
+    expect(adapter.reconcileProviderAuthentication("managed-auth", noPublicationEvidence)).toBe(false);
+
+    await adapter.updateManagedGeneration(generation(unrelatedHome));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-auth-epoch-workspace-"));
+    const target: TargetDescriptor = {
+      id: "target-auth-epoch", backendId: "pi", displayName: "Auth epoch",
+      workspaceRoot: workspace, managed: true, trusted: false
+    };
+    await expect(adapter.createSession({
+      target, providerId: "managed-auth", modelId: "managed-model", fastMode: false, permissionMode: "ask"
+    }, makeContext(target, []))).rejects.toMatchObject({
+      publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" }
+    });
+
+    const freshEvidence = adapter.beginProviderAuthenticationReconciliation("managed-auth");
+    await adapter.updateManagedGeneration(generation(freshHome));
+    expect(adapter.reconcileProviderAuthentication("managed-auth", freshEvidence)).toBe(true);
+    expect(fenceManagedSubagentProviderAuthentication).toHaveBeenCalledExactlyOnceWith("managed-auth");
+    expect(reconcileManagedSubagentProviderAuthentication).toHaveBeenCalledExactlyOnceWith(
+      "managed-auth",
+      issuedRouterFenceToken
+    );
+    await adapter.dispose();
+  });
+
+  it("retires an old credentialed generation and its dead child after the current generation removes the Provider", async () => {
+    const firstHome = await mkdtemp(join(tmpdir(), "joko-pi-old-auth-owner-one-"));
+    const secondHome = await mkdtemp(join(tmpdir(), "joko-pi-old-auth-owner-two-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-old-auth-owner-workspace-"));
+    const processes: ScriptedPiProcess[] = [];
+    const adapter = createPiAdapter({
+      agentHome: firstHome,
+      sessionRoot: firstHome,
+      providers: [{
+        id: "retired-auth",
+        baseUrl: "https://retired.example.invalid/v1",
+        api: "openai-completions",
+        apiKeyEnv: "RETIRED_AUTH_KEY",
+        models: [{ id: "retired-model" }]
+      }],
+      environment: { RETIRED_AUTH_KEY: "retired-secret" },
+      processFactory: (spec) => {
+        const process = new ScriptedPiProcess(spec);
+        processes.push(process);
+        return process as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "target-old-auth-owner",
+      backendId: "pi",
+      displayName: "Old auth owner",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: false
+    };
+    const oldContext = { ...makeContext(target, []), sessionId: "old-auth-owner" };
+    await adapter.createSession({
+      target,
+      providerId: "retired-auth",
+      modelId: "retired-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, oldContext);
+    const runDirectory = await writeDurableSubagentControlFixture(
+      firstHome,
+      oldContext.sessionId,
+      oldContext.generation,
+      "old-auth-child:1",
+      "running",
+      { provider: "retired-auth", model: "retired-model", effort: "off" }
+    );
+    const deadPid = 999_999_999;
+    for (const name of ["owner.json", "status.json", "runner.claim.json"] as const) {
+      const path = join(runDirectory, name);
+      const value = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+      value["runnerPid"] = deadPid;
+      if (name === "status.json") value["heartbeatAt"] = Date.now() - 60_000;
+      await writeFile(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+    }
+    const config = JSON.parse(await readFile(join(runDirectory, "config.json"), "utf8")) as Record<string, unknown>;
+    const nativeSessionPath = join(String(config["childSessionDir"]), `${String(config["nativeSessionId"])}.jsonl`);
+    await writeFile(nativeSessionPath, `${JSON.stringify({ token: "retired-child-secret" })}\n`, { mode: 0o600 });
+
+    await adapter.updateManagedGeneration({
+      agentHome: secondHome,
+      providers: [{
+        id: "current-keyless",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        api: "openai-completions",
+        keyless: true,
+        models: [{ id: "current-model" }]
+      }],
+      environment: {}
+    });
+    const siblingContext = { ...makeContext(target, []), sessionId: "current-keyless-owner" };
+    await adapter.createSession({
+      target,
+      providerId: "current-keyless",
+      modelId: "current-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, siblingContext);
+
+    await adapter.revokeProviderAuthentication("retired-auth");
+
+    expect(processes[0]!.exitCode).not.toBeNull();
+    expect(processes[1]!.exitCode).toBeNull();
+    await expect(readFile(nativeSessionPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(runDirectory, "status.json"), "utf8")).resolves.toContain('"state":"failed"');
+    await adapter.dispose();
+  });
+
+  it("fails Provider revocation closed when remote durable child retirement cannot be proven", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-remote-auth-revoke-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-remote-auth-revoke-workspace-"));
+    const revision = createHash("sha256").update("remote auth revoke empty revision").digest("hex");
+    let rejectScans = false;
+    const scan = vi.fn(async () => {
+      if (rejectScans) throw new Error("remote durable retirement unavailable");
+      return { revision, unchanged: false, retryAfterMs: 500, runs: [] };
+    });
+    const store: PiManagedDurableStore = {
+      scan,
+      readTail: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
+      writeControl: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
+      stopAndRemoveSession: vi.fn(async () => ({
+        terminalRunIds: [],
+        removed: true as const,
+        deletionReceipt: createHash("sha256").update("remote auth revoke deletion").digest("hex")
+      })),
+      finalizeDeletion: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => undefined)
+    };
+    const processes: ScriptedPiProcess[] = [];
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      providers: [{
+        id: "remote-secret",
+        baseUrl: "https://remote.example.invalid/v1",
+        api: "openai-completions",
+        apiKeyEnv: "REMOTE_SECRET_KEY",
+        models: [{ id: "remote-model" }]
+      }, {
+        id: "remote-keyless",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        api: "openai-completions",
+        keyless: true,
+        models: [{ id: "local-model" }]
+      }],
+      environment: { REMOTE_SECRET_KEY: "remote-secret-value" },
+      validateRemoteWorkspace: async () => undefined,
+      managedDurableStoreRegistry: { storeFor: async () => store },
+      versionProbe: async () => "pi 99.99.99-remote-auth-revoke-test",
+      processFactory: (spec) => {
+        const process = new ScriptedPiProcess(spec);
+        processes.push(process);
+        return process as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "target-remote-auth-revoke",
+      backendId: "pi",
+      displayName: "Remote auth revoke",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: false,
+      remoteWorkspace: {
+        hostTargetId: "target-remote-auth-revoke",
+        hostId: "fixture-host",
+        workspaceRoot: "/workspace"
+      }
+    };
+    const credentialedContext = { ...makeContext(target, []), sessionId: "remote-credentialed-runtime" };
+    await adapter.createSession({
+      target,
+      providerId: "remote-secret",
+      modelId: "remote-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, credentialedContext);
+    rejectScans = true;
+    scan.mockClear();
+
+    await expect(adapter.revokeProviderAuthentication("remote-secret"))
+      .rejects.toMatchObject({ publicError: { code: "PI_AUTH_CHILD_RETIREMENT_UNKNOWN" } });
+
+    expect(scan).toHaveBeenCalled();
+    expect(processes[0]!.exitCode).toBeNull();
+    await expect(adapter.createSession({
+      target,
+      providerId: "remote-secret",
+      modelId: "remote-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, { ...makeContext(target, []), sessionId: "remote-revoked-new-runtime" }))
+      .rejects.toMatchObject({ publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" } });
+    await expect(adapter.createSession({
+      target,
+      providerId: "remote-keyless",
+      modelId: "local-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, { ...makeContext(target, []), sessionId: "remote-keyless-new-runtime" }))
+      .resolves.toBeDefined();
+    expect(processes).toHaveLength(2);
+    await adapter.dispose();
+  });
+
+  it("retains an unresolved remote durable owner when startup cannot recover its store", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-remote-auth-owner-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-remote-auth-owner-workspace-"));
+    const storeFor = vi.fn(async () => undefined);
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      providers: [{
+        id: "remote-secret",
+        baseUrl: "https://remote.example.invalid/v1",
+        api: "openai-completions",
+        apiKeyEnv: "REMOTE_SECRET_KEY",
+        models: [{ id: "remote-model" }]
+      }],
+      environment: { REMOTE_SECRET_KEY: "remote-secret-value" },
+      validateRemoteWorkspace: async () => undefined,
+      managedDurableStoreRegistry: { storeFor }
+    });
+    const target: TargetDescriptor = {
+      id: "target-remote-auth-owner",
+      backendId: "pi",
+      displayName: "Remote auth owner",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: false,
+      remoteWorkspace: {
+        hostTargetId: "target-remote-auth-owner",
+        hostId: "fixture-host",
+        workspaceRoot: "/workspace"
+      }
+    };
+    const context = {
+      ...makeContext(target, []),
+      binding: { opaqueRef: join(agentHome, "remote-native-session.jsonl"), generation: 1 }
+    };
+
+    await expect(adapter.observeDetachedSubagents(context)).rejects.toMatchObject({
+      publicError: { code: "PI_REMOTE_SUBAGENT_STORE_UNAVAILABLE" }
+    });
+    await expect(adapter.revokeProviderAuthentication("remote-secret")).rejects.toMatchObject({
+      publicError: { code: "PI_AUTH_CHILD_RETIREMENT_UNKNOWN" }
+    });
+    await expect(adapter.createSession({
+      target,
+      providerId: "remote-secret",
+      modelId: "remote-model",
+      fastMode: false,
+      permissionMode: "ask"
+    }, { ...makeContext(target, []), sessionId: "fenced-after-unresolved-owner" })).rejects.toMatchObject({
+      publicError: { code: "PI_PROVIDER_AUTHENTICATION_REVOKED" }
+    });
+    expect(storeFor).toHaveBeenCalledTimes(1);
+    await adapter.dispose();
+  });
+
+  it("rescans an in-flight credential-bearing startup before Provider revocation completes", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-auth-revoke-race-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-auth-revoke-race-workspace-"));
+    let releaseSpawn!: (process: PiProcessHandle) => void;
+    let markSpawnEntered!: () => void;
+    const spawnEntered = new Promise<void>((resolvePromise) => { markSpawnEntered = resolvePromise; });
+    const spawned = new Promise<PiProcessHandle>((resolvePromise) => { releaseSpawn = resolvePromise; });
+    let process: ScriptedPiProcess | undefined;
+    let capturedSpec: PiProcessSpec | undefined;
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      catalogGeneration: 1,
+      nativeAuthProviderIds: ["native-oauth"],
+      nativeAuthenticatedProviderIds: ["native-oauth"],
+      nativeModels: [{
+        providerId: "native-oauth", modelId: "native-model", displayName: "Native",
+        api: "openai-responses", contextWindow: 100_000, maxOutputTokens: 16_000,
+        supportsImages: true, thinkingLevels: [], cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }
+      }],
+      loadNativeAuth: () => ({
+        catalogGeneration: 1,
+        credentials: { "native-oauth": { type: "oauth", access: "race-access-secret", refresh: "race-refresh-secret", expires: 10_000 } }
+      }),
+      versionProbe: async () => "pi 99.99.99-auth-revoke-race-test",
+      processFactory: async (spec) => {
+        capturedSpec = spec;
+        markSpawnEntered();
+        return spawned;
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "target-auth-revoke-race", backendId: "pi", displayName: "Auth revoke race",
+      workspaceRoot: workspace, managed: true, trusted: false
+    };
+    const context = makeContext(target, []);
+    const creating = adapter.createSession({
+      target, providerId: "native-oauth", modelId: "native-model", fastMode: false, permissionMode: "ask"
+    }, context);
+    await spawnEntered;
+    const revoking = adapter.revokeProviderAuthentication("native-oauth");
+    let revokeSettled = false;
+    void revoking.finally(() => { revokeSettled = true; });
+    await Promise.resolve();
+    expect(revokeSettled).toBe(false);
+
+    process = new ScriptedPiProcess(capturedSpec!);
+    releaseSpawn(process as unknown as PiProcessHandle);
+    await Promise.allSettled([creating]);
+    await revoking;
+
+    expect(process.exitCode).not.toBeNull();
+    await expect(adapter.getState(context)).rejects.toMatchObject({ publicError: { code: "PI_RUNTIME_NOT_ACTIVE" } });
+    await adapter.dispose();
+  });
+
   it("probes a hot replacement generation without recovering sibling runtimes owned by the current Adapter", async () => {
     const sessionRoot = await mkdtemp(join(tmpdir(), "joko-pi-hot-replacement-root-"));
     const generationsRoot = join(sessionRoot, "generations");
@@ -6716,7 +7361,9 @@ async function writeDurableSubagentControlFixture(
   productSessionId: string,
   productGeneration: number,
   taskId: string,
-  state: "running" | "completed" = "running"
+  state: "running" | "completed" = "running",
+  route: Readonly<{ readonly provider: string; readonly model: string; readonly effort: string }> =
+    { provider: "local", model: "test-model", effort: "medium" }
 ): Promise<string> {
   const runId = randomUUID();
   const launchToken = randomUUID();
@@ -6743,8 +7390,10 @@ async function writeDurableSubagentControlFixture(
       productGeneration,
       parentTaskId: "parent-call",
       taskId,
-      route: { provider: "local", model: "test-model", effort: "medium" },
+      route,
       turnCount: 1,
+      childSessionDir: join(runDirectory, "sessions"),
+      nativeSessionId,
       transcriptPath
     })}\n`, { mode: 0o600 }),
     writeFile(join(runDirectory, "owner.json"), `${JSON.stringify({
@@ -6777,7 +7426,8 @@ async function writeDurableSubagentControlFixture(
       createdAt: 1,
       startedAt: 2,
       heartbeatAt: Date.now(),
-      ...(state === "completed" ? { endedAt: 3, nativeSessionId, nativeSessionPath } : {}),
+      nativeSessionId,
+      ...(state === "completed" ? { endedAt: 3, nativeSessionPath } : {}),
       transcriptPath,
       turnCount: 1,
       usage: {},

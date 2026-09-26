@@ -88,6 +88,19 @@ function completedRecord(id: string, kind: string, body: unknown, response: unkn
 
 function immediateHost(store: object, extra: Record<string, unknown> = {}) {
   return {
+    beginBackendProviderAuthenticationEvidence: (backendId: string, providerId: string) => ({
+      backendId,
+      providerId,
+      routeToken: Symbol("provider-authentication-evidence"),
+      sequence: 1
+    }),
+    reconcileBackendProviderAuthentication: () => undefined,
+    fenceBackendProviderAuthentication: (backendId: string, providerId: string) => ({
+      backendId,
+      providerId,
+      retirementToken: Symbol("provider-authentication-retirement")
+    }),
+    completeBackendProviderAuthenticationRetirement: () => undefined,
     mutate: async (input: {
       operationId: string;
       kind: string;
@@ -4077,12 +4090,24 @@ describe("Connect typed feature boundaries", () => {
       current = { ...pending, pendingPrompt: undefined, state: "cancelled", updatedAt: 13, error: "Provider login was cancelled." };
       return current;
     });
+    const authenticationEvidence = {
+      backendId: "managed-backend",
+      providerId: pending.providerId,
+      routeToken: Symbol("provider-login-evidence"),
+      sequence: 1
+    };
+    const reconcileBackendProviderAuthentication = vi.fn();
     const services = createConnectServices(stubApplication({
+      providers: { nativeAuthenticationBackendId: "managed-backend" },
       providerAuth: {
         getFlow: (id: string) => id === "native-flow-1" ? current : undefined,
         beginInputUpload,
         submitInput,
         cancel
+      },
+      sessionHost: {
+        beginBackendProviderAuthenticationEvidence: () => authenticationEvidence,
+        reconcileBackendProviderAuthentication
       }
     }));
 
@@ -4121,6 +4146,11 @@ describe("Connect typed feature boundaries", () => {
       state: contract.ProviderLoginFlowState.COMPLETED,
       pendingPrompt: undefined
     });
+    expect(reconcileBackendProviderAuthentication).toHaveBeenCalledWith(
+      "managed-backend",
+      pending.providerId,
+      authenticationEvidence
+    );
     const submittedWire = toBinary(contract.SubmitProviderLoginInputResponseSchema, create(
       contract.SubmitProviderLoginInputResponseSchema,
       submitted

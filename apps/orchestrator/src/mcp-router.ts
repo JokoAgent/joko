@@ -276,7 +276,7 @@ interface BridgeGrant {
   readonly nativeAuth?: {
     readonly catalogGeneration: number;
     readonly providerIds: ReadonlySet<string>;
-    readonly authenticatedProviderIds: ReadonlySet<string>;
+    readonly authenticatedProviderIds: Set<string>;
     /** Digest of a parent-extension-only reservation authority. */
     readonly launchAuthorityDigest?: Buffer;
     readonly leases: Map<string, NativeAuthLease>;
@@ -314,6 +314,27 @@ interface DetachedNativeAuthLease {
   recoveryProof?: string;
   released: boolean;
   expiresAt: number;
+}
+
+interface NativeAuthProviderRouteState {
+  epoch: number;
+  fenced: boolean;
+  routeToken: object;
+  inFlight: number;
+  readonly idleWaiters: Set<() => void>;
+}
+
+interface NativeAuthProviderAdmission {
+  readonly providerId: string;
+  readonly state: NativeAuthProviderRouteState;
+  readonly epoch: number;
+  readonly routeToken: object;
+  readonly fencedAtStart: boolean;
+}
+
+export interface NativeAuthProviderFence {
+  readonly routeToken: object;
+  readonly settlement: Promise<void>;
 }
 
 interface NormalizedMcpResult {
@@ -389,6 +410,45 @@ export interface PiNativeAuthLeaseResult {
   readonly recoveryProof?: string;
 }
 
+interface NativeAuthRunnerReservationInput {
+  readonly authorization: string | undefined;
+  readonly launchAuthorization: string | undefined;
+  readonly generation: number;
+  readonly runnerProductGeneration: number;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly providerId: string;
+  readonly catalogGeneration: number;
+  readonly runId: string;
+  readonly runnerFence: string;
+  readonly publicKey: string;
+}
+
+interface NativeAuthRunnerReservationResult {
+  readonly reserved: true;
+  readonly reservationId: string;
+  readonly serviceGeneration: number;
+  readonly validForMs: number;
+}
+
+interface NativeAuthLeaseInput {
+  readonly authorization: string | undefined;
+  readonly action: "acquire" | "validate" | "release";
+  readonly generation: number;
+  readonly runnerProductGeneration: number;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly providerId: string;
+  readonly catalogGeneration: number;
+  readonly runId: string;
+  readonly runnerFence: string;
+  readonly credential?: unknown;
+  readonly recoveryProof?: string;
+  readonly recovery?: { readonly runnerPid: number };
+  readonly runnerProof?: NativeAuthRunnerProof;
+  readonly remoteRunnerAttestation?: RemoteNativeAuthRunnerAttestation;
+}
+
 export interface McpToolDiscoveryPolicy {
   readonly timeoutMs: number;
   readonly maximumPages: number;
@@ -442,6 +502,7 @@ export class McpRouter {
   readonly #detachedNativeAuthLeases = new Map<string, Map<string, DetachedNativeAuthLease>>();
   readonly #recoveryNativeAuthLeases = new Map<string, DetachedNativeAuthLease>();
   readonly #nativeAuthReleaseTails = new Map<string, Promise<void>>();
+  readonly #nativeAuthProviderRoutes = new Map<string, NativeAuthProviderRouteState>();
   readonly #remoteAttestationNonces = new Map<string, number>();
   readonly #bridgeToolProviders = new Map<string, BridgeToolProvider>();
   #lastGeneration = 0;
@@ -729,7 +790,8 @@ export class McpRouter {
       nativeAuth = {
         catalogGeneration: input.nativeAuthLease.catalogGeneration,
         providerIds,
-        authenticatedProviderIds,
+        authenticatedProviderIds: new Set([...authenticatedProviderIds].filter((providerId) =>
+          !this.#nativeAuthProviderRoute(providerId).fenced)),
         launchAuthorityDigest: digestToken(nativeAuthReservationToken),
         leases: new Map()
       };
@@ -1045,24 +1107,63 @@ export class McpRouter {
     await this.#nativeAuthRecovery?.revokeScope(input);
   }
 
-  async reserveNativeAuthRunner(input: {
-    readonly authorization: string | undefined;
-    readonly launchAuthorization: string | undefined;
-    readonly generation: number;
-    readonly runnerProductGeneration: number;
-    readonly sessionId: string;
-    readonly targetId: string;
-    readonly providerId: string;
-    readonly catalogGeneration: number;
-    readonly runId: string;
-    readonly runnerFence: string;
-    readonly publicKey: string;
-  }): Promise<{
-    readonly reserved: true;
-    readonly reservationId: string;
-    readonly serviceGeneration: number;
-    readonly validForMs: number;
-  }> {
+  fenceNativeAuthProvider(providerId: string): NativeAuthProviderFence {
+    normalizedProviderIds([providerId], "Native auth fence Provider");
+    const state = this.#nativeAuthProviderRoute(providerId);
+    state.epoch += 1;
+    state.fenced = true;
+    state.routeToken = Object.freeze({ providerId, epoch: state.epoch });
+    for (const grant of this.#grants.values()) grant.nativeAuth?.authenticatedProviderIds.delete(providerId);
+    const retirement = this.#retireNativeAuthProviderLeases(providerId);
+    const idle = state.inFlight === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolveIdle) => { state.idleWaiters.add(resolveIdle); });
+    return {
+      routeToken: state.routeToken,
+      settlement: Promise.all([idle, retirement]).then(() => undefined)
+    };
+  }
+
+  reconcileNativeAuthProvider(providerId: string, routeToken: unknown): boolean {
+    normalizedProviderIds([providerId], "Native auth reconciliation Provider");
+    const state = this.#nativeAuthProviderRoute(providerId);
+    if (!state.fenced || state.routeToken !== routeToken) return false;
+    state.epoch += 1;
+    state.fenced = false;
+    state.routeToken = Object.freeze({ providerId, epoch: state.epoch });
+    return true;
+  }
+
+  async reserveNativeAuthRunner(input: NativeAuthRunnerReservationInput): Promise<NativeAuthRunnerReservationResult> {
+    const admission = this.#beginNativeAuthProviderOperation(input.providerId, false);
+    try {
+      const result = await this.#reserveNativeAuthRunner(input);
+      try {
+        this.#assertNativeAuthProviderAdmissionCurrent(admission);
+      } catch (error) {
+        const revoked = await this.#nativeAuthRecovery?.revokeReservation({
+          reservationId: result.reservationId,
+          sessionId: input.sessionId,
+          targetId: input.targetId,
+          serviceGeneration: input.generation,
+          runnerProductGeneration: input.runnerProductGeneration,
+          providerId: input.providerId,
+          catalogGeneration: input.catalogGeneration,
+          runId: input.runId,
+          runnerFence: input.runnerFence
+        });
+        if (revoked !== true) {
+          throw new Error("Pi native auth runner reservation retirement could not be proven.", { cause: error });
+        }
+        throw error;
+      }
+      return result;
+    } finally {
+      this.#finishNativeAuthProviderOperation(admission);
+    }
+  }
+
+  async #reserveNativeAuthRunner(input: NativeAuthRunnerReservationInput): Promise<NativeAuthRunnerReservationResult> {
     this.#assertInitialized();
     const token = bearerToken(input.authorization);
     if (!Number.isSafeInteger(input.generation) || input.generation < 0
@@ -1116,25 +1217,29 @@ export class McpRouter {
   }
 
   /** Credential-bearing responses are returned only to trusted Pi runners. */
-  async executeNativeAuthLease(input: {
-    readonly authorization: string | undefined;
-    readonly action: "acquire" | "validate" | "release";
-    readonly generation: number;
-    readonly runnerProductGeneration: number;
-    readonly sessionId: string;
-    readonly targetId: string;
-    readonly providerId: string;
-    readonly catalogGeneration: number;
-    readonly runId: string;
-    readonly runnerFence: string;
-    readonly credential?: unknown;
-    readonly recoveryProof?: string;
-    readonly recovery?: {
-      readonly runnerPid: number;
-    };
-    readonly runnerProof?: NativeAuthRunnerProof;
-    readonly remoteRunnerAttestation?: RemoteNativeAuthRunnerAttestation;
-  }): Promise<PiNativeAuthLeaseResult> {
+  async executeNativeAuthLease(input: NativeAuthLeaseInput): Promise<PiNativeAuthLeaseResult> {
+    const admission = this.#beginNativeAuthProviderOperation(input.providerId, input.action === "release");
+    try {
+      const effectiveInput = admission.fencedAtStart && input.action === "release" && input.credential !== undefined
+        ? { ...input, credential: undefined }
+        : input;
+      const result = await this.#executeNativeAuthLease(effectiveInput, admission);
+      if (input.action !== "release") this.#assertNativeAuthProviderAdmissionCurrent(admission);
+      return result;
+    } catch (error) {
+      if (!this.#nativeAuthProviderAdmissionCurrent(admission)) {
+        await this.#retireNativeAuthProviderLeases(input.providerId);
+      }
+      throw error;
+    } finally {
+      this.#finishNativeAuthProviderOperation(admission);
+    }
+  }
+
+  async #executeNativeAuthLease(
+    input: NativeAuthLeaseInput,
+    admission: NativeAuthProviderAdmission
+  ): Promise<PiNativeAuthLeaseResult> {
     this.#assertInitialized();
     const token = bearerToken(input.authorization);
     if (!Number.isSafeInteger(input.generation) || input.generation < 0) throw new Error("Pi native auth lease generation is invalid.");
@@ -1254,7 +1359,9 @@ export class McpRouter {
         if (input.action === "release") return { active: false };
         throw new Error("Pi native auth lease is expired or revoked.");
       }
-      if (input.action === "release") return this.#releaseDetachedNativeAuthLease(detached, input.credential, source);
+      if (input.action === "release") {
+        return this.#releaseDetachedNativeAuthLease(detached, input.credential, source, admission);
+      }
       if (input.action === "acquire") {
         if (input.recovery === undefined || detached.recoveryId === undefined
             || detached.recoveryProof === undefined || this.#nativeAuthRecovery === undefined) {
@@ -1455,6 +1562,76 @@ export class McpRouter {
     };
   }
 
+  #nativeAuthProviderRoute(providerId: string): NativeAuthProviderRouteState {
+    let state = this.#nativeAuthProviderRoutes.get(providerId);
+    if (state !== undefined) return state;
+    state = {
+      epoch: 0,
+      fenced: false,
+      routeToken: Object.freeze({ providerId, epoch: 0 }),
+      inFlight: 0,
+      idleWaiters: new Set()
+    };
+    this.#nativeAuthProviderRoutes.set(providerId, state);
+    return state;
+  }
+
+  #beginNativeAuthProviderOperation(
+    providerId: string,
+    allowFencedRelease: boolean
+  ): NativeAuthProviderAdmission {
+    normalizedProviderIds([providerId], "Native auth operation Provider");
+    const state = this.#nativeAuthProviderRoute(providerId);
+    if (state.fenced && !allowFencedRelease) {
+      throw new Error("Pi native auth Provider route is revoked.");
+    }
+    state.inFlight += 1;
+    return {
+      providerId,
+      state,
+      epoch: state.epoch,
+      routeToken: state.routeToken,
+      fencedAtStart: state.fenced
+    };
+  }
+
+  #nativeAuthProviderAdmissionCurrent(admission: NativeAuthProviderAdmission): boolean {
+    return !admission.state.fenced
+      && admission.state.epoch === admission.epoch
+      && admission.state.routeToken === admission.routeToken;
+  }
+
+  #assertNativeAuthProviderAdmissionCurrent(admission: NativeAuthProviderAdmission): void {
+    if (!this.#nativeAuthProviderAdmissionCurrent(admission)) {
+      throw new Error("Pi native auth Provider route changed while the request was pending.");
+    }
+  }
+
+  #finishNativeAuthProviderOperation(admission: NativeAuthProviderAdmission): void {
+    admission.state.inFlight = Math.max(0, admission.state.inFlight - 1);
+    if (admission.state.inFlight !== 0) return;
+    for (const resolveIdle of admission.state.idleWaiters) resolveIdle();
+    admission.state.idleWaiters.clear();
+  }
+
+  async #retireNativeAuthProviderLeases(providerId: string): Promise<void> {
+    const candidates = new Set<DetachedNativeAuthLease>();
+    for (const byRun of this.#detachedNativeAuthLeases.values()) {
+      for (const detached of byRun.values()) {
+        if (detached.providerId === providerId) candidates.add(detached);
+      }
+    }
+    for (const detached of this.#recoveryNativeAuthLeases.values()) {
+      if (detached.providerId === providerId) candidates.add(detached);
+    }
+    await Promise.all([...candidates].map(async (detached) => {
+      detached.released = true;
+      this.#expireDetachedNativeAuthLease(detached);
+      await this.#revokeNativeAuthRecovery(detached);
+    }));
+    await this.#nativeAuthRecovery?.revokeProvider(providerId);
+  }
+
   async #validateDetachedNativeAuthLease(
     detached: DetachedNativeAuthLease,
     source: PiNativeAuthLeaseSource,
@@ -1565,14 +1742,16 @@ export class McpRouter {
   #releaseDetachedNativeAuthLease(
     detached: DetachedNativeAuthLease,
     credential: unknown,
-    source: PiNativeAuthLeaseSource
+    source: PiNativeAuthLeaseSource,
+    admission: NativeAuthProviderAdmission
   ): Promise<PiNativeAuthLeaseResult> {
     const lease = detached.lease;
     if (lease.release !== undefined) return lease.release;
     const accountKey = `${lease.providerId}\u0000${lease.accountId}`;
     const release = this.#withNativeAuthAccountLock(accountKey, async () => {
       if (detached.released) return { active: false } as const;
-      if (credential === undefined || lease.refreshSuperseded) {
+      if (credential === undefined || lease.refreshSuperseded
+          || !this.#nativeAuthProviderAdmissionCurrent(admission)) {
         await this.#completeDetachedNativeAuthRelease(detached);
         return { active: false } as const;
       }
@@ -1602,6 +1781,11 @@ export class McpRouter {
           });
         }
         try {
+          if (!this.#nativeAuthProviderAdmissionCurrent(admission)) {
+            await this.#nativeAuthRecovery?.abortTransition(transitionId);
+            await this.#completeDetachedNativeAuthRelease(detached);
+            return { active: false } as const;
+          }
           await source.persist({
             providerId: lease.providerId,
             credential,

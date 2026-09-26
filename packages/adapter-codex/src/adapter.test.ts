@@ -3925,6 +3925,335 @@ describe("CodexBackendAdapter", () => {
     expect(degraded.health).toBe("degraded");
   });
 
+  it("retires native-auth runtimes before logout without disturbing an independent managed route", async () => {
+    const managedModel: ProviderModel = {
+      providerId: "managed", modelId: "managed-model", displayName: "Managed", api: "openai-responses",
+      contextWindow: 32_000, maxOutputTokens: 4_000, supportsImages: false, supportsFastMode: false,
+      thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    };
+    const routeDispose = vi.fn();
+    const managedProviders: ManagedProviderRuntimePort = {
+      support: CODEX_MANAGED_PROVIDER_SUPPORT,
+      environment: { JOKO_PROVIDER_PROXY_TOKEN: "managed-private-token" },
+      secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+      dispose: () => undefined,
+      hasProvider: (providerId) => providerId === managedModel.providerId,
+      listModels: () => [managedModel],
+      listProviders: () => [],
+      getThinkingLevelMap: () => ({}),
+      prepare: async (): Promise<ManagedProviderRouteBinding> => ({
+        providerId: managedModel.providerId,
+        model: managedModel,
+        protocol: "openai-responses",
+        revision: "managed-revision",
+        baseUrl: "http://127.0.0.1:1234/managed",
+        apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN",
+        thinkingLevelMap: {},
+        assertCurrent: () => undefined,
+        activate: async () => ({ release: () => undefined }),
+        dispose: routeDispose
+      })
+    };
+    const setup = await createSetup(7, { managedProviders });
+    const nativeEvents: EventPayload[] = [];
+    const managedEvents: EventPayload[] = [];
+    const nativeContext = { ...context(setup.target, nativeEvents, { backendInstanceGeneration: 7 }), sessionId: "native-auth-session" };
+    const managedContext = { ...context(setup.target, managedEvents, { backendInstanceGeneration: 7 }), sessionId: "managed-session" };
+    const nativeBinding = await setup.adapter.createSession(sessionInput(setup.target), nativeContext);
+    const managedBinding = await setup.adapter.createSession({
+      ...sessionInput(setup.target), providerId: managedModel.providerId, modelId: managedModel.modelId
+    }, managedContext);
+
+    await setup.adapter.logout();
+
+    const requests = setup.fake.transport!.requests;
+    const logoutIndex = requests.findIndex((request) => request.method === "account/logout");
+    const nativeUnsubscribeIndex = requests.findIndex((request) =>
+      request.method === "thread/unsubscribe" && (request.params as JsonObject)?.["threadId"] === nativeBinding.nativeSessionId);
+    expect(nativeUnsubscribeIndex).toBeGreaterThanOrEqual(0);
+    expect(nativeUnsubscribeIndex).toBeLessThan(logoutIndex);
+    expect(requests.some((request) =>
+      request.method === "thread/unsubscribe" && (request.params as JsonObject)?.["threadId"] === managedBinding.nativeSessionId)).toBe(false);
+    expect(routeDispose).not.toHaveBeenCalled();
+
+    await setup.adapter.send(prompt("managed route remains usable"), {
+      ...managedContext,
+      binding: managedBinding,
+      operationId: "managed-after-native-logout"
+    });
+    expect(requests.findLast((request) => request.method === "turn/start")?.params)
+      .toMatchObject({ threadId: managedBinding.nativeSessionId });
+  });
+
+  it("blocks an existing native runtime at its final adapter dispatch fence once revocation starts", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const createContext = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), createContext);
+    const activeContext = {
+      ...createContext,
+      binding,
+      operationId: "active-before-native-revocation"
+    };
+    await setup.adapter.send(prompt("keep one root turn active"), activeContext);
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    let markSteerEntered!: () => void;
+    let releaseSteer!: () => void;
+    let markInterruptEntered!: () => void;
+    let releaseInterrupt!: () => void;
+    const steerEntered = new Promise<void>((resolve) => { markSteerEntered = resolve; });
+    const steerRelease = new Promise<void>((resolve) => { releaseSteer = resolve; });
+    const interruptEntered = new Promise<void>((resolve) => { markInterruptEntered = resolve; });
+    const interruptRelease = new Promise<void>((resolve) => { releaseInterrupt = resolve; });
+    let blockSteer = true;
+    let blockInterrupt = true;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "turn/steer" && blockSteer) {
+        blockSteer = false;
+        markSteerEntered();
+        await steerRelease;
+      }
+      if (method === "turn/interrupt" && blockInterrupt) {
+        blockInterrupt = false;
+        markInterruptEntered();
+        await interruptRelease;
+      }
+      return nativeRequest(method, params, options);
+    });
+    const steerEvents: EventPayload[] = [];
+    const send = setup.adapter.send({
+      ...prompt("must remain outside native acceptance"),
+      disposition: "steer"
+    }, context(setup.target, steerEvents, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "steer-racing-native-revocation"
+    }));
+    await steerEntered;
+
+    const revoking = setup.adapter.revokeProviderAuthentication("openai");
+    await interruptEntered;
+    releaseSteer();
+
+    await expect(send).rejects.toMatchObject({
+      publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED", stateMayHaveChanged: false }
+    });
+    expect(transport.requests.some((request) => request.method === "turn/steer")).toBe(false);
+    releaseInterrupt();
+    await revoking;
+    expect(events.filter((event) => event.type === "error" && event.terminal)).toEqual([
+      expect.objectContaining({
+        type: "error",
+        terminal: true,
+        error: expect.objectContaining({
+          code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED",
+          stateMayHaveChanged: true
+        })
+      })
+    ]);
+    expect(events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "failed" }
+    ]);
+    expect(steerEvents).toEqual([]);
+
+    await setup.fake.completeTurn(binding.nativeSessionId!, "late native completion");
+    expect(events.filter((event) => event.type === "error" && event.terminal)).toHaveLength(1);
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+  });
+
+  it("retires a smart runtime and its descendant authority when its route catalog carries native authentication", async () => {
+    const setup = await createSmartAuthenticationSetup(true);
+    const events: EventPayload[] = [];
+    const createContext = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), createContext);
+    const active = context(setup.target, events, {
+      binding,
+      backendInstanceGeneration: 7,
+      operationId: "native-smart-operation"
+    });
+    await setup.adapter.send(prompt("delegate through the smart route"), active);
+    const rootThreadId = binding.nativeSessionId!;
+    const childThreadId = "native-smart-child";
+    await setup.fake.transport!.emitNotification("item/started", {
+      threadId: rootThreadId,
+      turnId: "turn-1",
+      item: {
+        type: "collabAgentToolCall",
+        id: "native-smart-spawn",
+        tool: "spawnAgent",
+        status: "inProgress",
+        senderThreadId: rootThreadId,
+        receiverThreadIds: [childThreadId],
+        agentsStates: { [childThreadId]: { status: "running", message: null } },
+        prompt: "Inspect independently",
+        model: "managed-worker",
+        reasoningEffort: "low"
+      }
+    });
+    expect(setup.registerDescendant).toHaveBeenCalledWith(childThreadId, rootThreadId);
+
+    await setup.adapter.logout();
+
+    const requests = setup.fake.transport!.requests;
+    const interruptIndex = requests.findIndex((request) => request.method === "turn/interrupt");
+    const unsubscribeIndex = requests.findIndex((request) =>
+      request.method === "thread/unsubscribe" && (request.params as JsonObject)?.["threadId"] === binding.nativeSessionId);
+    const descendantUnsubscribeIndex = requests.findIndex((request) =>
+      request.method === "thread/unsubscribe" && (request.params as JsonObject)?.["threadId"] === childThreadId);
+    const logoutIndex = requests.findIndex((request) => request.method === "account/logout");
+    expect(interruptIndex).toBeGreaterThanOrEqual(0);
+    expect(unsubscribeIndex).toBeGreaterThan(interruptIndex);
+    expect(descendantUnsubscribeIndex).toBeGreaterThan(interruptIndex);
+    expect(descendantUnsubscribeIndex).toBeLessThan(logoutIndex);
+    expect(logoutIndex).toBeGreaterThan(unsubscribeIndex);
+    expect(setup.routeDispose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a managed-only smart runtime active when native authentication logs out", async () => {
+    const setup = await createSmartAuthenticationSetup(false);
+    const events: EventPayload[] = [];
+    const createContext = {
+      ...context(setup.target, events, { backendInstanceGeneration: 7 }),
+      sessionId: "managed-only-smart-session"
+    };
+    const binding = await setup.adapter.createSession({
+      ...sessionInput(setup.target),
+      providerId: setup.managedModel.providerId,
+      modelId: setup.managedModel.modelId
+    }, createContext);
+
+    await setup.adapter.logout();
+
+    const requests = setup.fake.transport!.requests;
+    expect(requests.some((request) =>
+      request.method === "thread/unsubscribe" && (request.params as JsonObject)?.["threadId"] === binding.nativeSessionId)).toBe(false);
+    expect(setup.routeDispose).not.toHaveBeenCalled();
+    await setup.adapter.send(prompt("managed-only smart route remains usable"), {
+      ...createContext,
+      binding,
+      operationId: "managed-only-smart-after-logout"
+    });
+    expect(requests.findLast((request) => request.method === "turn/start")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId });
+  });
+
+  it("rejects an in-flight local native resume after revocation and reopens only from a post-logout account refresh", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const initialContext = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initialContext);
+    await setup.adapter.closeSession(binding, { ...initialContext, binding });
+    const resumedBinding = { ...binding, generation: 2 };
+    const resumeContext = context(setup.target, events, {
+      binding: resumedBinding,
+      backendInstanceGeneration: 7,
+      generation: 2
+    });
+    const transport = setup.fake.transport!;
+    const nativeRequest = transport.request.bind(transport);
+    let markResumeReturned!: () => void;
+    let releaseResume!: () => void;
+    let markLogoutStarted!: () => void;
+    let releaseLogout!: () => void;
+    let markAccountReadReturned!: () => void;
+    let releaseAccountRead!: () => void;
+    const resumeReturned = new Promise<void>((resolve) => { markResumeReturned = resolve; });
+    const resumeRelease = new Promise<void>((resolve) => { releaseResume = resolve; });
+    const logoutStarted = new Promise<void>((resolve) => { markLogoutStarted = resolve; });
+    const logoutRelease = new Promise<void>((resolve) => { releaseLogout = resolve; });
+    const accountReadReturned = new Promise<void>((resolve) => { markAccountReadReturned = resolve; });
+    const accountReadRelease = new Promise<void>((resolve) => { releaseAccountRead = resolve; });
+    let blockNextResume = true;
+    let blockLogout = true;
+    let blockNextAccountRead = false;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "account/logout" && blockLogout) {
+        blockLogout = false;
+        markLogoutStarted();
+        await logoutRelease;
+      }
+      const result = await nativeRequest(method, params, options);
+      if (method === "thread/resume" && blockNextResume) {
+        blockNextResume = false;
+        markResumeReturned();
+        await resumeRelease;
+      }
+      if (method === "account/read" && blockNextAccountRead) {
+        blockNextAccountRead = false;
+        markAccountReadReturned();
+        await accountReadRelease;
+      }
+      return result;
+    });
+
+    const inFlightResume = setup.adapter.resumeSession(binding, resumeContext);
+    await resumeReturned;
+    const logout = setup.adapter.logout();
+    await logoutStarted;
+    blockNextAccountRead = true;
+    const staleAccountRead = setup.adapter.readAccount(true);
+    await accountReadReturned;
+    releaseLogout();
+    await logout;
+    releaseAccountRead();
+    await expect(staleAccountRead).rejects.toMatchObject({
+      publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_STATE_STALE" }
+    });
+    releaseResume();
+    await expect(inFlightResume).rejects.toMatchObject({
+      publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED", stateMayHaveChanged: false }
+    });
+    expect(transport.requests.filter((request) => request.method === "thread/resume")).toHaveLength(1);
+
+    const nativeStarts = transport.requests.filter((request) => request.method === "thread/start").length;
+    await expect(setup.adapter.createSession({
+      target: setup.target,
+      fastMode: false,
+      permissionMode: "ask"
+    }, {
+      ...context(setup.target, events, { backendInstanceGeneration: 7 }),
+      sessionId: "native-create-while-revoked"
+    })).rejects.toMatchObject({ publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED" } });
+    expect(transport.requests.filter((request) => request.method === "thread/start")).toHaveLength(nativeStarts);
+    await expect(setup.adapter.send(prompt("must not recover the partial owner"), {
+      ...resumeContext,
+      operationId: "send-while-native-auth-revoked"
+    })).rejects.toMatchObject({ publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_REVOKED" } });
+    expect(transport.requests.filter((request) => request.method === "thread/resume")).toHaveLength(1);
+
+    setup.fake.account = { type: "chatgpt", email: null, planType: "plus" };
+    await expect(setup.adapter.readAccount(true)).resolves.toMatchObject({ authenticationState: "authenticated" });
+    await expect(setup.adapter.resumeSession(binding, resumeContext)).resolves.toMatchObject({
+      binding: resumedBinding
+    });
+    expect(transport.requests.filter((request) => request.method === "thread/resume")).toHaveLength(2);
+  });
+
+  it("keeps an independently owned remote runtime active when local native authentication logs out", async () => {
+    const setup = await createRemoteSetup();
+    const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    const binding = await setup.adapter.resolveNativeSessionReference(candidate.nativeReference, setup.target, 1);
+    const events: EventPayload[] = [];
+    const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7 });
+    await setup.adapter.resumeSession(binding, bound);
+
+    await setup.adapter.logout();
+
+    expect(setup.localFake.transport?.requests.some((request) => request.method === "account/logout")).toBe(true);
+    expect(setup.remoteFake.transport?.requests.some((request) =>
+      request.method === "thread/unsubscribe" && (request.params as JsonObject)?.["threadId"] === nativeSessionId)).toBe(false);
+    await setup.adapter.send(prompt("remote authority remains usable"), {
+      ...bound,
+      operationId: "remote-after-local-auth-logout"
+    });
+    expect(setup.remoteFake.transport?.requests.findLast((request) => request.method === "turn/start")?.params)
+      .toMatchObject({ threadId: nativeSessionId, clientUserMessageId: "remote-after-local-auth-logout" });
+    await setup.remoteFake.completeTurn(nativeSessionId);
+    expect(events).toContainEqual({ type: "done", outcome: "completed" });
+  });
+
   it("applies advertised reasoning effort and Fast Mode to creation, turns, and live settings", async () => {
     const setup = await createSetup();
     await setup.adapter.describe();
@@ -4188,6 +4517,77 @@ async function createSetup(
     await rm(workspaceRoot, { recursive: true, force: true });
   });
   return { adapter, fake, host, target };
+}
+
+async function createSmartAuthenticationSetup(includeNativeRoute: boolean) {
+  const managedModel: ProviderModel = {
+    providerId: "managed-smart",
+    modelId: "managed-worker",
+    displayName: "Managed worker",
+    api: "openai-responses",
+    contextWindow: 32_000,
+    maxOutputTokens: 4_000,
+    supportsImages: false,
+    supportsFastMode: false,
+    thinkingLevels: [],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  };
+  const routes: CodexSmartRoutingPreparation["routes"] = [{
+    providerId: managedModel.providerId,
+    modelId: managedModel.modelId,
+    revision: "managed-smart-revision",
+    native: false
+  }];
+  const nativeRoutes: CodexSmartRoutingPreparation["nativeRoutes"] = includeNativeRoute
+    ? [{ providerId: "openai", modelId: "gpt-test", revision: "native-smart-revision", native: true }]
+    : [];
+  const proxyRoutes = [...routes, ...nativeRoutes];
+  const routeDispose = vi.fn();
+  const registerDescendant = vi.fn<ManagedProviderSmartRoutingBinding["registerDescendant"]>();
+  const port: ManagedProviderRuntimePort = {
+    support: CODEX_MANAGED_PROVIDER_SUPPORT,
+    environment: { JOKO_PROVIDER_PROXY_TOKEN: "smart-private-token" },
+    secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
+    dispose: () => undefined,
+    hasProvider: () => false,
+    listModels: () => [managedModel],
+    listProviders: () => [],
+    getThinkingLevelMap: () => ({}),
+    prepare: async () => { throw new Error("ordinary managed route must not be prepared"); },
+    prepareSmartRouting: async (): Promise<ManagedProviderSmartRoutingBinding> => ({
+      modelProviderId: "joko-smart-auth-fixture",
+      baseUrl: "http://127.0.0.1:1234/smart/auth-fixture",
+      proxyTokenEnvironment: "JOKO_PROVIDER_PROXY_TOKEN",
+      revision: "smart-auth-catalog",
+      routes: proxyRoutes,
+      assertCurrent: () => undefined,
+      bindRoot: () => undefined,
+      registerDescendant,
+      completeDescendant: () => undefined,
+      activate: async (operation) => {
+        operation.assertCurrent();
+        return { release: () => undefined };
+      },
+      dispose: routeDispose
+    })
+  };
+  const smartRouting: CodexSmartRoutingPreparation = {
+    desired: true,
+    applied: true,
+    revision: "smart-auth-catalog",
+    routes,
+    nativeRoutes,
+    launchArgs: ["-c", "smart_auth_fixture=true"],
+    catalogPath: "C:/private/smart-auth-catalog.json",
+    unavailableReason: "",
+    cleanup: async () => undefined
+  };
+  return {
+    ...await createSetup(7, { managedProviders: port, smartRouting }),
+    managedModel,
+    routeDispose,
+    registerDescendant
+  };
 }
 
 async function createRemoteSetup(options: {

@@ -4975,6 +4975,246 @@ describe("ClaudeCodeAdapter", () => {
     expect(active.events).toEqual([]);
     oldQuery.endOutput();
   });
+
+  test("retires only native OAuth Queries before logout and preserves independent managed routes", async () => {
+    let serialized: string | undefined = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: "native-access-secret",
+      refreshToken: "native-refresh-secret",
+      expiresAt: Date.now() + 60 * 60 * 1_000,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+    const credentialPort = {
+      readSerialized: async () => serialized,
+      compareAndSet: async (input: { readonly expected: string | undefined; readonly value: string }) => {
+        if (serialized !== input.expected) return false;
+        serialized = input.value;
+        return true;
+      },
+      restoreExact: async () => false,
+      deleteExact: async (expected: string) => {
+        if (serialized !== expected) return false;
+        serialized = undefined;
+        return true;
+      }
+    };
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { model: "configured-model" }
+    });
+    const remoteTarget: TargetDescriptor = {
+      ...target,
+      id: "native-oauth-remote-target",
+      workspaceRoot: "D:\\service-owned-placeholder",
+      remoteWorkspace: {
+        hostTargetId: "native-oauth-remote-target",
+        hostId: "host-auth",
+        workspaceRoot: "/srv/auth"
+      }
+    };
+    const remoteRuntime = new FakeSdkRuntime({
+      autoAdmitTurns: true,
+      initialFrameOverrides: { cwd: "/srv/auth", model: "configured-model" }
+    });
+    const adapter = adapterFor(runtime, {
+      credentialPort,
+      managedProviders: managed.port,
+      remoteRuntimes: {
+        resolve: async () => ({
+          runtime: remoteRuntime,
+          workspaceRoot: "/srv/auth",
+          remote: true,
+          assertCurrent: () => undefined
+        }),
+        close: async () => undefined
+      }
+    });
+    const nativeOwner = contextFor();
+    const nativeContext = { ...nativeOwner.context, sessionId: "native-oauth-session" };
+    const remoteContext = {
+      ...contextFor(undefined, { target: remoteTarget }).context,
+      sessionId: "native-oauth-remote-session"
+    };
+    const managedContext = {
+      ...contextFor().context,
+      sessionId: "managed-route-session",
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    const remoteManagedContext = {
+      ...contextFor(undefined, { target: remoteTarget }).context,
+      sessionId: "remote-managed-route-session",
+      modelSelection: { providerId: "configured-provider", modelId: "configured-model" }
+    };
+    const nativeBinding = await adapter.createSession(createInput({
+      providerId: "claude-code", modelId: "model-a"
+    }), nativeContext);
+    await adapter.createSession(createInput({
+      target: remoteTarget, providerId: "claude-code", modelId: "model-a"
+    }), remoteContext);
+    const managedBinding = await adapter.createSession(createInput({
+      providerId: "configured-provider", modelId: "configured-model"
+    }), managedContext);
+    const remoteManagedBinding = await adapter.createSession(createInput({
+      target: remoteTarget, providerId: "configured-provider", modelId: "configured-model"
+    }), remoteManagedContext);
+    const nativeQuery = runtime.queries[0]!;
+    const managedQuery = runtime.queries[1]!;
+    const remoteNativeQuery = remoteRuntime.queries[0]!;
+    const remoteManagedQuery = remoteRuntime.queries[1]!;
+
+    await adapter.send(textPrompt("keep one native turn active during logout"), {
+      ...nativeContext,
+      binding: nativeBinding,
+      operationId: "native-active-before-logout"
+    });
+
+    await adapter.logout();
+
+    expect(serialized).toBeUndefined();
+    expect(runtime.retiredQueries).toEqual([nativeQuery]);
+    expect(remoteRuntime.retiredQueries).toEqual([remoteNativeQuery]);
+    expect(nativeQuery.closeCalls).toBe(1);
+    expect(managedQuery.closeCalls).toBe(0);
+    expect(remoteNativeQuery.closeCalls).toBe(1);
+    expect(remoteManagedQuery.closeCalls).toBe(0);
+    expect(nativeOwner.events.filter((event) => event.type === "error" && event.terminal)).toEqual([
+      expect.objectContaining({
+        type: "error",
+        terminal: true,
+        error: expect.objectContaining({
+          code: "CLAUDE_CODE_PROVIDER_AUTHENTICATION_REVOKED",
+          stateMayHaveChanged: true
+        })
+      })
+    ]);
+    expect(nativeOwner.events.filter((event) => event.type === "done")).toEqual([
+      { type: "done", outcome: "failed" }
+    ]);
+    nativeQuery.push(resultMessage(nativeBinding.nativeSessionId!, { result: "late native result", totalCostUsd: 0 }));
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    expect(nativeOwner.events.filter((event) => event.type === "error" && event.terminal)).toHaveLength(1);
+    expect(nativeOwner.events.filter((event) => event.type === "done")).toHaveLength(1);
+    await adapter.send(textPrompt("managed route remains usable"), {
+      ...managedContext,
+      binding: managedBinding,
+      operationId: "managed-after-native-logout"
+    });
+    expect(managedQuery.receivedInputs).toHaveLength(1);
+    await adapter.send(textPrompt("remote managed owner remains usable"), {
+      ...remoteManagedContext,
+      binding: remoteManagedBinding,
+      operationId: "remote-managed-after-native-logout"
+    });
+    expect(remoteManagedQuery.receivedInputs).toHaveLength(1);
+    await adapter.closeSession(managedBinding, { ...managedContext, binding: managedBinding });
+    await adapter.closeSession(remoteManagedBinding, { ...remoteManagedContext, binding: remoteManagedBinding });
+    expect(nativeBinding.nativeSessionId).not.toBe(managedBinding.nativeSessionId);
+  });
+
+  test("fails an unconsumed native prompt with typed Provider auth revocation during logout", async () => {
+    let serialized: string | undefined = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: "native-access-secret",
+      refreshToken: "native-refresh-secret",
+      expiresAt: Date.now() + 60 * 60 * 1_000,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+    const credentialPort = {
+      readSerialized: async () => serialized,
+      compareAndSet: async (input: { readonly expected: string | undefined; readonly value: string }) => {
+        if (serialized !== input.expected) return false;
+        serialized = input.value;
+        return true;
+      },
+      restoreExact: async () => false,
+      deleteExact: async (expected: string) => {
+        if (serialized !== expected) return false;
+        serialized = undefined;
+        return true;
+      }
+    };
+    let resolveImage!: (value: { readonly data: Uint8Array }) => void;
+    const readBlob = vi.fn(() => new Promise<{ readonly data: Uint8Array }>((resolvePromise) => {
+      resolveImage = resolvePromise;
+    }));
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, { credentialPort, readBlob });
+    const binding = await adapter.createSession(
+      createInput({ providerId: "claude-code", modelId: "model-a" }),
+      contextFor().context
+    );
+    const sending = adapter.send(
+      { ...textPrompt(""), images: [{ blob: imageAttachment().blob }] },
+      contextFor(binding, { operationId: "logout-during-image-preparation" }).context
+    );
+    const rejected = expect(sending).rejects.toMatchObject({
+      publicError: {
+        code: "CLAUDE_CODE_PROVIDER_AUTHENTICATION_REVOKED",
+        stateMayHaveChanged: false,
+        recovery: expect.stringContaining("Sign in again")
+      }
+    });
+    await eventually(() => readBlob.mock.calls.length === 1);
+
+    await expect(adapter.logout()).resolves.toBeUndefined();
+    await rejected;
+    resolveImage({ data: imageAttachment().data });
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+
+    expect(serialized).toBeUndefined();
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+    expect(runtime.retiredQueries).toEqual([runtime.queries[0]]);
+  });
+
+  test("keeps the OAuth credential and an exact retry handle when native Query retirement is unconfirmed", async () => {
+    let serialized: string | undefined = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: "native-access-secret",
+      refreshToken: "native-refresh-secret",
+      expiresAt: Date.now() + 60 * 60 * 1_000,
+      scopes: ["user:inference"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+    const credentialPort = {
+      readSerialized: async () => serialized,
+      compareAndSet: async (input: { readonly expected: string | undefined; readonly value: string }) => {
+        if (serialized !== input.expected) return false;
+        serialized = input.value;
+        return true;
+      },
+      restoreExact: async () => false,
+      deleteExact: async (expected: string) => {
+        if (serialized !== expected) return false;
+        serialized = undefined;
+        return true;
+      }
+    };
+    const runtime = new FakeSdkRuntime();
+    runtime.retirementFailure = true;
+    const adapter = adapterFor(runtime, { credentialPort });
+    await adapter.createSession(createInput(), contextFor().context);
+    const query = runtime.queries[0]!;
+
+    await expect(adapter.logout()).rejects.toMatchObject({
+      publicError: { code: "CLAUDE_CODE_AUTH_RUNTIME_RETIREMENT_UNKNOWN" }
+    });
+    expect(serialized).toBeDefined();
+    expect(query.closeCalls).toBe(1);
+
+    runtime.retirementFailure = false;
+    await expect(adapter.logout()).resolves.toBeUndefined();
+    expect(serialized).toBeUndefined();
+    expect(runtime.retiredQueries).toEqual([query, query]);
+  });
 });
 
 interface FakeRuntimeOptions {

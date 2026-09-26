@@ -1,32 +1,63 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AddressInfo } from "node:net";
 
 import { create } from "@bufbuild/protobuf";
-import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
-import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
+import {
+  CLAUDE_MANAGED_PROVIDER_SUPPORT,
+  ClaudeCodeAdapter,
+  type ClaudeCodeCredentialPort
+} from "@joko/adapter-claude-code";
+import { createCodexAdapter, AppServerHost, CODEX_MANAGED_PROVIDER_SUPPORT } from "@joko/adapter-codex";
 import { FakeCodexAppServer, ScriptedRpcTransport } from "@joko/adapter-codex/testing";
 import {
   createDefaultPiManagedProcessSupervisor,
   createPiAdapter,
+  PiBackendAdapter,
   type PiManagedProvider
 } from "@joko/adapter-pi";
 import {
+  BeginProviderLoginMutationSchema,
+  CreateDiagnosticsBundleMutationSchema,
+  DiagnosticLevel,
   InteractionState,
+  LogoutProviderMutationSchema,
   OperationMutationSchema,
   OperationState,
+  ProviderLoginFlowState,
+  ProviderLoginMethod,
   QueueItemState,
+  RefreshProviderCredentialMutationSchema,
   RunState,
   StartReviewMutationSchema
 } from "@joko/contracts";
-import type { BackendAdapter } from "@joko/core";
+import type {
+  BackendAdapter,
+  ManagedProviderRouteBinding,
+  ManagedProviderRuntimePort,
+  ProviderModel,
+  ProviderRuntimeProtocol,
+  ProviderRuntimeSupport
+} from "@joko/core";
+import {
+  CredentialManager,
+  CredentialVault,
+  DiagnosticsBundleService,
+  PiProviderAuthSupervisor,
+  ProviderCatalogManager,
+  type PiAuthInteraction,
+  type PiCredentialStore,
+  type PiOAuthCredential,
+  type PiProviderAuthRuntime
+} from "@joko/orchestrator";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
 import { ControlledPiProcessFactory } from "./controlled-pi-process.js";
+import { AuthenticationPiProcessFactory } from "./auth-pi-process.js";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   createSessionMutation,
@@ -46,6 +77,247 @@ import {
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+const AUTH_PI_PROVIDER_ID = "paired-native-subscription";
+const AUTH_PI_MODEL_ID = "paired-native-model";
+const AUTH_PI_ACCESS_SECRET = "paired-pi-access-secret-never-public";
+const AUTH_PI_REFRESH_SECRET = "paired-pi-refresh-secret-never-public";
+const AUTH_CLAUDE_ACCESS_SECRET = "paired-claude-access-secret-never-public";
+const AUTH_CLAUDE_REFRESH_SECRET = "paired-claude-refresh-secret-never-public";
+const AUTH_CLAUDE_REFRESHED_ACCESS_SECRET = "paired-claude-refreshed-access-secret-never-public";
+const AUTH_CLAUDE_REFRESHED_REFRESH_SECRET = "paired-claude-refreshed-refresh-secret-never-public";
+const MANAGED_CODEX_PROVIDER_ID = "paired-managed-codex";
+const MANAGED_CODEX_MODEL_ID = "paired-managed-codex-model";
+const MANAGED_CODEX_PROXY_SECRET = "paired-managed-codex-proxy-secret-never-public";
+const MANAGED_CLAUDE_PROVIDER_ID = "paired-managed-claude";
+const MANAGED_CLAUDE_MODEL_ID = "claude-remote-fixture";
+const MANAGED_CLAUDE_PROXY_SECRET = "paired-managed-claude-proxy-secret-never-public";
+
+class ImmediatePiAuthenticationRuntime implements PiProviderAuthRuntime {
+  readonly #credentials: PiCredentialStore;
+  logoutCount = 0;
+  loginCount = 0;
+
+  constructor(credentials: PiCredentialStore) {
+    this.#credentials = credentials;
+  }
+
+  getProviders() {
+    return [{
+      id: AUTH_PI_PROVIDER_ID,
+      name: "Paired native subscription",
+      getModels: () => [{
+        id: AUTH_PI_MODEL_ID,
+        name: "Paired native model",
+        api: "openai-completions",
+        contextWindow: 32_768,
+        maxTokens: 4_096
+      }],
+      auth: {
+        oauth: {
+          isSubscription: true,
+          refresh: async (_credential: PiOAuthCredential, signal: AbortSignal): Promise<PiOAuthCredential> => {
+            signal.throwIfAborted();
+            return this.#credential();
+          }
+        }
+      }
+    }];
+  }
+
+  getProvider(providerId: string) {
+    return this.getProviders().find((provider) => provider.id === providerId);
+  }
+
+  async login(providerId: string, type: "oauth", interaction: PiAuthInteraction): Promise<PiOAuthCredential> {
+    if (providerId !== AUTH_PI_PROVIDER_ID || type !== "oauth") throw new Error("Unexpected Pi auth route.");
+    interaction.signal?.throwIfAborted();
+    this.loginCount++;
+    const credential = this.#credential();
+    await this.#credentials.modify(providerId, async () => credential, { signal: interaction.signal });
+    return credential;
+  }
+
+  async logout(providerId: string, options?: { readonly signal?: AbortSignal }): Promise<void> {
+    if (providerId !== AUTH_PI_PROVIDER_ID) throw new Error("Unexpected Pi auth route.");
+    this.logoutCount++;
+    await this.#credentials.delete(providerId, options);
+  }
+
+  async refresh(): Promise<{ readonly aborted: false; readonly errors: ReadonlyMap<string, Error> }> {
+    return { aborted: false, errors: new Map() };
+  }
+
+  #credential(): PiOAuthCredential {
+    return {
+      type: "oauth",
+      access: AUTH_PI_ACCESS_SECRET,
+      refresh: AUTH_PI_REFRESH_SECRET,
+      expires: Date.now() + 60 * 60_000,
+      accountId: "paired-pi-account"
+    };
+  }
+}
+
+class InMemoryClaudeCredentialPort implements ClaudeCodeCredentialPort {
+  serialized: string | undefined;
+  deleteCount = 0;
+
+  constructor() {
+    this.restoreInitial();
+  }
+
+  async readSerialized(): Promise<string | undefined> {
+    return this.serialized;
+  }
+
+  async compareAndSet(input: { readonly expected: string | undefined; readonly value: string }): Promise<boolean> {
+    if (this.serialized !== input.expected) return false;
+    this.serialized = input.value;
+    return true;
+  }
+
+  async restoreExact(input: { readonly expected: string; readonly value: string }): Promise<boolean> {
+    if (this.serialized !== input.expected) return false;
+    this.serialized = input.value;
+    return true;
+  }
+
+  async deleteExact(expected: string): Promise<boolean> {
+    if (this.serialized !== expected) return false;
+    this.serialized = undefined;
+    this.deleteCount++;
+    return true;
+  }
+
+  restoreInitial(): void {
+    this.serialized = JSON.stringify({
+      format: 1,
+      type: "oauth",
+      accessToken: AUTH_CLAUDE_ACCESS_SECRET,
+      refreshToken: AUTH_CLAUDE_REFRESH_SECRET,
+      expiresAt: Date.now() + 60 * 60_000,
+      scopes: ["user:inference", "user:sessions:claude_code"],
+      subscriptionType: "max",
+      rateLimitTier: null
+    });
+  }
+}
+
+class DeterministicManagedProviderRuntime implements ManagedProviderRuntimePort {
+  readonly support: ProviderRuntimeSupport;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly secretEnvironmentNames = ["JOKO_PAIRED_PROVIDER_PROXY_TOKEN"] as const;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly protocol: ProviderRuntimeProtocol;
+  readonly model: ProviderModel;
+  routeDisposeCount = 0;
+  operationReleaseCount = 0;
+  portDisposeCount = 0;
+
+  constructor(input: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly protocol: ProviderRuntimeProtocol;
+    readonly support: ProviderRuntimeSupport;
+    readonly proxySecret: string;
+  }) {
+    this.providerId = input.providerId;
+    this.modelId = input.modelId;
+    this.protocol = input.protocol;
+    this.support = input.support;
+    this.environment = { JOKO_PAIRED_PROVIDER_PROXY_TOKEN: input.proxySecret };
+    this.model = {
+      providerId: input.providerId,
+      modelId: input.modelId,
+      displayName: input.modelId,
+      api: input.protocol,
+      contextWindow: 64_000,
+      maxOutputTokens: 4_000,
+      supportsImages: false,
+      supportsFastMode: false,
+      thinkingLevels: ["off", "low", "medium", "high"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    };
+  }
+
+  dispose(): void {
+    this.portDisposeCount++;
+  }
+
+  hasProvider(providerId: string): boolean {
+    return providerId === this.providerId;
+  }
+
+  listModels(): readonly ProviderModel[] {
+    return [this.model];
+  }
+
+  getThinkingLevelMap(): Readonly<Record<string, string | null>> {
+    return {};
+  }
+
+  listProviders() {
+    return [{
+      providerId: this.providerId,
+      displayName: this.providerId,
+      api: this.protocol,
+      authenticationState: "authenticated" as const,
+      loginMethods: [],
+      supportsLogin: false,
+      supportsLogout: false,
+      supportsRefresh: true,
+      supportsModelRefresh: true
+    }];
+  }
+
+  async prepare(input: Parameters<ManagedProviderRuntimePort["prepare"]>[0]): Promise<ManagedProviderRouteBinding> {
+    if (input.providerId !== this.providerId || input.modelId !== this.modelId) {
+      throw new Error("The deterministic managed Provider route is unavailable.");
+    }
+    let disposed = false;
+    const assertCurrent = () => {
+      if (disposed) throw new Error("The deterministic managed Provider route was retired.");
+    };
+    return {
+      providerId: this.providerId,
+      model: this.model,
+      thinkingLevelMap: {},
+      protocol: this.protocol,
+      revision: "paired-managed-revision-one",
+      baseUrl: "http://127.0.0.1:43199/paired-managed",
+      apiKeyEnvironment: "JOKO_PAIRED_PROVIDER_PROXY_TOKEN",
+      assertCurrent,
+      activate: async (activation) => {
+        assertCurrent();
+        activation.assertCurrent();
+        let released = false;
+        return {
+          release: () => {
+            if (released) return;
+            released = true;
+            this.operationReleaseCount++;
+          }
+        };
+      },
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        this.routeDisposeCount++;
+      }
+    };
+  }
+}
+
+class LifecycleObservedClaudeRuntime extends ControlledClaudeRuntime {
+  readonly retiredQueries = new Set<Parameters<ControlledClaudeRuntime["retireQuery"]>[0]>();
+
+  override async retireQuery(query: Parameters<ControlledClaudeRuntime["retireQuery"]>[0]): Promise<void> {
+    this.retiredQueries.add(query);
+    await super.retireQuery(query);
+  }
+}
 
 it("runs Pi, Codex and Claude through one durable service without crossing Session or failure authority", { timeout: 90_000 }, async () => {
   const setup = await startPairedFixture();
@@ -2489,6 +2761,547 @@ it("fences consumed native inputs with lost receipts without blocking sibling Ba
   }
 });
 
+it.each([
+  {
+    backendId: "pi",
+    providerId: AUTH_PI_PROVIDER_ID,
+    modelId: AUTH_PI_MODEL_ID,
+    effortId: "off",
+    crossBackendId: "codex-paired"
+  },
+  {
+    backendId: "codex-paired",
+    providerId: "openai",
+    modelId: "gpt-test",
+    effortId: "medium",
+    crossBackendId: "pi"
+  },
+  {
+    backendId: "claude-paired",
+    providerId: "claude-code",
+    modelId: "claude-remote-fixture",
+    effortId: "high",
+    crossBackendId: "pi"
+  }
+] as const)("fences $backendId logout through the public product path and resumes only an explicit resend", { timeout: 60_000 }, async (route) => {
+  const setup = await startPairedFixture(undefined, { providerAuthentication: true });
+  const { fixture, codex, claude } = setup;
+  const authentication = setup.authentication;
+  try {
+    if (authentication === undefined) throw new Error("Provider authentication fixture state is unavailable.");
+    const paired = await fixture.pair(`Provider auth ${route.backendId}`);
+    const createSession = async (input: {
+      readonly backendId: string;
+      readonly providerId?: string;
+      readonly modelId?: string;
+      readonly effortId?: string;
+      readonly displayName: string;
+    }) => {
+      const operation = await submit(
+        paired.clients.operation,
+        paired.connectionId,
+        createSessionMutation({
+          backendId: input.backendId,
+          targetId: fixture.targetId(input.backendId),
+          displayName: input.displayName,
+          ...(input.providerId === undefined ? {} : {
+            providerId: input.providerId,
+            modelId: input.modelId!,
+            effortId: input.effortId ?? "off"
+          })
+        })
+      );
+      expect(operation.state, jsonWithBigints(operation.error)).toBe(OperationState.SUCCEEDED);
+      return sessionIdFrom(operation);
+    };
+    const nativeDispatchCount = (backendId: string): number => {
+      if (backendId === "pi") return authentication.piProcesses.promptDispatches.length;
+      if (backendId === "codex-paired") {
+        return codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0;
+      }
+      return claude.queries.reduce((total, query) => total + query.receivedInputs.length, 0);
+    };
+    const piCommandCount = (): number => authentication.piProcesses.processes.reduce(
+      (total, process) => total + process.commands.length,
+      0
+    );
+    const codexThreadRequests = (method: string, nativeSessionId: string) =>
+      (codex.transport?.requests ?? []).filter((request) =>
+        request.method === method
+        && (request.params as { readonly threadId?: unknown } | undefined)?.threadId === nativeSessionId);
+    const claudeQueriesFor = (nativeSessionId: string) => claude.queries.filter((query) =>
+      query.params.options.resume === nativeSessionId || query.params.options.sessionId === nativeSessionId);
+    const sendAndComplete = async (backendId: string, sessionId: string, text: string) => {
+      const before = nativeDispatchCount(backendId);
+      const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+      const operation = await submit(
+        paired.clients.operation,
+        paired.connectionId,
+        sendInputMutation(sessionId, generation, text)
+      );
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      const runId = queueRunIdFrom(operation);
+      if (backendId === "codex-paired") {
+        await waitFor(async () => nativeDispatchCount(backendId), (count) => count === before + 1, `${text} Codex dispatch`);
+        const nativeSessionId = fixture.application.store.getSession(sessionId).descriptor.binding.nativeSessionId;
+        if (nativeSessionId === undefined) throw new Error("Codex auth fixture has no native task identity.");
+        await codex.completeTurn(nativeSessionId, `${text} answer`);
+      } else if (backendId === "claude-paired") {
+        await waitFor(async () => nativeDispatchCount(backendId), (count) => count === before + 1, `${text} Claude dispatch`);
+        claude.queries.at(-1)!.complete(`${text} answer`);
+      }
+      try {
+        await waitFor(
+          async () => fixture.application.store.getRun(runId).descriptor.state,
+          (state) => state === "completed",
+          `${text} completion`
+        );
+      } catch (error) {
+        const queue = fixture.application.store.findQueueItemByRunId(sessionId, runId);
+        throw new Error(jsonWithBigints({
+          message: error instanceof Error ? error.message : String(error),
+          run: fixture.application.store.getRun(runId),
+          queue,
+          attempt: queue?.attemptId === undefined ? undefined : fixture.application.store.getAttempt(queue.attemptId),
+          diagnostics: fixture.application.store.listDiagnostics(),
+          piProcesses: authentication.piProcesses.processes.map((process) => ({
+            exitCode: process.exitCode,
+            signalCode: process.signalCode,
+            args: process.spec.args,
+            commands: process.commands
+          }))
+        }), { cause: error });
+      }
+      expect(nativeDispatchCount(backendId)).toBe(before + 1);
+      return runId;
+    };
+
+    const piTargetProcessStart = authentication.piProcesses.processes.length;
+    const targetSessionId = await createSession({
+      backendId: route.backendId,
+      providerId: route.providerId,
+      modelId: route.modelId,
+      effortId: route.effortId,
+      displayName: `${route.backendId} auth target`
+    });
+    await sendAndComplete(route.backendId, targetSessionId, `${route.backendId} authenticated baseline`);
+    const baselineBinding = { ...fixture.application.store.getSession(targetSessionId).descriptor.binding };
+    const baselineNativeSessionId = baselineBinding.nativeSessionId;
+    if (baselineNativeSessionId === undefined) throw new Error(`${route.backendId} target has no native Session identity.`);
+    const targetPiProcesses = authentication.piProcesses.processes.slice(piTargetProcessStart);
+    const targetClaudeQueries = claudeQueriesFor(baselineNativeSessionId);
+    if (route.backendId === "pi") {
+      expect(targetPiProcesses.length).toBeGreaterThan(0);
+      expect(targetPiProcesses.every((process) => process.exitCode === null)).toBe(true);
+    } else if (route.backendId === "claude-paired") {
+      expect(targetClaudeQueries.length).toBeGreaterThan(0);
+      expect(targetClaudeQueries.every((query) => !claude.retiredQueries.has(query))).toBe(true);
+    }
+    const piSiblingProcessStart = authentication.piProcesses.processes.length;
+    const siblingRoute = route.backendId === "pi"
+      ? { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off" }
+      : route.backendId === "codex-paired"
+        ? { providerId: MANAGED_CODEX_PROVIDER_ID, modelId: MANAGED_CODEX_MODEL_ID, effortId: "medium" }
+        : { providerId: MANAGED_CLAUDE_PROVIDER_ID, modelId: MANAGED_CLAUDE_MODEL_ID, effortId: "high" };
+    const siblingSessionId = await createSession({
+      backendId: route.backendId,
+      ...siblingRoute,
+      displayName: `${route.backendId} independent Provider sibling`
+    });
+    await sendAndComplete(route.backendId, siblingSessionId, `${route.backendId} sibling baseline`);
+    const siblingBaselineBinding = {
+      ...fixture.application.store.getSession(siblingSessionId).descriptor.binding
+    };
+    const siblingNativeSessionId = siblingBaselineBinding.nativeSessionId;
+    if (siblingNativeSessionId === undefined) throw new Error(`${route.backendId} sibling has no native Session identity.`);
+    const siblingPiProcesses = authentication.piProcesses.processes.slice(piSiblingProcessStart);
+    const siblingClaudeQueries = claudeQueriesFor(siblingNativeSessionId);
+    const codexTargetUnsubscribesBeforeLogout = codexThreadRequests(
+      "thread/unsubscribe",
+      baselineNativeSessionId
+    ).length;
+    const codexSiblingUnsubscribesBeforeLogout = codexThreadRequests(
+      "thread/unsubscribe",
+      siblingNativeSessionId
+    ).length;
+    const crossPiProcessStart = authentication.piProcesses.processes.length;
+    const crossSessionId = route.crossBackendId === "pi"
+      ? await createSession({
+          backendId: "pi",
+          providerId: REAL_PI_PROVIDER_ID,
+          modelId: REAL_PI_MODEL_ID,
+          effortId: "off",
+          displayName: `${route.backendId} cross-Backend route`
+        })
+      : await createSession({
+          backendId: "codex-paired",
+          providerId: "openai",
+          modelId: "gpt-test",
+          effortId: "medium",
+          displayName: "Pi cross-Backend route"
+        });
+    await sendAndComplete(route.crossBackendId, crossSessionId, `${route.backendId} cross-Backend baseline`);
+    const crossBaselineBinding = {
+      ...fixture.application.store.getSession(crossSessionId).descriptor.binding
+    };
+    const crossNativeSessionId = crossBaselineBinding.nativeSessionId;
+    if (crossNativeSessionId === undefined) throw new Error(`${route.backendId} cross-Backend Session has no native identity.`);
+    const crossPiProcesses = authentication.piProcesses.processes.slice(crossPiProcessStart);
+    const codexCrossUnsubscribesBeforeLogout = codexThreadRequests(
+      "thread/unsubscribe",
+      crossNativeSessionId
+    ).length;
+    const codexCrossResumesBeforeLogout = codexThreadRequests("thread/resume", crossNativeSessionId).length;
+
+    let activeLogoutRunId: string | undefined;
+    if (route.backendId === "codex-paired" || route.backendId === "claude-paired") {
+      const dispatchesBeforeActiveLogoutTurn = nativeDispatchCount(route.backendId);
+      const activeLogoutTurn = await submit(
+        paired.clients.operation,
+        paired.connectionId,
+        sendInputMutation(
+          targetSessionId,
+          BigInt(fixture.application.store.getSession(targetSessionId).descriptor.binding.generation),
+          `${route.backendId} active turn retired by logout`
+        )
+      );
+      expect(activeLogoutTurn.state).toBe(OperationState.SUCCEEDED);
+      activeLogoutRunId = queueRunIdFrom(activeLogoutTurn);
+      await waitFor(
+        async () => nativeDispatchCount(route.backendId),
+        (count) => count === dispatchesBeforeActiveLogoutTurn + 1,
+        `${route.backendId} active logout turn dispatch`
+      );
+      await waitFor(
+        async () => fixture.application.store.findQueueItemByRunId(targetSessionId, activeLogoutRunId!)?.state,
+        (state) => state === "backend_accepted",
+        `${route.backendId} active logout turn acceptance`
+      );
+    }
+    const targetClaudeQueriesAtLogout = claudeQueriesFor(baselineNativeSessionId);
+
+    const logoutOperationId = randomUUID();
+    const logoutMutation = create(OperationMutationSchema, {
+      payload: {
+        case: "logoutProvider",
+        value: create(LogoutProviderMutationSchema, {
+          backendId: route.backendId,
+          providerId: route.providerId
+        })
+      }
+    });
+    const logout = await submit(paired.clients.operation, paired.connectionId, logoutMutation, logoutOperationId);
+    expect(logout.state).toBe(OperationState.SUCCEEDED);
+    const replayedLogout = await submit(paired.clients.operation, paired.connectionId, logoutMutation, logoutOperationId);
+    expect(replayedLogout.state).toBe(OperationState.SUCCEEDED);
+    const logoutEffects = () => route.backendId === "pi"
+      ? authentication.piRuntime.logoutCount
+      : route.backendId === "codex-paired"
+        ? codex.transport?.requests.filter((request) => request.method === "account/logout").length ?? 0
+        : authentication.claudeCredentials.deleteCount;
+    expect(logoutEffects()).toBe(1);
+    const managedSiblingDisposals = () => route.backendId === "codex-paired"
+      ? authentication.codexManagedProvider.routeDisposeCount
+      : route.backendId === "claude-paired"
+        ? authentication.claudeManagedProvider.routeDisposeCount
+        : 0;
+    expect(managedSiblingDisposals()).toBe(0);
+
+    if (activeLogoutRunId !== undefined) {
+      await waitFor(
+        async () => fixture.application.store.getRun(activeLogoutRunId!).descriptor.state,
+        (state) => state === "failed" || state === "aborted" || state === "dispatch_unknown",
+        `${route.backendId} active logout turn terminal state`
+      );
+      const activeQueue = fixture.application.store.findQueueItemByRunId(targetSessionId, activeLogoutRunId);
+      if (activeQueue === undefined) throw new Error(`${route.backendId} active logout Queue item is missing.`);
+      expect(activeQueue.state).not.toBe("backend_accepted");
+      expect(activeQueue.error).toMatchObject({
+        code: expect.stringMatching(/PROVIDER_AUTHENTICATION_REVOKED$/u),
+        stateMayHaveChanged: true
+      });
+      expect(fixture.application.store.getRun(activeLogoutRunId).descriptor.error).toMatchObject({
+        code: expect.stringMatching(/PROVIDER_AUTHENTICATION_REVOKED$/u),
+        stateMayHaveChanged: true
+      });
+      if (activeQueue.attemptId === undefined) throw new Error(`${route.backendId} active logout Attempt is missing.`);
+      expect(fixture.application.store.getAttempt(activeQueue.attemptId).descriptor).toMatchObject({
+        endedAt: expect.any(Number),
+        error: {
+          code: expect.stringMatching(/PROVIDER_AUTHENTICATION_REVOKED$/u),
+          stateMayHaveChanged: true
+        }
+      });
+    }
+
+    if (route.backendId === "pi") {
+      expect(targetPiProcesses.every((process) => process.exitCode !== null)).toBe(true);
+      expect(siblingPiProcesses.length).toBeGreaterThan(0);
+      expect(siblingPiProcesses.every((process) => process.exitCode === null)).toBe(true);
+    } else if (route.backendId === "codex-paired") {
+      const requests = codex.transport?.requests ?? [];
+      const targetUnsubscribes = codexThreadRequests("thread/unsubscribe", baselineNativeSessionId);
+      expect(targetUnsubscribes).toHaveLength(codexTargetUnsubscribesBeforeLogout + 1);
+      expect(codexThreadRequests("thread/unsubscribe", siblingNativeSessionId))
+        .toHaveLength(codexSiblingUnsubscribesBeforeLogout);
+      const targetRetirement = targetUnsubscribes.at(-1);
+      if (targetRetirement === undefined) throw new Error("Codex target retirement request is missing.");
+      const logoutIndex = requests.findIndex((request) => request.method === "account/logout");
+      expect(requests.indexOf(targetRetirement)).toBeLessThan(logoutIndex);
+    } else {
+      expect(targetClaudeQueriesAtLogout.length).toBeGreaterThan(0);
+      expect(targetClaudeQueriesAtLogout.every((query) => claude.retiredQueries.has(query))).toBe(true);
+      expect(siblingClaudeQueries.length).toBeGreaterThan(0);
+      expect(siblingClaudeQueries.every((query) => !claude.retiredQueries.has(query))).toBe(true);
+    }
+
+    const targetActivationSnapshot = () => ({
+      piProcesses: authentication.piProcesses.processes.length,
+      piCommands: piCommandCount(),
+      codexStarts: codex.transport?.requests.filter((request) => request.method === "thread/start").length ?? 0,
+      codexTargetResumes: codexThreadRequests("thread/resume", baselineNativeSessionId).length,
+      claudeTargetQueries: claudeQueriesFor(baselineNativeSessionId).length
+    });
+    const activationsBeforeRejectedSend = targetActivationSnapshot();
+
+    const dispatchesBeforeRejectedSend = nativeDispatchCount(route.backendId);
+    const rejectedSendOperationId = randomUUID();
+    const rejectedMutation = sendInputMutation(
+      targetSessionId,
+      BigInt(fixture.application.store.getSession(targetSessionId).descriptor.binding.generation),
+      `${route.backendId} must stay behind auth fence`
+    );
+    const rejected = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      rejectedMutation,
+      rejectedSendOperationId
+    );
+    expect(rejected.state).toBe(OperationState.SUCCEEDED);
+    const rejectedRunId = queueRunIdFrom(rejected);
+    await waitFor(
+      async () => fixture.application.store.getRun(rejectedRunId).descriptor.state,
+      (state) => state === "failed",
+      `${route.backendId} auth-required failure`
+    );
+    expect(fixture.application.store.findQueueItemByRunId(targetSessionId, rejectedRunId)).toMatchObject({
+      state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false }
+    });
+    const rejectedReplay = await submit(
+      paired.clients.operation,
+      paired.connectionId,
+      rejectedMutation,
+      rejectedSendOperationId
+    );
+    expect(queueRunIdFrom(rejectedReplay)).toBe(rejectedRunId);
+    expect(nativeDispatchCount(route.backendId)).toBe(dispatchesBeforeRejectedSend);
+    expect(targetActivationSnapshot()).toEqual(activationsBeforeRejectedSend);
+
+    const siblingProcessesBeforeContinuation = authentication.piProcesses.processes.length;
+    const codexSiblingResumesBeforeContinuation = codexThreadRequests("thread/resume", siblingNativeSessionId).length;
+    const siblingClaudeQueryCountBeforeContinuation = siblingClaudeQueries.length;
+    await sendAndComplete(route.backendId, siblingSessionId, `${route.backendId} sibling continues during native logout`);
+    expect(fixture.application.store.getSession(siblingSessionId).descriptor.binding).toEqual(siblingBaselineBinding);
+    if (route.backendId === "pi") {
+      expect(authentication.piProcesses.processes).toHaveLength(siblingProcessesBeforeContinuation);
+      expect(siblingPiProcesses.every((process) => process.exitCode === null)).toBe(true);
+    } else if (route.backendId === "codex-paired") {
+      expect(codexThreadRequests("thread/unsubscribe", siblingNativeSessionId))
+        .toHaveLength(codexSiblingUnsubscribesBeforeLogout);
+      expect(codexThreadRequests("thread/resume", siblingNativeSessionId))
+        .toHaveLength(codexSiblingResumesBeforeContinuation);
+    } else {
+      expect(claudeQueriesFor(siblingNativeSessionId)).toHaveLength(siblingClaudeQueryCountBeforeContinuation);
+      expect(siblingClaudeQueries.every((query) => !claude.retiredQueries.has(query))).toBe(true);
+    }
+    expect(managedSiblingDisposals()).toBe(0);
+
+    const crossProcessesBeforeContinuation = authentication.piProcesses.processes.length;
+    await sendAndComplete(route.crossBackendId, crossSessionId, `${route.backendId} cross-Backend continues`);
+    expect(fixture.application.store.getSession(crossSessionId).descriptor.binding).toEqual(crossBaselineBinding);
+    if (route.crossBackendId === "pi") {
+      expect(authentication.piProcesses.processes).toHaveLength(crossProcessesBeforeContinuation);
+      expect(crossPiProcesses.length).toBeGreaterThan(0);
+      expect(crossPiProcesses.every((process) => process.exitCode === null)).toBe(true);
+    } else {
+      expect(codexThreadRequests("thread/unsubscribe", crossNativeSessionId))
+        .toHaveLength(codexCrossUnsubscribesBeforeLogout);
+      expect(codexThreadRequests("thread/resume", crossNativeSessionId))
+        .toHaveLength(codexCrossResumesBeforeLogout);
+    }
+
+    const dispatchesBeforeReauthentication = nativeDispatchCount(route.backendId);
+    if (route.backendId === "pi") {
+      const login = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        payload: {
+          case: "beginProviderLogin",
+          value: create(BeginProviderLoginMutationSchema, {
+            backendId: "pi",
+            providerId: AUTH_PI_PROVIDER_ID,
+            method: ProviderLoginMethod.SUBSCRIPTION
+          })
+        }
+      }));
+      expect(login.state).toBe(OperationState.SUCCEEDED);
+      if (login.result?.payload.case !== "providerLogin") throw new Error("Pi login flow result is missing.");
+      const loginFlowId = login.result.payload.value.loginFlowId;
+      await waitFor(
+        () => paired.clients.backend.getProviderLoginFlow({ loginFlowId }),
+        (response) => response.loginFlow?.state === ProviderLoginFlowState.COMPLETED,
+        "Pi public login completion"
+      );
+      expect(authentication.piRuntime.loginCount).toBe(1);
+    } else {
+      if (route.backendId === "codex-paired") {
+        codex.account = { type: "chatgpt", email: null, planType: "plus" };
+      } else {
+        authentication.claudeCredentials.restoreInitial();
+      }
+      const refreshed = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        payload: {
+          case: "refreshProviderCredential",
+          value: create(RefreshProviderCredentialMutationSchema, {
+            backendId: route.backendId,
+            providerId: route.providerId
+          })
+        }
+      }));
+      expect(refreshed.state).toBe(OperationState.SUCCEEDED);
+    }
+
+    expect(await waitForStableNumber(
+      () => nativeDispatchCount(route.backendId),
+      `${route.backendId} failed input staying terminal`
+    )).toBe(dispatchesBeforeReauthentication);
+    expect(fixture.application.store.getRun(rejectedRunId).descriptor.state).toBe("failed");
+    const activationsBeforeExplicitResend = targetActivationSnapshot();
+    const retiredClaudeQueries = claudeQueriesFor(baselineNativeSessionId);
+    const retiredClaudeInputCounts = retiredClaudeQueries.map((query) => query.receivedInputs.length);
+    await sendAndComplete(route.backendId, targetSessionId, `${route.backendId} explicit resend after reauth`);
+    const activationsAfterExplicitResend = targetActivationSnapshot();
+    if (route.backendId === "pi") {
+      expect(activationsAfterExplicitResend.piProcesses)
+        .toBeGreaterThan(activationsBeforeExplicitResend.piProcesses);
+      expect(targetPiProcesses.every((process) => process.exitCode !== null)).toBe(true);
+    } else if (route.backendId === "codex-paired") {
+      expect(activationsAfterExplicitResend.codexTargetResumes)
+        .toBeGreaterThan(activationsBeforeExplicitResend.codexTargetResumes);
+    } else {
+      expect(activationsAfterExplicitResend.claudeTargetQueries)
+        .toBeGreaterThan(activationsBeforeExplicitResend.claudeTargetQueries);
+      expect(retiredClaudeQueries.map((query) => query.receivedInputs.length)).toEqual(retiredClaudeInputCounts);
+    }
+    const resumedBinding = fixture.application.store.getSession(targetSessionId).descriptor.binding;
+    expect(resumedBinding).toMatchObject({
+      opaqueRef: baselineBinding.opaqueRef,
+      nativeSessionId: baselineBinding.nativeSessionId
+    });
+    expect(resumedBinding.generation).toBeGreaterThanOrEqual(baselineBinding.generation);
+
+    const diagnosticsOperation = await submit(paired.clients.operation, paired.connectionId,
+      create(OperationMutationSchema, {
+        payload: {
+          case: "createDiagnosticsBundle",
+          value: create(CreateDiagnosticsBundleMutationSchema, { level: DiagnosticLevel.VERBOSE })
+        }
+      }));
+    expect(diagnosticsOperation.state, jsonWithBigints(diagnosticsOperation.error)).toBe(OperationState.SUCCEEDED);
+    if (diagnosticsOperation.result?.payload.case !== "diagnosticsBundle") {
+      throw new Error("The public diagnostics bundle operation returned no Artifact.");
+    }
+    const diagnosticsArtifact = fixture.application.store.getArtifact(
+      diagnosticsOperation.result.payload.value.artifactId
+    );
+    const diagnosticsBundle = Buffer.from(
+      (await fixture.application.artifacts.readBlob(diagnosticsArtifact.blob)).data
+    ).toString("utf8");
+
+    const piSessionRoot = join(fixture.rootDirectory, "pi-sessions");
+    const piSessionFiles = (await readdir(piSessionRoot, { recursive: true }).catch(() => []))
+      .filter((path) => path.endsWith(".jsonl"));
+    const runtimeSessionJsonl = await Promise.all(piSessionFiles.map((path) =>
+      readFile(join(piSessionRoot, path), "utf8")));
+    const productSessionIds = [targetSessionId, siblingSessionId, crossSessionId];
+    const backendIds = ["pi", "codex-paired", "claude-paired"];
+    const capturePublicRpc = async <T>(read: () => Promise<T>) => {
+      try {
+        return { case: "response" as const, value: await read() };
+      } catch (error) {
+        const code = (error as { readonly code?: unknown } | undefined)?.code;
+        return {
+          case: "error" as const,
+          error: {
+            name: error instanceof Error ? error.name : "PublicRpcError",
+            message: error instanceof Error ? error.message : String(error),
+            ...(typeof code === "number" ? { code } : {})
+          }
+        };
+      }
+    };
+    const [
+      publicSettingsResponse,
+      publicOwnerSnapshot,
+      publicOperations,
+      publicBackends,
+      publicSessions,
+      publicSessionDetails,
+      publicSessionSnapshots,
+      publicRuntimeProcesses,
+      publicProviders
+    ] = await Promise.all([
+      paired.clients.settings.getSettings({}),
+      paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } }),
+      paired.clients.operation.listOperations({}),
+      paired.clients.backend.listBackends({}),
+      paired.clients.session.listSessions({}),
+      Promise.all(productSessionIds.map((sessionId) => paired.clients.session.getSession({ sessionId }))),
+      Promise.all(productSessionIds.map((sessionId) => paired.clients.event.getSnapshot({
+        scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } } }
+      }))),
+      Promise.all(backendIds.map((backendId) => capturePublicRpc(
+        () => paired.clients.backend.listRuntimeProcesses({ backendId })
+      ))),
+      Promise.all(backendIds.map((backendId) => paired.clients.backend.listProviders({ backendId })))
+    ]);
+    const publicSettings = publicSettingsResponse.settings;
+    if (publicSettings === undefined) throw new Error("The public Settings service returned no snapshot.");
+    const publicState = jsonWithBigints({
+      durableSettings: fixture.application.store.listSettings(),
+      publicSettings,
+      publicOwnerSnapshot,
+      publicOperations,
+      publicBackends,
+      publicSessions,
+      publicSessionDetails,
+      publicSessionSnapshots,
+      publicRuntimeProcesses,
+      publicProviders,
+      diagnostics: fixture.application.store.listDiagnostics(),
+      events: fixture.application.store.listEvents(),
+      operations: fixture.application.store.listOperations(),
+      backendDescriptors: fixture.application.store.listBackends().map(({ descriptor, revision }) => ({
+        ...descriptor,
+        capabilities: [...descriptor.capabilities.entries()],
+        revision
+      })),
+      productSessions: productSessionIds.map((sessionId) =>
+        fixture.application.store.getSession(sessionId)),
+      diagnosticsBundle,
+      workspaceReadme: await readFile(join(fixture.workspaceDirectory, "README.md"), "utf8"),
+      runtimeSessionJsonl
+    });
+    for (const [index, secret] of authentication.secrets.entries()) {
+      expect(
+        publicState.includes(secret),
+        `Public auth evidence leaked credential sentinel ${index + 1}.`
+      ).toBe(false);
+    }
+  } finally {
+    await setup.close();
+  }
+});
+
 mountedIt("keeps three native tasks distinct through mounted Web, approval and one native identity failure", { timeout: 120_000 }, async () => {
   const setup = await startPairedFixture(resolve(process.env.JOKO_MOUNTED_WEB_DIR!));
   const { fixture, codex, claude } = setup;
@@ -2597,11 +3410,12 @@ mountedIt("keeps three native tasks distinct through mounted Web, approval and o
 
 async function startPairedFixture(
   webDirectory?: string,
-  options: { readonly controlPiFault?: boolean } = {}
+  options: { readonly controlPiFault?: boolean; readonly providerAuthentication?: boolean } = {}
 ) {
   const root = await mkdtemp(join(tmpdir(), "joko-paired-backends-"));
   const requests: Parameters<typeof startLocalProvider>[0] = [];
   const piProcesses = new ControlledPiProcessFactory();
+  const authenticationPiProcesses = new AuthenticationPiProcessFactory();
   const providerServer = await startLocalProvider(
     requests,
     undefined,
@@ -2622,7 +3436,41 @@ async function startPairedFixture(
   };
   const codex = new FakeCodexAppServer();
   let codexHost = new AppServerHost({ transportFactory: () => codex.createTransport() });
-  const claude = new ControlledClaudeRuntime();
+  const claude = new LifecycleObservedClaudeRuntime();
+  const claudeCredentials = new InMemoryClaudeCredentialPort();
+  const codexManagedProvider = new DeterministicManagedProviderRuntime({
+    providerId: MANAGED_CODEX_PROVIDER_ID,
+    modelId: MANAGED_CODEX_MODEL_ID,
+    protocol: "openai-responses",
+    support: CODEX_MANAGED_PROVIDER_SUPPORT,
+    proxySecret: MANAGED_CODEX_PROXY_SECRET
+  });
+  const claudeManagedProvider = new DeterministicManagedProviderRuntime({
+    providerId: MANAGED_CLAUDE_PROVIDER_ID,
+    modelId: MANAGED_CLAUDE_MODEL_ID,
+    protocol: "anthropic-messages",
+    support: CLAUDE_MANAGED_PROVIDER_SUPPORT,
+    proxySecret: MANAGED_CLAUDE_PROXY_SECRET
+  });
+  const claudeOAuthFetch: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/v1/oauth/token")) {
+      return new Response(JSON.stringify({
+        access_token: AUTH_CLAUDE_REFRESHED_ACCESS_SECRET,
+        refresh_token: AUTH_CLAUDE_REFRESHED_REFRESH_SECRET,
+        expires_in: 3_600,
+        scope: "user:inference user:sessions:claude_code"
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response("", { status: 404 });
+  };
+  let authenticationProviders: ProviderCatalogManager | undefined;
+  let authenticationSupervisor: PiProviderAuthSupervisor | undefined;
+  let piAuthenticationRuntime: ImmediatePiAuthenticationRuntime | undefined;
+  let piSnapshotSequence = 0;
+  let refreshPiGenerationImpl: () => Promise<void> = async () => {
+    throw new Error("The paired Pi authentication generation is not ready.");
+  };
   const lifecycle: AdapterLifecycleEvent[] = [];
   const probeFailures = new CandidateProbeFailureController();
   const unexpectedPiRuntimeExits: Array<{
@@ -2635,14 +3483,128 @@ async function startPairedFixture(
   const closeProvider = () => new Promise<void>((resolvePromise, reject) => {
     providerServer.close((error) => error === undefined ? resolvePromise() : reject(error));
   });
+  const createAuthenticationSnapshot = async () => {
+    if (authenticationProviders === undefined || authenticationSupervisor === undefined) {
+      throw new Error("The paired Provider authentication owners are unavailable.");
+    }
+    return authenticationProviders.createPiGenerationSnapshot({
+      snapshotsRoot: join(root, "pi-auth-generations", `snapshot-${++piSnapshotSequence}`)
+    });
+  };
+  const createAuxiliaryServices = options.providerAuthentication !== true
+    ? undefined
+    : async (
+        store: OrchestratorE2eFixture["application"]["store"],
+        dataDirectory: string,
+        artifacts: OrchestratorE2eFixture["application"]["artifacts"]
+      ) => {
+        const vault = await CredentialVault.open(join(dataDirectory, "credentials", "paired-master.key"));
+        const credentials = new CredentialManager({
+          vault,
+          storagePath: join(dataDirectory, "credentials", "paired-records.json")
+        });
+        await credentials.initialize();
+        const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+        providers.initialize();
+        await providers.upsert({
+          backendId: "pi",
+          credentialOrigin: provider.baseUrl!,
+          provider,
+          displayName: "Paired local model",
+          kind: "custom_endpoint",
+          credentialBindings: {},
+          enabled: true,
+          supportsLogin: false,
+          supportsLogout: false,
+          supportsRefresh: false
+        });
+        const supervisor = await PiProviderAuthSupervisor.create({
+          store,
+          backendId: "pi",
+          providers,
+          refreshPiGeneration: () => refreshPiGenerationImpl(),
+          runtimeFactory: async (credentialStore) => {
+            const runtime = new ImmediatePiAuthenticationRuntime(credentialStore);
+            piAuthenticationRuntime = runtime;
+            return runtime;
+          }
+        });
+        const initialPiCredential: PiOAuthCredential = {
+          type: "oauth",
+          access: AUTH_PI_ACCESS_SECRET,
+          refresh: AUTH_PI_REFRESH_SECRET,
+          expires: Date.now() + 60 * 60_000,
+          accountId: "paired-pi-account"
+        };
+        await providers.writeNativeCredential({
+          providerId: AUTH_PI_PROVIDER_ID,
+          serializedCredential: JSON.stringify(initialPiCredential),
+          expiresAt: initialPiCredential.expires
+        });
+        authenticationProviders = providers;
+        authenticationSupervisor = supervisor;
+        refreshPiGenerationImpl = async () => {
+          const currentFixture = fixture;
+          if (currentFixture === undefined) throw new Error("The paired fixture is not running.");
+          const current = currentFixture.application.adapters.find((adapter) => adapter.id === "pi");
+          if (!(current instanceof PiBackendAdapter)) throw new Error("The current Pi Adapter is unavailable.");
+          const snapshot = await createAuthenticationSnapshot();
+          await current.updateManagedGeneration({
+            agentHome: snapshot.agentHome,
+            providers: snapshot.providers,
+            environment: snapshot.environment,
+            secretEnvironmentNames: snapshot.secretEnvironmentNames,
+            catalogGeneration: snapshot.catalogGeneration,
+            nativeAuthProviderIds: snapshot.nativeAuthProviderIds,
+            nativeAuthenticatedProviderIds: snapshot.nativeAuthenticatedProviderIds,
+            nativeModels: supervisor.listNativeModels(),
+            loadNativeAuth: (input) => supervisor.loadNativeAuth(input),
+            persistNativeAuth: (input) => supervisor.persistNativeAuth(input)
+          });
+          await currentFixture.application.refreshBackendDescriptor("pi");
+        };
+        return {
+          credentials,
+          providers,
+          providerAuth: supervisor,
+          refreshPiGeneration: () => refreshPiGenerationImpl(),
+          diagnosticsBundles: new DiagnosticsBundleService({
+            store,
+            artifacts,
+            credentials,
+            serviceVersion: "paired-e2e"
+          })
+        };
+      };
   const startFixture = () => OrchestratorE2eFixture.start({ rootDirectory: root, profiles: [],
-    ...(webDirectory === undefined ? {} : { webDirectory }), backendFactories: [
+    ...(webDirectory === undefined ? {} : { webDirectory }),
+    ...(createAuxiliaryServices === undefined ? {} : {
+      createAuxiliaryServicesBeforeBackendProvision: createAuxiliaryServices
+    }),
+    backendFactories: [
     { instanceId: "pi", adapterKind: "pi", displayName: "Published Pi",
-      create: ({ generation }) => {
+      create: async ({ generation }) => {
         const fault = probeFailures.take("pi", generation);
+        const authenticationSnapshot = options.providerAuthentication === true
+          ? await createAuthenticationSnapshot()
+          : undefined;
         const adapter = createPiAdapter({
-          agentHome: join(root, "pi-agent-home"), sessionRoot: join(root, "pi-sessions"),
-          externalSessionRoots: [], providers: [provider], versionProbe: async () => "pi 0.84.4",
+          agentHome: authenticationSnapshot?.agentHome ?? join(root, "pi-agent-home"),
+          sessionRoot: join(root, "pi-sessions"),
+          externalSessionRoots: [],
+          providers: authenticationSnapshot?.providers ?? [provider],
+          versionProbe: async () => "pi 0.84.4",
+          ...(authenticationSnapshot === undefined ? {} : {
+            environment: authenticationSnapshot.environment,
+            secretEnvironmentNames: authenticationSnapshot.secretEnvironmentNames,
+            catalogGeneration: authenticationSnapshot.catalogGeneration,
+            nativeAuthProviderIds: authenticationSnapshot.nativeAuthProviderIds,
+            nativeAuthenticatedProviderIds: authenticationSnapshot.nativeAuthenticatedProviderIds,
+            nativeModels: authenticationSupervisor!.listNativeModels(),
+            loadNativeAuth: (input) => authenticationSupervisor!.loadNativeAuth(input),
+            persistNativeAuth: (input) => authenticationSupervisor!.persistNativeAuth(input),
+            processFactory: authenticationPiProcesses.create
+          }),
           ...(fault === undefined ? {} : {
             command: join(root, `missing-pi-candidate-${generation}`),
             environment: { JOKO_PAIRED_CANDIDATE_SECRET: fault.sentinel },
@@ -2678,6 +3640,7 @@ async function startPairedFixture(
         const adapter = createCodexAdapter({
           id: "codex-paired",
           instanceGeneration: generation,
+          ...(options.providerAuthentication === true ? { managedProviders: codexManagedProvider } : {}),
           ...(fault === undefined ? { host: codexHost } : {
             appServer: {
               transportFactory: () => new ScriptedRpcTransport(async () => {
@@ -2700,7 +3663,12 @@ async function startPairedFixture(
         const adapter = new ClaudeCodeAdapter({
           id: "claude-paired", instanceGeneration: generation,
           runtime: candidateRuntime, environment: {}, initializationTimeoutMs: 500, admissionTimeoutMs: 500,
-          teardownTimeoutMs: 100
+          teardownTimeoutMs: 100,
+          ...(options.providerAuthentication === true ? {
+            credentialPort: claudeCredentials,
+            oauthFetch: claudeOAuthFetch,
+            managedProviders: claudeManagedProvider
+          } : {})
         });
         if (fault !== undefined) {
           probeFailures.observeProbe(adapter, fault);
@@ -2723,6 +3691,25 @@ async function startPairedFixture(
       unexpectedPiRuntimeExits,
       lifecycle,
       probeFailures,
+      ...(options.providerAuthentication !== true ? {} : {
+        authentication: {
+          piRuntime: piAuthenticationRuntime!,
+          piProcesses: authenticationPiProcesses,
+          claudeCredentials,
+          codexManagedProvider,
+          claudeManagedProvider,
+          secrets: [
+            AUTH_PI_ACCESS_SECRET,
+            AUTH_PI_REFRESH_SECRET,
+            AUTH_CLAUDE_ACCESS_SECRET,
+            AUTH_CLAUDE_REFRESH_SECRET,
+            AUTH_CLAUDE_REFRESHED_ACCESS_SECRET,
+            AUTH_CLAUDE_REFRESHED_REFRESH_SECRET,
+            MANAGED_CODEX_PROXY_SECRET,
+            MANAGED_CLAUDE_PROXY_SECRET
+          ] as const
+        }
+      }),
       async restart(beforeStart?: () => void | Promise<void>) {
         if (closed || fixture === undefined) throw new Error("The paired fixture is not running.");
         const current = fixture;

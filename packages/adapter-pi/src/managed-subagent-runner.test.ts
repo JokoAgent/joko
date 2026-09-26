@@ -13,7 +13,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   managedSubagentSessionKey,
   reconcileManagedSubagentAuthHomes,
-  stopAndRemoveManagedSubagentRuns
+  stopAndRemoveManagedSubagentRuns,
+  stopManagedSubagentRunsByProvider
 } from "./durable-subagent-runs.js";
 import {
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
@@ -652,6 +653,120 @@ describe("managed detached subagent runner", () => {
     await expect(readFile(fixture.statusPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("stops every exact Provider child regardless of native-auth mode and preserves sibling durable runs", { timeout: 20_000 }, async () => {
+    const target = await createRunnerFixture({
+      settleDelayMs: 10_000,
+      providerId: "managed-secret"
+    });
+    const sibling = await createRunnerFixture({
+      settleDelayMs: 10_000,
+      root: target.root,
+      productSessionId: target.productSessionId,
+      providerId: "local-keyless"
+    });
+    for (const fixture of [target, sibling]) {
+      const runner = spawn(process.execPath, [fixture.runnerPath, fixture.configPath], {
+        cwd: fixture.runDirectory,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        env: {
+          ...process.env,
+          JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES: "[]",
+          JOKO_PI_SECRET_ENV_NAMES: "[]"
+        }
+      });
+      await new Promise<void>((resolveStarted, rejectStarted) => {
+        runner.once("spawn", resolveStarted);
+        runner.once("error", rejectStarted);
+      });
+      runner.unref();
+    }
+    await Promise.all([
+      waitForState(target.statusPath, "running", 5_000),
+      waitForState(sibling.statusPath, "running", 5_000)
+    ]);
+
+    await stopManagedSubagentRunsByProvider(target.root, "managed-secret", 8_000);
+
+    expect(JSON.parse(await readFile(target.statusPath, "utf8"))).toMatchObject({ state: "aborted" });
+    expect(JSON.parse(await readFile(sibling.statusPath, "utf8"))).toMatchObject({ state: "running" });
+    await expect(readFile(join(target.runDirectory, "result.json"), "utf8")).resolves.toContain("aborted");
+    await expect(readdir(target.childHome)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readdir(sibling.childHome)).resolves.toBeDefined();
+
+    await stopAndRemoveManagedSubagentRuns(target.root, target.productSessionId, 8_000);
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["malformed", { provider: 42, model: "fixture", effort: "off" }],
+    ["illegal Provider", { provider: "invalid provider", model: "fixture", effort: "off" }]
+  ])("fails Provider retirement closed for an active local child with an %s immutable route", async (_label, route) => {
+    const fixture = await createRunnerFixture({ settleDelayMs: 10_000, providerId: "managed-secret" });
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as Record<string, unknown>;
+    if (route === undefined) delete config["route"];
+    else config["route"] = route;
+    await writeFile(fixture.configPath, `${JSON.stringify(config)}\n`, { encoding: "utf8", mode: 0o600 });
+
+    await expect(stopManagedSubagentRunsByProvider(fixture.root, "managed-secret", 1_000))
+      .rejects.toMatchObject({ publicError: { code: "PI_SUBAGENT_AUTH_REVOKE_ROUTE_UNKNOWN" } });
+    await expect(readFile(fixture.statusPath, "utf8")).resolves.toContain('"state":"queued"');
+  });
+
+  it("removes a dead runner native Session before synthesizing its terminal status", async () => {
+    const fixture = await createRunnerFixture({ settleDelayMs: 10_000, providerId: "managed-secret" });
+    const deadPid = await stoppedProcessId();
+    await writeRunningRunnerOwnership(fixture, deadPid, Date.now() - 60_000);
+    const nativeSessionPath = join(fixture.runDirectory, "sessions", `${fixture.nativeSessionId}.jsonl`);
+    const nativeSecret = `dead-native-secret-${randomUUID()}`;
+    await writeFile(nativeSessionPath, `${JSON.stringify({ type: "message", token: nativeSecret })}\n`, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as Record<string, unknown>;
+    status["nativeSessionPath"] = nativeSessionPath;
+    await writeFile(fixture.statusPath, `${JSON.stringify(status)}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(join(fixture.childHome, "auth.json"), `${JSON.stringify({ token: nativeSecret })}\n`, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+
+    await stopManagedSubagentRunsByProvider(fixture.root, "managed-secret", 2_000);
+
+    await expect(readFile(fixture.statusPath, "utf8")).resolves.toContain('"state":"failed"');
+    await expect(readFile(nativeSessionPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(fixture.childHome, "auth.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not synthesize terminal success when a dead runner native Session cannot be safely retired", async () => {
+    const fixture = await createRunnerFixture({ settleDelayMs: 10_000, providerId: "managed-secret" });
+    const deadPid = await stoppedProcessId();
+    await writeRunningRunnerOwnership(fixture, deadPid, Date.now() - 60_000);
+    const nativeSecret = `unretired-native-secret-${randomUUID()}`;
+    const outsideDirectory = await temporaryDirectory();
+    const unsafeSessionPath = join(outsideDirectory, `${fixture.nativeSessionId}.jsonl`);
+    await writeFile(unsafeSessionPath, `${JSON.stringify({ type: "message", token: nativeSecret })}\n`, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8")) as Record<string, unknown>;
+    config["childSessionDir"] = outsideDirectory;
+    await writeFile(fixture.configPath, `${JSON.stringify(config)}\n`, { encoding: "utf8", mode: 0o600 });
+
+    let failure: unknown;
+    try {
+      await stopManagedSubagentRunsByProvider(fixture.root, "managed-secret", 2_000);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({ publicError: { code: "PI_SUBAGENT_NATIVE_SESSION_RETIREMENT_UNKNOWN" } });
+    expect(JSON.stringify(failure)).not.toContain(nativeSecret);
+    await expect(readFile(fixture.statusPath, "utf8")).resolves.toContain('"state":"running"');
+    await expect(readFile(unsafeSessionPath, "utf8")).resolves.toContain(nativeSecret);
+  });
+
   it("persists a safe approval envelope and consumes an exactly fenced durable reply", { timeout: 20_000 }, async () => {
     const fixture = await createRunnerFixture({ settleDelayMs: 10_000, requestApproval: true });
     const runner = spawn(process.execPath, [fixture.runnerPath, fixture.configPath], {
@@ -779,6 +894,7 @@ async function createRunnerFixture(options: {
   readonly settleOnAbort?: boolean;
   readonly requestApproval?: boolean;
   readonly nativeAuthRequired?: boolean;
+  readonly providerId?: string;
   readonly refreshNativeAuth?: boolean;
   readonly runnerSource?: string;
   readonly root?: string;
@@ -853,8 +969,12 @@ async function createRunnerFixture(options: {
     nativeAuthRequired: options.nativeAuthRequired === true,
     background: true,
     runnerInstanceId,
+    route: {
+      provider: options.providerId ?? "native-provider",
+      model: "fixture",
+      effort: "off"
+    },
     ...(options.nativeAuthRequired === true ? {
-      route: { provider: "native-provider" },
       nativeAuthReservationId,
       nativeAuthServiceGeneration: 1,
       runnerPublicKey,

@@ -608,6 +608,67 @@ describe("BackendInstanceRegistry", () => {
     expect(registry.adapter("backend")).toBe(runtime);
   });
 
+  it("publishes a fail-closed Provider projection on the exact current generation without blocking a sibling route", async () => {
+    const { registry, store } = fixture();
+    const model = (providerId: string, modelId: string) => ({
+      providerId,
+      modelId,
+      displayName: modelId,
+      api: "openai-responses" as const,
+      contextWindow: 1,
+      maxOutputTokens: 1,
+      supportsImages: false,
+      thinkingLevels: [],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    });
+    const provider = (providerId: string) => ({
+      providerId,
+      displayName: providerId,
+      api: "openai-responses" as const,
+      authenticationState: "authenticated" as const,
+      loginMethods: ["api_key" as const],
+      supportsLogin: true,
+      supportsLogout: true,
+      supportsRefresh: true,
+      supportsModelRefresh: true
+    });
+    const runtime = adapter("backend", {
+      describe: vi.fn(async () => ({
+        ...descriptor("backend"),
+        providers: [provider("revoked"), provider("independent")],
+        models: [model("revoked", "revoked-model"), model("independent", "independent-model")]
+      }))
+    });
+    await registry.provision([factory("backend", runtime)]);
+
+    const projected = registry.projectProviderAuthentication("backend", "revoked", "signed_out");
+
+    expect(projected).toMatchObject({
+      generation: 1,
+      descriptor: {
+        instanceGeneration: 1,
+        authenticationState: "authenticated",
+        providers: [
+          { providerId: "revoked", authenticationState: "signed_out" },
+          { providerId: "independent", authenticationState: "authenticated" }
+        ],
+        models: [{ providerId: "independent", modelId: "independent-model" }]
+      }
+    });
+    expect(store.getBackend("backend").descriptor).toEqual(projected.descriptor);
+    expect(registry.adapter("backend")).toBe(runtime);
+
+    const fullySignedOut = registry.projectProviderAuthentication("backend", "independent", "signed_out");
+    expect(fullySignedOut.descriptor).toMatchObject({
+      authenticationState: "signed_out",
+      providers: [
+        { providerId: "revoked", authenticationState: "signed_out" },
+        { providerId: "independent", authenticationState: "signed_out" }
+      ],
+      models: []
+    });
+  });
+
   it("reapplies Host descriptor composition before provision, refresh and replacement publication", async () => {
     const projectDescriptor = vi.fn((value: BackendDescriptor): BackendDescriptor => ({
       ...value,

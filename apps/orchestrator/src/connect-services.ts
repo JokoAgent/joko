@@ -252,6 +252,8 @@ import { BROWSER_TOOLS } from "./browser-tool-bridge.js";
 import type { OperationalBrowserState, RecoverableBrowserPageRecord } from "./operational-browser-state.js";
 import {
   InteractionDecisionValidationError,
+  type BackendProviderAuthenticationEvidence,
+  type BackendProviderAuthenticationRetirement,
   type InteractionDecisionSubmission,
   type InteractionQuestionAnswerSubmission,
   type SessionHost,
@@ -458,6 +460,11 @@ interface ConnectServiceDependencies {
   readonly adapters: () => readonly BackendAdapter[];
   readonly restartBackend?: (backendId: string) => Promise<void>;
   readonly refreshBackendDescriptor?: (backendId: string) => Promise<void>;
+  readonly projectBackendProviderAuthentication?: (
+    backendId: string,
+    providerId: string,
+    authenticationState: BackendDescriptor["authenticationState"]
+  ) => void;
   readonly runtimeProcesses: RuntimeProcessControl;
   readonly sessionHost: SessionHost;
   readonly sessionWorktrees?: SessionWorktreeCoordinator;
@@ -525,6 +532,7 @@ interface ConnectServiceDependencies {
   readonly resolveSessionContextDefaults?: SessionContextDefaultsResolver;
   readonly piSettingsDefaults?: OrchestratorApplication["piSettingsDefaults"];
   readonly providerLoginFlows: Map<string, NativeProviderLoginFlow>;
+  readonly providerLoginEvidence: Map<string, BackendProviderAuthenticationEvidence>;
   readonly backendProviderLoginFlows: Map<string, BackendProviderLoginFlow>;
   readonly backendProviderLoginTails: Map<string, Promise<void>>;
   readonly diagnosticsArtifacts: Map<string, string>;
@@ -1016,6 +1024,22 @@ type ExtendedSessionHost = SessionHost & {
     token: symbol,
     activeRuntimesRetainPreviousSnapshot: boolean
   ): void;
+  fenceBackendProviderAuthentication(
+    backendId: string,
+    providerId: string
+  ): BackendProviderAuthenticationRetirement;
+  completeBackendProviderAuthenticationRetirement(
+    retirement: BackendProviderAuthenticationRetirement
+  ): void;
+  beginBackendProviderAuthenticationEvidence(
+    backendId: string,
+    providerId: string
+  ): BackendProviderAuthenticationEvidence;
+  reconcileBackendProviderAuthentication(
+    backendId: string,
+    providerId: string,
+    evidence: BackendProviderAuthenticationEvidence
+  ): void;
 };
 
 const DEFAULT_PAGE_SIZE = 100;
@@ -1073,6 +1097,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
 
 export function createConnectServices(application: OrchestratorApplication): ConnectServiceSet {
   const providerLoginFlows = new Map<string, NativeProviderLoginFlow>();
+  const providerLoginEvidence = new Map<string, BackendProviderAuthenticationEvidence>();
   const backendProviderLoginFlows = new Map<string, BackendProviderLoginFlow>();
   const backendProviderLoginTails = new Map<string, Promise<void>>();
   const diagnosticsArtifacts = new Map<string, string>();
@@ -1086,6 +1111,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
     adapters: () => application.adapters,
     restartBackend: application.restartBackend,
     refreshBackendDescriptor: application.refreshBackendDescriptor,
+    projectBackendProviderAuthentication: application.projectBackendProviderAuthentication,
     holdSubagentSmartRoutingDispatch: application.holdSubagentSmartRoutingDispatch,
     refreshSubagentSmartRouting: application.refreshSubagentSmartRouting,
     runtimeProcesses: new RuntimeProcessControl(
@@ -1160,6 +1186,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
       : { resolveSessionContextDefaults: application.resolveSessionContextDefaults }),
     ...(application.piSettingsDefaults === undefined ? {} : { piSettingsDefaults: application.piSettingsDefaults }),
     providerLoginFlows,
+    providerLoginEvidence,
     backendProviderLoginFlows,
     backendProviderLoginTails,
     diagnosticsArtifacts,
@@ -2093,6 +2120,17 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const flow = currentProviderLoginFlow(dependencies, request.loginFlowId);
       if (flow !== undefined && dependencies.providers !== undefined) {
         const provider = dependencies.providers.get(dependencies.providers.nativeAuthenticationBackendId, flow.providerId);
+        if ("state" in flow && flow.state === "completed"
+          && (provider.authenticationState === "authenticated" || provider.authenticationState === "not_required")) {
+          const evidence = dependencies.providerLoginEvidence.get(flow.opaqueFlowId);
+          if (evidence !== undefined) {
+            dependencies.sessionHost.reconcileBackendProviderAuthentication(
+              dependencies.providers.nativeAuthenticationBackendId,
+              flow.providerId,
+              evidence
+            );
+          }
+        }
         return {
           loginFlow: mapProviderLoginFlow(request.loginFlowId, flow),
           authenticationState: mapAuthenticationState(provider.authenticationState),
@@ -3603,6 +3641,10 @@ export function createConnectServices(application: OrchestratorApplication): Con
         if (request.input.case !== "credentialInputTicketId" || request.input.value.trim() === "") {
           throw invalidArgument("credential_input_ticket_id is required for sensitive Provider login input.");
         }
+        const authenticationEvidence = dependencies.sessionHost.beginBackendProviderAuthenticationEvidence(
+          backendFlow.backendId,
+          backendFlow.providerId
+        );
         let secret: string | undefined;
         let acceptedFlow: BackendProviderLoginFlow | undefined;
         try {
@@ -3625,6 +3667,7 @@ export function createConnectServices(application: OrchestratorApplication): Con
           });
           const acceptedAt = (dependencies.now ?? Date.now)();
           acceptedFlow = updateBackendProviderLoginFlow(dependencies, backendFlow, {
+            authenticationEvidence,
             credentialAcceptedAt: acceptedAt,
             updatedAt: acceptedAt,
             pendingPrompt: undefined,
@@ -3645,7 +3688,15 @@ export function createConnectServices(application: OrchestratorApplication): Con
           secret = undefined;
         }
         try {
-          await dependencies.refreshBackendDescriptor?.(backendFlow.backendId);
+          if (dependencies.refreshBackendDescriptor === undefined) {
+            throw new Error("Backend descriptor refresh is not configured.");
+          }
+          await dependencies.refreshBackendDescriptor(backendFlow.backendId);
+          dependencies.sessionHost.reconcileBackendProviderAuthentication(
+            backendFlow.backendId,
+            backendFlow.providerId,
+            acceptedFlow!.authenticationEvidence
+          );
           const completed = updateBackendProviderLoginFlow(dependencies, acceptedFlow!, {
             state: "completed",
             updatedAt: (dependencies.now ?? Date.now)(),
@@ -3667,15 +3718,26 @@ export function createConnectServices(application: OrchestratorApplication): Con
       const flow = requireCurrentProviderLoginFlow(dependencies, flowId);
       const prompt = requireActiveProviderLoginPrompt(flow, promptId);
       const answer = providerLoginPromptAnswer(prompt.kind, request.input);
+      const authenticationEvidence = dependencies.sessionHost.beginBackendProviderAuthenticationEvidence(
+        dependencies.providers!.nativeAuthenticationBackendId,
+        flow.providerId
+      );
       try {
-        return {
-          loginFlow: mapProviderLoginFlow(flowId, supervisor.submitInput({
+        const submitted = supervisor.submitInput({
             flowId: flow.opaqueFlowId,
             promptId,
             connectionId: connection.id,
             answer
-          }))
-        };
+          });
+        dependencies.providerLoginEvidence.set(submitted.opaqueFlowId, authenticationEvidence);
+        if (submitted.state === "completed") {
+          dependencies.sessionHost.reconcileBackendProviderAuthentication(
+            dependencies.providers!.nativeAuthenticationBackendId,
+            submitted.providerId,
+            authenticationEvidence
+          );
+        }
+        return { loginFlow: mapProviderLoginFlow(flowId, submitted) };
       } catch (error) {
         if (error instanceof ConnectError) throw error;
         throw new ConnectError("The Provider login prompt changed or rejected the submitted input.", Code.FailedPrecondition);
@@ -8087,12 +8149,15 @@ interface BackendProviderAccountOperations {
   beginLogin?(input: BackendProviderLoginInput): Promise<BackendProviderLoginResult>;
   cancelLogin?(loginId: string): Promise<void>;
   logout?(): Promise<void>;
+  /** Retire runtime leases whose native execution authority depends on this Provider credential. */
+  revokeProviderAuthentication?(providerId: string): Promise<void>;
 }
 
 type BackendProviderLoginState = "pending" | "completed" | "cancelled" | "timed_out" | "outcome_unknown" | "error";
 
 interface BackendProviderLoginFlow extends NativeProviderLoginFlow {
   readonly backendId: string;
+  readonly authenticationEvidence: BackendProviderAuthenticationEvidence;
   readonly state: BackendProviderLoginState;
   readonly startedAt: number;
   readonly updatedAt: number;
@@ -9540,7 +9605,15 @@ async function observeBackendProviderLoginFlow(
       const observedAccount = await operations.readAccount!(false);
       if (observedAccount.authenticated || observedAccount.authenticationState === "authenticated") {
         try {
-          await dependencies.refreshBackendDescriptor?.(flow.backendId);
+          if (dependencies.refreshBackendDescriptor === undefined) {
+            throw new Error("Backend descriptor refresh is not configured.");
+          }
+          await dependencies.refreshBackendDescriptor(flow.backendId);
+          dependencies.sessionHost.reconcileBackendProviderAuthentication(
+            flow.backendId,
+            flow.providerId,
+            flow.authenticationEvidence
+          );
         } catch {
           return { outcome: "completed" as const, account: observedAccount, refreshFailed: true };
         }
@@ -19081,8 +19154,13 @@ async function dispatchMutation(
           kind: payload.case,
           body: mutation,
           effect: async () => {
+            const authenticationEvidence = dependencies.sessionHost.beginBackendProviderAuthenticationEvidence(
+              backendId,
+              providerId
+            );
             flow = await dependencies.providers.beginLogin(providerId, method);
             dependencies.providerLoginFlows.set(flow.opaqueFlowId, flow);
+            dependencies.providerLoginEvidence.set(flow.opaqueFlowId, authenticationEvidence);
           },
           commit: () => {
             if (flow === undefined) throw new Error("Provider login effect completed without a flow.");
@@ -19113,10 +19191,15 @@ async function dispatchMutation(
         effect: async () => {
           const at = (dependencies.now ?? Date.now)();
           const loginFlowId = randomUUID();
+          const authenticationEvidence = dependencies.sessionHost.beginBackendProviderAuthenticationEvidence(
+            backendId,
+            providerId
+          );
           if (method === "api_key") {
             flow = rememberBackendProviderLoginFlow(dependencies, {
               backendId,
               providerId,
+              authenticationEvidence,
               method,
               opaqueFlowId: loginFlowId,
               state: "pending",
@@ -19155,6 +19238,7 @@ async function dispatchMutation(
           flow = rememberBackendProviderLoginFlow(dependencies, {
             backendId,
             providerId,
+            authenticationEvidence,
             method,
             opaqueFlowId: loginFlowId,
             state: "pending",
@@ -19204,6 +19288,10 @@ async function dispatchMutation(
           accepted: true,
           resultCase: "acknowledgement"
         }, async () => {
+          const authenticationEvidence = dependencies.sessionHost.beginBackendProviderAuthenticationEvidence(
+            backendId,
+            providerId
+          );
           await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
             const { operations } = backendProviderAccountOperations(
               dependencies,
@@ -19213,12 +19301,28 @@ async function dispatchMutation(
               adapter
             );
             if (operations.readAccount === undefined) {
-              await dependencies.refreshBackendDescriptor?.(backendId);
+              if (dependencies.refreshBackendDescriptor === undefined) {
+                throw new Error("Backend descriptor refresh is not configured.");
+              }
+              await dependencies.refreshBackendDescriptor(backendId);
+              dependencies.sessionHost.reconcileBackendProviderAuthentication(
+                backendId,
+                providerId,
+                authenticationEvidence
+              );
               return;
             }
             await operations.readAccount(true);
             try {
-              await dependencies.refreshBackendDescriptor?.(backendId);
+              if (dependencies.refreshBackendDescriptor === undefined) {
+                throw new Error("Backend descriptor refresh is not configured.");
+              }
+              await dependencies.refreshBackendDescriptor(backendId);
+              dependencies.sessionHost.reconcileBackendProviderAuthentication(
+                backendId,
+                providerId,
+                authenticationEvidence
+              );
             } catch {
               try {
                 dependencies.store.appendDiagnostic({
@@ -19240,9 +19344,19 @@ async function dispatchMutation(
         resultCase: "provider",
         entityId: providerId
       }, async () => {
+        const authenticationEvidence = dependencies.sessionHost.beginBackendProviderAuthenticationEvidence(
+          backendId,
+          providerId
+        );
+        const nativeCredentialOwner = dependencies.providerAuth?.canHandle(providerId) === true;
         await dependencies.providers.refreshCredential(providerId);
         clearProviderRateLimit(dependencies.store, backendId, providerId);
-        await dependencies.refreshPiGeneration?.();
+        if (!nativeCredentialOwner) await dependencies.refreshPiGeneration?.();
+        dependencies.sessionHost.reconcileBackendProviderAuthentication(
+          backendId,
+          providerId,
+          authenticationEvidence
+        );
         dependencies.messageSearch?.reconcileAvailability();
       });
     }
@@ -19258,6 +19372,8 @@ async function dispatchMutation(
           accepted: true,
           resultCase: "acknowledgement"
         }, async () => {
+          const retirement = dependencies.sessionHost.fenceBackendProviderAuthentication(backendId, providerId);
+          dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "pending");
           await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
             const operations = backendProviderAccountOperations(
               dependencies,
@@ -19266,10 +19382,19 @@ async function dispatchMutation(
               "provider.logout",
               adapter
             ).operations;
-            await operations.logout!();
             try {
-              await dependencies.refreshBackendDescriptor?.(backendId);
+              await operations.logout!();
+            } catch (error) {
+              dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "error");
+              throw error;
+            }
+            try {
+              if (dependencies.refreshBackendDescriptor === undefined) {
+                throw new Error("Backend descriptor refresh is not configured.");
+              }
+              await dependencies.refreshBackendDescriptor(backendId);
             } catch {
+              dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "signed_out");
               try {
                 dependencies.store.appendDiagnostic({
                   severity: "warning",
@@ -19282,6 +19407,7 @@ async function dispatchMutation(
                 // Logout is authoritative even when diagnostics are unavailable.
               }
             }
+            dependencies.sessionHost.completeBackendProviderAuthenticationRetirement(retirement);
           });
         });
       }
@@ -19290,9 +19416,32 @@ async function dispatchMutation(
         resultCase: "provider",
         entityId: providerId
       }, async () => {
-        await dependencies.providers.logout(providerId);
-        clearProviderRateLimit(dependencies.store, backendId, providerId);
-        await dependencies.refreshPiGeneration?.();
+        const retirement = dependencies.sessionHost.fenceBackendProviderAuthentication(backendId, providerId);
+        dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "pending");
+        const nativeCredentialOwner = dependencies.providerAuth?.canHandle(providerId) === true;
+        try {
+          await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
+            const revokeProviderAuthentication = (adapter as BackendAdapter & BackendProviderAccountOperations)
+              .revokeProviderAuthentication;
+            if (typeof revokeProviderAuthentication !== "function") {
+              throw new ConnectError(
+                "The selected Backend cannot retire runtime leases for this Provider credential.",
+                Code.Unimplemented
+              );
+            }
+            await revokeProviderAuthentication.call(adapter, providerId);
+          });
+          // ProviderCatalog native logout refreshes the immutable Pi generation.
+          // It must run after the exact Adapter lease above is released because
+          // generation replacement requires SessionHost admission to be idle.
+          await dependencies.providers.logout(providerId);
+          clearProviderRateLimit(dependencies.store, backendId, providerId);
+          if (!nativeCredentialOwner) await dependencies.refreshPiGeneration?.();
+          dependencies.sessionHost.completeBackendProviderAuthenticationRetirement(retirement);
+        } catch (error) {
+          dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "error");
+          throw error;
+        }
         dependencies.messageSearch?.reconcileAvailability();
       });
     }

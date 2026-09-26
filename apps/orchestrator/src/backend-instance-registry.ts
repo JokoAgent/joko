@@ -1,4 +1,8 @@
-import type { BackendAdapter, BackendDescriptor } from "@joko/core";
+import type {
+  BackendAdapter,
+  BackendAuthenticationState,
+  BackendDescriptor
+} from "@joko/core";
 import type {
   BackendDescriptorPublication,
   BackendInstanceGenerationReservation,
@@ -261,6 +265,67 @@ export class BackendInstanceRegistry {
     // Durable publication precedes the process-local pointer update and no
     // await separates the two authority changes.
     this.#instances.set(instanceId, refreshed);
+    return this.get(instanceId);
+  }
+
+  /**
+   * Publish a credential-free, fail-closed Provider projection for the exact
+   * current process generation. This is used when the credential owner has
+   * changed state but native descriptor discovery cannot be trusted to
+   * complete. It deliberately keeps the current Adapter object reachable so
+   * public re-authentication can recover the same process generation.
+   */
+  projectProviderAuthentication(
+    instanceId: string,
+    providerId: string,
+    authenticationState: BackendAuthenticationState
+  ): BackendInstanceSnapshot {
+    const current = this.#instances.get(instanceId);
+    if (current === undefined) throw new Error(`Unknown Backend instance: ${instanceId}`);
+    if (current.state !== "available") {
+      throw new Error(`Unavailable Backend instance cannot project Provider authentication: ${instanceId}`);
+    }
+    const normalizedProviderId = providerId.trim();
+    if (normalizedProviderId === "" || normalizedProviderId !== providerId) {
+      throw new Error("Provider identity must be a non-empty normalized string.");
+    }
+    const providerOwned = current.descriptor.providers?.some((provider) =>
+      provider.providerId === normalizedProviderId) === true;
+    const modelOwned = current.descriptor.models.some((model) =>
+      model.providerId === normalizedProviderId);
+    if (!providerOwned && !modelOwned) {
+      throw new Error(`Backend Provider is not owned by the current descriptor: ${instanceId}/${normalizedProviderId}`);
+    }
+
+    const providers = current.descriptor.providers?.map((provider) => provider.providerId === normalizedProviderId
+      ? { ...provider, authenticationState }
+      : provider);
+    const available = authenticationAvailable(authenticationState);
+    const projectedDescriptor = this.#normalizeDescriptor({
+      ...current.descriptor,
+      authenticationState: aggregateAuthenticationState(
+        providers,
+        current.descriptor.models.some((model) => model.providerId !== normalizedProviderId)
+          ? current.descriptor.authenticationState
+          : authenticationState
+      ),
+      ...(providers === undefined ? {} : { providers }),
+      models: available
+        ? current.descriptor.models
+        : current.descriptor.models.filter((model) => model.providerId !== normalizedProviderId)
+    }, current.descriptor.adapterKind, current.generation);
+    const publication = this.authority.publishBackendInstanceDescriptor({
+      descriptor: projectedDescriptor,
+      expectedCurrentGeneration: current.generation
+    });
+    if (publication.status === "stale") {
+      throw new Error(`Backend Provider authentication projection lost its current-generation fence: ${instanceId}`);
+    }
+    if (this.#instances.get(instanceId) !== current) {
+      throw new Error(`Backend instance changed while Provider authentication was being projected: ${instanceId}`);
+    }
+    const projected: AvailableBackendInstance = { ...current, descriptor: projectedDescriptor };
+    this.#instances.set(instanceId, projected);
     return this.get(instanceId);
   }
 
@@ -658,6 +723,30 @@ function normalizeDescriptor(
 function replacementCandidateAccepted(descriptor: BackendDescriptor): boolean {
   return descriptor.health !== "unavailable"
     && (descriptor.installationState === "installed" || descriptor.installationState === "update_available");
+}
+
+function authenticationAvailable(state: BackendAuthenticationState): boolean {
+  return state === "authenticated" || state === "not_required";
+}
+
+function aggregateAuthenticationState(
+  providers: BackendDescriptor["providers"],
+  fallback: BackendAuthenticationState
+): BackendAuthenticationState {
+  if (providers === undefined || providers.length === 0) return fallback;
+  const states = new Set(providers.map((provider) => provider.authenticationState));
+  for (const state of [
+    "authenticated",
+    "not_required",
+    "refreshing",
+    "pending",
+    "expired",
+    "error",
+    "signed_out"
+  ] as const) {
+    if (states.has(state)) return state;
+  }
+  return fallback;
 }
 
 async function settleBeforeDeadline(task: Promise<unknown>, timeoutMs: number): Promise<boolean> {
