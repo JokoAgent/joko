@@ -33,6 +33,8 @@ export class ControlledClaudeRuntime implements ClaudeSdkRuntime {
   readonly queries: ControlledClaudeQuery[] = [];
   readonly sessions = new Map<string, ClaudeSdkSessionInfo>();
   readonly #failBeforeAdmission = new Set<string>();
+  #nextProbeFailure: string | undefined;
+  probeCount = 0;
   onInput?: (message: ClaudeSdkUserMessage) => void;
 
   failNextInputBeforeAdmission(sessionId: string): void {
@@ -42,7 +44,20 @@ export class ControlledClaudeRuntime implements ClaudeSdkRuntime {
     this.#failBeforeAdmission.add(sessionId);
   }
 
+  failNextProbe(message: string): void {
+    if (this.#nextProbeFailure !== undefined) {
+      throw new Error("A controlled Claude startup probe failure is already armed.");
+    }
+    this.#nextProbeFailure = message;
+  }
+
   async probe(_input: ClaudeSdkProbeInput) {
+    this.probeCount++;
+    const failure = this.#nextProbeFailure;
+    if (failure !== undefined) {
+      this.#nextProbeFailure = undefined;
+      throw new Error(failure);
+    }
     return {
       installed: true,
       packageVersion: this.packageVersion,

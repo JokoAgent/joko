@@ -651,6 +651,162 @@ describe("Orchestrator application composition", () => {
     expect(store.getRun(runId).descriptor.state).toBe("dispatch_unknown");
   }, 20_000);
 
+  it("refreshes only the retained Pi generation after a candidate probe fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-pi-probe-failure-"));
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1",
+      port: 4618,
+      internalPort: 4617,
+      publicOrigin: "http://127.0.0.1:4618",
+      internalOrigin: "http://127.0.0.1:4617",
+      dataDirectory,
+      databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true,
+      allowInsecureLan: false,
+      lanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"),
+      piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-pi-probe-failure", root: workspace, displayName: "Pi probe failure", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"),
+      webDirectory: join(root, "no-web-build"),
+      corsOrigins: []
+    };
+
+    const application = await createOrchestratorApplication(config);
+    cleanups.push(async () => {
+      await application.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    const providers = application.providers!;
+    const credentialExpiry = Date.now() + 2 * 60 * 60_000;
+    const initialCredential = {
+      type: "oauth" as const,
+      access: "retained-probe-access",
+      refresh: "retained-probe-refresh",
+      expires: credentialExpiry,
+      accountId: "retained-probe-account"
+    };
+    await providers.writeNativeCredential({
+      providerId: "openai-codex",
+      serializedCredential: JSON.stringify(initialCredential),
+      expiresAt: credentialExpiry,
+      expectedCatalogGeneration: providers.generation
+    });
+    await application.refreshPiGeneration?.();
+    const model = application.store.getBackend("pi").descriptor.models
+      .find((candidate) => candidate.providerId === "openai-codex");
+    expect(model).toBeDefined();
+    const challenge = application.connections.issuePairing("Pi probe failure owner");
+    const paired = application.connections.completePairing({
+      challengeId: challenge.id,
+      code: challenge.code,
+      connectionName: "Pi probe failure test"
+    });
+    const sessionId = (await application.sessionHost.createSession({
+      operationId: "create-pi-probe-failure-idle-session",
+      connection: paired.connection,
+      targetId: config.workspace.id,
+      title: "Idle Pi probe failure",
+      providerId: model!.providerId,
+      modelId: model!.modelId,
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const binding = application.store.getSession(sessionId).descriptor.binding;
+    await writeFile(binding.opaqueRef, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: binding.nativeSessionId,
+      timestamp: new Date().toISOString(),
+      cwd: workspace
+    })}\n`);
+
+    const publishedCatalogGeneration = providers.generation;
+    expect(await providers.deleteNativeCredential("openai-codex")).toBe(true);
+    expect(providers.generation).toBeGreaterThan(publishedCatalogGeneration);
+    application.store.setSetting("service", "orchestrator", "settings.pi.pi", {
+      autoCompaction: false,
+      autoCompactionThresholdPercent: 70,
+      autoRetry: false,
+      steeringMode: 2,
+      followUpMode: 1
+    });
+
+    const retainedPi = application.adapters.find((candidate) => candidate.id === "pi");
+    expect(retainedPi).toBeInstanceOf(PiBackendAdapter);
+    const retainedAdapter = retainedPi as PiBackendAdapter;
+    const updateRetainedGeneration = vi.spyOn(retainedAdapter, "updateManagedGeneration");
+    const describeRetained = vi.spyOn(retainedAdapter, "describe");
+    const closeRetainedSession = vi.spyOn(retainedAdapter, "closeSession");
+    const resumeRetainedSession = vi.spyOn(retainedAdapter, "resumeSession");
+    const disposeRetained = vi.spyOn(retainedAdapter, "dispose");
+    const backendBefore = application.store.getBackend("pi");
+    const authorityBefore = application.store.getBackendInstanceGenerationAuthority("pi");
+    const sessionBefore = application.store.getSession(sessionId);
+    expect(backendBefore.descriptor.authenticationState).toBe("authenticated");
+    Object.assign(config, { piExecutable: join(root, "missing-pi-candidate") });
+    try {
+      await expect(application.restartBackend("pi"))
+        .rejects.toThrow("Backend replacement candidate failed validation: pi");
+    } finally {
+      Reflect.deleteProperty(config, "piExecutable");
+    }
+
+    expect(updateRetainedGeneration).toHaveBeenCalledOnce();
+    expect(updateRetainedGeneration.mock.calls[0]?.[0]).toMatchObject({
+      catalogGeneration: providers.generation,
+      settings: {
+        compaction: { enabled: false, thresholdPercent: 70 },
+        retry: { enabled: false },
+        steeringMode: "one-at-a-time",
+        followUpMode: "all"
+      }
+    });
+    expect(updateRetainedGeneration.mock.calls[0]?.[0].nativeAuthenticatedProviderIds)
+      .not.toContain("openai-codex");
+    expect(providers.generation).toBeGreaterThan(publishedCatalogGeneration);
+    expect(describeRetained).toHaveBeenCalledOnce();
+    expect(closeRetainedSession).not.toHaveBeenCalled();
+    expect(resumeRetainedSession).not.toHaveBeenCalled();
+    expect(disposeRetained).not.toHaveBeenCalled();
+    expect(application.adapters.find((candidate) => candidate.id === "pi")).toBe(retainedAdapter);
+    const backendAfter = application.store.getBackend("pi");
+    expect(backendAfter.descriptor).toMatchObject({
+      instanceGeneration: backendBefore.descriptor.instanceGeneration,
+      authenticationState: "signed_out"
+    });
+    expect(backendAfter.revision).toBeGreaterThan(backendBefore.revision);
+    expect(application.store.getBackendInstanceGenerationAuthority("pi")).toMatchObject({
+      adapterKind: authorityBefore.adapterKind,
+      currentGeneration: authorityBefore.currentGeneration,
+      highWaterGeneration: authorityBefore.highWaterGeneration + 1
+    });
+    expect(application.store.getSession(sessionId)).toEqual(sessionBefore);
+    expect(application.sessionHost.isSessionActive(sessionId)).toBe(true);
+
+    const generationFiles = await readdir(join(config.piAgentHome, "generations"), { recursive: true });
+    const generationManifests = generationFiles.filter((path) => path.endsWith("joko-generation.json"));
+    expect(generationManifests).toHaveLength(2);
+    const generations = await Promise.all(generationManifests.map(async (path) =>
+      JSON.parse(await readFile(join(config.piAgentHome, "generations", path), "utf8")) as { generation?: number }
+    ));
+    expect(generations.map((snapshot) => snapshot.generation).sort((left, right) =>
+      (left ?? 0) - (right ?? 0)
+    )).toEqual([publishedCatalogGeneration, providers.generation]);
+    const privateState = JSON.stringify({
+      diagnostics: application.store.listDiagnostics(),
+      backend: backendAfter,
+      events: application.store.listEvents({ sessionId })
+    }, (_key, value: unknown) => typeof value === "bigint" ? value.toString(10) : value);
+    expect(privateState).not.toContain("missing-pi-candidate");
+    expect(privateState).not.toContain(initialCredential.access);
+    expect(privateState).not.toContain(initialCredential.refresh);
+  }, 30_000);
+
   it("replaces an idle Pi runtime after native auth write-back without stale generation or fence", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-application-pi-replacement-"));
     const workspace = join(root, "workspace");
