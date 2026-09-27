@@ -93,7 +93,7 @@ describe("remote connection auth and durable operations", () => {
     expect(current.descriptor.displayName).toBe("second editor");
     await expect(submit(first.clients.operation, first.connectionId, edit({ displayName: "stale edit", pinned: false }, initial.revision))).rejects.toMatchObject({ code: Code.Aborted });
     await expect(submit(first.clients.operation, first.connectionId, create(OperationMutationSchema, {
-      payload: { case: "updateTarget", value: { targetId, workspaceLocationUpdate: { case: "serviceNodeWorkspace", value: true } } },
+      payload: { case: "updateTarget", value: { targetId, location: { kind: { case: "serviceNode", value: {} } } } },
       preconditions: [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: initial.revision } }]
     }))).rejects.toMatchObject({ code: Code.Aborted });
     expect(fixture.application.store.getTarget(targetId)).toEqual(current);

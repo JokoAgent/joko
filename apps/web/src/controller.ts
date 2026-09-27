@@ -1752,6 +1752,11 @@ export function useAppController(): AppController {
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
       createRemoteTarget: async (...args: Parameters<OperationApi["createRemoteTarget"]>) => original().createRemoteTarget(...args),
+      createDevicePeerTarget: async (...args: Parameters<OperationApi["createDevicePeerTarget"]>) => original().createDevicePeerTarget(...args),
+      listDevicePeers: async (...args: Parameters<OperationApi["listDevicePeers"]>) => original().listDevicePeers(...args),
+      listDevicePeerRecentDirectories: async (...args: Parameters<OperationApi["listDevicePeerRecentDirectories"]>) => original().listDevicePeerRecentDirectories(...args),
+      listDevicePeerDirectories: async (...args: Parameters<OperationApi["listDevicePeerDirectories"]>) => original().listDevicePeerDirectories(...args),
+      inspectDevicePeerDirectory: async (...args: Parameters<OperationApi["inspectDevicePeerDirectory"]>) => original().inspectDevicePeerDirectory(...args),
       listProjectDirectories: async (...args: Parameters<OperationApi["listProjectDirectories"]>) => original().listProjectDirectories(...args),
       prepareTargetWorkspace: async (...args: Parameters<OperationApi["prepareTargetWorkspace"]>) => original().prepareTargetWorkspace(...args),
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   createChildRuntimeEnvironment,
@@ -995,6 +995,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return;
     }
     validateRemoteTarget(target);
+    if (target.workspaceRoot !== target.remoteWorkspace.workspaceRoot) {
+      const pathStyle = remoteBindingPathStyle(target.remoteWorkspace)!;
+      if (!normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)) {
+        await validateCanonicalDirectory(target.workspaceRoot, "Target fallback workspace");
+      }
+    }
     const scoped = await this.#targetRuntime(target);
     scoped.assertCurrent();
   }
@@ -1792,9 +1798,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       || lifecycle.sourceTarget.backendId !== lifecycle.target.backendId
       || lifecycle.sourceTarget.managed !== lifecycle.target.managed
       || lifecycle.sourceTarget.trusted !== lifecycle.target.trusted
-      || lifecycle.sourceTarget.remoteWorkspace?.hostTargetId !== lifecycle.target.remoteWorkspace?.hostTargetId
-      || lifecycle.sourceTarget.remoteWorkspace?.hostId !== lifecycle.target.remoteWorkspace?.hostId
-      || lifecycle.sourceTarget.remoteWorkspace?.workspaceRoot !== lifecycle.target.remoteWorkspace?.workspaceRoot) return false;
+      || !sameClaudeRemoteExecutionBinding(
+        lifecycle.sourceTarget.remoteWorkspace,
+        lifecycle.target.remoteWorkspace
+      )) return false;
     const source = parseBindingRoute(lifecycle.sourceBinding);
     if (source.kind === "stored") {
       return source.workspaceAuthority === claudeWorkspaceAuthority(lifecycle.sourceTarget);
@@ -4548,8 +4555,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       throw new Error("The delegated working directory is invalid.");
     }
     if (runtime.remote) {
-      const normalized = remotePath.normalize(requested);
-      if (!remotePath.isAbsolute(requested) || normalized !== requested
+      const paths = normalizedAbsoluteRemotePath(runtime.runtimeWorkspaceRoot, "posix") ? remotePath : win32Path;
+      const normalized = paths.normalize(requested);
+      if (!paths.isAbsolute(requested) || normalized !== requested
         || !managedPathWithin(requested, [runtime.runtimeWorkspaceRoot], true)) {
         throw new Error("The delegated working directory is outside the remote Target.");
       }
@@ -5316,7 +5324,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       signal?.throwIfAborted();
       const scoped = await this.#remoteRuntimes.resolve(target, signal);
       signal?.throwIfAborted();
-      if (!scoped.remote || scoped.workspaceRoot !== target.workspaceRoot) {
+      const pathStyle = remoteBindingPathStyle(target.remoteWorkspace)!;
+      const expectedRemoteRoot = scoped.workspaceRoot === target.remoteWorkspace.workspaceRoot
+        || normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
+          && scoped.workspaceRoot === target.workspaceRoot;
+      if (!scoped.remote || !expectedRemoteRoot
+        || !normalizedAbsoluteRemotePath(scoped.workspaceRoot, pathStyle)) {
         throw new Error("The remote runtime returned a different workspace authority.");
       }
       scoped.assertCurrent();
@@ -6406,7 +6419,7 @@ function parseBindingRoute(binding: NativeSessionBinding): ParsedBindingRoute {
   return route;
 }
 
-function claudeWorkspaceAuthority(target: TargetDescriptor): string {
+export function claudeWorkspaceAuthority(target: TargetDescriptor): string {
   const hash = createHash("sha256")
     .update("joko-claude-workspace\0", "utf8")
     .update(target.backendId, "utf8")
@@ -6417,14 +6430,26 @@ function claudeWorkspaceAuthority(target: TargetDescriptor): string {
     hash.update("local\0", "utf8").update(canonicalPathKey(target.workspaceRoot), "utf8");
   } else {
     validateRemoteTarget(target);
-    hash.update("remote\0", "utf8")
-      .update(target.remoteWorkspace.hostTargetId, "utf8")
-      .update("\0", "utf8")
-      .update(target.remoteWorkspace.hostId, "utf8")
-      .update("\0", "utf8")
-      .update(target.remoteWorkspace.workspaceRoot, "utf8")
-      .update("\0", "utf8")
-      .update(target.workspaceRoot, "utf8");
+    hash.update(`remote:${target.remoteWorkspace.kind}\0`, "utf8");
+    if (target.remoteWorkspace.kind === "ssh") {
+      hash.update(target.remoteWorkspace.hostTargetId, "utf8")
+        .update("\0", "utf8")
+        .update(target.remoteWorkspace.hostId, "utf8");
+    } else {
+      hash.update(target.remoteWorkspace.controllerDeviceId, "utf8")
+        .update("\0", "utf8")
+        .update(target.remoteWorkspace.targetDeviceId, "utf8");
+    }
+    // The durable remote binding keeps the checkout root used to acquire the
+    // worktree, while an active derived Session is resumed with that exact
+    // worktree as its current remote root. Both representations identify the
+    // same execution route and effective workspace, so authority is scoped by
+    // the stable remote peer identity plus the effective Target workspace.
+    const pathStyle = remoteBindingPathStyle(target.remoteWorkspace)!;
+    const effectiveWorkspaceRoot = normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
+      ? target.workspaceRoot
+      : target.remoteWorkspace.workspaceRoot;
+    hash.update("\0", "utf8").update(effectiveWorkspaceRoot, "utf8");
   }
   const digest = hash.digest("hex");
   return `workspace-${digest}`;
@@ -6825,8 +6850,7 @@ function assertClaudeDerivationTarget(
     || source.backendId !== derived.backendId
     || source.managed !== derived.managed
     || source.trusted !== derived.trusted
-    || source.remoteWorkspace?.hostId !== derived.remoteWorkspace?.hostId
-    || source.remoteWorkspace?.workspaceRoot !== derived.remoteWorkspace?.workspaceRoot
+    || !sameClaudeRemoteExecutionBinding(source.remoteWorkspace, derived.remoteWorkspace)
     || (!workspaceDerivationSupported
       && canonicalPathKey(source.workspaceRoot) !== canonicalPathKey(derived.workspaceRoot))) {
     throw claudeCodeError(
@@ -6855,7 +6879,10 @@ function assertSessionInfoIdentity(info: ClaudeSdkSessionInfo, expectedSessionId
 function assertSessionTarget(observedCwd: string | undefined, expectedCwd: string, remote = false): void {
   if (observedCwd === undefined) throw continuityGap();
   if (remote) {
-    if (!normalizedAbsoluteRemotePath(observedCwd) || observedCwd !== expectedCwd) throw continuityGap();
+    const pathStyle = normalizedAbsoluteRemotePath(expectedCwd, "posix") ? "posix" : "win32";
+    if (!normalizedAbsoluteRemotePath(expectedCwd, pathStyle)
+      || !normalizedAbsoluteRemotePath(observedCwd, pathStyle)
+      || observedCwd !== expectedCwd) throw continuityGap();
     return;
   }
   if (!isAbsolute(observedCwd) || canonicalPathKey(observedCwd) !== canonicalPathKey(expectedCwd)) throw continuityGap();
@@ -6915,29 +6942,46 @@ function findModel(models: readonly ClaudeSdkModelInfo[], modelId: string): Clau
   return models.find((model) => model.value === modelId || model.resolvedModel === modelId);
 }
 
-function validateRemoteTarget(target: TargetDescriptor): void {
+function validateRemoteTarget(target: TargetDescriptor): asserts target is TargetDescriptor & {
+  readonly remoteWorkspace: NonNullable<TargetDescriptor["remoteWorkspace"]>;
+} {
   const binding = target.remoteWorkspace;
-  if (binding === undefined
-    || binding.hostTargetId.length === 0
-    || binding.hostTargetId.length > 256
-    || /[\u0000-\u001f\u007f]/u.test(binding.hostTargetId)
-    || binding.hostId.length === 0
-    || binding.hostId.length > 256
-    || /[\u0000-\u001f\u007f]/u.test(binding.hostId)
-    || !normalizedAbsoluteRemotePath(binding.workspaceRoot)
-    || !normalizedAbsoluteRemotePath(target.workspaceRoot)) {
+  const validIdentity = binding !== undefined && (binding.kind === "ssh"
+    ? boundedRemoteIdentity(binding.hostTargetId) && boundedRemoteIdentity(binding.hostId)
+    : boundedRemoteIdentity(binding.controllerDeviceId)
+      && boundedRemoteIdentity(binding.targetDeviceId)
+      && binding.controllerDeviceId !== binding.targetDeviceId);
+  const pathStyle = binding === undefined ? undefined : remoteBindingPathStyle(binding);
+  if (!validIdentity
+    || pathStyle === undefined
+    || !normalizedAbsoluteRemotePath(binding.workspaceRoot, pathStyle)
+    || (target.workspaceRoot === binding.workspaceRoot
+      && !normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle))) {
     throw claudeCodeError("REMOTE_TARGET_INVALID", "The remote Claude Code Target binding is invalid.", "target", {
-      recovery: "Select a canonical absolute workspace on a ready Remote Host."
+      recovery: "Select a canonical absolute workspace on the exact ready remote execution target."
     });
   }
 }
 
-function normalizedAbsoluteRemotePath(value: string): boolean {
+function boundedRemoteIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function remoteBindingPathStyle(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): "posix" | "win32" | undefined {
+  if (binding.kind === "ssh") return "posix";
+  if (normalizedAbsoluteRemotePath(binding.workspaceRoot, "posix")) return "posix";
+  if (normalizedAbsoluteRemotePath(binding.workspaceRoot, "win32")) return "win32";
+  return undefined;
+}
+
+function normalizedAbsoluteRemotePath(value: string, pathStyle: "posix" | "win32"): boolean {
+  const paths = pathStyle === "win32" ? win32Path : remotePath;
   return value.length > 0
     && value.length <= 16_384
-    && !/[\u0000-\u001f\u007f\\]/u.test(value)
-    && remotePath.isAbsolute(value)
-    && remotePath.normalize(value) === value;
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && (pathStyle === "win32" || !value.includes("\\"))
+    && paths.isAbsolute(value)
+    && paths.normalize(value) === value;
 }
 
 function effectiveTargetWorkspace(target: TargetDescriptor): string {
@@ -6948,6 +6992,7 @@ function sameEffectiveTargetWorkspace(left: TargetDescriptor, right: TargetDescr
   if (left.remoteWorkspace !== undefined || right.remoteWorkspace !== undefined) {
     return left.remoteWorkspace !== undefined
       && right.remoteWorkspace !== undefined
+      && sameClaudeRemoteExecutionBinding(left.remoteWorkspace, right.remoteWorkspace)
       && left.workspaceRoot === right.workspaceRoot;
   }
   return canonicalPathKey(left.workspaceRoot) === canonicalPathKey(right.workspaceRoot);
@@ -6960,8 +7005,36 @@ function sameTargetWorkspace(left: TargetDescriptor, right: TargetDescriptor): b
       && canonicalPathKey(left.workspaceRoot) === canonicalPathKey(right.workspaceRoot);
   }
   return left.workspaceRoot === right.workspaceRoot
-    && left.remoteWorkspace.hostId === right.remoteWorkspace.hostId
-    && left.remoteWorkspace.workspaceRoot === right.remoteWorkspace.workspaceRoot;
+    && sameClaudeRemoteWorkspace(left.remoteWorkspace, right.remoteWorkspace);
+}
+
+function sameClaudeRemoteWorkspace(
+  left: TargetDescriptor["remoteWorkspace"],
+  right: TargetDescriptor["remoteWorkspace"]
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId
+      && left.hostId === right.hostId
+      && left.workspaceRoot === right.workspaceRoot
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId
+      && left.workspaceRoot === right.workspaceRoot;
+}
+
+function sameClaudeRemoteExecutionBinding(
+  left: TargetDescriptor["remoteWorkspace"],
+  right: TargetDescriptor["remoteWorkspace"]
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function targetRuntimeOf(runtime: NativeRuntime): ClaudeTargetRuntime {

@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ConnectionAuthenticationError, ConnectionManager, PairingRequestError } from "./connection-manager.js";
+import {
+  ConnectionAuthenticationError,
+  ConnectionManager,
+  PairingRequestError,
+  digestAuthKey
+} from "./connection-manager.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -365,6 +370,51 @@ describe("ConnectionManager", () => {
       appVersion: "0.1.0"
     })).toThrowError(ConnectionAuthenticationError);
     expect(store.listDeviceConnections(deviceId)).toHaveLength(2);
+  });
+
+  it("separates Device-peer route authorization from renderer-readable Desktop bearers", () => {
+    const store = new OperationalStore(":memory:", { now: () => 5_000 });
+    cleanups.push(() => store.close());
+    const manager = new ConnectionManager(store, { now: () => 5_000 });
+    const webKey = "w".repeat(43);
+    const serviceKey = "s".repeat(43);
+    store.createConnection({
+      id: "web-connection",
+      deviceId: "web-device",
+      device: { name: "Web", kind: "web", platform: "web" },
+      name: "Web",
+      authKeyDigest: digestAuthKey(webKey)
+    });
+    const service = store.createConnection({
+      id: "service-connection",
+      deviceId: "service-device",
+      device: { name: "Service", kind: "service", platform: "linux" },
+      name: "Service",
+      authKeyDigest: digestAuthKey(serviceKey)
+    });
+    expect(manager.authenticateDevicePeerAgent(`Bearer ${serviceKey}`).id).toBe(service.id);
+    expect(() => manager.authenticateDevicePeerAgent(`Bearer ${webKey}`))
+      .toThrowError(ConnectionAuthenticationError);
+
+    const desktopHostKey = "h".repeat(43);
+    const desktop = manager.issueTrustedDesktopConnection({
+      desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592",
+      desktopDeviceId: "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75",
+      deviceName: "Desktop",
+      platform: "win32",
+      appVersion: "0.1.0",
+      desktopHostAuthKey: desktopHostKey
+    });
+    expect(() => manager.authenticateDevicePeerAgent(`Bearer ${desktop.authKey}`))
+      .toThrowError(ConnectionAuthenticationError);
+    expect(() => manager.authenticateDevicePeerAgent(`Bearer ${desktopHostKey}`))
+      .toThrowError(ConnectionAuthenticationError);
+    manager.confirmTrustedDesktopConnection(desktop.connection.id, desktop.authKey);
+    expect(manager.authenticateDevicePeerAgent(`Bearer ${desktopHostKey}`).id)
+      .toBe(desktop.connection.id);
+    manager.revoke(desktop.connection.id);
+    expect(() => manager.authenticateDevicePeerAgent(`Bearer ${desktopHostKey}`))
+      .toThrowError(ConnectionAuthenticationError);
   });
 
   it("durably authorizes one fresh bootstrap after the current managed connection logs itself out", () => {

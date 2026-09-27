@@ -15,7 +15,7 @@ import type {
 } from "@joko/remote-ssh";
 import { describe, expect, it, vi } from "vitest";
 
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
 import { WorkspaceService } from "./workspace-service.js";
 import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
@@ -71,13 +71,15 @@ describe("RemoteWorkspaceService", () => {
       files,
       processes
     };
-    const registry = {
-      transports: async (targetId: string, hostId: string) => {
-        scopes.push([targetId, hostId]);
-        return { host: {}, lease };
-      }
-    } as unknown as RemoteHostRegistry;
-    const remote = new RemoteWorkspaceService(registry);
+    const authority = (binding: import("@joko/core").RemoteWorkspaceBinding) => {
+      if (binding.kind !== "ssh") throw new Error("unexpected binding");
+      scopes.push([binding.hostTargetId, binding.hostId]);
+      return { kind: "ssh" as const, binding, executionIdentity: "ssh", authorityIdentity: "1", pathStyle: "posix" as const,
+        files, processes, assertCurrent: () => undefined, assertForwardingCurrent: () => undefined };
+    };
+    const remoteExecution = { workspace: async (binding: import("@joko/core").RemoteWorkspaceBinding) => authority(binding),
+      files: async (binding: import("@joko/core").RemoteWorkspaceBinding) => authority(binding) } as unknown as RemoteExecutionRouter;
+    const remote = new RemoteWorkspaceService(remoteExecution);
     const workspaces = new WorkspaceService({ remoteDelegate: remote });
 
     await workspaces.register({
@@ -85,7 +87,7 @@ describe("RemoteWorkspaceService", () => {
       root: "/workspace",
       displayName: "Remote project",
       trusted: true,
-      remote: { targetId: "target-a", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remote: { targetId: "target-a", binding: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" } }
     });
 
     const listing = await workspaces.list("workspace-a", "", { recursive: true });
@@ -104,7 +106,7 @@ describe("RemoteWorkspaceService", () => {
     await files.write({ path: "/workspace/page.html", content: Buffer.from([0xff, 0xfe]), mode: 0o644 });
     await expect(workspaces.preview("workspace-a", "page.html")).rejects.toMatchObject({ kind: "unsupported" });
     const realpath = vi.spyOn(files, "realpath");
-    realpath.mockResolvedValueOnce("/outside/page.html");
+    realpath.mockImplementation(async (candidate) => candidate === "/workspace/page.html" ? "/outside/page.html" : candidate);
     await expect(workspaces.preview("workspace-a", "page.html")).rejects.toMatchObject({ kind: "invalid" });
     realpath.mockRestore();
     await expect(workspaces.writeTextFile("workspace-a", {
@@ -170,10 +172,22 @@ describe("RemoteWorkspaceService", () => {
       return { hostRevision: BigInt(captured), leaseGeneration: captured, lease,
         assertCurrent: () => { if (generation !== captured) throw new Error("Remote lease changed"); } };
     });
-    const registry = { transports: async () => ({ lease }), captureTransportAuthority: capture } as unknown as RemoteHostRegistry;
-    const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(registry) });
+    const remoteExecution = {
+      workspace: async (binding: import("@joko/core").RemoteWorkspaceBinding) => ({
+        kind: binding.kind, binding, executionIdentity: "ssh", authorityIdentity: "registration", pathStyle: "posix",
+        files, processes: lease.processes, assertCurrent: () => undefined, assertForwardingCurrent: () => undefined
+      }),
+      files: async (binding: import("@joko/core").RemoteWorkspaceBinding, signal?: AbortSignal) => {
+        if (binding.kind !== "ssh") throw new Error("unexpected binding");
+        const current = await capture(binding.hostTargetId, binding.hostId, signal);
+        return { kind: binding.kind, binding, executionIdentity: "ssh",
+          authorityIdentity: `${current.hostRevision}:${current.leaseGeneration}`, pathStyle: "posix",
+          files, assertCurrent: current.assertCurrent };
+      }
+    } as unknown as RemoteExecutionRouter;
+    const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(remoteExecution) });
     const registration = { id: "workspace", root: "/workspace", displayName: "Remote", trusted: true,
-      remote: { targetId: "target", hostTargetId: "target", hostId: "host", workspaceRoot: "/workspace" } };
+      remote: { targetId: "target", binding: { kind: "ssh" as const, hostTargetId: "target", hostId: "host", workspaceRoot: "/workspace" } } };
     await workspaces.register(registration);
     const store = { getSession: () => ({ descriptor: { id: "session", targetId: "target", binding: { generation: 1, opaqueRef: "native" } } }),
       getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }), findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
@@ -232,33 +246,37 @@ describe("RemoteWorkspaceService", () => {
     }
   });
 
-  it("fails registration closed for non-canonical or missing transport capabilities", async () => {
+  it("restores registration while offline and validates each later route and canonical root", async () => {
     const files = new MemoryRemoteFiles();
     await files.mkdir("/canonical", { recursive: true });
-    const registry = {
-      transports: async () => ({
-        host: {},
-        lease: {
-          capabilities: {
-            commandExecution: false,
-            processStreaming: false,
-            fileTransfer: true,
-            tcpForwarding: false,
-            interactiveTerminal: false
-          },
-          files
-        }
-      })
-    } as unknown as RemoteHostRegistry;
-    const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(registry) });
-    await expect(workspaces.register({
+    const processes = { open: async () => new CompletedRemoteProcess({}) };
+    let capture: () => Promise<unknown> = async () => { throw new Error("Remote workspace transports are unavailable."); };
+    const remoteExecution = { workspace: async () => capture() } as unknown as RemoteExecutionRouter;
+    const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(remoteExecution) });
+    await workspaces.register({
       id: "workspace-a",
       root: "/canonical",
       displayName: "Remote",
       trusted: true,
-      remote: { targetId: "target-a", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/canonical" }
-    })).rejects.toThrow("transports are unavailable");
-    expect(workspaces.listRegistrations()).toEqual([]);
+      remote: { targetId: "target-a", binding: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/canonical" } }
+    });
+    expect(workspaces.listRegistrations()).toHaveLength(1);
+    await expect(workspaces.list("workspace-a", "", {})).rejects.toThrow("transports are unavailable");
+
+    let current = true;
+    capture = async () => ({
+      files,
+      processes,
+      pathStyle: "posix",
+      assertCurrent: () => { if (!current) throw new Error("Remote route changed."); }
+    });
+    expect(await workspaces.list("workspace-a", "", {})).toEqual([]);
+
+    const realpath = vi.spyOn(files, "realpath").mockResolvedValueOnce("/not-canonical");
+    await expect(workspaces.list("workspace-a", "", {})).rejects.toThrow("canonical directory");
+    realpath.mockRestore();
+    current = false;
+    await expect(workspaces.list("workspace-a", "", {})).rejects.toThrow("Remote route changed");
     await workspaces.close();
   });
 });

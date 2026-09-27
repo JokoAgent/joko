@@ -230,6 +230,7 @@ function authoringOwner(): Snapshot {
       backendId: "backend",
       workspaceId: "workspace",
       displayName: "Project",
+      location: { kind: { case: "serviceNode", value: {} } },
       state: TargetState.ACTIVE,
       version: { revision: { value: 4n, etag: "target-r4" }, generation: 1n }
     })],

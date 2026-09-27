@@ -13,8 +13,7 @@ const session = {
   name: "Task one",
   projectId: "project-1",
   pinned: false,
-  archived: false,
-  remoteWorkspace: false
+  archived: false
 } as unknown as SessionView;
 const projectTargets = [
   { id: "project-1", name: "One" },

@@ -90,13 +90,23 @@ export interface TargetView {
   readonly trusted: boolean;
   readonly pinned: boolean;
   readonly archived: boolean;
-  readonly remoteWorkspace?: {
-    readonly hostTargetId: string;
-    readonly hostId: string;
-    readonly workspaceRoot: string;
-  };
+  readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly error?: string;
 }
+
+export type RemoteWorkspaceView =
+  | {
+      readonly kind: "ssh";
+      readonly hostTargetId: string;
+      readonly hostId: string;
+      readonly workspaceRoot: string;
+    }
+  | {
+      readonly kind: "device_peer";
+      readonly controllerDeviceId: string;
+      readonly targetDeviceId: string;
+      readonly workspaceRoot: string;
+    };
 
 export type ArtifactStorageMaintenanceSupportView =
   | "supported"
@@ -238,6 +248,52 @@ export interface RemoteTargetDraft {
   readonly hostId: string;
   readonly expectedHostTargetRevision: bigint;
   readonly expectedHostRevision: bigint;
+  readonly workspacePath: string;
+  readonly createIfMissing: boolean;
+}
+
+/** Exact, short-lived authority for one controller-to-target Device route. */
+export interface DevicePeerRouteIdentityView {
+  readonly targetDeviceId: string;
+  readonly relationId: string;
+  readonly targetDeviceRevision: bigint;
+  readonly relationRevision: bigint;
+  readonly routeGeneration: bigint;
+}
+
+export interface DevicePeerView {
+  readonly route: DevicePeerRouteIdentityView;
+  readonly name: string;
+  readonly kind: "desktop" | "service";
+  readonly platform: string;
+  readonly capabilities: readonly ("files" | "process" | "terminal" | "forwarding")[];
+}
+
+export interface DevicePeerRecentDirectoryView {
+  readonly name: string;
+  readonly path: string;
+  readonly availability: "exists" | "missing";
+  readonly lastUsedAt: number;
+}
+
+export interface DevicePeerDirectoryListingView {
+  readonly peer: DevicePeerRouteIdentityView;
+  readonly path: string;
+  readonly parentPath: string;
+  readonly directories: readonly { readonly name: string; readonly path: string }[];
+  readonly truncated: boolean;
+}
+
+export interface DevicePeerDirectoryInspectionView {
+  readonly peer: DevicePeerRouteIdentityView;
+  readonly path: string;
+  readonly kind: "directory" | "file" | "missing";
+}
+
+export interface DevicePeerTargetDraft {
+  readonly backendId: string;
+  readonly name: string;
+  readonly peer: DevicePeerRouteIdentityView;
   readonly workspacePath: string;
   readonly createIfMissing: boolean;
 }
@@ -1144,7 +1200,7 @@ export interface SessionView {
   readonly targetId: string;
   /** Navigation-only project placement; absence places the task in Dialogue. */
   readonly projectId?: string;
-  readonly remoteWorkspace?: boolean;
+  readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly runtimeAttached?: boolean;
   readonly name: string;
   readonly summary?: string;
@@ -1925,6 +1981,7 @@ export interface WorkspaceView {
   readonly kind: "userProject" | "managedDialogue";
   readonly serverPath: string;
   readonly trusted: boolean;
+  readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly branch?: string;
   readonly head?: string;
   readonly detachedHead?: boolean;
@@ -5482,6 +5539,11 @@ export interface OperationApi {
   ): Promise<NativeSessionCatalogView>;
   createTarget(draft: TargetDraft): Promise<string>;
   createRemoteTarget(draft: RemoteTargetDraft): Promise<string>;
+  createDevicePeerTarget(draft: DevicePeerTargetDraft): Promise<string>;
+  listDevicePeers(signal?: AbortSignal): Promise<readonly DevicePeerView[]>;
+  listDevicePeerRecentDirectories(peer: DevicePeerRouteIdentityView, signal?: AbortSignal): Promise<readonly DevicePeerRecentDirectoryView[]>;
+  listDevicePeerDirectories(peer: DevicePeerRouteIdentityView, path: string, signal?: AbortSignal): Promise<DevicePeerDirectoryListingView>;
+  inspectDevicePeerDirectory(peer: DevicePeerRouteIdentityView, path: string, signal?: AbortSignal): Promise<DevicePeerDirectoryInspectionView>;
   listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
   prepareTargetWorkspace(targetId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<void>;
   updateTarget(targetId: string, patch: {

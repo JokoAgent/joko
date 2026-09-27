@@ -33,7 +33,7 @@
     "dev": "pnpm --filter @joko/orchestrator dev",
     "dev:web": "pnpm --filter @joko/web dev",
     "preview:task-status": "pnpm --filter @joko/desktop build && pnpm --filter @joko/desktop preview:task-status",
-    "prepare:desktop:dev": "pnpm --filter @joko/web build && pnpm --filter-prod @joko/orchestrator... build && pnpm --filter @joko/desktop build",
+    "prepare:desktop:dev": "pnpm --filter @joko/web build && pnpm stage:desktop:orchestrator-runtime && pnpm --filter @joko/desktop build",
     "dev:desktop": "pnpm --filter @joko/desktop dev"
   },
   "devDependencies": {

@@ -175,7 +175,7 @@ export class RemoteHostRegistry {
   boundHost(targetId: string): RemoteHostRecord | undefined {
     this.assertOpen();
     const binding = this.#store.getTarget(targetId).descriptor.remoteWorkspace;
-    return binding === undefined ? undefined : this.get(binding.hostTargetId, binding.hostId);
+    return binding?.kind !== "ssh" ? undefined : this.get(binding.hostTargetId, binding.hostId);
   }
 
   targetRevision(targetId: string): bigint {

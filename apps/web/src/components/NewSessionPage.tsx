@@ -49,7 +49,7 @@ import type {
   WorktreeSourceView,
   WorkspaceEntryView
 } from "../model.js";
-import type { RemoteTargetDraft, TargetDraft } from "../model.js";
+import type { TargetDraft } from "../model.js";
 import type { DelayedNewSessionDraft, NewSessionSubmissionOwner } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
 import { resolveRecentProject, subscribeRecentProjectsChange, type RecentProject } from "../recent-projects.js";
@@ -81,7 +81,7 @@ import {
 import { nativeSessionDiscoveryAvailability } from "./session-discovery.js";
 import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
 import { ProjectEditor, localProjectPickerOwner, sameProjectPickerOwner } from "./ProjectEditor.js";
-import { RemoteProjectEditor } from "./RemoteProjectEditor.js";
+import { RemoteProjectEditor, type RemoteProjectDraft } from "./RemoteProjectEditor.js";
 import { NewTaskProjectPicker } from "./NewTaskProjectPicker.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { modelSourceAccess, type ModelSourceSelection } from "../model-source-access.js";
@@ -208,6 +208,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const consumedPickerRequestIdRef = useRef<number | undefined>(undefined);
   const projectCreateEpochRef = useRef(0);
   const remoteProjectCreateEpochRef = useRef(0);
+  const remoteProjectConnectionEpochRef = useRef(0);
   const projectBrowseEpochRef = useRef(0);
   const [startKind, setStartKind] = useState<"fresh" | "attach">("fresh");
   const [nativeSessions, setNativeSessions] = useState<readonly NativeSessionCandidateView[]>([]);
@@ -329,6 +330,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  useLayoutEffect(() => {
+    remoteProjectConnectionEpochRef.current += 1;
+    remoteProjectCreateEpochRef.current += 1;
+    setRemoteProjectCreatePending(false);
+    setRemoteProjectCreateError(undefined);
+  }, [controller.state.connectionState]);
   useLayoutEffect(() => {
     const request = projectPickerRequest;
     if (!hydrated || hydratedProfileScope !== profileScope || request === undefined
@@ -492,26 +499,34 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (ownsResult()) setProjectCreatePending(false);
     });
   };
-  const createRemoteProject = (draft: RemoteTargetDraft): void => {
+  const createRemoteProject = (draft: RemoteProjectDraft): void => {
     if (remoteProjectCreatePending || controller.state.connectionState !== "connected"
       || controller.state.activeProfile === undefined || controller.state.route.kind !== "newSession") return;
     const epoch = ++remoteProjectCreateEpochRef.current;
     const owner = {
+      connectionEpoch: remoteProjectConnectionEpochRef.current,
       profileId: controller.state.activeProfile.id,
       serverId: controller.state.activeProfile.serverId,
+      deviceId: controller.state.activeProfile.deviceId,
+      origin: controller.state.activeProfile.origin,
       generation: controller.state.snapshot.generation,
       navigationRevision: controller.state.navigationRevision ?? 0
     };
     const ownsResult = (): boolean => {
       const current = controllerRef.current.state;
       return mountedRef.current && remoteProjectCreateEpochRef.current === epoch
+        && remoteProjectConnectionEpochRef.current === owner.connectionEpoch
         && current.connectionState === "connected" && current.activeProfile?.id === owner.profileId
-        && current.activeProfile.serverId === owner.serverId && current.snapshot.generation === owner.generation
+        && current.activeProfile.serverId === owner.serverId && current.activeProfile.deviceId === owner.deviceId
+        && current.activeProfile.origin === owner.origin && current.snapshot.generation === owner.generation
         && current.route.kind === "newSession" && (current.navigationRevision ?? 0) === owner.navigationRevision;
     };
     setRemoteProjectCreatePending(true);
     setRemoteProjectCreateError(undefined);
-    void controller.createRemoteTarget(draft).then((targetId) => {
+    const creation = "peer" in draft
+      ? controller.createDevicePeerTarget(draft)
+      : controller.createRemoteTarget(draft);
+    void creation.then((targetId) => {
       if (!ownsResult()) return;
       setSelection({ kind: "target", targetId });
       setStartKind("fresh");
@@ -1961,11 +1976,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const recentlyShownTargets = new Set(recentOptions.filter((option) => option.available).map((option) => option.entry.targetId));
   const projectPickerOptions = projectTargets.filter((target) => !recentlyShownTargets.has(target.id)).map((target) => {
     const targetWorkspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
-    const hostSource = target.remoteWorkspace === undefined ? undefined
-      : snapshot.targets.find((candidate) => candidate.id === target.remoteWorkspace?.hostTargetId);
+    const sshWorkspace = target.remoteWorkspace?.kind === "ssh" ? target.remoteWorkspace : undefined;
+    const hostSource = sshWorkspace === undefined ? undefined
+      : snapshot.targets.find((candidate) => candidate.id === sshWorkspace.hostTargetId);
     const location = target.remoteWorkspace === undefined
       ? targetWorkspace?.serverPath || target.workspaceName
-      : `${hostSource?.name ?? target.remoteWorkspace.hostTargetId} / ${target.remoteWorkspace.hostId} · ${target.remoteWorkspace.workspaceRoot}`;
+      : sshWorkspace === undefined
+        ? target.remoteWorkspace.workspaceRoot
+        : `${hostSource?.name ?? sshWorkspace.hostTargetId} / ${sshWorkspace.hostId} · ${sshWorkspace.workspaceRoot}`;
     const available = activeTargets.some((candidate) => candidate.id === target.id)
       && target.error === undefined && targetWorkspace !== undefined && targetWorkspace.targetId === target.id;
     return { value: newSessionSelectionValue({ kind: "target" as const, targetId: target.id }),

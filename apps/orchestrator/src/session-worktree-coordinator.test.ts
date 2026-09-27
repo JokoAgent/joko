@@ -519,7 +519,10 @@ describe("remote checkout coordination", () => {
     expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
       id: f.plan.workspaceId,
       root: f.plan.path,
-      remote: expect.objectContaining({ workspaceRoot: f.plan.path, targetId: "remote-target" })
+      remote: {
+        targetId: "remote-target",
+        binding: { ...f.plan.remote.binding, workspaceRoot: f.plan.path }
+      }
     }));
     expect(f.worktrees.effectiveTarget(f.store.getSession("child")).remoteWorkspace?.workspaceRoot)
       .toBe(f.plan.path);
@@ -566,10 +569,17 @@ describe("remote checkout coordination", () => {
     });
 
     const binding = await f.worktrees.acquirePlannedRemoteDerivation(f.plan);
-    expect(binding).toEqual(remoteBindingFromLease(f.plan.workspaceId, f.lease));
+    expect(binding).toEqual({
+      ...remoteBindingFromLease(f.plan.workspaceId, f.lease),
+      updatedAt: binding.updatedAt
+    });
+    expect(binding.updatedAt).toEqual(expect.any(Number));
     expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
       id: f.plan.workspaceId, root: f.plan.path,
-      remote: expect.objectContaining({ workspaceRoot: f.plan.path })
+      remote: {
+        targetId: "remote-target",
+        binding: { ...f.plan.remote.binding, workspaceRoot: f.plan.path }
+      }
     }));
     expect(await f.worktrees.inspectPlannedRemoteDerivation(f.plan)).toEqual({ status: "active", lease: f.lease });
     f.owner.releaseExact.mockResolvedValueOnce("preserved");
@@ -587,7 +597,7 @@ async function remoteFixture() {
   store.upsertBackend({ id: "remote-backend", adapterKind: "fixture", displayName: "Remote",
     version: "1", instanceGeneration: 0, health: "healthy", installationState: "installed",
     authenticationState: "not_required", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
-  const remoteWorkspace = { hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
+  const remoteWorkspace = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
   store.upsertTarget({ id: "remote-target", backendId: "remote-backend", displayName: "Remote project",
     workspaceRoot: join(root, "placeholder"), managed: true, trusted: true, remoteWorkspace });
   let host = store.createRemoteHost({ ownerId: "owner", targetId: "remote-target", id: "ssh",
@@ -609,10 +619,14 @@ async function remoteFixture() {
   const manifestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const sourceCommit = "c".repeat(40);
   const authority = {
-    hostOwnerId: host.ownerId, hostTargetId: host.targetId, hostId: host.id,
-    hostIdentity: `sha256:${"b".repeat(64)}`, targetId: "remote-target",
+    targetId: "remote-target",
+    binding: remoteWorkspace,
+    executionIdentity: JSON.stringify({
+      kind: "ssh", hostTargetId: remoteWorkspace.hostTargetId, hostId: remoteWorkspace.hostId,
+      ownerId: host.ownerId, hostname: host.hostname, port: host.port, user: host.user,
+      algorithm: host.trust!.algorithm, fingerprint: host.trust!.fingerprint
+    }),
     targetRevision: store.getTarget("remote-target").revision.toString(),
-    hostRevision: host.revision.toString()
   };
   const plan: RemoteGitCheckoutPlan = {
     format: 1, leaseId, manifestId, sessionId: "child", sourceSessionId: "source",

@@ -1,4 +1,4 @@
-import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -15,10 +15,13 @@ const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const explicitCodexExecutable = join(fixtureRoot, "codex.exe");
 const apnsPrivateKey = join(fixtureRoot, "AuthKey_TEST123456.p8");
 const desktopResources = join(fixtureRoot, "desktop-resources");
+const devicePeerAuthKey = join(fixtureRoot, "device-peer-auth-key");
 mkdirSync(workspaceRoot, { recursive: true });
 mkdirSync(desktopResources, { recursive: true });
 writeFileSync(explicitCodexExecutable, "", { flag: "wx" });
 writeFileSync(apnsPrivateKey, "private-key-fixture", { flag: "wx" });
+writeFileSync(devicePeerAuthKey, `${"A".repeat(43)}\n`, { flag: "wx", mode: 0o600 });
+chmodSync(devicePeerAuthKey, 0o600);
 
 afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
@@ -168,6 +171,70 @@ describe("Orchestrator network configuration", () => {
       JOKO_APNS_PRIVATE_KEY: apnsPrivateKey,
       JOKO_APNS_TOPIC: "invalid/topic"
     })).toThrow(/JOKO_APNS_TOPIC is invalid/u);
+  });
+
+  it("enables a standalone Service peer agent only from exact non-secret authority configuration", () => {
+    expect(loadConfig(base).devicePeerAgent).toBeUndefined();
+    expect(loadConfig({
+      ...base,
+      JOKO_DEVICE_PEER_CONTROLLER_ORIGIN: "https://controller.example.test",
+      JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID: "controller-server",
+      JOKO_DEVICE_PEER_CONNECTION_ID: "service-connection",
+      JOKO_DEVICE_PEER_DEVICE_ID: "service-device",
+      JOKO_DEVICE_PEER_AUTH_KEY_FILE: devicePeerAuthKey
+    }).devicePeerAgent).toEqual({
+      controllerOrigin: "https://controller.example.test",
+      controllerServerId: "controller-server",
+      connectionId: "service-connection",
+      deviceId: "service-device",
+      credentialPath: resolve(devicePeerAuthKey),
+      stateDirectory: resolve(dataDirectory, "device-peer-agent")
+    });
+    expect(() => loadConfig({
+      ...base,
+      JOKO_DEVICE_PEER_CONTROLLER_ORIGIN: "https://controller.example.test"
+    })).toThrow(/must be configured together/u);
+    expect(() => loadConfig({
+      ...base,
+      JOKO_DEVICE_PEER_CONTROLLER_ORIGIN: "http://192.168.1.40:4318",
+      JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID: "controller-server",
+      JOKO_DEVICE_PEER_CONNECTION_ID: "service-connection",
+      JOKO_DEVICE_PEER_DEVICE_ID: "service-device",
+      JOKO_DEVICE_PEER_AUTH_KEY_FILE: devicePeerAuthKey
+    })).toThrow(/JOKO_ALLOW_INSECURE_LAN/u);
+
+    const missingCredentialPath = join(fixtureRoot, "must-not-appear-in-error", "auth-key");
+    let missingCredentialError: unknown;
+    try {
+      loadConfig({
+        ...base,
+        JOKO_DEVICE_PEER_CONTROLLER_ORIGIN: "https://controller.example.test",
+        JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID: "controller-server",
+        JOKO_DEVICE_PEER_CONNECTION_ID: "service-connection",
+        JOKO_DEVICE_PEER_DEVICE_ID: "service-device",
+        JOKO_DEVICE_PEER_AUTH_KEY_FILE: missingCredentialPath
+      });
+    } catch (error) {
+      missingCredentialError = error;
+    }
+    expect(missingCredentialError).toEqual(new Error(
+      "JOKO_DEVICE_PEER_AUTH_KEY_FILE is unavailable or unsafe."
+    ));
+    expect(String(missingCredentialError)).not.toContain(missingCredentialPath);
+
+    if (process.platform !== "win32") {
+      const publicCredential = join(fixtureRoot, "public-device-peer-auth-key");
+      writeFileSync(publicCredential, `${"B".repeat(43)}\n`, { flag: "wx", mode: 0o644 });
+      chmodSync(publicCredential, 0o644);
+      expect(() => loadConfig({
+        ...base,
+        JOKO_DEVICE_PEER_CONTROLLER_ORIGIN: "https://controller.example.test",
+        JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID: "controller-server",
+        JOKO_DEVICE_PEER_CONNECTION_ID: "service-connection",
+        JOKO_DEVICE_PEER_DEVICE_ID: "service-device",
+        JOKO_DEVICE_PEER_AUTH_KEY_FILE: publicCredential
+      })).toThrow("JOKO_DEVICE_PEER_AUTH_KEY_FILE is unavailable or unsafe.");
+    }
   });
 
   it("canonicalizes a default-scheme port without rejecting its own origin", () => {

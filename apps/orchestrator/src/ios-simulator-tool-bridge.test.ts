@@ -19,7 +19,7 @@ it("binds Simulator discovery and dispatch to an exact trusted local task", asyn
     store: {
       getSession: () => ({ descriptor: { targetId: "target", backendId: "backend", binding: { generation }, archived: false } }) as never,
       getTarget: () => ({ descriptor: { backendId: "backend", trusted,
-        ...(remote ? { remoteWorkspace: { hostId: "remote" } } : {}) } }) as never
+        ...(remote ? { remoteWorkspace: { kind: "ssh", hostId: "remote" } } : {}) } }) as never
     }, ownership: { listForTask: () => [] } as never, runtime
   });
   const context = { sessionId: "task", targetId: "target", generation: 3 };

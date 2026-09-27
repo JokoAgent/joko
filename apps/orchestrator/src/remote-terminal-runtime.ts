@@ -1,7 +1,7 @@
-import { posix as remotePath } from "node:path";
+import { posix, win32, type PlatformPath } from "node:path";
 import { RemoteSshError, type RemoteFileTransportPort, type RemoteProcessHandle, type RemoteProcessTransportPort } from "@joko/remote-ssh";
 import { TerminalError, type TerminalRuntime, type TerminalScope, type TerminalShell } from "@joko/tool-terminal";
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 
 const DISCOVERY_OUTPUT_BYTES = 16 * 1024;
 const DISCOVERY_TIMEOUT_MS = 5000;
@@ -10,26 +10,34 @@ const SHELL_DISCOVERY = `for candidate in "$SHELL" /bin/bash /usr/bin/bash /bin/
     /*) if [ -f "$candidate" ] && [ -x "$candidate" ]; then printf '%s\\n' "$candidate"; fi ;;
   esac
 done`;
+const WINDOWS_SHELL_DISCOVERY = "where.exe pwsh.exe 2>nul & where.exe powershell.exe 2>nul & where.exe cmd.exe 2>nul";
 
 /** Resolves one authenticated remote connection for each terminal creation. */
 export class RemoteTerminalRuntimeResolver {
-  constructor(private readonly registry: Pick<RemoteHostRegistry, "transports">) {}
+  constructor(private readonly remoteExecution: RemoteExecutionRouter) {}
 
   async resolve(scope: TerminalScope, signal?: AbortSignal): Promise<TerminalRuntime> {
-    if (scope.remoteHostId === undefined) throw unavailable();
+    if (scope.remoteWorkspace === undefined) throw unavailable();
     try {
       signal?.throwIfAborted();
-      const { lease } = await this.registry.transports(scope.remoteHostTargetId ?? scope.targetId, scope.remoteHostId, signal);
-      if (!lease.capabilities.interactiveTerminal || !lease.capabilities.fileTransfer || !lease.capabilities.processStreaming
-        || lease.terminals === undefined || lease.files === undefined || lease.processes === undefined) throw unavailable();
-      const { terminals, files, processes } = lease;
+      const authority = await this.remoteExecution.terminal(scope.remoteWorkspace, signal);
+      const { terminals, files, processes } = authority;
+      const paths = authority.pathStyle === "win32" ? win32 : posix;
       return {
-        discoverShells: () => discoverShells(processes, scope.workspaceRoot, signal),
-        canonicalDirectory: (root, cwd) => canonicalDirectory(files, root, cwd, signal),
+        discoverShells: () => discoverShells(processes, scope.workspaceRoot, paths, signal),
+        canonicalDirectory: (root, cwd) => canonicalDirectory(files, paths, root, cwd, signal),
         spawn: async (shell, options, creationSignal) => {
           try {
-            return await terminals.open({ executable: shell.executable, args: shell.args, ...options,
+            authority.assertCurrent();
+            const terminal = await terminals.open({ executable: shell.executable, args: shell.args, ...options,
               ...(creationSignal === undefined ? {} : { signal: creationSignal }) });
+            try {
+              authority.assertCurrent();
+              return terminal;
+            } catch (error) {
+              await terminal.kill().catch(() => undefined);
+              throw error;
+            }
           } catch (error) { throw terminalError(error); }
         }
       };
@@ -37,14 +45,20 @@ export class RemoteTerminalRuntimeResolver {
   }
 }
 
-async function canonicalDirectory(files: RemoteFileTransportPort, root: string, cwd: string, signal?: AbortSignal): Promise<string> {
+async function canonicalDirectory(
+  files: RemoteFileTransportPort,
+  paths: PlatformPath,
+  root: string,
+  cwd: string,
+  signal?: AbortSignal
+): Promise<string> {
   try {
     signal?.throwIfAborted();
-    if (!remotePath.isAbsolute(root) || remotePath.normalize(root) !== root || root.includes("\0")
-      || remotePath.isAbsolute(cwd) || cwd.includes("\0")) throw new Error();
-    const candidate = remotePath.resolve(root, cwd);
-    const relative = remotePath.relative(root, candidate);
-    if (relative === ".." || relative.startsWith("../") || remotePath.isAbsolute(relative)) throw new Error();
+    if (!paths.isAbsolute(root) || paths.normalize(root) !== root || root.includes("\0")
+      || paths.isAbsolute(cwd) || cwd.includes("\0")) throw new Error();
+    const candidate = paths.resolve(root, cwd);
+    const relative = paths.relative(root, candidate);
+    if (relative === ".." || relative.startsWith(`..${paths.sep}`) || paths.isAbsolute(relative)) throw new Error();
     if (await files.realpath(root, signal) !== root || (await files.stat(root, signal)).kind !== "directory"
       || await files.realpath(candidate, signal) !== candidate || (await files.stat(candidate, signal)).kind !== "directory") throw new Error();
     signal?.throwIfAborted();
@@ -56,12 +70,17 @@ async function canonicalDirectory(files: RemoteFileTransportPort, root: string, 
   }
 }
 
-async function discoverShells(processes: RemoteProcessTransportPort, cwd: string, signal?: AbortSignal): Promise<readonly TerminalShell[]> {
+async function discoverShells(
+  processes: RemoteProcessTransportPort,
+  cwd: string,
+  paths: PlatformPath,
+  signal?: AbortSignal
+): Promise<readonly TerminalShell[]> {
   const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
   const lifetime = AbortSignal.any([timeout, ...(signal === undefined ? [] : [signal])]);
   try {
     lifetime.throwIfAborted();
-    const process = await openProbe(processes, cwd, lifetime);
+    const process = await openProbe(processes, cwd, paths === win32, lifetime);
     const output = await new Promise<string>((resolve, reject) => {
       let size = 0;
       let settled = false;
@@ -103,9 +122,17 @@ async function discoverShells(processes: RemoteProcessTransportPort, cwd: string
       else { process.stdin.end(); complete(); }
     });
     lifetime.throwIfAborted();
-    const paths = [...new Set(output.split("\n").filter((value) => value !== ""))];
-    if (paths.length > 32 || paths.some((path) => !remotePath.isAbsolute(path) || path.length > 1024 || /[\u0000-\u001f\u007f]/u.test(path))) throw unavailable();
-    return paths.map((executable, index) => ({ id: executable, label: remotePath.basename(executable), executable, args: ["-i"], isDefault: index === 0 }));
+    const executables = [...new Set(output.split(/\r?\n/u).map((value) => value.trim()).filter((value) => value !== ""))];
+    if (executables.length > 32 || executables.some((path) => !paths.isAbsolute(path) || path.length > 1024 || /[\u0000-\u001f\u007f]/u.test(path))) throw unavailable();
+    return executables.map((executable, index) => ({
+      id: executable,
+      label: paths.basename(executable),
+      executable,
+      args: paths === win32
+        ? (paths.basename(executable).toLowerCase() === "cmd.exe" ? ["/Q"] : ["-NoLogo"])
+        : ["-i"],
+      isDefault: index === 0
+    }));
   } catch (error) {
     const failure = terminalError(error);
     if (failure.stateMayHaveChanged) throw failure;
@@ -114,7 +141,12 @@ async function discoverShells(processes: RemoteProcessTransportPort, cwd: string
   }
 }
 
-async function openProbe(processes: RemoteProcessTransportPort, cwd: string, signal: AbortSignal): Promise<RemoteProcessHandle> {
+async function openProbe(
+  processes: RemoteProcessTransportPort,
+  cwd: string,
+  windows: boolean,
+  signal: AbortSignal
+): Promise<RemoteProcessHandle> {
   signal.throwIfAborted();
   return new Promise<RemoteProcessHandle>((resolve, reject) => {
     let settled = false;
@@ -124,7 +156,9 @@ async function openProbe(processes: RemoteProcessTransportPort, cwd: string, sig
     void Promise.resolve().then(() => {
       signal.throwIfAborted();
       attempted = true;
-      return processes.open({ executable: "/bin/sh", args: ["-c", SHELL_DISCOVERY], cwd, signal });
+      return processes.open(windows
+        ? { executable: "cmd.exe", args: ["/d", "/s", "/c", WINDOWS_SHELL_DISCOVERY], cwd, signal }
+        : { executable: "/bin/sh", args: ["-c", SHELL_DISCOVERY], cwd, signal });
     }).then((process) => {
       signal.removeEventListener("abort", abort);
       if (settled || signal.aborted) {
@@ -165,7 +199,7 @@ function probeUnknown(): TerminalError {
 }
 
 function unavailable(): TerminalError {
-  return new TerminalError("RUNTIME_UNAVAILABLE", "Connect the remote host and ensure an interactive shell is available.");
+  return new TerminalError("RUNTIME_UNAVAILABLE", "Connect the remote execution target and ensure an interactive shell is available.");
 }
 
 function terminalError(error: unknown): TerminalError {
@@ -173,8 +207,17 @@ function terminalError(error: unknown): TerminalError {
   if (error instanceof RemoteSshError && error.details?.stateMayHaveChanged === true) {
     return new TerminalError("CLEANUP_UNKNOWN", "The remote terminal process exit could not be confirmed.", true);
   }
+  if (hasUnknownRemoteOutcome(error)) {
+    return new TerminalError("CLEANUP_UNKNOWN", "The remote terminal process exit could not be confirmed.", true);
+  }
   if (error instanceof Error && error.name === "AbortError" || error instanceof RemoteSshError && error.code === "ABORTED") {
     return new TerminalError("ABORTED", "Terminal request cancelled.");
   }
   return unavailable();
+}
+
+function hasUnknownRemoteOutcome(error: unknown): boolean {
+  return error instanceof Error
+    && "stateMayHaveChanged" in error
+    && (error as Error & { readonly stateMayHaveChanged?: unknown }).stateMayHaveChanged === true;
 }

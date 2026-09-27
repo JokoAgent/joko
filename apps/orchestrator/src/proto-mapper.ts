@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { posix } from "node:path";
 import {
   ActorKind,
   ArtifactKind,
@@ -583,7 +584,7 @@ export function toProtoTarget(record: StoredTarget): ProtoTarget {
     lastActivityAt: toProtoTimestamp(record.updatedAt),
     version: toProtoEntityVersion(record.revision, 0, record.updatedAt),
     error: undefined,
-    remoteWorkspace: toProtoRemoteWorkspace(record.descriptor.remoteWorkspace)
+    location: toProtoWorkspaceLocation(record.descriptor.remoteWorkspace)
   });
 }
 
@@ -591,6 +592,7 @@ export function fromProtoTarget(target: ProtoTarget, workspaceRoot: string): Tar
   requireText(target.targetId, "target.target_id");
   requireText(target.backendId, "target.backend_id");
   requireText(workspaceRoot, "workspace_root");
+  const remoteWorkspace = fromProtoWorkspaceLocation(target.location);
   return {
     id: target.targetId,
     backendId: target.backendId,
@@ -598,9 +600,9 @@ export function fromProtoTarget(target: ProtoTarget, workspaceRoot: string): Tar
     workspaceRoot,
     managed: false,
     trusted: target.state !== TargetState.ERROR && target.state !== TargetState.DELETING,
-    ...(target.remoteWorkspace === undefined
+    ...(remoteWorkspace === undefined
       ? {}
-      : { remoteWorkspace: fromProtoRemoteWorkspace(target.remoteWorkspace) })
+      : { remoteWorkspace })
   };
 }
 
@@ -704,7 +706,7 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
     codeHostPullRequests: (context.codeHostPullRequests ?? []).map(toProtoCodeHostPullRequest),
     attention: session.attention === undefined ? undefined : toProtoSessionAttention(session.attention),
     worktree: session.worktree === undefined ? undefined : toProtoSessionWorktree(session.worktree),
-    remoteWorkspace: toProtoRemoteWorkspace(session.remoteWorkspace),
+    location: toProtoWorkspaceLocation(session.remoteWorkspace),
     createdAt: toProtoTimestamp(session.createdAt),
     lastActivityAt: toProtoTimestamp(session.updatedAt),
     version: toProtoEntityVersion(record.revision, session.binding.generation, session.updatedAt),
@@ -2152,36 +2154,103 @@ export function toProtoWorkspace(record: StoredTarget): WorkspaceDescriptor {
     serverPathDisplay: record.descriptor.workspaceRoot,
     trusted: record.descriptor.trusted,
     git: undefined,
-    remoteWorkspace: toProtoRemoteWorkspace(record.descriptor.remoteWorkspace),
+    location: toProtoWorkspaceLocation(record.descriptor.remoteWorkspace),
     version: toProtoEntityVersion(record.revision, 0, record.updatedAt)
   });
 }
 
-export function toProtoRemoteWorkspace(
+export function toProtoWorkspaceLocation(
   value: TargetDescriptor["remoteWorkspace"]
-): contract.RemoteWorkspaceBinding | undefined {
-  if (value === undefined) return undefined;
-  return message<contract.RemoteWorkspaceBinding>("joko.v1.RemoteWorkspaceBinding", {
-    hostTargetId: value.hostTargetId,
-    hostId: value.hostId,
-    workspaceRootDisplay: value.workspaceRoot
+): contract.WorkspaceLocation {
+  if (value === undefined) {
+    return message<contract.WorkspaceLocation>("joko.v1.WorkspaceLocation", {
+      kind: {
+        case: "serviceNode",
+        value: message<contract.ServiceNodeWorkspaceLocation>("joko.v1.ServiceNodeWorkspaceLocation", {})
+      }
+    });
+  }
+  if (value.kind === "ssh") {
+    return message<contract.WorkspaceLocation>("joko.v1.WorkspaceLocation", {
+      kind: {
+        case: "sshHost",
+        value: message<contract.SshHostWorkspaceLocation>("joko.v1.SshHostWorkspaceLocation", {
+          hostTargetId: value.hostTargetId,
+          hostId: value.hostId,
+          workspaceRootDisplay: value.workspaceRoot
+        })
+      }
+    });
+  }
+  return message<contract.WorkspaceLocation>("joko.v1.WorkspaceLocation", {
+    kind: {
+      case: "devicePeer",
+      value: message<contract.DevicePeerWorkspaceLocation>("joko.v1.DevicePeerWorkspaceLocation", {
+        controllerDeviceId: value.controllerDeviceId,
+        targetDeviceId: value.targetDeviceId,
+        workspaceRootDisplay: value.workspaceRoot
+      })
+    }
   });
 }
 
-export function fromProtoRemoteWorkspace(
-  value: contract.RemoteWorkspaceBinding
-): NonNullable<TargetDescriptor["remoteWorkspace"]> {
-  requireText(value.hostTargetId, "remote_workspace.host_target_id");
-  requireText(value.hostId, "remote_workspace.host_id");
-  requireText(value.workspaceRootDisplay, "remote_workspace.workspace_root_display");
-  if (!value.workspaceRootDisplay.startsWith("/") || value.workspaceRootDisplay.includes("\0")) {
+export function fromProtoWorkspaceLocation(
+  value: contract.WorkspaceLocation | undefined
+): TargetDescriptor["remoteWorkspace"] {
+  if (value === undefined || value.kind.case === undefined) {
     throw new ProtoMappingError(
       "invalid_argument",
-      "remote_workspace.workspace_root_display",
-      "Remote workspace root must be an absolute POSIX path."
+      "location",
+      "Workspace location and its kind are required."
     );
   }
-  return { hostTargetId: value.hostTargetId, hostId: value.hostId, workspaceRoot: value.workspaceRootDisplay };
+  if (value.kind.case === "serviceNode") return undefined;
+  if (value.kind.case === "sshHost") {
+    const ssh = value.kind.value;
+    requireText(ssh.hostTargetId, "location.ssh_host.host_target_id");
+    requireText(ssh.hostId, "location.ssh_host.host_id");
+    requireAbsolutePosixWorkspaceRoot(ssh.workspaceRootDisplay, "location.ssh_host.workspace_root_display");
+    return {
+      kind: "ssh",
+      hostTargetId: ssh.hostTargetId,
+      hostId: ssh.hostId,
+      workspaceRoot: ssh.workspaceRootDisplay
+    };
+  }
+  const peer = value.kind.value;
+  requireText(peer.controllerDeviceId, "location.device_peer.controller_device_id");
+  requireText(peer.targetDeviceId, "location.device_peer.target_device_id");
+  requireAbsoluteHostNativeWorkspaceRoot(peer.workspaceRootDisplay, "location.device_peer.workspace_root_display");
+  return {
+    kind: "device_peer",
+    controllerDeviceId: peer.controllerDeviceId,
+    targetDeviceId: peer.targetDeviceId,
+    workspaceRoot: peer.workspaceRootDisplay
+  };
+}
+
+function requireAbsolutePosixWorkspaceRoot(value: string, fieldPath: string): void {
+  requireText(value, fieldPath);
+  if (!value.startsWith("/") || value.includes("\0")) {
+    throw new ProtoMappingError(
+      "invalid_argument",
+      fieldPath,
+      "Workspace root must be an absolute POSIX path."
+    );
+  }
+}
+
+function requireAbsoluteHostNativeWorkspaceRoot(value: string, fieldPath: string): void {
+  requireText(value, fieldPath);
+  const windowsDriveAbsolute = /^[A-Za-z]:[\\/]/u.test(value);
+  const windowsUncAbsolute = /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(value);
+  if ((!posix.isAbsolute(value) && !windowsDriveAbsolute && !windowsUncAbsolute) || value.includes("\0")) {
+    throw new ProtoMappingError(
+      "invalid_argument",
+      fieldPath,
+      "Workspace root must be an absolute host-native path."
+    );
+  }
 }
 
 function toProtoWorkspaceChangeSetProjection(value: WorkspaceChangeSetProjection): WorkspaceChangeSet {

@@ -22,7 +22,7 @@ it("dispatches a remote Claude turn through HTTP only after durable admission an
   let remotePortClosed = false;
   const remoteRuntimes: ClaudeRemoteRuntimePort = {
     resolve: async (target) => {
-      expect(target.remoteWorkspace).toEqual({ hostTargetId: target.id, hostId: "host-a", workspaceRoot: REMOTE_WORKSPACE });
+      expect(target.remoteWorkspace).toEqual({ kind: "ssh", hostTargetId: target.id, hostId: "host-a", workspaceRoot: REMOTE_WORKSPACE });
       return {
         runtime: remoteRuntime,
         workspaceRoot: REMOTE_WORKSPACE,
@@ -62,9 +62,9 @@ it("dispatches a remote Claude turn through HTTP only after durable admission an
     const initialTarget = fixture.application.store.getTarget(targetId).descriptor;
     await fixture.application.sessionHost.registerTarget({
       ...initialTarget,
-      workspaceRoot: "D:\\service-owned-placeholder",
+      workspaceRoot: initialTarget.workspaceRoot,
       managed: false,
-      remoteWorkspace: { hostTargetId: targetId, hostId: "host-a", workspaceRoot: REMOTE_WORKSPACE }
+      remoteWorkspace: { kind: "ssh", hostTargetId: targetId, hostId: "host-a", workspaceRoot: REMOTE_WORKSPACE }
     });
     const paired = await fixture.pair("Remote Claude product client");
     const sessionId = sessionIdFrom(await submit(

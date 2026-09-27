@@ -89,7 +89,7 @@ it("uses a ready Host from another project, reuses its existing project, and exp
     status: { state: "ready" as const, changedAt: 1 }, revision: 3n };
   view.listRemoteHosts.mockImplementation(async (targetId: string) => targetId === "first" ? [host] : []);
   view.changeSnapshotSilently((snapshot) => ({ ...snapshot, targets: snapshot.targets.map((target) => target.id === "second"
-    ? { ...target, remoteWorkspace: { hostTargetId: "first", hostId: "build-box", workspaceRoot: "/srv/existing" } }
+    ? { ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "first", hostId: "build-box", workspaceRoot: "/srv/existing" } }
     : target) }));
   await view.render(request(1));
   await act(async () => option("newTask.addRemoteProject").click());
@@ -128,6 +128,159 @@ it("uses a ready Host from another project, reuses its existing project, and exp
   expect(selectionValue(view.host)).toBe("target:remote-created");
   expect(view.host.textContent).toContain("Keep this draft");
   expect(document.activeElement).toBe(view.host.querySelector(".new-task-project-picker__trigger"));
+});
+
+it("keeps an exact Device peer route, requires missing-directory confirmation, and preserves target and draft after failure", async () => {
+  const view = await mount();
+  const peer = {
+    route: {
+      targetDeviceId: "studio-device",
+      relationId: "relation-one",
+      targetDeviceRevision: 7n,
+      relationRevision: 9n,
+      routeGeneration: 11n
+    },
+    name: "Studio PC",
+    kind: "desktop" as const,
+    platform: "win32",
+    capabilities: ["files", "process"] as const
+  };
+  view.listDevicePeers.mockResolvedValue([peer]);
+  view.listDevicePeerRecentDirectories.mockResolvedValue([{
+    name: "new", path: "C:\\work\\new", availability: "missing", lastUsedAt: 12
+  }]);
+  view.inspectDevicePeerDirectory.mockResolvedValue({
+    peer: peer.route, path: "C:\\work\\new", kind: "missing"
+  });
+
+  await view.render(request(1));
+  await act(async () => option("newTask.addRemoteProject").click());
+  await vi.waitFor(() => expect(document.querySelector(".modal-layer .modal")?.textContent).toContain("Studio PC"));
+  expect(view.listDevicePeerRecentDirectories).toHaveBeenCalledWith(peer.route, expect.any(AbortSignal));
+  await vi.waitFor(() => expect(document.querySelector(".modal-layer .modal")?.textContent).toContain("C:\\work\\new"));
+  await act(async () => required([...document.querySelectorAll<HTMLButtonElement>(".project-editor__browser-list button")]
+    .find((button) => button.textContent?.includes("C:\\work\\new"))).click());
+  await act(async () => { required(document.querySelector<HTMLFormElement>("[role='dialog'] form")).requestSubmit(); await Promise.resolve(); });
+
+  expect(view.inspectDevicePeerDirectory).toHaveBeenCalledWith(peer.route, "C:\\work\\new", expect.any(AbortSignal));
+  expect(document.querySelector(".modal-layer .modal")?.textContent).toContain("remoteProject.missingDeviceBody");
+  expect(view.createDevicePeerTarget).not.toHaveBeenCalled();
+  expect(selectionValue(view.host)).toBe("target:first");
+  expect(view.host.textContent).toContain("Keep this draft");
+
+  view.createDevicePeerTarget.mockRejectedValueOnce(new Error("Peer route advanced"));
+  await act(async () => { required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent?.includes("remoteProject.createDirectory"))).click(); await Promise.resolve(); });
+  await vi.waitFor(() => expect(document.querySelector(".modal-layer [role='alert']")?.textContent).toContain("Peer route advanced"));
+  expect(view.createDevicePeerTarget).toHaveBeenLastCalledWith({
+    backendId: "backend", name: "new", peer: peer.route,
+    workspacePath: "C:\\work\\new", createIfMissing: true
+  });
+  expect(document.querySelector(".modal-layer .modal")?.textContent).toContain("C:\\work\\new");
+  expect(selectionValue(view.host)).toBe("target:first");
+  expect(view.host.textContent).toContain("Keep this draft");
+
+  view.createDevicePeerTarget.mockResolvedValueOnce("peer-created");
+  await act(async () => { required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent?.includes("remoteProject.createDirectory"))).click(); await Promise.resolve(); });
+  await vi.waitFor(() => expect(document.querySelector(".modal-layer .modal")).toBeNull());
+  expect(selectionValue(view.host)).toBe("target:peer-created");
+  expect(view.host.textContent).toContain("Keep this draft");
+});
+
+it("unlocks a pending Device peer project after an offline rejection without losing the target or draft", async () => {
+  const view = await mount();
+  const peer = {
+    route: {
+      targetDeviceId: "studio-device",
+      relationId: "relation-one",
+      targetDeviceRevision: 7n,
+      relationRevision: 9n,
+      routeGeneration: 11n
+    },
+    name: "Studio PC",
+    kind: "desktop" as const,
+    platform: "win32",
+    capabilities: ["files", "process"] as const
+  };
+  view.listDevicePeers.mockResolvedValue([peer]);
+  view.listDevicePeerRecentDirectories.mockResolvedValue([{
+    name: "new", path: "C:\\work\\new", availability: "missing", lastUsedAt: 12
+  }]);
+  view.inspectDevicePeerDirectory.mockResolvedValue({
+    peer: peer.route, path: "C:\\work\\new", kind: "missing"
+  });
+  let rejectCreation!: (cause: unknown) => void;
+  view.createDevicePeerTarget.mockReturnValueOnce(new Promise<string>((_resolve, reject) => { rejectCreation = reject; }));
+
+  await view.render(request(1));
+  await act(async () => option("newTask.addRemoteProject").click());
+  await vi.waitFor(() => expect(document.querySelector(".modal-layer .modal")?.textContent).toContain("C:\\work\\new"));
+  await act(async () => required([...document.querySelectorAll<HTMLButtonElement>(".project-editor__browser-list button")]
+    .find((button) => button.textContent?.includes("C:\\work\\new"))).click());
+  await act(async () => { required(document.querySelector<HTMLFormElement>("[role='dialog'] form")).requestSubmit(); await Promise.resolve(); });
+  await act(async () => required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent?.includes("remoteProject.createDirectory"))).click());
+  expect(required(document.querySelector<HTMLButtonElement>("[data-remote-project-missing-cancel]")).disabled).toBe(true);
+
+  await view.changeConnectionState("offline");
+  await act(async () => { rejectCreation(new Error("Peer went offline")); await Promise.resolve(); });
+  expect(selectionValue(view.host)).toBe("target:first");
+  expect(view.host.textContent).toContain("Keep this draft");
+  expect(document.querySelector(".modal-layer [role='alert']")?.textContent ?? "").not.toContain("Peer went offline");
+
+  await view.changeConnectionState("connected");
+  await vi.waitFor(() => expect(required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent === "common.cancel")).disabled).toBe(false));
+  await act(async () => required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent === "common.cancel")).click());
+  expect(document.querySelector(".modal-layer .modal")).toBeNull();
+  expect(selectionValue(view.host)).toBe("target:first");
+  expect(view.host.textContent).toContain("Keep this draft");
+});
+
+it("rejects a late Device peer project result from an earlier same-profile connection", async () => {
+  const view = await mount();
+  const peer = {
+    route: {
+      targetDeviceId: "studio-device",
+      relationId: "relation-one",
+      targetDeviceRevision: 7n,
+      relationRevision: 9n,
+      routeGeneration: 11n
+    },
+    name: "Studio PC",
+    kind: "desktop" as const,
+    platform: "win32",
+    capabilities: ["files", "process"] as const
+  };
+  view.listDevicePeers.mockResolvedValue([peer]);
+  view.listDevicePeerRecentDirectories.mockResolvedValue([{
+    name: "new", path: "C:\\work\\new", availability: "missing", lastUsedAt: 12
+  }]);
+  view.inspectDevicePeerDirectory.mockResolvedValue({
+    peer: peer.route, path: "C:\\work\\new", kind: "missing"
+  });
+  let resolveCreation!: (targetId: string) => void;
+  view.createDevicePeerTarget.mockReturnValueOnce(new Promise<string>((resolve) => { resolveCreation = resolve; }));
+
+  await view.render(request(1));
+  await act(async () => option("newTask.addRemoteProject").click());
+  await vi.waitFor(() => expect(document.querySelector(".modal-layer .modal")?.textContent).toContain("C:\\work\\new"));
+  await act(async () => required([...document.querySelectorAll<HTMLButtonElement>(".project-editor__browser-list button")]
+    .find((button) => button.textContent?.includes("C:\\work\\new"))).click());
+  await act(async () => { required(document.querySelector<HTMLFormElement>("[role='dialog'] form")).requestSubmit(); await Promise.resolve(); });
+  await act(async () => required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent?.includes("remoteProject.createDirectory"))).click());
+
+  await view.changeConnectionState("offline");
+  await view.changeConnectionState("connected");
+  await act(async () => { resolveCreation("stale-peer"); await Promise.resolve(); });
+  expect(selectionValue(view.host)).toBe("target:first");
+  expect(view.host.textContent).toContain("Keep this draft");
+  await vi.waitFor(() => expect(required([...document.querySelectorAll<HTMLButtonElement>(".modal-layer button")]
+    .find((button) => button.textContent === "common.cancel")).disabled).toBe(false));
+  expect(document.querySelector(".modal-layer .modal")).not.toBeNull();
 });
 
 it("keeps a ready Host available when its source project is archived", async () => {
@@ -316,7 +469,16 @@ async function mount(local = false) {
   } as unknown as ControllerState;
   const createTarget = vi.fn<(_draft: unknown) => Promise<string>>();
   const createRemoteTarget = vi.fn<(_draft: unknown) => Promise<string>>();
+  const createDevicePeerTarget = vi.fn<(_draft: unknown) => Promise<string>>();
   const listRemoteHosts = vi.fn(async (_targetId: string) => [] as readonly unknown[]);
+  const listDevicePeers = vi.fn<AppController["listDevicePeers"]>(async () => []);
+  const listDevicePeerRecentDirectories = vi.fn<AppController["listDevicePeerRecentDirectories"]>(async () => []);
+  const listDevicePeerDirectories = vi.fn<AppController["listDevicePeerDirectories"]>(async () => {
+    throw new Error("No Device directory fixture configured.");
+  });
+  const inspectDevicePeerDirectory = vi.fn<AppController["inspectDevicePeerDirectory"]>(async () => {
+    throw new Error("No Device directory inspection fixture configured.");
+  });
   const listRemoteHostDirectories = vi.fn<AppController["listRemoteHostDirectories"]>(async () => {
     throw new Error("No SSH directory fixture configured.");
   });
@@ -332,7 +494,8 @@ async function mount(local = false) {
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined),
-    createTarget, createRemoteTarget, listRemoteHosts, inspectRemoteHostDirectory,
+    createTarget, createRemoteTarget, createDevicePeerTarget, listRemoteHosts, inspectRemoteHostDirectory,
+    listDevicePeers, listDevicePeerRecentDirectories, listDevicePeerDirectories, inspectDevicePeerDirectory,
     getRemoteHostCapabilities: vi.fn(async () => ({ management: true, catalog: true,
       commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: true,
       interactiveTerminal: true, backendRuntimeSetup: true })),
@@ -348,13 +511,19 @@ async function mount(local = false) {
     await Promise.resolve();
   });
   await render();
-  return { host, consumed, createTarget, createRemoteTarget, listRemoteHosts, listRemoteHostDirectories, inspectRemoteHostDirectory,
+  return { host, consumed, createTarget, createRemoteTarget, createDevicePeerTarget,
+    listRemoteHosts, listRemoteHostDirectories, inspectRemoteHostDirectory,
+    listDevicePeers, listDevicePeerRecentDirectories, listDevicePeerDirectories, inspectDevicePeerDirectory,
     readRecentProjects, removeRecentProject, render,
     changeSnapshotSilently: (update: (value: AppSnapshot) => AppSnapshot) => {
       state = { ...state, snapshot: update(state.snapshot) };
     },
     changeProfile: async (id: string) => {
       state = { ...state, activeProfile: { ...state.activeProfile!, id } };
+      await render();
+    },
+    changeConnectionState: async (connectionState: ControllerState["connectionState"]) => {
+      state = { ...state, connectionState };
       await render();
     } };
 }

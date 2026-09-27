@@ -17,7 +17,7 @@ import {
   type TargetDescriptor
 } from "@joko/core";
 import { describe, expect, test, vi } from "vitest";
-import { ClaudeCodeAdapter, type ClaudeCodeAdapterOptions } from "./adapter.js";
+import { ClaudeCodeAdapter, claudeWorkspaceAuthority, type ClaudeCodeAdapterOptions } from "./adapter.js";
 import {
   ClaudeSessionStoreError,
   type ClaudeSessionStoreOperationAccess,
@@ -108,7 +108,7 @@ describe("ClaudeCodeAdapter", () => {
   test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
     const remoteTarget: TargetDescriptor = {
       ...target, id: "remote-mcp-target", workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-mcp-target", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const sdk = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
     const calls = vi.fn(async () => ({
@@ -168,7 +168,7 @@ describe("ClaudeCodeAdapter", () => {
     const remote = location === "remote";
     const selectedTarget: TargetDescriptor = remote ? {
       ...target, id: "remote-no-tool", workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-no-tool", hostId: "host-a", workspaceRoot: "/srv/project" }
     } : target;
     const sdk = new FakeSdkRuntime(remote ? { initialFrameOverrides: { cwd: "/srv/project" } } : {});
     let toolsAvailable = false;
@@ -279,7 +279,7 @@ describe("ClaudeCodeAdapter", () => {
           ...target,
           id: "target-remote-managed-effort",
           workspaceRoot: "/srv/effort",
-          remoteWorkspace: { hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
+          remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote-managed-effort", hostId: "host-effort", workspaceRoot: "/srv/effort" }
         }
       : target;
     const adapter = adapterFor(remote ? new FakeSdkRuntime() : runtime, {
@@ -948,7 +948,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote-managed-limits",
       workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote-managed-limits", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project", model: "configured-model" } });
     const close = vi.fn(async () => undefined);
@@ -3101,7 +3101,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote",
       workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const localRuntime = new FakeSdkRuntime();
     const remoteRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: "/srv/project" } });
@@ -3174,6 +3174,73 @@ describe("ClaudeCodeAdapter", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  test("validates and resolves an exact Windows device-peer runtime without SSH identity fields", async () => {
+    const peerTarget: TargetDescriptor = {
+      ...target,
+      id: "target-peer-win32",
+      workspaceRoot: process.cwd(),
+      remoteWorkspace: {
+        kind: "device_peer",
+        controllerDeviceId: "controller-device",
+        targetDeviceId: "windows-device",
+        workspaceRoot: "C:\\Joko\\Workspace"
+      }
+    };
+    const peerRuntime = new FakeSdkRuntime({ initialFrameOverrides: { cwd: peerTarget.remoteWorkspace!.workspaceRoot } });
+    const resolve = vi.fn(async () => ({
+      runtime: peerRuntime,
+      workspaceRoot: peerTarget.remoteWorkspace!.workspaceRoot,
+      remote: true,
+      assertCurrent: () => undefined
+    }));
+    const adapter = adapterFor(new FakeSdkRuntime(), {
+      remoteRuntimes: { resolve, close: async () => undefined }
+    });
+
+    await expect(adapter.validateTarget(peerTarget)).resolves.toBeUndefined();
+    expect(resolve).toHaveBeenCalledWith(peerTarget, undefined);
+    await expect(adapter.validateTarget({
+      ...peerTarget,
+      remoteWorkspace: {
+        kind: "device_peer",
+        controllerDeviceId: "controller-device",
+        targetDeviceId: "controller-device",
+        workspaceRoot: "C:\\Joko\\Workspace"
+      }
+    })).rejects.toMatchObject({ publicError: { code: "REMOTE_TARGET_INVALID" } });
+    expect(resolve).toHaveBeenCalledTimes(1);
+
+    const sourceTarget: TargetDescriptor = {
+      ...peerTarget,
+      id: "same-target",
+      workspaceRoot: "/srv/source",
+      remoteWorkspace: {
+        kind: "ssh", hostTargetId: "source-a", hostId: "same-host-name", workspaceRoot: "/srv"
+      }
+    };
+    const targetWithOtherSource: TargetDescriptor = {
+      ...sourceTarget,
+      workspaceRoot: "/srv/derived",
+      remoteWorkspace: {
+        kind: "ssh",
+        hostTargetId: "source-b",
+        hostId: "same-host-name",
+        workspaceRoot: "/srv"
+      }
+    };
+    const lifecycle: NativeSessionDerivationLifecycle = {
+      operationId: "peer-authority-source-fence",
+      kind: "clone",
+      sourceSessionId: "source-session",
+      sourceBinding: { opaqueRef: `claude-code:session:${randomUUID()}`, generation: 1 },
+      sessionId: "derived-session",
+      sourceTarget,
+      target: targetWithOtherSource
+    };
+    expect(adapter.ownsNativeSessionDerivationLifecycle(lifecycle)).toBe(false);
+    await adapter.dispose();
+  });
+
   test("closes the remote runtime owner even when an SDK cleanup boundary fails", async () => {
     const runtime = new FakeSdkRuntime();
     runtime.closeSessionOperationsFailure = true;
@@ -3197,7 +3264,7 @@ describe("ClaudeCodeAdapter", () => {
       ...target,
       id: "target-remote-manager-replacement",
       workspaceRoot: "/srv/project",
-      remoteWorkspace: { hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote-manager-replacement", hostId: "host-a", workspaceRoot: "/srv/project" }
     };
     const runtime = new FakeSdkRuntime();
     runtime.queryFailure = Object.assign(new Error("manager generation changed"), {
@@ -4669,6 +4736,7 @@ describe("ClaudeCodeAdapter", () => {
         target: {
           ...derivedTarget,
           remoteWorkspace: {
+            kind: "ssh",
             hostTargetId: derivedTarget.id,
             hostId: "remote-host",
             workspaceRoot: "/srv/project"
@@ -4763,6 +4831,7 @@ describe("ClaudeCodeAdapter", () => {
       id: "remote-stored-target",
       workspaceRoot: "/srv/source",
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "remote-stored-target",
         hostId: "remote-store-host",
         workspaceRoot: "/srv/source"
@@ -4825,8 +4894,21 @@ describe("ClaudeCodeAdapter", () => {
     };
     expect(adapter.ownsNativeSessionDerivationLifecycle(lifecycle)).toBe(true);
     await adapter.adoptNativeSessionDerivation(lifecycle, new AbortController().signal);
+    const resumedDerivedTarget: TargetDescriptor = {
+      ...derivedTarget,
+      remoteWorkspace: {
+        ...derivedTarget.remoteWorkspace!,
+        workspaceRoot: derivedTarget.workspaceRoot
+      }
+    };
+    expect(claudeWorkspaceAuthority(resumedDerivedTarget)).toBe(claudeWorkspaceAuthority(derivedTarget));
+    expect(claudeWorkspaceAuthority(resumedDerivedTarget)).not.toBe(claudeWorkspaceAuthority(sourceTarget));
+    expect(claudeWorkspaceAuthority({
+      ...sourceTarget,
+      workspaceRoot: "C:\\service-owned-fallback"
+    })).toBe(claudeWorkspaceAuthority(sourceTarget));
     const derivedContext = {
-      ...contextFor(binding, { target: derivedTarget }).context,
+      ...contextFor(binding, { target: resumedDerivedTarget }).context,
       sessionId: "remote-stored-product"
     };
     await adapter.resumeSession(binding, derivedContext);
@@ -5448,6 +5530,7 @@ describe("ClaudeCodeAdapter", () => {
       id: "native-oauth-remote-target",
       workspaceRoot: "/srv/auth",
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "native-oauth-remote-target",
         hostId: "host-auth",
         workspaceRoot: "/srv/auth"

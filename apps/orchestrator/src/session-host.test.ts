@@ -1875,7 +1875,7 @@ describe("SessionHost", () => {
         backendId: "pi",
         displayName: "Remote target",
         workspaceRoot: "/workspace",
-        remoteWorkspace: { hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
+        remoteWorkspace: { kind: "ssh", hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
         managed: true,
         trusted: true
       } as const;
@@ -2038,7 +2038,7 @@ describe("SessionHost", () => {
         backendId: "pi",
         displayName: "Remote target",
         workspaceRoot: "/workspace",
-        remoteWorkspace: { hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
+        remoteWorkspace: { kind: "ssh", hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
         managed: true,
         trusted: true
       } as const;
@@ -10377,7 +10377,7 @@ describe("SessionHost", () => {
       backendId: adapter.id,
       displayName: "Remote source",
       workspaceRoot: "/workspace",
-      remoteWorkspace: { hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" },
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-one", hostId: "host-a", workspaceRoot: "/workspace" },
       managed: true,
       trusted: true
     });
@@ -10394,6 +10394,124 @@ describe("SessionHost", () => {
       publicError: { code: "SESSION_DERIVATION_WORKTREE_UNSUPPORTED", stateMayHaveChanged: false }
     });
     expect(cloneNative).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "SSH",
+      binding: {
+        kind: "ssh" as const,
+        hostTargetId: "remote-resume-target",
+        hostId: "host-a",
+        workspaceRoot: "/srv/project"
+      },
+      derivedRoot: "/srv/checkouts/resumed"
+    },
+    {
+      label: "Device peer",
+      binding: {
+        kind: "device_peer" as const,
+        controllerDeviceId: "controller-a",
+        targetDeviceId: "desktop-a",
+        workspaceRoot: "C:\\work\\project"
+      },
+      derivedRoot: "C:\\work\\checkouts\\resumed"
+    }
+  ])("resumes an active remote $label worktree with snapshotted identity and its authorized derived root", async ({ binding, derivedRoot }) => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    let fixture!: Awaited<ReturnType<typeof createFixture>>;
+    const worktrees = {
+      effectiveTarget: (session: Parameters<SessionWorktreeCoordinator["effectiveTarget"]>[0]) => {
+        const target = fixture.store.getTarget(session.descriptor.targetId).descriptor;
+        const worktree = session.descriptor.worktree;
+        if (worktree === undefined) return target;
+        return {
+          ...target,
+          workspaceRoot: worktree.path,
+          remoteWorkspace: { ...target.remoteWorkspace!, workspaceRoot: worktree.path }
+        };
+      }
+    } as unknown as SessionWorktreeCoordinator;
+    fixture = await createFixture(adapter, { worktrees });
+    if (binding.kind === "device_peer") {
+      fixture.store.createConnection({
+        id: "remote-resume-controller-connection",
+        deviceId: binding.controllerDeviceId,
+        device: { name: "Controller", kind: "web", platform: "web" },
+        name: "Controller",
+        authKeyDigest: "controller-digest"
+      });
+      fixture.store.createConnection({
+        id: "remote-resume-target-connection",
+        deviceId: binding.targetDeviceId,
+        device: { name: "Target", kind: "desktop", platform: "windows" },
+        name: "Target",
+        authKeyDigest: "target-digest"
+      });
+      fixture.store.setDeviceRemoteControlEnabled(binding.targetDeviceId, true);
+    }
+    await fixture.host.registerTarget({
+      id: "remote-resume-target",
+      backendId: adapter.id,
+      displayName: "Remote resume target",
+      workspaceRoot: fixture.directory,
+      remoteWorkspace: binding,
+      managed: true,
+      trusted: true
+    });
+    const sourceId = (await fixture.host.createSession({
+      operationId: `remote-resume-source-${binding.kind}`,
+      connection: fixture.connection,
+      targetId: "remote-resume-target",
+      title: "Remote source",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    await fixture.host.closeIfActive(sourceId);
+    const source = fixture.store.getSession(sourceId).descriptor;
+    const targetRevision = fixture.store.getTarget(source.targetId).revision.toString();
+    const resumed = fixture.store.createSession({
+      ...source,
+      id: `remote-resumed-${binding.kind}`,
+      title: "Remote resumed worktree",
+      binding: { ...source.binding, opaqueRef: `fake://remote-resumed/${binding.kind}` },
+      worktree: {
+        leaseId: `lease-${binding.kind}`,
+        workspaceId: `workspace-${binding.kind}`,
+        path: derivedRoot,
+        repositoryRoot: binding.workspaceRoot,
+        branch: "task-branch",
+        sourceRef: "main",
+        sourceCommit: "a".repeat(40),
+        sourceStrategy: "explicit",
+        sourceRefreshed: false,
+        remote: {
+          targetId: source.targetId,
+          binding,
+          executionIdentity: `execution-${binding.kind}`,
+          targetRevision,
+          manifestId: `manifest-${binding.kind}`
+        },
+        state: "active",
+        acquiredAt: 1,
+        updatedAt: 1
+      }
+    });
+    let resumedTarget: AdapterContext["target"] | undefined;
+    const resumeSession = adapter.resumeSession.bind(adapter);
+    vi.spyOn(adapter, "resumeSession").mockImplementation(async (nativeBinding, context) => {
+      resumedTarget = context.target;
+      return resumeSession(nativeBinding, context);
+    });
+
+    await fixture.host.resume(resumed.descriptor.id);
+
+    expect(resumedTarget).toMatchObject({
+      workspaceRoot: derivedRoot,
+      remoteWorkspace: { ...binding, workspaceRoot: derivedRoot }
+    });
+    expect(fixture.store.getSession(resumed.descriptor.id).descriptor.remoteWorkspace).toEqual(binding);
   });
 
   it("snapshots a private append prompt and safely advances a service-owned runtime identity", async () => {
@@ -12149,7 +12267,7 @@ describe("SessionHost", () => {
       workspaceRoot: directory,
       managed: false,
       trusted: true,
-      remoteWorkspace: { hostTargetId: "codex-remote-target", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "codex-remote-target", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
     } as const;
     await host.registerTarget(target);
     const nativeSessionId = remoteFake.seedThread(target.remoteWorkspace.workspaceRoot);

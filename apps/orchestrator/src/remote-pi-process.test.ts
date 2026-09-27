@@ -3,7 +3,7 @@ import { EventEmitter, once } from "node:events";
 import { link, mkdir, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
-import { join, posix as remotePath } from "node:path";
+import { join, posix as remotePath, win32, type PlatformPath } from "node:path";
 import { PassThrough } from "node:stream";
 
 import {
@@ -12,6 +12,8 @@ import {
   type PiProcessHandle,
   type PiProcessSpec
 } from "@joko/adapter-pi";
+import type { RemoteWorkspaceBinding } from "@joko/core";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteDirectoryEntry,
   RemoteFileReadRequest,
@@ -22,20 +24,133 @@ import type {
   RemoteProcessStartRequest,
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
+import type { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it } from "vitest";
 import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import { REMOTE_PI_BROKER_SOURCE_SHA256 } from "./remote-pi-broker-source.js";
+import type { RemoteWorkspaceAuthority } from "./remote-execution-router.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
 
 const temporaryDirectories: string[] = [];
+
+const TEST_REMOTE_WORKSPACE = Object.freeze({
+  kind: "ssh",
+  hostTargetId: "target-a",
+  hostId: "host-a",
+  workspaceRoot: "/workspace"
+} satisfies RemoteWorkspaceBinding);
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
 describe("RemotePiProcessFactory", () => {
+  it("routes a Win32 Device-peer Pi broker through the reserved Node locator with native target paths", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-peer-win32-"));
+    temporaryDirectories.push(fixture);
+    const runtime = join(fixture, "runtime");
+    const sessions = join(fixture, "sessions");
+    const control = join(runtime, "control.json");
+    const cli = join(fixture, "pi-cli.mjs");
+    await mkdir(runtime, { recursive: true });
+    await mkdir(sessions, { recursive: true });
+    await writeFile(control, JSON.stringify({ generation: 1 }), { mode: 0o600 });
+    await writeFile(cli, "export {};", { mode: 0o600 });
+
+    const binding = {
+      kind: "device_peer" as const,
+      controllerDeviceId: "controller-device",
+      targetDeviceId: "windows-device",
+      workspaceRoot: "C:\\Joko\\Workspace"
+    };
+    const files = new PiMemoryRemoteFiles("win32");
+    await files.mkdir(binding.workspaceRoot, { recursive: true });
+    await files.mkdir("C:\\Users\\maker", { recursive: true });
+    const requests: RemoteProcessStartRequest[] = [];
+    const remoteProcess = new SignalOnlyRemoteProcess();
+    const controlProcess = new ManualRemoteProcess();
+    const authorityRoot = join(fixture, "authority");
+    const store: Pick<OperationalStore, "getTarget"> = {
+      getTarget: () => ({ descriptor: { id: "target-peer", remoteWorkspace: binding } })
+    } as unknown as Pick<OperationalStore, "getTarget">;
+    const factory = new RemotePiProcessFactory({
+      authorityRoot,
+      store,
+      remoteExecution: {
+        workspace: async () => ({
+          kind: "device_peer" as const,
+          binding,
+          executionIdentity: "peer-execution",
+          authorityIdentity: "peer-authority",
+          pathStyle: "win32" as const,
+          files,
+          processes: {
+            open: async (request) => {
+              requests.push(request);
+              return request.args[1] === "kill" ? controlProcess : remoteProcess;
+            }
+          },
+          assertCurrent: () => undefined,
+          assertForwardingCurrent: () => undefined
+        })
+      }
+    });
+    const recoveryIdentity = testRecoveryIdentity("peer-session", "target-peer", binding);
+    const mapped = await factory.create({
+      command: process.execPath,
+      args: [cli],
+      cwd: binding.workspaceRoot,
+      env: {
+        JOKO_PI_TARGET_ID: "target-peer",
+        JOKO_PI_SPAWN_IDENTITY: "a".repeat(64),
+        JOKO_PI_REMOTE_RECOVERY_IDENTITY: recoveryIdentity,
+        JOKO_PI_GENERATION: "1",
+        JOKO_PI_MCP_TOKEN: "bridge-token-peer",
+        JOKO_PI_CONTROL_FILE: control,
+        PI_CODING_AGENT_SESSION_DIR: sessions
+      },
+      remoteWorkspace: binding
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      executable: DEVICE_PEER_RUNTIME_EXECUTABLES.node,
+      cwd: binding.workspaceRoot
+    });
+    expect(requests[0]!.args.slice(0, 3)).toEqual([
+      expect.stringMatching(/^C:\\Users\\maker\\\.joko\\pi-broker\\broker-[a-f0-9]{64}\.mjs$/u),
+      "bridge",
+      "C:\\Users\\maker\\.joko\\pi-broker"
+    ]);
+    const bootstrap = JSON.parse(remoteProcess.input[0]!.toString("utf8")) as Record<string, unknown>;
+    expect(bootstrap).toMatchObject({ executable: "node", cwd: binding.workspaceRoot });
+    expect(bootstrap.runtimeRoot).toMatch(/^C:\\Users\\maker\\\.joko\\runtime\\[a-f0-9]{32}$/u);
+    expect((bootstrap.args as string[])[0]).toMatch(
+      /^C:\\Users\\maker\\\.joko\\runtime\\[a-f0-9]{32}\\assets\\[a-f0-9]{64}-pi-cli\.mjs$/u
+    );
+    mapped.kill("SIGKILL");
+    await waitUntil(() => requests.length === 2);
+    expect(requests[1]).toMatchObject({
+      executable: DEVICE_PEER_RUNTIME_EXECUTABLES.node,
+      args: [
+        expect.stringMatching(/^C:\\Users\\maker\\\.joko\\pi-broker\\broker-[a-f0-9]{64}\.mjs$/u),
+        "kill",
+        "C:\\Users\\maker\\.joko\\pi-broker"
+      ],
+      cwd: binding.workspaceRoot
+    });
+    expect(requests.every((request) => request.cwd === binding.workspaceRoot)).toBe(true);
+    const exited = new Promise<void>((resolve) => {
+      mapped.once("exit", () => resolve());
+    });
+    remoteProcess.stdout.write(testFrame(4, 1, terminalContent(0, null)));
+    remoteProcess.stdout.end();
+    remoteProcess.stderr.end();
+    remoteProcess.complete(0);
+    await exited;
+  });
   it("installs the broker, sends secrets only in its bounded bootstrap, maps paths, and retains attachable state", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-"));
     temporaryDirectories.push(fixture);
@@ -112,13 +227,11 @@ describe("RemotePiProcessFactory", () => {
       }
     } as unknown as RemoteHostRegistry;
     const authorityRoot = join(fixture, "authority");
-    const factory = new RemotePiProcessFactory({ registry, authorityRoot });
+    const factory = remoteFactory(registry, authorityRoot);
     const secret = "runtime-only-provider-secret";
     const nativeAuthReservationToken = "r".repeat(43);
     const productSessionId = "11111111-1111-4111-8111-111111111111";
-    const recoveryIdentity = createHash("sha256")
-      .update([productSessionId, "target-a", "target-a", "host-a"].join("\0"))
-      .digest("hex");
+    const recoveryIdentity = testRecoveryIdentity(productSessionId, "target-a", TEST_REMOTE_WORKSPACE);
     const spec: PiProcessSpec = {
       command: process.execPath,
       args: [cli, "--mode", "rpc", "--extension", managedExtension],
@@ -138,7 +251,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_NATIVE_AUTH_RESERVATION_TOKEN: nativeAuthReservationToken,
         PROVIDER_RUNTIME_KEY: secret
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     };
 
     let factoryResolved = false;
@@ -272,7 +385,7 @@ describe("RemotePiProcessFactory", () => {
     });
     await store!.dispose();
 
-    const restartedFactory = new RemotePiProcessFactory({ registry, authorityRoot });
+    const restartedFactory = remoteFactory(registry, authorityRoot);
     const rediscovered = await restartedFactory.storeFor({
       sessionId: productSessionId,
       targetId: "target-a",
@@ -304,7 +417,7 @@ describe("RemotePiProcessFactory", () => {
     const initiallyFinalizedAuthority = JSON.parse(
       await readFile(join(authorityRoot, provisionalAuthorityFile!), "utf8")
     ) as Record<string, any>;
-    const finalizedFactory = new RemotePiProcessFactory({ registry, authorityRoot });
+    const finalizedFactory = remoteFactory(registry, authorityRoot);
     const finalizedStore = await finalizedFactory.storeFor({
       sessionId: productSessionId,
       targetId: "target-a",
@@ -356,8 +469,8 @@ describe("RemotePiProcessFactory", () => {
         }
       })
     } as unknown as RemoteHostRegistry;
-    const factory = new RemotePiProcessFactory({ registry, authorityRoot: join(fixture, "authority") });
-    await expect(factory.validate("target-a", "host-a", "/workspace")).rejects.toThrow("file transport is unavailable");
+    const factory = remoteFactory(registry, join(fixture, "authority"));
+    await expect(factory.validate(TEST_REMOTE_WORKSPACE)).rejects.toThrow("file transport is unavailable");
   });
 
   it("stages immutable snapshots when local launch assets and a resumed session mutate during transfer", async () => {
@@ -400,10 +513,7 @@ describe("RemotePiProcessFactory", () => {
     const registry = {
       transports: async () => ({ host: {}, lease })
     } as unknown as RemoteHostRegistry;
-    const mapped = await new RemotePiProcessFactory({
-      registry,
-      authorityRoot: join(fixture, "authority")
-    }).create({
+    const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc", "--session", nativeSession],
       cwd: "/workspace",
@@ -416,7 +526,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as Record<string, any>;
     const sessionIndex = bootstrap.args.indexOf("--session");
@@ -488,7 +598,7 @@ describe("RemotePiProcessFactory", () => {
         return { host: {}, lease: leaseFor(bridges[index]!) };
       }
     } as unknown as RemoteHostRegistry;
-    const factory = new RemotePiProcessFactory({ registry, authorityRoot: join(fixture, "authority") });
+    const factory = remoteFactory(registry, join(fixture, "authority"));
     const mapped = await factory.create({
       command: process.execPath,
       args: [cli, "--mode", "rpc"],
@@ -503,7 +613,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_MCP_DESCRIPTOR_FILE: descriptor,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
     const output: string[] = [];
@@ -621,7 +731,7 @@ describe("RemotePiProcessFactory", () => {
     } as unknown as RemoteHostRegistry;
     const authorityRoot = join(fixture, "authority");
     const recoveryIdentity = "b".repeat(64);
-    const first = await new RemotePiProcessFactory({ registry, authorityRoot }).create({
+    const first = await remoteFactory(registry, authorityRoot).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc", "--session-dir", sessions, "--session-id", "native-g1"],
       cwd: "/workspace",
@@ -635,7 +745,7 @@ describe("RemotePiProcessFactory", () => {
         PI_CODING_AGENT_DIR: agentHomeOne,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     const firstOutput = once(first.stdout, "data");
     firstBridge.stdout.write(testFrame(2, 1, Buffer.from('{"phase":"consumed"}\n')));
@@ -662,13 +772,13 @@ describe("RemotePiProcessFactory", () => {
         PI_CODING_AGENT_DIR: agentHomeTwo,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     };
     const [authorityFile] = await readdir(authorityRoot);
     const authorityLink = join(fixture, "linked-authority.json");
     await link(join(authorityRoot, authorityFile!), authorityLink);
     await expect(
-      new RemotePiProcessFactory({ registry, authorityRoot }).create(secondSpec)
+      remoteFactory(registry, authorityRoot).create(secondSpec)
     ).rejects.toThrow("not a regular file");
     await unlink(authorityLink);
     const authorityPath = join(authorityRoot, authorityFile!);
@@ -676,7 +786,7 @@ describe("RemotePiProcessFactory", () => {
     clockRollbackRecord.updatedAt = Date.now() + 6 * 60 * 60 * 1_000;
     await writeFile(authorityPath, `${JSON.stringify(clockRollbackRecord)}\n`, { mode: 0o600 });
 
-    const second = await new RemotePiProcessFactory({ registry, authorityRoot }).create(secondSpec);
+    const second = await remoteFactory(registry, authorityRoot).create(secondSpec);
     expect((second as { readonly serviceRecovery?: unknown }).serviceRecovery).toEqual({ required: true });
     const firstBootstrap = JSON.parse(firstBridge.input[0]!.toString("utf8")) as Record<string, any>;
     const secondBootstrap = JSON.parse(secondBridge.input[0]!.toString("utf8")) as Record<string, any>;
@@ -796,7 +906,7 @@ describe("RemotePiProcessFactory", () => {
     } as unknown as RemoteHostRegistry;
     const authorityRoot = join(fixture, "authority");
     const recoveryIdentity = "b".repeat(64);
-    const first = await new RemotePiProcessFactory({ registry, authorityRoot }).create({
+    const first = await remoteFactory(registry, authorityRoot).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc", "--session-id", "native-g1"],
       cwd: "/workspace",
@@ -809,10 +919,10 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: controlOne,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
-    const second = await new RemotePiProcessFactory({ registry, authorityRoot }).create({
+    const second = await remoteFactory(registry, authorityRoot).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc", "--session", nativeSession],
       cwd: "/workspace",
@@ -825,7 +935,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: controlTwo,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     expect(bridgeIndex).toBe(3);
     expect(requests.filter((request) => request.args[1] === "kill")).toHaveLength(0);
@@ -916,12 +1026,12 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
 
-    const first = await new RemotePiProcessFactory({ registry, authorityRoot })
+    const first = await remoteFactory(registry, authorityRoot)
       .create(spec(1, controlOne, resourceOne));
-    const second = await new RemotePiProcessFactory({ registry, authorityRoot })
+    const second = await remoteFactory(registry, authorityRoot)
       .create(spec(2, controlTwo, resourceTwo));
     const initial = JSON.parse(initialBridge.input[0]!.toString("utf8")) as Record<string, any>;
     const rejected = JSON.parse(mismatchBridge.input[0]!.toString("utf8")) as Record<string, any>;
@@ -983,7 +1093,7 @@ describe("RemotePiProcessFactory", () => {
     const registry = {
       transports: async () => ({ host: {}, lease })
     } as unknown as RemoteHostRegistry;
-    const mapped = await new RemotePiProcessFactory({ registry, authorityRoot: join(fixture, "authority") }).create({
+    const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc"],
       cwd: "/workspace",
@@ -996,7 +1106,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     expect(mapped.kill("SIGKILL")).toBe(true);
     await waitUntil(() => requests.length === 2);
@@ -1061,7 +1171,7 @@ describe("RemotePiProcessFactory", () => {
         };
       }
     } as unknown as RemoteHostRegistry;
-    const mapped = await new RemotePiProcessFactory({ registry, authorityRoot: join(fixture, "authority") }).create({
+    const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
       command: process.execPath,
       args: [cli, "--mode", "rpc"],
       cwd: "/workspace",
@@ -1074,7 +1184,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_CONTROL_FILE: control,
         PI_CODING_AGENT_SESSION_DIR: sessions
       },
-      remoteWorkspace: { hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
     const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
       mapped.once("exit", (code, signal) => resolveExit([code, signal]));
@@ -1251,18 +1361,29 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
   readonly readPaths: string[] = [];
   #clock = 1;
 
+  readonly pathStyle: "posix" | "win32";
+  readonly beforeWrite: ((request: RemoteFileWriteRequest) => void | Promise<void>) | undefined;
+
   constructor(
-    readonly beforeWrite?: (request: RemoteFileWriteRequest) => void | Promise<void>
-  ) {}
+    pathStyleOrBefore: "posix" | "win32" | ((request: RemoteFileWriteRequest) => void | Promise<void>) = "posix",
+    beforeWrite?: (request: RemoteFileWriteRequest) => void | Promise<void>
+  ) {
+    this.pathStyle = typeof pathStyleOrBefore === "string" ? pathStyleOrBefore : "posix";
+    this.beforeWrite = typeof pathStyleOrBefore === "function" ? pathStyleOrBefore : beforeWrite;
+  }
+
+  get paths(): PlatformPath { return this.pathStyle === "win32" ? win32 : remotePath; }
 
   async realpath(path: string): Promise<string> {
-    const accepted = path === "." ? "/home/maker" : normalizeRemote(path);
+    const accepted = path === "."
+      ? this.pathStyle === "win32" ? "C:\\Users\\maker" : "/home/maker"
+      : normalizeRemote(path, this.pathStyle);
     this.require(accepted);
     return accepted;
   }
 
   async stat(path: string): Promise<RemoteFileStat> {
-    const entry = this.require(normalizeRemote(path));
+    const entry = this.require(normalizeRemote(path, this.pathStyle));
     return {
       kind: entry.kind,
       size: entry.kind === "file" ? entry.content.byteLength : 0,
@@ -1272,16 +1393,16 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
   }
 
   async list(path: string): Promise<readonly RemoteDirectoryEntry[]> {
-    const parent = normalizeRemote(path);
+    const parent = normalizeRemote(path, this.pathStyle);
     if (this.require(parent).kind !== "directory") throw new Error("Not a directory.");
-    const prefix = `${parent}/`;
+    const prefix = `${parent}${this.paths.sep}`;
     return [...this.#entries]
-      .filter(([candidate]) => candidate.startsWith(prefix) && !candidate.slice(prefix.length).includes("/"))
+      .filter(([candidate]) => candidate.startsWith(prefix) && !candidate.slice(prefix.length).includes(this.paths.sep))
       .map(([candidate, entry]) => ({ name: candidate.slice(prefix.length), kind: entry.kind }));
   }
 
   async read(request: RemoteFileReadRequest): Promise<Uint8Array> {
-    const path = normalizeRemote(request.path);
+    const path = normalizeRemote(request.path, this.pathStyle);
     this.readPaths.push(path);
     const entry = this.require(path);
     if (entry.kind !== "file" || entry.content.byteLength > request.maximumBytes) throw new Error("Read failed.");
@@ -1290,8 +1411,8 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
 
   async write(request: RemoteFileWriteRequest): Promise<void> {
     await this.beforeWrite?.(request);
-    const accepted = normalizeRemote(request.path);
-    if (request.createParents === true) await this.mkdir(remotePath.dirname(accepted), { recursive: true });
+    const accepted = normalizeRemote(request.path, this.pathStyle);
+    if (request.createParents === true) await this.mkdir(this.paths.dirname(accepted), { recursive: true });
     this.#entries.set(accepted, {
       kind: "file",
       mode: request.mode ?? 0o600,
@@ -1301,9 +1422,9 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
   }
 
   async mkdir(path: string, options?: { readonly recursive?: boolean; readonly mode?: number }): Promise<void> {
-    const accepted = normalizeRemote(path);
+    const accepted = normalizeRemote(path, this.pathStyle);
     if (this.#entries.has(accepted)) return;
-    const parent = remotePath.dirname(accepted);
+    const parent = this.paths.dirname(accepted);
     if (parent !== accepted && !this.#entries.has(parent)) {
       if (options?.recursive !== true) throw new Error("Parent is missing.");
       await this.mkdir(parent, options);
@@ -1312,18 +1433,18 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
   }
 
   async rename(sourcePath: string, destinationPath: string): Promise<void> {
-    const source = normalizeRemote(sourcePath);
-    const destination = normalizeRemote(destinationPath);
+    const source = normalizeRemote(sourcePath, this.pathStyle);
+    const destination = normalizeRemote(destinationPath, this.pathStyle);
     const entry = this.require(source);
     this.#entries.delete(source);
     this.#entries.set(destination, entry);
   }
 
   async remove(path: string, options?: { readonly recursive?: boolean }): Promise<void> {
-    const accepted = normalizeRemote(path);
+    const accepted = normalizeRemote(path, this.pathStyle);
     if (options?.recursive === true) {
       for (const candidate of [...this.#entries.keys()]) {
-        if (candidate === accepted || candidate.startsWith(`${accepted}/`)) this.#entries.delete(candidate);
+        if (candidate === accepted || candidate.startsWith(`${accepted}${this.paths.sep}`)) this.#entries.delete(candidate);
       }
       return;
     }
@@ -1331,7 +1452,7 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
   }
 
   text(path: string): string {
-    const entry = this.require(normalizeRemote(path));
+    const entry = this.require(normalizeRemote(path, this.pathStyle));
     if (entry.kind !== "file") throw new Error("Not a file.");
     return entry.content.toString("utf8");
   }
@@ -1344,7 +1465,7 @@ class PiMemoryRemoteFiles implements RemoteFileTransportPort {
   }
 
   has(path: string): boolean {
-    return this.#entries.has(normalizeRemote(path));
+    return this.#entries.has(normalizeRemote(path, this.pathStyle));
   }
 
   private require(path: string): PiMemoryEntry {
@@ -1426,7 +1547,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
       const authority = recovery === undefined ? {
         format: 1,
         targetId: requested.targetId,
-        hostId: requested.hostId,
+        routeIdentity: requested.routeIdentity,
         recoveryIdentity: requested.recoveryIdentity,
         spawnIdentity: requested.spawnIdentity,
         runtimeGeneration: generation,
@@ -1527,9 +1648,66 @@ class SignalOnlyRemoteProcess extends ManualRemoteProcess {
   }
 }
 
-function normalizeRemote(value: string): string {
-  if (!value.startsWith("/")) throw new Error("Remote path must be absolute.");
-  const normalized = remotePath.normalize(value);
-  if (normalized.includes("/../") || normalized.endsWith("/..")) throw new Error("Unsafe remote path.");
+function remoteFactory(registry: Pick<RemoteHostRegistry, "transports">, authorityRoot: string): RemotePiProcessFactory {
+  const store = {
+    getTarget: (targetId: string) => ({
+      descriptor: {
+        id: targetId,
+        remoteWorkspace: TEST_REMOTE_WORKSPACE
+      }
+    })
+  } as unknown as Pick<OperationalStore, "getTarget">;
+  return new RemotePiProcessFactory({
+    authorityRoot,
+    store,
+    remoteExecution: {
+      workspace: async (binding, signal) => {
+        if (binding.kind !== "ssh") throw new Error("The SSH test transport received a peer binding.");
+        const { lease } = await registry.transports(binding.hostTargetId, binding.hostId, signal);
+        if (!lease.capabilities.fileTransfer || lease.files === undefined) {
+          throw new Error("Remote file transport is unavailable.");
+        }
+        if (!lease.capabilities.processStreaming || lease.processes === undefined) {
+          throw new Error("Remote process transport is unavailable.");
+        }
+        return {
+          kind: "ssh",
+          binding,
+          executionIdentity: "ssh-test-execution",
+          authorityIdentity: "ssh-test-authority",
+          pathStyle: "posix",
+          files: lease.files,
+          processes: lease.processes,
+          ...(lease.capabilities.tcpForwarding && lease.forwarding !== undefined
+            ? { forwarding: lease.forwarding }
+            : {}),
+          assertCurrent: () => undefined,
+          assertForwardingCurrent: () => undefined
+        } satisfies RemoteWorkspaceAuthority;
+      }
+    }
+  });
+}
+
+function testRecoveryIdentity(
+  sessionId: string,
+  targetId: string,
+  binding: RemoteWorkspaceBinding
+): string {
+  const routeIdentity = binding.kind === "ssh"
+    ? JSON.stringify({ kind: binding.kind, hostTargetId: binding.hostTargetId, hostId: binding.hostId })
+    : JSON.stringify({
+        kind: binding.kind,
+        controllerDeviceId: binding.controllerDeviceId,
+        targetDeviceId: binding.targetDeviceId
+      });
+  return createHash("sha256").update([sessionId, targetId, routeIdentity].join("\0")).digest("hex");
+}
+
+function normalizeRemote(value: string, pathStyle: "posix" | "win32" = "posix"): string {
+  const paths = pathStyle === "win32" ? win32 : remotePath;
+  if (!paths.isAbsolute(value)) throw new Error("Remote path must be absolute.");
+  const normalized = paths.normalize(value);
+  if (normalized !== value) throw new Error("Unsafe remote path.");
   return normalized;
 }

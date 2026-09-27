@@ -7,6 +7,7 @@ import {
   CollaborationService,
   ConnectionService,
   ContactService,
+  DevicePeerService,
   EventService,
   ExtensionService,
   InteractionService,
@@ -34,6 +35,7 @@ export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
   readonly collaboration: Client<typeof CollaborationService>;
   readonly contact: Client<typeof ContactService>;
+  readonly devicePeer: Client<typeof DevicePeerService>;
   readonly event: Client<typeof EventService>;
   readonly extension: Client<typeof ExtensionService>;
   readonly operation: Client<typeof OperationService>;
@@ -85,6 +87,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     connection: createClient(ConnectionService, transport),
     collaboration: createClient(CollaborationService, transport),
     contact: createClient(ContactService, transport),
+    devicePeer: createClient(DevicePeerService, transport),
     event: createClient(EventService, transport),
     extension: createClient(ExtensionService, transport),
     operation: createClient(OperationService, transport),

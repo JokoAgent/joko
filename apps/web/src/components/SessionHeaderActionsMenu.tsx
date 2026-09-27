@@ -76,7 +76,7 @@ export function SessionHeaderActionsMenu({
   const menuId = useId();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
-  const canMove = !session.archived && session.remoteWorkspace !== true && onMoveSessionProject !== undefined;
+  const canMove = !session.archived && session.remoteWorkspace === undefined && onMoveSessionProject !== undefined;
 
   const close = (): void => {
     detailsRef.current?.removeAttribute("open");

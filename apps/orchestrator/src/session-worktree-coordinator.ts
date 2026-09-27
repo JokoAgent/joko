@@ -316,9 +316,8 @@ export class SessionWorktreeCoordinator {
     const source = this.#store.getSession(input.sourceSessionId);
     const target = this.#store.getTarget(source.descriptor.targetId);
     const remote = target.descriptor.remoteWorkspace;
-    if (remote === undefined || source.descriptor.remoteWorkspace?.hostTargetId !== remote.hostTargetId
-      || source.descriptor.remoteWorkspace.hostId !== remote.hostId
-      || source.descriptor.remoteWorkspace.workspaceRoot !== remote.workspaceRoot) {
+    const sourceRemote = source.descriptor.remoteWorkspace;
+    if (remote === undefined || sourceRemote === undefined || !sameRemoteWorkspace(sourceRemote, remote)) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     const sourceBinding = source.descriptor.worktree;
@@ -433,8 +432,7 @@ export class SessionWorktreeCoordinator {
     if (worktree.state !== "active") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     if (worktree.remote !== undefined) {
       if (target.remoteWorkspace === undefined || worktree.remote.targetId !== target.id
-        || worktree.remote.hostTargetId !== target.remoteWorkspace.hostTargetId
-        || worktree.remote.hostId !== target.remoteWorkspace.hostId) {
+        || !sameRemoteWorkspace(worktree.remote.binding, target.remoteWorkspace)) {
         throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
       }
       return {
@@ -635,7 +633,7 @@ export class SessionWorktreeCoordinator {
     const remote = target.descriptor.remoteWorkspace;
     if (remote === undefined || binding.remote === undefined || binding.remote.targetId !== target.descriptor.id
       || binding.remote.targetRevision !== target.revision.toString()
-      || binding.remote.hostTargetId !== remote.hostTargetId || binding.remote.hostId !== remote.hostId
+      || !sameRemoteWorkspace(binding.remote.binding, remote)
       || binding.state !== "active") {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
@@ -646,9 +644,7 @@ export class SessionWorktreeCoordinator {
       trusted: target.descriptor.trusted,
       remote: {
         targetId: target.descriptor.id,
-        hostTargetId: remote.hostTargetId,
-        hostId: remote.hostId,
-        workspaceRoot: binding.path
+        binding: { ...remote, workspaceRoot: binding.path }
       }
     });
   }
@@ -731,6 +727,18 @@ function remoteBindingMatchesPlan(binding: SessionWorktreeBinding, plan: RemoteG
     && binding.sourceCommit === plan.sourceCommit && binding.sourceStrategy === plan.sourceStrategy
     && binding.sourceRefreshed === plan.sourceRefreshed
     && operationBodyHash(binding.remote) === operationBodyHash(plan.remote);
+}
+
+function sameRemoteWorkspace(
+  left: NonNullable<TargetDescriptor["remoteWorkspace"]>,
+  right: NonNullable<TargetDescriptor["remoteWorkspace"]>
+): boolean {
+  if (left.kind !== right.kind || left.workspaceRoot !== right.workspaceRoot) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function probeEligibility(code: WorktreeErrorCode): TargetWorktreeEligibility {

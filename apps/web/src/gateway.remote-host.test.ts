@@ -129,12 +129,19 @@ describe("Remote Host gateway", () => {
       ...(revision === undefined ? {} : { version: { revision: { value: revision } } })
     }] }))).toThrow("Target without a current revision");
   });
-  it("rejects the obsolete remote binding shape without a source Target", () => {
+  it.each([undefined, {}])("rejects a Target projection without an explicit workspace location (%s)", (location) => {
     expect(() => mapSnapshot(create(SnapshotSchema, { targets: [{
       targetId: "target-one", backendId: "backend", workspaceId: "workspace-one",
       version: { revision: { value: 1n } },
-      remoteWorkspace: { hostId: "build-box", workspaceRootDisplay: "/srv/project" }
-    }] }))).toThrow("incomplete remote workspace binding");
+      ...(location === undefined ? {} : { location })
+    }] }))).toThrow("Target without an explicit workspace location");
+  });
+  it("rejects an incomplete SSH workspace location without a source Target", () => {
+    expect(() => mapSnapshot(create(SnapshotSchema, { targets: [{
+      targetId: "target-one", backendId: "backend", workspaceId: "workspace-one",
+      version: { revision: { value: 1n } },
+      location: { kind: { case: "sshHost", value: { hostId: "build-box", workspaceRootDisplay: "/srv/project" } } }
+    }] }))).toThrow("incomplete SSH workspace location");
   });
   it("uses generated contracts for capability, CRUD, status, TOFU, and remote workspace binding", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];
@@ -182,6 +189,7 @@ describe("Remote Host gateway", () => {
 
     expect(snapshot?.targets[0]?.revision).toBe(7n);
     expect(snapshot?.targets[0]?.remoteWorkspace).toEqual({
+      kind: "ssh",
       hostTargetId: "target-one",
       hostId: "build-box",
       workspaceRoot: "/srv/project"
@@ -252,10 +260,10 @@ describe("Remote Host gateway", () => {
       case: "updateTarget",
       value: {
         targetId: "target-one",
-        workspaceLocationUpdate: {
-          case: "remoteWorkspace",
+        location: { kind: {
+          case: "sshHost",
           value: { hostId: "build-box", workspaceRootDisplay: "/srv/project" }
-        }
+        } }
       }
     });
     expect(requests.find((request) => request.method === "submitOperation")?.input.mutation.preconditions).toMatchObject([{
@@ -605,7 +613,9 @@ function remoteTransport(handler: (method: string, input: any) => unknown, snaps
               displayName: "Project",
               workspaceId: "workspace-one",
               version: { revision: { value: 7n } },
-              remoteWorkspace: { hostTargetId: "target-one", hostId: "build-box", workspaceRootDisplay: "/srv/project" }
+              location: { kind: { case: "sshHost", value: {
+                hostTargetId: "target-one", hostId: "build-box", workspaceRootDisplay: "/srv/project"
+              } } }
             }],
             ...snapshotFields
           })

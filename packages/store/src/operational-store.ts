@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync
 } from "node:fs";
-import path from "node:path";
+import path, { type PlatformPath } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 
@@ -23,6 +23,7 @@ import type {
   PromptInput,
   PublicError,
   QueueState,
+  RemoteWorkspaceBinding,
   RunDescriptor,
   RunState,
   NativeSessionBinding,
@@ -1562,6 +1563,16 @@ export class OperationalStore {
     return row === undefined ? undefined : desktopHostAuthorizationFromRow(row);
   }
 
+  findDesktopHostAuthorizationByAuthKeyDigest(
+    authKeyDigest: string
+  ): DesktopHostAuthorizationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(
+      "SELECT * FROM desktop_host_authorizations WHERE auth_key_digest = ?"
+    ).get(normalizedPrivateDigest(authKeyDigest, "Desktop host authorization digest")) as Row | undefined;
+    return row === undefined ? undefined : desktopHostAuthorizationFromRow(row);
+  }
+
   getDesktopHostAuthorization(connectionId: string): DesktopHostAuthorizationRecord {
     const record = this.findDesktopHostAuthorization(connectionId);
     if (record === undefined) throw new NotFoundError("Desktop host authorization", connectionId);
@@ -2372,22 +2383,29 @@ export class OperationalStore {
   upsertTarget(descriptor: TargetDescriptor, metadata: unknown = {}, now = this.now()): StoredTarget {
     return this.write(() => {
       this.getBackend(descriptor.backendId);
-      const remoteWorkspace = descriptor.remoteWorkspace === undefined
-        ? undefined
-        : {
-            hostTargetId: remoteHostIdentity(descriptor.remoteWorkspace.hostTargetId, "host target id", 256),
-            hostId: remoteHostAlias(descriptor.remoteWorkspace.hostId),
-            workspaceRoot: remoteWorkspaceRoot(descriptor.remoteWorkspace.workspaceRoot)
-          };
-      if (remoteWorkspace !== undefined && remoteWorkspace.hostTargetId !== descriptor.id) {
+      const remoteWorkspace = normalizeRemoteWorkspace(descriptor.remoteWorkspace);
+      const existingRow = this.database.prepare("SELECT * FROM targets WHERE id = ?").get(descriptor.id) as Row | undefined;
+      if (existingRow !== undefined) {
+        const existingRemoteWorkspace = remoteWorkspaceFromRow(existingRow, "Target");
+        if ((existingRemoteWorkspace?.kind === "device_peer" || remoteWorkspace?.kind === "device_peer")
+          && !sameRemoteWorkspace(existingRemoteWorkspace, remoteWorkspace)) {
+          throw new StoreError("A Device peer Target workspace binding is immutable.");
+        }
+      }
+      if (remoteWorkspace?.kind === "ssh" && remoteWorkspace.hostTargetId !== descriptor.id) {
         this.getTarget(remoteWorkspace.hostTargetId);
+      }
+      if (remoteWorkspace?.kind === "device_peer") {
+        this.getDevice(remoteWorkspace.controllerDeviceId);
+        this.getDevice(remoteWorkspace.targetDeviceId);
       }
       this.database.prepare(`
         INSERT INTO targets(
           id, backend_id, display_name, workspace_root, managed, trusted,
-          metadata_json, remote_host_target_id, remote_host_id, remote_workspace_root,
+          metadata_json, remote_location_kind, remote_host_target_id, remote_host_id,
+          remote_controller_device_id, remote_target_device_id, remote_workspace_root,
           created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           backend_id = excluded.backend_id,
           display_name = excluded.display_name,
@@ -2395,8 +2413,11 @@ export class OperationalStore {
           managed = excluded.managed,
           trusted = excluded.trusted,
           metadata_json = excluded.metadata_json,
+          remote_location_kind = excluded.remote_location_kind,
           remote_host_target_id = excluded.remote_host_target_id,
           remote_host_id = excluded.remote_host_id,
+          remote_controller_device_id = excluded.remote_controller_device_id,
+          remote_target_device_id = excluded.remote_target_device_id,
           remote_workspace_root = excluded.remote_workspace_root,
           updated_at = excluded.updated_at,
           revision = excluded.revision
@@ -2408,8 +2429,11 @@ export class OperationalStore {
         boolInt(descriptor.managed),
         boolInt(descriptor.trusted),
         serializeJson(metadata),
-        remoteWorkspace?.hostTargetId ?? null,
-        remoteWorkspace?.hostId ?? null,
+        remoteWorkspace?.kind ?? null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostTargetId : null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.controllerDeviceId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.targetDeviceId : null,
         remoteWorkspace?.workspaceRoot ?? null,
         now,
         now,
@@ -2889,13 +2913,7 @@ export class OperationalStore {
       }
       const projectId = descriptor.projectId ?? descriptor.targetId;
       this.getTarget(projectId);
-      const remoteWorkspace = descriptor.remoteWorkspace === undefined
-        ? undefined
-        : {
-            hostTargetId: remoteHostIdentity(descriptor.remoteWorkspace.hostTargetId, "host target id", 256),
-            hostId: remoteHostAlias(descriptor.remoteWorkspace.hostId),
-            workspaceRoot: remoteWorkspaceRoot(descriptor.remoteWorkspace.workspaceRoot)
-          };
+      const remoteWorkspace = normalizeRemoteWorkspace(descriptor.remoteWorkspace);
       if (!sameRemoteWorkspace(remoteWorkspace, target.descriptor.remoteWorkspace)) {
         throw new StoreError("Session Remote workspace must match its target at creation time.");
       }
@@ -2957,10 +2975,11 @@ export class OperationalStore {
           summary_source_cursor, summary_updated_at, native_opaque_ref, native_binding_fingerprint, native_session_id,
           generation, pinned, archived, deleted_at, permission_mode, plan_mode,
           provider_id, model_id, effort, fast_mode, append_system_prompt,
-          remote_host_target_id, remote_host_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
+          remote_location_kind, remote_host_target_id, remote_host_id, remote_controller_device_id,
+          remote_target_device_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
           automation_run_id, derivation_kind, derivation_source_session_id,
           derivation_source_message_id, derivation_source_event_id, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         descriptor.id,
         descriptor.backendId,
@@ -2985,8 +3004,11 @@ export class OperationalStore {
         descriptor.effort ?? null,
         boolInt(descriptor.fastMode),
         descriptor.appendSystemPrompt ?? null,
-        remoteWorkspace?.hostTargetId ?? null,
-        remoteWorkspace?.hostId ?? null,
+        remoteWorkspace?.kind ?? null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostTargetId : null,
+        remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.controllerDeviceId : null,
+        remoteWorkspace?.kind === "device_peer" ? remoteWorkspace.targetDeviceId : null,
         remoteWorkspace?.workspaceRoot ?? null,
         automationOrigin?.scheduleId ?? null,
         automationOrigin?.scheduleName ?? null,
@@ -3011,10 +3033,9 @@ export class OperationalStore {
           INSERT INTO session_worktrees(
             session_id, lease_id, workspace_id, working_path, repository_root,
             branch, source_ref, source_commit, source_strategy, source_refreshed,
-            source_remote, remote_host_owner_id, remote_host_target_id, remote_host_id,
-            remote_host_identity, remote_target_id, remote_target_revision, remote_host_revision,
+            source_remote, remote_authority_json, remote_target_id, remote_target_revision,
             remote_manifest_id, state, acquired_at, updated_at, revision
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           descriptor.id,
           worktree.leaseId,
@@ -3027,13 +3048,9 @@ export class OperationalStore {
           worktree.sourceStrategy,
           boolInt(worktree.sourceRefreshed),
           worktree.sourceRemote ?? null,
-          worktree.remote?.hostOwnerId ?? null,
-          worktree.remote?.hostTargetId ?? null,
-          worktree.remote?.hostId ?? null,
-          worktree.remote?.hostIdentity ?? null,
+          worktree.remote === undefined ? null : JSON.stringify(worktree.remote),
           worktree.remote?.targetId ?? null,
           worktree.remote === undefined ? null : asSqlInteger(BigInt(worktree.remote.targetRevision)),
-          worktree.remote === undefined ? null : asSqlInteger(BigInt(worktree.remote.hostRevision)),
           worktree.remote?.manifestId ?? null,
           worktree.state,
           worktree.acquiredAt,
@@ -6526,9 +6543,10 @@ export class OperationalStore {
           target_id, source_session_revision, target_revision, derived_worktree_json, derived_worktree_digest,
           remote_worktree_plan_json, remote_worktree_plan_digest,
           external_lifecycle, source_native_opaque_ref, source_native_session_id, source_generation,
-          effective_workspace_root, remote_host_target_id, remote_host_id, remote_workspace_root,
+          effective_workspace_root, remote_location_kind, remote_host_target_id, remote_host_id,
+          remote_controller_device_id, remote_target_device_id, remote_workspace_root,
           native_opaque_ref, native_session_id, generation, state, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'prepared', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'prepared', ?, ?, ?)
       `).run(
         normalized.operationId, normalized.expectedBodyHash, normalized.sourceSessionId, normalized.sessionId,
         normalized.backendId, normalized.backendInstanceGeneration, normalized.backendInstanceGeneration,
@@ -6538,8 +6556,12 @@ export class OperationalStore {
         remoteWorktreePlan?.json ?? null, remoteWorktreePlan?.digest ?? null,
         normalized.sourceBinding.opaqueRef, normalized.sourceBinding.nativeSessionId ?? null,
         normalized.sourceBinding.generation, normalized.effectiveWorkspaceRoot,
-        normalized.remoteWorkspace?.hostTargetId ?? null,
-        normalized.remoteWorkspace?.hostId ?? null, normalized.remoteWorkspace?.workspaceRoot ?? null,
+        normalized.remoteWorkspace?.kind ?? null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostTargetId : null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.controllerDeviceId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.targetDeviceId : null,
+        normalized.remoteWorkspace?.workspaceRoot ?? null,
         at, at, asSqlInteger(this.requireActiveRevision())
       );
       return this.findNativeSessionDerivation(normalized.operationId)!;
@@ -6586,7 +6608,7 @@ export class OperationalStore {
         || !sameRemoteWorkspace(target.descriptor.remoteWorkspace, record.remoteWorkspace)) {
         throw new StoreError("The remote derivation checkout source authority changed.");
       }
-      this.assertNativeDerivationRemoteWorktreeOwner(record.remoteWorktreePlan, source, target, false);
+      this.assertNativeDerivationRemoteWorktreeOwner(record.remoteWorktreePlan, source, target);
       const encoded = encodeNativeDerivationWorktree(worktree);
       const changed = this.database.prepare(`
         UPDATE native_session_derivations
@@ -6605,8 +6627,7 @@ export class OperationalStore {
   private assertNativeDerivationRemoteWorktreeOwner(
     plan: RemoteNativeDerivationWorktreePlan,
     source: StoredSession,
-    target: StoredTarget,
-    requireAcquisitionRevision = true
+    target: StoredTarget
   ): void {
     const remote = plan.remote;
     if (!target.descriptor.trusted || remote.targetId !== target.descriptor.id
@@ -6633,13 +6654,26 @@ export class OperationalStore {
       || !sameStableRemoteWorktreeAuthority(sourceWorktree.remote, plan.sourceLease.remote))) {
       throw new StoreError("The remote derivation source checkout authority changed.");
     }
-    const hostTarget = this.getTarget(remote.hostTargetId);
-    if (!hostTarget.descriptor.trusted) throw new StoreError("The remote derivation Host Target is not trusted.");
-    const host = this.getRemoteHost(remote.hostOwnerId, remote.hostTargetId, remote.hostId);
-    if ((requireAcquisitionRevision && host.revision.toString() !== remote.hostRevision)
-      || host.status.state !== "ready"
-      || host.trust === undefined) {
-      throw new StoreError("The remote derivation Host authority changed.");
+    if (remote.binding.kind === "ssh") {
+      const hostTarget = this.getTarget(remote.binding.hostTargetId);
+      if (!hostTarget.descriptor.trusted) throw new StoreError("The remote derivation Host Target is not trusted.");
+      const execution = parseRemoteWorktreeExecutionIdentity(remote.executionIdentity, "ssh");
+      const host = this.getRemoteHost(execution.ownerId, remote.binding.hostTargetId, remote.binding.hostId);
+      if (host.status.state !== "ready" || host.trust === undefined
+        || remote.executionIdentity !== remoteSshWorktreeExecutionIdentity(remote.binding, host)) {
+        throw new StoreError("The remote derivation Host authority changed.");
+      }
+      return;
+    }
+    const execution = parseRemoteWorktreeExecutionIdentity(remote.executionIdentity, "device_peer");
+    const controller = this.getDevice(remote.binding.controllerDeviceId);
+    const device = this.getDevice(remote.binding.targetDeviceId);
+    const relation = this.getDeviceControlRelation(controller.id, device.id);
+    if (execution.controllerDeviceId !== controller.id || execution.targetDeviceId !== device.id
+      || controller.state !== "active" || device.state !== "active"
+      || (device.kind !== "desktop" && device.kind !== "service") || !device.remoteControlEnabled
+      || !relation.outboundEnabled || !relation.inboundAllowed) {
+      throw new StoreError("The remote derivation Device peer authority changed.");
     }
   }
 
@@ -6729,9 +6763,11 @@ export class OperationalStore {
           target_id, source_session_revision, target_revision, derived_worktree_json, derived_worktree_digest,
           remote_worktree_plan_json, remote_worktree_plan_digest,
           external_lifecycle, source_native_opaque_ref, source_native_session_id, source_generation,
-          effective_workspace_root, remote_host_target_id, remote_host_id, remote_workspace_root, native_opaque_ref, native_session_id,
+          effective_workspace_root, remote_location_kind, remote_host_target_id, remote_host_id,
+          remote_controller_device_id, remote_target_device_id, remote_workspace_root,
+          native_opaque_ref, native_session_id,
           generation, state, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', ?, ?, ?)
       `).run(
         normalized.operationId, normalized.expectedBodyHash, normalized.sourceSessionId, normalized.sessionId,
         normalized.backendId, normalized.backendInstanceGeneration, normalized.backendInstanceGeneration,
@@ -6739,8 +6775,12 @@ export class OperationalStore {
         worktree?.json ?? null, worktree?.digest ?? null,
         normalized.sourceBinding.opaqueRef, normalized.sourceBinding.nativeSessionId ?? null,
         normalized.sourceBinding.generation, normalized.effectiveWorkspaceRoot,
-        normalized.remoteWorkspace?.hostTargetId ?? null,
-        normalized.remoteWorkspace?.hostId ?? null, normalized.remoteWorkspace?.workspaceRoot ?? null,
+        normalized.remoteWorkspace?.kind ?? null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostTargetId : null,
+        normalized.remoteWorkspace?.kind === "ssh" ? normalized.remoteWorkspace.hostId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.controllerDeviceId : null,
+        normalized.remoteWorkspace?.kind === "device_peer" ? normalized.remoteWorkspace.targetDeviceId : null,
+        normalized.remoteWorkspace?.workspaceRoot ?? null,
         normalized.binding.opaqueRef, normalized.binding.nativeSessionId ?? null, normalized.binding.generation,
         at, at, asSqlInteger(this.requireActiveRevision())
       );
@@ -17286,13 +17326,7 @@ function backendFromRow(row: Row): StoredBackend {
 }
 
 function targetFromRow(row: Row): StoredTarget {
-  const remoteHostTargetId = optionalString("hostTargetId", row["remote_host_target_id"]).hostTargetId;
-  const remoteHostId = optionalString("hostId", row["remote_host_id"]).hostId;
-  const remoteRoot = optionalString("workspaceRoot", row["remote_workspace_root"]).workspaceRoot;
-  if ((remoteHostTargetId === undefined) !== (remoteHostId === undefined)
-    || (remoteHostId === undefined) !== (remoteRoot === undefined)) {
-    throw new StoreError("Stored Target Remote workspace binding is incomplete.");
-  }
+  const remoteWorkspace = remoteWorkspaceFromRow(row, "Target");
   return {
     descriptor: {
       id: stringValue(row["id"]),
@@ -17301,15 +17335,7 @@ function targetFromRow(row: Row): StoredTarget {
       workspaceRoot: stringValue(row["workspace_root"]),
       managed: booleanValue(row["managed"]),
       trusted: booleanValue(row["trusted"]),
-      ...(remoteHostTargetId === undefined || remoteHostId === undefined || remoteRoot === undefined
-        ? {}
-        : {
-            remoteWorkspace: {
-              hostTargetId: remoteHostIdentity(remoteHostTargetId, "host target id", 256),
-              hostId: remoteHostAlias(remoteHostId),
-              workspaceRoot: remoteWorkspaceRoot(remoteRoot)
-            }
-          })
+      ...(remoteWorkspace === undefined ? {} : { remoteWorkspace })
     },
     metadata: parseJson(stringValue(row["metadata_json"])),
     createdAt: numberValue(row["created_at"]),
@@ -17410,9 +17436,7 @@ function remoteHostFromRow(row: Row): RemoteHostRecord {
 }
 
 function sessionFromRow(row: Row): StoredSession {
-  const remoteHostTargetId = optionalString("hostTargetId", row["remote_host_target_id"]).hostTargetId;
-  const remoteHostId = optionalString("hostId", row["remote_host_id"]).hostId;
-  const remoteRoot = optionalString("workspaceRoot", row["remote_workspace_root"]).workspaceRoot;
+  const remoteWorkspace = remoteWorkspaceFromRow(row, "Session");
   const automationScheduleId = optionalString("scheduleId", row["automation_schedule_id"]).scheduleId;
   const automationScheduleName = optionalString("scheduleName", row["automation_schedule_name"]).scheduleName;
   const automationRunId = optionalString("runId", row["automation_run_id"]).runId;
@@ -17429,10 +17453,6 @@ function sessionFromRow(row: Row): StoredSession {
     "sourceEventId",
     row["derivation_source_event_id"]
   ).sourceEventId;
-  if ((remoteHostTargetId === undefined) !== (remoteHostId === undefined)
-    || (remoteHostId === undefined) !== (remoteRoot === undefined)) {
-    throw new StoreError("Stored Session Remote workspace binding is incomplete.");
-  }
   if ((automationScheduleId === undefined) !== (automationRunId === undefined) ||
     (automationScheduleId === undefined && automationScheduleName !== undefined)) {
     throw new StoreError("Stored Session automation origin is incomplete.");
@@ -17497,15 +17517,7 @@ function sessionFromRow(row: Row): StoredSession {
       ...optionalString("effort", row["effort"]),
       fastMode: booleanValue(row["fast_mode"]),
       ...optionalString("appendSystemPrompt", row["append_system_prompt"]),
-      ...(remoteHostTargetId === undefined || remoteHostId === undefined || remoteRoot === undefined
-        ? {}
-        : {
-            remoteWorkspace: {
-              hostTargetId: remoteHostIdentity(remoteHostTargetId, "host target id", 256),
-              hostId: remoteHostAlias(remoteHostId),
-              workspaceRoot: remoteWorkspaceRoot(remoteRoot)
-            }
-          }),
+      ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
       createdAt: numberValue(row["created_at"]),
       updatedAt: numberValue(row["updated_at"])
     },
@@ -17876,16 +17888,11 @@ function sessionWorktreeFromRow(row: Row): SessionWorktreeBinding {
     ] as const),
     sourceRefreshed: booleanValue(row["source_refreshed"]),
     ...optionalString("sourceRemote", row["source_remote"]),
-    ...(row["remote_host_owner_id"] === null ? {} : { remote: normalizeRemoteWorktreeAuthority({
-      hostOwnerId: stringValue(row["remote_host_owner_id"]),
-      hostTargetId: stringValue(row["remote_host_target_id"]),
-      hostId: stringValue(row["remote_host_id"]),
-      hostIdentity: stringValue(row["remote_host_identity"]),
-      targetId: stringValue(row["remote_target_id"]),
-      targetRevision: toBigInt(row["remote_target_revision"]).toString(),
-      hostRevision: toBigInt(row["remote_host_revision"]).toString(),
-      manifestId: stringValue(row["remote_manifest_id"])
-    }) }),
+    ...(row["remote_authority_json"] === null ? {} : {
+      remote: normalizeRemoteWorktreeAuthority(
+        parseJson<NonNullable<SessionWorktreeBinding["remote"]>>(stringValue(row["remote_authority_json"]))
+      )
+    }),
     state: enumValue(row["state"], ["active", "preserved"] as const),
     acquiredAt: numberValue(row["acquired_at"]),
     updatedAt: numberValue(row["updated_at"])
@@ -18063,6 +18070,7 @@ function normalizeNativeSessionDerivationCommon(input: Omit<RecordNativeSessionD
     throw new StoreError("Native derivation backend generation is invalid.");
   }
   if (!/^sha256:[a-f0-9]{64}$/u.test(input.expectedBodyHash)) throw new StoreError("Native derivation body hash is invalid.");
+  const remoteWorkspace = normalizeRemoteWorkspace(input.remoteWorkspace);
   return {
     operationId: nativeDerivationIdentity(input.operationId, "Operation ID"),
     expectedBodyHash: input.expectedBodyHash,
@@ -18072,14 +18080,12 @@ function normalizeNativeSessionDerivationCommon(input: Omit<RecordNativeSessionD
     backendId: nativeDerivationIdentity(input.backendId, "Backend ID"),
     backendInstanceGeneration: input.backendInstanceGeneration,
     targetId: nativeDerivationIdentity(input.targetId, "Target ID"),
-    effectiveWorkspaceRoot: input.remoteWorkspace === undefined
+    effectiveWorkspaceRoot: remoteWorkspace === undefined
       ? nativeBindingReference(input.effectiveWorkspaceRoot)
-      : remoteWorkspaceRoot(input.effectiveWorkspaceRoot),
-    ...(input.remoteWorkspace === undefined ? {} : { remoteWorkspace: {
-      hostTargetId: remoteHostIdentity(input.remoteWorkspace.hostTargetId, "host target id", 256),
-      hostId: remoteHostAlias(input.remoteWorkspace.hostId),
-      workspaceRoot: remoteWorkspaceRoot(input.remoteWorkspace.workspaceRoot)
-    } })
+      : remoteWorkspace.kind === "ssh"
+        ? remoteWorkspaceRoot(input.effectiveWorkspaceRoot)
+        : devicePeerWorkspaceRoot(input.effectiveWorkspaceRoot),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace })
   };
 }
 
@@ -18155,15 +18161,16 @@ function normalizeNativeDerivationWorktree(value: SessionWorktreeBinding): Sessi
     ? undefined
     : nativeDerivationWorktreeText(value.sourceRemote, "source remote", 1_024);
   const remote = value.remote === undefined ? undefined : normalizeRemoteWorktreeAuthority(value.remote);
+  const remotePaths = remote === undefined ? undefined : remoteWorktreePaths(remote.binding);
   return {
     leaseId: nativeDerivationWorktreeText(value.leaseId, "lease ID", 256),
     workspaceId: nativeDerivationWorktreeText(value.workspaceId, "workspace ID", 256),
     path: remote === undefined
       ? nativeDerivationWorktreeText(value.path, "path", 32_768)
-      : remoteWorkspaceRoot(value.path),
+      : remoteNativePath(value.path, remotePaths!),
     repositoryRoot: remote === undefined
       ? nativeDerivationWorktreeText(value.repositoryRoot, "repository root", 32_768)
-      : remoteWorkspaceRoot(value.repositoryRoot),
+      : remoteNativePath(value.repositoryRoot, remotePaths!),
     branch: nativeDerivationWorktreeText(value.branch, "branch", 4_096),
     sourceRef: nativeDerivationWorktreeText(value.sourceRef, "source ref", 4_096),
     sourceCommit: nativeDerivationWorktreeText(value.sourceCommit, "source commit", 256),
@@ -18181,25 +18188,18 @@ function normalizeRemoteWorktreeAuthority(
   value: NonNullable<SessionWorktreeBinding["remote"]>
 ): NonNullable<SessionWorktreeBinding["remote"]> {
   if (!isRecord(value) || Object.keys(value).some((key) => ![
-    "hostOwnerId", "hostTargetId", "hostId", "hostIdentity", "targetId",
-    "targetRevision", "hostRevision", "manifestId"
+    "targetId", "binding", "executionIdentity", "targetRevision", "manifestId"
   ].includes(key))) {
     throw new StoreError("Native derivation remote worktree authority is invalid.");
   }
-  const hostIdentity = value.hostIdentity;
-  if (typeof hostIdentity !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(hostIdentity)) {
-    throw new StoreError("Native derivation remote Host identity is invalid.");
-  }
   const targetRevision = canonicalPositiveRevision(value.targetRevision);
-  const hostRevision = canonicalPositiveRevision(value.hostRevision);
+  const binding = normalizeRemoteWorkspace(value.binding);
+  if (binding === undefined) throw new StoreError("Native derivation remote worktree binding is invalid.");
   return {
-    hostOwnerId: nativeDerivationIdentity(value.hostOwnerId, "Remote Host owner ID"),
-    hostTargetId: remoteHostIdentity(value.hostTargetId, "host target id", 256),
-    hostId: remoteHostAlias(value.hostId),
-    hostIdentity,
     targetId: nativeDerivationIdentity(value.targetId, "Remote Target ID"),
+    binding,
+    executionIdentity: nativeDerivationWorktreeText(value.executionIdentity, "execution identity", 4_096),
     targetRevision,
-    hostRevision,
     manifestId: nativeDerivationIdentity(value.manifestId, "Remote checkout manifest ID")
   };
 }
@@ -18209,6 +18209,52 @@ function canonicalPositiveRevision(value: unknown): string {
     throw new StoreError("Native derivation remote worktree revision is invalid.");
   }
   return value;
+}
+
+function parseRemoteWorktreeExecutionIdentity(value: string, kind: "ssh"): {
+  readonly ownerId: string;
+};
+function parseRemoteWorktreeExecutionIdentity(value: string, kind: "device_peer"): {
+  readonly controllerDeviceId: string;
+  readonly targetDeviceId: string;
+};
+function parseRemoteWorktreeExecutionIdentity(
+  value: string,
+  kind: RemoteWorkspaceBinding["kind"]
+): { readonly ownerId: string } | { readonly controllerDeviceId: string; readonly targetDeviceId: string } {
+  const parsed = parseJson<unknown>(value);
+  if (!isRecord(parsed) || parsed["kind"] !== kind) {
+    throw new StoreError("Native derivation remote execution identity is invalid.");
+  }
+  if (kind === "ssh") {
+    assertExactRemoteWorkspaceKeys(parsed, [
+      "algorithm", "fingerprint", "hostId", "hostTargetId", "hostname", "kind", "ownerId", "port", "user"
+    ]);
+    return { ownerId: nativeDerivationIdentity(parsed["ownerId"] as string, "Remote Host owner ID") };
+  }
+  assertExactRemoteWorkspaceKeys(parsed, ["controllerDeviceId", "kind", "targetDeviceId"]);
+  return {
+    controllerDeviceId: devicePeerIdentity(parsed["controllerDeviceId"] as string, "controller"),
+    targetDeviceId: devicePeerIdentity(parsed["targetDeviceId"] as string, "target")
+  };
+}
+
+function remoteSshWorktreeExecutionIdentity(
+  binding: Extract<RemoteWorkspaceBinding, { readonly kind: "ssh" }>,
+  host: RemoteHostRecord
+): string {
+  if (host.trust === undefined) throw new StoreError("The remote derivation Host authority changed.");
+  return JSON.stringify({
+    kind: "ssh",
+    hostTargetId: binding.hostTargetId,
+    hostId: binding.hostId,
+    ownerId: host.ownerId,
+    hostname: host.hostname,
+    port: host.port,
+    user: host.user,
+    algorithm: host.trust.algorithm,
+    fingerprint: host.trust.fingerprint
+  });
 }
 
 function normalizeRemoteNativeDerivationWorktreePlan(
@@ -18240,24 +18286,25 @@ function normalizeRemoteNativeDerivationWorktreePlan(
   const manifestId = nativeDerivationUuid(value.manifestId, "remote checkout manifest ID");
   const sessionId = nativeDerivationIdentity(value.sessionId, "Derived Session ID");
   const sourceSessionId = nativeDerivationIdentity(value.sourceSessionId, "Source Session ID");
-  const sourceCwd = remoteWorkspaceRoot(value.sourceCwd);
+  const remotePaths = remoteWorktreePaths(normalized.remote.binding);
+  const sourceCwd = remoteNativePath(value.sourceCwd, remotePaths);
   if (typeof value.sourceSnapshot !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(value.sourceSnapshot)) {
     throw new StoreError("Native derivation remote source snapshot is invalid.");
   }
   const sourceSnapshot = value.sourceSnapshot;
-  const storageRoot = remoteWorkspaceRoot(value.storageRoot);
+  const storageRoot = remoteNativePath(value.storageRoot, remotePaths);
   if (value.format !== 1 || sessionId === sourceSessionId
     || normalized.remote.manifestId !== manifestId
-    || normalized.path !== path.posix.join(storageRoot, "checkouts", leaseId)
+    || normalized.path !== remotePaths.join(storageRoot, "checkouts", leaseId)
     || normalized.branch !== `joko/remote-${createHash("sha256").update(sessionId).digest("hex").slice(0, 12)}-${leaseId.slice(0, 8)}`
     || normalized.sourceRef !== normalized.sourceCommit || normalized.sourceStrategy !== "explicit"
     || normalized.sourceRefreshed !== false || !/^[a-f0-9]{40,64}$/u.test(normalized.sourceCommit)) {
     throw new StoreError("Native derivation remote worktree plan identity is invalid.");
   }
   if (!isRecord(value.authority) || Object.keys(value.authority).some((key) => ![
-    "hostOwnerId", "hostTargetId", "hostId", "hostIdentity", "targetId", "targetRevision", "hostRevision"
+    "targetId", "binding", "executionIdentity", "targetRevision"
   ].includes(key))) {
-    throw new StoreError("Native derivation remote worktree plan Host authority is invalid.");
+    throw new StoreError("Native derivation remote worktree plan authority is invalid.");
   }
   const authorityWithManifest = normalizeRemoteWorktreeAuthority({
     ...value.authority, manifestId
@@ -18267,7 +18314,7 @@ function normalizeRemoteNativeDerivationWorktreePlan(
   }
   const { manifestId: _manifestId, ...authority } = authorityWithManifest;
   const sourceLease = value.sourceLease === undefined
-    ? undefined : normalizeRemoteNativeDerivationSourceLease(value.sourceLease);
+    ? undefined : normalizeRemoteNativeDerivationSourceLease(value.sourceLease, remotePaths);
   if (sourceLease !== undefined && (sourceLease.sessionId !== sourceSessionId || sourceLease.path !== sourceCwd
     || !sameStableRemoteWorktreeAuthority(sourceLease.remote, normalized.remote))) {
     throw new StoreError("Native derivation remote source checkout does not match its plan.");
@@ -18304,7 +18351,8 @@ function nativeDerivationUuid(value: string, label: string): string {
 }
 
 function normalizeRemoteNativeDerivationSourceLease(
-  value: NonNullable<RemoteNativeDerivationWorktreePlan["sourceLease"]>
+  value: NonNullable<RemoteNativeDerivationWorktreePlan["sourceLease"]>,
+  paths: PlatformPath
 ): NonNullable<RemoteNativeDerivationWorktreePlan["sourceLease"]> {
   if (!isRecord(value) || Object.keys(value).some((key) => ![
     "id", "sessionId", "path", "repositoryRoot", "branch", "source", "acquiredAt", "remote"
@@ -18316,11 +18364,15 @@ function normalizeRemoteNativeDerivationSourceLease(
     || !Number.isSafeInteger(value.acquiredAt) || value.acquiredAt < 0) {
     throw new StoreError("Native derivation remote source checkout is invalid.");
   }
+  const remote = normalizeRemoteWorktreeAuthority(value.remote);
+  if (remoteWorktreePaths(remote.binding) !== paths) {
+    throw new StoreError("Native derivation remote source checkout uses another path style.");
+  }
   return {
     id: nativeDerivationUuid(value.id, "source checkout lease ID"),
     sessionId: nativeDerivationIdentity(value.sessionId, "Source Session ID"),
-    path: remoteWorkspaceRoot(value.path),
-    repositoryRoot: remoteWorkspaceRoot(value.repositoryRoot),
+    path: remoteNativePath(value.path, paths),
+    repositoryRoot: remoteNativePath(value.repositoryRoot, paths),
     branch: nativeDerivationWorktreeText(value.branch, "source branch", 4_096),
     source: {
       ref: value.source.ref,
@@ -18329,7 +18381,7 @@ function normalizeRemoteNativeDerivationSourceLease(
       strategy: "explicit"
     },
     acquiredAt: value.acquiredAt,
-    remote: normalizeRemoteWorktreeAuthority(value.remote)
+    remote
   };
 }
 
@@ -18337,9 +18389,9 @@ function sameStableRemoteWorktreeAuthority(
   left: NonNullable<SessionWorktreeBinding["remote"]>,
   right: NonNullable<SessionWorktreeBinding["remote"]>
 ): boolean {
-  return left.hostOwnerId === right.hostOwnerId
-    && left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
-    && left.hostIdentity === right.hostIdentity && left.targetId === right.targetId;
+  return left.targetId === right.targetId
+    && left.executionIdentity === right.executionIdentity
+    && sameRemoteWorkspace(left.binding, right.binding);
 }
 
 function remoteDerivationWorktreeMatches(
@@ -18349,8 +18401,7 @@ function remoteDerivationWorktreeMatches(
   if (workspace === undefined || worktree.remote === undefined) {
     return workspace === undefined && worktree.remote === undefined;
   }
-  return workspace.hostTargetId === worktree.remote.hostTargetId
-    && workspace.hostId === worktree.remote.hostId;
+  return sameRemoteWorkspace(workspace, worktree.remote.binding);
 }
 
 function sameRemoteWorktreePlan(
@@ -18515,6 +18566,7 @@ function nativeSessionDerivationFromRow(row: Row): NativeSessionDerivationRecord
   }
   const worktree = decodeNativeDerivationWorktree(row);
   const remoteWorktreePlan = decodeRemoteNativeDerivationWorktreePlan(row);
+  const remoteWorkspace = remoteWorkspaceFromRow(row, "native derivation");
   return {
     operationId: stringValue(row["operation_id"]),
     expectedBodyHash: stringValue(row["body_hash"]),
@@ -18534,10 +18586,7 @@ function nativeSessionDerivationFromRow(row: Row): NativeSessionDerivationRecord
       : { sourceSessionRevision: toBigInt(row["source_session_revision"]) }),
     ...(row["target_revision"] === null ? {} : { targetRevision: toBigInt(row["target_revision"]) }),
     effectiveWorkspaceRoot: stringValue(row["effective_workspace_root"]),
-    ...(row["remote_host_id"] === null ? {} : { remoteWorkspace: {
-      hostTargetId: remoteHostIdentity(stringValue(row["remote_host_target_id"]), "host target id", 256),
-      hostId: stringValue(row["remote_host_id"]), workspaceRoot: stringValue(row["remote_workspace_root"])
-    } }),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(worktree === undefined ? {} : { worktree }),
     ...(remoteWorktreePlan === undefined ? {} : { remoteWorktreePlan }),
     externalLifecycle: booleanValue(row["external_lifecycle"]),
@@ -19848,13 +19897,157 @@ function remoteWorkspaceRoot(value: string): string {
   return value;
 }
 
+function remoteWorktreePaths(binding: RemoteWorkspaceBinding): PlatformPath {
+  if (binding.kind === "ssh" || binding.workspaceRoot.startsWith("/")) return path.posix;
+  return path.win32;
+}
+
+function remoteNativePath(value: string, paths: PlatformPath): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 2 ||
+    value.length > 32_768 ||
+    value !== value.trim() ||
+    value.includes("\0") ||
+    /[\r\n]/u.test(value) ||
+    !strictHostAbsolute(value, paths) ||
+    paths.normalize(value) !== value ||
+    paths.parse(value).root === value
+  ) {
+    throw new StoreError("Remote worktree path must be an absolute normalized host-native path.");
+  }
+  return value;
+}
+
+function devicePeerWorkspaceRoot(value: string): string {
+  const paths = value.startsWith("/") ? path.posix : path.win32;
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 16_384 ||
+    value !== value.trim() ||
+    value.includes("\0") ||
+    /[\r\n]/u.test(value) ||
+    !strictHostAbsolute(value, paths) ||
+    paths.normalize(value) !== value
+  ) {
+    throw new StoreError("Device peer workspace root must be an absolute host-native path.");
+  }
+  return value;
+}
+
+function strictHostAbsolute(value: string, paths: PlatformPath): boolean {
+  if (!paths.isAbsolute(value)) return false;
+  if (paths !== path.win32) return true;
+  const root = path.win32.parse(value).root;
+  return root !== "\\" && root !== "/" && root.length > 1;
+}
+
+function devicePeerIdentity(value: string, label: "controller" | "target"): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 256 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    throw new StoreError(`Device peer ${label} Device identity is invalid.`);
+  }
+  return value;
+}
+
+function normalizeRemoteWorkspace(
+  value: TargetDescriptor["remoteWorkspace"]
+): RemoteWorkspaceBinding | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new StoreError("Remote workspace binding is invalid.");
+  }
+  if (value.kind === "ssh") {
+    assertExactRemoteWorkspaceKeys(value, ["hostId", "hostTargetId", "kind", "workspaceRoot"]);
+    return {
+      kind: "ssh",
+      hostTargetId: remoteHostIdentity(value.hostTargetId, "host target id", 256),
+      hostId: remoteHostAlias(value.hostId),
+      workspaceRoot: remoteWorkspaceRoot(value.workspaceRoot)
+    };
+  }
+  if (value.kind === "device_peer") {
+    assertExactRemoteWorkspaceKeys(value, ["controllerDeviceId", "kind", "targetDeviceId", "workspaceRoot"]);
+    const controllerDeviceId = devicePeerIdentity(value.controllerDeviceId, "controller");
+    const targetDeviceId = devicePeerIdentity(value.targetDeviceId, "target");
+    if (controllerDeviceId === targetDeviceId) {
+      throw new StoreError("A Device peer controller cannot target itself.");
+    }
+    return {
+      kind: "device_peer",
+      controllerDeviceId,
+      targetDeviceId,
+      workspaceRoot: devicePeerWorkspaceRoot(value.workspaceRoot)
+    };
+  }
+  throw new StoreError("Remote workspace binding kind is invalid.");
+}
+
+function assertExactRemoteWorkspaceKeys(value: object, expected: readonly string[]): void {
+  const keys = Object.keys(value).sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new StoreError("Remote workspace binding fields do not match its kind.");
+  }
+}
+
+function remoteWorkspaceFromRow(row: Row, owner: string): RemoteWorkspaceBinding | undefined {
+  const kind = row["remote_location_kind"];
+  const hostTargetId = row["remote_host_target_id"];
+  const hostId = row["remote_host_id"];
+  const controllerDeviceId = row["remote_controller_device_id"];
+  const targetDeviceId = row["remote_target_device_id"];
+  const workspaceRoot = row["remote_workspace_root"];
+  if (kind === null) {
+    if (hostTargetId !== null || hostId !== null || controllerDeviceId !== null
+      || targetDeviceId !== null || workspaceRoot !== null) {
+      throw new StoreError(`Stored ${owner} Remote workspace binding is incomplete.`);
+    }
+    return undefined;
+  }
+  if (kind === "ssh") {
+    if (hostTargetId === null || hostId === null || controllerDeviceId !== null
+      || targetDeviceId !== null || workspaceRoot === null) {
+      throw new StoreError(`Stored ${owner} Remote workspace binding is incomplete.`);
+    }
+    return normalizeRemoteWorkspace({
+      kind: "ssh",
+      hostTargetId: stringValue(hostTargetId),
+      hostId: stringValue(hostId),
+      workspaceRoot: stringValue(workspaceRoot)
+    });
+  }
+  if (kind === "device_peer") {
+    if (hostTargetId !== null || hostId !== null || controllerDeviceId === null
+      || targetDeviceId === null || workspaceRoot === null) {
+      throw new StoreError(`Stored ${owner} Remote workspace binding is incomplete.`);
+    }
+    return normalizeRemoteWorkspace({
+      kind: "device_peer",
+      controllerDeviceId: stringValue(controllerDeviceId),
+      targetDeviceId: stringValue(targetDeviceId),
+      workspaceRoot: stringValue(workspaceRoot)
+    });
+  }
+  throw new StoreError(`Stored ${owner} Remote workspace binding kind is invalid.`);
+}
+
 function sameRemoteWorkspace(
   left: TargetDescriptor["remoteWorkspace"],
   right: TargetDescriptor["remoteWorkspace"]
 ): boolean {
   if (left === undefined || right === undefined) return left === right;
-  return left.hostTargetId === right.hostTargetId
-    && left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+  if (left.kind !== right.kind || left.workspaceRoot !== right.workspaceRoot) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function remoteHostCredentialReference(value: string): string {

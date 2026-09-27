@@ -605,14 +605,26 @@ export interface TargetDescriptor {
   readonly workspaceRoot: string;
   readonly managed: boolean;
   readonly trusted: boolean;
-  /** Optional capability-neutral process/filesystem location. */
+  /** Optional capability-neutral process/filesystem location. Absence means the service node. */
   readonly remoteWorkspace?: RemoteWorkspaceBinding;
 }
 
-export interface RemoteWorkspaceBinding {
+export type RemoteWorkspaceBinding = SshWorkspaceBinding | DevicePeerWorkspaceBinding;
+
+export interface SshWorkspaceBinding {
+  readonly kind: "ssh";
   /** Target that owns the single SSH Host record and transport authority. */
   readonly hostTargetId: string;
   readonly hostId: string;
+  readonly workspaceRoot: string;
+}
+
+export interface DevicePeerWorkspaceBinding {
+  readonly kind: "device_peer";
+  /** Stable controller Device that owns the durable control relation. */
+  readonly controllerDeviceId: string;
+  /** Stable target Device identity. A short-lived Connection or route generation is never persisted here. */
+  readonly targetDeviceId: string;
   readonly workspaceRoot: string;
 }
 
@@ -667,15 +679,13 @@ export interface SessionWorktreeBinding {
   readonly sourceRemote?: string;
   /** Stable remote checkout authority. Absent only for a service-node checkout. */
   readonly remote?: {
-    readonly hostOwnerId: string;
-    readonly hostTargetId: string;
-    readonly hostId: string;
-    /** Digest of the exact trusted SSH Host routing identity. */
-    readonly hostIdentity: string;
     readonly targetId: string;
-    /** Canonical decimal revisions at checkout acquisition. */
+    /** Exact durable execution location that owns the source checkout. */
+    readonly binding: RemoteWorkspaceBinding;
+    /** Stable remote machine/account identity; reconnect generations are excluded. */
+    readonly executionIdentity: string;
+    /** Canonical decimal Target revision at checkout acquisition. */
     readonly targetRevision: string;
-    readonly hostRevision: string;
     /** Identity of the remote owner manifest, distinct from a path or branch. */
     readonly manifestId: string;
   };

@@ -49,7 +49,7 @@ it("keeps a source Host undeletable while another project is bound to it", async
   const ready = { ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
     status: { state: "ready" as const, changedAt: 2 } };
   fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map((target) => target.id === "target-two"
-    ? { ...target, remoteWorkspace: { hostTargetId: "target-one", hostId: "build-box", workspaceRoot: "/srv/other" } }
+    ? { ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "target-one", hostId: "build-box", workspaceRoot: "/srv/other" } }
     : target) };
   await fixture.render(fixture.controller);
   await fixture.publish([ready]);
@@ -137,7 +137,7 @@ it("preserves a binding draft on concurrent project change until explicitly relo
   const fixture = await mountSettings();
   await fixture.publish([{ ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 }, status: { state: "ready", changedAt: 2 } }]);
   await change(input("Remote workspace path"), "/home/joko/local-edit");
-  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map(target => ({ ...target, revision: 2n, remoteWorkspace: { hostTargetId: target.id, hostId: "build-box", workspaceRoot: "/home/joko/other-window" } })) };
+  fixture.snapshot = { ...fixture.snapshot, targets: fixture.snapshot.targets.map(target => ({ ...target, revision: 2n, remoteWorkspace: { kind: "ssh", hostTargetId: target.id, hostId: "build-box", workspaceRoot: "/home/joko/other-window" } })) };
   await fixture.render(fixture.controller);
   expect(input("Remote workspace path").value).toBe("/home/joko/local-edit");
   expect(button("Use remote workspace").disabled).toBe(true);

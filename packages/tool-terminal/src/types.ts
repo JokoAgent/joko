@@ -1,11 +1,11 @@
+import type { RemoteWorkspaceBinding } from "@joko/core";
+
 export interface TerminalScope {
   readonly sessionId: string;
   readonly targetId: string;
   readonly workspaceRoot: string;
-  /** A remote scope uses POSIX paths owned by this host, never the service filesystem. */
-  readonly remoteHostId?: string;
-  /** Host catalog owner; a remote Target may use a Host owned by another Target. */
-  readonly remoteHostTargetId?: string;
+  /** Immutable remote execution identity; absence means the service-node filesystem. */
+  readonly remoteWorkspace?: RemoteWorkspaceBinding;
 }
 
 export interface TerminalReference extends TerminalScope {

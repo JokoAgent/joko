@@ -25,9 +25,9 @@ export function createRemoteClaudeDerivedWorkspaceAuthorizer(options: {
       || target.id !== storedTarget.descriptor.id
       || target.backendId !== storedTarget.descriptor.backendId
       || target.workspaceRoot === storedTarget.descriptor.workspaceRoot
-      || requested.hostTargetId !== source.hostTargetId
-      || requested.hostId !== source.hostId
-      || requested.workspaceRoot !== source.workspaceRoot) {
+      || (requested.workspaceRoot !== source.workspaceRoot
+        && requested.workspaceRoot !== target.workspaceRoot)
+      || !sameRemoteExecutionBinding(requested, source)) {
       throw new Error("The derived remote workspace Target authority is invalid.");
     }
     const targetRevision = storedTarget.revision;
@@ -63,6 +63,18 @@ export function createRemoteClaudeDerivedWorkspaceAuthorizer(options: {
     };
     return authority;
   };
+}
+
+function sameRemoteExecutionBinding(
+  left: import("@joko/core").RemoteWorkspaceBinding,
+  right: import("@joko/core").RemoteWorkspaceBinding
+): boolean {
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function findExactBinding(

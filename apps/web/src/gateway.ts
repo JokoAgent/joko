@@ -93,6 +93,10 @@ import {
   PartnerService,
   CredentialKind,
   CredentialService,
+  DevicePeerCapabilityKind,
+  DevicePeerDirectoryAvailability,
+  DevicePeerDirectoryKind,
+  DevicePeerService,
   DeviceKind,
   DevicePresenceState,
   ConnectionState,
@@ -338,6 +342,7 @@ import {
   WorktreeSourceStrategy,
   WorkspaceService,
   WorkspaceKind,
+  WorkspaceLocationSchema,
   type Artifact,
   type BackgroundTask as ProtoBackgroundTask,
   type BackendDescriptor,
@@ -379,6 +384,8 @@ import {
   type CredentialDescriptor,
   type Device,
   type DeviceControlRelation,
+  type DevicePeerDescriptor as ProtoDevicePeerDescriptor,
+  type DevicePeerRouteIdentity as ProtoDevicePeerRouteIdentity,
   type DisplayArgument,
   type ErrorInfo,
   type Event,
@@ -501,6 +508,7 @@ import {
   type TaskHistoryCleanupResult,
   type TaskHistoryMaintenanceProgress,
   type WorkspaceDescriptor,
+  type WorkspaceLocation,
   type WorkspaceEntry,
   type WorkspaceFileChange,
   type WorkspaceSearchMatch,
@@ -693,6 +701,12 @@ import type {
   RuntimeToolCatalogView,
   RuntimeToolFieldTypeView,
   RemoteConnectionView,
+  DevicePeerDirectoryInspectionView,
+  DevicePeerDirectoryListingView,
+  DevicePeerRecentDirectoryView,
+  DevicePeerRouteIdentityView,
+  DevicePeerTargetDraft,
+  DevicePeerView,
   RemoteBackendRuntimeFailureCodeView,
   RemoteBackendRuntimeInstallEventView,
   RemoteBackendRuntimeView,
@@ -701,6 +715,7 @@ import type {
   RemoteHostDirectoryListingView,
   RemoteHostDraft,
   RemoteHostView,
+  RemoteWorkspaceView,
   ScheduleView,
   ScheduleDraft,
   ScheduleHistoryPageView,
@@ -1917,6 +1932,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return payload.value.targetId;
   }
 
+  async createDevicePeerTarget(draft: DevicePeerTargetDraft): Promise<string> {
+    if (draft.name.trim() === "" || draft.backendId.trim() === ""
+      || !validDevicePeerRoute(draft.peer) || !absoluteDevicePeerPath(draft.workspacePath)) {
+      throw new GatewayError("A current Backend, Device peer route and absolute project directory are required.");
+    }
+    const operation = await this.submit({
+      case: "createDevicePeerTarget",
+      value: {
+        backendId: draft.backendId,
+        displayName: draft.name.trim(),
+        peer: devicePeerRouteMessage(draft.peer),
+        workspacePath: draft.workspacePath,
+        createIfMissing: draft.createIfMissing
+      }
+    }, true);
+    const payload = operation.result?.payload;
+    if (payload?.case !== "target" || payload.value.targetId.length === 0) {
+      throw new GatewayError("Orchestrator completed Device project creation without a typed project result.");
+    }
+    return payload.value.targetId;
+  }
+
   async listProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView> {
     const scope = this.captureActionScope(signal);
     const listing = await createClient(TargetService, scope.transport).listProjectDirectories({ path }, { signal: scope.signal });
@@ -1968,16 +2005,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (remoteWorkspaceRoot === "") {
       throw new GatewayError("A remote workspace root is required.");
     }
-    const workspaceLocationUpdate = patch.workspaceLocation === undefined
-      ? { case: undefined }
+    const location: MessageInitShape<typeof WorkspaceLocationSchema> | undefined = patch.workspaceLocation === undefined
+      ? undefined
       : patch.workspaceLocation.kind === "serviceNode"
-        ? { case: "serviceNodeWorkspace" as const, value: true }
+        ? { kind: { case: "serviceNode" as const, value: {} } }
         : {
-            case: "remoteWorkspace" as const,
-            value: {
-              hostTargetId: targetId,
-              hostId: patch.workspaceLocation.hostId,
-              workspaceRootDisplay: remoteWorkspaceRoot!
+            kind: {
+              case: "sshHost" as const,
+              value: {
+                hostTargetId: targetId,
+                hostId: patch.workspaceLocation.hostId,
+                workspaceRootDisplay: remoteWorkspaceRoot!
+              }
             }
           };
     await this.submit({
@@ -1986,7 +2025,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         targetId,
         ...(patch.name === undefined ? {} : { displayName: patch.name.trim() }),
         ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }),
-        workspaceLocationUpdate
+        ...(location === undefined ? {} : { location })
       }
     }, true, [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: expectedRevision } }]);
   }
@@ -7493,6 +7532,133 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return this.uploadCredentialTicket(secret, response.ticket, scope);
   }
 
+  async listDevicePeers(signal?: AbortSignal): Promise<readonly DevicePeerView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(DevicePeerService, scope.transport);
+    const peers: DevicePeerView[] = [];
+    const consumedTokens = new Set<string>();
+    const identities = new Set<string>();
+    let pageToken = "";
+    for (let page = 0; page < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; page += 1) {
+      const response = await client.listDevicePeers(
+        { page: { pageSize: 500, pageToken } },
+        { signal: scope.signal }
+      );
+      scope.signal.throwIfAborted();
+      for (const descriptor of response.peers) {
+        const peer = mapDevicePeer(descriptor);
+        const key = devicePeerRouteKey(peer.route);
+        if (identities.has(key)) throw new GatewayError("Orchestrator returned a duplicate Device peer route.");
+        identities.add(key);
+        peers.push(peer);
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") return peers.sort(compareDevicePeers);
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("Orchestrator returned a cyclic Device peer catalog page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Device peer catalog pagination exceeded its safety limit.");
+  }
+
+  async listDevicePeerRecentDirectories(
+    peer: DevicePeerRouteIdentityView,
+    signal?: AbortSignal
+  ): Promise<readonly DevicePeerRecentDirectoryView[]> {
+    if (!validDevicePeerRoute(peer)) throw new GatewayError("A current Device peer route is required.");
+    const scope = this.captureActionScope(signal);
+    const client = createClient(DevicePeerService, scope.transport);
+    const directories: DevicePeerRecentDirectoryView[] = [];
+    const consumedTokens = new Set<string>();
+    const paths = new Set<string>();
+    let pageToken = "";
+    for (let page = 0; page < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; page += 1) {
+      const response = await client.listDevicePeerRecentDirectories({
+        peer: devicePeerRouteMessage(peer),
+        page: { pageSize: 200, pageToken }
+      }, { signal: scope.signal });
+      scope.signal.throwIfAborted();
+      if (!sameDevicePeerRoute(response.peer, peer)) {
+        throw new GatewayError("Orchestrator returned recent directories for another Device peer route.");
+      }
+      for (const directory of response.directories) {
+        if (directory.name.trim() === "" || !absoluteDevicePeerPath(directory.path)
+          || paths.has(directory.path) || directory.lastUsedAt === undefined
+          || (directory.availability !== DevicePeerDirectoryAvailability.EXISTS
+            && directory.availability !== DevicePeerDirectoryAvailability.MISSING)) {
+          throw new GatewayError("Orchestrator returned an invalid Device peer recent directory.");
+        }
+        paths.add(directory.path);
+        directories.push({
+          name: directory.name,
+          path: directory.path,
+          availability: directory.availability === DevicePeerDirectoryAvailability.EXISTS ? "exists" : "missing",
+          lastUsedAt: timestampMs(directory.lastUsedAt)
+        });
+      }
+      const nextPageToken = response.page?.nextPageToken ?? "";
+      if (nextPageToken === "") return directories;
+      if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
+        throw new GatewayError("Orchestrator returned a cyclic Device peer recent-directory page token.");
+      }
+      consumedTokens.add(nextPageToken);
+      pageToken = nextPageToken;
+    }
+    throw new GatewayError("Device peer recent-directory pagination exceeded its safety limit.");
+  }
+
+  async listDevicePeerDirectories(
+    peer: DevicePeerRouteIdentityView,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<DevicePeerDirectoryListingView> {
+    if (!validDevicePeerRoute(peer) || (path !== "" && !absoluteDevicePeerPath(path))) {
+      throw new GatewayError("A current Device peer route and host-native absolute directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(DevicePeerService, scope.transport).listDevicePeerDirectories({
+      peer: devicePeerRouteMessage(peer), path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!sameDevicePeerRoute(response.peer, peer) || !absoluteDevicePeerPath(response.path)
+      || !absoluteDevicePeerPath(response.parentPath) || response.directories.length > 200
+      || response.directories.some((entry) => entry.name.trim() === "" || !absoluteDevicePeerPath(entry.path))) {
+      throw new GatewayError("Orchestrator returned a directory listing for another Device peer route or path.");
+    }
+    return {
+      peer: { ...peer },
+      path: response.path,
+      parentPath: response.parentPath,
+      directories: response.directories.map((entry) => ({ name: entry.name, path: entry.path })),
+      truncated: response.truncated
+    };
+  }
+
+  async inspectDevicePeerDirectory(
+    peer: DevicePeerRouteIdentityView,
+    path: string,
+    signal?: AbortSignal
+  ): Promise<DevicePeerDirectoryInspectionView> {
+    if (!validDevicePeerRoute(peer) || !absoluteDevicePeerPath(path)) {
+      throw new GatewayError("A current Device peer route and host-native absolute project directory are required.");
+    }
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(DevicePeerService, scope.transport).inspectDevicePeerDirectory({
+      peer: devicePeerRouteMessage(peer), path
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!sameDevicePeerRoute(response.peer, peer) || !absoluteDevicePeerPath(response.path)) {
+      throw new GatewayError("Orchestrator inspected another Device peer route or path.");
+    }
+    const kind = response.kind === DevicePeerDirectoryKind.DIRECTORY ? "directory" as const
+      : response.kind === DevicePeerDirectoryKind.FILE ? "file" as const
+        : response.kind === DevicePeerDirectoryKind.MISSING ? "missing" as const : undefined;
+    if (kind === undefined) throw new GatewayError("Orchestrator returned an unknown Device peer directory kind.");
+    return { peer: { ...peer }, path: response.path, kind };
+  }
+
   async listRemoteHosts(targetId: string, signal?: AbortSignal): Promise<readonly RemoteHostView[]> {
     const client = createClient(RemoteHostService, this.requireTransport());
     const hosts: RemoteHostView[] = [];
@@ -9425,10 +9591,7 @@ function remapSessionProjection(raw: Snapshot, snapshot: AppSnapshot, sessionId:
 function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly WorkspaceDescriptor[]): AppSnapshot["targets"][number] {
   const revision = target.version?.revision?.value;
   if (revision === undefined || revision < 1n) throw new GatewayError("Orchestrator returned a Target without a current revision.");
-  if (target.remoteWorkspace !== undefined && (target.remoteWorkspace.hostTargetId.trim() === ""
-    || target.remoteWorkspace.hostId.trim() === "" || !target.remoteWorkspace.workspaceRootDisplay.startsWith("/"))) {
-    throw new GatewayError("Orchestrator returned a Target with an incomplete remote workspace binding.");
-  }
+  const remoteWorkspace = mapRemoteWorkspaceLocation(target.location, "Target");
   const workspace = workspaces.find((candidate) => candidate.workspaceId === target.workspaceId);
   return {
     id: target.targetId,
@@ -9440,13 +9603,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     trusted: workspace?.trusted ?? false,
     pinned: target.pinned,
     archived: target.state === 2,
-    ...(target.remoteWorkspace === undefined ? {} : {
-      remoteWorkspace: {
-        hostTargetId: target.remoteWorkspace.hostTargetId,
-        hostId: target.remoteWorkspace.hostId,
-        workspaceRoot: target.remoteWorkspace.workspaceRootDisplay
-      }
-    }),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(target.error?.message ? { error: presentJokoServiceTerminology(target.error.message) } : {})
   };
 }
@@ -11158,6 +11315,7 @@ function mapSession(
   const contextState = session.contextState;
   const compacting = compactingOverride ?? contextState?.compacting;
   const attention = session.attention;
+  const remoteWorkspace = mapRemoteWorkspaceLocation(session.location, "Session");
   const attentionKind = attention?.kind === SessionAttentionKind.DONE
     ? "done" as const
     : attention?.kind === SessionAttentionKind.AWAITING
@@ -11183,7 +11341,7 @@ function mapSession(
       : {
           derivationOrigin: mapSessionDerivationOrigin(session.derivationOrigin)
         }),
-    ...(session.remoteWorkspace === undefined ? {} : { remoteWorkspace: true }),
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     name: session.displayName || "Untitled task",
     ...(session.taskSummary === "" ? {} : { summary: session.taskSummary }),
     state: sessionViewState(session.state, activeRun?.state),
@@ -11558,6 +11716,44 @@ function unavailableSessionModel(
     outputCostMicrosPerMillion: 0,
     currencyCode: "USD"
   };
+}
+
+function mapRemoteWorkspaceLocation(
+  location: WorkspaceLocation | undefined,
+  owner: "Target" | "Session" | "Workspace"
+): RemoteWorkspaceView | undefined {
+  if (location === undefined || location.kind.case === undefined) {
+    throw new GatewayError(`Orchestrator returned a ${owner} without an explicit workspace location.`);
+  }
+  if (location.kind.case === "serviceNode") return undefined;
+  if (location.kind.case === "sshHost") {
+    const value = location.kind.value;
+    if (value.hostTargetId.trim() === "" || value.hostId.trim() === ""
+      || !absoluteRemoteWorkspaceRoot(value.workspaceRootDisplay)) {
+      throw new GatewayError(`Orchestrator returned a ${owner} with an incomplete SSH workspace location.`);
+    }
+    return {
+      kind: "ssh",
+      hostTargetId: value.hostTargetId,
+      hostId: value.hostId,
+      workspaceRoot: value.workspaceRootDisplay
+    };
+  }
+  const value = location.kind.value;
+  if (value.controllerDeviceId.trim() === "" || value.targetDeviceId.trim() === ""
+    || !absoluteDevicePeerPath(value.workspaceRootDisplay)) {
+    throw new GatewayError(`Orchestrator returned a ${owner} with an incomplete Device workspace location.`);
+  }
+  return {
+    kind: "device_peer",
+    controllerDeviceId: value.controllerDeviceId,
+    targetDeviceId: value.targetDeviceId,
+    workspaceRoot: value.workspaceRootDisplay
+  };
+}
+
+function absoluteRemoteWorkspaceRoot(value: string): boolean {
+  return value.startsWith("/") && !value.includes("\0");
 }
 
 function modelRouteEnabled(
@@ -12241,6 +12437,7 @@ function mapQuestionChoice(choice: QuestionChoice): InteractionView["options"][n
 
 function mapWorkspace(workspace: WorkspaceDescriptor, entries: readonly WorkspaceEntry[]): WorkspaceView {
   const statuses = workspaceStatusMap(workspace);
+  const remoteWorkspace = mapRemoteWorkspaceLocation(workspace.location, "Workspace");
   return {
     id: workspace.workspaceId,
     targetId: workspace.targetId,
@@ -12248,6 +12445,7 @@ function mapWorkspace(workspace: WorkspaceDescriptor, entries: readonly Workspac
     kind: workspace.kind === WorkspaceKind.MANAGED_DIALOGUE ? "managedDialogue" : "userProject",
     serverPath: workspace.serverPathDisplay,
     trusted: workspace.trusted,
+    ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(workspace.git?.branchName ? { branch: workspace.git.branchName } : {}),
     ...(workspace.git?.headCommit ? { head: workspace.git.headCommit } : {}),
     detachedHead: workspace.git?.detachedHead === true,
@@ -16254,6 +16452,94 @@ function nativeTreeNodeView(
     active: node.active,
     children
   };
+}
+
+function mapDevicePeer(descriptor: ProtoDevicePeerDescriptor): DevicePeerView {
+  const route = mapDevicePeerRoute(descriptor.route);
+  if (descriptor.displayName.trim() === "" || descriptor.platform.trim() === ""
+    || descriptor.presence !== DevicePresenceState.ONLINE
+    || (descriptor.kind !== DeviceKind.DESKTOP && descriptor.kind !== DeviceKind.SERVICE)) {
+    throw new GatewayError("Orchestrator returned an ineligible Device peer.");
+  }
+  const capabilities: DevicePeerView["capabilities"][number][] = [];
+  const seen = new Set<DevicePeerCapabilityKind>();
+  for (const capability of descriptor.capabilities) {
+    if (seen.has(capability)) throw new GatewayError("Orchestrator returned duplicate Device peer capabilities.");
+    seen.add(capability);
+    if (capability === DevicePeerCapabilityKind.FILES) capabilities.push("files");
+    else if (capability === DevicePeerCapabilityKind.PROCESS) capabilities.push("process");
+    else if (capability === DevicePeerCapabilityKind.TERMINAL) capabilities.push("terminal");
+    else if (capability === DevicePeerCapabilityKind.FORWARDING) capabilities.push("forwarding");
+    else throw new GatewayError("Orchestrator returned an unknown Device peer capability.");
+  }
+  if (!seen.has(DevicePeerCapabilityKind.FILES) || !seen.has(DevicePeerCapabilityKind.PROCESS)) {
+    throw new GatewayError("Orchestrator returned a Device peer without files and process capabilities.");
+  }
+  return {
+    route,
+    name: descriptor.displayName,
+    kind: descriptor.kind === DeviceKind.DESKTOP ? "desktop" : "service",
+    platform: descriptor.platform,
+    capabilities
+  };
+}
+
+function mapDevicePeerRoute(route: ProtoDevicePeerRouteIdentity | undefined): DevicePeerRouteIdentityView {
+  const mapped = {
+    targetDeviceId: route?.targetDeviceId ?? "",
+    relationId: route?.relationId ?? "",
+    targetDeviceRevision: route?.targetDeviceRevision?.value ?? 0n,
+    relationRevision: route?.relationRevision?.value ?? 0n,
+    routeGeneration: route?.routeGeneration ?? 0n
+  };
+  if (!validDevicePeerRoute(mapped)) throw new GatewayError("Orchestrator returned an incomplete Device peer route.");
+  return mapped;
+}
+
+function validDevicePeerRoute(route: DevicePeerRouteIdentityView): boolean {
+  return route.targetDeviceId.trim() !== "" && !route.targetDeviceId.includes("\0")
+    && route.relationId.trim() !== "" && !route.relationId.includes("\0")
+    && route.targetDeviceRevision > 0n && route.relationRevision >= 0n && route.routeGeneration > 0n;
+}
+
+function devicePeerRouteMessage(route: DevicePeerRouteIdentityView): MessageInitShape<typeof import("@joko/contracts").DevicePeerRouteIdentitySchema> {
+  return {
+    targetDeviceId: route.targetDeviceId,
+    relationId: route.relationId,
+    targetDeviceRevision: { value: route.targetDeviceRevision },
+    relationRevision: { value: route.relationRevision },
+    routeGeneration: route.routeGeneration
+  };
+}
+
+function sameDevicePeerRoute(
+  actual: ProtoDevicePeerRouteIdentity | undefined,
+  expected: DevicePeerRouteIdentityView
+): boolean {
+  return actual?.targetDeviceId === expected.targetDeviceId
+    && actual.relationId === expected.relationId
+    && actual.targetDeviceRevision?.value === expected.targetDeviceRevision
+    && actual.relationRevision?.value === expected.relationRevision
+    && actual.routeGeneration === expected.routeGeneration;
+}
+
+function devicePeerRouteKey(route: DevicePeerRouteIdentityView): string {
+  return JSON.stringify([
+    route.targetDeviceId,
+    route.relationId,
+    route.targetDeviceRevision.toString(),
+    route.relationRevision.toString(),
+    route.routeGeneration.toString()
+  ]);
+}
+
+function compareDevicePeers(left: DevicePeerView, right: DevicePeerView): number {
+  return left.name.localeCompare(right.name) || left.route.targetDeviceId.localeCompare(right.route.targetDeviceId);
+}
+
+function absoluteDevicePeerPath(value: string): boolean {
+  return value.length > 0 && !/[\p{Cc}]/u.test(value)
+    && (value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/u.test(value));
 }
 
 function requireRemoteHost(host: ProtoRemoteHost | undefined): RemoteHostView {

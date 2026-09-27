@@ -3844,9 +3844,9 @@ export class SessionHost {
           targetId: source.descriptor.targetId,
           targetRevision: admittedTarget.revision,
           effectiveWorkspaceRoot: derivationTarget.workspaceRoot,
-          ...(sourceContext.target.remoteWorkspace === undefined
+          ...(admittedTarget.descriptor.remoteWorkspace === undefined
             ? {}
-            : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+            : { remoteWorkspace: admittedTarget.descriptor.remoteWorkspace }),
           ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
           ...(remotePlan === undefined ? {} : { remoteWorktreePlan: remotePlan })
         });
@@ -3877,9 +3877,9 @@ export class SessionHost {
             backendInstanceGeneration: active.backendInstanceGeneration,
             targetId: source.descriptor.targetId,
             effectiveWorkspaceRoot: derivationTarget.workspaceRoot,
-            ...(sourceContext.target.remoteWorkspace === undefined
+            ...(admittedTarget.descriptor.remoteWorkspace === undefined
               ? {}
-              : { remoteWorkspace: sourceContext.target.remoteWorkspace }),
+              : { remoteWorkspace: admittedTarget.descriptor.remoteWorkspace }),
             ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
             binding
           });
@@ -4053,14 +4053,25 @@ export class SessionHost {
     if (current.revision !== expected.revision) {
       throw new RevisionConflictError("Target", expected.descriptor.id, expected.revision, current.revision);
     }
+    const worktree = source.descriptor.worktree;
+    const expectedRemote = expected.descriptor.remoteWorkspace;
+    const contextRemote = context.target.remoteWorkspace;
+    const remoteAuthorityMatches = sameRemoteWorkspaceBinding(source.descriptor.remoteWorkspace, expectedRemote)
+      && (worktree?.remote === undefined
+        ? sameRemoteWorkspaceBinding(contextRemote, expectedRemote)
+        : expectedRemote !== undefined && contextRemote !== undefined
+          && contextRemote.workspaceRoot === worktree.path
+          && worktree.remote.targetId === expected.descriptor.id
+          && worktree.remote.targetRevision === expected.revision.toString()
+          && sameRemoteWorkspaceBinding(worktree.remote.binding, expectedRemote)
+          && sameRemoteExecutionBinding(contextRemote, expectedRemote));
     if (
       source.descriptor.targetId !== expected.descriptor.id
       || source.descriptor.backendId !== expected.descriptor.backendId
       || context.target.id !== expected.descriptor.id
       || context.target.backendId !== expected.descriptor.backendId
-      || context.target.workspaceRoot !== (source.descriptor.worktree?.path ?? expected.descriptor.workspaceRoot)
-      || context.target.remoteWorkspace?.hostId !== expected.descriptor.remoteWorkspace?.hostId
-      || context.target.remoteWorkspace?.workspaceRoot !== expected.descriptor.remoteWorkspace?.workspaceRoot
+      || context.target.workspaceRoot !== (worktree?.path ?? expected.descriptor.workspaceRoot)
+      || !remoteAuthorityMatches
     ) throw new StoreError("The derivation workspace authority changed.");
   }
 
@@ -4079,9 +4090,7 @@ export class SessionHost {
   ): Promise<NativeSessionDerivationLifecycle> {
     const target = this.#store.getTarget(record.targetId).descriptor;
     if (target.backendId !== record.backendId
-      || target.remoteWorkspace?.hostTargetId !== record.remoteWorkspace?.hostTargetId
-      || target.remoteWorkspace?.hostId !== record.remoteWorkspace?.hostId
-      || target.remoteWorkspace?.workspaceRoot !== record.remoteWorkspace?.workspaceRoot) {
+      || !sameRemoteWorkspaceBinding(target.remoteWorkspace, record.remoteWorkspace)) {
       throw new StoreError("The native derivation lifecycle target authority changed.");
     }
     if (record.worktree !== undefined && expectedWorktree !== undefined
@@ -11315,9 +11324,21 @@ export class SessionHost {
   private targetForSession(stored: StoredSession): TargetDescriptor {
     const current = this.#worktrees?.effectiveTarget(stored)
       ?? this.#store.getTarget(stored.descriptor.targetId).descriptor;
+    const worktree = stored.descriptor.worktree;
+    const remoteWorkspace = worktree?.state === "active" && worktree.remote !== undefined
+      ? (() => {
+          if (stored.descriptor.remoteWorkspace === undefined || current.remoteWorkspace === undefined) {
+            throw new StoreError("Remote Session worktree lost its durable workspace authority.");
+          }
+          return {
+            ...stored.descriptor.remoteWorkspace,
+            workspaceRoot: current.remoteWorkspace.workspaceRoot
+          };
+        })()
+      : stored.descriptor.remoteWorkspace;
     return {
       ...current,
-      remoteWorkspace: stored.descriptor.remoteWorkspace
+      remoteWorkspace
     };
   }
 
@@ -13666,6 +13687,31 @@ function sameNativeBinding(left: NativeSessionBinding, right: NativeSessionBindi
   return left.opaqueRef === right.opaqueRef
     && left.nativeSessionId === right.nativeSessionId
     && left.generation === right.generation;
+}
+
+function sameRemoteWorkspaceBinding(
+  left: TargetDescriptor["remoteWorkspace"],
+  right: TargetDescriptor["remoteWorkspace"]
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind || left.workspaceRoot !== right.workspaceRoot) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
+}
+
+function sameRemoteExecutionBinding(
+  left: NonNullable<TargetDescriptor["remoteWorkspace"]>,
+  right: NonNullable<TargetDescriptor["remoteWorkspace"]>
+): boolean {
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
 }
 
 function sameSessionWorktreeBinding(left: SessionWorktreeBinding, right: SessionWorktreeBinding): boolean {

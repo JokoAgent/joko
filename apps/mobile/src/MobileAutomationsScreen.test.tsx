@@ -237,6 +237,7 @@ function authoringOwner(): Snapshot {
     })],
     targets: [create(TargetSchema, {
       targetId: "target", backendId: "backend", workspaceId: "workspace", displayName: "Project",
+      location: { kind: { case: "serviceNode", value: {} } },
       state: TargetState.ACTIVE, version: { revision: { value: 2n } }
     })],
     workspaces: [create(WorkspaceDescriptorSchema, {

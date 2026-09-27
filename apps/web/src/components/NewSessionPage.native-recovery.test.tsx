@@ -141,7 +141,7 @@ describe("new-task native draft recovery", () => {
     const remoteTarget = {
       ...base.targets[1]!,
       name: "Project",
-      remoteWorkspace: { hostTargetId: "target-1", hostId: "build-host", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh" as const, hostTargetId: "target-1", hostId: "build-host", workspaceRoot: "/srv/project" }
     };
     const remoteWorkspace = { ...base.workspaces[1]!, name: "Project", serverPath: "/srv/project" };
     const snapshotValue = { ...base, targets: [base.targets[0]!, remoteTarget], workspaces: [base.workspaces[0]!, remoteWorkspace] };
@@ -956,7 +956,7 @@ describe("new-task worktree authority", () => {
     const remoteSnapshot: AppSnapshot = {
       ...base,
       targets: base.targets.map((target) => target.id === "target-1"
-        ? { ...target, remoteWorkspace: { hostTargetId: "target-1", hostId: "remote-1", workspaceRoot: "/srv/project" } }
+        ? { ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "target-1", hostId: "remote-1", workspaceRoot: "/srv/project" } }
         : target)
     };
     const probe = vi.fn(async (): Promise<TargetWorktreeProbeView> => {

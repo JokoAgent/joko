@@ -507,7 +507,7 @@ it("denies revoked, malformed, remote and review-only UI mutations before dispat
     h.store.upsertTarget({ id: "remote", backendId: "pi", displayName: "Remote host",
       workspaceRoot: "/work", managed: false, trusted: true });
     h.store.upsertTarget({ ...h.store.getTarget(SCOPE.targetId).descriptor,
-      remoteWorkspace: { hostTargetId: "remote", hostId: "host", workspaceRoot: "/work" } });
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote", hostId: "host", workspaceRoot: "/work" } });
     await expect(h.service.controlSimulatorInstance(valid, h.context))
       .rejects.toMatchObject({ code: "STALE_SCOPE" });
     expect(h.remove).not.toHaveBeenCalled();

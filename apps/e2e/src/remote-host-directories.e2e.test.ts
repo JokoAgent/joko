@@ -97,16 +97,20 @@ it("browses and creates a revision-fenced SSH project through the production HTT
     expect(createdOperation.state).toBe(OperationState.SUCCEEDED);
     if (createdOperation.result?.payload.case !== "target") throw new Error("Remote project creation returned no Target.");
     const createdTarget = createdOperation.result.payload.value;
-    expect(createdTarget.remoteWorkspace).toMatchObject({
-      hostTargetId: targetId, hostId: host.id, workspaceRootDisplay: "/srv/new-project"
+    expect(createdTarget.location?.kind).toMatchObject({
+      case: "sshHost",
+      value: { hostTargetId: targetId, hostId: host.id, workspaceRootDisplay: "/srv/new-project" }
     });
     expect(fixture.application.store.getTarget(createdTarget.targetId).descriptor.remoteWorkspace).toEqual({
-      hostTargetId: targetId, hostId: host.id, workspaceRoot: "/srv/new-project"
+      kind: "ssh", hostTargetId: targetId, hostId: host.id, workspaceRoot: "/srv/new-project"
     });
     expect(fixture.application.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({
       id: createdTarget.workspaceId,
       root: "/srv/new-project",
-      remote: { targetId: createdTarget.targetId, hostTargetId: targetId, hostId: host.id, workspaceRoot: "/srv/new-project" }
+      remote: {
+        targetId: createdTarget.targetId,
+        binding: { kind: "ssh", hostTargetId: targetId, hostId: host.id, workspaceRoot: "/srv/new-project" }
+      }
     }));
     expect(files.mkdir).toHaveBeenCalledWith("/srv/new-project", expect.objectContaining({ recursive: true, mode: 0o700 }));
     expect(connect).toHaveBeenCalledOnce();

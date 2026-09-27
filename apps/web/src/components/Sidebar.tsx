@@ -4751,7 +4751,7 @@ function SessionActionsMenu({ session, t, onStartRename, onPin, onArchive, onPre
       >
         {!session.archived && <button type="button" role="menuitem" onClick={() => run(onPin)}>{session.pinned ? t("session.unpin") : t("session.pin")}</button>}
         <button type="button" role="menuitem" onClick={() => { close(false); onStartRename(); }}>{t("session.rename")}</button>
-        {!session.archived && session.remoteWorkspace !== true && <button
+        {!session.archived && session.remoteWorkspace === undefined && <button
           ref={projectTriggerRef}
           type="button"
           role="menuitem"

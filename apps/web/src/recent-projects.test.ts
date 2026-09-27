@@ -32,11 +32,11 @@ it("uses current Target and Workspace identity, availability and path rather tha
   expect(resolveRecentProject(entry!, { ...snapshot, workspaces: [{ ...snapshot.workspaces[0]!, serverPath: "C:/other" }] })).toBeUndefined();
   expect(resolveRecentProject(entry!, { ...snapshot, targets: [] })).toBeUndefined();
   expect(recentProjectForTarget({ ...snapshot, workspaces: [{ ...snapshot.workspaces[0]!, kind: "managedDialogue" }] }, "target")).toBeUndefined();
-  const remoteSnapshot = { ...snapshot, targets: [{ ...snapshot.targets[0]!, remoteWorkspace: { hostTargetId: "target", hostId: "host-a", workspaceRoot: "/srv/project" } }],
+  const remoteSnapshot = { ...snapshot, targets: [{ ...snapshot.targets[0]!, remoteWorkspace: { kind: "ssh" as const, hostTargetId: "target", hostId: "host-a", workspaceRoot: "/srv/project" } }],
     workspaces: [{ ...snapshot.workspaces[0]!, serverPath: "/srv/project" }] };
   const remoteEntry = recentProjectForTarget(remoteSnapshot, "target");
   expect(resolveRecentProject(remoteEntry!, { ...remoteSnapshot,
-    targets: [{ ...remoteSnapshot.targets[0]!, remoteWorkspace: { hostTargetId: "target", hostId: "host-b", workspaceRoot: "/srv/project" } }] })).toBeUndefined();
+    targets: [{ ...remoteSnapshot.targets[0]!, remoteWorkspace: { kind: "ssh" as const, hostTargetId: "target", hostId: "host-b", workspaceRoot: "/srv/project" } }] })).toBeUndefined();
 });
 
 it("discards malformed local history and removes only the exact remembered identity", () => {

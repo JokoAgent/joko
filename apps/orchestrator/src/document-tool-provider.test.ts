@@ -18,7 +18,7 @@ it("binds editable document creation to the current trusted local task and stric
       } }) as never,
       getTarget: () => ({ descriptor: {
         id: "target", backendId: "backend", trusted, workspaceRoot: "D:\\base",
-        ...(remote ? { remoteWorkspace: { hostTargetId: "host", hostId: "host", workspaceRoot: "/remote" } } : {})
+        ...(remote ? { remoteWorkspace: { kind: "ssh", hostTargetId: "host", hostId: "host", workspaceRoot: "/remote" } } : {})
       } }) as never
     },
     publish: async input => {

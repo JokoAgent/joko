@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -794,11 +794,26 @@ export class PiBackendAdapter implements
     this.#assertNotDisposed();
     if (target.backendId !== this.id) throw piError("PI_TARGET_BACKEND_MISMATCH", "Target is not assigned to the Pi adapter", "provision");
     if (target.remoteWorkspace !== undefined) {
-      if (!normalizedPosixAbsolutePath(target.remoteWorkspace.workspaceRoot)) {
-        throw piError("PI_REMOTE_WORKSPACE_INVALID", "Remote workspace root must be a normalized absolute POSIX path", "provision");
+      const pathStyle = remoteBindingPathStyle(target.remoteWorkspace);
+      if (!validRemoteWorkspaceIdentity(target.remoteWorkspace)
+        || pathStyle === undefined
+        || !normalizedRemoteAbsolutePath(target.remoteWorkspace.workspaceRoot, pathStyle)
+        || (target.workspaceRoot === target.remoteWorkspace.workspaceRoot
+          ? !normalizedRemoteAbsolutePath(target.workspaceRoot, pathStyle)
+          : !isAbsolute(target.workspaceRoot) || resolve(target.workspaceRoot) !== target.workspaceRoot)) {
+        throw piError("PI_REMOTE_WORKSPACE_INVALID", "Remote workspace roots and execution identity must be canonical for the bound target platform", "provision");
       }
       if (this.#options.validateRemoteWorkspace === undefined) {
         throw piError("PI_REMOTE_WORKSPACE_UNAVAILABLE", "Remote workspace validation is unavailable", "provision");
+      }
+      if (target.workspaceRoot !== target.remoteWorkspace.workspaceRoot) {
+        const info = await lstat(target.workspaceRoot).catch((error) => {
+          throw piError("PI_WORKSPACE_UNAVAILABLE", `Pi fallback workspace '${target.workspaceRoot}' is unavailable`, "provision", { cause: error });
+        });
+        if (!info.isDirectory() || info.isSymbolicLink()
+          || !samePath(await realpath(target.workspaceRoot), target.workspaceRoot)) {
+          throw piError("PI_WORKSPACE_UNSAFE", "Pi fallback workspace must be a canonical regular directory", "provision");
+        }
       }
       await this.#options.validateRemoteWorkspace(target);
       return;
@@ -4367,8 +4382,7 @@ export class PiBackendAdapter implements
         JOKO_PI_REMOTE_RECOVERY_IDENTITY: stableRemoteRecoveryIdentity(
           context.sessionId,
           context.target.id,
-          context.target.remoteWorkspace.hostTargetId,
-          context.target.remoteWorkspace.hostId
+          context.target.remoteWorkspace
         )
       }),
       JOKO_PI_RUNTIME_POLICY: profile.runtimePolicy,
@@ -6657,9 +6671,20 @@ function stableSpawnIdentity(agentHome: string, sessionsRoot: string, sessionKey
     .digest("hex");
 }
 
-function stableRemoteRecoveryIdentity(sessionId: string, targetId: string, hostTargetId: string, hostId: string): string {
+function stableRemoteRecoveryIdentity(
+  sessionId: string,
+  targetId: string,
+  binding: NonNullable<TargetDescriptor["remoteWorkspace"]>
+): string {
+  const routeIdentity = binding.kind === "ssh"
+    ? JSON.stringify({ kind: binding.kind, hostTargetId: binding.hostTargetId, hostId: binding.hostId })
+    : JSON.stringify({
+        kind: binding.kind,
+        controllerDeviceId: binding.controllerDeviceId,
+        targetDeviceId: binding.targetDeviceId
+      });
   return createHash("sha256")
-    .update([sessionId, targetId, hostTargetId, hostId].join("\0"))
+    .update([sessionId, targetId, routeIdentity].join("\0"))
     .digest("hex");
 }
 
@@ -7017,7 +7042,14 @@ function sameRemoteWorkspace(
   right: TargetDescriptor["remoteWorkspace"]
 ): boolean {
   if (left === undefined || right === undefined) return left === right;
-  return left.hostId === right.hostId && left.workspaceRoot === right.workspaceRoot;
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId
+      && left.hostId === right.hostId
+      && left.workspaceRoot === right.workspaceRoot
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId && left.workspaceRoot === right.workspaceRoot;
 }
 
 function normalizedPosixAbsolutePath(value: string): boolean {
@@ -7065,13 +7097,43 @@ export function isRuntimeResourceProvenLoaded(
   );
 }
 
+function normalizedWin32AbsolutePath(value: string): boolean {
+  return value.length > 0
+    && value.length <= 16_384
+    && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && win32Path.isAbsolute(value)
+    && win32Path.normalize(value) === value;
+}
+
+function normalizedRemoteAbsolutePath(value: string, pathStyle: "posix" | "win32"): boolean {
+  return pathStyle === "posix" ? normalizedPosixAbsolutePath(value) : normalizedWin32AbsolutePath(value);
+}
+
+function remoteBindingPathStyle(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): "posix" | "win32" | undefined {
+  if (binding.kind === "ssh") return "posix";
+  if (normalizedPosixAbsolutePath(binding.workspaceRoot)) return "posix";
+  if (normalizedWin32AbsolutePath(binding.workspaceRoot)) return "win32";
+  return undefined;
+}
+
+function validRemoteWorkspaceIdentity(binding: NonNullable<TargetDescriptor["remoteWorkspace"]>): boolean {
+  const bounded = (value: string): boolean => value.length > 0
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+  return binding.kind === "ssh"
+    ? bounded(binding.hostTargetId) && bounded(binding.hostId)
+    : bounded(binding.controllerDeviceId)
+      && bounded(binding.targetDeviceId)
+      && binding.controllerDeviceId !== binding.targetDeviceId;
+}
+
 function assertPiDerivationTarget(context: AdapterContext, derivation: NativeSessionDerivation): void {
   const source = context.target;
   const target = derivation.target;
   const sameWorkspace = source.remoteWorkspace === undefined
     ? target.remoteWorkspace === undefined && samePath(source.workspaceRoot, target.workspaceRoot)
-    : target.remoteWorkspace?.hostId === source.remoteWorkspace.hostId
-      && target.remoteWorkspace.workspaceRoot === source.remoteWorkspace.workspaceRoot
+    : sameRemoteWorkspace(target.remoteWorkspace, source.remoteWorkspace)
       && target.workspaceRoot === source.workspaceRoot;
   if (target.id === source.id
     && target.backendId === source.backendId

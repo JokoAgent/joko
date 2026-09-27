@@ -190,9 +190,9 @@ message Target {
   google.protobuf.Timestamp last_activity_at = 8;
   EntityVersion version = 9;
   ErrorInfo error = 10;
-  // Present only when process and file capabilities are routed through an
-  // authenticated Remote Host rather than the service node.
-  RemoteWorkspaceBinding remote_workspace = 11;
+  // Required strict location. Clients must reject an absent/unspecified kind
+  // rather than infer service-node execution from missing remote fields.
+  WorkspaceLocation location = 11;
 }
 
 enum SessionState {
@@ -312,9 +312,9 @@ message Session {
   ErrorInfo error = 17;
   SessionAttention attention = 18;
   SessionWorktree worktree = 19;
-  // Immutable creation-time snapshot. A later Target rebind cannot retarget
+  // Immutable creation-time location. A later Target rebind cannot retarget
   // an already-created task or its native runtime.
-  RemoteWorkspaceBinding remote_workspace = 20;
+  WorkspaceLocation location = 20;
   // Bounded generated navigation aid. Empty means no current summary.
   string task_summary = 21;
   // Navigation-only project placement. Absence means the dialogue group;

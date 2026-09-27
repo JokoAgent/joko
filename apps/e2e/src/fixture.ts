@@ -11,6 +11,7 @@ import {
   BlobTransferCoordinator,
   ConnectionManager,
   ContactManager,
+  DevicePeerOwner,
   LanDiscoveryService,
   DurableWorkspaceRunCapture,
   HistoryMaintenance,
@@ -18,6 +19,7 @@ import {
   OperationalArtifactRepository,
   DurableReviewEvidenceProvider,
   ReviewCoordinator,
+  RemoteExecutionRouter,
   RemoteWorkspaceService,
   ScheduleCoordinator,
   SessionHost,
@@ -248,9 +250,13 @@ export class OrchestratorE2eFixture {
     for (const adapter of backendInstances.availableAdapters()) {
       if (adapter instanceof InstrumentedFakeAdapter) adapters.set(adapter.id, adapter);
     }
-    const workspaces = new WorkspaceService(auxiliaryServices?.remoteHosts === undefined
+    const devicePeers = new DevicePeerOwner({ store });
+    const remoteExecution = auxiliaryServices?.remoteHosts === undefined
       ? undefined
-      : { remoteDelegate: new RemoteWorkspaceService(auxiliaryServices.remoteHosts) });
+      : new RemoteExecutionRouter({ hosts: auxiliaryServices.remoteHosts, peers: devicePeers });
+    const workspaces = new WorkspaceService(remoteExecution === undefined
+      ? undefined
+      : { remoteDelegate: new RemoteWorkspaceService(remoteExecution) });
     await workspaces.register({
       id: "workspace-main",
       root: workspaceDirectory,
@@ -391,6 +397,8 @@ export class OrchestratorE2eFixture {
       config,
       store,
       connections,
+      devicePeers,
+      ...(remoteExecution === undefined ? {} : { remoteExecution }),
       serverId,
       lanDiscovery,
       artifacts,
@@ -440,6 +448,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => contacts.close());
         await attempt(() => contactStore.close());
         await attempt(() => sessionWorktrees.dispose());
+        await attempt(() => devicePeers.shutdown());
         await attempt(() => store.close());
         if (failures.length > 0) throw new AggregateError(failures, "The E2E application did not close cleanly.");
       }

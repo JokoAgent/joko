@@ -292,7 +292,7 @@ async function waitForConfiguredTaskTarget(
     if (backend !== undefined && target !== undefined
       && target.backendId === backend.backendId
       && target.state === TargetState.ACTIVE
-      && target.remoteWorkspace === undefined
+      && target.location?.kind.case === "serviceNode"
       && target.version?.revision?.value !== undefined
       && target.version.revision.value >= 1n
       && (backend.health === BackendHealth.HEALTHY || backend.health === BackendHealth.DEGRADED)
@@ -359,7 +359,7 @@ function selectTaskTarget(snapshot: Snapshot): { readonly backend: BackendDescri
     const backend = backends.get(target.backendId);
     if (backend === undefined
       || target.state !== TargetState.ACTIVE
-      || target.remoteWorkspace !== undefined
+      || target.location?.kind.case !== "serviceNode"
       || target.version?.revision?.value === undefined
       || target.version.revision.value < 1n
       || (backend.health !== BackendHealth.HEALTHY && backend.health !== BackendHealth.DEGRADED)

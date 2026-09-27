@@ -273,6 +273,28 @@ describe("native derivation receipts", () => {
     const input = { ...claimed, effectiveWorkspaceRoot: plan.path, remoteWorkspace, worktree };
     const attempt = { ...f.attempt({ ...input, worktree: undefined }), remoteWorktreePlan: plan };
     expect(() => f.store.prepareNativeSessionDerivation({
+      ...attempt,
+      remoteWorktreePlan: {
+        ...plan,
+        authority: { ...plan.authority, authorityIdentity: "live-route-generation" },
+        remote: { ...plan.remote, authorityIdentity: "live-route-generation" }
+      }
+    } as PrepareNativeSessionDerivationInput)).toThrow(/authority/u);
+    expect(() => f.store.prepareNativeSessionDerivation({
+      ...attempt,
+      remoteWorktreePlan: {
+        ...plan,
+        authority: {
+          ...plan.authority,
+          binding: { ...plan.authority.binding, routeGeneration: 7 }
+        },
+        remote: {
+          ...plan.remote,
+          binding: { ...plan.remote.binding, routeGeneration: 7 }
+        }
+      }
+    } as PrepareNativeSessionDerivationInput)).toThrow(/fields|binding/u);
+    expect(() => f.store.prepareNativeSessionDerivation({
       ...attempt, remoteWorktreePlan: { ...plan, sourceSnapshot: "not-a-snapshot" }
     })).toThrow(/source snapshot/u);
     const prepared = f.store.prepareNativeSessionDerivation(attempt);
@@ -312,6 +334,54 @@ describe("native derivation receipts", () => {
     expect(f.store.findNativeSessionDerivation(input.operationId)).toMatchObject({
       state: "product_adopted", worktree, remoteWorktreePlan: plan
     });
+  });
+
+  it("persists a stable Device peer binding in native derivation receipts", () => {
+    const f = fixture("device_peer");
+    const input = f.claim("peer-derivation");
+    const recorded = f.store.recordNativeSessionDerivation(input);
+
+    expect(recorded.remoteWorkspace).toEqual({
+      kind: "device_peer",
+      controllerDeviceId: "controller-device",
+      targetDeviceId: "peer-device",
+      workspaceRoot: "D:\\peer\\project"
+    });
+    expect(recorded.remoteWorkspace).not.toHaveProperty("routeGeneration");
+
+    f.reopen();
+    expect(f.store.findNativeSessionDerivation(input.operationId)?.remoteWorkspace)
+      .toEqual(recorded.remoteWorkspace);
+  });
+
+  it("persists a Win32 Device peer checkout plan with native checkout paths", () => {
+    const f = fixture("device_peer");
+    const input = f.claim("peer-worktree-plan");
+    const plan = remotePeerPlan(
+      f,
+      input,
+      "9".repeat(40),
+      "12121212-1212-4121-8121-121212121212",
+      "34343434-3434-4343-8343-343434343434"
+    );
+
+    expect(() => f.store.prepareNativeSessionDerivation({
+      ...f.attempt({ ...input, effectiveWorkspaceRoot: plan.path, remoteWorkspace: plan.authority.binding }),
+      remoteWorktreePlan: {
+        ...plan,
+        storageRoot: "\\Joko\\runtime\\worktrees",
+        path: `\\Joko\\runtime\\worktrees\\checkouts\\${plan.leaseId}`
+      }
+    })).toThrow(/absolute normalized host-native path/u);
+
+    const prepared = f.store.prepareNativeSessionDerivation({
+      ...f.attempt({ ...input, effectiveWorkspaceRoot: plan.path, remoteWorkspace: plan.authority.binding }),
+      remoteWorktreePlan: plan
+    });
+
+    expect(prepared.remoteWorktreePlan).toEqual(plan);
+    f.reopen();
+    expect(f.store.findNativeSessionDerivation(input.operationId)?.remoteWorktreePlan).toEqual(plan);
   });
 
   it("retains a remote checkout intent when effect outcome and cleanup are unknown", () => {
@@ -721,11 +791,23 @@ function remotePlan(
 ) {
   const target = f.store.getTarget("workspace");
   const binding = target.descriptor.remoteWorkspace!;
+  if (binding.kind !== "ssh") throw new Error("Expected an SSH workspace fixture.");
   const host = f.store.getRemoteHost("owner", "workspace", "ssh");
   const authority = {
-    hostOwnerId: host.ownerId, hostTargetId: binding.hostTargetId, hostId: binding.hostId,
-    hostIdentity: `sha256:${"a".repeat(64)}`, targetId: target.descriptor.id,
-    targetRevision: target.revision.toString(), hostRevision: host.revision.toString()
+    targetId: target.descriptor.id,
+    binding,
+    executionIdentity: JSON.stringify({
+      kind: "ssh",
+      hostTargetId: binding.hostTargetId,
+      hostId: binding.hostId,
+      ownerId: host.ownerId,
+      hostname: host.hostname,
+      port: host.port,
+      user: host.user,
+      algorithm: host.trust!.algorithm,
+      fingerprint: host.trust!.fingerprint
+    }),
+    targetRevision: target.revision.toString()
   };
   return {
     format: 1 as const,
@@ -750,7 +832,50 @@ function remoteWorktree(plan: ReturnType<typeof remotePlan>) {
   };
 }
 
-function fixture(remote = false) {
+function remotePeerPlan(
+  f: ReturnType<typeof fixture>,
+  input: Pick<RecordNativeSessionDerivationInput, "operationId" | "sessionId" | "sourceSessionId">,
+  sourceCommit: string,
+  leaseId: string,
+  manifestId: string
+) {
+  const target = f.store.getTarget("workspace");
+  const binding = target.descriptor.remoteWorkspace!;
+  if (binding.kind !== "device_peer") throw new Error("Expected a Device peer workspace fixture.");
+  const authority = {
+    targetId: target.descriptor.id,
+    binding,
+    executionIdentity: JSON.stringify({
+      kind: "device_peer",
+      controllerDeviceId: binding.controllerDeviceId,
+      targetDeviceId: binding.targetDeviceId
+    }),
+    targetRevision: target.revision.toString()
+  };
+  const storageRoot = "D:\\Joko\\runtime\\worktrees";
+  return {
+    format: 1 as const,
+    leaseId,
+    manifestId,
+    sessionId: input.sessionId,
+    sourceSessionId: input.sourceSessionId,
+    workspaceId: `workspace-${input.operationId}`,
+    sourceCwd: binding.workspaceRoot,
+    sourceSnapshot: `sha256:${"e".repeat(64)}`,
+    path: `${storageRoot}\\checkouts\\${leaseId}`,
+    repositoryRoot: "D:\\peer\\project",
+    branch: `joko/remote-${createHash("sha256").update(input.sessionId).digest("hex").slice(0, 12)}-${leaseId.slice(0, 8)}`,
+    sourceRef: sourceCommit,
+    sourceCommit,
+    sourceStrategy: "explicit" as const,
+    sourceRefreshed: false as const,
+    storageRoot,
+    authority,
+    remote: { ...authority, manifestId }
+  };
+}
+
+function fixture(remote: boolean | "device_peer" = false) {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-derivation-store-"));
   const databasePath = path.join(directory, "operational.sqlite");
   let store = new OperationalStore(databasePath);
@@ -758,12 +883,21 @@ function fixture(remote = false) {
   store.upsertBackend({ id: "native", adapterKind: "fixture", displayName: "Native", version: "1",
     instanceGeneration: 0, health: "healthy", installationState: "installed", authenticationState: "not_required",
     capabilities: new Map(), models: [], tools: [], diagnostics: [] });
-  const remoteWorkspace = remote
-    ? { hostTargetId: "workspace", hostId: "ssh", workspaceRoot: "/srv/repository/project" }
-    : undefined;
+  const remoteWorkspace = remote === true
+    ? { kind: "ssh" as const, hostTargetId: "workspace", hostId: "ssh", workspaceRoot: "/srv/repository/project" }
+    : remote === "device_peer"
+      ? { kind: "device_peer" as const, controllerDeviceId: "controller-device",
+          targetDeviceId: "peer-device", workspaceRoot: "D:\\peer\\project" }
+      : undefined;
+  if (remote === "device_peer") {
+    store.createDevice({ id: "controller-device", name: "Controller", kind: "web", platform: "web", appVersion: "test" });
+    store.createDevice({ id: "peer-device", name: "Peer", kind: "desktop", platform: "win32", appVersion: "test" });
+    const peer = store.getDevice("peer-device");
+    store.setDeviceRemoteControlEnabled(peer.id, true, peer.revision);
+  }
   store.upsertTarget({ id: "workspace", backendId: "native", displayName: "Workspace", workspaceRoot: "D:/workspace",
     managed: false, trusted: true, ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }) });
-  if (remote) {
+  if (remote === true) {
     let host = store.createRemoteHost({ ownerId: "owner", targetId: "workspace", id: "ssh",
       hostname: "host.example.test", user: "builder", source: "manual" });
     host = store.pinRemoteHostTrust({ ownerId: host.ownerId, targetId: host.targetId, id: host.id,

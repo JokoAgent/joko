@@ -36,6 +36,7 @@
     "@joko/adapter-transcription-sauc": "workspace:*",
     "@joko/contracts": "workspace:*",
     "@joko/core": "workspace:*",
+    "@joko/device-peer": "workspace:*",
     "@joko/git-safety": "workspace:*",
     "@joko/local-model-runtime": "workspace:*",
     "@joko/messaging": "workspace:*",

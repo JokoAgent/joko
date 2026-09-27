@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 
-import { loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
+import { claudeWorkspaceAuthority, loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   ClaudeSessionStoreOperationAccess,
   ClaudeSessionStoreSessionAccess,
@@ -24,7 +25,7 @@ import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const FORK_ID = "22222222-2222-4222-8222-222222222222";
@@ -115,7 +116,7 @@ describe("RemoteClaudeRuntimeResolver", () => {
     const binding = await fixture.resolver.resolve(fixture.target);
 
     expect(binding).toMatchObject({ workspaceRoot: "/srv/project", remote: true });
-    expect(fixture.capture).toHaveBeenCalledWith(fixture.target.id, "host-a", undefined);
+    expect(fixture.capture).toHaveBeenCalledWith(fixture.target.remoteWorkspace, undefined);
     expect(fixture.processes.requests[0]).toMatchObject({ executable: "/bin/sh", cwd: "/srv/project" });
     expect(fixture.processes.requests[1]).toMatchObject({
       executable: "/home/test/.joko/runtime/v1/claude-code/current/node/bin/node",
@@ -158,6 +159,35 @@ describe("RemoteClaudeRuntimeResolver", () => {
     const cached = await fixture.resolver.resolve(fixture.target);
     expect(cached).toBe(binding);
     expect(fixture.capture).toHaveBeenCalledOnce();
+  });
+
+  it("opens the packaged Claude manager through the Win32 Device-peer locator without POSIX probes", async () => {
+    const fixture = createFixture({ devicePeerWin32: true });
+    cleanups.push(() => fixture.resolver.close());
+
+    const binding = await fixture.resolver.resolve(fixture.target);
+    expect(binding).toMatchObject({ workspaceRoot: "C:\\Joko\\Project", remote: true });
+    expect(fixture.capture).toHaveBeenCalledWith(fixture.target.remoteWorkspace, undefined);
+    expect(fixture.processes.requests).toHaveLength(1);
+    expect(fixture.processes.requests[0]).toMatchObject({
+      executable: DEVICE_PEER_RUNTIME_EXECUTABLES.claude,
+      args: [
+        "bridge",
+        expect.stringMatching(/^\\\\\.\\pipe\\joko-claude-[0-9a-f]{32}$/u),
+        "C:\\Joko\\Project\\.joko\\runtime\\v1\\claude-code"
+      ],
+      cwd: "C:\\Joko\\Project",
+      env: {
+        HOME: "C:\\Joko\\Project\\.joko\\runtime\\v1\\claude-code\\profile",
+        TMP: "C:\\Joko\\Project\\.joko\\runtime\\v1\\claude-code\\tmp",
+        TEMP: "C:\\Joko\\Project\\.joko\\runtime\\v1\\claude-code\\tmp",
+        CLAUDE_CONFIG_DIR: "C:\\Joko\\Project\\.joko\\runtime\\v1\\claude-code\\profile",
+        JOKO_CLAUDE_EXECUTABLE: DEVICE_PEER_RUNTIME_EXECUTABLES.claude
+      }
+    });
+    expect(fixture.processes.requests[0]?.env).not.toHaveProperty("PATH");
+    await expect(binding.runtime.getSessionInfo(SESSION_ID, { dir: binding.workspaceRoot }))
+      .resolves.toMatchObject({ sessionId: SESSION_ID, cwd: binding.workspaceRoot });
   });
 
   it("replays a lost start receipt, deduplicates a maybe-consumed input, restores callbacks, and confirms retirement", async () => {
@@ -566,6 +596,7 @@ describe("RemoteClaudeRuntimeResolver", () => {
 });
 
 interface FixtureOptions {
+  readonly devicePeerWin32?: boolean;
   readonly dropStartResponseOnce?: boolean;
   readonly dropInputResponseOnce?: boolean;
   readonly replayGapOnce?: boolean;
@@ -578,14 +609,22 @@ interface FixtureOptions {
 }
 
 function createFixture(options: FixtureOptions = {}) {
+  const workspaceRoot = options.devicePeerWin32 === true ? "C:\\Joko\\Project" : "/srv/project";
   const target: TargetDescriptor = {
     id: "target-claude",
     backendId: "claude-code",
     displayName: "Remote Claude",
-    workspaceRoot: "/srv/project",
+    workspaceRoot,
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostTargetId: "target-claude", hostId: "host-a", workspaceRoot: "/srv/project" }
+    remoteWorkspace: options.devicePeerWin32 === true
+      ? {
+          kind: "device_peer",
+          controllerDeviceId: "controller-device",
+          targetDeviceId: "windows-device",
+          workspaceRoot
+        }
+      : { kind: "ssh", hostTargetId: "target-claude", hostId: "host-a", workspaceRoot }
   };
   const host: RemoteHostRecord = {
     ownerId: "owner-a",
@@ -637,17 +676,22 @@ function createFixture(options: FixtureOptions = {}) {
     capture: vi.fn()
   };
   fixture.capture.mockImplementation(async () => ({
-    host,
-    hostRevision: host.revision,
-    leaseGeneration: 3,
-    lease,
+    kind: options.devicePeerWin32 === true ? "device_peer" as const : "ssh" as const,
+    binding: target.remoteWorkspace!,
+    executionIdentity: options.devicePeerWin32 === true
+      ? JSON.stringify({ controllerDeviceId: "controller-device", targetDeviceId: "windows-device" })
+      : JSON.stringify({ ownerId: host.ownerId, hostId: host.id }),
+    authorityIdentity: `${host.revision}:3`,
+    pathStyle: options.devicePeerWin32 === true ? "win32" as const : "posix" as const,
+    processes,
+    forwarding,
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
     assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
   const resolver = new RemoteClaudeRuntimeResolver({
     storeGeneration: options.storeGeneration ?? 7,
     store: { getTarget: () => fixture.stored },
-    registry: { captureProcessAuthority: fixture.capture } as unknown as Pick<RemoteHostRegistry, "captureProcessAuthority">,
+    remoteExecution: { processes: fixture.capture } as unknown as Pick<RemoteExecutionRouter, "processes">,
     authorizeDerivedWorkspace: async () => {
       if (options.rejectDerivedAuthorization === true) throw new Error("Remote checkout is not owned");
       return {
@@ -861,8 +905,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
       this.#lostQuery = undefined;
       return process.respond(frame.id, { retired: true });
     }
-    if (frame.method === "session.info") return process.respond(frame.id, sessionInfo(String(params.sessionId)));
-    if (frame.method === "session.list") return process.respond(frame.id, [sessionInfo(SESSION_ID)]);
+    if (frame.method === "session.info") return process.respond(frame.id, sessionInfo(String(params.sessionId), String(params.dir)));
+    if (frame.method === "session.list") return process.respond(frame.id, [sessionInfo(SESSION_ID, String(params.dir))]);
     if (frame.method === "session.messages") return process.respond(frame.id, [{
       type: "assistant",
       uuid: MESSAGE_ID,
@@ -1112,22 +1156,7 @@ function sessionInfo(sessionId: string, cwd = "/srv/project") {
 }
 
 function workspaceAuthority(target: TargetDescriptor): string {
-  const remote = target.remoteWorkspace!;
-  return `workspace-${createHash("sha256")
-    .update("joko-claude-workspace\0", "utf8")
-    .update(target.backendId, "utf8")
-    .update("\0", "utf8")
-    .update(target.id, "utf8")
-    .update("\0", "utf8")
-    .update("remote\0", "utf8")
-    .update(remote.hostTargetId, "utf8")
-    .update("\0", "utf8")
-    .update(remote.hostId, "utf8")
-    .update("\0", "utf8")
-    .update(remote.workspaceRoot, "utf8")
-    .update("\0", "utf8")
-    .update(target.workspaceRoot, "utf8")
-    .digest("hex")}`;
+  return claudeWorkspaceAuthority(target);
 }
 
 function probeOutput(): Buffer {

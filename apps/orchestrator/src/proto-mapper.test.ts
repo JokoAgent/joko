@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { CapabilitySupport, PermissionMode, ProviderApiCompatibility, ProviderConfigurationField, capabilityNames } from "@joko/contracts";
+import { CapabilitySupport, PermissionMode, ProviderApiCompatibility, ProviderConfigurationField, WorkspaceLocationSchema, capabilityNames } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
@@ -20,6 +20,7 @@ import {
   fromProtoSubagentRunDetail,
   fromProtoSubagentTranscriptEntry,
   fromProtoTimestamp,
+  fromProtoWorkspaceLocation,
   mapErrorToPublic,
   toProtoEvent,
   toProtoBackend,
@@ -35,10 +36,36 @@ import {
   toProtoSession,
   toProtoSubagentRunDetail,
   toProtoSubagentTranscriptEntry,
-  toProtoTimestamp
+  toProtoTimestamp,
+  toProtoWorkspaceLocation
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("maps every current workspace location explicitly and rejects an absent or unspecified kind", () => {
+    expect(toProtoWorkspaceLocation(undefined).kind.case).toBe("serviceNode");
+    expect(() => fromProtoWorkspaceLocation(undefined)).toThrow(/location and its kind are required/u);
+    expect(() => fromProtoWorkspaceLocation(create(WorkspaceLocationSchema, {})))
+      .toThrow(/location and its kind are required/u);
+
+    const ssh = { kind: "ssh" as const, hostTargetId: "target-owner", hostId: "host-one", workspaceRoot: "/srv/project" };
+    expect(fromProtoWorkspaceLocation(toProtoWorkspaceLocation(ssh))).toEqual(ssh);
+    const peer = {
+      kind: "device_peer" as const,
+      controllerDeviceId: "controller-device",
+      targetDeviceId: "target-device",
+      workspaceRoot: "/srv/peer-project"
+    };
+    expect(fromProtoWorkspaceLocation(toProtoWorkspaceLocation(peer))).toEqual(peer);
+    const windowsPeer = { ...peer, workspaceRoot: "C:\\Users\\Owner\\peer-project" };
+    expect(fromProtoWorkspaceLocation(toProtoWorkspaceLocation(windowsPeer))).toEqual(windowsPeer);
+    const uncPeer = { ...peer, workspaceRoot: "\\\\device\\share\\peer-project" };
+    expect(fromProtoWorkspaceLocation(toProtoWorkspaceLocation(uncPeer))).toEqual(uncPeer);
+    expect(() => fromProtoWorkspaceLocation(toProtoWorkspaceLocation({ ...peer, workspaceRoot: "\\peer-project" })))
+      .toThrow(/absolute host-native path/u);
+    expect(() => fromProtoWorkspaceLocation(toProtoWorkspaceLocation({ ...peer, workspaceRoot: "relative\\peer-project" })))
+      .toThrow(/absolute host-native path/u);
+  });
+
   it("projects Artifact expiration exactly and rejects malformed stored expiry", () => {
     const artifact: ArtifactRecord = {
       blob: {

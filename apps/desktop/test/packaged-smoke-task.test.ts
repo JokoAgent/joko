@@ -331,6 +331,7 @@ function snapshot(sessions: readonly object[], includeManaged = true, configured
         displayName: "Unrelated project",
         workspaceId: "workspace-unrelated",
         state: TargetState.ACTIVE,
+        location: { kind: { case: "serviceNode", value: {} } },
         version: { revision: { value: 4n } }
       },
       ...(includeManaged ? [{
@@ -339,6 +340,7 @@ function snapshot(sessions: readonly object[], includeManaged = true, configured
         displayName: "Managed project",
         workspaceId: "workspace-managed",
         state: TargetState.ACTIVE,
+        location: { kind: { case: "serviceNode", value: {} } },
         version: { revision: { value: 7n } }
       }] : [])
     ],

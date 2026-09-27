@@ -25,14 +25,15 @@ describe("TerminalProvider", () => {
       expect(created).toEqual(duplicate);
       expect(created).toMatchObject({ cwd: "/srv/project/child", shellId: remoteShell.id, exitConfirmed: false });
       expect(created).not.toHaveProperty("pid");
-      expect(resolveRuntime).toHaveBeenCalledExactlyOnceWith({ sessionId: scope.sessionId, targetId: scope.targetId, workspaceRoot: scope.workspaceRoot, remoteHostId: scope.remoteHostId }, expect.any(AbortSignal));
+      expect(resolveRuntime).toHaveBeenCalledExactlyOnceWith({ sessionId: scope.sessionId, targetId: scope.targetId, workspaceRoot: scope.workspaceRoot, remoteWorkspace: scope.remoteWorkspace }, expect.any(AbortSignal));
       expect(runtime.discoverShells).toHaveBeenCalledOnce();
       expect(runtime.canonicalDirectory).toHaveBeenCalledExactlyOnceWith("/srv/project", "child/../child");
       expect(runtime.spawn).toHaveBeenCalledExactlyOnceWith(remoteShell, { cwd: "/srv/project/child", cols: 91, rows: 27 }, expect.any(AbortSignal));
-      await expect(provider.input({ ...ref(scope, created), remoteHostId: "another-host", data: "do not send" }))
+      const otherRemote = { ...scope.remoteWorkspace, hostId: "another-host" };
+      await expect(provider.input({ ...ref(scope, created), remoteWorkspace: otherRemote, data: "do not send" }))
         .rejects.toMatchObject({ code: "TERMINAL_SCOPE_MISMATCH" });
-      await expect(provider.create({ ...request, remoteHostId: "another-host" })).rejects.toMatchObject({ code: "TERMINAL_SCOPE_MISMATCH" });
-      expect(provider.list({ ...scope, remoteHostId: "another-host" })).toEqual([]);
+      await expect(provider.create({ ...request, remoteWorkspace: otherRemote })).rejects.toMatchObject({ code: "TERMINAL_SCOPE_MISMATCH" });
+      expect(provider.list({ ...scope, remoteWorkspace: otherRemote })).toEqual([]);
       await expect(provider.discoverShells({ ...scope, workspaceRoot: "C:\\local\\workspace" })).rejects.toMatchObject({ code: "WORKSPACE_PATH_DENIED" });
       expect(fixture.localSpawn).not.toHaveBeenCalled();
       expect(fixture.localShells).not.toHaveBeenCalled();
@@ -546,7 +547,8 @@ class FakePty implements TerminalPty {
 const remoteShell: TerminalShell = { id: "remote-shell", label: "Remote shell", executable: "/bin/bash", args: ["-l"], isDefault: true };
 
 function remoteSetup(enabled = true) {
-  const scope = { sessionId: "remote-task", targetId: "remote-target", remoteHostId: "host-a", workspaceRoot: "/srv/project", initialPalette: palette };
+  const scope = { sessionId: "remote-task", targetId: "remote-target", workspaceRoot: "/srv/project",
+    remoteWorkspace: { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/srv/project" }, initialPalette: palette };
   const ptys: FakePty[] = [];
   const runtime = {
     discoverShells: vi.fn<TerminalRuntime["discoverShells"]>(async () => [remoteShell]),

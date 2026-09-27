@@ -157,7 +157,12 @@ describe("Connect security and protocol audit", () => {
     const authenticate = () => {
       throw new ConnectionAuthenticationError("AUTH_REQUIRED", "Authentication is required.");
     };
-    registerConnectServices(router, stubApplication({ connections: { authenticate } }));
+    registerConnectServices(router, stubApplication({
+      connections: {
+        authenticate,
+        authenticateDevicePeerAgent: authenticate
+      }
+    }));
     const publicCalls = new Set([
       "joko.v1.ConnectionService/getServerInfo",
       "joko.v1.ConnectionService/listDiscoveredNodes",
@@ -2795,12 +2800,12 @@ describe("Connect security and protocol audit", () => {
     await submit(true);
     expect(files.mkdir).toHaveBeenCalledOnce();
     expect(validateTarget).toHaveBeenCalledWith(expect.objectContaining({ remoteWorkspace: {
-      hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new"
+      kind: "ssh", hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new"
     } }));
     expect(upsertTarget).toHaveBeenCalledOnce();
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ root: "/srv/new", remote: {
-      targetId: created?.descriptor.id, hostTargetId: sourceDescriptor.id,
-      hostId: "build-box", workspaceRoot: "/srv/new"
+      targetId: created?.descriptor.id,
+      binding: { kind: "ssh", hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new" }
     } }));
 
     upsertTarget.mockClear();
@@ -2811,6 +2816,273 @@ describe("Connect security and protocol audit", () => {
     await expect(submit(true, 9n, "-commit-fence")).rejects.toMatchObject({ code: Code.Aborted });
     expect(upsertTarget).not.toHaveBeenCalled();
     expect(unregister).toHaveBeenCalledOnce();
+  });
+
+  it("creates a Device peer Target only after explicit missing-directory consent and preserves exact Device authority", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-device-peer-project-audit-"));
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const connection = {
+      id: "controller-connection",
+      deviceId: "controller-device",
+      name: "Controller",
+      authKeyDigest: "digest",
+      state: "active" as const,
+      pairedAt: 1,
+      revision: 3n
+    };
+    const identity = {
+      targetDeviceId: "target-device",
+      targetDeviceRevision: 8n,
+      relationId: "controller-device:target-device",
+      relationRevision: 5n,
+      routeGeneration: 4
+    };
+    const authority = {
+      controllerConnectionId: connection.id,
+      controllerDeviceId: connection.deviceId,
+      identity,
+      capabilities: ["files", "process", "terminal", "forwarding"] as const,
+      assertCurrent: vi.fn()
+    };
+    let directoryCreated = false;
+    const dispatch = vi.fn(async (_authority, request: { action: string }) => {
+      if (request.action === "statFile" && !directoryCreated) {
+        return { outcome: "failed", errorCode: "not_found" };
+      }
+      if (request.action === "createDirectory") {
+        directoryCreated = true;
+        return {
+          outcome: "completed",
+          value: { case: "directoryCreated", value: create(contract.DevicePeerDirectoryCreatedResultSchema, {
+            path: "C:\\work\\new"
+          }) }
+        };
+      }
+      if (request.action === "statFile") {
+        return {
+          outcome: "completed",
+          value: { case: "fileStat", value: create(contract.DevicePeerFileStatResultSchema, {
+            kind: contract.DevicePeerFileKind.DIRECTORY,
+            size: 0n,
+            modifiedAt: toProtoTimestamp(1),
+            mode: 0o700
+          }) }
+        };
+      }
+      if (request.action === "realpath") {
+        return {
+          outcome: "completed",
+          value: { case: "realpath", value: create(contract.DevicePeerRealpathResultSchema, {
+            path: "C:\\work\\new"
+          }) }
+        };
+      }
+      throw new Error(`Unexpected Device peer action: ${request.action}`);
+    });
+    const devicePeers = {
+      capture: vi.fn(() => authority),
+      dispatch,
+      list: vi.fn(() => []),
+      registerRoute: vi.fn(),
+      retireRoute: vi.fn(),
+      shutdown: vi.fn()
+    };
+    let created: { descriptor: Parameters<OperationalStore["upsertTarget"]>[0]; metadata: unknown;
+      revision: bigint; createdAt: number; updatedAt: number } | undefined;
+    const upsertTarget = vi.fn((descriptor: Parameters<OperationalStore["upsertTarget"]>[0], metadata: unknown) => {
+      created = { descriptor, metadata, revision: 1n, createdAt: 1, updatedAt: 1 };
+    });
+    let persistedOperation: {
+      id: string;
+      connectionId: string;
+      kind: string;
+      body: unknown;
+      bodyHash: string;
+      completionMode: "synchronous";
+      status: "completed";
+      response: unknown;
+      createdAt: number;
+      updatedAt: number;
+      revision: bigint;
+    } | undefined;
+    const store = {
+      findOperation: (id: string) => persistedOperation?.id === id ? persistedOperation : undefined,
+      getOperation: (id: string) => persistedOperation?.id === id
+        ? persistedOperation
+        : (() => { throw new Error("Operation missing"); })(),
+      getBackend: () => ({ descriptor: { id: "pi" } }),
+      getConnection: (id: string) => id === connection.id
+        ? connection
+        : (() => { throw new Error("Connection missing"); })(),
+      getTarget: (id: string) => created?.descriptor.id === id ? created : (() => { throw new Error("Target missing"); })(),
+      upsertTarget
+    };
+    const register = vi.fn(async (registration) => registration);
+    const unregister = vi.fn();
+    const validateTarget = vi.fn(async () => undefined);
+    const mutate = vi.fn(async (input: {
+      operationId: string;
+      kind: string;
+      body: unknown;
+      precondition: (value: typeof store) => void;
+      effect: () => Promise<void>;
+      commit: (value: typeof store) => unknown;
+    }) => {
+      input.precondition(store);
+      await input.effect();
+      input.precondition(store);
+      const value = input.commit(store);
+      persistedOperation = {
+        id: input.operationId,
+        connectionId: connection.id,
+        kind: input.kind,
+        body: input.body,
+        bodyHash: operationBodyHash(input.body),
+        completionMode: "synchronous",
+        status: "completed",
+        response: value,
+        createdAt: 1,
+        updatedAt: 2,
+        revision: 1n
+      };
+      return { replayed: false, value, operation: persistedOperation };
+    });
+    const services = createConnectServices(stubApplication({
+      config: { publicOrigin: "https://orchestrator.example.test", dataDirectory: directory },
+      store,
+      devicePeers,
+      workspaces: { register, unregister },
+      sessionHost: { mutate, validateTarget },
+      connections: { authenticate: () => connection }
+    }));
+    const submit = (
+      createIfMissing: boolean,
+      routeIdentity = identity,
+      displayName = "Peer project"
+    ) => invoke(services.operation.submitOperation, {
+      operationId: `operation-device-peer-${createIfMissing}`,
+      connectionId: connection.id,
+      mutation: create(contract.OperationMutationSchema, {
+        preconditions: [],
+        payload: { case: "createDevicePeerTarget", value: create(contract.CreateDevicePeerTargetMutationSchema, {
+          backendId: "pi",
+          displayName,
+          peer: create(contract.DevicePeerRouteIdentitySchema, {
+            targetDeviceId: routeIdentity.targetDeviceId,
+            targetDeviceRevision: { value: routeIdentity.targetDeviceRevision },
+            relationId: routeIdentity.relationId,
+            relationRevision: { value: routeIdentity.relationRevision },
+            routeGeneration: BigInt(routeIdentity.routeGeneration)
+          }),
+          workspacePath: "C:\\work\\new",
+          createIfMissing
+        }) }
+      })
+    }, context());
+
+    await expect(submit(false)).rejects.toMatchObject({ code: Code.NotFound });
+    expect(dispatch).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "createDirectory" }));
+    expect(upsertTarget).not.toHaveBeenCalled();
+    await submit(true);
+    expect(devicePeers.capture).toHaveBeenCalledWith(
+      expect.objectContaining({ id: connection.id, deviceId: connection.deviceId, authKeyDigest: connection.authKeyDigest }),
+      identity,
+      ["files", "process"]
+    );
+    expect(validateTarget).toHaveBeenCalledWith(expect.objectContaining({ remoteWorkspace: {
+      kind: "device_peer",
+      controllerDeviceId: connection.deviceId,
+      targetDeviceId: identity.targetDeviceId,
+      workspaceRoot: "C:\\work\\new"
+    } }));
+    expect(upsertTarget).toHaveBeenCalledOnce();
+    expect(persistedOperation?.body).toEqual({
+      version: 1,
+      kind: "createDevicePeerTarget",
+      controllerDeviceId: connection.deviceId,
+      targetDeviceId: identity.targetDeviceId,
+      backendId: "pi",
+      displayName: "Peer project",
+      workspacePath: "C:\\work\\new",
+      createIfMissing: true,
+      preconditions: []
+    });
+    expect(JSON.stringify(persistedOperation?.body)).not.toMatch(
+      /relation|routeGeneration|targetDeviceRevision|controller-connection/u
+    );
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({
+      root: "C:\\work\\new",
+      remote: {
+        targetId: created?.descriptor.id,
+        binding: {
+          kind: "device_peer",
+          controllerDeviceId: connection.deviceId,
+          targetDeviceId: identity.targetDeviceId,
+          workspaceRoot: "C:\\work\\new"
+        }
+      }
+    }));
+
+    const callsBeforeReplay = mutate.mock.calls.length;
+    await submit(true, {
+      ...identity,
+      targetDeviceRevision: 9n,
+      relationRevision: 6n,
+      routeGeneration: 5
+    });
+    expect(mutate).toHaveBeenCalledTimes(callsBeforeReplay);
+    await expect(submit(true, {
+      ...identity,
+      targetDeviceRevision: 9n,
+      relationRevision: 6n,
+      routeGeneration: 5
+    }, "Different project")).rejects.toBeInstanceOf(OperationConflictError);
+
+    const restartedServices = createConnectServices(stubApplication({
+      store,
+      connections: { authenticate: () => connection }
+    }));
+    const restored = await invoke(restartedServices.operation.getOperation, {
+      operationId: "operation-device-peer-true"
+    }, context()) as contract.GetOperationResponse;
+    expect(restored.operation?.mutation?.payload).toMatchObject({
+      case: "createDevicePeerTarget",
+      value: {
+        backendId: "pi",
+        displayName: "Peer project",
+        workspacePath: "C:\\work\\new",
+        createIfMissing: true
+      }
+    });
+    expect(restored.operation?.mutation?.payload.case === "createDevicePeerTarget"
+      ? restored.operation.mutation.payload.value.peer
+      : "wrong-payload").toBeUndefined();
+
+    const mutationCallsBeforeRebind = mutate.mock.calls.length;
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "operation-device-peer-rebind",
+      connectionId: connection.id,
+      mutation: create(contract.OperationMutationSchema, {
+        preconditions: [{
+          entity: { kind: contract.EntityKind.TARGET, id: created!.descriptor.id },
+          expectedRevision: { value: created!.revision }
+        }],
+        payload: {
+          case: "updateTarget",
+          value: create(contract.UpdateTargetMutationSchema, {
+            targetId: created!.descriptor.id,
+            location: create(contract.WorkspaceLocationSchema, {
+              kind: { case: "serviceNode", value: {} }
+            })
+          })
+        }
+      })
+    }, context())).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+      message: expect.stringContaining("immutable")
+    });
+    expect(mutate).toHaveBeenCalledTimes(mutationCallsBeforeRebind);
+    expect(upsertTarget).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -2840,14 +3112,16 @@ describe("Connect security and protocol audit", () => {
         workspaceRoot: "D:\\service-copy",
         managed: false,
         trusted: false,
-        remoteWorkspace: { hostTargetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
+        remoteWorkspace: { kind: "ssh", hostTargetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
       },
       expected: {
         id: "workspace-remote",
         root: "/srv/project",
         displayName: "Remote project",
         trusted: false,
-        remote: { targetId: "target-remote", hostTargetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project" }
+        remote: { targetId: "target-remote", binding: {
+          kind: "ssh", hostTargetId: "target-remote", hostId: "build-host", workspaceRoot: "/srv/project"
+        } }
       }
     }
   ])("prepares the exact durable $name Target workspace binding and revision", async ({ descriptor, expected }) => {

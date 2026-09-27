@@ -21,7 +21,7 @@ import {
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  TargetState, WorkspaceKind, capabilityNames, nativeSessionTreeWireFields
+  TargetState, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -186,6 +186,7 @@ const automationAuthoringOwnerSnapshot = create(SnapshotSchema, {
   targets: [create(TargetSchema, {
     ...snapshot.targets[0]!,
     workspaceId: "workspace",
+    location: create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } }),
     version: create(EntityVersionSchema, {
       revision: create(RevisionSchema, { value: 3n, etag: "target-r3" }), generation: 1n
     })

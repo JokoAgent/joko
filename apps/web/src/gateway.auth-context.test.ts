@@ -779,6 +779,7 @@ describe("authoritative session context state", () => {
     sessionId: "session-1",
     backendId: "pi-1",
     targetId: "target-1",
+    location: { kind: { case: "serviceNode" as const, value: {} } },
     state: SessionState.IDLE,
     context: {
       usedTokens: 10n,

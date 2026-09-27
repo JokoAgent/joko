@@ -450,7 +450,7 @@ function bootstrap(
     authority: {
       format: 1,
       targetId: "target-test",
-      hostId: "host-test",
+      routeIdentity: "host-test",
       recoveryIdentity: fixture.recoveryIdentity,
       spawnIdentity,
       runtimeGeneration: generation,
@@ -538,9 +538,15 @@ async function startBridge(
     env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 },
     stdio: ["pipe", "pipe", "pipe"]
   });
+  let diagnostics = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (diagnostics.length < 16_384) diagnostics += chunk.toString("utf8");
+  });
   child.stdin.write(`${JSON.stringify(value)}\n`);
   const reader = new FrameReader(child.stdout);
-  const control = await nextFrameOfType(reader, FRAME_AUTHORITY);
+  const control = await nextFrameOfType(reader, FRAME_AUTHORITY).catch((error: unknown) => {
+    throw new Error(`${error instanceof Error ? error.message : "Broker startup failed."}${diagnostics === "" ? "" : `\n${diagnostics}`}`);
+  });
   const declaredEnvironment = value["env"] as Record<string, string> | undefined;
   const currentBearer = declaredEnvironment?.["JOKO_PI_MCP_TOKEN"];
   if (currentBearer !== undefined) expect(control.content.toString("utf8")).not.toContain(currentBearer);
@@ -563,7 +569,10 @@ async function startBridge(
       authorityDigest: parsed.state.authorityDigest,
       attestation: parsed.authority.attestation
     }))));
-    const committed = JSON.parse((await nextFrameOfType(reader, FRAME_AUTHORITY_COMMIT_ACK)).content.toString("utf8")) as {
+    const committedFrame = await nextFrameOfType(reader, FRAME_AUTHORITY_COMMIT_ACK).catch((error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "Broker commit failed."}${diagnostics === "" ? "" : `\n${diagnostics}`}`);
+    });
+    const committed = JSON.parse(committedFrame.content.toString("utf8")) as {
       readonly ok: boolean;
       readonly epoch: number;
       readonly authorityDigest: string;
@@ -625,6 +634,11 @@ async function processExitWithin(child: ChildProcess, timeoutMs: number): Promis
 }
 
 async function exactKill(pid: number, mode: "daemon" | "owner", sourcePath: string): Promise<void> {
+  if (process.platform === "win32") {
+    process.kill(pid, "SIGKILL");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+    return;
+  }
   const fields = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
   expect(fields).toContain(sourcePath);
   expect(fields).toContain(mode);
@@ -1053,7 +1067,7 @@ describe("remote Pi broker source", () => {
     15_000
   );
 
-  it.runIf(process.platform === "linux")(
+  it.runIf(process.platform === "linux" || process.platform === "win32")(
     "keeps the exact child and replay alive across manager crash, then rotates relay authority",
     async () => {
       const fixture = await brokerFixture();
@@ -1145,10 +1159,10 @@ describe("remote Pi broker source", () => {
         await closeServer(firstUpstream.server);
         if (secondUpstream !== undefined) await closeServer(secondUpstream.server);
         try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
-        await rm(fixture.root, { recursive: true, force: true });
+        await rm(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       }
     },
-    30_000
+    process.platform === "win32" ? 120_000 : 30_000
   );
 
   it.runIf(process.platform === "linux")(

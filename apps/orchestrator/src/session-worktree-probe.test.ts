@@ -24,7 +24,7 @@ describe("SessionWorktreeCoordinator probe classification", () => {
 
     await expect(coordinator.probe({
       ...target,
-      remoteWorkspace: { hostTargetId: "target-1", hostId: "remote-1", workspaceRoot: "/srv/project" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-1", hostId: "remote-1", workspaceRoot: "/srv/project" }
     })).resolves.toEqual({ targetId: "target-1", eligibility: "unavailable", canRefreshRemote: false });
     expect(inspected).toBe(false);
   });

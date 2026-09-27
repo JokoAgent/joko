@@ -6,6 +6,7 @@ import { createRemoteClaudeDerivedWorkspaceAuthorizer } from "./remote-claude-de
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 
 const sourceRemote = {
+  kind: "ssh" as const,
   hostTargetId: "host-target",
   hostId: "host-one",
   workspaceRoot: "/srv/project"
@@ -31,13 +32,10 @@ const binding: SessionWorktreeBinding = {
   sourceStrategy: "explicit",
   sourceRefreshed: false,
   remote: {
-    hostOwnerId: "owner-one",
-    hostTargetId: sourceRemote.hostTargetId,
-    hostId: sourceRemote.hostId,
-    hostIdentity: `sha256:${"b".repeat(64)}`,
     targetId: sourceTarget.id,
+    binding: sourceRemote,
+    executionIdentity: "ssh-owner-one",
     targetRevision: "7",
-    hostRevision: "9",
     manifestId: "manifest-child"
   },
   state: "active",
@@ -97,6 +95,20 @@ describe("remote Claude derived workspace authority", () => {
     expect(f.assertActiveRemoteWorktree).toHaveBeenCalledTimes(2);
     f.changeTargetRevision();
     expect(() => authority.assertCurrent()).toThrow(/Target authority changed/u);
+  });
+
+  it("accepts only the primary or exact derived root on the same remote execution binding", async () => {
+    const effectiveTarget = {
+      ...derivedTarget,
+      remoteWorkspace: { ...sourceRemote, workspaceRoot: derivedTarget.workspaceRoot }
+    };
+    const effective = fixture();
+    await expect(effective.authorize(effectiveTarget, effective.storedTarget)).resolves.toBeDefined();
+    const unrelated = fixture();
+    await expect(unrelated.authorize({
+      ...derivedTarget,
+      remoteWorkspace: { ...sourceRemote, workspaceRoot: "/srv/runtime/worktrees/other" }
+    }, unrelated.storedTarget)).rejects.toThrow(/Target authority is invalid/u);
   });
 
   it("rejects failed or ambiguous receipts before granting an SDK runtime", async () => {

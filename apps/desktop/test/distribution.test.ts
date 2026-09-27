@@ -51,9 +51,11 @@ describe("Desktop distribution", () => {
 
   it("pins an inert builder toolchain and keeps build-only packages out of production dependencies", () => {
     expect(manifest.dependencies).toEqual({
+      "@bufbuild/protobuf": "2.14.0",
       "@connectrpc/connect": "2.1.2",
       "@connectrpc/connect-node": "2.1.2",
       "@joko/contracts": "workspace:*",
+      "@joko/device-peer": "workspace:*",
       "electron-updater": "6.8.9",
       "electron-window-state": "5.0.3",
       loudness: "0.4.2",

@@ -40,14 +40,21 @@ describe("operation ID lifecycle", () => {
         targetId: "runtime-target",
         projectId: "navigation-project",
         displayName: "Movable task",
-        remoteWorkspace: { hostTargetId: "runtime-target", hostId: "host-1", workspaceRootDisplay: "/srv/work" }
+        location: { kind: { case: "sshHost", value: {
+          hostTargetId: "runtime-target", hostId: "host-1", workspaceRootDisplay: "/srv/work"
+        } } }
       }]
     }));
     expect(snapshot.sessions[0]).toMatchObject({
       id: "session-1",
       targetId: "runtime-target",
       projectId: "navigation-project",
-      remoteWorkspace: true
+      remoteWorkspace: {
+        kind: "ssh",
+        hostTargetId: "runtime-target",
+        hostId: "host-1",
+        workspaceRoot: "/srv/work"
+      }
     });
   });
 
@@ -119,7 +126,8 @@ describe("operation ID lifecycle", () => {
         sessionId: "session-existing",
         backendId: "pi",
         targetId: "target-1",
-        displayName: "Existing task"
+        displayName: "Existing task",
+        location: { kind: { case: "serviceNode", value: {} } }
       }])
     );
     await gateway.connect();
@@ -472,6 +480,7 @@ function operationTransport(
             targetId: input.targetId,
             displayName: "Local workspace",
             serverPathDisplay: "D:\\workspace",
+            location: { kind: { case: "serviceNode", value: {} } },
             version: { revision: input.expectedTargetRevision }
           }
         }));
@@ -490,6 +499,7 @@ function targetDescriptor(archived: boolean, revision = 1n): any {
     displayName: "Local workspace",
     workspaceId: "workspace-1",
     archived,
+    location: { kind: { case: "serviceNode", value: {} } },
     version: { revision: { value: revision } }
   };
 }
@@ -508,6 +518,7 @@ function successfulSessionResponse(method: any, input: any, sessionId: string): 
             backendId: "pi",
             targetId: "target-1",
             displayName: "New task",
+            location: { kind: { case: "serviceNode", value: {} } },
             nativeBinding: { runtimeGeneration: 7n }
           }
         }

@@ -1859,6 +1859,42 @@ describe("CodexBackendAdapter", () => {
     expect(setup.remoteFake.threads.has(nativeSessionId)).toBe(true);
   });
 
+  it("validates a canonical Windows device-peer Target and fences same-name SSH hosts by source Target", async () => {
+    const peerBinding: NonNullable<TargetDescriptor["remoteWorkspace"]> = {
+      kind: "device_peer",
+      controllerDeviceId: "controller-device",
+      targetDeviceId: "windows-device",
+      workspaceRoot: "C:\\Joko\\Workspace"
+    };
+    const peer = await createRemoteSetup({
+      targetWorkspaceRoot: peerBinding.workspaceRoot,
+      remoteWorkspace: peerBinding
+    });
+    await expect(peer.adapter.validateTarget(peer.target)).resolves.toBeUndefined();
+    expect(peer.resolveRemote).toHaveBeenCalledWith(peer.target, undefined);
+    await expect(peer.adapter.validateTarget({ ...peer.target, workspaceRoot: "C:/Joko/Workspace" }))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_TARGET_PATH_INVALID" } });
+
+    const ssh = await createRemoteSetup();
+    const nativeSessionId = ssh.remoteFake.seedThread(ssh.target.remoteWorkspace!.workspaceRoot);
+    const candidate = (await ssh.adapter.listNativeSessions(ssh.target))[0]!;
+    const binding = await ssh.adapter.resolveNativeSessionReference(candidate.nativeReference, ssh.target, 1);
+    const bound = context(ssh.target, [], { binding, backendInstanceGeneration: 7 });
+    await ssh.adapter.resumeSession(binding, bound);
+    const sshWorkspace = ssh.target.remoteWorkspace;
+    if (sshWorkspace?.kind !== "ssh") throw new Error("Expected the remote Codex fixture to use an SSH workspace.");
+    const reboundTarget: TargetDescriptor = {
+      ...ssh.target,
+      remoteWorkspace: { ...sshWorkspace, hostTargetId: "other-source-target" }
+    };
+    await expect(ssh.adapter.send(prompt("must not cross source Target authority"), {
+      ...bound,
+      target: reboundTarget,
+      operationId: "cross-source-host-name"
+    })).rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_TARGET_UNAVAILABLE" } });
+    expect(ssh.remoteFake.threads.get(nativeSessionId)?.turns).toHaveLength(0);
+  });
+
   it("never resends uncertain remote input and rejects authority drift at the final pre-write fence", async () => {
     const setup = await createRemoteSetup();
     const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
@@ -4593,6 +4629,8 @@ async function createSmartAuthenticationSetup(includeNativeRoute: boolean) {
 async function createRemoteSetup(options: {
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly resolveNativeMemoryEnabled?: CodexAdapterOptions["resolveNativeMemoryEnabled"];
+  readonly targetWorkspaceRoot?: string;
+  readonly remoteWorkspace?: NonNullable<TargetDescriptor["remoteWorkspace"]>;
 } = {}) {
   const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
   const localFake = new FakeCodexAppServer();
@@ -4600,15 +4638,27 @@ async function createRemoteSetup(options: {
   const localHost = new AppServerHost({ transportFactory: () => localFake.createTransport() });
   const remoteHost = new AppServerHost({ transportFactory: () => remoteFake.createTransport() });
   const profileKey = "a".repeat(64);
+  const targetWorkspaceRoot = options.targetWorkspaceRoot ?? "/srv/joko-project";
+  const remoteWorkspace = options.remoteWorkspace ?? {
+    kind: "ssh" as const,
+    hostTargetId: "target-codex",
+    hostId: "remote-host",
+    workspaceRoot: targetWorkspaceRoot
+  };
   let current = true;
-  const resolveRemote = vi.fn(async () => ({
-    host: remoteHost,
-    workspaceRoot: "/srv/joko-project",
-    profileKey,
-    executionDomain: "ssh-codex-profile-fixture",
-    assertCurrent: () => { if (!current) throw new Error("remote authority changed"); },
-    ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge })
-  }));
+  const resolveRemote = vi.fn(async (selected: TargetDescriptor) => {
+    if (JSON.stringify(selected.remoteWorkspace) !== JSON.stringify(remoteWorkspace)) {
+      throw new Error("remote binding changed");
+    }
+    return {
+      host: remoteHost,
+      workspaceRoot: targetWorkspaceRoot,
+      profileKey,
+      executionDomain: "ssh-codex-profile-fixture",
+      assertCurrent: () => { if (!current) throw new Error("remote authority changed"); },
+      ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge })
+    };
+  });
   const adapter = new CodexBackendAdapter({
     id: "codex-test",
     instanceGeneration: 7,
@@ -4629,7 +4679,7 @@ async function createRemoteSetup(options: {
     workspaceRoot: serviceRoot,
     managed: false,
     trusted: true,
-    remoteWorkspace: { hostTargetId: "target-codex", hostId: "remote-host", workspaceRoot: "/srv/joko-project" }
+    remoteWorkspace
   };
   cleanups.push(async () => {
     await adapter.dispose();

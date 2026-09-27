@@ -221,6 +221,13 @@ import {
   type ManagedOrchestratorRuntime,
   verifyManagedOrchestratorAdoption
 } from "./managed-orchestrator.js";
+import { DesktopDevicePeerAgentExecutor } from "./device-peer-agent.js";
+import { DesktopDevicePeerAgentLifecycle } from "./device-peer-agent-lifecycle.js";
+import { createAuditedDesktopDevicePeerTerminalPort } from "./device-peer-terminal.js";
+import {
+  createAuditedDesktopDevicePeerRuntimeExecutables,
+  resolveDesktopDevicePeerRuntimeRoot
+} from "./device-peer-runtime-executables.js";
 import {
   atomicWritePrivateFile,
   atomicWriteUserSelectedFile,
@@ -450,6 +457,7 @@ let managedOrchestratorStatus: DesktopManagedOrchestratorStatus = process.env["J
   ? { state: "disabled" }
   : { state: "starting" };
 let managedOrchestratorInitialization: Promise<DesktopManagedOrchestratorStatus> | undefined;
+let desktopDevicePeerAgentLifecycle: DesktopDevicePeerAgentLifecycle | undefined;
 const managedOrchestratorExitFence = createManagedExitFence({
   getInitialization: () => managedOrchestratorInitialization,
   clearInitialization: (initialization) => {
@@ -591,6 +599,9 @@ if (!app.requestSingleInstanceLock()) {
     nativeArtifactSourceRevealer?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
+    // Route authority ends at quit admission, before renderer beforeunload can
+    // delay or cancel the later managed-runtime handoff.
+    desktopDevicePeerAgentLifecycle?.setConnection(undefined);
     activeDiscoveryAbort?.abort();
     sessionDragPreviewCoordinator.dispose();
     sessionDragNativeResultFence.dispose();
@@ -604,6 +615,7 @@ if (!app.requestSingleInstanceLock()) {
     // operation either enters its explicit handoff or recovers.
     if (desktopUpdateChannelRelaunch !== undefined || desktopUpdateService?.isRelaunching() === true) {
       quitting = false;
+      reconcileDesktopDevicePeerAgentLifecycle();
       return;
     }
     if (desktopCompleteExit !== undefined) return;
@@ -634,6 +646,7 @@ if (!app.requestSingleInstanceLock()) {
     });
   });
   app.on("will-quit", () => {
+    void desktopDevicePeerAgentLifecycle?.dispose();
     nativeFileClipboard?.dispose();
     nativeFileOpener?.dispose();
     nativeArtifactSourceRevealer?.dispose();
@@ -695,6 +708,7 @@ if (!app.requestSingleInstanceLock()) {
     applicationMenuLocale = app.getLocale();
     installDesktopApplicationMenu();
     createWindow();
+    initializeDesktopDevicePeerAgentLifecycle();
     void beginDesktopUpdateStartup();
     if (!packagedSmoke) ensureTray();
   }, (error: unknown) => {
@@ -1717,13 +1731,14 @@ function finishPackagedSmoke(result: string, exitCode: number): void {
   }
   const runtime = managedOrchestratorRuntime;
   managedOrchestratorRuntime = undefined;
+  const retirePeerAgent = desktopDevicePeerAgentLifecycle?.dispose() ?? Promise.resolve();
   if (runtime === undefined) {
     recordPackagedSmokeProgress("finish_without_runtime");
-    exitPackagedSmokeProcess(exitCode);
+    void retirePeerAgent.finally(() => exitPackagedSmokeProcess(exitCode));
     return;
   }
   recordPackagedSmokeProgress("runtime_stop_started");
-  void runtime.stop().then(
+  void retirePeerAgent.then(() => runtime.stop()).then(
     () => {
       recordPackagedSmokeProgress("runtime_stop_completed");
       exitPackagedSmokeProcess(exitCode);
@@ -4129,6 +4144,7 @@ async function performDesktopUpdateChannelRelaunch(
   try {
     await stopManagedOrchestratorForCompleteExit();
   } catch {
+    reconcileDesktopDevicePeerAgentLifecycle();
     return { accepted: false, reason: "orchestrator-shutdown-failed" };
   }
   let handedOff = false;
@@ -4221,6 +4237,91 @@ function sameManagedOrchestratorConnection(
     left.serverId === right.serverId && left.name === right.name && left.origin === right.origin;
 }
 
+function initializeDesktopDevicePeerAgentLifecycle(): void {
+  if (desktopDevicePeerAgentLifecycle !== undefined) return;
+  let terminalPort: ReturnType<typeof createAuditedDesktopDevicePeerTerminalPort> | undefined;
+  let runtimeExecutables: ReturnType<typeof createAuditedDesktopDevicePeerRuntimeExecutables> | undefined;
+  desktopDevicePeerAgentLifecycle = new DesktopDevicePeerAgentLifecycle({
+    async createExecutor() {
+      const runtimeRoot = resolveDesktopDevicePeerRuntimeRoot({
+        packaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+        sourceDirectory
+      });
+      terminalPort ??= createAuditedDesktopDevicePeerTerminalPort({
+        runtimeRoot,
+        platform: process.platform,
+        arch: process.arch,
+        environment: process.env
+      });
+      runtimeExecutables ??= createAuditedDesktopDevicePeerRuntimeExecutables({
+        runtimeRoot,
+        electronExecutable: process.execPath,
+        platform: process.platform,
+        arch: process.arch,
+        environment: process.env
+      });
+      const [terminals, locatedExecutables] = await Promise.all([terminalPort, runtimeExecutables]);
+      return new DesktopDevicePeerAgentExecutor({
+        recentDirectoriesPath: join(
+          app.getPath("userData"),
+          "device-peer-agent",
+          "recent-directories.json"
+        ),
+        terminals,
+        runtimeExecutables: locatedExecutables
+      });
+    },
+    readAuthKey: readCredential,
+    readRouteAuthorization: readDesktopDevicePeerAgentRouteAuthorization,
+    isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
+  });
+  reconcileDesktopDevicePeerAgentLifecycle();
+}
+
+function reconcileDesktopDevicePeerAgentLifecycle(): void {
+  const connection = managedOrchestratorStatus.state === "ready"
+    && managedOrchestratorConnection !== undefined
+    && sameManagedOrchestratorConnection(
+      managedOrchestratorStatus.connection,
+      managedOrchestratorConnection
+    )
+    && isDesktopDevicePeerAgentAuthorityCurrent(managedOrchestratorConnection)
+    ? managedOrchestratorConnection
+    : undefined;
+  desktopDevicePeerAgentLifecycle?.setConnection(connection);
+}
+
+function isDesktopDevicePeerAgentAuthorityCurrent(
+  candidate: DesktopManagedOrchestratorConnection
+): boolean {
+  const runtime = managedOrchestratorRuntime;
+  return !quitting
+    && !desktopUpdateLifecycleDisposed
+    && !managedOrchestratorExitFence.shutdownStarted
+    && runtime !== undefined
+    && managedOrchestratorStatus.state === "ready"
+    && managedOrchestratorConnection !== undefined
+    && sameManagedOrchestratorConnection(managedOrchestratorStatus.connection, candidate)
+    && sameManagedOrchestratorConnection(managedOrchestratorConnection, candidate)
+    && sameManagedOrchestratorConnection(runtime.connection, candidate);
+}
+
+async function readDesktopDevicePeerAgentRouteAuthorization(
+  profileId: string
+): Promise<string | undefined> {
+  const runtime = managedOrchestratorRuntime;
+  const connection = managedOrchestratorConnection;
+  if (runtime === undefined || connection === undefined || connection.profileId !== profileId
+    || !isDesktopDevicePeerAgentAuthorityCurrent(connection)
+    || !sameManagedOrchestratorConnection(runtime.connection, connection)) return undefined;
+  try {
+    return runtime.readDesktopHostAuthKey();
+  } catch {
+    return undefined;
+  }
+}
+
 function disposeDesktopUpdateLifecycle(): void {
   desktopUpdateLifecycleDisposed = true;
   desktopUpdateStartupPhase = undefined;
@@ -4237,6 +4338,7 @@ async function performDesktopCompleteExit(): Promise<void> {
   } catch {
     managedOrchestratorExitFence.releaseForRecovery();
     quitting = false;
+    reconcileDesktopDevicePeerAgentLifecycle();
     reportDesktopCompleteExitFailure("orchestrator-shutdown-failed");
     return;
   }
@@ -4293,6 +4395,7 @@ async function stopManagedOrchestratorForUpdateApply(): Promise<void> {
     desktopUpdateNativeInstallQuitHandoffPending = true;
   } catch (error) {
     desktopUpdateNativeInstallQuitHandoffPending = false;
+    reconcileDesktopDevicePeerAgentLifecycle();
     throw error;
   }
 }
@@ -4300,6 +4403,7 @@ async function stopManagedOrchestratorForUpdateApply(): Promise<void> {
 async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
   globalVoiceSystemAudioOwner = undefined;
   await Promise.all([
+    desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
     managedOrchestratorExitFence.stop(),
     globalVoiceSystemAudio.releaseAll().catch(() => undefined)
   ]).then(() => undefined);
@@ -4315,6 +4419,7 @@ async function recoverManagedOrchestratorAfterUpdateApplyFailure(): Promise<void
   if (managedOrchestratorStatus.state === "disabled") return;
   managedOrchestratorConnection = undefined;
   managedOrchestratorStatus = { state: "retryableError", reason: "serviceUnavailable" };
+  reconcileDesktopDevicePeerAgentLifecycle();
   await beginManagedOrchestratorInitialization(true, true);
 }
 
@@ -5344,11 +5449,20 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.credentialDelete, async (event, profileId: string) => {
     assertTrustedIpcSender(event);
     validateProfileId(profileId);
-    await deleteCredential(profileId);
+    if (managedOrchestratorConnection?.profileId === profileId) {
+      desktopDevicePeerAgentLifecycle?.setConnection(undefined);
+    }
+    try {
+      await deleteCredential(profileId);
+    } catch (error) {
+      reconcileDesktopDevicePeerAgentLifecycle();
+      throw error;
+    }
     if (managedOrchestratorConnection?.profileId === profileId) {
       managedOrchestratorRecoveryTarget = managedOrchestratorConnection;
       managedOrchestratorConnection = undefined;
       managedOrchestratorStatus = managedOrchestratorRecovery("credentialUnavailable");
+      reconcileDesktopDevicePeerAgentLifecycle();
     }
   });
   ipcMain.handle(DESKTOP_CHANNELS.openExternal, async (event, value: string) => {
@@ -5532,6 +5646,7 @@ function beginManagedOrchestratorInitialization(
   if (managedOrchestratorStatus.state === "ready" && !forceProbe) return Promise.resolve(managedOrchestratorStatus);
   managedOrchestratorConnection = undefined;
   managedOrchestratorStatus = { state: "starting" };
+  reconcileDesktopDevicePeerAgentLifecycle();
   const attempt = initializeManagedOrchestrator(controlledStopConfirmed).then<DesktopManagedOrchestratorStatus>(() => {
     const connection = managedOrchestratorConnection;
     if (connection === undefined) return { state: "retryableError", reason: "startFailed" };
@@ -5544,6 +5659,7 @@ function beginManagedOrchestratorInitialization(
     return { state: "retryableError", reason: "startFailed" };
   }).then((status) => {
     managedOrchestratorStatus = status;
+    reconcileDesktopDevicePeerAgentLifecycle();
     refreshTrayContextMenu();
     if (status.state !== "ready") {
       process.stderr.write(`JOKO_DESKTOP_MANAGED_ORCHESTRATOR_UNAVAILABLE ${status.state}:${"reason" in status ? status.reason : "unknown"}\n`);
@@ -5577,6 +5693,7 @@ async function adoptManagedOrchestratorConnection(
   const hostDirectory = join(app.getPath("userData"), "managed-orchestrator-host");
   const deviceIdPath = join(hostDirectory, "device-id");
   const connectionPath = join(hostDirectory, "connection.json");
+  desktopDevicePeerAgentLifecycle?.setConnection(undefined);
   const authorityIsCurrent = async (): Promise<boolean> => {
     if (managedOrchestratorStatus.state !== "recoveryRequired" || managedOrchestratorRuntime !== ownedRuntime ||
       managedOrchestratorRecoveryTarget === undefined ||
@@ -5624,6 +5741,7 @@ async function adoptManagedOrchestratorConnection(
     managedOrchestratorRecoveryTarget = undefined;
     managedOrchestratorConnection = runtime.connection;
     managedOrchestratorStatus = { state: "ready", connection: runtime.connection };
+    reconcileDesktopDevicePeerAgentLifecycle();
     if (previous.profileId !== connection.profileId && previous.profileId !== runtime.connection.profileId) {
       await deleteCredential(previous.profileId).catch(() => {
         process.stderr.write("JOKO_DESKTOP_STALE_MANAGED_CREDENTIAL_CLEANUP_FAILED\n");
@@ -5650,6 +5768,7 @@ async function completeCurrentManagedOrchestratorLogout(): Promise<DesktopManage
     throw new Error("Desktop has no current managed Orchestrator authority to retire.");
   }
   const connectionPath = join(app.getPath("userData"), "managed-orchestrator-host", "connection.json");
+  desktopDevicePeerAgentLifecycle?.setConnection(undefined);
   const transition = (async (): Promise<DesktopManagedOrchestratorStatus> => {
     await completeVerifiedManagedOrchestratorLogout({
       verifyRevocation: () => probeManagedOrchestratorConnection({
@@ -5673,6 +5792,7 @@ async function completeCurrentManagedOrchestratorLogout(): Promise<DesktopManage
     managedOrchestratorConnection = undefined;
     managedOrchestratorRecoveryTarget = undefined;
     managedOrchestratorStatus = { state: "disabled" };
+    reconcileDesktopDevicePeerAgentLifecycle();
     refreshTrayContextMenu();
     return managedOrchestratorStatus;
   })();
@@ -5681,6 +5801,7 @@ async function completeCurrentManagedOrchestratorLogout(): Promise<DesktopManage
     return await transition;
   } finally {
     if (managedOrchestratorInitialization === transition) managedOrchestratorInitialization = undefined;
+    reconcileDesktopDevicePeerAgentLifecycle();
   }
 }
 

@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/device_peer.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
@@ -57,6 +58,7 @@ message OperationMutation {
     RestartBackendMutation restart_backend = 12;
     CreateTargetMutation create_target = 13;
     CreateRemoteTargetMutation create_remote_target = 215;
+    CreateDevicePeerTargetMutation create_device_peer_target = 216;
     UpdateTargetMutation update_target = 14;
     ArchiveTargetMutation archive_target = 15;
     DeleteTargetMutation delete_target = 16;
@@ -497,6 +499,19 @@ message CreateRemoteTargetMutation {
   bool create_if_missing = 7;
 }
 
+// Creates a project through one exact, currently authorized Device peer
+// route. The durable Target binding retains the exact controller Device,
+// target Device and root; relation revision and live route generation fence
+// this Operation's effect but are re-resolved rather than persisted.
+message CreateDevicePeerTargetMutation {
+  string backend_id = 1;
+  string display_name = 2;
+  DevicePeerRouteIdentity peer = 3;
+  string workspace_path = 4;
+  // True only after the user explicitly confirms creating an absent directory.
+  bool create_if_missing = 5;
+}
+
 message TargetWorkspaceInput {
   WorkspaceKind kind = 1;
   // Interpreted and canonicalized only on the service node.
@@ -508,12 +523,8 @@ message UpdateTargetMutation {
   string target_id = 1;
   optional string display_name = 2;
   optional bool pinned = 3;
-  oneof workspace_location_update {
-    RemoteWorkspaceBinding remote_workspace = 4;
-    // Must be true. Clears a Remote binding and restores the Target's durable
-    // service-node workspace root for subsequently-created Sessions.
-    bool service_node_workspace = 5;
-  }
+  // When present, must contain exactly one current-v1 location variant.
+  WorkspaceLocation location = 4;
 }
 
 message RenameDeviceMutation {

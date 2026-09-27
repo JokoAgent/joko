@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { posix as remotePath } from "node:path";
+import { posix, win32, type PlatformPath } from "node:path";
 import { TextDecoder } from "node:util";
 import {
   AppServerHost,
@@ -11,16 +11,16 @@ import {
   type JsonRpcRecordChannel,
   type JsonRpcRecordChannelHandlers
 } from "@joko/adapter-codex";
-import type { TargetDescriptor } from "@joko/core";
+import type { RemoteWorkspaceBinding, TargetDescriptor } from "@joko/core";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteProcessHandle,
-  RemoteProcessTransportPort,
-  RemoteSshTransportLease
+  RemoteProcessTransportPort
 } from "@joko/remote-ssh";
-import type { OperationalStore, RemoteHostRecord, StoredTarget } from "@joko/store";
+import type { OperationalStore, StoredTarget } from "@joko/store";
 import { probeRemoteCodexInstallation } from "./remote-codex-installation.js";
-import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import type { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
+import type { RemoteExecutionRouter, RemoteProcessAuthority } from "./remote-execution-router.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
 const DAEMON_BOOTSTRAP_TIMEOUT_MS = 30_000;
@@ -32,26 +32,26 @@ const MAXIMUM_MESSAGE_BYTES = 16 * 1_024 * 1_024;
 const MAXIMUM_FRAME_BUFFER_BYTES = 20 * 1_024 * 1_024;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-type ProcessAuthority = Awaited<ReturnType<RemoteHostRegistry["captureProcessAuthority"]>>;
-
 interface ResolverEntry {
+  readonly key: string;
   readonly targetId: string;
   readonly targetRevision: bigint;
   readonly targetSignature: string;
-  readonly authority: ProcessAuthority;
+  readonly storedSignature: string;
+  readonly authority: RemoteProcessAuthority;
   readonly runtime: CodexRemoteRuntime;
 }
 
 export interface RemoteCodexRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
-  readonly registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   readonly mcpBridge?: Pick<CodexMcpBridgeManager, "open" | "shutdown">;
 }
 
 /** Target- and SSH-generation-bound owner for a remote Codex runtime. */
 export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   readonly #store: Pick<OperationalStore, "getTarget">;
-  readonly #registry: Pick<RemoteHostRegistry, "captureProcessAuthority">;
+  readonly #remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   readonly #mcpBridge: RemoteCodexRuntimeResolverOptions["mcpBridge"];
   readonly #entries = new Map<string, ResolverEntry>();
   readonly #flights = new Map<string, Promise<CodexRemoteRuntime>>();
@@ -59,7 +59,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
 
   constructor(options: RemoteCodexRuntimeResolverOptions) {
     this.#store = options.store;
-    this.#registry = options.registry;
+    this.#remoteExecution = options.remoteExecution;
     this.#mcpBridge = options.mcpBridge;
   }
 
@@ -67,8 +67,10 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     this.#assertOpen();
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
     const stored = this.#storedTarget(target);
+    const binding = requireRemoteBinding(target);
+    const key = JSON.stringify([target.id, binding.workspaceRoot]);
     const signature = targetSignature(target);
-    const existing = this.#entries.get(target.id);
+    const existing = this.#entries.get(key);
     if (existing !== undefined
       && existing.targetRevision === stored.revision
       && existing.targetSignature === signature) {
@@ -81,14 +83,14 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     } else if (existing !== undefined) {
       await this.#retire(existing, true);
     }
-    const activeFlight = this.#flights.get(target.id);
+    const activeFlight = this.#flights.get(key);
     if (activeFlight !== undefined) return activeFlight;
-    const flight = this.#resolveFresh(target, stored, signature, signal);
-    this.#flights.set(target.id, flight);
+    const flight = this.#resolveFresh(target, stored, signature, key, signal);
+    this.#flights.set(key, flight);
     try {
       return await flight;
     } finally {
-      if (this.#flights.get(target.id) === flight) this.#flights.delete(target.id);
+      if (this.#flights.get(key) === flight) this.#flights.delete(key);
     }
   }
 
@@ -114,25 +116,35 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     target: TargetDescriptor,
     stored: StoredTarget,
     signature: string,
+    key: string,
     signal?: AbortSignal
   ): Promise<CodexRemoteRuntime> {
     const binding = requireRemoteBinding(target);
-    const authority = await this.#registry.captureProcessAuthority(binding.hostTargetId, binding.hostId, signal);
-    const processes = requireProcesses(authority.lease);
+    const authority = await this.#remoteExecution.processes(binding, signal);
+    const processes = authority.processes;
     authority.assertCurrent();
-    const installation = await probeRemoteCodexInstallation(processes, binding.workspaceRoot, authority.assertCurrent, signal);
+    const targetPaths = remotePaths(authority.pathStyle);
+    const installation = authority.kind === "device_peer"
+      ? Object.freeze({
+          state: "ready" as const,
+          workspaceRoot: binding.workspaceRoot,
+          profileRoot: targetPaths.join(binding.workspaceRoot, ".joko", "runtime", "v1", "codex-home"),
+          executable: DEVICE_PEER_RUNTIME_EXECUTABLES.codex
+        })
+      : await probeRemoteCodexInstallation(processes, binding.workspaceRoot, authority.assertCurrent, signal);
     authority.assertCurrent();
     if (installation.state !== "ready") throw remoteRuntimeFault("The fixed remote Codex runtime is unavailable.");
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
-    const executionDomain = executionDomainFor(authority.host, installation.profileRoot);
+    const executionDomain = executionDomainFor(authority.executionIdentity, installation.profileRoot);
     const profileKey = createHash("sha256").update(executionDomain, "utf8").digest("hex");
+    const storedSignature = targetSignature(stored.descriptor);
     let entry: ResolverEntry;
     const assertCurrent = (): void => {
       this.#assertOpen();
       const current = this.#store.getTarget(target.id);
       if (current.revision !== stored.revision
-        || targetSignature(current.descriptor) !== signature
-        || this.#entries.get(target.id) !== entry) {
+        || targetSignature(current.descriptor) !== storedSignature
+        || this.#entries.get(key) !== entry) {
         throw remoteRuntimeFault("The remote Codex Target authority changed.");
       }
       authority.assertCurrent();
@@ -144,6 +156,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
           executable: installation.executable,
           profileRoot: installation.profileRoot,
           workspaceRoot: installation.workspaceRoot,
+          pathStyle: authority.pathStyle,
           assertCurrent
         })
       })
@@ -158,7 +171,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
         openMcpBridge: async (input: CodexMcpOpenInput) => {
           assertCurrent();
           const bridge = await this.#mcpBridge!.open({
-            forwarding: authority.lease.forwarding,
+            forwarding: authority.forwarding,
             assertCurrent: authority.assertCurrent,
             assertForwardingCurrent: authority.assertForwardingCurrent
           }, input);
@@ -174,15 +187,17 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       })
     });
     entry = Object.freeze({
+      key,
       targetId: target.id,
       targetRevision: stored.revision,
       targetSignature: signature,
+      storedSignature,
       authority,
       runtime
     });
     this.#assertOpen();
     authority.assertCurrent();
-    this.#entries.set(target.id, entry);
+    this.#entries.set(key, entry);
     try {
       runtime.assertCurrent();
       return runtime;
@@ -193,7 +208,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   }
 
   async #retire(entry: ResolverEntry, force: boolean): Promise<void> {
-    if (this.#entries.get(entry.targetId) === entry) this.#entries.delete(entry.targetId);
+    if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key);
     if (force) await entry.runtime.host.forceShutdown().catch(() => undefined);
     else await entry.runtime.host.shutdown().catch(() => undefined);
   }
@@ -201,7 +216,26 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   #storedTarget(target: TargetDescriptor): StoredTarget {
     const stored = this.#store.getTarget(target.id);
     if (targetSignature(stored.descriptor) !== targetSignature(target)) {
-      throw remoteRuntimeFault("The remote Codex Target binding is stale.");
+      const binding = target.remoteWorkspace;
+      const primaryBinding = stored.descriptor.remoteWorkspace;
+      const normalized = binding !== undefined && primaryBinding !== undefined
+        && sameRemoteWorkspaceAuthority(binding, primaryBinding)
+        && binding.workspaceRoot === target.workspaceRoot
+        ? {
+            ...target,
+            workspaceRoot: stored.descriptor.workspaceRoot,
+            remoteWorkspace: primaryBinding
+          }
+        : undefined;
+      if (target.workspaceRoot === stored.descriptor.workspaceRoot
+        || !normalizedAbsoluteRemotePath(
+          target.workspaceRoot,
+          target.workspaceRoot.startsWith("/") ? "posix" : "win32"
+        )
+        || normalized === undefined
+        || targetSignature(normalized) !== targetSignature(stored.descriptor)) {
+        throw remoteRuntimeFault("The remote Codex Target binding is stale.");
+      }
     }
     requireRemoteBinding(stored.descriptor);
     return stored;
@@ -308,6 +342,7 @@ interface RemoteCodexWebSocketChannelOptions {
   readonly executable: string;
   readonly profileRoot: string;
   readonly workspaceRoot: string;
+  readonly pathStyle: "posix" | "win32";
   readonly assertCurrent: () => void;
 }
 
@@ -657,10 +692,10 @@ async function ensureDaemon(options: RemoteCodexWebSocketChannelOptions): Promis
     available = await version();
   }
   if (available.exitCode !== 0) throw remoteRuntimeFault("The remote Codex daemon is unavailable.");
-  return daemonSocketPath(available.stdout, options.profileRoot);
+  return daemonSocketPath(available.stdout, options.profileRoot, options.pathStyle);
 }
 
-function daemonSocketPath(stdout: Buffer, profileRoot: string): string {
+function daemonSocketPath(stdout: Buffer, profileRoot: string, pathStyle: "posix" | "win32"): string {
   let value: unknown;
   try {
     value = JSON.parse(stdout.toString("utf8"));
@@ -676,8 +711,14 @@ function daemonSocketPath(stdout: Buffer, profileRoot: string): string {
     : typeof record["socket_path"] === "string"
       ? record["socket_path"]
       : undefined;
-  if (socketPath === undefined || !normalizedAbsoluteRemotePath(socketPath)
-    || socketPath === profileRoot || !socketPath.startsWith(`${profileRoot}/`)) {
+  const paths = remotePaths(pathStyle);
+  const relative = socketPath === undefined ? undefined : paths.relative(profileRoot, socketPath);
+  const invalid = socketPath === undefined || (pathStyle === "win32"
+    ? socketPath.length > 512 || !/^\\\\\.\\pipe\\[A-Za-z0-9._-]+$/u.test(socketPath)
+    : !normalizedAbsoluteRemotePath(socketPath, pathStyle)
+      || relative === undefined || relative === "" || relative === ".."
+      || relative.startsWith(`..${paths.sep}`) || paths.isAbsolute(relative));
+  if (invalid) {
     throw remoteRuntimeFault("The remote Codex daemon socket is outside its isolated profile.");
   }
   return socketPath;
@@ -753,44 +794,55 @@ async function processExitBefore(processHandle: RemoteProcessHandle, timeoutMs: 
   }
 }
 
-function requireProcesses(lease: RemoteSshTransportLease): RemoteProcessTransportPort {
-  if (lease.capabilities.processStreaming !== true || lease.processes === undefined) {
-    throw remoteRuntimeFault("The SSH process-stream capability is unavailable.");
-  }
-  return lease.processes;
-}
-
-function requireRemoteBinding(target: TargetDescriptor): NonNullable<TargetDescriptor["remoteWorkspace"]> {
+function requireRemoteBinding(target: TargetDescriptor): RemoteWorkspaceBinding {
   const binding = target.remoteWorkspace;
-  if (binding === undefined || binding.hostId.length === 0 || binding.hostId.length > 256
-    || !normalizedAbsoluteRemotePath(binding.workspaceRoot)) {
+  if (binding === undefined || !validRemoteBindingIdentity(binding)
+    || !normalizedAbsoluteRemotePath(binding.workspaceRoot,
+      binding.kind === "ssh" || binding.workspaceRoot.startsWith("/") ? "posix" : "win32")) {
     throw remoteRuntimeFault("The remote Codex Target binding is invalid.");
   }
   return binding;
 }
 
-function normalizedAbsoluteRemotePath(value: string): boolean {
+function normalizedAbsoluteRemotePath(value: string, pathStyle: "posix" | "win32"): boolean {
+  const paths = remotePaths(pathStyle);
   return value.length > 0
     && value.length <= 16_384
-    && !/[\u0000-\u001f\u007f\\]/u.test(value)
-    && remotePath.isAbsolute(value)
-    && remotePath.normalize(value) === value;
+    && !/[\u0000-\u001f\u007f]/u.test(value)
+    && paths.isAbsolute(value)
+    && paths.normalize(value) === value;
 }
 
-function executionDomainFor(host: RemoteHostRecord, profileRoot: string): string {
-  if (host.trust === undefined
-    || host.trust.algorithm.length === 0
-    || host.trust.fingerprint.length === 0
-    || host.user.length === 0) {
-    throw remoteRuntimeFault("The remote Codex host identity is not pinned.");
-  }
+function remotePaths(pathStyle: "posix" | "win32"): PlatformPath {
+  return pathStyle === "win32" ? win32 : posix;
+}
+
+function executionDomainFor(executionIdentity: string, profileRoot: string): string {
   return JSON.stringify({
-    kind: "ssh-codex-profile-v1",
-    algorithm: host.trust.algorithm,
-    fingerprint: host.trust.fingerprint,
-    user: host.user,
+    kind: "remote-codex-profile-v1",
+    executionIdentity,
     profileRoot
   });
+}
+
+function validRemoteBindingIdentity(binding: RemoteWorkspaceBinding): boolean {
+  return binding.kind === "ssh"
+    ? boundedIdentity(binding.hostTargetId) && boundedIdentity(binding.hostId)
+    : boundedIdentity(binding.controllerDeviceId) && boundedIdentity(binding.targetDeviceId);
+}
+
+function sameRemoteWorkspaceAuthority(left: RemoteWorkspaceBinding, right: RemoteWorkspaceBinding): boolean {
+  if (left.kind !== right.kind) return false;
+  return left.kind === "ssh" && right.kind === "ssh"
+    ? left.hostTargetId === right.hostTargetId && left.hostId === right.hostId
+    : left.kind === "device_peer" && right.kind === "device_peer"
+      && left.controllerDeviceId === right.controllerDeviceId
+      && left.targetDeviceId === right.targetDeviceId;
+}
+
+function boundedIdentity(value: string): boolean {
+  return value.length > 0 && value.length <= 512 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function targetSignature(target: TargetDescriptor): string {

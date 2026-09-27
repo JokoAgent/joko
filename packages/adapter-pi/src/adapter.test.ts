@@ -564,6 +564,44 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it("validates canonical Windows device-peer Targets without treating them as POSIX or SSH", async () => {
+    const validateRemoteWorkspace = vi.fn(async () => undefined);
+    const adapter = createPiAdapter({
+      agentHome: process.cwd(),
+      sessionRoot: process.cwd(),
+      versionProbe: async () => "pi 99.1.0",
+      providers: [],
+      validateRemoteWorkspace
+    });
+    const peerTarget: TargetDescriptor = {
+      id: "pi-peer-win32",
+      backendId: "pi",
+      displayName: "Windows peer",
+      workspaceRoot: process.cwd(),
+      managed: false,
+      trusted: true,
+      remoteWorkspace: {
+        kind: "device_peer",
+        controllerDeviceId: "controller-device",
+        targetDeviceId: "windows-device",
+        workspaceRoot: "C:\\Joko\\Workspace"
+      }
+    };
+    const peerBinding = peerTarget.remoteWorkspace;
+    if (peerBinding?.kind !== "device_peer") throw new Error("Expected the device-peer test binding.");
+    await expect(adapter.validateTarget(peerTarget)).resolves.toBeUndefined();
+    expect(validateRemoteWorkspace).toHaveBeenCalledWith(peerTarget);
+    await expect(adapter.validateTarget({
+      ...peerTarget,
+      remoteWorkspace: { ...peerBinding, workspaceRoot: "C:/Joko/Workspace" }
+    })).rejects.toMatchObject({ publicError: { code: "PI_REMOTE_WORKSPACE_INVALID" } });
+    await expect(adapter.validateTarget({
+      ...peerTarget,
+      remoteWorkspace: { ...peerBinding, controllerDeviceId: "windows-device" }
+    })).rejects.toMatchObject({ publicError: { code: "PI_REMOTE_WORKSPACE_INVALID" } });
+    expect(validateRemoteWorkspace).toHaveBeenCalledTimes(1);
+    await adapter.dispose();
+  });
   it("rejects unsupported start navigation and structured workspace references without spawning a runtime", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-start-boundary-"));
     const processFactory = vi.fn((): PiProcessHandle => { throw new Error("No native runtime should start"); });
@@ -835,7 +873,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: true,
       trusted: false,
-      remoteWorkspace: { hostTargetId: "remote-lineage-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-lineage-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
     };
     const context = makeContext(target, []);
     const initial = createPiAdapter(options);
@@ -925,7 +963,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: true,
       trusted: false,
-      remoteWorkspace: { hostTargetId: "remote-deletion-journal-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "remote-deletion-journal-target", hostId: "fixture-host", workspaceRoot: "/workspace" }
     };
     const binding: NativeSessionBinding = {
       opaqueRef: join(agentHome, "native-session.jsonl"),
@@ -1327,7 +1365,7 @@ describe("PiBackendAdapter", () => {
       workspaceRoot: workspace,
       managed: false,
       trusted: false,
-      remoteWorkspace: { hostTargetId: "target-native-fence", hostId: "test-host", workspaceRoot: "/workspace" }
+      remoteWorkspace: { kind: "ssh", hostTargetId: "target-native-fence", hostId: "test-host", workspaceRoot: "/workspace" }
     };
     const events: EventPayload[] = [];
     const context = makeContext(target, events);
@@ -6523,6 +6561,7 @@ describe("PiBackendAdapter", () => {
       managed: true,
       trusted: false,
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "target-remote-auth-revoke",
         hostId: "fixture-host",
         workspaceRoot: "/workspace"
@@ -6590,6 +6629,7 @@ describe("PiBackendAdapter", () => {
       managed: true,
       trusted: false,
       remoteWorkspace: {
+        kind: "ssh",
         hostTargetId: "target-remote-auth-owner",
         hostId: "fixture-host",
         workspaceRoot: "/workspace"
