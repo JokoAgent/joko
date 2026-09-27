@@ -75,12 +75,13 @@ describe("RuntimeProcessMonitorWindow", () => {
           sequence.push("owner");
           return owner;
         },
+        sampleDesktop: vi.fn(async () => desktopSample()),
         request
       } satisfies JokoRuntimeProcessDiagnosticsApi
     });
 
     const container = await render();
-    await vi.waitFor(() => expect(container.querySelectorAll('[role="row"][tabindex="0"]')).toHaveLength(1));
+    await vi.waitFor(() => expect(container.querySelectorAll('[role="row"][tabindex="0"]')).toHaveLength(2));
     expect(sequence.slice(0, 3)).toEqual(["response", "retired", "owner"]);
     expect(request).toHaveBeenCalledWith(expect.objectContaining({ owner, action: { kind: "refresh" } }));
     expect(container.textContent).toContain("Local task");
@@ -112,6 +113,7 @@ describe("RuntimeProcessMonitorWindow", () => {
       get: () => visibility
     });
     const request = vi.fn(async () => undefined);
+    const sampleDesktop = vi.fn(async () => desktopSample());
     Object.defineProperty(window, "jokoRuntimeProcessDiagnostics", {
       configurable: true,
       value: {
@@ -119,6 +121,7 @@ describe("RuntimeProcessMonitorWindow", () => {
         platform: "win32",
         window: windowControls(),
         getOwner: vi.fn(async () => owner),
+        sampleDesktop,
         request,
         onResponse: vi.fn(() => () => undefined),
         onRetired: vi.fn(() => () => undefined)
@@ -128,6 +131,7 @@ describe("RuntimeProcessMonitorWindow", () => {
     await render();
     await act(async () => Promise.resolve());
     expect(request).not.toHaveBeenCalled();
+    expect(sampleDesktop).not.toHaveBeenCalled();
 
     visibility = "visible";
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
@@ -135,6 +139,7 @@ describe("RuntimeProcessMonitorWindow", () => {
       owner,
       action: { kind: "refresh" }
     })));
+    expect(sampleDesktop).toHaveBeenCalledOnce();
   });
 });
 
@@ -166,6 +171,14 @@ function runtimeProcess(): DesktopRuntimeProcessMonitorProcess {
     processCount: 1,
     terminable: true,
     processInstanceId: "10000000-0000-4000-8000-000000000042"
+  };
+}
+
+function desktopSample(): DesktopRuntimeProcessSample {
+  return {
+    version: 1,
+    capturedAt: 1_700_000_000_000,
+    processes: [{ role: "main", pid: 41, label: null, cpuPercent: 1, memoryKb: 2_048, processCount: 1 }]
   };
 }
 

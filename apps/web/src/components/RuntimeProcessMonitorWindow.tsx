@@ -13,7 +13,9 @@ import { randomUuid } from "../web-crypto.js";
 import { DesktopWindowControls } from "./DesktopWindowControls.js";
 import {
   mergeRuntimeProcessDiagnosticsDisplay,
+  mergeDesktopRuntimeProcessDisplay,
   RuntimeProcessMonitorSurface,
+  staleDesktopRuntimeProcessDisplay,
   staleRuntimeProcessDiagnosticsDisplay,
   type RuntimeProcessDiagnosticsDisplay
 } from "./RuntimeProcessMonitor.js";
@@ -43,7 +45,7 @@ export function RuntimeProcessMonitorWindow(): JSX.Element {
   const ownerRef = useRef<RuntimeProcessDiagnosticsOwner | undefined>(undefined);
   ownerRef.current = owner;
   const ownerKey = runtimeProcessDiagnosticsOwnerKey(owner);
-  const [display, setDisplay] = useState<RuntimeProcessDiagnosticsDisplay>(() => emptyDisplay("unavailable", false));
+  const [display, setDisplay] = useState<RuntimeProcessDiagnosticsDisplay>(() => emptyDisplay("unavailable", false, api !== undefined));
   const [bridgeError, setBridgeError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [samplingActive, setSamplingActive] = useState(() => document.visibilityState !== "hidden");
@@ -68,7 +70,7 @@ export function RuntimeProcessMonitorWindow(): JSX.Element {
   useEffect(() => {
     if (api === undefined) {
       setBridgeError(translate(localeRef.current, "settings.processUsage.connectInMainWindow"));
-      setDisplay(emptyDisplay("unavailable", true));
+      setDisplay(emptyDisplay("unavailable", true, false));
       return;
     }
     let disposed = false;
@@ -83,18 +85,18 @@ export function RuntimeProcessMonitorWindow(): JSX.Element {
       rejectPending("The runtime process monitor owner was retired.");
       ownerRef.current = undefined;
       setOwner(undefined);
-      setDisplay(emptyDisplay("unavailable", true));
+      setDisplay(emptyDisplay("unavailable", true, true));
       setBridgeError(translate(localeRef.current, "settings.processUsage.connectInMainWindow"));
     });
     void api.getOwner().then((initialOwner) => {
       if (disposed) return;
       ownerRef.current = initialOwner;
       setOwner(initialOwner);
-      setDisplay(emptyDisplay(runtimeProcessDiagnosticsOwnerKey(initialOwner), false));
+      setDisplay(emptyDisplay(runtimeProcessDiagnosticsOwnerKey(initialOwner), false, true));
       setBridgeError(undefined);
     }).catch((error: unknown) => {
       if (disposed) return;
-      setDisplay(emptyDisplay("unavailable", true));
+      setDisplay(emptyDisplay("unavailable", true, true));
       setBridgeError(errorMessage(error, translate(localeRef.current, "settings.processUsage.connectInMainWindow")));
     });
     return () => {
@@ -135,12 +137,12 @@ export function RuntimeProcessMonitorWindow(): JSX.Element {
   }, [api]);
 
   useEffect(() => {
-    if (owner === undefined || !samplingActive) return;
+    if (owner === undefined || api === undefined || !samplingActive) return;
     let disposed = false;
     let inFlight: Promise<void> | undefined;
     const refresh = (): Promise<void> => {
       if (inFlight !== undefined) return inFlight;
-      inFlight = request(owner, { kind: "refresh" }).then((result) => {
+      const backendRefresh = request(owner, { kind: "refresh" }).then((result) => {
         if (disposed || !sameRuntimeProcessDiagnosticsOwner(ownerRef.current, owner)) return;
         if (result.kind === "error") throw new Error(result.message);
         if (result.kind !== "snapshot") throw new Error("The runtime process monitor returned an invalid refresh response.");
@@ -154,13 +156,26 @@ export function RuntimeProcessMonitorWindow(): JSX.Element {
           setDisplay((current) => staleRuntimeProcessDiagnosticsDisplay(current, ownerKey, message));
           setBridgeError(message);
         }
-      }).finally(() => {
+      });
+      const desktopRefresh = api.sampleDesktop().then((sample) => {
+        if (disposed || !sameRuntimeProcessDiagnosticsOwner(ownerRef.current, owner)) return;
+        setDisplay((current) => mergeDesktopRuntimeProcessDisplay(current, ownerKey, sample));
+      }).catch((error: unknown) => {
+        if (!disposed && sameRuntimeProcessDiagnosticsOwner(ownerRef.current, owner)) {
+          setDisplay((current) => staleDesktopRuntimeProcessDisplay(
+            current,
+            ownerKey,
+            errorMessage(error, translate(localeRef.current, "settings.processUsage.loadFailed"))
+          ));
+        }
+      });
+      inFlight = Promise.all([backendRefresh, desktopRefresh]).then(() => undefined).finally(() => {
         inFlight = undefined;
       });
       return inFlight;
     };
     refreshRef.current = refresh;
-    setDisplay(emptyDisplay(ownerKey, false));
+    setDisplay(emptyDisplay(ownerKey, false, true));
     void refresh();
     const timer = window.setInterval(() => { void refresh(); }, POLL_INTERVAL_MS);
     return () => {
@@ -186,7 +201,7 @@ export function RuntimeProcessMonitorWindow(): JSX.Element {
     });
   }, [t]);
   const activeDisplay = useMemo(
-    () => display.ownerKey === ownerKey ? display : emptyDisplay(ownerKey, owner === undefined),
+    () => display.ownerKey === ownerKey ? display : emptyDisplay(ownerKey, owner === undefined, api !== undefined),
     [display, owner, ownerKey]
   );
 
@@ -234,8 +249,14 @@ function fromWireSnapshot(snapshot: DesktopRuntimeProcessMonitorSnapshot): Runti
   };
 }
 
-function emptyDisplay(ownerKey: string, loaded: boolean): RuntimeProcessDiagnosticsDisplay {
-  return { ownerKey, loaded, backends: [], sessions: [] };
+function emptyDisplay(ownerKey: string, loaded: boolean, desktopSupported: boolean): RuntimeProcessDiagnosticsDisplay {
+  return {
+    ownerKey,
+    loaded,
+    backends: [],
+    sessions: [],
+    ...(desktopSupported ? { desktop: { state: "loading", processes: [] } } : {})
+  };
 }
 
 function initialLocale(): Locale {

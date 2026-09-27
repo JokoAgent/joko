@@ -231,6 +231,7 @@ type JokoDesktopCapability =
   | "page.search"
   | "power.keepAwake"
   | "provider.modelCatalogLifecycle"
+  | "runtime.desktopProcessUsage"
   | "runtime.processMonitorWindow"
   | "selection.quote.contextMenu"
   | "session.windows"
@@ -321,6 +322,23 @@ interface DesktopRuntimeProcessMonitorProcess {
   readonly processInstanceId?: string;
 }
 
+type DesktopRuntimeProcessRole = "main" | "renderer" | "gpu" | "utility";
+
+interface DesktopRuntimeProcessMetric {
+  readonly role: DesktopRuntimeProcessRole;
+  readonly pid: number;
+  readonly label: string | null;
+  readonly cpuPercent: number;
+  readonly memoryKb: number;
+  readonly processCount: 1;
+}
+
+interface DesktopRuntimeProcessSample {
+  readonly version: 1;
+  readonly capturedAt: number;
+  readonly processes: readonly DesktopRuntimeProcessMetric[];
+}
+
 interface DesktopRuntimeProcessMonitorBackendBase {
   readonly backendId: string;
   readonly backendGeneration: string;
@@ -404,6 +422,7 @@ interface JokoDesktopApi {
     >;
   };
   readonly runtimeProcessMonitor: {
+    sampleDesktop(): Promise<DesktopRuntimeProcessSample>;
     open(owner: DesktopRuntimeProcessMonitorOwner): Promise<{ readonly version: 1; readonly focusedExisting: boolean }>;
     retire(owner: DesktopRuntimeProcessMonitorOwner): Promise<void>;
     onRequest(listener: (request: DesktopRuntimeProcessMonitorRequest) => void): () => void;
@@ -618,6 +637,7 @@ interface JokoRuntimeProcessDiagnosticsApi {
     close(): Promise<void>;
   };
   getOwner(): Promise<DesktopRuntimeProcessMonitorOwner>;
+  sampleDesktop(): Promise<DesktopRuntimeProcessSample>;
   request(request: DesktopRuntimeProcessMonitorRequest): Promise<void>;
   onResponse(listener: (response: DesktopRuntimeProcessMonitorResponse) => void): () => void;
   onRetired(listener: () => void): () => void;

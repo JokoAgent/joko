@@ -4,6 +4,7 @@ import {
   RUNTIME_PROCESS_MONITOR_MAX_PENDING_REQUESTS,
   RUNTIME_PROCESS_MONITOR_REQUEST_TIMEOUT_MS,
   RuntimeProcessMonitorBroker,
+  parseDesktopRuntimeProcessSample,
   parseDesktopRuntimeProcessMonitorOwner,
   parseDesktopRuntimeProcessMonitorRequest,
   parseDesktopRuntimeProcessMonitorResponse,
@@ -75,6 +76,31 @@ function uuid(index: number): string {
 afterEach(() => vi.useRealTimers());
 
 describe("runtime process monitor v1 protocol", () => {
+  it("accepts only exact read-only Desktop application process projections", () => {
+    const sample = {
+      version: 1,
+      capturedAt: 1_000,
+      processes: [{
+        role: "renderer",
+        pid: 321,
+        label: "Task one",
+        cpuPercent: 2.5,
+        memoryKb: 8_192,
+        processCount: 1
+      }]
+    };
+    expect(parseDesktopRuntimeProcessSample(sample)).toEqual(sample);
+    expect(() => parseDesktopRuntimeProcessSample({
+      ...sample,
+      processes: [{ ...sample.processes[0], terminable: true }]
+    })).toThrow(/metric/u);
+    expect(() => parseDesktopRuntimeProcessSample({
+      ...sample,
+      processes: [sample.processes[0], { ...sample.processes[0] }]
+    })).toThrow(/identities/u);
+    expect(() => parseDesktopRuntimeProcessSample({ ...sample, capturedAt: -1 })).toThrow(/sample/u);
+  });
+
   it("accepts only the exact occurrence owner and canonical request identity", () => {
     expect(parseDesktopRuntimeProcessMonitorOwner(OWNER)).toEqual(OWNER);
     expect(() => parseDesktopRuntimeProcessMonitorOwner({ ...OWNER, snapshotGeneration: "01" })).toThrow(/owner/u);

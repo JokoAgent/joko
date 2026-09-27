@@ -4,7 +4,8 @@ import type {
   DesktopRuntimeProcessMonitorProcess,
   DesktopRuntimeProcessMonitorRequest,
   DesktopRuntimeProcessMonitorResponse,
-  DesktopRuntimeProcessMonitorSession
+  DesktopRuntimeProcessMonitorSession,
+  DesktopRuntimeProcessSample
 } from "./channels.js";
 import type { IpcRendererEvent } from "electron";
 
@@ -18,7 +19,8 @@ const CHANNELS = Object.freeze({
   getOwner: "joko:runtime-process-diagnostics:owner:get",
   request: "joko:runtime-process-diagnostics:request",
   response: "joko:runtime-process-diagnostics:response",
-  retired: "joko:runtime-process-diagnostics:retired"
+  retired: "joko:runtime-process-diagnostics:retired",
+  sampleDesktop: "joko:runtime-process-monitor:sample-desktop"
 });
 
 const api = Object.freeze({
@@ -37,6 +39,8 @@ const api = Object.freeze({
   }),
   getOwner: (): Promise<DesktopRuntimeProcessMonitorOwner> =>
     ipcRenderer.invoke(CHANNELS.getOwner).then(parseOwner),
+  sampleDesktop: (): Promise<DesktopRuntimeProcessSample> =>
+    ipcRenderer.invoke(CHANNELS.sampleDesktop).then(parseDesktopSample),
   request: (request: DesktopRuntimeProcessMonitorRequest): Promise<void> => {
     const parsed = parseRequest(request);
     return ipcRenderer.invoke(CHANNELS.request, parsed).then(() => undefined);
@@ -72,6 +76,31 @@ function parseOwner(value: unknown): DesktopRuntimeProcessMonitorOwner {
     connectionGeneration: value["connectionGeneration"],
     snapshotGeneration: value["snapshotGeneration"]
   });
+}
+
+function parseDesktopSample(value: unknown): DesktopRuntimeProcessSample {
+  if (!record(value, ["version", "capturedAt", "processes"]) || value["version"] !== 1 ||
+    !Number.isSafeInteger(value["capturedAt"]) || (value["capturedAt"] as number) < 0 ||
+    !Array.isArray(value["processes"]) || value["processes"].length > 512) {
+    throw new TypeError("Desktop runtime process sample is invalid.");
+  }
+  const processes = value["processes"].map((process) => {
+    if (!record(process, ["role", "pid", "label", "cpuPercent", "memoryKb", "processCount"]) ||
+      (process["role"] !== "main" && process["role"] !== "renderer" && process["role"] !== "gpu" && process["role"] !== "utility") ||
+      !positiveInteger(process["pid"]) || !(process["label"] === null || boundedText(process["label"], 512)) ||
+      typeof process["cpuPercent"] !== "number" || !Number.isFinite(process["cpuPercent"]) || process["cpuPercent"] < 0 ||
+      !Number.isSafeInteger(process["memoryKb"]) || (process["memoryKb"] as number) < 0 || process["processCount"] !== 1) {
+      throw new TypeError("Desktop runtime process metric is invalid.");
+    }
+    return Object.freeze({
+      role: process["role"], pid: process["pid"], label: process["label"], cpuPercent: process["cpuPercent"],
+      memoryKb: process["memoryKb"] as number, processCount: 1 as const
+    });
+  });
+  if (new Set(processes.map((process) => process.pid)).size !== processes.length) {
+    throw new TypeError("Desktop runtime process identities must be unique.");
+  }
+  return Object.freeze({ version: 1, capturedAt: value["capturedAt"] as number, processes: Object.freeze(processes) });
 }
 
 function parseRequest(value: unknown): DesktopRuntimeProcessMonitorRequest {

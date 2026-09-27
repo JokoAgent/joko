@@ -79,6 +79,7 @@ import {
   parseDesktopPageSearchStopAction
 } from "./channels.js";
 import {
+  parseDesktopRuntimeProcessSample,
   parseDesktopRuntimeProcessMonitorOpenResult,
   parseDesktopRuntimeProcessMonitorOwner,
   parseDesktopRuntimeProcessMonitorRequest,
@@ -86,6 +87,7 @@ import {
   RuntimeProcessMonitorBroker,
   sameDesktopRuntimeProcessMonitorOwner
 } from "./runtime-process-monitor.js";
+import { DesktopRuntimeProcessSampler } from "./desktop-runtime-processes.js";
 import { projectDirectoryAuthorityMatches } from "./project-directory-authority.js";
 import {
   DESKTOP_DEEP_LINK_SCHEME,
@@ -414,6 +416,10 @@ const runtimeProcessMonitorBroker = new RuntimeProcessMonitorBroker<WebContents>
       !isRuntimeProcessMonitorNavigation(target.getURL())) return;
     try { target.send(DESKTOP_CHANNELS.runtimeProcessDiagnosticsResponse, response); } catch { /* The document retired after validation. */ }
   }
+});
+const desktopRuntimeProcessSampler = new DesktopRuntimeProcessSampler({
+  getMetrics: () => app.getAppMetrics(),
+  describeRenderer: describeDesktopRuntimeRenderer
 });
 let globalVoiceOverlayWindow: BrowserWindow | undefined;
 let globalVoiceShortcutRecoveryFailurePending = false;
@@ -1364,6 +1370,14 @@ async function verifyPackagedSmokeRuntimeProcessMonitor(ownerWindow: BrowserWind
   if (initial.isDestroyed() || initial.isVisible() || runtimeProcessMonitorWindow !== initial) {
     throw new Error("Packaged runtime diagnostics close did not preserve its hidden cached window.");
   }
+  const hiddenSamplingRejected = await initial.webContents.executeJavaScript(
+    "(async () => { try { await window.jokoRuntimeProcessDiagnostics.sampleDesktop(); return false; } catch { return true; } })()",
+    true
+  );
+  if (hiddenSamplingRejected !== true) {
+    throw new Error("Packaged runtime diagnostics sampled Desktop processes while hidden.");
+  }
+  recordPackagedSmokeProgress("runtime_process_monitor_hidden_sampling_fenced");
   recordPackagedSmokeProgress("runtime_process_monitor_closed");
 
   const reopened = parseDesktopRuntimeProcessMonitorOpenResult(
@@ -1409,7 +1423,11 @@ async function waitForPackagedSmokeRuntimeProcessMonitor(excluded?: BrowserWindo
     const candidate = runtimeProcessMonitorWindow;
     if (candidate !== undefined && candidate !== excluded && !candidate.isDestroyed() &&
       !candidate.webContents.isDestroyed() && isRuntimeProcessMonitorNavigation(candidate.webContents.getURL())) {
-      return candidate;
+      // The packaged smoke host intentionally keeps its primary window hidden.
+      // Exercise the same restore/show path as a repeated user open before
+      // calling visibility-gated diagnostics from the dedicated window.
+      if (!candidate.isVisible() || candidate.isMinimized()) showWindowFromTray(candidate);
+      if (candidate.isVisible() && !candidate.isMinimized()) return candidate;
     }
     await waitForPackagedSmokePoll();
   }
@@ -1436,7 +1454,8 @@ async function inspectPackagedSmokeRuntimeProcessMonitorSurface(
       "    windowKeys: api?.window === undefined ? [] : Object.keys(api.window).sort(),",
       "    version: api?.version,",
       "    platform: api?.platform,",
-      "    owner: await api?.getOwner?.()",
+      "    owner: await api?.getOwner?.(),",
+      "    desktopSample: await api?.sampleDesktop?.()",
       "  });",
       "})()"
     ].join("\n"),
@@ -1450,15 +1469,21 @@ async function inspectPackagedSmokeRuntimeProcessMonitorSurface(
     readonly version?: unknown;
     readonly platform?: unknown;
     readonly owner?: unknown;
+    readonly desktopSample?: unknown;
   };
   if (value.hasGeneralDesktopBridge !== false || value.version !== 1 || typeof value.platform !== "string" ||
-    !Array.isArray(value.keys) || value.keys.join(",") !== "getOwner,onResponse,onRetired,platform,request,version,window" ||
+    !Array.isArray(value.keys) || value.keys.join(",") !== "getOwner,onResponse,onRetired,platform,request,sampleDesktop,version,window" ||
     !Array.isArray(value.windowKeys) || value.windowKeys.join(",") !== "close,minimize,setZoomFactor,toggleMaximize") {
     throw new Error("Packaged runtime diagnostics exposed a non-minimal preload surface.");
   }
   const actualOwner = parseDesktopRuntimeProcessMonitorOwner(value.owner);
   if (!sameDesktopRuntimeProcessMonitorOwner(actualOwner, expectedOwner)) {
     throw new Error("Packaged runtime diagnostics lost its exact owner occurrence.");
+  }
+  const desktopSample = parseDesktopRuntimeProcessSample(value.desktopSample);
+  if (!desktopSample.processes.some((process) => process.role === "main") ||
+    !desktopSample.processes.some((process) => process.role === "renderer")) {
+    throw new Error("Packaged runtime diagnostics did not project the active Desktop process roles.");
   }
 }
 
@@ -5490,6 +5515,14 @@ function registerIpc(): void {
     }
     return openRuntimeProcessMonitorWindow(owner, monitorOwner);
   });
+  ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessMonitorSampleDesktop, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 0) throw new TypeError("Desktop runtime process sampling does not accept parameters.");
+    const source = assertTrustedWindowControlSender(event);
+    if (source.isDestroyed() || !source.isVisible() || source.isMinimized()) {
+      throw new Error("Desktop runtime process sampling is inactive while its window is hidden.");
+    }
+    return parseDesktopRuntimeProcessSample(desktopRuntimeProcessSampler.sample());
+  });
   ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessDiagnosticsGetOwner, async (event, ...parameters: unknown[]) => {
     assertRuntimeProcessDiagnosticsSender(event);
     if (parameters.length !== 0) throw new TypeError("Runtime diagnostics owner lookup does not accept parameters.");
@@ -7103,6 +7136,18 @@ function assertTrustedIpcSender(event: IpcMainInvokeEvent): void {
   }, navigationPolicy)) {
     throw new Error("Desktop IPC request did not originate from the trusted Joko application frame.");
   }
+}
+
+function describeDesktopRuntimeRenderer(pid: number): string | null {
+  for (const window of BrowserWindow.getAllWindows().sort((left, right) => left.id - right.id)) {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
+    try {
+      if (window.webContents.getOSProcessId() === pid) return window.getTitle();
+    } catch {
+      // A renderer may retire between enumeration and process lookup.
+    }
+  }
+  return null;
 }
 
 function assertRuntimeProcessDiagnosticsSender(event: IpcMainInvokeEvent): void {

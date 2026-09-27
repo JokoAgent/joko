@@ -2,6 +2,7 @@ export const RUNTIME_PROCESS_MONITOR_PROTOCOL_VERSION = 1 as const;
 export const RUNTIME_PROCESS_MONITOR_MAX_BACKENDS = 128;
 export const RUNTIME_PROCESS_MONITOR_MAX_SESSIONS = 4_096;
 export const RUNTIME_PROCESS_MONITOR_MAX_PROCESSES_PER_BACKEND = 512;
+export const RUNTIME_PROCESS_MONITOR_MAX_DESKTOP_PROCESSES = 512;
 export const RUNTIME_PROCESS_MONITOR_MAX_PENDING_REQUESTS = 32;
 export const RUNTIME_PROCESS_MONITOR_REQUEST_TIMEOUT_MS = 15_000;
 
@@ -31,6 +32,24 @@ export interface DesktopRuntimeProcessMonitorProcess {
   readonly processCount: number;
   readonly terminable: boolean;
   readonly processInstanceId?: string;
+}
+
+export type DesktopRuntimeProcessRole = "main" | "renderer" | "gpu" | "utility";
+
+/** Command-, path-, environment-, and credential-free Electron process projection. */
+export interface DesktopRuntimeProcessMetric {
+  readonly role: DesktopRuntimeProcessRole;
+  readonly pid: number;
+  readonly label: string | null;
+  readonly cpuPercent: number;
+  readonly memoryKb: number;
+  readonly processCount: 1;
+}
+
+export interface DesktopRuntimeProcessSample {
+  readonly version: 1;
+  readonly capturedAt: number;
+  readonly processes: readonly DesktopRuntimeProcessMetric[];
 }
 
 export type DesktopRuntimeProcessMonitorAction =
@@ -167,6 +186,23 @@ export function parseDesktopRuntimeProcessMonitorOpenResult(value: unknown): Des
   return Object.freeze({ version: 1, focusedExisting: value.focusedExisting });
 }
 
+export function parseDesktopRuntimeProcessSample(value: unknown): DesktopRuntimeProcessSample {
+  if (!plainRecordWithKeys(value, ["version", "capturedAt", "processes"]) ||
+    value.version !== RUNTIME_PROCESS_MONITOR_PROTOCOL_VERSION ||
+    !nonNegativeSafeInteger(value.capturedAt) || !Array.isArray(value.processes) ||
+    value.processes.length > RUNTIME_PROCESS_MONITOR_MAX_DESKTOP_PROCESSES) {
+    throw new TypeError("Desktop runtime process sample is invalid.");
+  }
+  const processes = value.processes.map(parseDesktopRuntimeProcessMetric);
+  const pids = new Set(processes.map((process) => process.pid));
+  if (pids.size !== processes.length) throw new TypeError("Desktop runtime process identities must be unique.");
+  return Object.freeze({
+    version: 1,
+    capturedAt: value.capturedAt,
+    processes: Object.freeze(processes)
+  });
+}
+
 export function sameDesktopRuntimeProcessMonitorOwner(
   left: DesktopRuntimeProcessMonitorOwner,
   right: DesktopRuntimeProcessMonitorOwner
@@ -299,6 +335,28 @@ function parseDesktopRuntimeProcessMonitorProcess(value: unknown): DesktopRuntim
   });
 }
 
+function parseDesktopRuntimeProcessMetric(value: unknown): DesktopRuntimeProcessMetric {
+  if (!plainRecordWithKeys(value, ["role", "pid", "label", "cpuPercent", "memoryKb", "processCount"]) ||
+    !desktopRuntimeProcessRole(value.role) || !positiveSafeInteger(value.pid) ||
+    !(value.label === null || boundedDisplayLabel(value.label, RUNTIME_PROCESS_MONITOR_NAME_MAX_LENGTH)) ||
+    typeof value.cpuPercent !== "number" || !Number.isFinite(value.cpuPercent) || value.cpuPercent < 0 ||
+    !nonNegativeSafeInteger(value.memoryKb) || value.processCount !== 1) {
+    throw new TypeError("Desktop runtime process metric is invalid.");
+  }
+  return Object.freeze({
+    role: value.role,
+    pid: value.pid,
+    label: value.label,
+    cpuPercent: value.cpuPercent,
+    memoryKb: value.memoryKb,
+    processCount: 1
+  });
+}
+
+function desktopRuntimeProcessRole(value: unknown): value is DesktopRuntimeProcessRole {
+  return value === "main" || value === "renderer" || value === "gpu" || value === "utility";
+}
+
 function positiveSafeDecimal(value: unknown): value is string {
   return typeof value === "string" && POSITIVE_SAFE_DECIMAL_PATTERN.test(value) &&
     BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
@@ -323,6 +381,11 @@ function boundedText(value: unknown, maximum: number): value is string {
 
 function boundedDisplayText(value: unknown, maximum: number): value is string {
   return typeof value === "string" && value.length <= maximum && !/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value);
+}
+
+function boundedDisplayLabel(value: unknown, maximum: number): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= maximum && value.trim() === value &&
+    !/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value);
 }
 
 function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {

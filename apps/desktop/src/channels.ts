@@ -21,6 +21,7 @@ export const DESKTOP_CHANNELS = {
   runtimeProcessMonitorRequest: "joko:runtime-process-monitor:request",
   runtimeProcessMonitorRespond: "joko:runtime-process-monitor:respond",
   runtimeProcessMonitorRetire: "joko:runtime-process-monitor:retire",
+  runtimeProcessMonitorSampleDesktop: "joko:runtime-process-monitor:sample-desktop",
   runtimeProcessDiagnosticsGetOwner: "joko:runtime-process-diagnostics:owner:get",
   runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
   runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
@@ -635,6 +636,7 @@ export interface DesktopWindowInteractionSettings {
 }
 
 export type {
+  DesktopRuntimeProcessMetric,
   DesktopRuntimeProcessMonitorAction,
   DesktopRuntimeProcessMonitorBackend,
   DesktopRuntimeProcessMonitorOpenResult,
@@ -644,7 +646,9 @@ export type {
   DesktopRuntimeProcessMonitorResponse,
   DesktopRuntimeProcessMonitorResult,
   DesktopRuntimeProcessMonitorSession,
-  DesktopRuntimeProcessMonitorSnapshot
+  DesktopRuntimeProcessMonitorSnapshot,
+  DesktopRuntimeProcessRole,
+  DesktopRuntimeProcessSample
 } from "./runtime-process-monitor.js";
 
 export interface DesktopCopyFileRequest {

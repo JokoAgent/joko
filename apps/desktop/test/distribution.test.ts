@@ -152,6 +152,7 @@ describe("Desktop distribution", () => {
         "joko:runtime-process-diagnostics:request",
         "joko:runtime-process-diagnostics:response",
         "joko:runtime-process-diagnostics:retired",
+        "joko:runtime-process-monitor:sample-desktop",
         "joko:window:close",
         "joko:window:minimize",
         "joko:window:set-zoom-factor",

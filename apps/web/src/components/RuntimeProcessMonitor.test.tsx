@@ -10,12 +10,14 @@ import { terminateRuntimeProcessWithCurrentFence, type RuntimeProcessDiagnostics
 import {
   formatRuntimeProcessCpu,
   formatRuntimeProcessMemory,
+  mergeDesktopRuntimeProcessDisplay,
   mergeRuntimeProcessDiagnosticsDisplay,
   nextRuntimeProcessSort,
   RuntimeProcessMonitor,
   RuntimeProcessMonitorSurface,
   sortRuntimeProcesses,
   staleRuntimeProcessDiagnosticsDisplay,
+  staleDesktopRuntimeProcessDisplay,
   type RuntimeProcessDiagnosticsDisplay
 } from "./RuntimeProcessMonitor.js";
 
@@ -92,6 +94,41 @@ describe("RuntimeProcessMonitor", () => {
     expect(listRuntimeProcesses).not.toHaveBeenCalled();
   });
 
+  it("shows Main-owned application roles as read-only rows without entering Backend termination", async () => {
+    const sampleDesktop = vi.fn(async (): Promise<DesktopRuntimeProcessSample> => ({
+      version: 1,
+      capturedAt: 500,
+      processes: [
+        { role: "main", pid: 100, label: null, cpuPercent: 3, memoryKb: 10_240, processCount: 1 },
+        { role: "renderer", pid: 101, label: "Settings", cpuPercent: 2, memoryKb: 8_192, processCount: 1 },
+        { role: "utility", pid: 102, label: "network.mojom.NetworkService", cpuPercent: 1, memoryKb: 4_096, processCount: 1 }
+      ]
+    }));
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: {
+        capabilities: ["runtime.processMonitorWindow", "runtime.desktopProcessUsage"],
+        runtimeProcessMonitor: { sampleDesktop }
+      } as unknown as JokoDesktopApi
+    });
+    const terminateRuntimeProcess = vi.fn(async () => undefined);
+    const container = await render({
+      listRuntimeProcesses: vi.fn(async () => ({ capturedAt: 500, processes: [] })),
+      terminateRuntimeProcess
+    } as unknown as AppController, snapshot(false));
+
+    await vi.waitFor(() => expect(container.querySelectorAll('[data-process-source="desktop"] [role="row"]')).toHaveLength(3));
+    expect(sampleDesktop).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Joko application");
+    expect(container.textContent).toContain("Settings");
+    expect(container.textContent).toContain("Network service");
+    const settings = [...container.querySelectorAll<HTMLElement>('[data-process-source="desktop"] [role="row"]')]
+      .find((row) => row.textContent?.includes("Settings"));
+    await act(async () => settings?.click());
+    expect(container.querySelector<HTMLButtonElement>(".runtime-process-footer .button")?.disabled).toBe(true);
+    expect(terminateRuntimeProcess).not.toHaveBeenCalled();
+  });
+
   it("opens the capability-advertised standalone Desktop monitor from the empty state", async () => {
     const open = vi.fn(async () => ({ version: 1 as const, focusedExisting: false }));
     Object.defineProperty(window, "jokoDesktop", {
@@ -156,6 +193,27 @@ describe("RuntimeProcessMonitor", () => {
       error: "invalid Backend occurrence",
       processes: []
     });
+  });
+
+  it("retains only the last same-owner Desktop sample when that source fails", () => {
+    const initial = mergeDesktopRuntimeProcessDisplay({
+      ownerKey: "owner-one",
+      loaded: true,
+      backends: [],
+      sessions: [],
+      desktop: { state: "loading", processes: [] }
+    }, "owner-one", {
+      version: 1,
+      capturedAt: 100,
+      processes: [{ role: "main", pid: 100, label: null, cpuPercent: 1, memoryKb: 1_024, processCount: 1 }]
+    });
+    expect(staleDesktopRuntimeProcessDisplay(initial, "owner-one", "sample failed").desktop).toMatchObject({
+      state: "stale",
+      capturedAt: 100,
+      error: "sample failed",
+      processes: [{ pid: 100 }]
+    });
+    expect(staleDesktopRuntimeProcessDisplay(initial, "owner-two", "sample failed")).toBe(initial);
   });
 
   it("clears selection and confirmation state when the Backend occurrence changes", async () => {

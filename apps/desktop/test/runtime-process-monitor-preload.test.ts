@@ -50,6 +50,18 @@ const RESPONSE = Object.freeze({
     })])
   })
 });
+const DESKTOP_SAMPLE = Object.freeze({
+  version: 1,
+  capturedAt: 200,
+  processes: Object.freeze([Object.freeze({
+    role: "renderer",
+    pid: 222,
+    label: "Task one",
+    cpuPercent: 1.25,
+    memoryKb: 8_192,
+    processCount: 1
+  })])
+});
 
 interface DiagnosticsApi {
   readonly version: number;
@@ -61,6 +73,7 @@ interface DiagnosticsApi {
     close(): Promise<void>;
   };
   getOwner(): Promise<unknown>;
+  sampleDesktop(): Promise<unknown>;
   request(request: unknown): Promise<void>;
   onResponse(listener: (response: unknown) => void): () => void;
   onRetired(listener: () => void): () => void;
@@ -80,6 +93,7 @@ function loadPreload(): {
   const listeners = new Map<string, (...parameters: unknown[]) => void>();
   const invoke = vi.fn(async (channel: string): Promise<unknown> => {
     if (channel === "joko:runtime-process-diagnostics:owner:get") return OWNER;
+    if (channel === "joko:runtime-process-monitor:sample-desktop") return DESKTOP_SAMPLE;
     if (channel === "joko:window:toggle-maximize") return true;
     return undefined;
   });
@@ -131,13 +145,14 @@ describe("runtime process monitor dedicated preload", () => {
     const loaded = loadPreload();
     expect(loaded.exposedNames).toEqual(["jokoRuntimeProcessDiagnostics"]);
     expect(Object.keys(loaded.api).sort()).toEqual([
-      "getOwner", "onResponse", "onRetired", "platform", "request", "version", "window"
+      "getOwner", "onResponse", "onRetired", "platform", "request", "sampleDesktop", "version", "window"
     ]);
     expect(Object.keys(loaded.api.window).sort()).toEqual([
       "close", "minimize", "setZoomFactor", "toggleMaximize"
     ]);
     expect(loaded.api).toMatchObject({ version: 1, platform: "linux" });
     await expect(loaded.api.getOwner()).resolves.toEqual(OWNER);
+    await expect(loaded.api.sampleDesktop()).resolves.toEqual(DESKTOP_SAMPLE);
     await expect(loaded.api.window.toggleMaximize()).resolves.toBe(true);
     await expect(loaded.api.window.close()).resolves.toBeUndefined();
     expect(loaded.invoke).toHaveBeenCalledWith("joko:window:close");
@@ -150,6 +165,11 @@ describe("runtime process monitor dedicated preload", () => {
     await expect(loaded.api.request(REQUEST)).resolves.toBeUndefined();
     expect(loaded.invoke).toHaveBeenCalledWith("joko:runtime-process-diagnostics:request", REQUEST);
     expect(() => loaded.api.request({ ...REQUEST, bearer: "secret" })).toThrow(/request/u);
+    loaded.invoke.mockImplementationOnce(async () => ({
+      ...DESKTOP_SAMPLE,
+      processes: [{ ...DESKTOP_SAMPLE.processes[0], terminable: true }]
+    }));
+    await expect(loaded.api.sampleDesktop()).rejects.toThrow(/metric/u);
 
     const onResponse = vi.fn();
     const releaseResponse = loaded.api.onResponse(onResponse);
