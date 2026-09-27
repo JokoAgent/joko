@@ -12,6 +12,7 @@ describe("RuntimeProcessControl", () => {
       getRuntimeProcessUsage: async () => ({
         capturedAt: 1_000,
         processes: [{
+          role: "task-host",
           sessionId: "session-1",
           generation: 4,
           pid: 42,
@@ -33,6 +34,7 @@ describe("RuntimeProcessControl", () => {
       capturedAt: 1_000,
       processes: [{
         backendId: "backend-1",
+        role: "task-host",
         sessionId: "session-1",
         generation: 4,
         pid: 42,
@@ -63,6 +65,7 @@ describe("RuntimeProcessControl", () => {
       getRuntimeProcessUsage: async () => ({
         capturedAt: 1_000,
         processes: [{
+          role: "task-host",
           sessionId: "session-1",
           generation: 4,
           pid: 42,
@@ -84,6 +87,39 @@ describe("RuntimeProcessControl", () => {
       processes: [{ terminable: false }]
     });
     expect((await control.list("backend-1")).processes[0]).not.toHaveProperty("processInstanceId");
+  });
+
+  it("projects a shared control-plane service without inventing a Session owner", async () => {
+    const runtime = adapter({
+      getRuntimeProcessUsage: async () => ({
+        capturedAt: 1_000,
+        processes: [{
+          role: "control-plane",
+          pid: 84,
+          cpuPercent: 2.5,
+          memoryKb: 1_024,
+          processCount: 2,
+          terminable: false
+        }]
+      })
+    });
+    const control = new RuntimeProcessControl(
+      store(["runtime.process_usage", "runtime.process_terminate"]),
+      (_backendId, effect) => Promise.resolve(effect(runtime, 0))
+    );
+
+    await expect(control.list("backend-1")).resolves.toEqual({
+      capturedAt: 1_000,
+      processes: [{
+        backendId: "backend-1",
+        role: "control-plane",
+        pid: 84,
+        cpuPercent: 2.5,
+        memoryKb: 1_024,
+        processCount: 2,
+        terminable: false
+      }]
+    });
   });
 
   it("fails closed before Adapter termination when any durable fence is stale", async () => {
@@ -116,6 +152,7 @@ describe("RuntimeProcessControl", () => {
       getRuntimeProcessUsage: async () => ({
         capturedAt: 1_000,
         processes: [{
+          role: "task-host",
           sessionId: "session-1",
           generation: 3,
           pid: 42,

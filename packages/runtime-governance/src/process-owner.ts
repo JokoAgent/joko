@@ -23,9 +23,23 @@ import { setTimeout as delay } from "node:timers/promises";
 
 export type ProcessRetirementOutcome = "not_running" | "terminated" | "identity_mismatch" | "unconfirmed";
 
+export interface ManagedProcessRoot {
+  readonly pid: number;
+  readonly expectedIdentity: string;
+}
+
+export interface ManagedProcessUsage {
+  readonly pid: number;
+  readonly cpuPercent: number;
+  readonly memoryKb: number;
+  readonly processCount: number;
+}
+
 export interface ProcessIdentitySupervisor {
   capture(pid: number): Promise<string | undefined>;
   captureSync(pid: number): string | undefined;
+  /** Samples only exact roots whose current birth identity still matches. */
+  inspect?(roots: readonly ManagedProcessRoot[]): Promise<readonly ManagedProcessUsage[]>;
   terminate(pid: number, expectedIdentity: string, timeoutMs: number): Promise<ProcessRetirementOutcome>;
 }
 
@@ -41,6 +55,11 @@ export interface DurableProcessLease {
   readonly ownerToken: string;
   readonly pid: number;
   readonly processIdentity: string;
+}
+
+/** Display-safe metrics for one still-current durable lease. */
+export interface DurableProcessUsage extends ManagedProcessUsage {
+  readonly ownerToken: string;
 }
 
 interface ProcessOwnerManifest extends DurableProcessLease {
@@ -78,6 +97,10 @@ export class DurableProcessOwner {
     this.#generation = positiveSafeInteger(options.generation, "Process owner generation");
     this.#recoverStale = options.recoverStale;
     this.#supervisor = options.supervisor;
+  }
+
+  get inspectionSupported(): boolean {
+    return this.#supervisor.inspect !== undefined;
   }
 
   prepare(timeoutMs: number): Promise<void> {
@@ -129,6 +152,50 @@ export class DurableProcessOwner {
     return leaseOf(manifest);
   }
 
+  /**
+   * Samples only leases still owned by this exact process-owner generation.
+   * The second lease check rejects exits, releases and owner replacement that
+   * race the asynchronous process-table observation.
+   */
+  async inspect(leases?: readonly DurableProcessLease[]): Promise<readonly DurableProcessUsage[]> {
+    const inspect = this.#supervisor.inspect;
+    if (inspect === undefined) throw new Error("Process-owner inspection is unavailable.");
+    const requested = leases ?? [...this.#leases.values()].map(leaseOf);
+    const candidates = new Map<number, ProcessOwnerManifest>();
+    for (const lease of requested) {
+      const current = this.#leases.get(lease.ownerToken);
+      if (current === undefined || !sameLease(current, lease) || this.#releaseFlights.has(lease.ownerToken)) continue;
+      if (candidates.has(current.pid)) throw new Error("Process-owner leases contain a duplicate process root.");
+      candidates.set(current.pid, current);
+    }
+    if (candidates.size === 0) return [];
+
+    const sampled = await inspect([...candidates.values()].map((lease) => ({
+      pid: lease.pid,
+      expectedIdentity: lease.processIdentity
+    })));
+    const observed = new Set<number>();
+    const result: DurableProcessUsage[] = [];
+    for (const usage of sampled) {
+      const candidate = candidates.get(usage.pid);
+      if (candidate === undefined || observed.has(usage.pid)) {
+        throw new Error("Process supervisor returned an unowned or duplicate process root.");
+      }
+      observed.add(usage.pid);
+      if (!validUsage(usage)) throw new Error("Process supervisor returned invalid process metrics.");
+      const current = this.#leases.get(candidate.ownerToken);
+      if (current === undefined || !sameManifest(current, candidate) || this.#releaseFlights.has(candidate.ownerToken)) continue;
+      result.push({
+        ownerToken: candidate.ownerToken,
+        pid: usage.pid,
+        cpuPercent: usage.cpuPercent,
+        memoryKb: usage.memoryKb,
+        processCount: usage.processCount
+      });
+    }
+    return result;
+  }
+
   async releaseAfterExit(lease: DurableProcessLease): Promise<void> {
     const existing = this.#releaseFlights.get(lease.ownerToken);
     if (existing !== undefined) {
@@ -160,18 +227,29 @@ export class DurableProcessOwner {
   }
 
   async retireLease(lease: DurableProcessLease, timeoutMs: number): Promise<void> {
+    await this.retireLeaseWithOutcome(lease, timeoutMs);
+  }
+
+  /** Returns the exact retirement observation for user-requested action fences. */
+  async retireLeaseWithOutcome(
+    lease: DurableProcessLease,
+    timeoutMs: number
+  ): Promise<ProcessRetirementOutcome> {
     const releasing = this.#releaseFlights.get(lease.ownerToken);
     if (releasing !== undefined) {
-      if (!sameLease(releasing.manifest, lease)) return;
-      return releasing.promise;
+      if (!sameLease(releasing.manifest, lease)) return "identity_mismatch";
+      await releasing.promise;
+      return "not_running";
     }
     const current = this.#leases.get(lease.ownerToken);
-    if (current === undefined || !sameLease(current, lease)) return;
+    if (current === undefined) return "not_running";
+    if (!sameLease(current, lease)) return "identity_mismatch";
     const outcome = await this.#supervisor.terminate(current.pid, current.processIdentity, timeoutMs);
     if (outcome === "unconfirmed") {
       throw new Error("The exact child process did not confirm hard retirement.");
     }
     await this.releaseAfterExit(current);
+    return outcome;
   }
 
   async retireAll(timeoutMs: number): Promise<void> {
@@ -387,6 +465,13 @@ function normalizedIdentity(value: string): string {
 function positiveSafeInteger(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${label} must be a positive safe integer.`);
   return value;
+}
+
+function validUsage(value: ManagedProcessUsage): boolean {
+  return Number.isSafeInteger(value.pid) && value.pid > 0
+    && Number.isFinite(value.cpuPercent) && value.cpuPercent >= 0
+    && Number.isSafeInteger(value.memoryKb) && value.memoryKb >= 0
+    && Number.isSafeInteger(value.processCount) && value.processCount >= 1;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

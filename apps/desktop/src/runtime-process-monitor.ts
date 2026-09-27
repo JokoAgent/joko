@@ -22,17 +22,33 @@ export interface DesktopRuntimeProcessMonitorOwner {
   readonly snapshotGeneration: string;
 }
 
-export interface DesktopRuntimeProcessMonitorProcess {
+interface DesktopRuntimeProcessMonitorProcessBase {
   readonly backendId: string;
-  readonly sessionId: string;
-  readonly generation: number;
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
   readonly processCount: number;
+}
+
+export interface DesktopRuntimeProcessMonitorControlPlaneProcess extends DesktopRuntimeProcessMonitorProcessBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+export interface DesktopRuntimeProcessMonitorTaskHostProcess extends DesktopRuntimeProcessMonitorProcessBase {
+  readonly role: "task-host";
+  readonly sessionId: string;
+  readonly generation: number;
   readonly terminable: boolean;
   readonly processInstanceId?: string;
 }
+
+export type DesktopRuntimeProcessMonitorProcess =
+  | DesktopRuntimeProcessMonitorControlPlaneProcess
+  | DesktopRuntimeProcessMonitorTaskHostProcess;
 
 export type DesktopRuntimeProcessRole = "main" | "renderer" | "gpu" | "utility";
 
@@ -153,6 +169,10 @@ export function parseDesktopRuntimeProcessMonitorRequest(value: unknown): Deskto
   }
   if (plainRecordWithKeys(value.action, ["kind", "backendGeneration", "process"]) && value.action.kind === "terminate" &&
     positiveSafeDecimal(value.action.backendGeneration)) {
+    const process = parseDesktopRuntimeProcessMonitorProcess(value.action.process);
+    if (process.role !== "task-host" || !process.terminable || process.processInstanceId === undefined) {
+      throw new TypeError("Runtime process monitor termination requires a current task-host fence.");
+    }
     return Object.freeze({
       version: 1,
       requestId: value.requestId as string,
@@ -160,7 +180,7 @@ export function parseDesktopRuntimeProcessMonitorRequest(value: unknown): Deskto
       action: Object.freeze({
         kind: "terminate",
         backendGeneration: value.action.backendGeneration,
-        process: parseDesktopRuntimeProcessMonitorProcess(value.action.process)
+        process
       })
     });
   }
@@ -241,7 +261,8 @@ function parseDesktopRuntimeProcessMonitorResult(value: unknown): DesktopRuntime
   for (const backend of backends) {
     if (backend.state !== "ready") continue;
     for (const process of backend.processes) {
-      if (process.backendId !== backend.backendId || !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`)) {
+      if (process.backendId !== backend.backendId || (process.role === "task-host" &&
+        !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`))) {
         throw new TypeError("Runtime process monitor process ownership is invalid.");
       }
     }
@@ -309,29 +330,45 @@ function parseDesktopRuntimeProcessMonitorSession(value: unknown): DesktopRuntim
 }
 
 function parseDesktopRuntimeProcessMonitorProcess(value: unknown): DesktopRuntimeProcessMonitorProcess {
-  const required = ["backendId", "sessionId", "generation", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
-  const hasInstance = plainRecordWithKeys(value, [...required, "processInstanceId"]);
-  if ((!hasInstance && !plainRecordWithKeys(value, required)) ||
-    !boundedText(value.backendId, RUNTIME_PROCESS_MONITOR_ID_MAX_LENGTH) ||
-    !boundedText(value.sessionId, RUNTIME_PROCESS_MONITOR_ID_MAX_LENGTH) ||
-    !positiveSafeInteger(value.generation) || !positiveSafeInteger(value.pid) ||
+  const base = ["backendId", "role", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
+  if (!plainRecordWithKeys(value, base) ||
+    value.role !== "control-plane" || value.terminable !== false ||
+    !boundedText(value.backendId, RUNTIME_PROCESS_MONITOR_ID_MAX_LENGTH) || !positiveSafeInteger(value.pid) ||
     typeof value.cpuPercent !== "number" || !Number.isFinite(value.cpuPercent) || value.cpuPercent < 0 ||
-    !nonNegativeSafeInteger(value.memoryKb) || !positiveSafeInteger(value.processCount) ||
-    typeof value.terminable !== "boolean" ||
-    (value.terminable !== hasInstance) ||
-    (hasInstance && (typeof value.processInstanceId !== "string" || !UUID_V4_PATTERN.test(value.processInstanceId)))) {
-    throw new TypeError("Runtime process monitor process is invalid.");
+    !nonNegativeSafeInteger(value.memoryKb) || !positiveSafeInteger(value.processCount)) {
+    const task = [...base, "sessionId", "generation"];
+    const hasInstance = plainRecordWithKeys(value, [...task, "processInstanceId"]);
+    if ((!hasInstance && !plainRecordWithKeys(value, task)) ||
+      value.role !== "task-host" || !boundedText(value.backendId, RUNTIME_PROCESS_MONITOR_ID_MAX_LENGTH) ||
+      !boundedText(value.sessionId, RUNTIME_PROCESS_MONITOR_ID_MAX_LENGTH) ||
+      !positiveSafeInteger(value.generation) || !positiveSafeInteger(value.pid) ||
+      typeof value.cpuPercent !== "number" || !Number.isFinite(value.cpuPercent) || value.cpuPercent < 0 ||
+      !nonNegativeSafeInteger(value.memoryKb) || !positiveSafeInteger(value.processCount) ||
+      typeof value.terminable !== "boolean" || value.terminable !== hasInstance ||
+      (hasInstance && (typeof value.processInstanceId !== "string" || !UUID_V4_PATTERN.test(value.processInstanceId)))) {
+      throw new TypeError("Runtime process monitor process is invalid.");
+    }
+    return Object.freeze({
+      backendId: value.backendId,
+      role: "task-host",
+      sessionId: value.sessionId,
+      generation: value.generation,
+      pid: value.pid,
+      cpuPercent: value.cpuPercent,
+      memoryKb: value.memoryKb,
+      processCount: value.processCount,
+      terminable: value.terminable,
+      ...(hasInstance ? { processInstanceId: value.processInstanceId as string } : {})
+    });
   }
   return Object.freeze({
     backendId: value.backendId,
-    sessionId: value.sessionId,
-    generation: value.generation,
+    role: "control-plane",
     pid: value.pid,
     cpuPercent: value.cpuPercent,
     memoryKb: value.memoryKb,
     processCount: value.processCount,
-    terminable: value.terminable,
-    ...(hasInstance ? { processInstanceId: value.processInstanceId as string } : {})
+    terminable: false
   });
 }
 

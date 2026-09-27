@@ -7,9 +7,7 @@ import {
 } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
-export interface ProjectedRuntimeProcessUsage extends RuntimeProcessUsage {
-  readonly backendId: string;
-}
+export type ProjectedRuntimeProcessUsage = RuntimeProcessUsage & { readonly backendId: string };
 
 export interface ProjectedRuntimeProcessUsageSnapshot {
   readonly capturedAt: number;
@@ -63,30 +61,41 @@ export class RuntimeProcessControl {
       const identities = new Set<string>();
       const processes = snapshot.processes.map((process) => {
         validateUsage(process);
-        const session = this.#store.getSession(process.sessionId).descriptor;
-        if (
-          session.backendId !== normalizedBackendId
-          || session.binding.generation !== process.generation
-        ) throw invalidSnapshot("The Backend returned a process outside its current Session generation.");
-        const identity = `${process.sessionId}\0${process.generation}\0${process.pid}`;
+        if (process.role === "task-host") {
+          const session = this.#store.getSession(process.sessionId).descriptor;
+          if (
+            session.backendId !== normalizedBackendId
+            || session.binding.generation !== process.generation
+          ) throw invalidSnapshot("The Backend returned a process outside its current Session generation.");
+        }
+        const identity = process.role === "task-host"
+          ? `${process.role}\0${process.sessionId}\0${process.generation}\0${process.pid}`
+          : `${process.role}\0${process.pid}`;
         if (identities.has(identity)) throw invalidSnapshot("The Backend returned a duplicate runtime process root.");
         identities.add(identity);
 
-        const terminable = canTerminate && process.terminable;
+        const terminable = process.role === "task-host" && canTerminate && process.terminable;
         if (terminable && !validProcessInstanceId(process.processInstanceId)) {
           throw invalidSnapshot("The Backend returned a terminable process without a valid spawn fence.");
         }
-        return {
+        const metrics = {
           backendId: normalizedBackendId,
-          sessionId: process.sessionId,
-          generation: process.generation,
+          role: process.role,
           pid: process.pid,
           cpuPercent: process.cpuPercent,
           memoryKb: process.memoryKb,
-          processCount: process.processCount,
-          terminable,
-          ...(terminable ? { processInstanceId: process.processInstanceId } : {})
-        } satisfies ProjectedRuntimeProcessUsage;
+          processCount: process.processCount
+        } as const;
+        return process.role === "control-plane"
+          ? { ...metrics, role: "control-plane" as const, terminable: false as const }
+          : {
+              ...metrics,
+              role: "task-host" as const,
+              sessionId: process.sessionId,
+              generation: process.generation,
+              terminable,
+              ...(terminable ? { processInstanceId: process.processInstanceId } : {})
+            };
       });
       return { capturedAt: snapshot.capturedAt, processes };
     });
@@ -131,9 +140,20 @@ export class RuntimeProcessControl {
 }
 
 function validateUsage(process: RuntimeProcessUsage): void {
-  boundedIdentity(process.sessionId, "Session");
-  if (!Number.isSafeInteger(process.generation) || process.generation < 1) {
-    throw invalidSnapshot("The Backend returned an invalid runtime generation.");
+  if (process.role === "task-host") {
+    boundedIdentity(process.sessionId, "Session");
+    if (!Number.isSafeInteger(process.generation) || process.generation < 1) {
+      throw invalidSnapshot("The Backend returned an invalid runtime generation.");
+    }
+  } else if (process.role === "control-plane") {
+    if (process.terminable
+      || Object.prototype.hasOwnProperty.call(process, "sessionId")
+      || Object.prototype.hasOwnProperty.call(process, "generation")
+      || Object.prototype.hasOwnProperty.call(process, "processInstanceId")) {
+      throw invalidSnapshot("The Backend returned an invalid control-plane process scope.");
+    }
+  } else {
+    throw invalidSnapshot("The Backend returned an invalid runtime process role.");
   }
   if (!Number.isSafeInteger(process.pid) || process.pid < 1) {
     throw invalidSnapshot("The Backend returned an invalid process ID.");

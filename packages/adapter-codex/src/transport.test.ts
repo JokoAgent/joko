@@ -408,6 +408,56 @@ describe("StdioJsonRpcTransport", () => {
     }
   });
 
+  it("projects only the exact shared app-server lease through the host", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-codex-inspection-"));
+    const inspect = vi.fn(async (roots: readonly { readonly pid: number }[]) => roots.map(({ pid }) => ({
+      pid,
+      cpuPercent: 6.5,
+      memoryKb: 8_192,
+      processCount: 2
+    })));
+    const host = new AppServerHost({
+      transport: {
+        command: process.execPath,
+        args: [fixture],
+        processOwner: {
+          rootDirectory: root,
+          instanceId: "codex-instance",
+          generation: 4,
+          recoverStale: false,
+          supervisor: {
+            capture: async (pid) => `current-${pid}`,
+            captureSync: (pid) => `current-${pid}`,
+            inspect,
+            terminate: async (pid) => {
+              try { process.kill(pid, "SIGKILL"); } catch { /* The fixture already exited. */ }
+              return "terminated";
+            }
+          }
+        }
+      }
+    });
+    try {
+      await host.ensureStarted();
+      expect(host.processInspectionSupported).toBe(true);
+      const usage = await host.inspectProcessUsage();
+      expect(usage).toEqual([expect.objectContaining({
+        ownerToken: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        pid: expect.any(Number),
+        cpuPercent: 6.5,
+        memoryKb: 8_192,
+        processCount: 2
+      })]);
+      expect(inspect).toHaveBeenCalledWith([{
+        pid: usage[0]!.pid,
+        expectedIdentity: `current-${usage[0]!.pid}`
+      }]);
+    } finally {
+      await host.forceShutdown().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps an unconfirmed stale owner fenced and refuses to spawn a second app-server", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-codex-owner-unconfirmed-"));
     const staleDirectory = join(root, "7");

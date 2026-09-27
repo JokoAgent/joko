@@ -238,6 +238,7 @@ import {
   RemoteHostStatus,
   RetryState,
   RuntimeRecoveryState,
+  RuntimeProcessRole,
   TaskHistoryMaintenancePhase,
   TaskHistoryMaintenanceStatus,
   TaskHistoryRetention,
@@ -4123,16 +4124,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned an invalid runtime-process capture time.");
     }
     const processes = response.processes.map((process): RuntimeProcessUsageView => {
-      const generation = exactSafeUnsignedNumber(process.runtimeGeneration);
       const pid = exactSafeUnsignedNumber(process.processId);
       const memoryKb = exactSafeUnsignedNumber(process.memoryKb);
       const processCount = exactSafeUnsignedNumber(BigInt(process.processCount));
       const processInstanceId = process.processInstanceId?.trim();
       if (
         process.backendId !== backendId
-        || process.sessionId.trim() === ""
-        || generation === undefined
-        || generation < 1
         || pid === undefined
         || pid < 1
         || memoryKb === undefined
@@ -4143,14 +4140,34 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         || (process.terminable && !isRuntimeProcessInstanceId(processInstanceId))
         || (!process.terminable && processInstanceId !== undefined)
       ) throw new GatewayError("Orchestrator returned an invalid runtime-process fence or metric.");
-      return {
+      const metrics = {
         backendId: process.backendId,
-        sessionId: process.sessionId,
-        generation,
         pid,
         cpuPercent: process.cpuPercent,
         memoryKb,
-        processCount,
+        processCount
+      } as const;
+      if (process.role === RuntimeProcessRole.CONTROL_PLANE) {
+        if (process.sessionId !== undefined || process.runtimeGeneration !== undefined || process.terminable) {
+          throw new GatewayError("Orchestrator returned an invalid control-plane process scope.");
+        }
+        return { ...metrics, role: "control-plane", terminable: false };
+      }
+      const generation = process.runtimeGeneration === undefined
+        ? undefined
+        : exactSafeUnsignedNumber(process.runtimeGeneration);
+      if (
+        process.role !== RuntimeProcessRole.TASK_HOST
+        || process.sessionId === undefined
+        || process.sessionId.trim() === ""
+        || generation === undefined
+        || generation < 1
+      ) throw new GatewayError("Orchestrator returned an invalid task-host process scope.");
+      return {
+        ...metrics,
+        role: "task-host",
+        sessionId: process.sessionId,
+        generation,
         terminable: process.terminable,
         ...(processInstanceId === undefined ? {} : { processInstanceId })
       };
@@ -4247,6 +4264,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async terminateRuntimeProcess(process: RuntimeProcessUsageView): Promise<void> {
     if (
       process.backendId.trim() === ""
+      || process.role !== "task-host"
       || process.sessionId.trim() === ""
       || !Number.isSafeInteger(process.generation)
       || process.generation < 1

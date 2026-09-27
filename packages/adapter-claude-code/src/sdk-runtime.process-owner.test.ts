@@ -259,6 +259,76 @@ describe("Claude SDK owned custom spawn", () => {
     await expectOwnerRootEmpty(root);
     expect(terminate).toHaveBeenCalledWith(manifest.pid, manifest.processIdentity, 1_000);
   });
+
+  it("samples and terminates one Query only through its opaque durable lease", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-query-inspection-"));
+    roots.push(root);
+    let child: ReturnType<typeof spawnOwnedClaudeCodeProcess> | undefined;
+    sdk.query.mockImplementationOnce(({ options }: { options: {
+      abortController: AbortController;
+      spawnClaudeCodeProcess: (input: Parameters<typeof spawnOwnedClaudeCodeProcess>[0]) => ReturnType<typeof spawnOwnedClaudeCodeProcess>;
+    } }) => {
+      child = options.spawnClaudeCodeProcess({
+        command: process.execPath,
+        args: ["-e", "setInterval(() => undefined, 1000)"],
+        cwd: process.cwd(),
+        env: { ...process.env },
+        signal: options.abortController.signal
+      });
+      return { close: () => undefined } as ClaudeSdkQuery;
+    });
+    const inspect = vi.fn(async (roots: readonly { readonly pid: number }[]) => roots.map(({ pid }) => ({
+      pid,
+      cpuPercent: 8.5,
+      memoryKb: 16_384,
+      processCount: 2
+    })));
+    const terminate = vi.fn(async (pid: number, expectedIdentity: string) => {
+      if (expectedIdentity !== `query-${pid}`) return "identity_mismatch" as const;
+      try { process.kill(pid, "SIGKILL"); } catch { return "not_running" as const; }
+      return "terminated" as const;
+    });
+    const runtime = new DefaultClaudeSdkRuntime({
+      processOwner: {
+        rootDirectory: root,
+        instanceId: "query-inspection",
+        generation: 1,
+        recoverStale: false,
+        supervisor: {
+          capture: async (pid) => `query-${pid}`,
+          captureSync: (pid) => `query-${pid}`,
+          inspect,
+          terminate
+        }
+      }
+    });
+    try {
+      const query = await runtime.query(queryParams());
+      const usage = await runtime.inspectQueryProcesses(query);
+      expect(runtime.processInspectionSupported).toBe(true);
+      expect(usage).toEqual([expect.objectContaining({
+        ownerToken: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        pid: expect.any(Number),
+        cpuPercent: 8.5,
+        memoryKb: 16_384,
+        processCount: 2
+      })]);
+      const exit = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      await runtime.terminateQueryProcess(query, {
+        pid: usage[0]!.pid,
+        processInstanceId: usage[0]!.ownerToken
+      }, 1_000);
+      await exit;
+      await expect(runtime.terminateQueryProcess(query, {
+        pid: usage[0]!.pid,
+        processInstanceId: usage[0]!.ownerToken
+      }, 1_000)).rejects.toThrow("no longer current");
+      expect(terminate).toHaveBeenCalledWith(usage[0]!.pid, `query-${usage[0]!.pid}`, 1_000);
+    } finally {
+      await runtime.retireOwnedProcesses(1_000);
+      await runtime.closeSessionOperations();
+    }
+  });
 });
 
 function queryParams(sessionStoreAccess?: ClaudeSessionStoreSessionAccess): ClaudeSdkQueryParams {

@@ -1044,19 +1044,34 @@ export interface RemoteBackendRuntimeInstallEventView {
   readonly observedAt: number;
 }
 
-/** Content-free resource usage for one Adapter-owned service-node runtime. */
-export interface RuntimeProcessUsageView {
+interface RuntimeProcessUsageViewBase {
   readonly backendId: string;
-  readonly sessionId: string;
-  readonly generation: number;
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
   readonly processCount: number;
+}
+
+/** Shared Backend infrastructure with no product Session owner. */
+export interface RuntimeControlPlaneProcessUsageView extends RuntimeProcessUsageViewBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+/** Content-free resource usage for one exact Session task host. */
+export interface RuntimeTaskHostProcessUsageView extends RuntimeProcessUsageViewBase {
+  readonly role: "task-host";
+  readonly sessionId: string;
+  readonly generation: number;
   readonly terminable: boolean;
   /** Opaque spawn-instance action fence; never an executable or command. */
   readonly processInstanceId?: string;
 }
+
+export type RuntimeProcessUsageView = RuntimeControlPlaneProcessUsageView | RuntimeTaskHostProcessUsageView;
 
 export interface RuntimeProcessUsageSnapshotView {
   readonly capturedAt: number;

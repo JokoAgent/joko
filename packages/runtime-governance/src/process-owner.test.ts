@@ -84,10 +84,75 @@ describe("DurableProcessOwner", () => {
 
     expect(await readdir(root)).toEqual([]);
   });
+
+  it("samples only exact current leases and drops a lease released during inspection", async () => {
+    const root = await temporaryRoot();
+    let finishInspection: ((value: readonly [{ readonly pid: number; readonly cpuPercent: number; readonly memoryKb: number; readonly processCount: number }]) => void) | undefined;
+    const inspect = vi.fn(() => new Promise<readonly [{ readonly pid: number; readonly cpuPercent: number; readonly memoryKb: number; readonly processCount: number }]>((resolve) => {
+      finishInspection = resolve;
+    }));
+    const owner = new DurableProcessOwner({
+      rootDirectory: root,
+      instanceId: "backend-instance",
+      generation: 4,
+      recoverStale: false,
+      supervisor: { ...supervisor(), inspect }
+    });
+    await owner.prepare(50);
+    const lease = owner.claimSync(101);
+
+    const pending = owner.inspect([lease]);
+    expect(inspect).toHaveBeenCalledWith([{ pid: 101, expectedIdentity: "identity-101" }]);
+    await owner.releaseAfterExit(lease);
+    finishInspection?.([{ pid: 101, cpuPercent: 3.5, memoryKb: 2_048, processCount: 2 }]);
+
+    await expect(pending).resolves.toEqual([]);
+  });
+
+  it("returns the opaque owner token with validated display-safe metrics", async () => {
+    const root = await temporaryRoot();
+    const owner = new DurableProcessOwner({
+      rootDirectory: root,
+      instanceId: "backend-instance",
+      generation: 4,
+      recoverStale: false,
+      supervisor: {
+        ...supervisor(),
+        inspect: async () => [{ pid: 202, cpuPercent: 4.5, memoryKb: 4_096, processCount: 3 }]
+      }
+    });
+    await owner.prepare(50);
+    const lease = owner.claimSync(202);
+
+    await expect(owner.inspect([lease])).resolves.toEqual([{
+      ownerToken: lease.ownerToken,
+      pid: 202,
+      cpuPercent: 4.5,
+      memoryKb: 4_096,
+      processCount: 3
+    }]);
+  });
+
+  it("reports a stale birth identity and consumes its lease without replay", async () => {
+    const root = await temporaryRoot();
+    const owner = new DurableProcessOwner({
+      rootDirectory: root,
+      instanceId: "backend-instance",
+      generation: 4,
+      recoverStale: false,
+      supervisor: supervisor(vi.fn(async () => "identity_mismatch" as const))
+    });
+    await owner.prepare(50);
+    const lease = owner.claimSync(303);
+
+    await expect(owner.retireLeaseWithOutcome(lease, 50)).resolves.toBe("identity_mismatch");
+    await expect(owner.retireLeaseWithOutcome(lease, 50)).resolves.toBe("not_running");
+    expect(await readdir(root)).toEqual([]);
+  });
 });
 
 function supervisor(
-  terminate = vi.fn(async () => "terminated" as const)
+  terminate: ProcessIdentitySupervisor["terminate"] = vi.fn(async () => "terminated" as const)
 ): ProcessIdentitySupervisor {
   return {
     capture: async (pid) => `identity-${pid}`,

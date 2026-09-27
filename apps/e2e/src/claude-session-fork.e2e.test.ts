@@ -10,7 +10,7 @@ import {
   ClaudeCodeAdapter,
   type ClaudeSdkProbeInput
 } from "@joko/adapter-claude-code";
-import { createDefaultPiManagedProcessSupervisor } from "@joko/adapter-pi";
+import { createDefaultManagedProcessSupervisor } from "@joko/adapter-pi";
 import {
   DefaultClaudeSdkRuntime,
   SessionSdkFailure,
@@ -859,7 +859,7 @@ class StoredLocalSessionRuntime implements ClaudeSdkRuntime {
         instanceId: backendId,
         generation: options.generation,
         recoverStale: true,
-        supervisor: createDefaultPiManagedProcessSupervisor()
+        supervisor: createDefaultManagedProcessSupervisor()
       },
       sessionStoreRootDirectory: options.sessionStoreRoot,
       retirementTimeoutMs: 5_000,

@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue, RpcNotification, RpcServerRequest } from "./protocol.js";
+import type { DurableProcessUsage } from "@joko/runtime-governance";
 import {
   commandApprovalAvailability,
   isJsonObject,
@@ -109,6 +110,23 @@ export class AppServerHost {
 
   get initializeResult(): NativeInitializeResult | undefined {
     return this.#initializeResult;
+  }
+
+  get processInspectionSupported(): boolean {
+    return this.#transport?.running === true
+      && this.#transport.processInspectionSupported === true
+      && this.#transport.inspectProcessUsage !== undefined;
+  }
+
+  async inspectProcessUsage(): Promise<readonly DurableProcessUsage[]> {
+    const transport = this.#transport;
+    const generation = this.#generation;
+    if (transport?.running !== true || transport.processInspectionSupported !== true
+      || transport.inspectProcessUsage === undefined) {
+      return [];
+    }
+    const usage = await transport.inspectProcessUsage();
+    return transport === this.#transport && transport.running && generation === this.#generation ? usage : [];
   }
 
   isActiveGeneration(generation: number): boolean {

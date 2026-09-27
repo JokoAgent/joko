@@ -1133,6 +1133,7 @@ describe("Connect typed feature boundaries", () => {
         }
       }),
       findSetting: () => undefined,
+      findLatestVisibleUserMessageAt: () => undefined,
       listRuns: () => [],
       acknowledgeSessionAttention
     };
@@ -1199,6 +1200,7 @@ describe("Connect typed feature boundaries", () => {
       findOperation: () => undefined,
       getSession: () => storedSession,
       findSetting: () => undefined,
+      findLatestVisibleUserMessageAt: () => undefined,
       listRuns: () => []
     };
     const resetSession = vi.fn(async (input: any) => {

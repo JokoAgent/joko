@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type AppSnapshot, type RuntimeProcessUsageView } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type RuntimeProcessUsageView, type RuntimeTaskHostProcessUsageView } from "../model.js";
 import { terminateRuntimeProcessWithCurrentFence, type RuntimeProcessDiagnosticsSnapshot } from "../runtime-process-diagnostics.js";
 import {
   formatRuntimeProcessCpu,
@@ -46,6 +46,36 @@ describe("RuntimeProcessMonitor", () => {
       .map((item) => item.sessionId)).toEqual(["alpha", "beta"]);
   });
 
+  it("renders a shared Backend control plane as read-only without a Session label", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const value = display("owner-one", "ready", [{
+      backendId: "backend-local",
+      role: "control-plane",
+      pid: 91,
+      cpuPercent: 4.5,
+      memoryKb: 8_192,
+      processCount: 2,
+      terminable: false
+    }], 100);
+    await act(async () => root.render(<RuntimeProcessMonitorSurface
+      display={value}
+      runAction={(_key, work) => { void work(); }}
+      t={(key, values) => translate("en", key, values)}
+      onRefresh={async () => undefined}
+      onTerminate={async () => { throw new Error("control plane must remain read-only"); }}
+    />));
+
+    const row = container.querySelector<HTMLElement>('[role="row"][tabindex="0"]')!;
+    expect(row.textContent).toContain("Backend control plane · 2 processes");
+    expect(row.textContent).not.toContain("Alpha task");
+    await act(async () => row.click());
+    expect(container.querySelector<HTMLButtonElement>(".runtime-process-footer .button")?.disabled).toBe(true);
+    expect(container.querySelector(".runtime-process-hint")?.textContent).toBe("This process is read-only.");
+  });
+
   it("loads only capability-advertised roots and submits the complete selected spawn fence", async () => {
     let terminated = false;
     const rows = [process("beta", 10, 3), process("alpha", 11, 20)];
@@ -63,8 +93,8 @@ describe("RuntimeProcessMonitor", () => {
     await vi.waitFor(() => expect(container.querySelectorAll('[role="row"][tabindex="0"]')).toHaveLength(2));
     expect(listRuntimeProcesses).toHaveBeenCalledWith("backend-local", expect.any(AbortSignal));
     expect([...container.querySelectorAll(".runtime-process-details > span:first-child")].map((item) => item.textContent)).toEqual([
-      "Alpha task · 3 processes",
-      "Beta task · 3 processes"
+      "Session task host · Alpha task · 3 processes",
+      "Session task host · Beta task · 3 processes"
     ]);
     expect(container.querySelector('[aria-sort="descending"]')?.textContent).toContain("CPU");
 
@@ -337,9 +367,10 @@ function display(
   };
 }
 
-function process(sessionId: string, pid: number, cpuPercent: number): RuntimeProcessUsageView {
+function process(sessionId: string, pid: number, cpuPercent: number): RuntimeTaskHostProcessUsageView {
   return {
     backendId: "backend-local",
+    role: "task-host",
     sessionId,
     generation: 4,
     pid,

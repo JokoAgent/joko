@@ -49,9 +49,11 @@ import {
   type PromptInput,
   type ProviderModel,
   type PublicError,
+  type RuntimeProcessUsageSnapshot,
   type RuntimeResource,
   type SubagentControlInput,
   type TargetDescriptor,
+  type TerminateRuntimeProcessInput,
   type UsageSnapshot
 } from "@joko/core";
 import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
@@ -546,6 +548,7 @@ interface NativeRuntime {
   readonly toolNames: Map<string, string>;
   consumer: Promise<void>;
   closed: boolean;
+  externalTermination: boolean;
   retirementConfirmed: boolean;
   nativeTaskProjectionEnabled: boolean;
   steerEnabled: boolean;
@@ -847,6 +850,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         this.#resolveNativeMemoryEnabled !== undefined,
         catalogModels,
         this.#managedModels().some((model) => model.thinkingLevels.length > 0),
+        this.#runtime.processInspectionSupported === true && this.#runtime.inspectQueryProcesses !== undefined,
+        this.#runtime.processInspectionSupported === true && this.#runtime.terminateQueryProcess !== undefined,
         this.#hostCapabilities,
         supportsLogin,
         supportsLogout,
@@ -978,6 +983,111 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   async revokeProviderAuthentication(providerId: string): Promise<void> {
     if (providerId !== PROVIDER_ID) return;
     await this.#retireAuthorizedRuntimes();
+  }
+
+  async getRuntimeProcessUsage(): Promise<RuntimeProcessUsageSnapshot> {
+    const inspect = this.#runtime.inspectQueryProcesses;
+    if (this.#runtime.processInspectionSupported !== true || inspect === undefined) {
+      throw claudeCodeError(
+        "CLAUDE_RUNTIME_PROCESS_USAGE_UNAVAILABLE",
+        "Local Claude task-host processes cannot be inspected.",
+        "resource",
+        { retryable: true, recovery: "Use a service node with exact local process inspection support." }
+      );
+    }
+    const runtimes = [...this.#sessions.values()].filter((runtime) =>
+      !runtime.closed
+      && !runtime.externalTermination
+      && !runtime.remote
+      && runtime.sdkRuntime === this.#runtime
+      && runtime.backendInstanceGeneration === this.#instanceGeneration);
+    let sampled: readonly { readonly runtime: NativeRuntime; readonly query: ClaudeSdkQuery; readonly processes: Awaited<ReturnType<typeof inspect>> }[];
+    try {
+      sampled = (await Promise.all(runtimes.flatMap((runtime) => runtimeQueries(runtime).map(async (query) => ({
+        runtime,
+        query,
+        processes: await inspect.call(this.#runtime, query)
+      })))));
+    } catch (error) {
+      throw claudeCodeError(
+        "CLAUDE_RUNTIME_PROCESS_USAGE_FAILED",
+        "Local Claude task-host process usage could not be inspected.",
+        "resource",
+        { retryable: true, recovery: "Retry after checking service-node process inspection support." }
+      );
+    }
+    const identities = new Set<string>();
+    const processes = sampled.flatMap(({ runtime, query, processes: usage }) => {
+      if (this.#sessions.get(runtime.productSessionId) !== runtime || runtime.closed || runtime.externalTermination
+        || runtime.sdkRuntime !== this.#runtime || !runtimeQueries(runtime).includes(query)) return [];
+      return usage.map((process) => {
+        const identity = `${process.ownerToken}\u0000${process.pid}`;
+        if (identities.has(identity)) {
+          throw claudeCodeError(
+            "CLAUDE_RUNTIME_PROCESS_USAGE_INVALID",
+            "The local Claude process owner returned a duplicate task-host root.",
+            "resource"
+          );
+        }
+        identities.add(identity);
+        return {
+          role: "task-host" as const,
+          sessionId: runtime.productSessionId,
+          generation: runtime.sessionGeneration,
+          pid: process.pid,
+          cpuPercent: process.cpuPercent,
+          memoryKb: process.memoryKb,
+          processCount: process.processCount,
+          terminable: true,
+          processInstanceId: process.ownerToken
+        };
+      });
+    });
+    return { capturedAt: this.#now(), processes };
+  }
+
+  async terminateRuntimeProcess(input: TerminateRuntimeProcessInput): Promise<void> {
+    const runtime = this.#sessions.get(input.sessionId);
+    const inspect = this.#runtime.inspectQueryProcesses;
+    const terminate = this.#runtime.terminateQueryProcess;
+    if (runtime === undefined || runtime.closed || runtime.externalTermination || runtime.remote || runtime.sdkRuntime !== this.#runtime
+      || runtime.sessionGeneration !== input.generation
+      || runtime.backendInstanceGeneration !== this.#instanceGeneration
+      || this.#runtime.processInspectionSupported !== true || inspect === undefined || terminate === undefined) {
+      throw runtimeProcessFenceMismatch();
+    }
+    let owner: ClaudeSdkQuery | undefined;
+    for (const query of runtimeQueries(runtime)) {
+      const usage = await inspect.call(this.#runtime, query).catch(() => []);
+      if (usage.some((process) => process.pid === input.pid && process.ownerToken === input.processInstanceId)) {
+        if (owner !== undefined) throw runtimeProcessFenceMismatch();
+        owner = query;
+      }
+    }
+    if (owner === undefined || this.#sessions.get(input.sessionId) !== runtime || runtime.closed || runtime.externalTermination
+      || runtime.sessionGeneration !== input.generation || !runtimeQueries(runtime).includes(owner)) {
+      throw runtimeProcessFenceMismatch();
+    }
+    runtime.externalTermination = true;
+    try {
+      await terminate.call(this.#runtime, owner, {
+        pid: input.pid,
+        processInstanceId: input.processInstanceId
+      }, this.#teardownTimeoutMs);
+    } catch {
+      await this.#retireRuntime(runtime, false).catch(() => undefined);
+      throw claudeCodeError(
+        "CLAUDE_RUNTIME_PROCESS_EXIT_UNCONFIRMED",
+        "The exact local Claude task-host process did not confirm retirement.",
+        "shutdown",
+        {
+          retryable: true,
+          stateMayHaveChanged: true,
+          recovery: "Keep this Session generation fenced and refresh process usage before retrying."
+        }
+      );
+    }
+    await this.#retireRuntime(runtime, false);
   }
 
   async listModels(): Promise<readonly ProviderModel[]> {
@@ -2928,6 +3038,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         toolNames: new Map(),
         consumer: Promise.resolve(),
         closed: false,
+        externalTermination: false,
         retirementConfirmed: false,
         nativeTaskProjectionEnabled: false,
         steerEnabled: false,
@@ -5540,7 +5651,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   #isRuntimeCurrent(runtime: NativeRuntime): boolean {
-    if (runtime.closed || this.#sessions.get(runtime.productSessionId) !== runtime) return false;
+    if (runtime.closed || runtime.externalTermination || this.#sessions.get(runtime.productSessionId) !== runtime) return false;
     try {
       runtime.assertRuntimeCurrent();
       return true;
@@ -6253,6 +6364,8 @@ function capabilityManifest(
   nativeMemoryConfigured: boolean,
   models: readonly ClaudeSdkModelInfo[],
   managedEffortSupported: boolean,
+  processInspectionSupported: boolean,
+  processTerminationSupported: boolean,
   hostCapabilities: ReadonlySet<HostComposedCapability>,
   supportsLogin: boolean,
   supportsLogout: boolean,
@@ -6304,6 +6417,8 @@ function capabilityManifest(
   if (steerSupported) supported.add("turn.steer");
   if (subagentDefaultModelSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
   if (nativeMemoryConfigured) supported.add("memory.native");
+  if (processInspectionSupported) supported.add("runtime.process_usage");
+  if (processInspectionSupported && processTerminationSupported) supported.add("runtime.process_terminate");
   if (managedEffortSupported || models.some((model) => model.supportsEffort === true)) supported.add("model.effort");
   if (models.some((model) => model.supportsFastMode === true)) supported.add("model.fast_mode");
   for (const capability of hostCapabilities) supported.add(capability);
@@ -6338,6 +6453,9 @@ function capabilityManifest(
         : key === "turn.steer" && !steerSupported ? { reason: "upstream_missing" as const }
         : key === "subagents.default_model" && !subagentDefaultModelSupported ? { reason: "upstream_missing" as const }
         : key === "subagents.default_model" && !subagentDefaultModelConfigured ? { reason: "not_implemented" as const }
+        : (key === "runtime.process_usage" && !processInspectionSupported)
+          || (key === "runtime.process_terminate" && (!processInspectionSupported || !processTerminationSupported))
+          ? { reason: "platform_limited" as const }
         : (key === "background.tasks"
           || key === "background.tasks.cancel"
           || key.startsWith("subagents.")) && !nativeTasksSupported
@@ -6347,6 +6465,28 @@ function capabilityManifest(
       ...(options === undefined ? {} : { options })
     }];
   }));
+}
+
+function runtimeQueries(runtime: NativeRuntime): readonly ClaudeSdkQuery[] {
+  const queries = new Set<ClaudeSdkQuery>([runtime.query]);
+  for (const child of runtime.managedChildren.values()) {
+    if (child.query !== undefined) queries.add(child.query);
+  }
+  for (const owner of runtime.childNativeTaskOwners.values()) queries.add(owner.query);
+  return [...queries];
+}
+
+function runtimeProcessFenceMismatch(): JokoError {
+  return claudeCodeError(
+    "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH",
+    "The selected local Claude task-host process is no longer current.",
+    "shutdown",
+    {
+      retryable: true,
+      stateMayHaveChanged: false,
+      recovery: "Refresh runtime process usage before attempting termination again."
+    }
+  );
 }
 
 function nativeState(runtime: NativeRuntime): NativeSessionState {

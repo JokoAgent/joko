@@ -160,6 +160,7 @@ function refreshRequest(ownerValue: DesktopRuntimeProcessMonitorOwner, requestId
 function runtimeProcess(): DesktopRuntimeProcessMonitorProcess {
   return {
     backendId: "backend-local",
+    role: "task-host",
     sessionId: "session-local",
     generation: 4,
     pid: 42,

@@ -39,6 +39,53 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("projects the shared local app-server as a read-only control-plane process", async () => {
+    const fake = new FakeCodexAppServer();
+    const inspectProcessUsage = vi.fn(async () => [{
+      ownerToken: "10000000-0000-4000-8000-000000000001",
+      pid: 91,
+      cpuPercent: 4.5,
+      memoryKb: 8_192,
+      processCount: 2
+    }]);
+    const host = new AppServerHost({
+      transportFactory: () => {
+        const transport = fake.createTransport();
+        Object.defineProperties(transport, {
+          processInspectionSupported: { value: true },
+          inspectProcessUsage: { value: inspectProcessUsage }
+        });
+        return transport;
+      }
+    });
+    const adapter = new CodexBackendAdapter({
+      id: "codex-test",
+      instanceGeneration: 7,
+      host,
+      now: () => 1_000
+    });
+    cleanups.push(async () => {
+      await adapter.dispose();
+      await host.shutdown();
+    });
+
+    const descriptor = await adapter.describe();
+    expect(descriptor.capabilities.get("runtime.process_usage")?.supported).toBe(true);
+    expect(descriptor.capabilities.get("runtime.process_terminate")?.supported).toBe(false);
+    await expect(adapter.getRuntimeProcessUsage()).resolves.toEqual({
+      capturedAt: 1_000,
+      processes: [{
+        role: "control-plane",
+        pid: 91,
+        cpuPercent: 4.5,
+        memoryKb: 8_192,
+        processCount: 2,
+        terminable: false
+      }]
+    });
+    expect(inspectProcessUsage).toHaveBeenCalledOnce();
+  });
+
   it("keeps managed routes on the original thread, authorizes only the active operation, and adopts revisions before new input", async () => {
     let revision = "1";
     let enabled = true;

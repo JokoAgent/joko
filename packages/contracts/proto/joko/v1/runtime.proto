@@ -957,16 +957,25 @@ message SessionResource {
 // Command lines, executable paths, native references, and environment values
 // are deliberately not representable. The opaque instance id is a spawn fence,
 // not an OS birth identity.
+enum RuntimeProcessRole {
+  RUNTIME_PROCESS_ROLE_UNSPECIFIED = 0;
+  RUNTIME_PROCESS_ROLE_CONTROL_PLANE = 1;
+  RUNTIME_PROCESS_ROLE_TASK_HOST = 2;
+}
+
 message RuntimeProcessUsage {
   string backend_id = 1;
-  string session_id = 2;
-  uint64 runtime_generation = 3;
+  // Present only for TASK_HOST. Shared control-plane services must not invent
+  // a product Session owner.
+  optional string session_id = 2;
+  optional uint64 runtime_generation = 3;
   uint64 process_id = 4;
   double cpu_percent = 5;
   uint64 memory_kb = 6;
   uint32 process_count = 7;
   bool terminable = 8;
   optional string process_instance_id = 9;
+  RuntimeProcessRole role = 10;
 }
 
 enum RuntimeCommandSource {

@@ -4,6 +4,7 @@ import {
   GetSnapshotResponseSchema,
   ListRuntimeProcessesResponseSchema,
   OperationState,
+  RuntimeProcessRole,
   RuntimeProcessUsageSchema,
   SnapshotSchema,
   SubmitOperationResponseSchema
@@ -23,6 +24,7 @@ describe("runtime process gateway", () => {
           capturedAt: { seconds: 123n, nanos: 456_000_000 },
           processes: [create(RuntimeProcessUsageSchema, {
             backendId: "backend-local",
+            role: RuntimeProcessRole.TASK_HOST,
             sessionId: "session-one",
             runtimeGeneration: 7n,
             processId: 42n,
@@ -60,6 +62,7 @@ describe("runtime process gateway", () => {
       capturedAt: 123_456,
       processes: [{
         backendId: "backend-local",
+        role: "task-host",
         sessionId: "session-one",
         generation: 7,
         pid: 42,
@@ -93,6 +96,7 @@ describe("runtime process gateway", () => {
         capturedAt: { seconds: 1n, nanos: 0 },
         processes: [{
           backendId: "backend-local",
+          role: RuntimeProcessRole.TASK_HOST,
           sessionId: "session-one",
           runtimeGeneration: 1n,
           processId: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
@@ -114,6 +118,7 @@ describe("runtime process gateway", () => {
     await expect(gateway.listRuntimeProcesses("backend-local")).rejects.toThrow("invalid runtime-process fence or metric");
     await expect(gateway.terminateRuntimeProcess({
       backendId: "backend-local",
+      role: "task-host",
       sessionId: "session-one",
       generation: 1,
       pid: 42,
@@ -122,6 +127,45 @@ describe("runtime process gateway", () => {
       processCount: 1,
       terminable: true
     })).rejects.toThrow("current terminable runtime-process fence");
+    gateway.disconnect();
+  });
+
+  it("maps a shared control-plane row without a synthetic Session or action fence", async () => {
+    const transport = processTransport((method) => {
+      if (method.localName !== "listRuntimeProcesses") throw new Error("Unexpected method");
+      return create(ListRuntimeProcessesResponseSchema, {
+        capturedAt: { seconds: 2n, nanos: 0 },
+        processes: [create(RuntimeProcessUsageSchema, {
+          backendId: "backend-local",
+          role: RuntimeProcessRole.CONTROL_PLANE,
+          processId: 84n,
+          cpuPercent: 1.5,
+          memoryKb: 2_048n,
+          processCount: 2,
+          terminable: false
+        })]
+      });
+    });
+    const gateway = createOrchestratorGateway(
+      { id: "connection-process", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => transport
+    );
+    await gateway.connect();
+
+    const snapshot = await gateway.listRuntimeProcesses("backend-local");
+    expect(snapshot.processes).toEqual([{
+      backendId: "backend-local",
+      role: "control-plane",
+      pid: 84,
+      cpuPercent: 1.5,
+      memoryKb: 2_048,
+      processCount: 2,
+      terminable: false
+    }]);
+    await expect(gateway.terminateRuntimeProcess(snapshot.processes[0]!))
+      .rejects.toThrow("current terminable runtime-process fence");
     gateway.disconnect();
   });
 });

@@ -17,7 +17,7 @@ import {
 } from "@joko/adapter-codex";
 import {
   createPiAdapter,
-  createDefaultPiManagedProcessSupervisor,
+  createDefaultManagedProcessSupervisor,
   createManagedSubagentRunnerProcessInspector,
   MANAGED_SUBAGENT_RUNNER_SOURCE,
   managedSubagentRunRoot,
@@ -1105,7 +1105,7 @@ export async function createOrchestratorApplication(
       mcpRouter.fenceNativeAuthProvider(providerId),
     reconcileManagedSubagentProviderAuthentication: (providerId, routeToken) =>
       mcpRouter.reconcileNativeAuthProvider(providerId, routeToken),
-    processSupervisor: createDefaultPiManagedProcessSupervisor(),
+    processSupervisor: createDefaultManagedProcessSupervisor(),
     validateRemoteWorkspace: async (target, signal) => {
       const binding = target.remoteWorkspace;
       if (binding === undefined) throw new Error("Remote workspace binding is missing.");
@@ -1278,7 +1278,7 @@ export async function createOrchestratorApplication(
                   instanceId,
                   generation,
                   recoverStale: backendInstances.adapter(instanceId) === undefined,
-                  supervisor: createDefaultPiManagedProcessSupervisor()
+                  supervisor: createDefaultManagedProcessSupervisor()
                 }
               }
             },
@@ -1372,7 +1372,7 @@ export async function createOrchestratorApplication(
           instanceId,
           generation,
           recoverStale: backendInstances.adapter(instanceId) === undefined,
-          supervisor: createDefaultPiManagedProcessSupervisor()
+          supervisor: createDefaultManagedProcessSupervisor()
         },
         sessionStoreRootDirectory: join(config.dataDirectory, "backend-session-store", instanceId),
         ...(config.claudeCodeExecutable === undefined

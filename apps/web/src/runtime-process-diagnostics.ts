@@ -174,6 +174,7 @@ export async function terminateRuntimeProcessWithCurrentFence(
   isCurrent: () => boolean = () => true
 ): Promise<void> {
   const backend = snapshot.backends.find((candidate) => candidate.id === process.backendId);
+  if (process.role !== "task-host") throw new Error("The selected runtime process is read-only.");
   const session = snapshot.sessions.find((candidate) => candidate.id === process.sessionId);
   if (
     runtimeProcessBackendGeneration(backend?.instanceGeneration) !== expectedBackendGeneration
@@ -206,6 +207,8 @@ export function sameRuntimeProcessAuthority(
   right: RuntimeProcessUsageView
 ): boolean {
   return left.backendId === right.backendId
+    && left.role === "task-host"
+    && right.role === "task-host"
     && left.sessionId === right.sessionId
     && left.generation === right.generation
     && left.pid === right.pid

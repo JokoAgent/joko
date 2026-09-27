@@ -49,6 +49,7 @@ function response(index = 1, owner = OWNER): DesktopRuntimeProcessMonitorRespons
         capturedAt: 1_000,
         processes: Object.freeze([Object.freeze({
           backendId: "backend-1",
+          role: "task-host",
           sessionId: "session-1",
           generation: 2,
           pid: 123,
@@ -128,6 +129,32 @@ describe("runtime process monitor v1 protocol", () => {
     expect(sameDesktopRuntimeProcessMonitorOwner(OWNER, { ...OWNER })).toBe(true);
     expect(sameDesktopRuntimeProcessMonitorOwner(OWNER, { ...OWNER, connectionGeneration: "8" })).toBe(false);
     expect(sameDesktopRuntimeProcessMonitorOwner(OWNER, { ...OWNER, snapshotGeneration: "12" })).toBe(false);
+  });
+
+  it("accepts a Session-free control plane but rejects it as a termination target", () => {
+    const base = response();
+    if (base.result.kind !== "snapshot" || base.result.backends[0]?.state !== "ready") throw new Error("fixture must be ready");
+    const controlPlane = {
+      backendId: "backend-1",
+      role: "control-plane" as const,
+      pid: 321,
+      cpuPercent: 2.5,
+      memoryKb: 8_192,
+      processCount: 2,
+      terminable: false as const
+    };
+    const value = {
+      ...base,
+      result: {
+        ...base.result,
+        backends: [{ ...base.result.backends[0], processes: [controlPlane] }]
+      }
+    };
+    expect(parseDesktopRuntimeProcessMonitorResponse(value)).toEqual(value);
+    expect(() => parseDesktopRuntimeProcessMonitorRequest({
+      ...request(3),
+      action: { kind: "terminate", backendGeneration: "3", process: controlPlane }
+    })).toThrow(/termination/u);
   });
 
   it("parses the direct snapshot shape and enforces backend/session/process ownership", () => {

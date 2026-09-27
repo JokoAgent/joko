@@ -1317,6 +1317,10 @@ function parseDesktopRuntimeProcessMonitorRequest(value: unknown): DesktopRuntim
   }
   if (runtimeProcessRecord(action, ["kind", "backendGeneration", "process"]) && action["kind"] === "terminate" &&
     runtimeProcessSafeGeneration(action["backendGeneration"])) {
+    const process = parseRuntimeProcess(action["process"]);
+    if (process.role !== "task-host" || !process.terminable || process.processInstanceId === undefined) {
+      throw new TypeError("Runtime process monitor termination fence is invalid.");
+    }
     return Object.freeze({
       version: 1,
       requestId: value["requestId"],
@@ -1324,7 +1328,7 @@ function parseDesktopRuntimeProcessMonitorRequest(value: unknown): DesktopRuntim
       action: Object.freeze({
         kind: "terminate",
         backendGeneration: action["backendGeneration"],
-        process: parseRuntimeProcess(action["process"])
+        process
       })
     });
   }
@@ -1361,7 +1365,8 @@ function parseDesktopRuntimeProcessMonitorResponse(value: unknown): DesktopRunti
   if (backendIds.size !== backends.length || sessionKeys.size !== sessions.length ||
     sessions.some((session) => !backendIds.has(session.backendId)) ||
     backends.some((backend) => backend.state === "ready" && backend.processes.some((process) =>
-      process.backendId !== backend.backendId || !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`)))) {
+      process.backendId !== backend.backendId || (process.role === "task-host" &&
+        !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`))))) {
     throw new TypeError("Runtime process monitor snapshot ownership is invalid.");
   }
   return Object.freeze({
@@ -1411,22 +1416,33 @@ function parseRuntimeProcessSession(value: unknown): DesktopRuntimeProcessMonito
 }
 
 function parseRuntimeProcess(value: unknown): DesktopRuntimeProcessMonitorProcess {
-  const keys = ["backendId", "sessionId", "generation", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
-  const hasInstance = runtimeProcessRecord(value, [...keys, "processInstanceId"]);
-  if ((!hasInstance && !runtimeProcessRecord(value, keys)) || !runtimeProcessIdentity(value["backendId"]) ||
-    !runtimeProcessIdentity(value["sessionId"]) || !runtimeProcessPositiveInteger(value["generation"]) ||
-    !runtimeProcessPositiveInteger(value["pid"]) || typeof value["cpuPercent"] !== "number" ||
-    !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
+  const base = ["backendId", "role", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
+  if (!runtimeProcessRecord(value, base) || value["role"] !== "control-plane" || value["terminable"] !== false ||
+    !runtimeProcessIdentity(value["backendId"]) || !runtimeProcessPositiveInteger(value["pid"]) ||
+    typeof value["cpuPercent"] !== "number" || !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
     !Number.isSafeInteger(value["memoryKb"]) || (value["memoryKb"] as number) < 0 ||
-    !runtimeProcessPositiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
-    value["terminable"] !== hasInstance ||
-    (hasInstance && !runtimeProcessUuid(value["processInstanceId"]))) {
-    throw new TypeError("Runtime process monitor process is invalid.");
+    !runtimeProcessPositiveInteger(value["processCount"])) {
+    const task = [...base, "sessionId", "generation"];
+    const hasInstance = runtimeProcessRecord(value, [...task, "processInstanceId"]);
+    if ((!hasInstance && !runtimeProcessRecord(value, task)) || value["role"] !== "task-host" ||
+      !runtimeProcessIdentity(value["backendId"]) || !runtimeProcessIdentity(value["sessionId"]) ||
+      !runtimeProcessPositiveInteger(value["generation"]) || !runtimeProcessPositiveInteger(value["pid"]) ||
+      typeof value["cpuPercent"] !== "number" || !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
+      !Number.isSafeInteger(value["memoryKb"]) || (value["memoryKb"] as number) < 0 ||
+      !runtimeProcessPositiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
+      value["terminable"] !== hasInstance || (hasInstance && !runtimeProcessUuid(value["processInstanceId"]))) {
+      throw new TypeError("Runtime process monitor process is invalid.");
+    }
+    return Object.freeze({
+      backendId: value["backendId"], role: "task-host", sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+      cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
+      terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+    });
   }
   return Object.freeze({
-    backendId: value["backendId"], sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+    backendId: value["backendId"], role: "control-plane", pid: value["pid"],
     cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
-    terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+    terminable: false
   });
 }
 

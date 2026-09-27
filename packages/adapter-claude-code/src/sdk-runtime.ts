@@ -9,7 +9,8 @@ import { SessionSdkOwner } from "./session-sdk-owner.js";
 import {
   DurableProcessOwner,
   type DurableProcessLease,
-  type DurableProcessOwnerOptions
+  type DurableProcessOwnerOptions,
+  type DurableProcessUsage
 } from "@joko/runtime-governance";
 import { z } from "zod";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
@@ -328,10 +329,18 @@ export interface ClaudeSdkRuntime {
    * the Adapter must not advertise workspace derivation until Host adoption,
    * recovery and live-cwd proof are also configured. */
   readonly storedSessions?: ClaudeSdkStoredSessionRuntime;
+  /** True only for exact local Query roots owned by this runtime. */
+  readonly processInspectionSupported?: boolean;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
   query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery>;
   /** Confirm retirement of this exact Query before resuming its native Session. */
   retireQuery(query: ClaudeSdkQuery, timeoutMs: number): Promise<void>;
+  inspectQueryProcesses?(query: ClaudeSdkQuery): Promise<readonly DurableProcessUsage[]>;
+  terminateQueryProcess?(
+    query: ClaudeSdkQuery,
+    input: { readonly pid: number; readonly processInstanceId: string },
+    timeoutMs: number
+  ): Promise<void>;
   getSessionInfo(sessionId: string, options: { readonly dir: string; readonly signal?: AbortSignal }): Promise<ClaudeSdkSessionInfo | undefined>;
   getSessionMessages(
     sessionId: string,
@@ -530,6 +539,10 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       : storedSessionRuntime(this.#sessionOwner);
   }
 
+  get processInspectionSupported(): boolean {
+    return this.#processOwner?.inspectionSupported === true;
+  }
+
   async probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe> {
     let loaded: LoadedSdkModule;
     try {
@@ -708,8 +721,37 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
     const results = await Promise.allSettled(owner.leases.map((lease) => this.#processOwner!.retireLease(lease, timeoutMs)));
     const failed = results.find((result) => result.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
+    owner.leases.splice(0, owner.leases.length);
     owner.sessionStore?.close();
     this.#queryProcesses.delete(query);
+  }
+
+  async inspectQueryProcesses(query: ClaudeSdkQuery): Promise<readonly DurableProcessUsage[]> {
+    const processOwner = this.#processOwner;
+    const owner = this.#queryProcesses.get(query);
+    if (processOwner === undefined || owner === undefined || !processOwner.inspectionSupported) return [];
+    const usage = await processOwner.inspect(owner.leases);
+    return this.#queryProcesses.get(query) === owner ? usage : [];
+  }
+
+  async terminateQueryProcess(
+    query: ClaudeSdkQuery,
+    input: { readonly pid: number; readonly processInstanceId: string },
+    timeoutMs: number
+  ): Promise<void> {
+    const processOwner = this.#processOwner;
+    const owner = this.#queryProcesses.get(query);
+    const index = owner?.leases.findIndex((lease) =>
+      lease.pid === input.pid && lease.ownerToken === input.processInstanceId) ?? -1;
+    if (processOwner === undefined || owner === undefined || index < 0) {
+      throw new Error("The exact native Query process fence is no longer current.");
+    }
+    const lease = owner.leases[index]!;
+    const outcome = await processOwner.retireLeaseWithOutcome(lease, timeoutMs);
+    if (owner.leases[index] === lease) owner.leases.splice(index, 1);
+    if (outcome !== "terminated") {
+      throw new Error("The exact native Query process fence was stale before retirement.");
+    }
   }
 
   async getSessionInfo(

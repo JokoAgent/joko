@@ -33,6 +33,7 @@ const RESPONSE = Object.freeze({
       capturedAt: 100,
       processes: Object.freeze([Object.freeze({
         backendId: "backend-1",
+        role: "task-host",
         sessionId: "session-1",
         generation: 5,
         pid: 123,

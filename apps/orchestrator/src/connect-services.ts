@@ -1843,8 +1843,12 @@ export function createConnectServices(application: OrchestratorApplication): Con
         capturedAt: toProtoTimestamp(snapshot.capturedAt),
         processes: snapshot.processes.map((process) => create(contract.RuntimeProcessUsageSchema, {
           backendId: process.backendId,
-          sessionId: process.sessionId,
-          runtimeGeneration: BigInt(process.generation),
+          role: process.role === "control-plane"
+            ? contract.RuntimeProcessRole.CONTROL_PLANE
+            : contract.RuntimeProcessRole.TASK_HOST,
+          ...(process.role === "task-host"
+            ? { sessionId: process.sessionId, runtimeGeneration: BigInt(process.generation) }
+            : {}),
           processId: BigInt(process.pid),
           cpuPercent: process.cpuPercent,
           memoryKb: BigInt(process.memoryKb),

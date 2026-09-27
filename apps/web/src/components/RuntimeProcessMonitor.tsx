@@ -400,9 +400,10 @@ export function RuntimeProcessMonitorSurface({ display, runAction, t, openingWin
   const processes = useMemo(() => display.backends.flatMap((backend) => backend.processes), [display.backends]);
   const processName = useCallback((process: RuntimeProcessUsageView): string => {
     const backend = backendById.get(process.backendId)?.backendName ?? process.backendId;
+    if (process.role === "control-plane") return `${backend} ${t("settings.processUsage.controlPlane")}`;
     const session = sessionByKey.get(`${process.backendId}\u0000${process.sessionId}`)?.sessionName ?? process.sessionId;
     return `${backend} ${session}`;
-  }, [backendById, sessionByKey]);
+  }, [backendById, sessionByKey, t]);
   const selected = processes.find((process) => displayProcessKey(process, backendById) === selectedKey);
   const selectedDesktop = display.desktop?.processes.find((process) => desktopProcessKey(process) === selectedKey);
 
@@ -485,11 +486,14 @@ export function RuntimeProcessMonitorSurface({ display, runAction, t, openingWin
                           {backend.state === "empty" || sorted.length === 0
                             ? <div className="runtime-process-state">{t("settings.processUsage.empty")}</div>
                             : sorted.map((process) => {
-                                const sessionName = sessionByKey.get(`${process.backendId}\u0000${process.sessionId}`)?.sessionName ?? process.sessionId;
+                                const scope = process.role === "control-plane"
+                                  ? t("settings.processUsage.controlPlane")
+                                  : `${t("settings.processUsage.taskHost")} · ${sessionByKey.get(`${process.backendId}\u0000${process.sessionId}`)?.sessionName ?? process.sessionId}`;
                                 const details = process.processCount > 1
-                                  ? `${sessionName} · ${t("settings.processUsage.processCount", { count: process.processCount })}`
-                                  : sessionName;
+                                  ? `${scope} · ${t("settings.processUsage.processCount", { count: process.processCount })}`
+                                  : scope;
                                 return <RuntimeProcessRow
+                                  Icon={process.role === "control-plane" ? Cog : Bot}
                                   metric={process}
                                   name={backend.backendName}
                                   details={details}
@@ -682,6 +686,7 @@ function processCanTerminate(
   backendById: ReadonlyMap<string, RuntimeProcessBackendDisplay>,
   sessionByKey: ReadonlyMap<string, RuntimeProcessDiagnosticsSessionSnapshot>
 ): boolean {
+  if (process.role !== "task-host") return false;
   const session = sessionByKey.get(`${process.backendId}\u0000${process.sessionId}`);
   return process.terminable
     && process.processInstanceId !== undefined
@@ -700,7 +705,9 @@ function runtimeProcessCatalogKey(snapshot: AppSnapshot): string {
 }
 
 function processKey(process: RuntimeProcessUsageView): string {
-  return `${process.backendId}:${process.sessionId}:${process.generation}:${process.pid}:${process.processInstanceId ?? "read-only"}`;
+  return process.role === "control-plane"
+    ? `${process.backendId}:control-plane:${process.pid}:read-only`
+    : `${process.backendId}:task-host:${process.sessionId}:${process.generation}:${process.pid}:${process.processInstanceId ?? "read-only"}`;
 }
 
 function displayProcessKey(

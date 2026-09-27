@@ -342,17 +342,33 @@ export interface RuntimeResource {
  * the service node. Command lines, executable paths, environment values, and
  * native Session references are deliberately not representable here.
  */
-export interface RuntimeProcessUsage {
-  readonly sessionId: SessionId;
-  readonly generation: number;
+interface RuntimeProcessUsageBase {
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
   readonly processCount: number;
+}
+
+/** Shared Backend infrastructure with no truthful product Session owner. */
+export interface RuntimeControlPlaneProcessUsage extends RuntimeProcessUsageBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+/** Process root owned by one exact product Session runtime generation. */
+export interface RuntimeTaskHostProcessUsage extends RuntimeProcessUsageBase {
+  readonly role: "task-host";
+  readonly sessionId: SessionId;
+  readonly generation: number;
   readonly terminable: boolean;
   /** Opaque spawn-instance fence. It contains no OS path or command content. */
   readonly processInstanceId?: string;
 }
+
+export type RuntimeProcessUsage = RuntimeControlPlaneProcessUsage | RuntimeTaskHostProcessUsage;
 
 export interface RuntimeProcessUsageSnapshot {
   readonly capturedAt: number;

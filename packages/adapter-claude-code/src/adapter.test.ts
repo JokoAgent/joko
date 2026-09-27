@@ -16,6 +16,7 @@ import {
   type ProviderModel,
   type TargetDescriptor
 } from "@joko/core";
+import type { DurableProcessUsage } from "@joko/runtime-governance";
 import { describe, expect, test, vi } from "vitest";
 import { ClaudeCodeAdapter, claudeWorkspaceAuthority, type ClaudeCodeAdapterOptions } from "./adapter.js";
 import {
@@ -56,6 +57,87 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("binds exact local Query process usage to the real product Session and fences termination", async () => {
+    const sdk = new FakeSdkRuntime({ processInspectionSupported: true });
+    const adapter = adapterFor(sdk);
+    await adapter.createSession(createInput(), contextFor().context);
+    const descriptor = await adapter.describe();
+    expect(descriptor.capabilities.get("runtime.process_usage")?.supported).toBe(true);
+    expect(descriptor.capabilities.get("runtime.process_terminate")?.supported).toBe(true);
+
+    const snapshot = await adapter.getRuntimeProcessUsage();
+    expect(snapshot.processes).toEqual([{
+      role: "task-host",
+      sessionId: "product-session",
+      generation: 1,
+      pid: 701,
+      cpuPercent: 7.5,
+      memoryKb: 8_192,
+      processCount: 2,
+      terminable: true,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    }]);
+    await expect(adapter.terminateRuntimeProcess({
+      sessionId: "product-session",
+      generation: 2,
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    })).rejects.toMatchObject({ publicError: { code: "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH" } });
+    expect(sdk.terminatedQueryProcesses).toEqual([]);
+
+    await adapter.terminateRuntimeProcess({
+      sessionId: "product-session",
+      generation: 1,
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    });
+    expect(sdk.terminatedQueryProcesses).toEqual([{
+      query: sdk.queries[0],
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    }]);
+    expect(sdk.queries[0]!.closeCalls).toBe(1);
+    await expect(adapter.getRuntimeProcessUsage()).resolves.toMatchObject({ processes: [] });
+    await expect(adapter.terminateRuntimeProcess({
+      sessionId: "product-session",
+      generation: 1,
+      pid: 701,
+      processInstanceId: "10000000-0000-4000-8000-000000000701"
+    })).rejects.toMatchObject({ publicError: { code: "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH" } });
+    await adapter.dispose();
+  });
+
+  test("keeps a Session generation fenced when exact Query termination is unconfirmed", async () => {
+    const sdk = new FakeSdkRuntime({ processInspectionSupported: true });
+    sdk.processTerminationFailure = true;
+    const adapter = adapterFor(sdk);
+    await adapter.createSession(createInput(), contextFor().context);
+    const process = (await adapter.getRuntimeProcessUsage()).processes[0]!;
+    if (process.role !== "task-host" || process.processInstanceId === undefined) {
+      throw new Error("Expected a terminable task-host process fixture.");
+    }
+    const fence = {
+      sessionId: process.sessionId,
+      generation: process.generation,
+      pid: process.pid,
+      processInstanceId: process.processInstanceId
+    };
+
+    await expect(adapter.terminateRuntimeProcess(fence)).rejects.toMatchObject({
+      publicError: {
+        code: "CLAUDE_RUNTIME_PROCESS_EXIT_UNCONFIRMED",
+        stateMayHaveChanged: true
+      }
+    });
+    expect(sdk.queries[0]!.closeCalls).toBe(1);
+    await expect(adapter.getRuntimeProcessUsage()).resolves.toMatchObject({ processes: [] });
+    await expect(adapter.terminateRuntimeProcess(fence)).rejects.toMatchObject({
+      publicError: { code: "CLAUDE_RUNTIME_PROCESS_FENCE_MISMATCH" }
+    });
+    expect(sdk.terminatedQueryProcesses).toEqual([]);
+    await adapter.dispose();
+  });
+
   test("isolates precommit MCP and binds a committed local root turn to a frozen product catalog", async () => {
     const sdk = new FakeSdkRuntime();
     let committed = false;
@@ -5748,6 +5830,7 @@ interface FakeRuntimeOptions {
   readonly leaveOutputOpenOnClose?: boolean;
   readonly probeDiagnostic?: string;
   readonly probeInstalled?: boolean;
+  readonly processInspectionSupported?: boolean;
 }
 
 function managedProviderFixture(
@@ -5825,11 +5908,37 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   supportsWorkspaceDerivation = true;
   storedSessions: ClaudeSdkStoredSessionRuntime | undefined;
   readonly queries: FakeQuery[] = [];
+  get processInspectionSupported(): boolean { return this.options.processInspectionSupported === true; }
+  readonly queryProcessUsage = new Map<ClaudeSdkQuery, readonly DurableProcessUsage[]>();
+  readonly terminatedQueryProcesses: Array<{
+    readonly query: ClaudeSdkQuery;
+    readonly pid: number;
+    readonly processInstanceId: string;
+  }> = [];
+  processTerminationFailure = false;
   retirementFailure = false;
   readonly retiredQueries: ClaudeSdkQuery[] = [];
   async retireQuery(query: ClaudeSdkQuery): Promise<void> {
     this.retiredQueries.push(query);
     if (this.retirementFailure) throw new Error("The controlled Query has not confirmed exit.");
+  }
+  inspectQueryProcesses(query: ClaudeSdkQuery): Promise<readonly DurableProcessUsage[]> {
+    return Promise.resolve(this.queryProcessUsage.get(query) ?? []);
+  }
+  terminateQueryProcess(
+    query: ClaudeSdkQuery,
+    input: { readonly pid: number; readonly processInstanceId: string }
+  ): Promise<void> {
+    if (this.processTerminationFailure) {
+      return Promise.reject(new Error("The fake Query process exit is unconfirmed."));
+    }
+    const usage = this.queryProcessUsage.get(query);
+    if (usage?.some((process) => process.pid === input.pid && process.ownerToken === input.processInstanceId) !== true) {
+      return Promise.reject(new Error("The fake Query process fence is stale."));
+    }
+    this.terminatedQueryProcesses.push({ query, ...input });
+    this.queryProcessUsage.delete(query);
+    return Promise.resolve();
   }
   readonly sessions = new Map<string, ClaudeSdkSessionInfo>();
   readonly messages = new Map<string, readonly ClaudeSdkSessionMessage[]>();
@@ -5881,6 +5990,16 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
     const query = new FakeQuery(params, this.queryInitialization, this.options.leaveOutputOpenOnClose ?? false,
       this.options.pauseAfterFirstInput ?? false);
     this.queries.push(query);
+    if (this.processInspectionSupported) {
+      const ordinal = this.queries.length;
+      this.queryProcessUsage.set(query, [{
+        ownerToken: `10000000-0000-4000-8000-${String(700 + ordinal).padStart(12, "0")}`,
+        pid: 700 + ordinal,
+        cpuPercent: 7.5,
+        memoryKb: 8_192,
+        processCount: 2
+      }]);
+    }
     if (params.options.sessionId !== undefined) this.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
     if (params.options.sessionStoreAccess !== undefined) {
       queueMicrotask(() => query.push({

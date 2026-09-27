@@ -114,6 +114,10 @@ function parseRequest(value: unknown): DesktopRuntimeProcessMonitorRequest {
   }
   if (record(action, ["kind", "backendGeneration", "process"]) && action["kind"] === "terminate" &&
     safeGeneration(action["backendGeneration"])) {
+    const process = parseProcess(action["process"]);
+    if (process.role !== "task-host" || !process.terminable || process.processInstanceId === undefined) {
+      throw new TypeError("Runtime diagnostics termination fence is invalid.");
+    }
     return Object.freeze({
       version: 1,
       requestId: value["requestId"],
@@ -121,7 +125,7 @@ function parseRequest(value: unknown): DesktopRuntimeProcessMonitorRequest {
       action: Object.freeze({
         kind: "terminate",
         backendGeneration: action["backendGeneration"],
-        process: parseProcess(action["process"])
+        process
       })
     });
   }
@@ -160,7 +164,7 @@ function parseResponse(value: unknown): DesktopRuntimeProcessMonitorResponse {
   const sessionKeys = new Set(sessions.map((session) => `${session.backendId}\u0000${session.sessionId}`));
   if (sessionKeys.size !== sessions.length || backends.some((backend) => backend.state === "ready" &&
     backend.processes.some((process) => process.backendId !== backend.backendId ||
-      !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`)))) {
+      (process.role === "task-host" && !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`))))) {
     throw new TypeError("Runtime diagnostics process ownership is invalid.");
   }
   return Object.freeze({
@@ -210,20 +214,31 @@ function parseSession(value: unknown): DesktopRuntimeProcessMonitorSession {
 }
 
 function parseProcess(value: unknown): DesktopRuntimeProcessMonitorProcess {
-  const keys = ["backendId", "sessionId", "generation", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
-  const hasInstance = record(value, [...keys, "processInstanceId"]);
-  if ((!hasInstance && !record(value, keys)) || !identity(value["backendId"]) || !identity(value["sessionId"]) ||
-    !positiveInteger(value["generation"]) || !positiveInteger(value["pid"]) || typeof value["cpuPercent"] !== "number" ||
+  const base = ["backendId", "role", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
+  if (!record(value, base) || value["role"] !== "control-plane" || value["terminable"] !== false ||
+    !identity(value["backendId"]) || !positiveInteger(value["pid"]) || typeof value["cpuPercent"] !== "number" ||
     !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 || !Number.isSafeInteger(value["memoryKb"]) ||
-    (value["memoryKb"] as number) < 0 || !positiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
-    value["terminable"] !== hasInstance ||
-    (hasInstance && !uuid(value["processInstanceId"]))) {
-    throw new TypeError("Runtime diagnostics process is invalid.");
+    (value["memoryKb"] as number) < 0 || !positiveInteger(value["processCount"])) {
+    const task = [...base, "sessionId", "generation"];
+    const hasInstance = record(value, [...task, "processInstanceId"]);
+    if ((!hasInstance && !record(value, task)) || value["role"] !== "task-host" || !identity(value["backendId"]) ||
+      !identity(value["sessionId"]) || !positiveInteger(value["generation"]) || !positiveInteger(value["pid"]) ||
+      typeof value["cpuPercent"] !== "number" || !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
+      !Number.isSafeInteger(value["memoryKb"]) || (value["memoryKb"] as number) < 0 ||
+      !positiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
+      value["terminable"] !== hasInstance || (hasInstance && !uuid(value["processInstanceId"]))) {
+      throw new TypeError("Runtime diagnostics process is invalid.");
+    }
+    return Object.freeze({
+      backendId: value["backendId"], role: "task-host", sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+      cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
+      terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+    });
   }
   return Object.freeze({
-    backendId: value["backendId"], sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+    backendId: value["backendId"], role: "control-plane", pid: value["pid"],
     cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
-    terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+    terminable: false
   });
 }
 

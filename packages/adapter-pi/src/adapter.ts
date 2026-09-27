@@ -152,8 +152,8 @@ import {
 import { PiRpcTransport, spawnPiProcess, type PiProcessFactory, type PiProcessSpec } from "./transport.js";
 import { PiEventTranslator } from "./translator.js";
 import {
-  createDefaultPiManagedProcessSupervisor,
-  type PiManagedProcessSupervisor
+  createDefaultManagedProcessSupervisor,
+  type ManagedProcessSupervisor
 } from "./runtime-process.js";
 
 const execFileAsync = promisify(execFile);
@@ -336,7 +336,7 @@ export interface PiAdapterOptions {
   /** Host-owned validation for capability-neutral Remote workspaces. */
   readonly validateRemoteWorkspace?: (target: TargetDescriptor, signal?: AbortSignal) => Promise<void>;
   /** OS process birth-identity supervisor. Custom process factories opt in explicitly. */
-  readonly processSupervisor?: PiManagedProcessSupervisor;
+  readonly processSupervisor?: ManagedProcessSupervisor;
   /** Service-node global command gate shared by every local Session runtime. */
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
   /** Hot read for local spawn and command admission policy. */
@@ -674,7 +674,7 @@ export class PiBackendAdapter implements
   readonly #processFactory: PiProcessFactory;
   readonly #usesDefaultProcessFactory: boolean;
   readonly #usesBundledCommand: boolean;
-  readonly #processSupervisor: PiManagedProcessSupervisor | undefined;
+  readonly #processSupervisor: ManagedProcessSupervisor | undefined;
   readonly #sessionStore: PiSessionStore;
   readonly #externalSessionRoots: readonly string[];
   readonly #externalSessionReferences = new Map<string, PiExternalSessionSource>();
@@ -732,7 +732,7 @@ export class PiBackendAdapter implements
     this.#usesDefaultProcessFactory = options.processFactory === undefined;
     this.#usesBundledCommand = options.command === undefined;
     this.#processSupervisor = options.processSupervisor ?? (options.processFactory === undefined
-      ? createDefaultPiManagedProcessSupervisor()
+      ? createDefaultManagedProcessSupervisor()
       : undefined);
     this.#sessionStore = new PiSessionStore(sessionRoot);
     if (options.mcpBridge && !options.mcpBridge.token) {
@@ -3338,6 +3338,7 @@ export class PiBackendAdapter implements
           || runtime.transport.closed
         ) return [];
         return [{
+          role: "task-host" as const,
           sessionId: runtime.key,
           generation: runtime.transport.generation,
           pid,

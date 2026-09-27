@@ -39,6 +39,7 @@ import {
   type PermissionMode,
   type PromptInput,
   type ProviderModel,
+  type RuntimeProcessUsageSnapshot,
   type TargetDescriptor
 } from "@joko/core";
 import { AppServerHost, type AppServerHostOptions, type HostSubscription } from "./host.js";
@@ -614,6 +615,33 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       authenticationState,
       diagnostics
     });
+  }
+
+  async getRuntimeProcessUsage(): Promise<RuntimeProcessUsageSnapshot> {
+    this.#assertOpen();
+    const host = this.#host;
+    if (!host.processInspectionSupported) {
+      throw adapterError({
+        code: "CODEX_RUNTIME_PROCESS_USAGE_UNAVAILABLE",
+        message: "The local Codex control-plane process cannot be inspected.",
+        phase: "probe",
+        retryable: true,
+        recovery: "Use a service node with exact local process inspection support."
+      });
+    }
+    const usage = await host.inspectProcessUsage();
+    if (host !== this.#host) return { capturedAt: this.#now(), processes: [] };
+    return {
+      capturedAt: this.#now(),
+      processes: usage.map((process) => ({
+        role: "control-plane" as const,
+        pid: process.pid,
+        cpuPercent: process.cpuPercent,
+        memoryKb: process.memoryKb,
+        processCount: process.processCount,
+        terminable: false as const
+      }))
+    };
   }
 
   /**
@@ -4556,6 +4584,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#account?.supportsLogin === true) supported.add("provider.login");
     if (this.#account?.supportsLogout === true) supported.add("provider.logout");
     if (this.#resolvers.readBlob !== undefined) supported.add("input.image");
+    if (this.#host.processInspectionSupported) supported.add("runtime.process_usage");
     const isolatedReviewSupported = supportsIsolatedReview(this.#host.initializeResult?.userAgent);
     if (isolatedReviewSupported) supported.add("review.isolated");
     const nativeCollaborationSupported = supportsNativeCollaboration(this.#host.initializeResult?.userAgent);
@@ -4584,6 +4613,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : key === "memory.native" && this.#resolveNativeMemoryEnabled !== undefined
               && !supportsNativeMemoryRuntime(this.#host)
             ? { reason: "upstream_missing" as const }
+          : key === "runtime.process_usage" && !this.#host.processInspectionSupported
+            ? { reason: "platform_limited" as const }
           : (key === "plan_mode"
               || key === "interaction.plan_review"
               || key === "background.tasks"

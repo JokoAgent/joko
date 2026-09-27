@@ -310,17 +310,33 @@ interface DesktopRuntimeProcessMonitorOwner {
   readonly snapshotGeneration: string;
 }
 
-interface DesktopRuntimeProcessMonitorProcess {
+interface DesktopRuntimeProcessMonitorProcessBase {
   readonly backendId: string;
-  readonly sessionId: string;
-  readonly generation: number;
   readonly pid: number;
   readonly cpuPercent: number;
   readonly memoryKb: number;
   readonly processCount: number;
+}
+
+interface DesktopRuntimeProcessMonitorControlPlaneProcess extends DesktopRuntimeProcessMonitorProcessBase {
+  readonly role: "control-plane";
+  readonly terminable: false;
+  readonly sessionId?: never;
+  readonly generation?: never;
+  readonly processInstanceId?: never;
+}
+
+interface DesktopRuntimeProcessMonitorTaskHostProcess extends DesktopRuntimeProcessMonitorProcessBase {
+  readonly role: "task-host";
+  readonly sessionId: string;
+  readonly generation: number;
   readonly terminable: boolean;
   readonly processInstanceId?: string;
 }
+
+type DesktopRuntimeProcessMonitorProcess =
+  | DesktopRuntimeProcessMonitorControlPlaneProcess
+  | DesktopRuntimeProcessMonitorTaskHostProcess;
 
 type DesktopRuntimeProcessRole = "main" | "renderer" | "gpu" | "utility";
 
