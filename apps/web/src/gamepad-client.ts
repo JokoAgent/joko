@@ -176,12 +176,13 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
       return;
     }
     if (doc.body.classList.contains("modal-open")) return;
-    if ((effect.action === "open-skills" || effect.action === "open-schedules" || effect.action === "open-folder" || effect.action === "navigate-back"
+    if ((effect.action === "open-skills" || effect.action === "open-schedules" || effect.action === "open-folder" || effect.action === "feedback" || effect.action === "navigate-back"
       || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen" || isGamepadInspectorAction(effect.action)) && (doc.body.dataset.appShortcutRecording === "1"
       || doc.querySelector("[role='listbox']") !== null
       || focused !== null && (focused.matches("iframe, webview, object, embed")
         || focused.closest("[data-gamepad-preview], [data-message-rewind-preview], [role='dialog'], [role='menu'], [role='listbox']") !== null))) return;
-    if ((effect.action === "navigate-back" || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen" || effect.action === "open-folder")
+    if (effect.action === "feedback" && (doc.defaultView === null || doc.defaultView.top !== doc.defaultView)) return;
+    if ((effect.action === "navigate-back" || effect.action === "navigate-forward" || effect.action === "toggle-fullscreen" || effect.action === "open-folder" || effect.action === "feedback")
       && (doc.visibilityState !== "visible" || !doc.hasFocus() || doc.querySelector("[data-gamepad-preview]") !== null)) return;
     if (effect.action === "focus-composer") {
       currentGamepadTaskRoot(doc)?.querySelector<HTMLElement>("[data-composer-editor='true']")?.focus(); return;

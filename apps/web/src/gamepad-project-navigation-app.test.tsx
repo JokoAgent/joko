@@ -129,15 +129,32 @@ it("drops a pending folder action when navigation changes before the Files leave
   expect(projectPicker()).toBeNull();
 });
 
-function controller(route: AppRoute): {
+it("opens the fixed product feedback destination without a task or connection and reports failures", async () => {
+  const view = controller({ kind: "settings" }, "disconnected");
+  const host = document.createElement("div"); document.body.append(host);
+  root = createRoot(host);
+  await act(async () => root?.render(createElement(AppWithController, { controller: view.value })));
+  await act(async () => { gamepad.action?.("feedback"); await Promise.resolve(); });
+  expect(view.openHttpLink).toHaveBeenCalledExactlyOnceWith("https://github.com/JokoAgent/joko/issues/new", { forceExternal: true });
+  expect(view.navigate).not.toHaveBeenCalled();
+
+  view.openHttpLink.mockRejectedValueOnce(new Error("Default browser unavailable."));
+  await act(async () => { gamepad.action?.("feedback"); await Promise.resolve(); await Promise.resolve(); });
+  await vi.waitFor(() => expect(document.querySelector("[role='alert']")?.textContent).toContain("Default browser unavailable."));
+  expect(view.openHttpLink).toHaveBeenCalledTimes(2);
+  expect(document.querySelector("[role='alert'] button")?.getAttribute("aria-label")).toBe("Dismiss");
+});
+
+function controller(route: AppRoute, connectionState: ControllerState["connectionState"] = "connected"): {
   readonly value: AppController;
   readonly navigate: ReturnType<typeof vi.fn>;
+  readonly openHttpLink: ReturnType<typeof vi.fn>;
   readonly replaceRoute: (route: AppRoute) => void;
 } {
   const profile = { id: "profile", deviceId: "device", serverId: "server", name: "Local", origin: "http://127.0.0.1" };
   let state = {
     ready: true,
-    connectionState: "connected",
+    connectionState,
     profiles: [profile],
     machineCaches: [],
     machinePresenceByProfile: {},
@@ -155,9 +172,11 @@ function controller(route: AppRoute): {
   const navigate = vi.fn((next: AppRoute) => {
     state = { ...state, route: next, navigationRevision: (state.navigationRevision ?? 0) + 1 };
   });
+  const openHttpLink = vi.fn(async () => undefined);
   const value = {
     get state() { return state; },
     navigate,
+    openHttpLink,
     refreshDiscoveredNodes: vi.fn(async () => undefined),
     disconnect: vi.fn(async () => undefined),
     retryManagedOrchestrator: vi.fn(async () => undefined),
@@ -177,6 +196,7 @@ function controller(route: AppRoute): {
   return {
     value,
     navigate,
+    openHttpLink,
     replaceRoute: (next) => { state = { ...state, route: next, navigationRevision: (state.navigationRevision ?? 0) + 1 }; }
   };
 }

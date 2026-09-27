@@ -52,11 +52,12 @@ describe("gamepad preference authority", () => {
   it("accepts the complete current shape and rejects malformed settings without repairing persisted content", () => {
     const current = preferences();
     expect(parseGamepadPreferences(current)).toEqual(current);
-    const splitAttachments = {
+    const currentActions = {
       ...current,
-      buttons: current.buttons.map((action, index) => index === 0 ? "add-photos" : index === 1 ? "add-files" : index === 2 ? "open-folder" : action)
+      buttons: current.buttons.map((action, index) => index === 0 ? "add-photos" : index === 1 ? "add-files" : index === 2 ? "open-folder" : index === 3 ? "feedback" : action),
+      rightStick: { ...current.rightStick, directions: { ...current.rightStick.directions, right: "feedback" } }
     };
-    expect(parseGamepadPreferences(splitAttachments)).toEqual(splitAttachments);
+    expect(parseGamepadPreferences(currentActions)).toEqual(currentActions);
     const invalid = [
       { ...current, version: 2 }, { ...current, enabled: 1 }, { ...current, extra: true },
       { ...current, buttons: current.buttons.slice(1) }, { ...current, buttons: [...current.buttons, "none"] },
@@ -119,6 +120,19 @@ describe("gamepad preference authority", () => {
 });
 
 describe("gamepad input ownership", () => {
+  it("keeps feedback opt-in and emits a saved binding only on physical edges", () => {
+    const defaults = createDefaultGamepadPreferences();
+    expect(defaults.buttons).not.toContain("feedback");
+    expect(Object.values(defaults.leftStick.directions)).not.toContain("feedback");
+    expect(Object.values(defaults.rightStick.directions)).not.toContain("feedback");
+    const layout = { ...defaults, enabled: true, buttons: defaults.buttons.map((binding, index) => index === 0 ? "feedback" as const : binding) };
+    const { sample } = sampler();
+    expect(sample([pad({ down: [0] })], { preferences: layout }).effects).toEqual([]);
+    sample([pad()], { preferences: layout });
+    expect(sample([pad({ down: [0] })], { preferences: layout }).effects).toEqual([{ kind: "action", action: "feedback", phase: "press" }]);
+    expect(sample([pad({ down: [0] })], { preferences: layout }).effects).toEqual([]);
+    expect(sample([pad()], { preferences: layout }).effects).toEqual([{ kind: "action", action: "feedback", phase: "release" }]);
+  });
   it("maps the standard View button to fullscreen after a neutral sample", () => {
     expect(createDefaultGamepadPreferences().buttons[8]).toBe("toggle-fullscreen");
     const { sample } = sampler();

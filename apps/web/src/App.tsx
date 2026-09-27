@@ -118,6 +118,7 @@ const SettingsPage = lazy(async () => ({ default: (await import("./components/Se
 const StandaloneAboutPage = lazy(async () => ({ default: (await import("./components/SettingsPage.js")).StandaloneAboutPage }));
 const ToolsPage = lazy(async () => ({ default: (await import("./components/ToolsPage.js")).ToolsPage }));
 const EMPTY_TIMELINE: readonly TimelineItemView[] = [];
+const JOKO_PRODUCT_FEEDBACK_URL = "https://github.com/JokoAgent/joko/issues/new";
 
 interface ActiveTimelineHistory {
   readonly sessionId: string;
@@ -1146,6 +1147,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       runAction("gamepad-fullscreen", () => toggleGamepadFullscreen(document, window.jokoDesktop, t("settings.gamepad.fullscreenUnavailable")));
       return;
     }
+    if (action === "feedback") {
+      runAction("gamepad-feedback", () => controller.openHttpLink(JOKO_PRODUCT_FEEDBACK_URL, { forceExternal: true }));
+      return;
+    }
     if (action === "toggle-sidebar") { setWindowNavigationOpen(!effectiveNavigationOpen); return; }
     if (action === "toggle-inspector") {
       if (state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined) runAction("gamepad-inspector", () => controller.setInspectorOpen(!inspectorOpen));
@@ -1216,6 +1221,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       </div>
     </div>
   );
+  const actionErrorFeedback = actionError === undefined ? null : (
+    <ErrorBanner message={actionError} dismissLabel={t("common.dismiss")} onClose={() => setActionError(undefined)} />
+  );
   const aboutRequested = typeof window !== "undefined" && /^#\/settings\/about(?:[/?#]|$)/u.test(window.location.hash);
   const standaloneAboutRequested = aboutRequested && (
     !state.ready
@@ -1227,6 +1235,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
 
   if (standaloneAboutRequested) return <>
     {applicationMenuFeedback}
+    {actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}
     <AppErrorBoundary
       scope="route"
       resetKey={routeErrorBoundaryKey("settings")}
@@ -1236,10 +1245,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <Suspense fallback={<RouteLoading label={t("common.loading")} />}><StandaloneAboutPage snapshot={state.snapshot} t={t} /></Suspense>
     </AppErrorBoundary>
   </>;
-  if (!state.ready) return <>{applicationMenuFeedback}<LoadingScreen label={t("common.loading")} body={t("app.openingState")} /></>;
-  if (state.activeProfile === undefined || state.connectionState === "disconnected") return <>{applicationMenuFeedback}<ConnectionScreen controller={controller} t={t} /></>;
-  if (state.connectionState === "connecting" && state.snapshot.revision === 0n) return <>{applicationMenuFeedback}<ConnectingScreen controller={controller} t={t} /></>;
-  if (state.snapshot.revision === 0n && state.connectionState !== "connected") return <>{applicationMenuFeedback}<UnavailableScreen controller={controller} t={t} error={state.error} /></>;
+  if (!state.ready) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<LoadingScreen label={t("common.loading")} body={t("app.openingState")} /></>;
+  if (state.activeProfile === undefined || state.connectionState === "disconnected") return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<ConnectionScreen controller={controller} t={t} /></>;
+  if (state.connectionState === "connecting" && state.snapshot.revision === 0n) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<ConnectingScreen controller={controller} t={t} /></>;
+  if (state.snapshot.revision === 0n && state.connectionState !== "connected") return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<UnavailableScreen controller={controller} t={t} error={state.error} /></>;
 
   const preferredNavigation = auxiliaryApplicationWindow ? sessionWindowNavigation : {
     mode: state.preferences.navigationMode,
@@ -1347,7 +1356,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       {state.connectionState === "offline" && <div className="offline-banner" role="status"><AlertTriangle aria-hidden="true" /><span>{t("error.offline")}</span><Button tone="ghost" onClick={() => runAction("refresh", controller.refresh)}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button></div>}
       {state.snapshot.server.health === "degraded" && <div className="degraded-banner" role="status"><ServerCrash aria-hidden="true" /><span>{t("app.degraded")}</span></div>}
       {state.error !== undefined && <ErrorBanner message={state.error} retryLabel={t("common.retry")} onRetry={() => runAction("refresh", controller.refresh)} />}
-      {actionError !== undefined && <ErrorBanner message={actionError} dismissLabel={t("common.dismiss")} onClose={() => setActionError(undefined)} />}
+      {actionErrorFeedback}
       {backgroundInteraction !== undefined && <div className="pending-interaction-banner" role="status"><Bell aria-hidden="true" /><span>{t("interaction.pendingElsewhere")}</span><Button tone="ghost" onClick={() => controller.navigate({ kind: "session", sessionId: backgroundInteraction.sessionId })}>{t("interaction.openTask")}</Button></div>}
       {busyAction !== undefined && <div className="action-progress" role="status"><Spinner label={t("common.working")} /><span>{t("app.applyingChange")}</span></div>}
     </div>
