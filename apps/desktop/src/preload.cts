@@ -124,6 +124,8 @@ const DESKTOP_CHANNELS = {
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
   selectionContextMenuSetLocale: "joko:selection-context-menu:set-locale",
   inspectorWindowReady: "joko:inspector-window:ready",
+  inspectorWindowIdentity: "joko:inspector-window:identity",
+  inspectorWindowActivate: "joko:inspector-window:activate",
   inspectorWindowMinimize: "joko:inspector-window:minimize",
   inspectorWindowToggleMaximize: "joko:inspector-window:toggle-maximize",
   inspectorWindowClose: "joko:inspector-window:close",
@@ -444,9 +446,17 @@ const desktopApi = Object.freeze({
     }
   }),
   inspectorWindow: Object.freeze({
-    onClosed: (listener: () => void): (() => void) => {
+    activate: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.inspectorWindowActivate),
+    onClosed: (listener: (event: { readonly occurrence: string; readonly reason: "user" | "child-failure" }) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("Inspector window listener must be a function.");
-      const wrapped = (): void => listener();
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        if (typeof value !== "object" || value === null) return;
+        const occurrence = Reflect.get(value, "occurrence");
+        const reason = Reflect.get(value, "reason");
+        if (typeof occurrence !== "string" || occurrence.length === 0 || occurrence.length > 128 ||
+          (reason !== "user" && reason !== "child-failure")) return;
+        listener({ occurrence, reason });
+      };
       ipcRenderer.on(DESKTOP_CHANNELS.inspectorWindowClosed, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.inspectorWindowClosed, wrapped);
     }

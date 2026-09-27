@@ -11,7 +11,13 @@ export interface DetachedInspectorHost {
 export function inspectorDetachAvailable(desktop: JokoDesktopApi | undefined): boolean {
   return Array.isArray(desktop?.capabilities) &&
     desktop.capabilities.includes(INSPECTOR_DETACH_CAPABILITY) &&
+    typeof desktop.inspectorWindow?.activate === "function" &&
     typeof desktop.inspectorWindow?.onClosed === "function";
+}
+
+export async function activateDetachedInspectorWindow(desktop: JokoDesktopApi | undefined): Promise<boolean> {
+  if (desktop === undefined || !inspectorDetachAvailable(desktop)) return false;
+  return desktop.inspectorWindow.activate();
 }
 
 export function openDetachedInspectorWindow(
@@ -32,6 +38,7 @@ export function initializeDetachedInspectorHost(
   if (
     control === undefined ||
     typeof control.platform !== "string" ||
+    typeof control.window?.identity !== "function" ||
     typeof control.window?.ready !== "function" ||
     typeof control.window.minimize !== "function" ||
     typeof control.window.toggleMaximize !== "function" ||

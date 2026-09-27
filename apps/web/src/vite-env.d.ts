@@ -507,7 +507,8 @@ interface JokoDesktopApi {
     onCommand(listener: (command: "open-about" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
   };
   readonly inspectorWindow: {
-    onClosed(listener: () => void): () => void;
+    activate(): Promise<boolean>;
+    onClosed(listener: (event: { readonly occurrence: string; readonly reason: "user" | "child-failure" }) => void): () => void;
   };
   readonly selectionContextMenu: {
     setLocale(locale: "en" | "zh-CN" | "en-XA"): Promise<void>;
@@ -626,10 +627,11 @@ interface JokoDesktopApi {
 interface JokoInspectorDesktopApi {
   readonly platform: string;
   readonly window: {
+    identity(): Promise<string>;
     ready(): Promise<void>;
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;
-    close(): Promise<void>;
+    close(kind: "user" | "passive"): Promise<void>;
   };
   readonly selectionContextMenu: {
     onAddToChat(listener: () => void): () => void;

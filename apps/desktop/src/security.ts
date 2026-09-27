@@ -193,6 +193,9 @@ export function isAllowedExtensionWindowNavigation(
 function isAllowedPackagedAppResourceHash(url: URL): boolean {
   if (url.hash === "") return true;
   if (url.pathname !== "/index.html") return false;
+  // The primary window owns renderer routing in its fragment. Auxiliary
+  // entries carry an identity query and remain bound to one exact route below.
+  if (url.search === "") return true;
   const sessionId = sessionWindowIdentity(url.searchParams);
   if (sessionId !== undefined) return url.hash === `#/tasks/${encodeURIComponent(sessionId)}`;
   const extensionId = extensionWindowIdentity(url.searchParams);

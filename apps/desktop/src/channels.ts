@@ -43,6 +43,8 @@ export const DESKTOP_CHANNELS = {
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat",
   selectionContextMenuSetLocale: "joko:selection-context-menu:set-locale",
   inspectorWindowReady: "joko:inspector-window:ready",
+  inspectorWindowIdentity: "joko:inspector-window:identity",
+  inspectorWindowActivate: "joko:inspector-window:activate",
   inspectorWindowMinimize: "joko:inspector-window:minimize",
   inspectorWindowToggleMaximize: "joko:inspector-window:toggle-maximize",
   inspectorWindowClose: "joko:inspector-window:close",

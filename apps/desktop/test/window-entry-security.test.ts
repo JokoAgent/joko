@@ -104,6 +104,7 @@ describe("trusted auxiliary window entries", () => {
     expect(isAllowedRuntimeProcessMonitorNavigation(`${entry}#/settings/about`, policy)).toBe(false);
     expect(isAllowedPrimaryWindowNavigation(entry, policy)).toBe(false);
     expect(isAllowedPrimaryWindowNavigation("joko://app/index.html#/settings/about", policy)).toBe(true);
+    expect(isAllowedPackagedBundleResource("joko://app/index.html#/settings/about", policy)).toBe(true);
     expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
     expect(isAllowedPackagedBundleResource(`${entry}#/runtime-process-monitor`, policy)).toBe(false);
     expect(runtimeProcessMonitorEntryUrl("http://127.0.0.1:4319/app?discard=private#/settings/about"))

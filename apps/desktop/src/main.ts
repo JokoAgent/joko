@@ -65,6 +65,7 @@ import {
   type DesktopUpdateChannelSettings,
   type DesktopUpdateStatus,
   INSPECTOR_WINDOW_FEATURES,
+  INSPECTOR_WINDOW_FRAME_NAME,
   INSPECTOR_WINDOW_URL,
   isDesktopExtensionId,
   isDesktopProjectDirectoryRequest,
@@ -87,6 +88,7 @@ import {
   RuntimeProcessMonitorBroker,
   sameDesktopRuntimeProcessMonitorOwner
 } from "./runtime-process-monitor.js";
+import { InspectorWindowLifecycle } from "./inspector-window-lifecycle.js";
 import { DesktopRuntimeProcessSampler } from "./desktop-runtime-processes.js";
 import { projectDirectoryAuthorityMatches } from "./project-directory-authority.js";
 import {
@@ -381,6 +383,10 @@ import {
 const sourceDirectory = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const developmentUrl = process.env["JOKO_WEB_DEV_URL"];
 const packagedSmoke = process.env["JOKO_DESKTOP_PACKAGED_SMOKE"] === "1";
+const packagedSmokeScope = process.env["JOKO_DESKTOP_SMOKE_SCOPE"] ?? "full";
+if (packagedSmoke && packagedSmokeScope !== "full" && packagedSmokeScope !== "inspector") {
+  throw new Error(`Unsupported packaged smoke scope: ${packagedSmokeScope}`);
+}
 const githubActionsPackagedSmoke = packagedSmoke && process.env["GITHUB_ACTIONS"] === "true";
 const packagedSmokeConnectOrigin = process.env["JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN"];
 const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN"];
@@ -405,7 +411,8 @@ const desktopDeepLinkDelivery = new DesktopDeepLinkDeliveryBuffer();
 const desktopInboundOpenIntentFence = new DesktopInboundOpenIntentFence();
 let inspectorWindow: BrowserWindow | undefined;
 let inspectorWindowOwner: WebContents | undefined;
-let inspectorWindowReady = false;
+let inspectorWindowLifecycle: InspectorWindowLifecycle<BrowserWindow, BrowserWindow> | undefined;
+let inspectorWindowOccurrence: string | undefined;
 let runtimeProcessMonitorWindow: BrowserWindow | undefined;
 let runtimeProcessMonitorOwnerWindow: BrowserWindow | undefined;
 let releaseRuntimeProcessMonitorOwnerLifecycle: (() => void) | undefined;
@@ -938,6 +945,9 @@ function createWindow(): void {
   };
   installDesktopNativeTaskStatusVisibilityLifecycle(window);
   mainWindowState.manage(window);
+  window.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) inspectorWindowLifecycle?.ownerRetired(window);
+  });
   window.webContents.on("did-start-loading", () => {
     desktopDeepLinkDelivery.resetRenderer();
     unregisterGlobalVoiceShortcut();
@@ -949,6 +959,7 @@ function createWindow(): void {
     releaseDesktopAttentionSource(attentionSourceId);
   });
   window.webContents.on("render-process-gone", (_event, details) => {
+    inspectorWindowLifecycle?.ownerRetired(window);
     unregisterGlobalVoiceShortcut();
     stopGlobalVoiceShortcutCapture(window.webContents);
     resetGlobalVoicePresentation();
@@ -999,9 +1010,6 @@ function createWindow(): void {
     if (isInspectorWindowOpenRequest(url, frameName) &&
       features === INSPECTOR_WINDOW_FEATURES && postBody === undefined) {
       if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) {
-        if (inspectorWindow.isMinimized()) inspectorWindow.restore();
-        inspectorWindow.show();
-        inspectorWindow.focus();
         return { action: "deny" };
       }
       const inspectorFrameOptions = process.platform === "darwin"
@@ -1051,7 +1059,7 @@ function createWindow(): void {
       return;
     }
     inspectorWindowState.manage(childWindow);
-    installInspectorWindowSecurity(childWindow, window.webContents);
+    installInspectorWindowSecurity(childWindow, window);
   });
   window.webContents.on("will-navigate", (event, url) => {
     if (!isAllowedPrimaryWindowNavigation(url, navigationPolicy)) {
@@ -1136,14 +1144,10 @@ function createWindow(): void {
       () => mainWindow === window && !window.isDestroyed() && canApplyMainWindowClose());
     else void closeController.request();
   });
-  window.on("hide", () => {
-    if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) inspectorWindow.hide();
-  });
-  window.on("show", () => {
-    if (inspectorWindowReady && inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) {
-      inspectorWindow.showInactive();
-    }
-  });
+  window.on("hide", () => inspectorWindowLifecycle?.ownerHidden(window));
+  window.on("minimize", () => inspectorWindowLifecycle?.ownerHidden(window));
+  window.on("show", () => inspectorWindowLifecycle?.ownerShown(window));
+  window.on("restore", () => inspectorWindowLifecycle?.ownerShown(window));
   if (packagedSmoke) {
     const timeout = setTimeout(() => {
       process.stderr.write("JOKO_DESKTOP_SMOKE_TIMEOUT\n");
@@ -1155,6 +1159,7 @@ function createWindow(): void {
         [
           "(async () => {",
           "  const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));",
+          `  const runFullJourney = ${JSON.stringify(packagedSmokeScope === "full")};`,
           "  let genericConnectionScreenSeen = Boolean(document.querySelector('.connection-screen'));",
           "  const observer = new MutationObserver(() => {",
           "    if (document.querySelector('.connection-screen')) genericConnectionScreenSeen = true;",
@@ -1234,14 +1239,16 @@ function createWindow(): void {
           "    if (!document.querySelector('.app') || document.querySelector('.connection-screen')) {",
           "      throw new Error('The local connection action did not reach the product UI.');",
           "    }",
-          "    window.location.hash = '#/settings/about';",
-          "    const monitorActionDeadline = Date.now() + 5_000;",
-          "    while (!document.querySelector('[data-runtime-process-monitor-open]') && Date.now() < monitorActionDeadline) await sleep(100);",
-          "    const monitorOpen = document.querySelector('[data-runtime-process-monitor-open]');",
-          "    if (!(monitorOpen instanceof HTMLButtonElement) || monitorOpen.disabled) {",
-          "      throw new Error('The standalone runtime resource monitor action is unavailable.');",
+          "    if (runFullJourney) {",
+          "      window.location.hash = '#/settings/about';",
+          "      const monitorActionDeadline = Date.now() + 5_000;",
+          "      while (!document.querySelector('[data-runtime-process-monitor-open]') && Date.now() < monitorActionDeadline) await sleep(100);",
+          "      const monitorOpen = document.querySelector('[data-runtime-process-monitor-open]');",
+          "      if (!(monitorOpen instanceof HTMLButtonElement) || monitorOpen.disabled) {",
+          "        throw new Error('The standalone runtime resource monitor action is unavailable.');",
+          "      }",
+          "      monitorOpen.click();",
           "    }",
-          "    monitorOpen.click();",
           "    const response = await fetch(`${connectOrigin}/joko.v1.ConnectionService/GetServerInfo`, {",
           "      method: 'POST',",
           "      mode: 'cors',",
@@ -1280,9 +1287,14 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
-        await verifyPackagedSmokeRuntimeProcessMonitor(window);
-        if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
-        await verifyPackagedSmokeSessionWindow(window);
+        if (packagedSmokeScope === "full") {
+          await verifyPackagedSmokeRuntimeProcessMonitor(window);
+          if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
+          await verifyPackagedSmokeSessionWindow(window);
+        } else {
+          recordPackagedSmokeProgress("inspector_scope_selected");
+        }
+        await verifyPackagedSmokeInspectorWindow(window);
       }).then(() => {
         clearTimeout(timeout);
         process.stdout.write("JOKO_DESKTOP_SMOKE_OK\n");
@@ -1315,6 +1327,321 @@ function safeSmokeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error ?? "unknown error"))
     .replace(/[\r\n\t]+/gu, " ")
     .slice(0, 500);
+}
+
+async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise<void> {
+  if (owner.isDestroyed() || owner.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke owner window retired before Inspector verification.");
+  }
+  const preexistingInspector = inspectorWindow;
+  if (preexistingInspector !== undefined) throw new Error("Packaged smoke Inspector existed before its first detach.");
+  if (owner.isMinimized()) owner.restore();
+  // The Windows smoke process is launched without an activation grant. Match
+  // the real no-focus-theft restore path first, then request activation.
+  owner.showInactive();
+  owner.focus();
+  await waitForPackagedSmokeInspectorCondition(
+    () => owner.isVisible() && !owner.isMinimized(),
+    "owner reveal before first detach"
+  );
+  await installPackagedSmokeInspectorCloseObserver(owner);
+
+  const initial = await openPackagedSmokeInspector(owner);
+  await requestPackagedSmokeInspectorOpen(owner);
+  if (inspectorWindow !== initial || initial.isDestroyed() || initial.isVisible()) {
+    throw new Error("Packaged Inspector exposed or replaced its child before portal readiness.");
+  }
+  recordPackagedSmokeProgress("inspector_pending_reuse_remained_hidden");
+  await inspectPackagedSmokeInspectorSurface(initial);
+  await waitForPackagedSmokeInspectorState(initial,
+    () => initial.isVisible() && !initial.isMinimized(), "initial reveal");
+  await waitForPackagedSmokeInspectorCondition(() => initial.isFocused(), "initial focus");
+  recordPackagedSmokeProgress("inspector_initial_ready");
+
+  await requestPackagedSmokeInspectorMinimize(initial);
+  await waitForPackagedSmokeInspectorState(initial, () => initial.isMinimized(), "pre-reuse minimize");
+  owner.show();
+  owner.focus();
+  await waitForPackagedSmokeInspectorCondition(() => owner.isFocused(), "pre-reuse owner focus");
+  if (!await requestPackagedSmokeInspectorActivation(owner)) {
+    throw new Error("Packaged Inspector rejected activation from its focused exact owner.");
+  }
+  const reusedInspector = inspectorWindow;
+  if (reusedInspector !== initial) throw new Error("Packaged Inspector did not reuse its exact owner occurrence.");
+  await waitForPackagedSmokeInspectorState(initial,
+    () => initial.isVisible() && !initial.isMinimized() && initial.isFocused(), "exact-owner activation");
+  await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 300));
+  if (initial.isDestroyed() || !initial.isVisible() || initial.isMinimized() || !initial.isFocused()) {
+    throw new Error("Packaged Inspector activation did not remain usable after native focus settled.");
+  }
+  recordPackagedSmokeProgress("inspector_same_owner_reused");
+
+  owner.hide();
+  await waitForPackagedSmokeInspectorState(initial, () => !initial.isVisible(), "owner hide");
+  owner.showInactive();
+  await waitForPackagedSmokeInspectorState(initial, () => initial.isVisible(), "owner show");
+  owner.minimize();
+  await waitForPackagedSmokeInspectorState(initial, () => !initial.isVisible(), "owner minimize");
+  owner.restore();
+  owner.showInactive();
+  await waitForPackagedSmokeInspectorState(initial, () => initial.isVisible(), "owner restore");
+  recordPackagedSmokeProgress("inspector_owner_visibility_verified");
+
+  initial.focus();
+  await waitForPackagedSmokeInspectorCondition(() => initial.isFocused(), "user-close focus");
+  void initial.webContents.executeJavaScript(
+    "(() => { void window.jokoInspectorDesktop?.window.close('user'); return true; })()",
+    true
+  ).catch(() => undefined);
+  recordPackagedSmokeProgress("inspector_user_close_requested");
+  await waitForPackagedSmokeInspectorDestroyed(initial, "user close");
+  await waitForPackagedSmokeInspectorClosedCount(owner, 1);
+  await waitForPackagedSmokeInspectorCondition(() => owner.isFocused(), "safe owner focus return");
+  recordPackagedSmokeProgress("inspector_user_close_returned_focus");
+
+  const reloading = await openPackagedSmokeInspector(owner, initial);
+  await inspectPackagedSmokeInspectorSurface(reloading);
+  const foreground = new BrowserWindow({
+    width: 320,
+    height: 200,
+    show: false,
+    skipTaskbar: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      nodeIntegrationInSubFrames: false,
+      nodeIntegrationInWorker: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      navigateOnDragDrop: false,
+      safeDialogs: true,
+      spellcheck: false
+    }
+  });
+  await foreground.loadURL(INSPECTOR_WINDOW_URL);
+  foreground.show();
+  foreground.focus();
+  await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "independent focus");
+  if (await requestPackagedSmokeInspectorActivation(owner) || !foreground.isFocused() || reloading.isFocused()) {
+    throw new Error("Packaged Inspector activation stole focus from a foreground window outside its owner.");
+  }
+  recordPackagedSmokeProgress("inspector_background_activation_rejected");
+  await waitForPackagedSmokeOwnerDocument(owner, "reload", () => owner.reload());
+  await waitForPackagedSmokeInspectorDestroyed(reloading, "owner reload");
+  if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
+    inspectorWindowOccurrence !== undefined) {
+    throw new Error("Packaged Inspector retained stale state after owner reload.");
+  }
+  recordPackagedSmokeProgress("inspector_owner_reload_retired");
+
+  await installPackagedSmokeInspectorCloseObserver(owner);
+  owner.show();
+  const failing = await openPackagedSmokeInspector(owner, reloading);
+  await inspectPackagedSmokeInspectorSurface(failing);
+  foreground.show();
+  foreground.focus();
+  await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "pre-child-failure independent focus");
+  const childFailureDispatched = (failing.webContents as unknown as {
+    emit(event: string, eventObject: object, details: { readonly reason: "crashed"; readonly exitCode: number }): boolean;
+  }).emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
+  if (!childFailureDispatched) throw new Error("Packaged Inspector child-failure event had no lifecycle listener.");
+  await waitForPackagedSmokeInspectorDestroyed(failing, "child renderer failure");
+  await waitForPackagedSmokeInspectorClosedCount(owner, 1);
+  if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
+    inspectorWindowOccurrence !== undefined) {
+    throw new Error("Packaged Inspector retained stale state after child renderer failure.");
+  }
+  if (!foreground.isFocused() || owner.isFocused()) {
+    throw new Error("Packaged Inspector child renderer failure stole focus from another application window.");
+  }
+  recordPackagedSmokeProgress("inspector_child_failure_notified_without_focus_theft");
+
+  owner.show();
+  const crashing = await openPackagedSmokeInspector(owner, failing);
+  await inspectPackagedSmokeInspectorSurface(crashing);
+  foreground.show();
+  foreground.focus();
+  await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "pre-crash independent focus");
+  owner.webContents.forcefullyCrashRenderer();
+  await waitForPackagedSmokeInspectorDestroyed(crashing, "owner crash");
+  if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
+    inspectorWindowOccurrence !== undefined) {
+    throw new Error("Packaged Inspector retained stale state after owner crash.");
+  }
+  foreground.destroy();
+  recordPackagedSmokeProgress("inspector_owner_crash_retired");
+  recordPackagedSmokeProgress("inspector_lifecycle_verified");
+}
+
+async function installPackagedSmokeInspectorCloseObserver(owner: BrowserWindow): Promise<void> {
+  const installed = await owner.webContents.executeJavaScript(
+    [
+      "(() => {",
+      "  const desktop = window.jokoDesktop;",
+      "  if (typeof desktop?.inspectorWindow?.onClosed !== 'function') return false;",
+      "  const state = { closed: 0 };",
+      "  globalThis.__jokoInspectorSmoke = state;",
+      "  desktop.inspectorWindow.onClosed(() => { state.closed += 1; });",
+      "  return true;",
+      "})()"
+    ].join("\n"),
+    true
+  );
+  if (installed !== true) throw new Error("Packaged Inspector close observer was unavailable.");
+}
+
+async function requestPackagedSmokeInspectorOpen(owner: BrowserWindow): Promise<boolean> {
+  const opened = await owner.webContents.executeJavaScript(
+    `window.open(${JSON.stringify(INSPECTOR_WINDOW_URL)}, ${JSON.stringify(INSPECTOR_WINDOW_FRAME_NAME)}, ${JSON.stringify(INSPECTOR_WINDOW_FEATURES)}) !== null`,
+    true
+  );
+  if (typeof opened !== "boolean") throw new Error("Packaged Inspector open returned an invalid result.");
+  return opened;
+}
+
+async function requestPackagedSmokeInspectorActivation(owner: BrowserWindow): Promise<boolean> {
+  const activated = await owner.webContents.executeJavaScript(
+    "window.jokoDesktop?.inspectorWindow?.activate?.()",
+    true
+  );
+  if (typeof activated !== "boolean") throw new Error("Packaged Inspector activation returned an invalid result.");
+  return activated;
+}
+
+async function requestPackagedSmokeInspectorMinimize(window: BrowserWindow): Promise<void> {
+  const minimized = await window.webContents.executeJavaScript(
+    "(async () => { await window.jokoInspectorDesktop?.window.minimize(); return true; })()",
+    true
+  );
+  if (minimized !== true) throw new Error("Packaged Inspector minimize bridge returned an invalid result.");
+}
+
+async function openPackagedSmokeInspector(owner: BrowserWindow, excluded?: BrowserWindow): Promise<BrowserWindow> {
+  if (!await requestPackagedSmokeInspectorOpen(owner)) {
+    throw new Error("Packaged Inspector window.open request was rejected.");
+  }
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const candidate = inspectorWindow;
+    if (candidate !== undefined && candidate !== excluded && !candidate.isDestroyed() &&
+      !candidate.webContents.isDestroyed() && inspectorWindowOwner === owner.webContents) return candidate;
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error("Packaged Inspector window did not become available.");
+}
+
+async function inspectPackagedSmokeInspectorSurface(window: BrowserWindow): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let serialized: unknown;
+  while (Date.now() < deadline && !window.isDestroyed()) {
+    try {
+      serialized = await window.webContents.executeJavaScript(
+        [
+          "(async () => {",
+          "  const api = window.jokoInspectorDesktop;",
+          "  const identity = await api?.window.identity?.();",
+          "  return JSON.stringify({",
+          "    hasGeneralDesktopBridge: window.jokoDesktop !== undefined,",
+          "    keys: api === undefined ? [] : Object.keys(api).sort(),",
+          "    windowKeys: api?.window === undefined ? [] : Object.keys(api.window).sort(),",
+          "    selectionKeys: api?.selectionContextMenu === undefined ? [] : Object.keys(api.selectionContextMenu).sort(),",
+          "    identity,",
+          "    platform: api?.platform,",
+          "    href: location.href",
+          "  });",
+          "})()"
+        ].join("\n"),
+        true
+      );
+      if (typeof serialized === "string") break;
+    } catch { /* The initial about:blank document has not committed yet. */ }
+    await waitForPackagedSmokePoll();
+  }
+  if (typeof serialized !== "string") throw new Error("Packaged Inspector bridge did not serialize its surface.");
+  const value = JSON.parse(serialized) as {
+    readonly hasGeneralDesktopBridge?: unknown;
+    readonly keys?: unknown;
+    readonly windowKeys?: unknown;
+    readonly selectionKeys?: unknown;
+    readonly identity?: unknown;
+    readonly platform?: unknown;
+    readonly href?: unknown;
+  };
+  if (value.hasGeneralDesktopBridge !== false || typeof value.platform !== "string" ||
+    value.href !== INSPECTOR_WINDOW_URL || value.identity !== inspectorWindowOccurrence || !Array.isArray(value.keys) ||
+    value.keys.join(",") !== "platform,selectionContextMenu,window" ||
+    !Array.isArray(value.windowKeys) || value.windowKeys.join(",") !== "close,identity,minimize,ready,toggleMaximize" ||
+    !Array.isArray(value.selectionKeys) || value.selectionKeys.join(",") !== "onAddToChat") {
+    throw new Error("Packaged Inspector exposed a non-minimal preload surface.");
+  }
+  const ready = await window.webContents.executeJavaScript(
+    "(async () => { await window.jokoInspectorDesktop.window.ready(); return true; })()",
+    true
+  );
+  if (ready !== true) throw new Error("Packaged Inspector readiness bridge returned an invalid result.");
+}
+
+async function waitForPackagedSmokeInspectorClosedCount(owner: BrowserWindow, expected: number): Promise<void> {
+  await waitForPackagedSmokeInspectorCondition(async () => {
+    if (owner.isDestroyed() || owner.webContents.isDestroyed()) return false;
+    const count = await owner.webContents.executeJavaScript("globalThis.__jokoInspectorSmoke?.closed", true);
+    return count === expected;
+  }, `close notification ${expected}`);
+}
+
+async function waitForPackagedSmokeInspectorState(
+  window: BrowserWindow,
+  predicate: () => boolean,
+  operation: string
+): Promise<void> {
+  await waitForPackagedSmokeInspectorCondition(
+    () => !window.isDestroyed() && predicate(),
+    operation
+  );
+}
+
+async function waitForPackagedSmokeInspectorCondition(
+  predicate: () => boolean | Promise<boolean>,
+  operation: string
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error(`Packaged Inspector did not finish ${operation}.`);
+}
+
+async function waitForPackagedSmokeInspectorDestroyed(window: BrowserWindow, operation: string): Promise<void> {
+  await waitForPackagedSmokeInspectorCondition(() => window.isDestroyed(), operation);
+}
+
+function waitForPackagedSmokeOwnerDocument(
+  window: BrowserWindow,
+  operation: string,
+  begin: () => void
+): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const contents = window.webContents;
+    const timeout = setTimeout(() => finish(new Error(`Packaged Inspector owner did not finish ${operation}.`)), 20_000);
+    const loaded = (): void => finish();
+    const failed = (_event: unknown, code: number, description: string): void => {
+      finish(new Error(`Packaged Inspector owner ${operation} failed (${code} ${description}).`));
+    };
+    const finish = (error?: Error): void => {
+      clearTimeout(timeout);
+      contents.removeListener("dom-ready", loaded);
+      contents.removeListener("did-fail-load", failed);
+      if (error === undefined) resolvePromise(); else rejectPromise(error);
+    };
+    contents.once("dom-ready", loaded);
+    contents.once("did-fail-load", failed);
+    try { begin(); } catch (error: unknown) {
+      finish(error instanceof Error ? error : new Error(`Packaged Inspector owner could not start ${operation}.`));
+    }
+  });
 }
 
 async function verifyPackagedSmokeRuntimeProcessMonitor(ownerWindow: BrowserWindow): Promise<void> {
@@ -3818,10 +4145,22 @@ function showMainWindow(): void {
   if (mainWindow !== undefined) showWindowFromTray(mainWindow);
 }
 
-function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: WebContents): void {
+function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: BrowserWindow): void {
+  const occurrence = randomUUID();
   inspectorWindow = childWindow;
-  inspectorWindowOwner = owner;
-  inspectorWindowReady = false;
+  inspectorWindowOwner = owner.webContents;
+  inspectorWindowOccurrence = occurrence;
+  const lifecycle = new InspectorWindowLifecycle({
+    owner,
+    child: childWindow,
+    isCurrent: (candidateOwner, candidateChild) =>
+      mainWindow === candidateOwner &&
+      inspectorWindowOwner === candidateOwner.webContents &&
+      inspectorWindow === candidateChild &&
+      inspectorWindowOccurrence === occurrence,
+    retire: (_candidateOwner, candidateChild) => retireInspectorWindow(candidateChild)
+  });
+  inspectorWindowLifecycle = lifecycle;
   childWindow.webContents.setZoomFactor(currentWindowZoomFactor);
 
   installSelectionContextMenu(childWindow, {
@@ -3835,8 +4174,13 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: WebCo
   // must never become a second application renderer or navigation surface.
   childWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   childWindow.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
+  childWindow.on("close", () => {
+    inspectorWindowLifecycle?.markUserClosing(childWindow);
+  });
   childWindow.webContents.on("render-process-gone", () => {
-    if (inspectorWindow === childWindow && !childWindow.isDestroyed()) childWindow.destroy();
+    if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true && !childWindow.isDestroyed()) {
+      childWindow.destroy();
+    }
   });
   childWindow.webContents.on("will-navigate", (event) => event.preventDefault());
   childWindow.webContents.on("will-redirect", (event) => event.preventDefault());
@@ -3847,23 +4191,46 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: WebCo
   });
   childWindow.webContents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
   childWindow.once("closed", () => {
-    if (inspectorWindow !== childWindow) return;
+    const activeLifecycle = inspectorWindowLifecycle;
+    const decision = activeLifecycle?.closeDecision(childWindow);
+    if (decision === undefined) return;
     inspectorWindow = undefined;
-    inspectorWindowReady = false;
     const notifyOwner = inspectorWindowOwner;
     inspectorWindowOwner = undefined;
-    if (notifyOwner === undefined || notifyOwner.isDestroyed() || notifyOwner !== mainWindow?.webContents) return;
-    notifyOwner.send(DESKTOP_CHANNELS.inspectorWindowClosed);
-    if (mainWindow !== undefined && !mainWindow.isDestroyed() && mainWindow.isVisible()) mainWindow.focus();
+    inspectorWindowLifecycle = undefined;
+    inspectorWindowOccurrence = undefined;
+    if (notifyOwner === undefined || notifyOwner.isDestroyed() || notifyOwner !== owner.webContents || mainWindow !== owner) return;
+    if (decision.notifyOwner && decision.reason !== undefined && !quitting) {
+      try {
+        notifyOwner.send(DESKTOP_CHANNELS.inspectorWindowClosed, Object.freeze({ occurrence, reason: decision.reason }));
+      } catch { /* The owner retired after validation. */ }
+    }
+    if (decision.returnFocus && !quitting && !owner.isDestroyed() && BrowserWindow.getFocusedWindow() === owner) owner.focus();
   });
 }
 
-function destroyInspectorWindow(): void {
+function destroyInspectorWindow(expectedWindow?: BrowserWindow): void {
+  if (expectedWindow !== undefined && inspectorWindow !== expectedWindow) return;
   const childWindow = inspectorWindow;
   inspectorWindow = undefined;
   inspectorWindowOwner = undefined;
-  inspectorWindowReady = false;
+  inspectorWindowLifecycle = undefined;
+  inspectorWindowOccurrence = undefined;
   if (childWindow !== undefined && !childWindow.isDestroyed()) childWindow.destroy();
+}
+
+function retireInspectorWindow(expectedWindow: BrowserWindow): void {
+  if (inspectorWindow !== expectedWindow) return;
+  inspectorWindow = undefined;
+  inspectorWindowOwner = undefined;
+  inspectorWindowLifecycle = undefined;
+  inspectorWindowOccurrence = undefined;
+  // Destroying a window.open guest synchronously from did-start-navigation can
+  // cancel the owner's own navigation. Fence the occurrence immediately, then
+  // let Chromium finish dispatching the navigation before retiring the guest.
+  setImmediate(() => {
+    if (!expectedWindow.isDestroyed()) expectedWindow.destroy();
+  });
 }
 
 function ensureTray(icon?: NativeImage): void {
@@ -5667,11 +6034,35 @@ function registerIpc(): void {
     }
     throw new Error("Desktop close requests are restricted to application windows.");
   });
+  ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowActivate, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 0) throw new TypeError("Inspector activation does not accept parameters.");
+    assertTrustedIpcSender(event);
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (owner === null || owner !== mainWindow || event.sender !== owner.webContents) {
+      throw new Error("Inspector activation did not originate from the trusted primary application window.");
+    }
+    const child = inspectorWindow;
+    const lifecycle = inspectorWindowLifecycle;
+    if (child === undefined || child.isDestroyed() || inspectorWindowOwner !== owner.webContents ||
+      lifecycle === undefined || !lifecycle.owns(owner, child) || BrowserWindow.getFocusedWindow() !== owner) return false;
+    return lifecycle.activate(owner, child);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowIdentity, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 0) throw new TypeError("Inspector identity does not accept parameters.");
+    assertTrustedInspectorWindowSender(event);
+    if (inspectorWindowOccurrence === undefined) {
+      throw new Error("Inspector identity is unavailable for a retired occurrence.");
+    }
+    return inspectorWindowOccurrence;
+  });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowReady, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 0) throw new TypeError("Inspector readiness does not accept parameters.");
     const window = assertTrustedInspectorWindowSender(event);
-    inspectorWindowReady = true;
-    if (mainWindow?.isVisible() === true) {
+    const lifecycle = inspectorWindowLifecycle;
+    if (lifecycle === undefined || !lifecycle.markReady(window)) {
+      throw new Error("Inspector readiness did not originate from the current detached Inspector.");
+    }
+    if (lifecycle.canReveal(window)) {
       window.show();
       window.focus();
     }
@@ -5702,8 +6093,17 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowClose, (event, ...parameters: unknown[]) => {
-    if (parameters.length !== 0) throw new TypeError("Inspector close does not accept parameters.");
-    assertTrustedInspectorWindowSender(event).close();
+    if (parameters.length !== 1 || (parameters[0] !== "user" && parameters[0] !== "passive")) {
+      throw new TypeError("Inspector close requires one current-v1 close kind.");
+    }
+    const window = assertTrustedInspectorWindowSender(event);
+    const lifecycle = inspectorWindowLifecycle;
+    if (lifecycle === undefined || (parameters[0] === "user"
+      ? !lifecycle.markUserClosing(window)
+      : !lifecycle.markPassiveClosing(window))) {
+      throw new Error("Inspector close did not originate from the current detached Inspector.");
+    }
+    window.close();
   });
   ipcMain.handle(DESKTOP_CHANNELS.traySetIcon, (event, value: unknown) => {
     assertTrustedIpcSender(event);

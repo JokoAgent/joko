@@ -37,6 +37,7 @@ import { PortableSessionDropTarget } from "./components/PortableSessionDropTarge
 import { SessionSplitView } from "./components/SessionSplitView.js";
 import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
 import { createInspectorTurnReviewRequest, type InspectorTurnReviewRequest } from "./components/inspector-review-focus.js";
+import { activateDetachedInspectorWindow } from "./components/inspector-detach.js";
 import { requestWorkspaceDocumentLeave } from "./workspace-document-lifecycle.js";
 import { useNewSessionSubmission } from "./use-new-session-submission.js";
 import { currentAppShortcutPlatform, type AppShortcutId, type AppShortcutOverrides } from "./app-shortcuts.js";
@@ -1386,6 +1387,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const creatingNewSession = state.route.kind === "newSession";
   const inspectorOpen = state.preferences.inspectorOpen && state.route.kind === "session" && activeSession !== undefined && activeReviewerRun === undefined;
   const inspectorAttached = inspectorOpen && !inspectorDetached;
+  const openInspector = (): void => {
+    if (!inspectorDetached) {
+      void controller.setInspectorOpen(true);
+      return;
+    }
+    runAction("inspector-activate", async () => {
+      if (!await activateDetachedInspectorWindow(window.jokoDesktop)) {
+        throw new Error(t("inspector.detachUnavailable"));
+      }
+    });
+  };
   const closeNavigation = (): void => { if (window.matchMedia("(max-width: 980px)").matches) setWindowNavigationOpen(false); };
   const setNavigationMode = (mode: NavigationMode): void => {
     setWindowNavigationLayout({ mode, width: preferredNavigation.width });
@@ -1512,17 +1524,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       interaction={activeInteractions[0]}
       remainingInteractions={Math.max(0, activeInteractions.length - 1)}
       navigationOpen={embeddedInFiles || navigationOpen}
-      inspectorOpen={embeddedInFiles ? false : inspectorOpen}
+      inspectorOpen={embeddedInFiles ? false : inspectorAttached}
       inspectorAvailable={!embeddedInFiles}
       selectionQuoteInsertion={fileSelectionQuoteInsertion?.sessionId === activeSession.id ? fileSelectionQuoteInsertion : undefined}
       attachmentInsertion={fileAttachmentInsertion?.sessionId === activeSession.id ? fileAttachmentInsertion : undefined}
       t={t}
       runAction={runAction}
       onOpenNavigation={() => { if (!embeddedInFiles) setWindowNavigationOpen(true); }}
-      onOpenInspector={() => { if (!embeddedInFiles && activeReviewerRun === undefined) void controller.setInspectorOpen(true); }}
+      onOpenInspector={() => { if (!embeddedInFiles && activeReviewerRun === undefined) openInspector(); }}
       onOpenSubagent={embeddedInFiles || activeReviewerRun !== undefined ? undefined : (runId) => {
         setInspectorSubagentFocusRequest({ sessionId: activeSession.id, runId, requestId: ++inspectorSubagentFocusRequestIdRef.current });
-        void controller.setInspectorOpen(true);
+        openInspector();
       }}
       onOpenTurnReview={embeddedInFiles || activeReviewerRun !== undefined ? undefined : (changeSetId, selectedPath) => {
         setInspectorTurnReviewFocusRequest(createInspectorTurnReviewRequest(
@@ -1531,7 +1543,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           changeSetId,
           selectedPath
         ));
-        void controller.setInspectorOpen(true);
+        openInspector();
       }}
       onRename={() => setRenameSession(activeSession)}
       onPin={() => runAction(`pin:${activeSession.id}`, () => controller.pinSession(activeSession.id, !activeSession.pinned))}
