@@ -4,11 +4,15 @@ import {
   RUNTIME_PROCESS_MONITOR_MAX_PENDING_REQUESTS,
   RUNTIME_PROCESS_MONITOR_REQUEST_TIMEOUT_MS,
   RuntimeProcessMonitorBroker,
+  RuntimeProcessMonitorRetirementAcknowledgements,
   parseDesktopRuntimeProcessSample,
   parseDesktopRuntimeProcessMonitorOwner,
   parseDesktopRuntimeProcessMonitorRequest,
   parseDesktopRuntimeProcessMonitorResponse,
+  parseDesktopRuntimeProcessMonitorRetirement,
+  retireRuntimeProcessMonitorForReplacement,
   sameDesktopRuntimeProcessMonitorOwner,
+  shouldRecoverRuntimeProcessMonitorRenderer,
   type DesktopRuntimeProcessMonitorOwner,
   type DesktopRuntimeProcessMonitorRequest,
   type DesktopRuntimeProcessMonitorResponse
@@ -77,6 +81,43 @@ function uuid(index: number): string {
 afterEach(() => vi.useRealTimers());
 
 describe("runtime process monitor v1 protocol", () => {
+  it("recovers renderer loss only for the exact current live window", () => {
+    const current = {};
+    expect(shouldRecoverRuntimeProcessMonitorRenderer(current, current, false, false)).toBe(true);
+    expect(shouldRecoverRuntimeProcessMonitorRenderer(current, {}, false, false)).toBe(false);
+    expect(shouldRecoverRuntimeProcessMonitorRenderer(current, current, true, false)).toBe(false);
+    expect(shouldRecoverRuntimeProcessMonitorRenderer(current, current, false, true)).toBe(false);
+  });
+
+  it("accepts only an exact retirement occurrence acknowledgement", () => {
+    const retirement = { version: 1, retirementOccurrence: uuid(0xabcdef) } as const;
+    expect(parseDesktopRuntimeProcessMonitorRetirement(retirement)).toEqual(retirement);
+    expect(() => parseDesktopRuntimeProcessMonitorRetirement({ ...retirement, bearer: "secret" }))
+      .toThrow(/retirement/u);
+    expect(() => parseDesktopRuntimeProcessMonitorRetirement({
+      ...retirement,
+      retirementOccurrence: uuid(0xabcdef).toUpperCase()
+    })).toThrow(/retirement/u);
+  });
+
+  it("fences retirement acknowledgements by endpoint and occurrence", async () => {
+    const acknowledgements = new RuntimeProcessMonitorRetirementAcknowledgements<string>();
+    const firstOccurrence = uuid(0xabc001);
+    const first = acknowledgements.begin("monitor-a", firstOccurrence);
+    expect(acknowledgements.acknowledge("monitor-b", firstOccurrence)).toBe(false);
+    expect(acknowledgements.acknowledge("monitor-a", uuid(0xabc002))).toBe(false);
+    expect(acknowledgements.acknowledge("monitor-a", firstOccurrence)).toBe(true);
+    await expect(first.acknowledged).resolves.toBe(true);
+    expect(acknowledgements.acknowledge("monitor-a", firstOccurrence)).toBe(false);
+
+    const superseded = acknowledgements.begin("monitor-a", uuid(0xabc003));
+    const currentOccurrence = uuid(0xabc004);
+    const current = acknowledgements.begin("monitor-a", currentOccurrence);
+    await expect(superseded.acknowledged).resolves.toBe(false);
+    expect(acknowledgements.acknowledge("monitor-a", currentOccurrence)).toBe(true);
+    await expect(current.acknowledged).resolves.toBe(true);
+  });
+
   it("accepts only exact read-only Desktop application process projections", () => {
     const sample = {
       version: 1,
@@ -207,6 +248,73 @@ describe("runtime process monitor v1 protocol", () => {
 });
 
 describe("runtime process monitor broker", () => {
+  it("drains retired IPC before native destruction and before the next binding", async () => {
+    const firstDrain = deferred<void>();
+    const rendererRetirement = deferred<void>();
+    const nativeDestruction = deferred<void>();
+    const nativeRetirement = deferred<void>();
+    const calls: string[] = [];
+    let drainCount = 0;
+    const operation = retireRuntimeProcessMonitorForReplacement({
+      retireAuthority: () => { calls.push("retire"); },
+      waitForRendererRetirement: () => {
+        calls.push("wait-renderer");
+        return rendererRetirement.promise;
+      },
+      drainRetiredIpc: () => {
+        drainCount += 1;
+        calls.push(`drain-${drainCount}`);
+        return drainCount === 1 ? firstDrain.promise : Promise.resolve();
+      },
+      destroyNativeWindow: () => {
+        calls.push("destroy");
+        return nativeDestruction.promise;
+      },
+      waitForNativeRetirement: () => {
+        calls.push("wait-destroyed");
+        return nativeRetirement.promise;
+      }
+    });
+
+    expect(calls).toEqual(["retire", "wait-renderer"]);
+    rendererRetirement.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(["retire", "wait-renderer", "drain-1"]);
+    firstDrain.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(["retire", "wait-renderer", "drain-1", "destroy"]);
+    nativeDestruction.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(["retire", "wait-renderer", "drain-1", "destroy", "wait-destroyed"]);
+    nativeRetirement.resolve();
+    await operation;
+    expect(calls).toEqual(["retire", "wait-renderer", "drain-1", "destroy", "wait-destroyed", "drain-2"]);
+  });
+
+  it("destroys and observes the native window before surfacing a renderer retirement failure", async () => {
+    const failure = new Error("renderer retirement failed");
+    const calls: string[] = [];
+    let drainCount = 0;
+    await expect(retireRuntimeProcessMonitorForReplacement({
+      retireAuthority: () => { calls.push("retire"); },
+      waitForRendererRetirement: () => {
+        calls.push("wait-renderer");
+        return Promise.reject(failure);
+      },
+      drainRetiredIpc: () => {
+        drainCount += 1;
+        calls.push(`drain-${drainCount}`);
+        return Promise.resolve();
+      },
+      destroyNativeWindow: () => { calls.push("destroy"); },
+      waitForNativeRetirement: () => {
+        calls.push("wait-destroyed");
+        return Promise.resolve();
+      }
+    })).rejects.toBe(failure);
+    expect(calls).toEqual(["retire", "wait-renderer", "drain-1", "destroy", "wait-destroyed", "drain-2"]);
+  });
+
   it("routes only exact owner/request/action pairs and fences a reloaded document", () => {
     const onTimeout = vi.fn();
     const broker = new RuntimeProcessMonitorBroker<string>({ onTimeout });
@@ -271,3 +379,9 @@ describe("runtime process monitor broker", () => {
     expect(broker.ownerForMonitor("monitor-b")).toEqual(nextOwner);
   });
 });
+
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+  let resolvePromise!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => { resolvePromise = resolve; });
+  return { promise, resolve: resolvePromise };
+}

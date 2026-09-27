@@ -494,6 +494,118 @@ export async function rewriteRuntimePackageManifestFile(path: string, expectedNa
   }
 }
 
+export interface RuntimeCommandShimNormalization {
+  readonly source: string;
+  readonly targetPath: string;
+}
+
+/**
+ * Replaces pnpm's source-workspace absolute diagnostic marker with the exact
+ * relative target inside the candidate runtime. Executable shim statements
+ * are left byte-for-byte unchanged.
+ */
+export function normalizeRuntimeCommandShimSource(
+  source: string,
+  sourceRuntimeRoot: string,
+  candidateRuntimeRoot: string,
+  candidateShimPath: string
+): RuntimeCommandShimNormalization | undefined {
+  const markerPattern = /^# cmd-shim-target=([^\0\r\n]+)\r?$/gmu;
+  const markers = [...source.matchAll(markerPattern)];
+  if (markers.length === 0) return undefined;
+  if (markers.length !== 1) throw new Error("Runtime command shim contains multiple target markers.");
+  const marker = markers[0]!;
+  const target = marker[1]!;
+  const suffix = source.slice((marker.index ?? 0) + marker[0].length);
+  if (suffix !== "" && suffix !== "\n" && suffix !== "\r\n") {
+    throw new Error("Runtime command shim target marker is not the final line.");
+  }
+  if (!isAbsolute(target)) throw new Error("Runtime command shim target is not absolute.");
+  const normalizedSourceRoot = resolve(sourceRuntimeRoot);
+  const normalizedCandidateRoot = resolve(candidateRuntimeRoot);
+  const normalizedShim = resolve(candidateShimPath);
+  const normalizedTarget = resolve(target);
+  assertContained(normalizedSourceRoot, normalizedTarget);
+  assertContained(normalizedCandidateRoot, normalizedShim);
+  const mappedTarget = resolve(normalizedCandidateRoot, relative(normalizedSourceRoot, normalizedTarget));
+  assertContained(normalizedCandidateRoot, mappedTarget);
+  let stableTarget = relative(dirname(normalizedShim), mappedTarget).replaceAll("\\", "/");
+  if (stableTarget === "" || isAbsolute(stableTarget)) {
+    throw new Error("Runtime command shim target could not be mapped into the candidate runtime.");
+  }
+  if (!stableTarget.startsWith(".")) stableTarget = `./${stableTarget}`;
+  const replacement = `# cmd-shim-target=${stableTarget}`;
+  return {
+    source: `${source.slice(0, marker.index)}${replacement}${suffix}`,
+    targetPath: mappedTarget
+  };
+}
+
+export async function normalizeRuntimeCommandShims(
+  sourceRuntimeRoot: string,
+  candidateRuntimeRoot: string
+): Promise<number> {
+  const sourceRoot = await assertCanonicalDirectory(sourceRuntimeRoot);
+  const candidateRoot = await assertCanonicalDirectory(candidateRuntimeRoot);
+  let normalized = 0;
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      validateEntryName(entry.name);
+      const path = join(directory, entry.name);
+      assertContained(candidateRoot, path);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        await visit(path);
+        continue;
+      }
+      if (basename(directory) !== ".bin") continue;
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || !samePath(await realpath(path), path)) {
+        throw new Error(`Runtime command shim is not a canonical regular file: ${path}`);
+      }
+      if (info.size > 256 * 1024) {
+        throw new Error(`Runtime command shim exceeds the normalization limit: ${path}`);
+      }
+      const bytes = await readFile(path);
+      if (bytes.byteLength !== info.size || bytes.byteLength > 256 * 1024) {
+        bytes.fill(0);
+        throw new Error(`Runtime command shim changed while being normalized: ${path}`);
+      }
+      if (!bytes.includes(Buffer.from("# cmd-shim-target=", "utf8"))) {
+        bytes.fill(0);
+        continue;
+      }
+      let result: RuntimeCommandShimNormalization | undefined;
+      try {
+        result = normalizeRuntimeCommandShimSource(
+          new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+          sourceRoot,
+          candidateRoot,
+          path
+        );
+      } finally {
+        bytes.fill(0);
+      }
+      if (result === undefined) continue;
+      const targetInfo = await lstat(result.targetPath);
+      if (!targetInfo.isFile() || targetInfo.isSymbolicLink() ||
+        !samePath(await realpath(result.targetPath), result.targetPath)) {
+        throw new Error(`Runtime command shim mapped target is not a canonical regular file: ${result.targetPath}`);
+      }
+      const output = Buffer.from(result.source, "utf8");
+      try {
+        await writeFile(path, output, { flag: "w" });
+      } finally {
+        output.fill(0);
+      }
+      normalized += 1;
+    }
+  };
+  await visit(candidateRoot);
+  return normalized;
+}
+
 export async function digestFile(path: string): Promise<string | undefined> {
   const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;

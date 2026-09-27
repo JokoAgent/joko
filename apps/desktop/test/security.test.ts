@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { verifyPackagedWebBundle } from "../src/bundle.js";
+import { requireCurrentDesktopMainDocumentOccurrence } from "../src/channels.js";
+import { DesktopMainDocumentOccurrenceAuthority } from "../src/main-document-occurrence.js";
 import {
   DESKTOP_CONTENT_SECURITY_POLICY,
   DESKTOP_APP_ENTRY_URL,
@@ -133,6 +135,38 @@ describe("Desktop security policy", () => {
     expect(isTrustedIpcSenderIdentity({ ...trusted, senderFrame: undefined }, policy)).toBe(false);
     expect(isTrustedIpcSenderIdentity({ ...trusted, frameUrl: "joko://app/assets/app.js" }, policy)).toBe(false);
     expect(isTrustedIpcSenderIdentity({ ...trusted, frameUrl: "https://example.test/" }, policy)).toBe(false);
+  });
+
+  it("binds private main-Document IPC to the occurrence captured by that exact preload", () => {
+    expect(requireCurrentDesktopMainDocumentOccurrence("document-one", "document-one"))
+      .toBe("document-one");
+    expect(() => requireCurrentDesktopMainDocumentOccurrence("document-one", "document-two"))
+      .toThrow(/current main application Document occurrence/u);
+    expect(() => requireCurrentDesktopMainDocumentOccurrence("document-one", undefined))
+      .toThrow(/current main application Document occurrence/u);
+    expect(() => requireCurrentDesktopMainDocumentOccurrence(undefined, "document-one"))
+      .toThrow(/current main application Document occurrence/u);
+    expect(() => requireCurrentDesktopMainDocumentOccurrence(" document-one", " document-one"))
+      .toThrow(/current main application Document occurrence/u);
+  });
+
+  it("keeps main-Document identities host-issued and retires the prior preload capture", () => {
+    const endpoint = {};
+    const issued = ["host-document-one", "host-document-two"];
+    const authority = new DesktopMainDocumentOccurrenceAuthority<object>(() => issued.shift()!);
+    const firstClaim = "00000000-0000-4000-8000-000000000001";
+    const secondClaim = "00000000-0000-4000-8000-000000000002";
+    const first = authority.capture(endpoint, firstClaim).current.occurrence;
+    const second = authority.capture(endpoint, secondClaim);
+
+    expect(second.retired).toEqual({ endpoint, claim: firstClaim, occurrence: first });
+    expect(authority.currentFor(endpoint)).toBe("host-document-two");
+    expect(() => requireCurrentDesktopMainDocumentOccurrence(first, authority.currentFor(endpoint)))
+      .toThrow(/current main application Document occurrence/u);
+    expect(requireCurrentDesktopMainDocumentOccurrence(
+      "host-document-two",
+      authority.currentFor(endpoint)
+    )).toBe("host-document-two");
   });
 
   it("preserves an existing CSP as an additional policy and adds all Desktop restrictions", () => {

@@ -16,6 +16,7 @@ import {
   copyRegularTree,
   claudeSessionElectronSmokeSource,
   extensionLibraryElectronSmokeSource,
+  normalizeRuntimeCommandShims,
   replaceDirectoryFromPrepared,
   rewriteRuntimePackageManifest,
   ORCHESTRATOR_BUNDLED_NPM_RUNTIME,
@@ -238,6 +239,24 @@ describe("isolated Orchestrator runtime staging", () => {
       .toThrow(/unexpected runtime workspace package/iu);
   });
 
+  it("normalizes pnpm command-shim markers across different temporary source roots", async () => {
+    const first = commandShimFixture("first");
+    const second = commandShimFixture("second");
+
+    await expect(normalizeRuntimeCommandShims(first.sourceRoot, first.candidateRoot)).resolves.toBe(1);
+    await expect(normalizeRuntimeCommandShims(second.sourceRoot, second.candidateRoot)).resolves.toBe(1);
+    const firstSource = readFileSync(first.shimPath, "utf8");
+    const secondSource = readFileSync(second.shimPath, "utf8");
+    expect(firstSource).toBe(secondSource);
+    expect(firstSource).not.toContain(first.sourceRoot.replaceAll("\\", "/"));
+    expect(secondSource).not.toContain(second.sourceRoot.replaceAll("\\", "/"));
+
+    const marker = firstSource.match(/^# cmd-shim-target=([^\r\n]+)$/mu)?.[1];
+    expect(marker).toBe("../fixture-cli/bin/cli.js");
+    expect(resolve(dirname(first.shimPath), marker!)).toBe(first.targetPath);
+    expect(resolve(dirname(second.shimPath), marker!)).toBe(second.targetPath);
+  });
+
   it("passes only OS launch necessities and never inherited Node/npm/provider secrets", () => {
     const environment = runtimeBuildEnvironment({
       PATH: "bin",
@@ -332,6 +351,36 @@ function temporaryDirectory(label: string): string {
   const directory = mkdtempSync(join(tmpdir(), `joko-runtime-${label}-`));
   cleanups.push(directory);
   return directory;
+}
+
+function commandShimFixture(label: string): {
+  readonly sourceRoot: string;
+  readonly candidateRoot: string;
+  readonly shimPath: string;
+  readonly targetPath: string;
+} {
+  const root = temporaryDirectory(`command-shim-${label}`);
+  const sourceRoot = resolve(root, "workspace");
+  const candidateRoot = resolve(root, "candidate");
+  const sourceTarget = resolve(sourceRoot, "node_modules", "fixture-cli", "bin", "cli.js");
+  const targetPath = resolve(candidateRoot, "node_modules", "fixture-cli", "bin", "cli.js");
+  const shimPath = resolve(candidateRoot, "node_modules", ".bin", "fixture-cli");
+  mkdirSync(dirname(sourceTarget), { recursive: true });
+  mkdirSync(dirname(targetPath), { recursive: true });
+  mkdirSync(dirname(shimPath), { recursive: true });
+  writeFileSync(sourceTarget, "#!/usr/bin/env node\n", { mode: 0o755 });
+  writeFileSync(targetPath, "#!/usr/bin/env node\n", { mode: 0o755 });
+  writeFileSync(
+    shimPath,
+    [
+      "#!/bin/sh",
+      'exec node "$basedir/../fixture-cli/bin/cli.js" "$@"',
+      `# cmd-shim-target=${sourceTarget.replaceAll("\\", "/")}`,
+      ""
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  return { sourceRoot, candidateRoot, shimPath, targetPath };
 }
 
 interface SqliteVecFixture {

@@ -60,7 +60,10 @@ export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSess
     if (!ownsProjection || !supported || desktop === undefined) return;
     const settling = new Set<string>();
     return desktop.nativeTaskStatus.onAction((action) => {
-      if (action.kind !== "permission") return;
+      if (action.kind === "focus") {
+        controllerRef.current.navigate({ kind: "session", sessionId: action.sessionId });
+        return;
+      }
       const key = `${action.sessionId}\u0000${action.interactionId}\u0000${action.generation}`;
       if (settling.has(key)) return;
       settling.add(key);

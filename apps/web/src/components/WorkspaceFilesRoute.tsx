@@ -236,6 +236,7 @@ export function WorkspaceFilesRoute({
     return registerWorkspaceDocumentLeaveGate(async (request) => workspaceDocumentController.requestLeave({
       reason: request.reason,
       ...(request.matches === undefined ? {} : { matches: request.matches }),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
       prompt: (input) => new Promise<WorkspaceLeaveChoice>((resolve) => {
         // The registry serializes prompts. Failing closed here protects against
         // an unexpected duplicate host rather than replacing a live resolver.
@@ -243,9 +244,30 @@ export function WorkspaceFilesRoute({
           resolve("cancel");
           return;
         }
-        const next = { input, resolve };
+        if (workspaceLeaveSignalAborted(request.signal)) {
+          resolve("cancel");
+          return;
+        }
+        let settled = false;
+        let next!: LeavePromptState;
+        const finish = (choice: WorkspaceLeaveChoice): void => {
+          if (settled) return;
+          settled = true;
+          request.signal?.removeEventListener("abort", onAbort);
+          resolve(choice);
+        };
+        const onAbort = (): void => {
+          if (leavePromptRef.current === next) {
+            leavePromptRef.current = undefined;
+            setLeavePrompt((current) => current === next ? undefined : current);
+          }
+          finish("cancel");
+        };
+        next = { input, resolve: finish };
+        request.signal?.addEventListener("abort", onAbort, { once: true });
         leavePromptRef.current = next;
         setLeavePrompt(next);
+        if (workspaceLeaveSignalAborted(request.signal)) onAbort();
       })
     }));
   }, []);
@@ -1224,6 +1246,10 @@ function workspaceSidebarLabels(t: Translator) {
     searchTruncated: (matches: number) => t("workspace.searchTruncated", { matches }),
     deleteConfirmation: (name: string) => t("workspace.deleteEntryConfirmation", { name })
   };
+}
+
+function workspaceLeaveSignalAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted ?? false;
 }
 
 function messageOf(error: unknown, fallback: string): string {

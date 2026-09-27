@@ -263,6 +263,17 @@ type JokoDesktopDeepLinkNavigation =
   | { readonly kind: "settings"; readonly section: JokoDesktopDeepLinkSettingsSection }
   | { readonly kind: "portable"; readonly file?: JokoDesktopFile };
 
+interface JokoDesktopDeepLinkDelivery {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+  readonly navigation: JokoDesktopDeepLinkNavigation;
+}
+
+interface JokoDesktopDeepLinkAcknowledgement {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+}
+
 interface JokoDesktopSessionDragPreviewRequest {
   readonly gestureId: string;
   readonly profileId: string;
@@ -515,10 +526,11 @@ interface JokoDesktopApi {
     onAddToChat(listener: () => void): () => void;
   };
   setTrayIcon(dataUrl: string): Promise<void>;
-  notify(value: { readonly title: string; readonly body: string; readonly sessionId?: string }): Promise<void>;
-  readonly notifications: {
-    onFocusSession(listener: (sessionId: string) => void): () => void;
-  };
+  notify(value: {
+    readonly title: string;
+    readonly body: string;
+    readonly navigation?: { readonly kind: "session"; readonly profileId: string; readonly sessionId: string };
+  }): Promise<void>;
   readonly attention: {
     mark(key: JokoDesktopAttentionKey): Promise<void>;
     clear(key: JokoDesktopAttentionKey): Promise<void>;
@@ -572,8 +584,9 @@ interface JokoDesktopApi {
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
   readonly deepLinks: {
-    takePending(): Promise<JokoDesktopDeepLinkNavigation | undefined>;
-    onNavigate(listener: (navigation: JokoDesktopDeepLinkNavigation) => void): () => void;
+    takePending(): Promise<JokoDesktopDeepLinkDelivery | undefined>;
+    acknowledge(acknowledgement: JokoDesktopDeepLinkAcknowledgement): Promise<boolean>;
+    onNavigate(listener: (delivery: JokoDesktopDeepLinkDelivery) => void): () => void;
   };
   saveFile(file: JokoDesktopFile): Promise<boolean>;
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;

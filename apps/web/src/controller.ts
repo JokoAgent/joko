@@ -104,6 +104,25 @@ export type AppRoute =
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
+interface MachineSessionMessageTarget {
+  readonly messageId?: string;
+  readonly messageEventId?: string;
+}
+
+interface MachineSessionRouteOwner {
+  readonly hash: string;
+  readonly locationHash: string;
+  readonly navigationRevision: number;
+}
+
+interface NavigationHashHandoff {
+  readonly targetHash: string;
+  readonly rollbackHash: string;
+  readonly requestId: number;
+  readonly signal: AbortSignal;
+  readonly isCurrent: () => boolean;
+}
+
 export interface BrowserInspectorFocusRequest {
   readonly sessionId: string;
   readonly browserId: string;
@@ -165,13 +184,18 @@ export interface AppController extends OperationApi {
   refreshMachines(): Promise<void>;
   setMachineSelection(selection: MachineSelection): Promise<void>;
   switchMachine(profileId: string): Promise<void>;
-  openMachineSession(profileId: string, sessionId: string): Promise<void>;
+  openMachineSession(profileId: string, sessionId: string, messageTarget?: MachineSessionMessageTarget): Promise<void>;
   searchRemoteSessionMessages(query: string, options?: SessionMessageSearchCollectionOptions): Promise<readonly FederatedSessionMessageSearchMatchView[]>;
   retryManagedOrchestrator(): Promise<void>;
   /** Consume only the not-yet-started automatic attempt for this app open. */
   cancelAutomaticConnectionAttempt(): void;
   setAutomaticConnectionEnabled(enabled: boolean): Promise<void>;
-  navigate(route: AppRoute, options?: { readonly replace?: boolean }): void;
+  navigate(route: AppRoute, options?: {
+    readonly replace?: boolean;
+    readonly exactHash?: string;
+    readonly isCurrent?: () => boolean;
+    readonly signal?: AbortSignal;
+  }): void;
   setLocale(locale: Locale): Promise<void>;
   setTheme(theme: Theme): Promise<void>;
   setUiFamily(family: string): Promise<void>;
@@ -255,8 +279,10 @@ export function useAppController(): AppController {
   const machinePresenceByProfileRef = useRef(state.machinePresenceByProfile);
   machinePresenceByProfileRef.current = state.machinePresenceByProfile;
   const routeRef = useRef<AppRoute>(state.route);
-  const navigationBypassHashRef = useRef<string | undefined>(undefined);
+  const navigationRevisionRef = useRef(state.navigationRevision ?? 0);
+  const navigationHashHandoffRef = useRef<NavigationHashHandoff | undefined>(undefined);
   const navigationRequestRef = useRef(0);
+  const navigationAbortRef = useRef<AbortController | undefined>(undefined);
   const browserInspectorRequestRef = useRef(0);
   routeRef.current = state.route;
   const preferencesRef = useRef<UiPreferences>(DEFAULT_UI_PREFERENCES);
@@ -370,35 +396,69 @@ export function useAppController(): AppController {
     const commitRoute = (route: AppRoute): void => {
       explicitDisconnectRef.current = false;
       routeRef.current = route;
+      const navigationRevision = ++navigationRevisionRef.current;
       setState((current) => ({
         ...current,
         route,
-        navigationRevision: (current.navigationRevision ?? 0) + 1
+        navigationRevision
       }));
     };
-    const onHashChange = (): void => {
+    const onHashChange = (event: HashChangeEvent): void => {
       const requestedHash = window.location.hash;
+      if (event.newURL !== "") {
+        try {
+          if (new URL(event.newURL).hash !== requestedHash) return;
+        } catch {
+          return;
+        }
+      }
       const next = routeFromLocation();
-      if (navigationBypassHashRef.current === requestedHash) {
-        navigationBypassHashRef.current = undefined;
-        if (explicitDisconnectRef.current) {
-          window.history.replaceState(window.history.state, "", appRouteHash(routeRef.current));
+      const handoff = navigationHashHandoffRef.current;
+      if (handoff?.targetHash === requestedHash) {
+        navigationHashHandoffRef.current = undefined;
+        const current = navigationRequestRef.current === handoff.requestId
+          && !handoff.signal.aborted
+          && safeNavigationOwnerCurrent(handoff.isCurrent);
+        if (navigationRequestRef.current === handoff.requestId) navigationAbortRef.current = undefined;
+        if (!current) {
+          window.history.replaceState(window.history.state, "", handoff.rollbackHash);
           return;
         }
         commitRoute(next);
         return;
       }
+      navigationAbortRef.current?.abort();
+      navigationAbortRef.current = undefined;
+      navigationHashHandoffRef.current = undefined;
+      const requestId = ++navigationRequestRef.current;
       const leave = workspaceRouteLeaveRequest(routeRef.current, next);
       if (leave === undefined) {
         commitRoute(next);
         return;
       }
-      const requestId = ++navigationRequestRef.current;
-      const currentHash = appRouteHash(routeRef.current);
+      const requestAbort = new AbortController();
+      navigationAbortRef.current = requestAbort;
+      let currentHash = appRouteHash(routeRef.current);
+      if (event.oldURL !== "") {
+        try {
+          currentHash = new URL(event.oldURL).hash || currentHash;
+        } catch {
+          // Synthetic events may omit a parseable old URL; the route remains authoritative.
+        }
+      }
       window.history.replaceState(window.history.state, "", currentHash);
-      void requestWorkspaceDocumentLeave(leave).then((accepted) => {
-        if (!accepted || navigationRequestRef.current !== requestId) return;
-        navigationBypassHashRef.current = requestedHash;
+      void requestWorkspaceDocumentLeave({ ...leave, signal: requestAbort.signal }).then((accepted) => {
+        if (!accepted || navigationRequestRef.current !== requestId || requestAbort.signal.aborted) {
+          if (navigationRequestRef.current === requestId) navigationAbortRef.current = undefined;
+          return;
+        }
+        navigationHashHandoffRef.current = {
+          targetHash: requestedHash,
+          rollbackHash: currentHash,
+          requestId,
+          signal: requestAbort.signal,
+          isCurrent: () => true
+        };
         window.location.hash = requestedHash;
       });
     };
@@ -409,6 +469,9 @@ export function useAppController(): AppController {
       machineRefreshGenerationRef.current += 1;
       discoveryGenerationRef.current += 1;
       discoveryAbortRef.current?.abort();
+      navigationAbortRef.current?.abort();
+      navigationAbortRef.current = undefined;
+      navigationHashHandoffRef.current = undefined;
       window.removeEventListener("hashchange", onHashChange);
       gatewayRef.current?.disconnect();
       for (const binding of remoteMachineGatewaysRef.current.values()) {
@@ -958,6 +1021,13 @@ export function useAppController(): AppController {
     automaticPreferenceIntentRef.current += 1;
     machineSwitchIntentRef.current += 1;
     navigationRequestRef.current += 1;
+    navigationAbortRef.current?.abort();
+    navigationAbortRef.current = undefined;
+    const pendingNavigation = navigationHashHandoffRef.current;
+    navigationHashHandoffRef.current = undefined;
+    if (pendingNavigation !== undefined && window.location.hash === pendingNavigation.targetHash) {
+      window.history.replaceState(window.history.state, "", pendingNavigation.rollbackHash);
+    }
     gatewayGenerationRef.current += 1;
     const previous = gatewayRef.current;
     gatewayRef.current = undefined;
@@ -1025,29 +1095,85 @@ export function useAppController(): AppController {
     });
   }, [removeProfile, state.profiles]);
 
-  const navigate = useCallback((route: AppRoute, options?: { readonly replace?: boolean }): void => {
+  const navigate = useCallback((route: AppRoute, options?: {
+    readonly replace?: boolean;
+    readonly exactHash?: string;
+    readonly isCurrent?: () => boolean;
+    readonly signal?: AbortSignal;
+  }): void => {
+    const externalOwnerIsCurrent = (): boolean => {
+      if (options?.signal?.aborted === true) return false;
+      try {
+        return options?.isCurrent?.() !== false;
+      } catch {
+        return false;
+      }
+    };
+    if (!externalOwnerIsCurrent()) return;
+    const previousHandoff = navigationHashHandoffRef.current;
+    navigationHashHandoffRef.current = undefined;
+    navigationAbortRef.current?.abort();
+    if (previousHandoff !== undefined && window.location.hash === previousHandoff.targetHash) {
+      window.history.replaceState(window.history.state, "", previousHandoff.rollbackHash);
+    }
+    const requestId = ++navigationRequestRef.current;
+    const requestAbort = new AbortController();
+    navigationAbortRef.current = requestAbort;
+    const signal = options?.signal === undefined
+      ? requestAbort.signal
+      : AbortSignal.any([requestAbort.signal, options.signal]);
+    const ownerIsCurrent = (): boolean => navigationRequestRef.current === requestId
+      && !signal.aborted
+      && externalOwnerIsCurrent();
+    const finish = (): void => {
+      if (navigationRequestRef.current === requestId && navigationAbortRef.current === requestAbort) {
+        navigationAbortRef.current = undefined;
+      }
+    };
+    if (!ownerIsCurrent()) {
+      finish();
+      return;
+    }
     const effectiveRoute: AppRoute = route.kind === "session" && route.profileId === undefined && activeProfileRef.current !== undefined
       ? { ...route, profileId: activeProfileRef.current.id }
       : route;
-    const hash = appRouteHash(effectiveRoute);
+    const hash = options?.exactHash ?? appRouteHash(effectiveRoute);
     const commit = (): void => {
-      explicitDisconnectRef.current = false;
-      routeRef.current = effectiveRoute;
-      if (window.location.hash === hash) setState((current) => ({
-        ...current,
-        route: effectiveRoute,
-        navigationRevision: (current.navigationRevision ?? 0) + 1
-      }));
-      else if (options?.replace === true) {
-        navigationBypassHashRef.current = undefined;
-        window.history.replaceState(window.history.state, "", hash);
+      if (!ownerIsCurrent()) {
+        finish();
+        return;
+      }
+      if (window.location.hash === hash) {
+        explicitDisconnectRef.current = false;
+        routeRef.current = effectiveRoute;
+        navigationHashHandoffRef.current = undefined;
+        const navigationRevision = ++navigationRevisionRef.current;
         setState((current) => ({
           ...current,
           route: effectiveRoute,
-          navigationRevision: (current.navigationRevision ?? 0) + 1
+          navigationRevision
         }));
+        finish();
+      } else if (options?.replace === true) {
+        explicitDisconnectRef.current = false;
+        routeRef.current = effectiveRoute;
+        navigationHashHandoffRef.current = undefined;
+        window.history.replaceState(window.history.state, "", hash);
+        const navigationRevision = ++navigationRevisionRef.current;
+        setState((current) => ({
+          ...current,
+          route: effectiveRoute,
+          navigationRevision
+        }));
+        finish();
       } else {
-        navigationBypassHashRef.current = hash;
+        navigationHashHandoffRef.current = {
+          targetHash: hash,
+          rollbackHash: window.location.hash,
+          requestId,
+          signal,
+          isCurrent: ownerIsCurrent
+        };
         window.location.hash = hash;
       }
     };
@@ -1056,9 +1182,9 @@ export function useAppController(): AppController {
       commit();
       return;
     }
-    const requestId = ++navigationRequestRef.current;
-    void requestWorkspaceDocumentLeave(leave).then((accepted) => {
-      if (accepted && navigationRequestRef.current === requestId) commit();
+    void requestWorkspaceDocumentLeave({ ...leave, signal }).then((accepted) => {
+      if (accepted && ownerIsCurrent()) commit();
+      else finish();
     });
   }, [updatePreferences]);
 
@@ -1199,21 +1325,40 @@ export function useAppController(): AppController {
     navigate({ kind: "session", profileId });
   }, [connect, loadMachineSnapshot, navigate]);
 
-  const openMachineSession = useCallback(async (profileId: string, sessionId: string): Promise<void> => {
+  const openMachineSession = useCallback(async (
+    profileId: string,
+    sessionId: string,
+    messageTarget?: MachineSessionMessageTarget
+  ): Promise<void> => {
     const intent = ++machineSwitchIntentRef.current;
+    const routeOwner: MachineSessionRouteOwner = {
+      hash: appRouteHash(routeRef.current),
+      locationHash: window.location.hash,
+      navigationRevision: navigationRevisionRef.current
+    };
+    const isCurrentOwner = (): boolean => machineSwitchIntentRef.current === intent
+      && appRouteHash(routeRef.current) === routeOwner.hash
+      && window.location.hash === routeOwner.locationHash
+      && navigationRevisionRef.current === routeOwner.navigationRevision;
     const profile = profilesRef.current.find((candidate) => candidate.id === profileId);
     if (profile === undefined) throw new Error("The selected machine is no longer saved on this client.");
     const snapshot = await loadMachineSnapshot(profile);
+    if (!isCurrentOwner()) return;
     if (!snapshot.sessions.some((session) => session.id === sessionId)) {
       throw new Error("This cached task no longer exists on the selected machine.");
     }
-    if (machineSwitchIntentRef.current !== intent) return;
     if (activeProfileRef.current?.id !== profile.id || connectionStateRef.current !== "connected") await connect(profile);
-    if (machineSwitchIntentRef.current !== intent) return;
+    if (!isCurrentOwner()) return;
     if (!snapshotRef.current.sessions.some((session) => session.id === sessionId)) {
       throw new Error("The task disappeared while the selected machine was connecting.");
     }
-    navigate({ kind: "session", profileId, sessionId });
+    navigate({
+      kind: "session",
+      profileId,
+      sessionId,
+      ...(messageTarget?.messageId === undefined ? {} : { messageId: messageTarget.messageId }),
+      ...(messageTarget?.messageEventId === undefined ? {} : { messageEventId: messageTarget.messageEventId })
+    });
   }, [connect, loadMachineSnapshot, navigate]);
 
   const searchRemoteSessionMessages = useCallback(async (
@@ -1417,12 +1562,13 @@ export function useAppController(): AppController {
       && connectionStateRef.current === "connected"
       && snapshotRef.current.sessions.some((session) => session.id === route.sessionId)) return;
     const requestedHash = appRouteHash(route);
-    void openMachineSession(route.profileId, route.sessionId).catch((error: unknown) => {
-      if (appRouteHash(routeRef.current) !== requestedHash) return;
+    const requestedNavigationRevision = state.navigationRevision ?? 0;
+    void openMachineSession(route.profileId, route.sessionId, route).catch((error: unknown) => {
+      if (appRouteHash(routeRef.current) !== requestedHash
+        || navigationRevisionRef.current !== requestedNavigationRevision) return;
       setState((current) => ({ ...current, error: messageOf(error) }));
-      navigate({ kind: "session" }, { replace: true });
     });
-  }, [navigate, openMachineSession, state.connectionState, state.ready, state.route]);
+  }, [openMachineSession, state.connectionState, state.navigationRevision, state.ready, state.route]);
 
   const refreshDiscoveredNodes = useCallback(async (): Promise<void> => {
     const generation = ++discoveryGenerationRef.current;
@@ -3371,7 +3517,8 @@ function applyFavicon(dark: boolean): void {
     link.href = iconUrl;
   }
   const desktop = window.jokoDesktop;
-  if (desktop === undefined) return;
+  const documentQuery = new URLSearchParams(window.location.search);
+  if (desktop === undefined || documentQuery.has("sessionWindow") || documentQuery.has("extensionWindow")) return;
   const icon = new Image();
   icon.decoding = "async";
   icon.onload = () => {
@@ -3397,6 +3544,14 @@ function requireLocal(value: LocalState | undefined): LocalState {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : "Unexpected error";
+}
+
+function safeNavigationOwnerCurrent(isCurrent: () => boolean): boolean {
+  try {
+    return isCurrent();
+  } catch {
+    return false;
+  }
 }
 
 export type { InteractionView, PermissionMode };

@@ -33,6 +33,8 @@ export interface WorkspaceLeaveRequest {
   readonly reason: WorkspaceLeaveReason;
   readonly prompt: (input: WorkspaceLeavePromptInput) => Promise<WorkspaceLeaveChoice>;
   readonly matches?: (identity: WorkspaceDocumentIdentity) => boolean;
+  /** Retires a queued or visible leave request before it can mutate a document. */
+  readonly signal?: AbortSignal;
 }
 
 export interface WorkspaceDocumentRegistration {
@@ -95,27 +97,30 @@ export class WorkspaceDocumentController {
   requestLeave(request: WorkspaceLeaveRequest): Promise<boolean> {
     const run = this.#leaveTail.then(() => this.#requestLeave(request));
     this.#leaveTail = run.then(() => undefined, () => undefined);
-    return run;
+    return request.signal === undefined ? run : settleFalseOnAbort(run, request.signal);
   }
 
   async #requestLeave(request: WorkspaceLeaveRequest): Promise<boolean> {
+    if (workspaceLeaveAborted(request.signal)) return false;
     const pendingKeys = this.#dirtyEntries(request.matches).map(([key]) => key);
     for (let index = 0; index < pendingKeys.length; index += 1) {
+      if (workspaceLeaveAborted(request.signal)) return false;
       const key = pendingKeys[index]!;
       const entry = this.#documents.get(key);
       if (entry === undefined || !safeIsDirty(entry.document)) continue;
 
-      let choice: WorkspaceLeaveChoice;
+      let choice: WorkspaceLeaveChoice | undefined;
       try {
-        choice = await request.prompt({
+        choice = await abortableLeaveChoice(request.prompt({
           document: entry.document.identity,
           reason: request.reason,
           remainingDirtyDocuments: pendingKeys.length - index
-        });
+        }), request.signal);
       } catch {
         entry.document.focus?.();
         return false;
       }
+      if (choice === undefined || workspaceLeaveAborted(request.signal)) return false;
 
       const current = this.#documents.get(key);
       if (current?.registrationId !== entry.registrationId) continue;
@@ -125,8 +130,10 @@ export class WorkspaceDocumentController {
       }
 
       try {
+        if (workspaceLeaveAborted(request.signal)) return false;
         if (choice === "save") {
           const saved = await current.document.save();
+          if (workspaceLeaveAborted(request.signal)) return false;
           const latest = this.#documents.get(key);
           if (!saved || (latest?.registrationId === current.registrationId && safeIsDirty(latest.document))) {
             latest?.document.focus?.();
@@ -134,6 +141,7 @@ export class WorkspaceDocumentController {
           }
         } else {
           await current.document.discard();
+          if (workspaceLeaveAborted(request.signal)) return false;
           const latest = this.#documents.get(key);
           if (latest?.registrationId === current.registrationId && safeIsDirty(latest.document)) {
             latest.document.focus?.();
@@ -205,4 +213,56 @@ function safeIsDirty(document: WorkspaceDirtyDocument): boolean {
     // discard content that the registry can no longer inspect.
     return true;
   }
+}
+
+function workspaceLeaveAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted ?? false;
+}
+
+function settleFalseOnAbort(result: Promise<boolean>, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve, reject) => {
+    let settled = false;
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => finish(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void result.then(finish, (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+    if (signal.aborted) onAbort();
+  });
+}
+
+function abortableLeaveChoice(
+  result: Promise<WorkspaceLeaveChoice>,
+  signal: AbortSignal | undefined
+): Promise<WorkspaceLeaveChoice | undefined> {
+  if (signal === undefined) return result;
+  if (signal.aborted) return Promise.resolve(undefined);
+  return new Promise<WorkspaceLeaveChoice | undefined>((resolve, reject) => {
+    let settled = false;
+    const finish = (value: WorkspaceLeaveChoice | undefined): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => finish(undefined);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void result.then(finish, (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+    if (signal.aborted) onAbort();
+  });
 }

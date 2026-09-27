@@ -2,6 +2,8 @@ import { posix, win32 } from "node:path";
 
 import {
   isDesktopDeepLinkSettingsSection,
+  type DesktopDeepLinkAcknowledgement,
+  type DesktopDeepLinkDelivery,
   type DesktopDeepLinkNavigation,
   type DesktopDeepLinkSettingsSection
 } from "./channels.js";
@@ -35,9 +37,23 @@ export interface DesktopSessionDeepLinkInput {
   readonly messageEventId?: string;
 }
 
+export interface DesktopDeepLinkOffer {
+  readonly deliveryOccurrence: number;
+  readonly delivery?: DesktopDeepLinkDelivery;
+}
+
+/** A renderer Document changes only for a non-in-place main-frame navigation. */
+export function isDesktopMainDocumentReplacementNavigation(
+  isMainFrame: boolean,
+  isInPlace: boolean
+): boolean {
+  return isMainFrame && !isInPlace;
+}
+
 /** Parse only the public OS handoff surface. The privileged `joko://app` origin is intentionally rejected. */
 export function parseDesktopDeepLink(value: unknown): ParsedDesktopDeepLink | undefined {
-  if (typeof value !== "string" || value.length < 1 || value.length > MAXIMUM_DEEP_LINK_CHARACTERS) return undefined;
+  if (typeof value !== "string" || value.length < 1 || value.length > MAXIMUM_DEEP_LINK_CHARACTERS
+    || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
   let url: URL;
   try {
     url = new URL(value);
@@ -47,7 +63,7 @@ export function parseDesktopDeepLink(value: unknown): ParsedDesktopDeepLink | un
   if (url.protocol !== `${DESKTOP_DEEP_LINK_SCHEME}:` || url.username !== "" || url.password !== "" ||
     url.port !== "" || url.hash !== "") return undefined;
 
-  if (url.hostname === "task") return parseSessionUrl(url);
+  if (url.hostname === "task" || url.hostname === "session") return parseSessionUrl(url);
   if (url.hostname === "settings") return parseSettingsUrl(url);
   if (url.hostname === "focus") return parseFocusUrl(url);
   if (url.hostname === "portable" && url.pathname === "/import" && exactQuery(url, [])) {
@@ -68,23 +84,50 @@ export function buildDesktopSessionDeepLink(input: DesktopSessionDeepLinkInput):
   if (input.messageEventId !== undefined) query.set("event", input.messageEventId);
   if (input.messageId !== undefined) query.set("message", input.messageId);
   if (input.profileId !== undefined) query.set("profile", input.profileId);
-  return `${DESKTOP_DEEP_LINK_SCHEME}://task/${encodeURIComponent(input.sessionId)}` +
-    (query.size === 0 ? "" : `?${query.toString()}`);
+  return requireBoundedPublicDeepLink(`${DESKTOP_DEEP_LINK_SCHEME}://task/${encodeURIComponent(input.sessionId)}` +
+    (query.size === 0 ? "" : `?${query.toString()}`));
 }
 
 export function buildDesktopSettingsDeepLink(section: DesktopDeepLinkSettingsSection): string {
   if (!isDesktopDeepLinkSettingsSection(section)) throw new TypeError("Settings section is not public.");
-  return `${DESKTOP_DEEP_LINK_SCHEME}://settings/${section}`;
+  return requireBoundedPublicDeepLink(`${DESKTOP_DEEP_LINK_SCHEME}://settings/${section}`);
 }
 
 export function buildDesktopFocusDeepLink(source?: string): string {
-  if (source === undefined) return `${DESKTOP_DEEP_LINK_SCHEME}://focus`;
+  if (source === undefined) return requireBoundedPublicDeepLink(`${DESKTOP_DEEP_LINK_SCHEME}://focus`);
   if (!boundedText(source, MAXIMUM_FOCUS_SOURCE_CHARACTERS)) throw new TypeError("Focus source is invalid.");
-  return `${DESKTOP_DEEP_LINK_SCHEME}://focus/${encodeURIComponent(source)}`;
+  return requireBoundedPublicDeepLink(`${DESKTOP_DEEP_LINK_SCHEME}://focus/${encodeURIComponent(source)}`);
 }
 
 export function buildDesktopPortableDeepLink(): string {
-  return `${DESKTOP_DEEP_LINK_SCHEME}://portable/import`;
+  return requireBoundedPublicDeepLink(`${DESKTOP_DEEP_LINK_SCHEME}://portable/import`);
+}
+
+export function parseDesktopDeepLinkAcknowledgement(value: unknown): DesktopDeepLinkAcknowledgement {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Desktop deep-link acknowledgement must be an exact object.");
+  }
+  const candidate = value as Record<string, unknown>;
+  if (Object.keys(candidate).sort().join(",") !== "deliveryOccurrence,documentOccurrence"
+    || !boundedIdentity(candidate["documentOccurrence"])
+    || typeof candidate["deliveryOccurrence"] !== "number"
+    || !Number.isSafeInteger(candidate["deliveryOccurrence"])
+    || candidate["deliveryOccurrence"] < 1) {
+    throw new TypeError("Desktop deep-link acknowledgement is invalid.");
+  }
+  return Object.freeze({
+    documentOccurrence: candidate["documentOccurrence"],
+    deliveryOccurrence: candidate["deliveryOccurrence"]
+  });
+}
+
+export function desktopDeepLinkDeliveryMatchesAcknowledgement(
+  delivery: Pick<DesktopDeepLinkDelivery, "deliveryOccurrence"> & { readonly documentOccurrence?: string },
+  acknowledgement: DesktopDeepLinkAcknowledgement
+): boolean {
+  return delivery.documentOccurrence !== undefined
+    && delivery.documentOccurrence === acknowledgement.documentOccurrence
+    && delivery.deliveryOccurrence === acknowledgement.deliveryOccurrence;
 }
 
 /** Find the last OS handoff argument without resolving arbitrary paths or accepting folder switches. */
@@ -109,29 +152,82 @@ export function isPortableSessionPath(value: unknown, platform: NodeJS.Platform)
 }
 
 /**
- * Main and renderer use a pull-on-mount handshake. Before the handshake the
- * latest valid OS intent is buffered; afterwards a new intent can be pushed
- * immediately. A renderer reload closes the gate again.
+ * Main and renderer use a pull-on-mount handshake. The latest valid OS intent
+ * remains retained until the exact document and delivery occurrences
+ * acknowledge it. A replacement preload capture closes the old gate without
+ * discarding that intent, so a committed replacement document can reclaim it
+ * safely while a cancelled navigation leaves the existing gate usable.
  */
 export class DesktopDeepLinkDeliveryBuffer {
-  private pending: DesktopDeepLinkNavigation | undefined;
-  private rendererReady = false;
+  private pending: {
+    readonly deliveryOccurrence: number;
+    readonly navigation: DesktopDeepLinkNavigation;
+  } | undefined;
+  private readyDocumentOccurrence: string | undefined;
+  private nextDeliveryOccurrence = 0;
 
-  offer(value: DesktopDeepLinkNavigation): DesktopDeepLinkNavigation | undefined {
-    if (this.rendererReady) return value;
-    this.pending = value;
-    return undefined;
+  offer(value: DesktopDeepLinkNavigation): DesktopDeepLinkDelivery | undefined {
+    return this.offerWithOccurrence(value).delivery;
   }
 
-  takeAfterRendererReady(): DesktopDeepLinkNavigation | undefined {
-    this.rendererReady = true;
-    const value = this.pending;
+  offerWithOccurrence(value: DesktopDeepLinkNavigation): DesktopDeepLinkOffer {
+    this.nextDeliveryOccurrence += 1;
+    if (!Number.isSafeInteger(this.nextDeliveryOccurrence)) {
+      throw new RangeError("Desktop deep-link delivery occurrence capacity was reached.");
+    }
+    this.pending = Object.freeze({
+      deliveryOccurrence: this.nextDeliveryOccurrence,
+      navigation: value
+    });
+    const delivery = this.currentClaim();
+    return Object.freeze({
+      deliveryOccurrence: this.nextDeliveryOccurrence,
+      ...(delivery === undefined ? {} : { delivery })
+    });
+  }
+
+  /**
+   * Retire an older delivery as soon as a newer navigation intent wins native
+   * ingress. Keep the current renderer ready occurrence so the replacement can
+   * be delivered live after any bounded native materialization finishes.
+   */
+  retirePendingForNewNavigation(): void {
     this.pending = undefined;
-    return value;
+  }
+
+  takeAfterRendererReady(documentOccurrence: string): DesktopDeepLinkDelivery | undefined {
+    if (!boundedIdentity(documentOccurrence)) {
+      throw new TypeError("Desktop deep-link document occurrence is invalid.");
+    }
+    if (this.readyDocumentOccurrence !== undefined && this.readyDocumentOccurrence !== documentOccurrence) {
+      return undefined;
+    }
+    this.readyDocumentOccurrence = documentOccurrence;
+    return this.currentClaim();
+  }
+
+  acknowledge(acknowledgement: DesktopDeepLinkAcknowledgement): boolean {
+    const pending = this.pending;
+    if (pending === undefined || acknowledgement.documentOccurrence !== this.readyDocumentOccurrence ||
+      acknowledgement.deliveryOccurrence !== pending.deliveryOccurrence) return false;
+    this.pending = undefined;
+    return true;
   }
 
   resetRenderer(): void {
-    this.rendererReady = false;
+    this.readyDocumentOccurrence = undefined;
+  }
+
+  private currentClaim(): DesktopDeepLinkDelivery | undefined {
+    const pending = this.pending;
+    const documentOccurrence = this.readyDocumentOccurrence;
+    return pending === undefined || documentOccurrence === undefined
+      ? undefined
+      : Object.freeze({
+          documentOccurrence,
+          deliveryOccurrence: pending.deliveryOccurrence,
+          navigation: pending.navigation
+        });
   }
 }
 
@@ -226,4 +322,11 @@ function boundedText(value: unknown, maximum: number): value is string {
 
 function requireIdentity(value: unknown, label: string): asserts value is string {
   if (!boundedIdentity(value)) throw new TypeError(`${label} is invalid.`);
+}
+
+function requireBoundedPublicDeepLink(value: string): string {
+  if (value.length > MAXIMUM_DEEP_LINK_CHARACTERS) {
+    throw new RangeError("Desktop deep link exceeds the public handoff limit.");
+  }
+  return value;
 }

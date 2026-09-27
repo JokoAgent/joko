@@ -4,6 +4,8 @@ import type {
   DesktopApplicationMenuCommand,
   DesktopApplicationMenuConfigurationPatch,
   DesktopDiscoveredNode,
+  DesktopDeepLinkAcknowledgement,
+  DesktopDeepLinkDelivery,
   DesktopExtensionWindowOpenResult,
   DesktopExtensionLibraryBeginSaveRequest,
   DesktopExtensionLibraryClipboardRequest,
@@ -107,6 +109,7 @@ const DESKTOP_CHANNELS = {
   runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
   runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
   runtimeProcessDiagnosticsRetired: "joko:runtime-process-diagnostics:retired",
+  runtimeProcessDiagnosticsRetiredAcknowledge: "joko:runtime-process-diagnostics:retired:acknowledge",
   layoutReset: "joko:layout:reset",
   layoutResetBroadcast: "joko:layout:reset-broadcast",
   windowInteractionGet: "joko:window-interaction:get",
@@ -132,9 +135,9 @@ const DESKTOP_CHANNELS = {
   inspectorWindowClosed: "joko:inspector-window:closed",
   traySetIcon: "joko:tray:set-icon",
   notify: "joko:notify",
-  notificationFocusSession: "joko:notification:focus-session",
   attentionMark: "joko:attention:mark",
   attentionClear: "joko:attention:clear",
+  mainDocumentOccurrenceGet: "joko:main-document:occurrence:get",
   nativeTaskStatusGetAvailability: "joko:native-task-status:availability:get",
   nativeTaskStatusGetSettings: "joko:native-task-status:settings:get",
   nativeTaskStatusSetSettings: "joko:native-task-status:settings:set",
@@ -184,6 +187,7 @@ const DESKTOP_CHANNELS = {
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
+  deepLinkAcknowledge: "joko:deep-link:acknowledge",
   deepLinkNavigate: "joko:deep-link:navigate",
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
@@ -219,10 +223,28 @@ const DESKTOP_CHANNELS = {
   updateChannelRelaunch: "joko:update:channel:relaunch"
 } as const satisfies typeof import("./channels.js").DESKTOP_CHANNELS;
 
+const mainDocumentPreloadClaim = createMainDocumentPreloadClaim();
+const mainDocumentOccurrenceValue: unknown = ipcRenderer.sendSync(
+  DESKTOP_CHANNELS.mainDocumentOccurrenceGet,
+  mainDocumentPreloadClaim
+);
+const mainDocumentOccurrence = isDesktopDeepLinkOccurrence(mainDocumentOccurrenceValue)
+  ? mainDocumentOccurrenceValue
+  : undefined;
+
+function createMainDocumentPreloadClaim(): string {
+  if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hexadecimal = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hexadecimal.slice(0, 8)}-${hexadecimal.slice(8, 12)}-${hexadecimal.slice(12, 16)}-${hexadecimal.slice(16, 20)}-${hexadecimal.slice(20)}`;
+}
 const nativeTaskStatusSupported = ipcRenderer.sendSync(
   DESKTOP_CHANNELS.nativeTaskStatusGetAvailability
 ) === true;
-const attentionBadgeSupported = process.platform === "darwin" || process.platform === "win32";
+const attentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
+  || process.platform === "linux";
 const desktopCapabilities = Object.freeze([
   "app.info",
   "navigation.deepLinks",
@@ -471,18 +493,10 @@ const desktopApi = Object.freeze({
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.selectionContextMenuAddToChat, wrapped);
     }
   }),
-  setTrayIcon: (dataUrl: string): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.traySetIcon, dataUrl),
-  notify: (notification: DesktopNotification): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.notify, notification),
-  notifications: Object.freeze({
-    onFocusSession: (listener: (sessionId: string) => void): (() => void) => {
-      if (typeof listener !== "function") throw new TypeError("Desktop notification focus listener must be a function.");
-      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
-        if (isDesktopNotificationSessionId(value)) listener(value);
-      };
-      ipcRenderer.on(DESKTOP_CHANNELS.notificationFocusSession, wrapped);
-      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.notificationFocusSession, wrapped);
-    }
-  }),
+  setTrayIcon: (dataUrl: string): Promise<void> =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.traySetIcon, mainDocumentOccurrence, dataUrl),
+  notify: (notification: DesktopNotification): Promise<void> =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.notify, mainDocumentOccurrence, notification),
   attention: Object.freeze({
     mark: (key: DesktopAttentionKey): Promise<void> => invokeDesktopAttention(
       DESKTOP_CHANNELS.attentionMark,
@@ -717,16 +731,24 @@ const desktopApi = Object.freeze({
   choosePortableSessionFile: (): Promise<DesktopFile | undefined> =>
     ipcRenderer.invoke(DESKTOP_CHANNELS.choosePortableSessionFile),
   deepLinks: Object.freeze({
-    takePending: (): Promise<DesktopDeepLinkNavigation | undefined> =>
-      ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkTakePending).then((value: unknown) =>
-        value === undefined ? undefined : parseDesktopDeepLinkNavigation(value)),
-    onNavigate: (listener: (navigation: DesktopDeepLinkNavigation) => void): (() => void) => {
+    takePending: (): Promise<DesktopDeepLinkDelivery | undefined> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkTakePending, mainDocumentOccurrence).then((value: unknown) =>
+        value === undefined ? undefined : requireCurrentDesktopDeepLinkDelivery(value)),
+    acknowledge: (acknowledgement: DesktopDeepLinkAcknowledgement): Promise<boolean> => {
+      const parsed = parseDesktopDeepLinkAcknowledgement(acknowledgement);
+      if (mainDocumentOccurrence === undefined || parsed.documentOccurrence !== mainDocumentOccurrence) {
+        return Promise.reject(new TypeError("Desktop deep-link acknowledgement crossed its Document occurrence."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkAcknowledge, parsed).then(parseDesktopBoolean);
+    },
+    onNavigate: (listener: (delivery: DesktopDeepLinkDelivery) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("Desktop deep-link listener must be a function.");
       const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
         try {
-          listener(parseDesktopDeepLinkNavigation(value));
+          listener(requireCurrentDesktopDeepLinkDelivery(value));
         } catch {
-          // Ignore malformed host messages; the pending pull remains authoritative after a reload.
+          // Ignore malformed or retired-Document host messages; the current
+          // occurrence's pending pull remains authoritative after a reload.
         }
       };
       ipcRenderer.on(DESKTOP_CHANNELS.deepLinkNavigate, wrapped);
@@ -974,6 +996,46 @@ function parseDesktopDeepLinkNavigation(value: unknown): DesktopDeepLinkNavigati
   throw new TypeError("Desktop deep-link navigation kind is invalid.");
 }
 
+function parseDesktopDeepLinkDelivery(value: unknown): DesktopDeepLinkDelivery {
+  if (!nativeRecord(value) || nativeKeys(value) !== "deliveryOccurrence,documentOccurrence,navigation"
+    || !isDesktopDeepLinkOccurrence(value["documentOccurrence"])
+    || !Number.isSafeInteger(value["deliveryOccurrence"])
+    || (value["deliveryOccurrence"] as number) < 1) {
+    throw new TypeError("Desktop deep-link delivery is invalid.");
+  }
+  return Object.freeze({
+    documentOccurrence: value["documentOccurrence"],
+    deliveryOccurrence: value["deliveryOccurrence"] as number,
+    navigation: parseDesktopDeepLinkNavigation(value["navigation"])
+  });
+}
+
+function parseDesktopDeepLinkAcknowledgement(value: unknown): DesktopDeepLinkAcknowledgement {
+  if (!nativeRecord(value) || nativeKeys(value) !== "deliveryOccurrence,documentOccurrence"
+    || !isDesktopDeepLinkOccurrence(value["documentOccurrence"])
+    || !Number.isSafeInteger(value["deliveryOccurrence"])
+    || (value["deliveryOccurrence"] as number) < 1) {
+    throw new TypeError("Desktop deep-link acknowledgement is invalid.");
+  }
+  return Object.freeze({
+    documentOccurrence: value["documentOccurrence"],
+    deliveryOccurrence: value["deliveryOccurrence"] as number
+  });
+}
+
+function requireCurrentDesktopDeepLinkDelivery(value: unknown): DesktopDeepLinkDelivery {
+  const delivery = parseDesktopDeepLinkDelivery(value);
+  if (mainDocumentOccurrence === undefined || delivery.documentOccurrence !== mainDocumentOccurrence) {
+    throw new TypeError("Desktop deep-link delivery crossed its Document occurrence.");
+  }
+  return delivery;
+}
+
+function isDesktopDeepLinkOccurrence(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
 function invokeDesktopAttention(channel: string, key: DesktopAttentionKey): Promise<void> {
   let parsed: DesktopAttentionKey;
   try {
@@ -981,7 +1043,7 @@ function invokeDesktopAttention(channel: string, key: DesktopAttentionKey): Prom
   } catch (error) {
     return Promise.reject(error);
   }
-  return ipcRenderer.invoke(channel, parsed);
+  return ipcRenderer.invoke(channel, mainDocumentOccurrence, parsed);
 }
 
 function parseDesktopAttentionKey(value: unknown): DesktopAttentionKey {

@@ -26,6 +26,7 @@ export const DESKTOP_CHANNELS = {
   runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
   runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
   runtimeProcessDiagnosticsRetired: "joko:runtime-process-diagnostics:retired",
+  runtimeProcessDiagnosticsRetiredAcknowledge: "joko:runtime-process-diagnostics:retired:acknowledge",
   layoutReset: "joko:layout:reset",
   layoutResetBroadcast: "joko:layout:reset-broadcast",
   windowInteractionGet: "joko:window-interaction:get",
@@ -51,9 +52,9 @@ export const DESKTOP_CHANNELS = {
   inspectorWindowClosed: "joko:inspector-window:closed",
   traySetIcon: "joko:tray:set-icon",
   notify: "joko:notify",
-  notificationFocusSession: "joko:notification:focus-session",
   attentionMark: "joko:attention:mark",
   attentionClear: "joko:attention:clear",
+  mainDocumentOccurrenceGet: "joko:main-document:occurrence:get",
   nativeTaskStatusGetAvailability: "joko:native-task-status:availability:get",
   nativeTaskStatusGetSettings: "joko:native-task-status:settings:get",
   nativeTaskStatusSetSettings: "joko:native-task-status:settings:set",
@@ -103,6 +104,7 @@ export const DESKTOP_CHANNELS = {
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
+  deepLinkAcknowledge: "joko:deep-link:acknowledge",
   deepLinkNavigate: "joko:deep-link:navigate",
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
@@ -491,6 +493,29 @@ export type DesktopDeepLinkNavigation =
   | { readonly kind: "settings"; readonly section: DesktopDeepLinkSettingsSection }
   | { readonly kind: "portable"; readonly file?: DesktopFile };
 
+export interface DesktopDeepLinkDelivery {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+  readonly navigation: DesktopDeepLinkNavigation;
+}
+
+export interface DesktopDeepLinkAcknowledgement {
+  readonly documentOccurrence: string;
+  readonly deliveryOccurrence: number;
+}
+
+export function requireCurrentDesktopMainDocumentOccurrence(
+  captured: unknown,
+  current: string | undefined
+): string {
+  if (!isDesktopMainDocumentOccurrence(captured)
+    || !isDesktopMainDocumentOccurrence(current)
+    || captured !== current) {
+    throw new Error("Desktop IPC did not originate from the current main application Document occurrence.");
+  }
+  return captured;
+}
+
 export interface DesktopSaveFileRequest {
   readonly name: string;
   readonly mediaType: string;
@@ -500,12 +525,21 @@ export interface DesktopSaveFileRequest {
 export interface DesktopNotification {
   readonly title: string;
   readonly body: string;
-  readonly sessionId?: string;
+  readonly navigation?: {
+    readonly kind: "session";
+    readonly profileId: string;
+    readonly sessionId: string;
+  };
 }
 
 export interface DesktopAttentionKey {
   readonly ownerId: string;
   readonly sessionId: string;
+}
+
+function isDesktopMainDocumentOccurrence(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 export type DesktopNativeTaskStatusPhase = "running" | "interaction" | "completed" | "error";

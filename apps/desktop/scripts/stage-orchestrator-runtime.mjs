@@ -24,6 +24,7 @@ import {
   copyRegularTree,
   digestFile,
   extensionLibraryElectronSmokeSource,
+  normalizeRuntimeCommandShims,
   removeSafeTemporaryDirectory,
   replaceDirectoryFromPrepared,
   rewriteRuntimePackageManifestFile,
@@ -95,6 +96,7 @@ try {
     skip: (path) => skippedInstalledPath(path)
   });
   await overlayWorkspacePackages();
+  const normalizedCommandShims = await normalizeRuntimeCommandShims(workspaceRoot, candidateRoot);
   await auditRegularRuntimeTree(candidateRoot);
   const optionalDependency = await assertOptionalDependencyPreserved(candidateRoot);
   const importSmoke = await runCandidateImportSmoke(candidateRoot);
@@ -122,6 +124,7 @@ try {
     destinationRoot,
     files: audit.files,
     bytes: audit.bytes,
+    normalizedCommandShims,
     optionalDependency,
     criticalImportsResolvedWithinCandidate: importSmoke.criticalImports,
     piCliResolvedWithinCandidate: importSmoke.piCli,

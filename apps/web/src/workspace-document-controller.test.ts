@@ -75,6 +75,54 @@ describe("WorkspaceDocumentController", () => {
     expect(focus).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["save", "discard"] as const)("retires an active leave before a late %s choice can mutate the document", async (choice) => {
+    const controller = new WorkspaceDocumentController();
+    const save = vi.fn(async () => true);
+    const discard = vi.fn();
+    const focus = vi.fn();
+    const document = fixture({ save, discard, focus });
+    controller.register(document);
+    const selected = deferred<WorkspaceLeaveChoice>();
+    const prompt = vi.fn(() => selected.promise);
+    const owner = new AbortController();
+
+    const leave = controller.requestLeave({ reason: "route-change", prompt, signal: owner.signal });
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+    owner.abort();
+
+    await expect(leave).resolves.toBe(false);
+    selected.resolve(choice);
+    await Promise.resolve();
+    expect(save).not.toHaveBeenCalled();
+    expect(discard).not.toHaveBeenCalled();
+    expect(focus).not.toHaveBeenCalled();
+    expect(document.dirty).toBe(true);
+  });
+
+  it("retires an aborted queued leave without ever presenting its prompt", async () => {
+    const controller = new WorkspaceDocumentController();
+    controller.register(fixture());
+    const activeChoice = deferred<WorkspaceLeaveChoice>();
+    const activePrompt = vi.fn(() => activeChoice.promise);
+    const activeLeave = controller.requestLeave({ reason: "route-change", prompt: activePrompt });
+    await vi.waitFor(() => expect(activePrompt).toHaveBeenCalledOnce());
+
+    const queuedOwner = new AbortController();
+    const queuedPrompt = vi.fn<() => Promise<WorkspaceLeaveChoice>>();
+    const queuedLeave = controller.requestLeave({
+      reason: "switch-session",
+      prompt: queuedPrompt,
+      signal: queuedOwner.signal
+    });
+    queuedOwner.abort();
+    await expect(queuedLeave).resolves.toBe(false);
+
+    activeChoice.resolve("cancel");
+    await expect(activeLeave).resolves.toBe(false);
+    await Promise.resolve();
+    expect(queuedPrompt).not.toHaveBeenCalled();
+  });
+
   it("scopes dirty checks and protects a replacement from stale cleanup", async () => {
     const controller = new WorkspaceDocumentController();
     const first = controller.register(fixture());
@@ -103,3 +151,9 @@ describe("WorkspaceDocumentController", () => {
     }
   });
 });
+
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
+}

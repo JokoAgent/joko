@@ -83,6 +83,7 @@ interface DiagnosticsApi {
 function loadPreload(): {
   readonly api: DiagnosticsApi;
   readonly invoke: ReturnType<typeof vi.fn>;
+  readonly send: ReturnType<typeof vi.fn>;
   readonly listeners: Map<string, (...parameters: unknown[]) => void>;
   readonly removeListener: ReturnType<typeof vi.fn>;
   readonly exposedNames: readonly string[];
@@ -101,6 +102,7 @@ function loadPreload(): {
   const removeListener = vi.fn((channel: string, listener: (...parameters: unknown[]) => void): void => {
     if (listeners.get(channel) === listener) listeners.delete(channel);
   });
+  const send = vi.fn();
   const exposures = new Map<string, unknown>();
   const electron = {
     contextBridge: {
@@ -108,6 +110,7 @@ function loadPreload(): {
     },
     ipcRenderer: {
       invoke,
+      send,
       on: (channel: string, listener: (...parameters: unknown[]) => void): void => { listeners.set(channel, listener); },
       removeListener
     }
@@ -135,6 +138,7 @@ function loadPreload(): {
   return {
     api: exposures.get("jokoRuntimeProcessDiagnostics") as DiagnosticsApi,
     invoke,
+    send,
     listeners,
     removeListener,
     exposedNames: [...exposures.keys()]
@@ -189,8 +193,20 @@ describe("runtime process monitor dedicated preload", () => {
 
     const onRetired = vi.fn();
     const releaseRetired = loaded.api.onRetired(onRetired);
-    loaded.listeners.get("joko:runtime-process-diagnostics:retired")?.({});
+    const retirement = { version: 1, retirementOccurrence: "00000000-0000-4000-8000-000000000099" };
+    loaded.listeners.get("joko:runtime-process-diagnostics:retired")?.({}, retirement);
     expect(onRetired).toHaveBeenCalledTimes(1);
+    expect(loaded.send).toHaveBeenCalledWith(
+      "joko:runtime-process-diagnostics:retired:acknowledge",
+      retirement
+    );
+    expect(onRetired.mock.invocationCallOrder[0]!).toBeLessThan(loaded.send.mock.invocationCallOrder[0] ?? 0);
+    loaded.listeners.get("joko:runtime-process-diagnostics:retired")?.({}, {
+      ...retirement,
+      bearer: "secret"
+    });
+    expect(onRetired).toHaveBeenCalledTimes(1);
+    expect(loaded.send).toHaveBeenCalledTimes(1);
     releaseRetired();
   });
 });

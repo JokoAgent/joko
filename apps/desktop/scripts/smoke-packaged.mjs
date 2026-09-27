@@ -1,5 +1,15 @@
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  readdirSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -12,6 +22,20 @@ import {
   sqliteVecElectronSmokeSource,
   terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
+import { capturePackagedSmokeProcessBirthIdentitySync } from "../dist/packaged-smoke-process-identity.js";
+import {
+  applyPrimaryChildExitFence,
+  authoritativeSmokeJourneyError,
+  canonicalSmokeDirectoryForRemoval,
+  claimSmokeJourneyFailure,
+  compareConfiguredExtraResourceMirrors,
+  comparePackagedApplicationMirror,
+  finalizeSmokeRun,
+  managedRuntimeCleanupDecision,
+  observePrimaryChild,
+  parseManagedRuntimeProcessMarker,
+  runIdentityFencedProcessEffect
+} from "./smoke-packaged-helpers.mjs";
 
 // Without arguments this exercises the staged development host. `--unpacked`
 // launches electron-builder's real app.isPackaged output with its external
@@ -19,159 +43,358 @@ import {
 const require = createRequire(import.meta.url);
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const releaseRoot = resolve(appRoot, "release");
-const useUnpackedArtifact = parseArguments(process.argv.slice(2));
+const smokeOptions = parseArguments(process.argv.slice(2));
+const useUnpackedArtifact = smokeOptions.unpacked;
+const smokeScope = smokeOptions.inspector ? "inspector" : "full";
 const executable = useUnpackedArtifact ? resolveUnpackedExecutable(releaseRoot) : require("electron");
+if (useUnpackedArtifact) assertUnpackedArtifactFresh(executable);
 const dedicatedHardwareUtilityEntry = resolveDedicatedHardwareUtilityEntry(executable, useUnpackedArtifact);
+if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+  throw new Error("Packaged desktop smoke requires a display server on Linux. Run it under `xvfb-run -a` in headless environments.");
+}
 const markerDirectory = mkdtempSync(resolve(tmpdir(), "joko-desktop-smoke-"));
 const markerPath = resolve(markerDirectory, "result.txt");
 const smokeUserDataPath = resolve(markerDirectory, "user-data");
 const timeoutMs = boundedTimeout(process.env.JOKO_DESKTOP_SMOKE_TIMEOUT_MS);
-if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
-  rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  throw new Error("Packaged desktop smoke requires a display server on Linux. Run it under `xvfb-run -a` in headless environments.");
-}
-let sqliteVecSmoke;
-let extensionLibrarySmoke;
-let terminalSmoke;
-let claudeSessionSmoke;
-try {
+const smokeDeadline = Date.now() + timeoutMs;
+
+await finalizeSmokeRun({
+  runJourney: runSmokeJourney,
+  cleanupTemporaryDirectory: () => removeMarkerDirectory(markerDirectory),
+  retainFailure: process.env.JOKO_DESKTOP_SMOKE_KEEP_FAILED === "1",
+  reportRetained: () => process.stderr.write(`JOKO_DESKTOP_SMOKE_RETAINED ${markerDirectory}\n`),
+  emitSuccess: (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`)
+});
+
+async function runSmokeJourney() {
   // Electron's app.setPath throws when its directory does not already exist.
   // Create the isolated smoke profile before the main module receives it.
   mkdirSync(smokeUserDataPath, { recursive: false, mode: 0o700 });
-  sqliteVecSmoke = await runNativeElectronSmoke(
+  const sqliteVecSmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
     markerDirectory,
     "sqlite-vec",
-    sqliteVecElectronSmokeSource(process.platform, process.arch)
+    sqliteVecElectronSmokeSource(process.platform, process.arch),
+    smokeDeadline
   );
-  extensionLibrarySmoke = await runNativeElectronSmoke(
+  const extensionLibrarySmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
     markerDirectory,
     "extension-library",
-    extensionLibraryElectronSmokeSource()
+    extensionLibraryElectronSmokeSource(),
+    smokeDeadline
   );
   if (extensionLibrarySmoke.sqlite !== true || extensionLibrarySmoke.changes !== 1 || extensionLibrarySmoke.selectedValue !== "electron-worker") {
     throw new Error("Electron-Node Extension Library smoke returned an invalid SQLite round trip.");
   }
-  terminalSmoke = await runNativeElectronSmoke(
+  const terminalSmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
     markerDirectory,
     "terminal",
-    terminalElectronSmokeSource(process.platform, process.arch)
+    terminalElectronSmokeSource(process.platform, process.arch),
+    smokeDeadline
   );
   if (terminalSmoke.tty !== true || terminalSmoke.input !== true || terminalSmoke.resized !== true || terminalSmoke.exitCode !== 0 || terminalSmoke.hostCleanup !== true) {
     throw new Error("Electron-Node terminal smoke returned an invalid PTY handshake.");
   }
-  claudeSessionSmoke = await runNativeElectronSmoke(
+  const claudeSessionSmoke = await runNativeElectronSmoke(
     executable,
     resolveOrchestratorRuntimeRoot(executable, useUnpackedArtifact),
     markerDirectory,
     "session-sdk",
-    claudeSessionElectronSmokeSource(process.platform, process.arch)
+    claudeSessionElectronSmokeSource(process.platform, process.arch),
+    smokeDeadline
   );
   if (claudeSessionSmoke.missingSession !== true || claudeSessionSmoke.workerRetired !== true || claudeSessionSmoke.isolatedProfileUnchanged !== true) {
     throw new Error("Electron-Node Session SDK smoke returned an invalid Worker result.");
   }
   process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", dedicatedHardwareUtilityEntry, sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
-} catch (error) {
-  rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  throw error;
-}
-const connectSmoke = await createConnectSmokeServer();
-let providerSmoke;
-try {
-  providerSmoke = await createProviderSmokeServer();
-} catch (error) {
-  await connectSmoke.close();
-  throw error;
-}
-const childEnvironment = {
-  ...process.env,
-  ELECTRON_ENABLE_LOGGING: "1",
-  JOKO_DESKTOP_PACKAGED_SMOKE: "1",
-  JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN: connectSmoke.origin,
-  JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN: connectSmoke.publicOrigin,
-  JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN: providerSmoke.origin,
-  JOKO_DESKTOP_SMOKE_RESULT: markerPath,
-  JOKO_DESKTOP_SMOKE_USER_DATA: smokeUserDataPath
-};
-// A parent Node process may itself run with this Electron development flag.
-// Inheriting it would make the packaged executable run as Node instead of
-// exercising Chromium, preload isolation, file navigation and renderer boot.
-delete childEnvironment.ELECTRON_RUN_AS_NODE;
-const child = spawn(executable, [
-  ...(process.platform === "linux" && process.env.JOKO_DESKTOP_SMOKE_NO_SANDBOX === "1" ? ["--no-sandbox"] : []),
-  "--disable-gpu",
-  "--enable-logging=stderr",
-  "--host-resolver-rules=MAP public.example 127.0.0.1",
-  ...(useUnpackedArtifact ? [] : [appRoot])
-], {
-  cwd: useUnpackedArtifact ? dirname(executable) : appRoot,
-  env: childEnvironment,
-  stdio: ["ignore", "pipe", "pipe"],
-  windowsHide: true
-});
 
-let stdout = "";
-let stderr = "";
-child.stdout.setEncoding("utf8");
-child.stderr.setEncoding("utf8");
-child.stdout.on("data", (chunk) => {
-  stdout += chunk;
-  process.stdout.write(chunk);
-});
-child.stderr.on("data", (chunk) => {
-  stderr += chunk;
-  process.stderr.write(chunk);
-});
-
-let timedOut = false;
-const timeout = setTimeout(() => {
-  timedOut = true;
-  child.kill("SIGKILL");
-}, timeoutMs);
-let result;
-try {
-  result = await new Promise((resolvePromise, reject) => {
-    child.once("error", reject);
-    // Electron may report process exit before Chromium helpers have closed the
-    // inherited stdio pipes. Waiting for close keeps profile cleanup from
-    // racing their final user-data writes, especially on macOS.
-    child.once("close", (code, signal) => resolvePromise({ code, signal }));
-  });
-} finally {
-  clearTimeout(timeout);
-  await Promise.all([connectSmoke.close(), providerSmoke.close()]);
-}
-const marker = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
-const progressPath = `${markerPath}.progress`;
-const progress = existsSync(progressPath) ? readFileSync(progressPath, "utf8").trim().replace(/\n/gu, " -> ") : "";
-const managedOrigin = readManagedOrigin(resolve(markerDirectory, "user-data", "managed-orchestrator-host", "connection.json"));
-const managedOrchestratorStopped = managedOrigin === undefined || await waitForManagedOrchestratorExit(managedOrigin, 5_000);
-const failed = (
-  timedOut || marker !== "JOKO_DESKTOP_SMOKE_OK" || result.code !== 0 || result.signal !== null ||
-  connectSmoke.observations.preflightOrigin !== "joko://app" ||
-  connectSmoke.observations.requestOrigin !== "joko://app" ||
-  connectSmoke.observations.requestBody !== "{}" ||
-  connectSmoke.observations.publicRequestSeen ||
-  providerSmoke.observations.unexpectedRequests.length > 0 ||
-  !managedOrchestratorStopped
-);
-if (!failed || process.env.JOKO_DESKTOP_SMOKE_KEEP_FAILED !== "1") {
-  rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-} else {
-  process.stderr.write(`JOKO_DESKTOP_SMOKE_RETAINED ${markerDirectory}\n`);
-}
-if (failed) {
-  throw new Error(
-    `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}, provider=${JSON.stringify(providerSmoke.observations)}): ${stderr.slice(-1_000)}`
+  const connectSmoke = await createConnectSmokeServer();
+  const requiredSystemHandoffProgress = smokeScope === "full" ? [
+    "system_handoff_cold_argv_ingress",
+    "system_handoff_cancelled_navigation_preserved",
+    "system_handoff_failed_document_request_injected",
+    "system_handoff_failed_document_load_stopped",
+    "system_handoff_failed_navigation_preserved",
+    "system_handoff_second_instance_ingress",
+    "system_handoff_second_instance_delivery_acknowledged",
+    "system_handoff_second_instance_acknowledged",
+    "system_handoff_deep_link_acknowledged",
+    "system_handoff_primary_surfaces_verified",
+    "system_handoff_auxiliary_owner_fenced",
+    "system_handoff_tray_reopened"
+  ] : [];
+  let providerSmoke;
+  let child;
+  let secondInstance;
+  let timeout;
+  let timedOut = false;
+  let orchestrationError;
+  let primaryTermination;
+  let primaryTerminationError;
+  let managedConnectionError;
+  let managedConnection;
+  let managedRuntimeProcessError;
+  let managedRuntimeProcessMarker;
+  let managedRuntimeProcessId;
+  let managedRuntimeEndpointState = "not-probed";
+  let managedRuntimeWasLiveAtCleanup = false;
+  let managedRuntimeProcessStopped = false;
+  let result = { code: undefined, signal: undefined };
+  let stderr = "";
+  const journeyAbort = new AbortController();
+  const deadline = smokeDeadline;
+  const managedConnectionPath = resolve(
+    markerDirectory,
+    "user-data",
+    "managed-orchestrator-host",
+    "connection.json"
   );
+  const managedRuntimeProcessPath = `${markerPath}.managed-process.json`;
+  try {
+    providerSmoke = await createProviderSmokeServer();
+    const childEnvironment = {
+      ...process.env,
+      ELECTRON_ENABLE_LOGGING: "1",
+      JOKO_DESKTOP_PACKAGED_SMOKE: "1",
+      JOKO_DESKTOP_SMOKE_SCOPE: smokeScope,
+      JOKO_DESKTOP_SMOKE_TIMEOUT_MS: String(timeoutMs),
+      JOKO_DESKTOP_SMOKE_CONNECT_ORIGIN: connectSmoke.origin,
+      JOKO_DESKTOP_SMOKE_PUBLIC_HTTP_ORIGIN: connectSmoke.publicOrigin,
+      JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN: providerSmoke.origin,
+      JOKO_DESKTOP_SMOKE_RESULT: markerPath,
+      JOKO_DESKTOP_SMOKE_USER_DATA: smokeUserDataPath
+    };
+    // A parent Node process may itself run with this Electron development flag.
+    // Inheriting it would make the packaged executable run as Node instead of
+    // exercising Chromium, preload isolation, file navigation and renderer boot.
+    delete childEnvironment.ELECTRON_RUN_AS_NODE;
+    child = spawn(executable, desktopLaunchArguments(
+      appRoot,
+      useUnpackedArtifact,
+      smokeScope === "full" ? "joko://focus/packaged-smoke-cold" : undefined
+    ), {
+      cwd: useUnpackedArtifact ? dirname(executable) : appRoot,
+      env: childEnvironment,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      detached: process.platform !== "win32"
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => process.stdout.write(chunk));
+    child.stderr.on("data", (chunk) => {
+      stderr = appendBounded(stderr, chunk);
+      process.stderr.write(chunk);
+    });
+
+    let primaryFailure;
+    let primaryFailureOwnsAbort = false;
+    const requestPrimaryTermination = () => {
+      if (primaryTermination !== undefined || child.exitCode !== null || child.signalCode !== null) return;
+      primaryTermination = terminateChildTree(child).catch((error) => {
+        primaryTerminationError = error instanceof Error ? error : new Error(String(error));
+      });
+    };
+    const inspectPrimaryOutcome = (outcome) => {
+      result = outcome;
+      const progressPath = `${markerPath}.progress`;
+      const decision = applyPrimaryChildExitFence({
+        outcome,
+        marker: existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "",
+        progress: existsSync(progressPath)
+          ? readFileSync(progressPath, "utf8").trim().split(/\r?\n/gu).filter(Boolean)
+          : [],
+        requiredProgress: requiredSystemHandoffProgress,
+        abortController: journeyAbort
+      });
+      if (decision.ownsAbort) {
+        primaryFailure = decision.failure;
+        primaryFailureOwnsAbort = true;
+      }
+      return decision.failure;
+    };
+    const childResult = observePrimaryChild(child, inspectPrimaryOutcome).then((outcome) => {
+      inspectPrimaryOutcome(outcome);
+      if (primaryFailureOwnsAbort) throw primaryFailure;
+      return outcome;
+    });
+    secondInstance = (smokeScope === "full"
+      ? driveSecondInstance({
+          executable,
+          appRoot,
+          useUnpackedArtifact,
+          environment: childEnvironment,
+          progressPath: `${markerPath}.progress`,
+          deadline,
+          signal: journeyAbort.signal
+        })
+      : Promise.resolve()).catch((error) => {
+        const decision = claimSmokeJourneyFailure({
+          abortController: journeyAbort,
+          failure: error,
+          source: "second-instance"
+        });
+        if (decision.terminatePrimary) requestPrimaryTermination();
+        throw decision.failure;
+      });
+    timeout = setTimeout(() => {
+      const timeoutError = new Error(`Packaged desktop smoke exceeded its ${timeoutMs} ms journey timeout.`);
+      const decision = claimSmokeJourneyFailure({
+        abortController: journeyAbort,
+        failure: timeoutError,
+        source: "timeout"
+      });
+      if (!decision.ownsAbort) return;
+      timedOut = decision.timedOut;
+      if (decision.terminatePrimary) requestPrimaryTermination();
+    }, remainingTimeout(deadline));
+    timeout.unref();
+    try {
+      [result] = await Promise.all([childResult, secondInstance]);
+    } catch (error) {
+      const decision = claimSmokeJourneyFailure({
+        abortController: journeyAbort,
+        failure: error,
+        source: "orchestration"
+      });
+      orchestrationError = decision.failure;
+      if (primaryTermination !== undefined) await primaryTermination;
+      const [settledChild] = await Promise.allSettled([childResult, secondInstance]);
+      if (settledChild.status === "fulfilled") result = settledChild.value;
+    }
+  } catch (error) {
+    const decision = claimSmokeJourneyFailure({
+      abortController: journeyAbort,
+      failure: error,
+      source: "orchestration"
+    });
+    orchestrationError = decision.failure;
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (secondInstance !== undefined) await Promise.allSettled([secondInstance]);
+    try {
+      managedConnection = readManagedConnectionMetadata(managedConnectionPath);
+    } catch (error) {
+      managedConnectionError = error instanceof Error ? error : new Error(String(error));
+    }
+    try {
+      managedRuntimeProcessMarker = readManagedRuntimeProcessMarker(managedRuntimeProcessPath);
+      managedRuntimeProcessId = managedRuntimeProcessMarker.pid;
+    } catch (error) {
+      managedRuntimeProcessError = error instanceof Error ? error : new Error(String(error));
+    }
+    const preCleanupErrors = [
+      ...(primaryTerminationError === undefined ? [] : [primaryTerminationError])
+    ];
+    let managedRuntimeCleanup;
+    let managedRuntimeTreeCleanupSafe = false;
+    if (managedRuntimeProcessMarker !== undefined && managedRuntimeProcessId !== undefined) {
+      try {
+        const endpoint = managedConnection === undefined
+          ? "unreachable"
+          : await probeManagedOrchestratorIdentity({
+              origin: managedConnection.origin,
+              serverId: managedRuntimeProcessMarker.serverId
+            });
+        managedRuntimeEndpointState = endpoint;
+        const processIdentity = currentManagedRuntimeIdentityState(managedRuntimeProcessMarker);
+        const decision = managedRuntimeCleanupDecision(endpoint, processIdentity);
+        if (decision === "terminate") {
+          managedRuntimeWasLiveAtCleanup = true;
+          managedRuntimeCleanup = managedRuntimeProcessMarker;
+          managedRuntimeTreeCleanupSafe = true;
+        } else if (decision === "identityFailure") {
+          preCleanupErrors.push(new Error(
+            "Managed Orchestrator cleanup could not prove the recorded process birth identity."
+          ));
+        } else {
+          managedRuntimeTreeCleanupSafe = true;
+        }
+      } catch (error) {
+        preCleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+    if (managedConnection !== undefined && managedRuntimeProcessMarker !== undefined &&
+      managedConnection.serverId !== managedRuntimeProcessMarker.serverId) {
+      managedConnectionError = new Error(
+        "Durable managed Orchestrator metadata does not match the launched smoke runtime."
+      );
+    }
+    const cleanupResults = await Promise.allSettled([
+      ...(child === undefined ? [] : [terminateChildTree(child, {
+        managedRuntime: managedRuntimeCleanup,
+        windowsTree: managedRuntimeTreeCleanupSafe
+      })]),
+      connectSmoke.close(),
+      ...(providerSmoke === undefined ? [] : [providerSmoke.close()])
+    ]);
+    const cleanupErrors = [...preCleanupErrors, ...cleanupResults
+      .filter((item) => item.status === "rejected")
+      .map((item) => item.reason instanceof Error ? item.reason : new Error(String(item.reason)))];
+    const authoritativeJourneyError = authoritativeSmokeJourneyError(
+      journeyAbort.signal,
+      orchestrationError
+    );
+    if (cleanupErrors.length > 0) {
+      orchestrationError = authoritativeJourneyError === undefined
+        ? new AggregateError(cleanupErrors, "Packaged desktop smoke cleanup failed.")
+        : new AggregateError(
+          [authoritativeJourneyError, ...cleanupErrors],
+          authoritativeJourneyError.message,
+          { cause: authoritativeJourneyError }
+        );
+    } else orchestrationError = authoritativeJourneyError;
+    if (managedRuntimeProcessMarker !== undefined) {
+      try {
+        managedRuntimeProcessStopped = currentManagedRuntimeIdentityState(managedRuntimeProcessMarker) !== "matched";
+      } catch (error) {
+        managedRuntimeProcessError ??= error instanceof Error ? error : new Error(String(error));
+      }
+    }
+  }
+
+  const marker = existsSync(markerPath) ? readFileSync(markerPath, "utf8").trim() : "";
+  const progressPath = `${markerPath}.progress`;
+  const progress = existsSync(progressPath) ? readFileSync(progressPath, "utf8").trim().replace(/\r?\n/gu, " -> ") : "";
+  const missingSystemHandoffProgress = requiredSystemHandoffProgress.filter((step) =>
+    !progress.split(" -> ").includes(step)
+  );
+  const managedOrchestratorStopped = managedConnection !== undefined &&
+    await waitForManagedOrchestratorExit(managedConnection.origin, 5_000);
+  const failed = (
+    orchestrationError !== undefined || timedOut || marker !== "JOKO_DESKTOP_SMOKE_OK" || result.code !== 0 || result.signal !== null ||
+    connectSmoke.observations.preflightOrigin !== "joko://app" ||
+    connectSmoke.observations.requestOrigin !== "joko://app" ||
+    connectSmoke.observations.requestBody !== "{}" ||
+    connectSmoke.observations.publicRequestSeen ||
+    providerSmoke?.observations.unexpectedRequests.length > 0 ||
+    missingSystemHandoffProgress.length > 0 ||
+    managedConnectionError !== undefined ||
+    managedRuntimeProcessError !== undefined ||
+    managedRuntimeWasLiveAtCleanup ||
+    !managedRuntimeProcessStopped ||
+    !managedOrchestratorStopped
+  );
+  if (failed) {
+    throw new Error(
+      `Packaged desktop smoke failed (platform=${process.platform}, timeoutMs=${timeoutMs}, code=${String(result.code)}, signal=${String(result.signal)}, marker=${marker}, progress=${progress}, missingSystemHandoffProgress=${JSON.stringify(missingSystemHandoffProgress)}, managedConnectionError=${managedConnectionError?.message ?? "none"}, managedRuntimeProcessError=${managedRuntimeProcessError?.message ?? "none"}, managedRuntimeEndpointState=${managedRuntimeEndpointState}, managedRuntimeWasLiveAtCleanup=${String(managedRuntimeWasLiveAtCleanup)}, managedRuntimeProcessStopped=${String(managedRuntimeProcessStopped)}, managedOrchestratorStopped=${String(managedOrchestratorStopped)}, sqliteVec=${sqliteVecSmoke.version}, extensionLibrary=${extensionLibrarySmoke.version}, connect=${JSON.stringify(connectSmoke.observations)}, provider=${JSON.stringify(providerSmoke?.observations)}, orchestrationError=${orchestrationError?.message ?? "none"}): ${stderr.slice(-1_000)}`,
+      orchestrationError === undefined ? undefined : { cause: orchestrationError }
+    );
+  }
+  return {
+    event: smokeScope === "full" ? "JOKO_DESKTOP_SYSTEM_HANDOFF_SMOKE_OK" : "JOKO_DESKTOP_INSPECTOR_SMOKE_OK",
+    scope: smokeScope,
+    ingress: smokeScope === "full" ? ["cold-argv", "second-instance"] : [],
+    progress: requiredSystemHandoffProgress
+  };
 }
 
-async function runNativeElectronSmoke(electronExecutable, runtimeRoot, temporaryRoot, name, source) {
+async function runNativeElectronSmoke(electronExecutable, runtimeRoot, temporaryRoot, name, source, deadline) {
   const smokePath = resolve(temporaryRoot, `${name}-runtime-smoke.mjs`);
   writeFileSync(smokePath, `${source}\n`, {
     encoding: "utf8",
@@ -185,7 +408,7 @@ async function runNativeElectronSmoke(electronExecutable, runtimeRoot, temporary
     const result = await runBoundedChild(electronExecutable, [smokePath, runtimeRoot], {
       cwd: runtimeRoot,
       environment,
-      timeoutMs: 45_000
+      timeoutMs: Math.min(45_000, remainingTimeout(deadline))
     });
     if (result.code !== 0 || result.signal !== null || result.timedOut) {
       throw new Error(
@@ -214,28 +437,232 @@ function runBoundedChild(executablePath, arguments_, options) {
       cwd: options.cwd,
       env: options.environment,
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      detached: process.platform !== "win32"
     });
     let stdout = "";
     let stderr = "";
-    const append = (current, chunk) => `${current}${String(chunk)}`.slice(-256 * 1024);
-    child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
-    child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
+    child.stdout.on("data", (chunk) => { stdout = appendBounded(stdout, chunk); });
+    child.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk); });
     let timedOut = false;
+    let aborted = false;
+    let settled = false;
+    const settle = (operation) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const stop = async () => {
+      try {
+        await terminateChildTree(child);
+      } catch (error) {
+        settle(() => reject(error));
+        return;
+      }
+      if (aborted) {
+        const reason = options.signal?.reason;
+        settle(() => reject(reason instanceof Error ? reason : new Error("Electron child smoke was aborted.")));
+        return;
+      }
+      settle(() => resolvePromise({
+        code: child.exitCode,
+        signal: child.signalCode,
+        stderr,
+        stdout,
+        timedOut
+      }));
+    };
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      void stop();
     }, options.timeoutMs);
     timeout.unref();
+    const onAbort = () => {
+      aborted = true;
+      void stop();
+    };
+    if (options.signal?.aborted) onAbort();
+    else options.signal?.addEventListener("abort", onAbort, { once: true });
     child.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(new Error("Electron-Node native smoke could not start.", { cause: error }));
+      settle(() => reject(new Error("Electron-Node native smoke could not start.", { cause: error })));
     });
     child.once("close", (code, signal) => {
-      clearTimeout(timeout);
-      resolvePromise({ code, signal, stderr, stdout, timedOut });
+      if (aborted) {
+        const reason = options.signal?.reason;
+        settle(() => reject(reason instanceof Error ? reason : new Error("Electron child smoke was aborted.")));
+        return;
+      }
+      settle(() => resolvePromise({ code, signal, stderr, stdout, timedOut }));
     });
   });
+}
+
+function appendBounded(current, chunk) {
+  return `${current}${String(chunk)}`.slice(-256 * 1024);
+}
+
+async function terminateChildTree(child, options = {}) {
+  const pid = child.pid;
+  if (options.managedRuntime !== undefined) {
+    const runtime = options.managedRuntime;
+    const outcome = await runIdentityFencedProcessEffect({
+      pid: runtime.pid,
+      expectedIdentity: runtime.processIdentity,
+      captureIdentity: capturePackagedSmokeProcessBirthIdentitySync,
+      effect: process.platform === "win32"
+        ? (target) => runWindowsTaskKill(target, runtime.processIdentity, true)
+        : (target) => terminatePosixProcessGroup(target, runtime.processIdentity)
+    });
+    if (outcome === "identityMismatch") {
+      throw new Error(`Refusing to terminate reused managed Desktop smoke runtime PID ${runtime.pid}.`);
+    }
+  }
+  if (process.platform === "win32") {
+    if (pid !== undefined && child.exitCode === null && child.signalCode === null) {
+      validateCleanupProcessId(pid);
+      if (windowsProcessExists(pid)) await runWindowsTaskKill(pid, undefined, options.windowsTree !== false);
+    }
+  } else if (pid !== undefined && child.exitCode === null && child.signalCode === null) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+    }
+  }
+  const exited = pid === undefined || child.exitCode !== null || child.signalCode !== null
+    ? true
+    : await waitForChildExit(child, 5_000);
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  if (pid !== undefined && !exited && child.exitCode === null && child.signalCode === null) {
+    throw new Error(`Desktop smoke child process ${pid} did not exit after forced tree termination.`);
+  }
+  if (options.managedRuntime !== undefined &&
+    currentManagedRuntimeIdentityState(options.managedRuntime) === "matched") {
+    throw new Error(`Managed Desktop smoke runtime ${options.managedRuntime.pid} remained live after forced tree termination.`);
+  }
+}
+
+async function terminatePosixProcessGroup(pid, expectedIdentity) {
+  validateCleanupProcessId(pid);
+  if (currentProcessBirthIdentity(pid) !== expectedIdentity) {
+    throw new Error(`Managed Desktop smoke runtime ${pid} changed identity before POSIX termination.`);
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  const deadline = Date.now() + 5_000;
+  while (currentProcessBirthIdentity(pid) === expectedIdentity && Date.now() < deadline) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+}
+
+function runWindowsTaskKill(pid, expectedIdentity, includeTree = true) {
+  validateCleanupProcessId(pid);
+  if (expectedIdentity !== undefined && currentProcessBirthIdentity(pid) !== expectedIdentity) {
+    throw new Error(`Managed Desktop smoke runtime ${pid} changed identity before Windows termination.`);
+  }
+  return new Promise((resolvePromise, reject) => {
+    const killer = spawn("taskkill.exe", ["/pid", String(pid), ...(includeTree ? ["/T"] : []), "/F"], {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true
+    });
+    let stderr = "";
+    killer.stderr.setEncoding("utf8");
+    killer.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk); });
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error === undefined) resolvePromise(); else reject(error);
+    };
+    const timeout = setTimeout(() => {
+      try { killer.kill("SIGKILL"); } catch {}
+      finish(new Error(`taskkill timed out while terminating Desktop smoke process ${pid}.`));
+    }, 5_000);
+    timeout.unref();
+    killer.once("error", (error) => finish(new Error(
+      `taskkill could not terminate Desktop smoke process ${pid}.`,
+      { cause: error }
+    )));
+    killer.once("close", (code, signal) => {
+      const live = expectedIdentity === undefined
+        ? windowsProcessExists(pid)
+        : currentProcessBirthIdentity(pid) === expectedIdentity;
+      if (live) {
+        finish(new Error(
+          `taskkill failed for Desktop smoke process ${pid} ` +
+          `(code=${String(code)}, signal=${String(signal)}, live=${String(live)}): ${stderr.slice(-1_000)}`
+        ));
+        return;
+      }
+      finish();
+    });
+  });
+}
+
+function validateCleanupProcessId(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0xffff_ffff || pid === process.pid) {
+    throw new Error(`Refusing to terminate an unsafe Desktop smoke process ID: ${String(pid)}`);
+  }
+}
+
+function windowsProcessExists(pid) {
+  return processExists(pid);
+}
+
+function currentProcessBirthIdentity(pid) {
+  validateCleanupProcessId(pid);
+  return capturePackagedSmokeProcessBirthIdentitySync(pid);
+}
+
+function currentManagedRuntimeIdentityState(marker) {
+  const current = currentProcessBirthIdentity(marker.pid);
+  if (current === undefined) return "absent";
+  return current === marker.processIdentity ? "matched" : "mismatched";
+}
+
+function processExists(pid) {
+  validateCleanupProcessId(pid);
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.removeListener("exit", onExit);
+      child.removeListener("close", onExit);
+      resolvePromise(exited);
+    };
+    const onExit = () => finish(true);
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    timeout.unref();
+    child.once("exit", onExit);
+    child.once("close", onExit);
+  });
+}
+
+function removeMarkerDirectory(directory) {
+  const canonicalDirectory = canonicalSmokeDirectoryForRemoval(directory, tmpdir());
+  if (canonicalDirectory === undefined) return;
+  rmSync(canonicalDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 function resolveOrchestratorRuntimeRoot(electronExecutable, useUnpacked) {
@@ -246,17 +673,67 @@ function resolveOrchestratorRuntimeRoot(electronExecutable, useUnpacked) {
   return resolve(dirname(electronExecutable), "resources", "orchestrator-runtime");
 }
 
-function readManagedOrigin(path) {
-  if (!existsSync(path)) return undefined;
+function readManagedConnectionMetadata(path) {
+  if (!canonicalRegularFileExists(path)) {
+    throw new Error("Packaged smoke has no canonical managed Orchestrator connection metadata.");
+  }
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"));
-    if (typeof parsed?.origin !== "string") return undefined;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) ||
+      Object.keys(parsed).sort().join(",") !== "deviceId,name,origin,profileId,serverId" ||
+      typeof parsed.profileId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/u.test(parsed.profileId) ||
+      typeof parsed.deviceId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(parsed.deviceId) ||
+      typeof parsed.serverId !== "string" || !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(parsed.serverId) ||
+      typeof parsed.name !== "string" || parsed.name.trim() !== parsed.name || parsed.name.length < 1 || parsed.name.length > 128 ||
+      typeof parsed.origin !== "string") {
+      throw new Error("Packaged smoke managed Orchestrator connection metadata is malformed.");
+    }
     const origin = new URL(parsed.origin);
-    return origin.protocol === "http:" && origin.hostname === "127.0.0.1" && origin.origin === parsed.origin
-      ? origin.origin
-      : undefined;
-  } catch {
-    return undefined;
+    const port = Number(origin.port);
+    if (origin.protocol !== "http:" || origin.hostname !== "127.0.0.1" || origin.origin !== parsed.origin ||
+      !Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+      throw new Error("Packaged smoke managed Orchestrator origin is not an exact loopback HTTP authority.");
+    }
+    return { origin: origin.origin, serverId: parsed.serverId };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Packaged smoke managed")) throw error;
+    throw new Error("Packaged smoke managed Orchestrator connection metadata is malformed.", { cause: error });
+  }
+}
+
+function readManagedRuntimeProcessMarker(path) {
+  if (!canonicalRegularFileExists(path)) {
+    throw new Error("Packaged smoke has no canonical managed Orchestrator runtime process marker.");
+  }
+  try {
+    return parseManagedRuntimeProcessMarker(readFileSync(path, "utf8"));
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Packaged smoke managed")) throw error;
+    throw new Error("Packaged smoke managed Orchestrator runtime process marker is malformed.", { cause: error });
+  }
+}
+
+async function probeManagedOrchestratorIdentity(connection) {
+  try {
+    const response = await fetch(`${connection.origin}/joko.v1.ConnectionService/GetServerInfo`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "connect-protocol-version": "1" },
+      body: "{}",
+      signal: AbortSignal.timeout(1_000)
+    });
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      return "mismatchedLive";
+    }
+    return response.status === 200 && body?.server?.serverId === connection.serverId
+      ? "matchedLive"
+      : "mismatchedLive";
+  } catch (error) {
+    if (connectionRefused(error)) return "stopped";
+    return "unreachable";
   }
 }
 
@@ -270,11 +747,20 @@ async function waitForManagedOrchestratorExit(origin, timeoutMs) {
         body: "{}",
         signal: AbortSignal.timeout(500)
       });
-    } catch {
-      return true;
+    } catch (error) {
+      if (connectionRefused(error)) return true;
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
   } while (Date.now() < deadline);
+  return false;
+}
+
+function connectionRefused(error) {
+  let current = error;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current.code === "ECONNREFUSED") return true;
+    current = current.cause;
+  }
   return false;
 }
 
@@ -357,21 +843,60 @@ async function createConnectSmokeServer() {
     origin: `http://127.0.0.1:${address.port}`,
     publicOrigin: `http://public.example:${address.port}`,
     observations,
-    close: () => new Promise((resolvePromise) => server.close(() => resolvePromise()))
+    close: () => closeSmokeServer(server)
   };
 }
 
 function resolveDedicatedHardwareUtilityEntry(electronExecutable, useUnpacked) {
-  const applicationRoot = !useUnpacked
-    ? appRoot
-    : process.platform === "darwin"
-      ? resolve(dirname(electronExecutable), "..", "Resources", "app")
-      : resolve(dirname(electronExecutable), "resources", "app");
+  const applicationRoot = useUnpacked ? resolveUnpackedApplicationRoot(electronExecutable) : appRoot;
   const entry = resolve(applicationRoot, "dist", "dedicated-hardware", "utility-entry.js");
   if (!pathContained(applicationRoot, entry) || !canonicalRegularFileExists(entry)) {
     throw new Error("The packaged dedicated hardware utility entry is missing or unsafe.");
   }
   return realpathSync(entry);
+}
+
+function assertUnpackedArtifactFresh(electronExecutable) {
+  const sourceRoot = resolve(appRoot, "dist");
+  const artifactRoot = resolve(resolveUnpackedApplicationRoot(electronExecutable), "dist");
+  const application = comparePackagedApplicationMirror(sourceRoot, artifactRoot);
+  const builderConfig = JSON.parse(readFileSync(resolve(appRoot, "electron-builder.json"), "utf8"));
+  const extraResources = compareConfiguredExtraResourceMirrors({
+    applicationRoot: appRoot,
+    artifactResourcesRoot: resolveUnpackedResourcesRoot(electronExecutable),
+    extraResources: builderConfig.extraResources
+  });
+  if (application.missing.length === 0 && application.unexpected.length === 0 &&
+    application.changed.length === 0 &&
+    extraResources.missing.length === 0 && extraResources.unexpected.length === 0 &&
+    extraResources.changed.length === 0) return;
+  throw new Error(
+    `The unpacked Desktop artifact is stale relative to the current compiled app ` +
+    `(missing=${summarizePaths(application.missing)}, unexpected=${summarizePaths(application.unexpected)}, ` +
+    `changed=${summarizePaths(application.changed)}, ` +
+    `extraResourceMissing=${summarizePaths(extraResources.missing)}, ` +
+    `extraResourceUnexpected=${summarizePaths(extraResources.unexpected)}, ` +
+    `extraResourceChanged=${summarizePaths(extraResources.changed)}). ` +
+    "Rebuild it with `pnpm build:desktop:unpacked` before running the artifact smoke."
+  );
+}
+
+function resolveUnpackedApplicationRoot(electronExecutable) {
+  return process.platform === "darwin"
+    ? resolve(dirname(electronExecutable), "..", "Resources", "app")
+    : resolve(dirname(electronExecutable), "resources", "app");
+}
+
+function resolveUnpackedResourcesRoot(electronExecutable) {
+  return process.platform === "darwin"
+    ? resolve(dirname(electronExecutable), "..", "Resources")
+    : resolve(dirname(electronExecutable), "resources");
+}
+
+function summarizePaths(paths) {
+  if (paths.length === 0) return "none";
+  const shown = paths.slice(0, 8);
+  return `${shown.join(",")}${paths.length > shown.length ? `,+${paths.length - shown.length} more` : ""}`;
 }
 
 async function createProviderSmokeServer() {
@@ -400,8 +925,28 @@ async function createProviderSmokeServer() {
   return {
     origin: `http://127.0.0.1:${address.port}`,
     observations,
-    close: () => new Promise((resolvePromise) => server.close(() => resolvePromise()))
+    close: () => closeSmokeServer(server)
   };
+}
+
+function closeSmokeServer(server) {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    let timeout;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      resolvePromise();
+    };
+    timeout = setTimeout(() => {
+      server.closeAllConnections?.();
+      finish();
+    }, 5_000);
+    timeout.unref();
+    server.close(finish);
+    server.closeAllConnections?.();
+  });
 }
 
 function boundedTimeout(value) {
@@ -410,9 +955,84 @@ function boundedTimeout(value) {
 }
 
 function parseArguments(arguments_) {
-  if (arguments_.length === 0) return false;
-  if (arguments_.length === 1 && arguments_[0] === "--unpacked") return true;
-  throw new Error("Usage: node scripts/smoke-packaged.mjs [--unpacked]");
+  const values = new Set(arguments_);
+  if (values.size !== arguments_.length || [...values].some((value) => value !== "--unpacked" && value !== "--inspector")) {
+    throw new Error("Usage: node scripts/smoke-packaged.mjs [--unpacked] [--inspector]");
+  }
+  return { unpacked: values.has("--unpacked"), inspector: values.has("--inspector") };
+}
+
+function desktopLaunchArguments(applicationRoot, useUnpacked, openIntent) {
+  return [
+    ...(process.platform === "linux" && process.env.JOKO_DESKTOP_SMOKE_NO_SANDBOX === "1" ? ["--no-sandbox"] : []),
+    "--disable-gpu",
+    "--enable-logging=stderr",
+    "--host-resolver-rules=MAP public.example 127.0.0.1",
+    ...(useUnpacked ? [] : [applicationRoot]),
+    ...(openIntent === undefined ? [] : [openIntent])
+  ];
+}
+
+async function driveSecondInstance(options) {
+  await waitForProgress(
+    options.progressPath,
+    "system_handoff_second_instance_ready",
+    options.deadline,
+    options.signal
+  );
+  const result = await runBoundedChild(
+    options.executable,
+    desktopLaunchArguments(options.appRoot, options.useUnpackedArtifact, "joko://settings/providers"),
+    {
+      cwd: options.useUnpackedArtifact ? dirname(options.executable) : options.appRoot,
+      environment: options.environment,
+      timeoutMs: Math.min(30_000, remainingTimeout(options.deadline)),
+      signal: options.signal
+    }
+  );
+  if (result.code !== 0 || result.signal !== null || result.timedOut) {
+    throw new Error(`Desktop second-instance smoke failed (code=${String(result.code)}, signal=${String(result.signal)}): ${result.stderr.slice(-2_000)}`);
+  }
+  await waitForProgress(
+    options.progressPath,
+    "system_handoff_second_instance_delivery_acknowledged",
+    options.deadline,
+    options.signal
+  );
+}
+
+async function waitForProgress(path, expected, deadline, signal) {
+  while (Date.now() < deadline) {
+    throwIfAborted(signal);
+    const progress = existsSync(path) ? readFileSync(path, "utf8") : "";
+    if (progress.split(/\r?\n/gu).includes(expected)) return;
+    await abortableDelay(Math.min(50, remainingTimeout(deadline)), signal);
+  }
+  throw new Error(`Packaged Desktop smoke did not observe progress: ${expected}.`);
+}
+
+function remainingTimeout(deadline) {
+  return Math.max(1, deadline - Date.now());
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("Packaged Desktop smoke journey was aborted.");
+}
+
+function abortableDelay(delayMs, signal) {
+  return new Promise((resolvePromise, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Packaged Desktop smoke journey was aborted."));
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function resolveUnpackedExecutable(root) {

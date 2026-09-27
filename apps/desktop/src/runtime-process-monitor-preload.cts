@@ -20,7 +20,18 @@ const CHANNELS = Object.freeze({
   request: "joko:runtime-process-diagnostics:request",
   response: "joko:runtime-process-diagnostics:response",
   retired: "joko:runtime-process-diagnostics:retired",
+  retiredAcknowledge: "joko:runtime-process-diagnostics:retired:acknowledge",
   sampleDesktop: "joko:runtime-process-monitor:sample-desktop"
+});
+
+const retiredListeners = new Set<() => void>();
+ipcRenderer.on(CHANNELS.retired, (_event: IpcRendererEvent, value: unknown): void => {
+  let retirement: { readonly version: 1; readonly retirementOccurrence: string };
+  try { retirement = parseRetirement(value); } catch { return; }
+  for (const listener of [...retiredListeners]) {
+    try { listener(); } catch { /* Main still receives the document retirement acknowledgement. */ }
+  }
+  try { ipcRenderer.send(CHANNELS.retiredAcknowledge, retirement); } catch { /* The native document already retired. */ }
 });
 
 const api = Object.freeze({
@@ -55,9 +66,8 @@ const api = Object.freeze({
   },
   onRetired: (listener: () => void): (() => void) => {
     if (typeof listener !== "function") throw new TypeError("Runtime diagnostics retirement listener is invalid.");
-    const wrapped = (): void => listener();
-    ipcRenderer.on(CHANNELS.retired, wrapped);
-    return () => ipcRenderer.removeListener(CHANNELS.retired, wrapped);
+    retiredListeners.add(listener);
+    return () => { retiredListeners.delete(listener); };
   }
 });
 
@@ -76,6 +86,14 @@ function parseOwner(value: unknown): DesktopRuntimeProcessMonitorOwner {
     connectionGeneration: value["connectionGeneration"],
     snapshotGeneration: value["snapshotGeneration"]
   });
+}
+
+function parseRetirement(value: unknown): { readonly version: 1; readonly retirementOccurrence: string } {
+  if (!record(value, ["version", "retirementOccurrence"]) || value["version"] !== 1 ||
+    !uuid(value["retirementOccurrence"])) {
+    throw new TypeError("Runtime diagnostics retirement is invalid.");
+  }
+  return Object.freeze({ version: 1, retirementOccurrence: value["retirementOccurrence"] });
 }
 
 function parseDesktopSample(value: unknown): DesktopRuntimeProcessSample {

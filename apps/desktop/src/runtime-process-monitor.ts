@@ -22,6 +22,96 @@ export interface DesktopRuntimeProcessMonitorOwner {
   readonly snapshotGeneration: string;
 }
 
+export function shouldRecoverRuntimeProcessMonitorRenderer<TWindow>(
+  current: TWindow | undefined,
+  candidate: TWindow,
+  destroyed: boolean,
+  quitting: boolean
+): boolean {
+  return current === candidate && !destroyed && !quitting;
+}
+
+export interface RuntimeProcessMonitorReplacementRetirement {
+  readonly retireAuthority: () => void;
+  readonly waitForRendererRetirement: () => Promise<void>;
+  readonly drainRetiredIpc: () => Promise<void>;
+  readonly destroyNativeWindow: () => void | Promise<void>;
+  readonly waitForNativeRetirement: () => Promise<void>;
+}
+
+/**
+ * Retire the old document authority before destroying its native window. The
+ * renderer acknowledges retirement with a one-way message, and an event-loop
+ * turn between that acknowledgement and native destruction lets the message
+ * dispatch finish before Windows tears down the WebContents. Cleanup still
+ * runs when acknowledgement or draining fails, and a final turn keeps late
+ * work out of the next binding.
+ */
+export async function retireRuntimeProcessMonitorForReplacement(
+  retirement: RuntimeProcessMonitorReplacementRetirement
+): Promise<void> {
+  let failure: { readonly error: unknown } | undefined;
+  try { retirement.retireAuthority(); } catch (error: unknown) { failure ??= { error }; }
+  try { await retirement.waitForRendererRetirement(); } catch (error: unknown) { failure ??= { error }; }
+  try { await retirement.drainRetiredIpc(); } catch (error: unknown) { failure ??= { error }; }
+  try { await retirement.destroyNativeWindow(); } catch (error: unknown) { failure ??= { error }; }
+  try { await retirement.waitForNativeRetirement(); } catch (error: unknown) { failure ??= { error }; }
+  try { await retirement.drainRetiredIpc(); } catch (error: unknown) { failure ??= { error }; }
+  if (failure !== undefined) throw failure.error;
+}
+
+export interface DesktopRuntimeProcessMonitorRetirement {
+  readonly version: 1;
+  readonly retirementOccurrence: string;
+}
+
+export function parseDesktopRuntimeProcessMonitorRetirement(
+  value: unknown
+): DesktopRuntimeProcessMonitorRetirement {
+  if (!plainRecordWithKeys(value, ["version", "retirementOccurrence"]) || value["version"] !== 1 ||
+    typeof value["retirementOccurrence"] !== "string" || !UUID_V4_PATTERN.test(value["retirementOccurrence"])) {
+    throw new TypeError("Runtime process monitor retirement is invalid.");
+  }
+  return Object.freeze({ version: 1, retirementOccurrence: value["retirementOccurrence"] });
+}
+
+export class RuntimeProcessMonitorRetirementAcknowledgements<TEndpoint> {
+  readonly #pending = new Map<TEndpoint, {
+    readonly retirementOccurrence: string;
+    readonly settle: (acknowledged: boolean) => void;
+  }>();
+
+  begin(endpoint: TEndpoint, retirementOccurrence: string): {
+    readonly acknowledged: Promise<boolean>;
+    readonly cancel: () => void;
+  } {
+    if (!UUID_V4_PATTERN.test(retirementOccurrence)) {
+      throw new TypeError("Runtime process monitor retirement occurrence is invalid.");
+    }
+    this.#pending.get(endpoint)?.settle(false);
+    let settled = false;
+    let resolveAcknowledgement!: (acknowledged: boolean) => void;
+    const acknowledged = new Promise<boolean>((resolvePromise) => { resolveAcknowledgement = resolvePromise; });
+    let pending!: { readonly retirementOccurrence: string; readonly settle: (acknowledged: boolean) => void };
+    const settle = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (this.#pending.get(endpoint) === pending) this.#pending.delete(endpoint);
+      resolveAcknowledgement(value);
+    };
+    pending = Object.freeze({ retirementOccurrence, settle });
+    this.#pending.set(endpoint, pending);
+    return Object.freeze({ acknowledged, cancel: () => settle(false) });
+  }
+
+  acknowledge(endpoint: TEndpoint, retirementOccurrence: string): boolean {
+    const pending = this.#pending.get(endpoint);
+    if (pending === undefined || pending.retirementOccurrence !== retirementOccurrence) return false;
+    pending.settle(true);
+    return true;
+  }
+}
+
 interface DesktopRuntimeProcessMonitorProcessBase {
   readonly backendId: string;
   readonly pid: number;

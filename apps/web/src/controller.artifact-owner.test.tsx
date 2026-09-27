@@ -551,7 +551,181 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(fetch).not.toHaveBeenCalled();
 });
 
+it("retains a message deep-link target while connecting its saved machine", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  vi.mocked(persistentWebSecretEncryptionAvailable).mockResolvedValue(false);
+  window.history.replaceState(window.history.state, "", "#/tasks/current-task");
+
+  const first = profile("route-first");
+  const second = profile("route-second");
+  const snapshots = new Map<string, AppSnapshot>([
+    [first.id, { ...emptySnapshot(), revision: 1n, sessions: [session("current-task", 1)] }],
+    [second.id, { ...emptySnapshot(), revision: 2n, sessions: [session("linked-task", 2)] }]
+  ]);
+  const preferences: UiPreferences = { ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] };
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [first, second],
+    listMachineCaches: async () => [],
+    readPreferences: async () => preferences,
+    readAuthKey: async () => "test-key",
+    saveProfile: async () => undefined,
+    saveMachineCache: async () => undefined,
+    deleteMachineCache: async () => undefined
+  } as unknown as LocalState);
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(async (origin) => {
+    const owner = [first, second].find((candidate) => candidate.origin === origin);
+    if (owner === undefined) throw new Error("Unexpected machine origin");
+    return { serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: false };
+  });
+  vi.mocked(createOrchestratorGateway).mockImplementation((owner, _authKey, callbacks) => ({
+    connect: async () => {
+      callbacks.onState?.("connected");
+      callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
+    },
+    disconnect: vi.fn()
+  } as unknown as OrchestratorGateway));
+
+  let current!: AppController;
+  function Probe(): null { current = useAppController(); return null; }
+  root = createRoot(document.body.appendChild(document.createElement("div")));
+  await act(async () => root!.render(<Probe />));
+  await vi.waitFor(() => expect(current.state.ready).toBe(true));
+  await act(async () => current.connect(first));
+
+  const linkedRoute = {
+    kind: "session",
+    profileId: second.id,
+    sessionId: "linked-task",
+    messageId: "linked-message",
+    messageEventId: "linked-event"
+  } as const;
+  const navigationRevision = current.state.navigationRevision ?? 0;
+  await act(async () => {
+    current.navigate(linkedRoute);
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+  });
+  await act(async () => {
+    await vi.waitFor(() => {
+      expect(current.state.activeProfile?.id).toBe(second.id);
+      expect(current.state.connectionState).toBe("connected");
+      expect(current.state.navigationRevision).toBeGreaterThanOrEqual(navigationRevision + 2);
+    });
+  });
+
+  expect(current.state.route).toEqual(linkedRoute);
+  expect(window.location.hash).toBe("#/tasks/linked-task?event=linked-event&message=linked-message&profile=route-second");
+
+  const missingRoute = {
+    kind: "session",
+    profileId: second.id,
+    sessionId: "missing-task",
+    messageId: "missing-message"
+  } as const;
+  await act(async () => {
+    current.navigate(missingRoute);
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+  });
+  await act(async () => {
+    await vi.waitFor(() => {
+      expect(current.state.route).toEqual(missingRoute);
+      expect(current.state.error ?? "").toContain("no longer exists");
+    });
+  });
+  expect(current.state.route).toEqual(missingRoute);
+  expect(window.location.hash).toBe("#/tasks/missing-task?message=missing-message&profile=route-second");
+});
+
+it("does not let a stale cross-machine task open replace a newer navigation occurrence", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  vi.mocked(persistentWebSecretEncryptionAvailable).mockResolvedValue(false);
+  window.history.replaceState(window.history.state, "", "#/settings");
+
+  const first = profile("stale-route-first");
+  const second = profile("stale-route-second");
+  const snapshots = new Map<string, AppSnapshot>([
+    [first.id, { ...emptySnapshot(), revision: 1n, sessions: [session("current-task", 1)] }],
+    [second.id, { ...emptySnapshot(), revision: 2n, sessions: [session("stale-task", 2)] }]
+  ]);
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [first, second],
+    listMachineCaches: async () => [],
+    readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
+    readAuthKey: async () => "test-key",
+    saveProfile: async () => undefined,
+    saveMachineCache: async () => undefined,
+    deleteMachineCache: async () => undefined
+  } as unknown as LocalState);
+
+  let blockSecondProbe = false;
+  let releaseSecondProbe!: () => void;
+  const secondProbeReleased = new Promise<void>((resolve) => { releaseSecondProbe = resolve; });
+  let markSecondProbeStarted!: () => void;
+  const secondProbeStarted = new Promise<void>((resolve) => { markSecondProbeStarted = resolve; });
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(async (origin) => {
+    const owner = [first, second].find((candidate) => candidate.origin === origin);
+    if (owner === undefined) throw new Error("Unexpected machine origin");
+    if (owner.id === second.id && blockSecondProbe) {
+      markSecondProbeStarted();
+      await secondProbeReleased;
+    }
+    return { serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: false };
+  });
+  vi.mocked(createOrchestratorGateway).mockImplementation((owner, _authKey, callbacks) => ({
+    connect: async () => {
+      callbacks.onState?.("connected");
+      callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
+    },
+    disconnect: vi.fn()
+  } as unknown as OrchestratorGateway));
+
+  let current!: AppController;
+  function Probe(): null { current = useAppController(); return null; }
+  root = createRoot(document.body.appendChild(document.createElement("div")));
+  await act(async () => root!.render(<Probe />));
+  await vi.waitFor(() => expect(current.state.ready).toBe(true));
+  await vi.waitFor(() => expect(current.state.machinePresenceByProfile[second.id]).not.toBe("checking"));
+  await act(async () => current.connect(first));
+
+  blockSecondProbe = true;
+  let staleOpen!: Promise<void>;
+  await act(async () => {
+    staleOpen = current.openMachineSession(second.id, "stale-task");
+    await secondProbeStarted;
+  });
+  const previousNavigationRevision = current.state.navigationRevision ?? 0;
+  window.history.replaceState(window.history.state, "", "#/settings/providers");
+  expect(current.state.navigationRevision).toBe(previousNavigationRevision);
+
+  releaseSecondProbe();
+  await act(async () => staleOpen);
+
+  expect(current.state.activeProfile?.id).toBe(first.id);
+  await act(async () => window.dispatchEvent(new HashChangeEvent("hashchange")));
+  await vi.waitFor(() => expect(current.state.navigationRevision).toBe(previousNavigationRevision + 1));
+
+  expect(current.state.route).toEqual({ kind: "settings" });
+  expect(window.location.hash).toBe("#/settings/providers");
+  expect(current.state.activeProfile?.id).toBe(first.id);
+});
+
 function profile(id: string): ConnectionProfile { return { id, deviceId: `device-${id}`, name: id, origin: `https://${id}.example`, serverId: `server-${id}` }; }
+
+function session(id: string, updatedAt: number): SessionView {
+  return {
+    id,
+    backendId: "backend",
+    targetId: "target",
+    name: id,
+    state: "idle",
+    pinned: false,
+    archived: false,
+    generation: 1n,
+    fastMode: false,
+    permissionMode: "ask",
+    planMode: false,
+    updatedAt
+  };
+}
 
 function browserSettings(automationTarget: BrowserSettingsView["automationTarget"]): BrowserSettingsView {
   return {
