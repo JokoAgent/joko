@@ -132,6 +132,31 @@ export function isAllowedDesktopAppEntrySearch(search: string): boolean {
   return sessionWindowIdentity(query) !== undefined;
 }
 
+/** Primary windows cannot adopt an auxiliary entry while retaining their broader preload. */
+export function isAllowedPrimaryWindowNavigation(value: string, policy: DesktopNavigationPolicy): boolean {
+  if (!isAllowedMainFrameNavigation(value, policy)) return false;
+  try {
+    const url = new URL(value);
+    const expected = new URL(policy.developmentUrl ?? DESKTOP_APP_ENTRY_URL);
+    return url.origin === expected.origin && url.pathname === expected.pathname && url.search === expected.search;
+  } catch {
+    return false;
+  }
+}
+
+/** The dedicated runtime monitor may load only its exact query entry and no renderer-owned route. */
+export function isAllowedRuntimeProcessMonitorNavigation(value: string, policy: DesktopNavigationPolicy): boolean {
+  if (!isAllowedMainFrameNavigation(value, policy)) return false;
+  try {
+    const url = new URL(value);
+    const expected = new URL(runtimeProcessMonitorEntryUrl(policy.developmentUrl ?? DESKTOP_APP_ENTRY_URL));
+    return url.origin === expected.origin && url.pathname === expected.pathname &&
+      url.search === expected.search && url.hash === "";
+  } catch {
+    return false;
+  }
+}
+
 export function isAllowedSessionWindowNavigation(
   value: string,
   sessionId: string,

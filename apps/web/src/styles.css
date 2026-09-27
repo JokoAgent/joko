@@ -2790,7 +2790,15 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .runtime-process-sort:hover { color: var(--text); }
 .runtime-process-sort:focus-visible, .runtime-process-row:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent); }
 .runtime-process-body { min-height: 0; overflow-y: auto; padding: 4px 6px 8px; }
-.runtime-process-group { height: 28px; padding: 10px 4px 4px; color: var(--text-soft); font-size: var(--text-10); font-weight: 600; line-height: 14px; letter-spacing: .05em; text-transform: uppercase; }
+.runtime-process-backend { min-width: 0; }
+.runtime-process-group { min-height: 28px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 4px 4px; color: var(--text-soft); font-size: var(--text-10); font-weight: 600; line-height: 14px; letter-spacing: .05em; text-transform: uppercase; }
+.runtime-process-group > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-process-freshness { display: inline-flex; min-width: 0; flex: 0 1 auto; align-items: center; gap: 3px; overflow: hidden; color: var(--text-faint); font-size: 9px; font-weight: 500; letter-spacing: 0; text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
+.runtime-process-freshness[data-stale="true"] { color: var(--amber); }
+.runtime-process-freshness > button { width: 20px; height: 20px; display: inline-grid; flex: 0 0 auto; place-items: center; border: 0; border-radius: 999px; padding: 0; background: transparent; color: currentColor; }
+.runtime-process-freshness > button:hover { background: var(--surface-hover); }
+.runtime-process-freshness > button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.runtime-process-freshness > button > svg { width: 11px; height: 11px; }
 .runtime-process-row { min-height: 42px; padding: 4px; border-radius: 8px; cursor: default; transition: background-color 120ms ease; }
 .runtime-process-row:hover { background: var(--surface-hover); }
 .runtime-process-row[data-selected="true"] { background: var(--accent-soft); }
@@ -2802,6 +2810,10 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .runtime-process-number { overflow: hidden; color: var(--text-soft); font-size: var(--text-11); font-variant-numeric: tabular-nums; line-height: 18px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-process-pid-inline { display: none; }
 .runtime-process-state { display: flex; min-height: 42px; align-items: center; gap: 7px; padding: 8px 4px; color: var(--text-soft); font-size: var(--text-11); line-height: 18px; }
+.runtime-process-state--error { justify-content: space-between; color: var(--amber); }
+.runtime-process-state--error > span { min-width: 0; overflow-wrap: anywhere; }
+.runtime-process-state--error > .button { min-height: 28px; flex: 0 0 auto; padding: 0 8px; }
+.runtime-process-state--error > .button > svg { width: 12px; height: 12px; }
 .runtime-process-footer { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 10px; border-top: 1px solid var(--line); }
 .runtime-process-hint { min-width: 0; overflow: hidden; color: var(--text-soft); font-size: var(--text-10); line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-process-footer > .button { min-height: 30px; flex: 0 0 auto; border-radius: 999px; padding: 0 12px; }

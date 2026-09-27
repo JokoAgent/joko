@@ -55,6 +55,7 @@ import {
   type DesktopNativeTaskStatusSettings,
   type DesktopNotification,
   type DesktopPageSearchResult,
+  type DesktopRuntimeProcessMonitorOwner,
   type DesktopSaveFileRequest,
   type DesktopSessionDragPreviewRequest,
   type DesktopSessionWindowOwner,
@@ -77,6 +78,14 @@ import {
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
+import {
+  parseDesktopRuntimeProcessMonitorOpenResult,
+  parseDesktopRuntimeProcessMonitorOwner,
+  parseDesktopRuntimeProcessMonitorRequest,
+  parseDesktopRuntimeProcessMonitorResponse,
+  RuntimeProcessMonitorBroker,
+  sameDesktopRuntimeProcessMonitorOwner
+} from "./runtime-process-monitor.js";
 import { projectDirectoryAuthorityMatches } from "./project-directory-authority.js";
 import {
   DESKTOP_DEEP_LINK_SCHEME,
@@ -348,6 +357,8 @@ import {
   isAllowedExtensionWindowNavigation,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
+  isAllowedPrimaryWindowNavigation,
+  isAllowedRuntimeProcessMonitorNavigation,
   isAllowedRendererNetworkUrl,
   isAllowedSessionWindowNavigation,
   isSafeExternalUrl,
@@ -394,6 +405,16 @@ let inspectorWindow: BrowserWindow | undefined;
 let inspectorWindowOwner: WebContents | undefined;
 let inspectorWindowReady = false;
 let runtimeProcessMonitorWindow: BrowserWindow | undefined;
+let runtimeProcessMonitorOwnerWindow: BrowserWindow | undefined;
+let releaseRuntimeProcessMonitorOwnerLifecycle: (() => void) | undefined;
+let runtimeProcessMonitorFocusOwnerOnClose = false;
+const runtimeProcessMonitorBroker = new RuntimeProcessMonitorBroker<WebContents>({
+  onTimeout: (target, response) => {
+    if (target.isDestroyed() || runtimeProcessMonitorBroker.binding?.monitorEndpoint !== target ||
+      !isRuntimeProcessMonitorNavigation(target.getURL())) return;
+    try { target.send(DESKTOP_CHANNELS.runtimeProcessDiagnosticsResponse, response); } catch { /* The document retired after validation. */ }
+  }
+});
 let globalVoiceOverlayWindow: BrowserWindow | undefined;
 let globalVoiceShortcutRecoveryFailurePending = false;
 type GlobalVoiceInputSource = "shortcut" | "hardware";
@@ -1027,13 +1048,13 @@ function createWindow(): void {
     installInspectorWindowSecurity(childWindow, window.webContents);
   });
   window.webContents.on("will-navigate", (event, url) => {
-    if (!isAllowedMainFrameNavigation(url, navigationPolicy)) {
+    if (!isAllowedPrimaryWindowNavigation(url, navigationPolicy)) {
       event.preventDefault();
       if (isSafeExternalUrl(url)) void openExternalSafely(url).catch(() => undefined);
     }
   });
   window.webContents.on("will-redirect", (event, url) => {
-    if (!isAllowedMainFrameNavigation(url, navigationPolicy)) event.preventDefault();
+    if (!isAllowedPrimaryWindowNavigation(url, navigationPolicy)) event.preventDefault();
   });
   electronSession.webRequest.onBeforeRequest((details, callback) => {
     let protocol: string | undefined;
@@ -1207,10 +1228,14 @@ function createWindow(): void {
           "    if (!document.querySelector('.app') || document.querySelector('.connection-screen')) {",
           "      throw new Error('The local connection action did not reach the product UI.');",
           "    }",
-          "    const monitorWindow = await window.jokoDesktop.runtimeProcessMonitor.open();",
-          "    if (monitorWindow?.focusedExisting !== false) {",
-          "      throw new Error('The standalone runtime resource monitor did not open a fresh application window.');",
+          "    window.location.hash = '#/settings/about';",
+          "    const monitorActionDeadline = Date.now() + 5_000;",
+          "    while (!document.querySelector('[data-runtime-process-monitor-open]') && Date.now() < monitorActionDeadline) await sleep(100);",
+          "    const monitorOpen = document.querySelector('[data-runtime-process-monitor-open]');",
+          "    if (!(monitorOpen instanceof HTMLButtonElement) || monitorOpen.disabled) {",
+          "      throw new Error('The standalone runtime resource monitor action is unavailable.');",
           "    }",
+          "    monitorOpen.click();",
           "    const response = await fetch(`${connectOrigin}/joko.v1.ConnectionService/GetServerInfo`, {",
           "      method: 'POST',",
           "      mode: 'cors',",
@@ -1249,6 +1274,7 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
+        await verifyPackagedSmokeRuntimeProcessMonitor(window);
         if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
         await verifyPackagedSmokeSessionWindow(window);
       }).then(() => {
@@ -1283,6 +1309,182 @@ function safeSmokeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error ?? "unknown error"))
     .replace(/[\r\n\t]+/gu, " ")
     .slice(0, 500);
+}
+
+async function verifyPackagedSmokeRuntimeProcessMonitor(ownerWindow: BrowserWindow): Promise<void> {
+  const initial = await waitForPackagedSmokeRuntimeProcessMonitor();
+  const owner = runtimeProcessMonitorBroker.ownerForMonitor(initial.webContents);
+  await inspectPackagedSmokeRuntimeProcessMonitorSurface(initial, owner);
+  recordPackagedSmokeProgress("runtime_process_monitor_initial_ready");
+
+  const sameOwner = parseDesktopRuntimeProcessMonitorOpenResult(
+    await openRuntimeProcessMonitorWindow(ownerWindow, owner)
+  );
+  if (!sameOwner.focusedExisting || runtimeProcessMonitorWindow !== initial) {
+    throw new Error("Packaged runtime diagnostics did not reuse its exact owner occurrence.");
+  }
+  recordPackagedSmokeProgress("runtime_process_monitor_same_owner_reused");
+
+  const wrongOwner = Object.freeze({
+    ...owner,
+    snapshotGeneration: owner.snapshotGeneration === String(Number.MAX_SAFE_INTEGER)
+      ? "1"
+      : String(Number(owner.snapshotGeneration) + 1)
+  });
+  const rejected = await initial.webContents.executeJavaScript(
+    [
+      "(async () => {",
+      "  try {",
+      `    await window.jokoRuntimeProcessDiagnostics.request(${JSON.stringify({
+        version: 1,
+        requestId: "00000000-0000-4000-8000-000000000001",
+        owner: wrongOwner,
+        action: { kind: "refresh" }
+      })});`,
+      "    return false;",
+      "  } catch { return true; }",
+      "})()"
+    ].join("\n"),
+    true
+  );
+  if (rejected !== true) throw new Error("Packaged runtime diagnostics accepted a wrong owner occurrence.");
+  recordPackagedSmokeProgress("runtime_process_monitor_wrong_owner_fenced");
+
+  await waitForPackagedSmokeRuntimeMonitorDocument(initial, () => initial.reload());
+  await inspectPackagedSmokeRuntimeProcessMonitorSurface(initial, owner);
+  recordPackagedSmokeProgress("runtime_process_monitor_reload_recovered");
+
+  void initial.webContents.executeJavaScript(
+    "(() => { void window.jokoRuntimeProcessDiagnostics.window.close(); return true; })()",
+    true
+  ).catch(() => undefined);
+  recordPackagedSmokeProgress("runtime_process_monitor_close_requested");
+  const closeDeadline = Date.now() + 5_000;
+  while (initial.isVisible() && Date.now() < closeDeadline) await waitForPackagedSmokePoll();
+  if (initial.isDestroyed() || initial.isVisible() || runtimeProcessMonitorWindow !== initial) {
+    throw new Error("Packaged runtime diagnostics close did not preserve its hidden cached window.");
+  }
+  recordPackagedSmokeProgress("runtime_process_monitor_closed");
+
+  const reopened = parseDesktopRuntimeProcessMonitorOpenResult(
+    await openRuntimeProcessMonitorWindow(ownerWindow, owner)
+  );
+  if (!reopened.focusedExisting || runtimeProcessMonitorWindow !== initial) {
+    throw new Error("Packaged runtime diagnostics close did not reuse its exact cached owner occurrence.");
+  }
+  const reopenedWindow = await waitForPackagedSmokeRuntimeProcessMonitor();
+  await inspectPackagedSmokeRuntimeProcessMonitorSurface(reopenedWindow, owner);
+  recordPackagedSmokeProgress("runtime_process_monitor_reopened");
+
+  const replaced = parseDesktopRuntimeProcessMonitorOpenResult(
+    await openRuntimeProcessMonitorWindow(ownerWindow, wrongOwner)
+  );
+  if (replaced.focusedExisting) {
+    throw new Error("Packaged runtime diagnostics did not retire a different owner occurrence.");
+  }
+  const wrongOwnerWindow = await waitForPackagedSmokeRuntimeProcessMonitor(reopenedWindow);
+  await waitForPackagedSmokeWindowDestroyed(reopenedWindow, "different owner replacement");
+  await inspectPackagedSmokeRuntimeProcessMonitorSurface(wrongOwnerWindow, wrongOwner);
+  recordPackagedSmokeProgress("runtime_process_monitor_different_owner_replaced");
+
+  const restored = parseDesktopRuntimeProcessMonitorOpenResult(
+    await openRuntimeProcessMonitorWindow(ownerWindow, owner)
+  );
+  if (restored.focusedExisting) {
+    throw new Error("Packaged runtime diagnostics did not replace the synthetic owner occurrence.");
+  }
+  const restoredWindow = await waitForPackagedSmokeRuntimeProcessMonitor(wrongOwnerWindow);
+  await waitForPackagedSmokeWindowDestroyed(wrongOwnerWindow, "owner restoration");
+  await inspectPackagedSmokeRuntimeProcessMonitorSurface(restoredWindow, owner);
+  recordPackagedSmokeProgress("runtime_process_monitor_owner_restored");
+  await waitForPackagedSmokeRuntimeMonitorDocument(restoredWindow, () => restoredWindow.webContents.forcefullyCrashRenderer());
+  await inspectPackagedSmokeRuntimeProcessMonitorSurface(restoredWindow, owner);
+  recordPackagedSmokeProgress("runtime_process_monitor_crash_recovered");
+  recordPackagedSmokeProgress("runtime_process_monitor_lifecycle_verified");
+}
+
+async function waitForPackagedSmokeRuntimeProcessMonitor(excluded?: BrowserWindow): Promise<BrowserWindow> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const candidate = runtimeProcessMonitorWindow;
+    if (candidate !== undefined && candidate !== excluded && !candidate.isDestroyed() &&
+      !candidate.webContents.isDestroyed() && isRuntimeProcessMonitorNavigation(candidate.webContents.getURL())) {
+      return candidate;
+    }
+    await waitForPackagedSmokePoll();
+  }
+  throw new Error("Packaged runtime diagnostics window did not become available.");
+}
+
+async function waitForPackagedSmokeWindowDestroyed(window: BrowserWindow, operation: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!window.isDestroyed() && Date.now() < deadline) await waitForPackagedSmokePoll();
+  if (!window.isDestroyed()) throw new Error(`Packaged runtime diagnostics did not finish ${operation}.`);
+}
+
+async function inspectPackagedSmokeRuntimeProcessMonitorSurface(
+  window: BrowserWindow,
+  expectedOwner: DesktopRuntimeProcessMonitorOwner
+): Promise<void> {
+  const serialized = await window.webContents.executeJavaScript(
+    [
+      "(async () => {",
+      "  const api = window.jokoRuntimeProcessDiagnostics;",
+      "  return JSON.stringify({",
+      "    hasGeneralDesktopBridge: window.jokoDesktop !== undefined,",
+      "    keys: api === undefined ? [] : Object.keys(api).sort(),",
+      "    windowKeys: api?.window === undefined ? [] : Object.keys(api.window).sort(),",
+      "    version: api?.version,",
+      "    platform: api?.platform,",
+      "    owner: await api?.getOwner?.()",
+      "  });",
+      "})()"
+    ].join("\n"),
+    true
+  );
+  if (typeof serialized !== "string") throw new Error("Packaged runtime diagnostics bridge did not serialize its surface.");
+  const value = JSON.parse(serialized) as {
+    readonly hasGeneralDesktopBridge?: unknown;
+    readonly keys?: unknown;
+    readonly windowKeys?: unknown;
+    readonly version?: unknown;
+    readonly platform?: unknown;
+    readonly owner?: unknown;
+  };
+  if (value.hasGeneralDesktopBridge !== false || value.version !== 1 || typeof value.platform !== "string" ||
+    !Array.isArray(value.keys) || value.keys.join(",") !== "getOwner,onResponse,onRetired,platform,request,version,window" ||
+    !Array.isArray(value.windowKeys) || value.windowKeys.join(",") !== "close,minimize,setZoomFactor,toggleMaximize") {
+    throw new Error("Packaged runtime diagnostics exposed a non-minimal preload surface.");
+  }
+  const actualOwner = parseDesktopRuntimeProcessMonitorOwner(value.owner);
+  if (!sameDesktopRuntimeProcessMonitorOwner(actualOwner, expectedOwner)) {
+    throw new Error("Packaged runtime diagnostics lost its exact owner occurrence.");
+  }
+}
+
+function waitForPackagedSmokeRuntimeMonitorDocument(
+  window: BrowserWindow,
+  begin: () => void
+): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const contents = window.webContents;
+    const timeout = setTimeout(() => finish(new Error("Packaged runtime diagnostics document did not recover.")), 20_000);
+    const loaded = (): void => finish();
+    const failed = (_event: unknown, code: number, description: string): void => {
+      finish(new Error(`Packaged runtime diagnostics document failed to load (${code} ${description}).`));
+    };
+    const finish = (error?: Error): void => {
+      clearTimeout(timeout);
+      contents.removeListener("did-finish-load", loaded);
+      contents.removeListener("did-fail-load", failed);
+      if (error === undefined) resolvePromise(); else rejectPromise(error);
+    };
+    contents.once("did-finish-load", loaded);
+    contents.once("did-fail-load", failed);
+    try { begin(); } catch (error: unknown) {
+      finish(error instanceof Error ? error : new Error("Packaged runtime diagnostics recovery could not start."));
+    }
+  });
 }
 
 async function verifyPackagedSmokeFullscreen(window: BrowserWindow): Promise<void> {
@@ -3035,11 +3237,17 @@ async function loadRuntimeProcessMonitorUi(window: BrowserWindow): Promise<void>
   await window.loadURL(runtimeProcessMonitorEntryUrl(DESKTOP_APP_ENTRY_URL));
 }
 
-async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ readonly focusedExisting: boolean }> {
+async function openRuntimeProcessMonitorWindow(
+  owner: BrowserWindow,
+  monitorOwner: DesktopRuntimeProcessMonitorOwner
+): Promise<{ readonly version: 1; readonly focusedExisting: boolean }> {
   const existing = runtimeProcessMonitorWindow;
   if (existing !== undefined && !existing.isDestroyed()) {
-    showWindowFromTray(existing);
-    return { focusedExisting: true };
+    if (runtimeProcessMonitorBroker.matchesOwner(owner.webContents, monitorOwner)) {
+      showWindowFromTray(existing);
+      return { version: 1, focusedExisting: true };
+    }
+    destroyRuntimeProcessMonitorWindow(false);
   }
   if (!canShowDesktopWindow({
     quitting,
@@ -3084,6 +3292,15 @@ async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ 
     }
   });
   runtimeProcessMonitorWindow = window;
+  runtimeProcessMonitorOwnerWindow = owner;
+  runtimeProcessMonitorFocusOwnerOnClose = true;
+  runtimeProcessMonitorBroker.bind({
+    owner: monitorOwner,
+    ownerEndpoint: owner.webContents,
+    monitorEndpoint: window.webContents
+  });
+  const releaseOwnerLifecycle = installRuntimeProcessMonitorOwnerLifecycle(owner, window);
+  releaseRuntimeProcessMonitorOwnerLifecycle = releaseOwnerLifecycle;
   managedRuntimeProcessMonitorWindowState = state;
   state.manage(window);
   window.webContents.setZoomFactor(currentWindowZoomFactor);
@@ -3094,8 +3311,9 @@ async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ 
     const options = {
       unavailable: () => window.isDestroyed() || quitting,
       load: () => loadRuntimeProcessMonitorUi(window),
-      presentFailure: (error: unknown, attempt: number) =>
-        presentDesktopWindowLoadFailure("runtime", error, attempt, owner),
+      presentFailure: (error: unknown, attempt: number) => packagedSmoke
+        ? Promise.resolve(attempt <= 2 ? "retry" as const : "close" as const)
+        : presentDesktopWindowLoadFailure("runtime", error, attempt, owner),
       close: () => {
         if (!window.isDestroyed()) window.destroy();
       }
@@ -3116,6 +3334,7 @@ async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ 
   window.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   window.webContents.on("render-process-gone", (_event, details) => {
     if (window.isDestroyed() || quitting) return;
+    runtimeProcessMonitorBroker.clearMonitorDocument(window.webContents);
     void beginRuntimeUiLoadRecovery(desktopRendererLossError("runtime", details)).catch((error: unknown) => {
       process.stderr.write(`JOKO_DESKTOP_RUNTIME_WINDOW_RECOVERY_FAILED ${safeSmokeError(error)}\n`);
     });
@@ -3135,6 +3354,9 @@ async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ 
     event.preventDefault();
     if (isSafeExternalUrl(url)) void openExternalSafely(url).catch(() => undefined);
   });
+  window.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) runtimeProcessMonitorBroker.clearMonitorDocument(window.webContents);
+  });
   window.webContents.on("will-redirect", (event, url) => {
     if (!isRuntimeProcessMonitorNavigation(url)) event.preventDefault();
   });
@@ -3151,19 +3373,71 @@ async function openRuntimeProcessMonitorWindow(owner: BrowserWindow): Promise<{ 
     }
   });
   window.once("closed", () => {
-    if (runtimeProcessMonitorWindow === window) runtimeProcessMonitorWindow = undefined;
+    const wasCurrent = runtimeProcessMonitorWindow === window;
+    const focusOwner = runtimeProcessMonitorFocusOwnerOnClose;
+    const previousOwner = runtimeProcessMonitorOwnerWindow;
+    releaseOwnerLifecycle();
+    runtimeProcessMonitorBroker.retireEndpoint(window.webContents);
+    if (wasCurrent) {
+      runtimeProcessMonitorFocusOwnerOnClose = false;
+      runtimeProcessMonitorOwnerWindow = undefined;
+      runtimeProcessMonitorWindow = undefined;
+      if (releaseRuntimeProcessMonitorOwnerLifecycle === releaseOwnerLifecycle) {
+        releaseRuntimeProcessMonitorOwnerLifecycle = undefined;
+      }
+    }
     if (managedRuntimeProcessMonitorWindowState === state) managedRuntimeProcessMonitorWindowState = undefined;
+    if (wasCurrent && focusOwner && previousOwner !== undefined && !previousOwner.isDestroyed() && previousOwner.isVisible() &&
+      !previousOwner.isMinimized() && !quitting) previousOwner.focus();
   });
   try {
     const result = await beginRuntimeUiLoadRecovery();
     if (result === "closed") throw new Error("Runtime resource usage was closed before it loaded.");
   } catch (error: unknown) {
-    if (runtimeProcessMonitorWindow === window) runtimeProcessMonitorWindow = undefined;
-    if (managedRuntimeProcessMonitorWindowState === state) managedRuntimeProcessMonitorWindowState = undefined;
-    if (!window.isDestroyed()) window.destroy();
+    if (runtimeProcessMonitorWindow === window) destroyRuntimeProcessMonitorWindow(false);
+    else if (!window.isDestroyed()) window.destroy();
     throw error;
   }
-  return { focusedExisting: false };
+  return { version: 1, focusedExisting: false };
+}
+
+function installRuntimeProcessMonitorOwnerLifecycle(owner: BrowserWindow, monitor: BrowserWindow): () => void {
+  const contents = owner.webContents;
+  let released = false;
+  const retire = (): void => {
+    if (runtimeProcessMonitorOwnerWindow !== owner || runtimeProcessMonitorWindow !== monitor) return;
+    destroyRuntimeProcessMonitorWindow(false);
+  };
+  const navigate = (_event: unknown, _url: string, isInPlace: boolean, isMainFrame: boolean): void => {
+    if (isMainFrame && !isInPlace) retire();
+  };
+  const hide = (): void => {
+    if (runtimeProcessMonitorOwnerWindow === owner && runtimeProcessMonitorWindow === monitor && !monitor.isDestroyed()) monitor.hide();
+  };
+  const restore = (): void => {
+    if (runtimeProcessMonitorOwnerWindow === owner && runtimeProcessMonitorWindow === monitor && !monitor.isDestroyed() &&
+      owner.isVisible() && !owner.isMinimized()) monitor.showInactive();
+  };
+  owner.once("closed", retire);
+  owner.on("hide", hide);
+  owner.on("minimize", hide);
+  owner.on("show", restore);
+  owner.on("restore", restore);
+  contents.on("did-start-navigation", navigate);
+  contents.once("render-process-gone", retire);
+  contents.once("destroyed", retire);
+  return () => {
+    if (released) return;
+    released = true;
+    owner.removeListener("closed", retire);
+    owner.removeListener("hide", hide);
+    owner.removeListener("minimize", hide);
+    owner.removeListener("show", restore);
+    owner.removeListener("restore", restore);
+    contents.removeListener("did-start-navigation", navigate);
+    contents.removeListener("render-process-gone", retire);
+    contents.removeListener("destroyed", retire);
+  };
 }
 
 function runtimeProcessMonitorWindowTitle(): string {
@@ -3171,21 +3445,44 @@ function runtimeProcessMonitorWindowTitle(): string {
 }
 
 function isRuntimeProcessMonitorNavigation(value: string): boolean {
-  if (!isAllowedMainFrameNavigation(value, navigationPolicy)) return false;
-  try {
-    const url = new URL(value);
-    return [...url.searchParams.keys()].join(",") === "runtimeProcessMonitor" &&
-      url.searchParams.get("runtimeProcessMonitor") === "1";
-  } catch {
-    return false;
+  return isAllowedRuntimeProcessMonitorNavigation(value, navigationPolicy);
+}
+
+function destroyRuntimeProcessMonitorWindow(focusOwner = false): void {
+  const window = runtimeProcessMonitorWindow;
+  const previousOwner = runtimeProcessMonitorOwnerWindow;
+  const shouldFocusOwner = focusOwner && previousOwner !== undefined && !previousOwner.isDestroyed() &&
+    previousOwner.isVisible() && !previousOwner.isMinimized() && !quitting;
+  runtimeProcessMonitorFocusOwnerOnClose = false;
+  runtimeProcessMonitorWindow = undefined;
+  runtimeProcessMonitorOwnerWindow = undefined;
+  managedRuntimeProcessMonitorWindowState = undefined;
+  const releaseOwnerLifecycle = releaseRuntimeProcessMonitorOwnerLifecycle;
+  releaseRuntimeProcessMonitorOwnerLifecycle = undefined;
+  releaseOwnerLifecycle?.();
+  const retired = runtimeProcessMonitorBroker.retire();
+  if (window !== undefined && !window.isDestroyed()) {
+    if (retired !== undefined && !window.webContents.isDestroyed()) {
+      try { window.webContents.send(DESKTOP_CHANNELS.runtimeProcessDiagnosticsRetired); } catch { /* Destruction remains authoritative. */ }
+    }
+    // This remains an independent native top-level window. Its opener binding,
+    // visibility and lifetime are enforced by the exact owner lifecycle above;
+    // using an Electron native parent can deadlock Windows teardown during an
+    // owner replacement or renderer recovery.
+    window.destroy();
+  }
+  if (shouldFocusOwner && previousOwner !== undefined) {
+    previousOwner.focus();
   }
 }
 
-function destroyRuntimeProcessMonitorWindow(): void {
-  const window = runtimeProcessMonitorWindow;
-  runtimeProcessMonitorWindow = undefined;
-  managedRuntimeProcessMonitorWindowState = undefined;
-  if (window !== undefined && !window.isDestroyed()) window.destroy();
+function hideRuntimeProcessMonitorWindow(window: BrowserWindow, focusOwner: boolean): void {
+  if (runtimeProcessMonitorWindow !== window || window.isDestroyed()) return;
+  const owner = runtimeProcessMonitorOwnerWindow;
+  const shouldFocusOwner = focusOwner && owner !== undefined && !owner.isDestroyed() && owner.isVisible() &&
+    !owner.isMinimized() && !quitting;
+  window.hide();
+  if (shouldFocusOwner && owner !== undefined) owner.focus();
 }
 
 function applicationWindows(): readonly BrowserWindow[] {
@@ -5181,12 +5478,64 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessMonitorOpen, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
-    if (parameters.length !== 0) throw new TypeError("Runtime process monitor open does not accept parameters.");
+    if (parameters.length !== 1) throw new TypeError("Runtime process monitor open requires one exact owner.");
+    const monitorOwner = parseDesktopRuntimeProcessMonitorOwner(parameters[0]);
     const owner = trustedApplicationWindowForContents(event.sender);
-    if (owner === undefined || owner === runtimeProcessMonitorWindow) {
+    const sessionOwner = sessionWindowOwnersByContents.get(event.sender);
+    const allowedOwner = owner === mainWindow || (sessionOwner !== undefined && owner !== undefined &&
+      sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner);
+    if (!allowedOwner || owner === undefined || owner === runtimeProcessMonitorWindow ||
+      (sessionOwner !== undefined && sessionOwner.profileId !== monitorOwner.profileId)) {
       throw new Error("Runtime process monitor can only be opened by a primary application window.");
     }
-    return openRuntimeProcessMonitorWindow(owner);
+    return openRuntimeProcessMonitorWindow(owner, monitorOwner);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessDiagnosticsGetOwner, async (event, ...parameters: unknown[]) => {
+    assertRuntimeProcessDiagnosticsSender(event);
+    if (parameters.length !== 0) throw new TypeError("Runtime diagnostics owner lookup does not accept parameters.");
+    return runtimeProcessMonitorBroker.ownerForMonitor(event.sender);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessDiagnosticsRequest, async (event, ...parameters: unknown[]) => {
+    assertRuntimeProcessDiagnosticsSender(event);
+    if (parameters.length !== 1) throw new TypeError("Runtime diagnostics requires one exact request.");
+    const monitorWindow = runtimeProcessMonitorWindowForEvent(event);
+    if (monitorWindow === undefined || !monitorWindow.isVisible() || monitorWindow.isMinimized()) {
+      throw new Error("Runtime diagnostics sampling is inactive while its window is hidden.");
+    }
+    const request = parseDesktopRuntimeProcessMonitorRequest(parameters[0]);
+    const ownerContents = runtimeProcessMonitorBroker.acceptRequest(event.sender, request);
+    if (ownerContents.isDestroyed() || trustedApplicationWindowForContents(ownerContents) === undefined) {
+      runtimeProcessMonitorBroker.clearMonitorDocument(event.sender);
+      throw new Error("Runtime diagnostics owner is no longer available.");
+    }
+    try {
+      ownerContents.send(DESKTOP_CHANNELS.runtimeProcessMonitorRequest, request);
+    } catch (error: unknown) {
+      runtimeProcessMonitorBroker.cancelRequest(event.sender, request.requestId);
+      throw error;
+    }
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessMonitorRespond, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Runtime process monitor requires one exact response.");
+    const response = parseDesktopRuntimeProcessMonitorResponse(parameters[0]);
+    const monitorContents = runtimeProcessMonitorBroker.acceptResponse(event.sender, response);
+    if (monitorContents.isDestroyed() || runtimeProcessMonitorWindow?.webContents !== monitorContents ||
+      !isRuntimeProcessMonitorNavigation(monitorContents.getURL())) {
+      throw new Error("Runtime diagnostics window is no longer available.");
+    }
+    monitorContents.send(DESKTOP_CHANNELS.runtimeProcessDiagnosticsResponse, response);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.runtimeProcessMonitorRetire, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("Runtime process monitor retirement requires one exact owner.");
+    const owner = parseDesktopRuntimeProcessMonitorOwner(parameters[0]);
+    const binding = runtimeProcessMonitorBroker.binding;
+    if (binding === undefined) return;
+    if (binding.ownerEndpoint !== event.sender || !sameDesktopRuntimeProcessMonitorOwner(binding.owner, owner)) {
+      throw new Error("Runtime process monitor retirement crossed its owner occurrence.");
+    }
+    destroyRuntimeProcessMonitorWindow(false);
   });
   ipcMain.handle(DESKTOP_CHANNELS.layoutReset, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -5247,13 +5596,10 @@ function registerIpc(): void {
     event.sender.stopFindInPage(action);
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowMinimize, (event) => {
-    assertTrustedIpcSender(event);
-    BrowserWindow.fromWebContents(event.sender)?.minimize();
+    assertTrustedWindowControlSender(event).minimize();
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowToggleMaximize, (event) => {
-    assertTrustedIpcSender(event);
-    const window = BrowserWindow.fromWebContents(event.sender);
-    if (window === null) return false;
+    const window = assertTrustedWindowControlSender(event);
     if (window.isMaximized()) window.unmaximize(); else window.maximize();
     return window.isMaximized();
   });
@@ -5265,16 +5611,15 @@ function registerIpc(): void {
     return toggleApplicationWindowFullscreen(event.sender, BrowserWindow.fromWebContents(event.sender), mainWindow, sessionWindow);
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowClose, async (event, ...parameters: unknown[]) => {
-    assertTrustedIpcSender(event);
+    const window = assertTrustedWindowControlSender(event);
     if (parameters.length !== 0) throw new TypeError("Desktop close does not accept parameters.");
-    const window = BrowserWindow.fromWebContents(event.sender);
-    if (window === null || window.isDestroyed()) throw new Error("Desktop close request has no trusted window.");
     if (window === mainWindow) {
       window.close();
       return;
     }
     if (window === runtimeProcessMonitorWindow) {
-      window.close();
+      recordPackagedSmokeProgress("runtime_process_monitor_close_ipc_received");
+      hideRuntimeProcessMonitorWindow(window, true);
       return;
     }
     const sessionOwner = sessionWindowOwnersByContents.get(event.sender);
@@ -5309,17 +5654,13 @@ function registerIpc(): void {
     return window.isMaximized();
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowSetZoomFactor, (event, ...parameters: unknown[]) => {
-    assertTrustedIpcSender(event);
+    assertTrustedWindowControlSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "number" || !Number.isFinite(parameters[0])) {
       throw new TypeError("Desktop zoom factor must be one finite number.");
     }
     const zoomFactor = parameters[0];
     if (zoomFactor < 0.5 || zoomFactor > 3 || Math.abs(zoomFactor * 10 - Math.round(zoomFactor * 10)) > Number.EPSILON * 10) {
       throw new RangeError("Desktop zoom factor must be from 0.5 through 3 in 0.1 increments.");
-    }
-    const window = BrowserWindow.fromWebContents(event.sender);
-    if (window === null || window.isDestroyed() || trustedApplicationWindowForContents(event.sender) !== window) {
-      throw new Error("Desktop zoom requests are restricted to application windows.");
     }
     currentWindowZoomFactor = zoomFactor;
     for (const applicationWindow of applicationWindows()) applicationWindow.webContents.setZoomFactor(zoomFactor);
@@ -6764,6 +7105,33 @@ function assertTrustedIpcSender(event: IpcMainInvokeEvent): void {
   }
 }
 
+function assertRuntimeProcessDiagnosticsSender(event: IpcMainInvokeEvent): void {
+  if (runtimeProcessMonitorWindowForEvent(event) === undefined) {
+    throw new Error("Runtime diagnostics IPC did not originate from the bound monitor document.");
+  }
+}
+
+function assertTrustedWindowControlSender(event: IpcMainInvokeEvent): BrowserWindow {
+  const monitor = runtimeProcessMonitorWindowForEvent(event);
+  if (monitor !== undefined) return monitor;
+  assertTrustedIpcSender(event);
+  const window = trustedApplicationWindowForContents(event.sender);
+  if (window === undefined) throw new Error("Desktop window control has no trusted application window.");
+  return window;
+}
+
+function runtimeProcessMonitorWindowForEvent(event: IpcMainInvokeEvent): BrowserWindow | undefined {
+  const window = runtimeProcessMonitorWindow;
+  const senderFrame = event.senderFrame;
+  if (window === undefined || window.isDestroyed() || event.sender !== window.webContents ||
+    runtimeProcessMonitorBroker.binding?.monitorEndpoint !== event.sender ||
+    BrowserWindow.fromWebContents(event.sender) !== window || window.webContents !== event.sender ||
+    senderFrame === undefined || senderFrame !== event.sender.mainFrame ||
+    !isRuntimeProcessMonitorNavigation(senderFrame.url) ||
+    !isRuntimeProcessMonitorNavigation(event.sender.getURL())) return undefined;
+  return window;
+}
+
 function assertFocusedTrustedIpcSender(event: IpcMainInvokeEvent): BrowserWindow {
   assertTrustedIpcSender(event);
   const owner = trustedApplicationWindowForContents(event.sender);
@@ -6819,10 +7187,7 @@ function trackExtensionLibraryGestureScope(contents: WebContents): void {
 function trustedApplicationWindowForContents(contents: WebContents): BrowserWindow | undefined {
   const owner = BrowserWindow.fromWebContents(contents);
   if (owner === null || owner.isDestroyed() || owner.webContents !== contents) return undefined;
-  if (owner === mainWindow) return owner;
-  if (owner === runtimeProcessMonitorWindow) {
-    return isRuntimeProcessMonitorNavigation(contents.getURL()) ? owner : undefined;
-  }
+  if (owner === mainWindow) return isAllowedPrimaryWindowNavigation(contents.getURL(), navigationPolicy) ? owner : undefined;
   const sessionOwner = sessionWindowOwnersByContents.get(contents);
   if (sessionOwner !== undefined && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
     && isAllowedSessionWindowNavigation(contents.getURL(), sessionOwner.sessionId, navigationPolicy)) return owner;

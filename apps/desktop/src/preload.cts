@@ -52,6 +52,12 @@ import type {
   DesktopRevealArtifactSourceRequest,
   DesktopRevealArtifactSourceResult,
   DesktopRuntimeProcessMonitorOpenResult,
+  DesktopRuntimeProcessMonitorBackend,
+  DesktopRuntimeProcessMonitorOwner,
+  DesktopRuntimeProcessMonitorProcess,
+  DesktopRuntimeProcessMonitorRequest,
+  DesktopRuntimeProcessMonitorResponse,
+  DesktopRuntimeProcessMonitorSession,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
   DesktopSessionWindowOwner,
@@ -92,6 +98,13 @@ const DESKTOP_CHANNELS = {
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
   runtimeProcessMonitorOpen: "joko:runtime-process-monitor:open",
+  runtimeProcessMonitorRequest: "joko:runtime-process-monitor:request",
+  runtimeProcessMonitorRespond: "joko:runtime-process-monitor:respond",
+  runtimeProcessMonitorRetire: "joko:runtime-process-monitor:retire",
+  runtimeProcessDiagnosticsGetOwner: "joko:runtime-process-diagnostics:owner:get",
+  runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
+  runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
+  runtimeProcessDiagnosticsRetired: "joko:runtime-process-diagnostics:retired",
   layoutReset: "joko:layout:reset",
   layoutResetBroadcast: "joko:layout:reset-broadcast",
   windowInteractionGet: "joko:window-interaction:get",
@@ -321,9 +334,27 @@ const desktopApi = Object.freeze({
     }
   }),
   runtimeProcessMonitor: Object.freeze({
-    open: (): Promise<DesktopRuntimeProcessMonitorOpenResult> =>
-      ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorOpen)
-        .then(parseDesktopRuntimeProcessMonitorOpenResult)
+    open: (owner: DesktopRuntimeProcessMonitorOwner): Promise<DesktopRuntimeProcessMonitorOpenResult> => {
+      const parsed = parseDesktopRuntimeProcessMonitorOwner(owner);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorOpen, parsed)
+        .then(parseDesktopRuntimeProcessMonitorOpenResult);
+    },
+    onRequest: (listener: (request: DesktopRuntimeProcessMonitorRequest) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Runtime process monitor request listener is invalid.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try { listener(parseDesktopRuntimeProcessMonitorRequest(value)); } catch { /* Main remains authoritative. */ }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.runtimeProcessMonitorRequest, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.runtimeProcessMonitorRequest, wrapped);
+    },
+    respond: (response: DesktopRuntimeProcessMonitorResponse): Promise<void> => {
+      const parsed = parseDesktopRuntimeProcessMonitorResponse(response);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorRespond, parsed).then(() => undefined);
+    },
+    retire: (owner: DesktopRuntimeProcessMonitorOwner): Promise<void> => {
+      const parsed = parseDesktopRuntimeProcessMonitorOwner(owner);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.runtimeProcessMonitorRetire, parsed).then(() => undefined);
+    }
   }),
   layout: Object.freeze({
     reset: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.layoutReset),
@@ -1219,12 +1250,185 @@ function parseDesktopSessionWindowDropResult(value: unknown): DesktopSessionWind
 }
 
 function parseDesktopRuntimeProcessMonitorOpenResult(value: unknown): DesktopRuntimeProcessMonitorOpenResult {
-  if (typeof value !== "object" || value === null || Array.isArray(value) ||
-    Object.keys(value).join(",") !== "focusedExisting" ||
-    typeof (value as Record<string, unknown>)["focusedExisting"] !== "boolean") {
+  if (!runtimeProcessRecord(value, ["version", "focusedExisting"]) || value["version"] !== 1 ||
+    typeof value["focusedExisting"] !== "boolean") {
     throw new TypeError("Runtime process monitor result is invalid.");
   }
-  return Object.freeze({ focusedExisting: (value as DesktopRuntimeProcessMonitorOpenResult).focusedExisting });
+  return Object.freeze({ version: 1, focusedExisting: value["focusedExisting"] });
+}
+
+function parseDesktopRuntimeProcessMonitorOwner(value: unknown): DesktopRuntimeProcessMonitorOwner {
+  if (!runtimeProcessRecord(value, ["version", "profileId", "serverId", "connectionGeneration", "snapshotGeneration"]) ||
+    value["version"] !== 1 || !runtimeProcessIdentity(value["profileId"]) || !runtimeProcessIdentity(value["serverId"]) ||
+    !runtimeProcessSafeGeneration(value["connectionGeneration"]) || !runtimeProcessUint64Generation(value["snapshotGeneration"])) {
+    throw new TypeError("Runtime process monitor owner is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    profileId: value["profileId"],
+    serverId: value["serverId"],
+    connectionGeneration: value["connectionGeneration"],
+    snapshotGeneration: value["snapshotGeneration"]
+  });
+}
+
+function parseDesktopRuntimeProcessMonitorRequest(value: unknown): DesktopRuntimeProcessMonitorRequest {
+  if (!runtimeProcessRecord(value, ["version", "requestId", "owner", "action"]) || value["version"] !== 1 ||
+    !runtimeProcessUuid(value["requestId"])) throw new TypeError("Runtime process monitor request is invalid.");
+  const owner = parseDesktopRuntimeProcessMonitorOwner(value["owner"]);
+  const action = value["action"];
+  if (runtimeProcessRecord(action, ["kind"]) && action["kind"] === "refresh") {
+    return Object.freeze({ version: 1, requestId: value["requestId"], owner, action: Object.freeze({ kind: "refresh" }) });
+  }
+  if (runtimeProcessRecord(action, ["kind", "backendGeneration", "process"]) && action["kind"] === "terminate" &&
+    runtimeProcessSafeGeneration(action["backendGeneration"])) {
+    return Object.freeze({
+      version: 1,
+      requestId: value["requestId"],
+      owner,
+      action: Object.freeze({
+        kind: "terminate",
+        backendGeneration: action["backendGeneration"],
+        process: parseRuntimeProcess(action["process"])
+      })
+    });
+  }
+  throw new TypeError("Runtime process monitor action is invalid.");
+}
+
+function parseDesktopRuntimeProcessMonitorResponse(value: unknown): DesktopRuntimeProcessMonitorResponse {
+  if (!runtimeProcessRecord(value, ["version", "requestId", "owner", "result"]) || value["version"] !== 1 ||
+    !runtimeProcessUuid(value["requestId"])) throw new TypeError("Runtime process monitor response is invalid.");
+  const owner = parseDesktopRuntimeProcessMonitorOwner(value["owner"]);
+  const result = value["result"];
+  if (runtimeProcessRecord(result, ["kind"]) && result["kind"] === "terminated") {
+    return Object.freeze({ version: 1, requestId: value["requestId"], owner, result: Object.freeze({ kind: "terminated" }) });
+  }
+  if (runtimeProcessRecord(result, ["kind", "message"]) && result["kind"] === "error" &&
+    runtimeProcessBoundedText(result["message"], 2_048)) {
+    return Object.freeze({
+      version: 1,
+      requestId: value["requestId"],
+      owner,
+      result: Object.freeze({ kind: "error", message: result["message"] })
+    });
+  }
+  if (!runtimeProcessRecord(result, ["kind", "locale", "backends", "sessions"]) || result["kind"] !== "snapshot" ||
+    (result["locale"] !== "en" && result["locale"] !== "zh-CN" && result["locale"] !== "en-XA") ||
+    !Array.isArray(result["backends"]) || result["backends"].length > 128 ||
+    !Array.isArray(result["sessions"]) || result["sessions"].length > 4_096) {
+    throw new TypeError("Runtime process monitor snapshot is invalid.");
+  }
+  const backends = result["backends"].map(parseRuntimeProcessBackend);
+  const sessions = result["sessions"].map(parseRuntimeProcessSession);
+  const backendIds = new Set(backends.map((backend) => backend.backendId));
+  const sessionKeys = new Set(sessions.map((session) => `${session.backendId}\u0000${session.sessionId}`));
+  if (backendIds.size !== backends.length || sessionKeys.size !== sessions.length ||
+    sessions.some((session) => !backendIds.has(session.backendId)) ||
+    backends.some((backend) => backend.state === "ready" && backend.processes.some((process) =>
+      process.backendId !== backend.backendId || !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`)))) {
+    throw new TypeError("Runtime process monitor snapshot ownership is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    requestId: value["requestId"],
+    owner,
+    result: Object.freeze({
+      kind: "snapshot",
+      locale: result["locale"],
+      backends: Object.freeze(backends),
+      sessions: Object.freeze(sessions)
+    })
+  });
+}
+
+function parseRuntimeProcessBackend(value: unknown): DesktopRuntimeProcessMonitorBackend {
+  if (runtimeProcessRecord(value, ["backendId", "backendGeneration", "backendName", "usageSupported", "terminateSupported", "state", "capturedAt", "processes"]) &&
+    runtimeProcessIdentity(value["backendId"]) && runtimeProcessSafeGeneration(value["backendGeneration"]) && runtimeProcessDisplayText(value["backendName"]) &&
+    typeof value["usageSupported"] === "boolean" && typeof value["terminateSupported"] === "boolean" && value["state"] === "ready" &&
+    Number.isSafeInteger(value["capturedAt"]) && (value["capturedAt"] as number) >= 0 &&
+    Array.isArray(value["processes"]) && value["processes"].length <= 512) {
+    return Object.freeze({
+      backendId: value["backendId"], backendGeneration: value["backendGeneration"], backendName: value["backendName"], usageSupported: value["usageSupported"],
+      terminateSupported: value["terminateSupported"], state: "ready", capturedAt: value["capturedAt"] as number,
+      processes: Object.freeze(value["processes"].map(parseRuntimeProcess))
+    });
+  }
+  if (runtimeProcessRecord(value, ["backendId", "backendGeneration", "backendName", "usageSupported", "terminateSupported", "state", "error"]) &&
+    runtimeProcessIdentity(value["backendId"]) && runtimeProcessSafeGeneration(value["backendGeneration"]) && runtimeProcessDisplayText(value["backendName"]) &&
+    typeof value["usageSupported"] === "boolean" && typeof value["terminateSupported"] === "boolean" && value["state"] === "error" &&
+    runtimeProcessBoundedText(value["error"], 2_048)) {
+    return Object.freeze({
+      backendId: value["backendId"], backendGeneration: value["backendGeneration"], backendName: value["backendName"], usageSupported: value["usageSupported"],
+      terminateSupported: value["terminateSupported"], state: "error", error: value["error"]
+    });
+  }
+  throw new TypeError("Runtime process monitor Backend is invalid.");
+}
+
+function parseRuntimeProcessSession(value: unknown): DesktopRuntimeProcessMonitorSession {
+  if (!runtimeProcessRecord(value, ["sessionId", "backendId", "sessionName", "generation"]) ||
+    !runtimeProcessIdentity(value["sessionId"]) || !runtimeProcessIdentity(value["backendId"]) ||
+    !runtimeProcessDisplayText(value["sessionName"]) || !runtimeProcessUint64Generation(value["generation"])) {
+    throw new TypeError("Runtime process monitor Session is invalid.");
+  }
+  return Object.freeze({ sessionId: value["sessionId"], backendId: value["backendId"], sessionName: value["sessionName"], generation: value["generation"] });
+}
+
+function parseRuntimeProcess(value: unknown): DesktopRuntimeProcessMonitorProcess {
+  const keys = ["backendId", "sessionId", "generation", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
+  const hasInstance = runtimeProcessRecord(value, [...keys, "processInstanceId"]);
+  if ((!hasInstance && !runtimeProcessRecord(value, keys)) || !runtimeProcessIdentity(value["backendId"]) ||
+    !runtimeProcessIdentity(value["sessionId"]) || !runtimeProcessPositiveInteger(value["generation"]) ||
+    !runtimeProcessPositiveInteger(value["pid"]) || typeof value["cpuPercent"] !== "number" ||
+    !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 ||
+    !Number.isSafeInteger(value["memoryKb"]) || (value["memoryKb"] as number) < 0 ||
+    !runtimeProcessPositiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
+    value["terminable"] !== hasInstance ||
+    (hasInstance && !runtimeProcessUuid(value["processInstanceId"]))) {
+    throw new TypeError("Runtime process monitor process is invalid.");
+  }
+  return Object.freeze({
+    backendId: value["backendId"], sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+    cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
+    terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+  });
+}
+
+function runtimeProcessRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function runtimeProcessIdentity(value: unknown): value is string {
+  return runtimeProcessBoundedText(value, 512);
+}
+
+function runtimeProcessDisplayText(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 512 && !/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value);
+}
+
+function runtimeProcessBoundedText(value: unknown, maximum: number): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= maximum && value.trim() === value &&
+    !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function runtimeProcessSafeGeneration(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,15}$/u.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function runtimeProcessUint64Generation(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,19}$/u.test(value) &&
+    BigInt(value) <= 18_446_744_073_709_551_615n;
+}
+
+function runtimeProcessUuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
+}
+
+function runtimeProcessPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
 function parseDesktopKeepAwakeSettings(value: unknown): DesktopKeepAwakeSettings {

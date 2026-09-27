@@ -134,6 +134,7 @@ module.exports = async function auditPackaged(context) {
     "package.json",
     join("dist", "main.js"),
     join("dist", "preload.cjs"),
+    join("dist", "runtime-process-monitor-preload.cjs"),
     join("dist", "web", "index.html"),
     join("dist", "dedicated-hardware", "utility-entry.js")
   ]) {

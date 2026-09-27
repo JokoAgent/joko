@@ -28,6 +28,7 @@ import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
 import { StartupUpdateOverlay } from "./components/StartupUpdateOverlay.js";
 import { NativeTaskStatusBridge } from "./components/NativeTaskStatusBridge.js";
 import { DesktopGlobalVoiceBridge } from "./components/DesktopGlobalVoiceBridge.js";
+import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorBroker.js";
 import { RuntimeProcessMonitorWindow } from "./components/RuntimeProcessMonitorWindow.js";
 import { VisionBridgeToasts } from "./components/VisionBridgeToasts.js";
 import { Sidebar } from "./components/Sidebar.js";
@@ -178,14 +179,18 @@ export function App(): JSX.Element {
 }
 
 function AppControllerRoot(): JSX.Element {
+  const runtimeProcessMonitor = typeof window !== "undefined" && isRuntimeProcessMonitorWindow(window.location);
+  if (runtimeProcessMonitor) return <RuntimeProcessMonitorWindow />;
+  return <ConnectedAppControllerRoot />;
+}
+
+function ConnectedAppControllerRoot(): JSX.Element {
   const controller = useAppController();
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(controller.state.preferences.locale, key, values), [controller.state.preferences.locale]);
-  const runtimeProcessMonitor = typeof window !== "undefined" && isRuntimeProcessMonitorWindow(window.location);
-  if (runtimeProcessMonitor) return <><RuntimeProcessMonitorWindow controller={controller} t={t} /><DesktopWindowControls t={t} /></>;
   const applicationWindowOwner = typeof window !== "undefined"
     && !isSessionApplicationWindow(window.location)
     && !isExtensionApplicationWindow(window.location);
-  return <><StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
+  return <><RuntimeProcessMonitorBroker controller={controller} /><StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
 }
 
 /** Injectable application shell used by deterministic development harnesses. */

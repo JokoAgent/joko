@@ -301,6 +301,86 @@ type JokoDesktopGlobalVoiceStatus =
   | { readonly state: "submitting"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly transcript: string }
   | { readonly state: "error"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly errorKind: "unsupported" | "permission" | "microphone" | "service" | "empty" | "insertion" };
 
+interface DesktopRuntimeProcessMonitorOwner {
+  readonly version: 1;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly connectionGeneration: string;
+  readonly snapshotGeneration: string;
+}
+
+interface DesktopRuntimeProcessMonitorProcess {
+  readonly backendId: string;
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly pid: number;
+  readonly cpuPercent: number;
+  readonly memoryKb: number;
+  readonly processCount: number;
+  readonly terminable: boolean;
+  readonly processInstanceId?: string;
+}
+
+interface DesktopRuntimeProcessMonitorBackendBase {
+  readonly backendId: string;
+  readonly backendGeneration: string;
+  readonly backendName: string;
+  readonly usageSupported: boolean;
+  readonly terminateSupported: boolean;
+}
+
+interface DesktopRuntimeProcessMonitorReadyBackend extends DesktopRuntimeProcessMonitorBackendBase {
+  readonly state: "ready";
+  readonly capturedAt: number;
+  readonly error?: never;
+  readonly processes: readonly DesktopRuntimeProcessMonitorProcess[];
+}
+
+interface DesktopRuntimeProcessMonitorErrorBackend extends DesktopRuntimeProcessMonitorBackendBase {
+  readonly state: "error";
+  readonly capturedAt?: never;
+  readonly error: string;
+  readonly processes?: never;
+}
+
+type DesktopRuntimeProcessMonitorBackend =
+  | DesktopRuntimeProcessMonitorReadyBackend
+  | DesktopRuntimeProcessMonitorErrorBackend;
+
+interface DesktopRuntimeProcessMonitorSession {
+  readonly sessionId: string;
+  readonly backendId: string;
+  readonly sessionName: string;
+  readonly generation: string;
+}
+
+interface DesktopRuntimeProcessMonitorSnapshot {
+  readonly locale: "en" | "zh-CN" | "en-XA";
+  readonly backends: readonly DesktopRuntimeProcessMonitorBackend[];
+  readonly sessions: readonly DesktopRuntimeProcessMonitorSession[];
+}
+
+type DesktopRuntimeProcessMonitorRequest = {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly owner: DesktopRuntimeProcessMonitorOwner;
+  readonly action: { readonly kind: "refresh" } | {
+    readonly kind: "terminate";
+    readonly backendGeneration: string;
+    readonly process: DesktopRuntimeProcessMonitorProcess;
+  };
+};
+
+type DesktopRuntimeProcessMonitorResponse = {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly owner: DesktopRuntimeProcessMonitorOwner;
+  readonly result:
+    | ({ readonly kind: "snapshot" } & DesktopRuntimeProcessMonitorSnapshot)
+    | { readonly kind: "terminated" }
+    | { readonly kind: "error"; readonly message: string };
+};
+
 interface JokoDesktopApi {
   readonly platform: string;
   readonly capabilities: readonly JokoDesktopCapability[];
@@ -324,7 +404,10 @@ interface JokoDesktopApi {
     >;
   };
   readonly runtimeProcessMonitor: {
-    open(): Promise<{ readonly focusedExisting: boolean }>;
+    open(owner: DesktopRuntimeProcessMonitorOwner): Promise<{ readonly version: 1; readonly focusedExisting: boolean }>;
+    retire(owner: DesktopRuntimeProcessMonitorOwner): Promise<void>;
+    onRequest(listener: (request: DesktopRuntimeProcessMonitorRequest) => void): () => void;
+    respond(response: DesktopRuntimeProcessMonitorResponse): Promise<void>;
   };
   readonly layout: {
     reset(): Promise<void>;
@@ -525,8 +608,24 @@ interface JokoVoiceOverlayApi {
   retry(): Promise<void>;
 }
 
+interface JokoRuntimeProcessDiagnosticsApi {
+  readonly version: 1;
+  readonly platform: string;
+  readonly window: {
+    minimize(): Promise<void>;
+    toggleMaximize(): Promise<boolean>;
+    setZoomFactor(zoomFactor: number): Promise<void>;
+    close(): Promise<void>;
+  };
+  getOwner(): Promise<DesktopRuntimeProcessMonitorOwner>;
+  request(request: DesktopRuntimeProcessMonitorRequest): Promise<void>;
+  onResponse(listener: (response: DesktopRuntimeProcessMonitorResponse) => void): () => void;
+  onRetired(listener: () => void): () => void;
+}
+
 interface Window {
   readonly jokoDesktop?: JokoDesktopApi;
   readonly jokoInspectorDesktop?: JokoInspectorDesktopApi;
   readonly jokoVoiceOverlay?: JokoVoiceOverlayApi;
+  readonly jokoRuntimeProcessDiagnostics?: JokoRuntimeProcessDiagnosticsApi;
 }

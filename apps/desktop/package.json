@@ -9,7 +9,7 @@
     "package.json"
   ],
   "scripts": {
-    "build": "pnpm build:native-voice-shortcut && pnpm build:native-simulator-hid && pnpm build:native-simulator-h264 && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/voice-overlay-preload.cjs && node scripts/stage-web.mjs",
+    "build": "pnpm build:native-voice-shortcut && pnpm build:native-simulator-hid && pnpm build:native-simulator-h264 && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/voice-overlay-preload.cjs && node --check dist/runtime-process-monitor-preload.cjs && node scripts/stage-web.mjs",
     "build:native-voice-shortcut": "node scripts/build-native-voice-shortcut.mjs",
     "build:native-simulator-hid": "node scripts/build-native-simulator-hid.mjs",
     "build:native-simulator-h264": "node scripts/build-native-simulator-h264.mjs",

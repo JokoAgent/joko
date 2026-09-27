@@ -18,6 +18,13 @@ export const DESKTOP_CHANNELS = {
   sessionDragPreviewEnd: "joko:session-drag-preview:end",
   sessionWindowOpenIfDroppedOutside: "joko:session-window:open-if-dropped-outside",
   runtimeProcessMonitorOpen: "joko:runtime-process-monitor:open",
+  runtimeProcessMonitorRequest: "joko:runtime-process-monitor:request",
+  runtimeProcessMonitorRespond: "joko:runtime-process-monitor:respond",
+  runtimeProcessMonitorRetire: "joko:runtime-process-monitor:retire",
+  runtimeProcessDiagnosticsGetOwner: "joko:runtime-process-diagnostics:owner:get",
+  runtimeProcessDiagnosticsRequest: "joko:runtime-process-diagnostics:request",
+  runtimeProcessDiagnosticsResponse: "joko:runtime-process-diagnostics:response",
+  runtimeProcessDiagnosticsRetired: "joko:runtime-process-diagnostics:retired",
   layoutReset: "joko:layout:reset",
   layoutResetBroadcast: "joko:layout:reset-broadcast",
   windowInteractionGet: "joko:window-interaction:get",
@@ -432,10 +439,6 @@ function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is 
   return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
 
-export interface DesktopRuntimeProcessMonitorOpenResult {
-  readonly focusedExisting: boolean;
-}
-
 export function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"
     || value === "new-session"
@@ -630,6 +633,19 @@ export type DesktopProviderModelRefreshLifecycleHint =
 export interface DesktopWindowInteractionSettings {
   readonly swallowActivationClick: boolean;
 }
+
+export type {
+  DesktopRuntimeProcessMonitorAction,
+  DesktopRuntimeProcessMonitorBackend,
+  DesktopRuntimeProcessMonitorOpenResult,
+  DesktopRuntimeProcessMonitorOwner,
+  DesktopRuntimeProcessMonitorProcess,
+  DesktopRuntimeProcessMonitorRequest,
+  DesktopRuntimeProcessMonitorResponse,
+  DesktopRuntimeProcessMonitorResult,
+  DesktopRuntimeProcessMonitorSession,
+  DesktopRuntimeProcessMonitorSnapshot
+} from "./runtime-process-monitor.js";
 
 export interface DesktopCopyFileRequest {
   readonly requestId: string;

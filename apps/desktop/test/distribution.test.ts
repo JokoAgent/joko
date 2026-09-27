@@ -42,6 +42,10 @@ const config = JSON.parse(readFileSync(new URL("../electron-builder.json", impor
 const workspace = readFileSync(new URL("../../../pnpm-workspace.yaml", import.meta.url), "utf8");
 const packagedAudit = readFileSync(new URL("../scripts/audit-packaged.cjs", import.meta.url), "utf8");
 const packagedSmoke = readFileSync(new URL("../scripts/smoke-packaged.mjs", import.meta.url), "utf8");
+const runtimeProcessMonitorPreload = readFileSync(
+  new URL("../src/runtime-process-monitor-preload.cts", import.meta.url),
+  "utf8"
+);
 
 describe("Desktop distribution", () => {
   it("invalidates incremental state whenever compiled Desktop output is removed", () => {
@@ -131,6 +135,28 @@ describe("Desktop distribution", () => {
     expect(packagedSmoke).toContain('resolve(applicationRoot, "dist", "dedicated-hardware", "utility-entry.js")');
     expect(packagedSmoke).toContain("canonicalRegularFileExists(entry)");
     expect(packagedSmoke).toContain("function canonicalRegularFileExists(path)");
+  });
+
+  it("builds and audits the minimal standalone runtime-diagnostics preload", () => {
+    expect(manifest.scripts?.build).toContain("node --check dist/runtime-process-monitor-preload.cjs");
+    expect(config.files).toContain("dist/**/*.cjs");
+    expect(packagedAudit).toContain('join("dist", "runtime-process-monitor-preload.cjs")');
+    expect(runtimeProcessMonitorPreload).toContain(
+      'contextBridge.exposeInMainWorld("jokoRuntimeProcessDiagnostics", api)'
+    );
+    expect(runtimeProcessMonitorPreload).not.toContain('exposeInMainWorld("jokoDesktop"');
+    expect(runtimeProcessMonitorPreload).not.toContain("sendSync(");
+    expect([...runtimeProcessMonitorPreload.matchAll(/"(joko:[^"]+)"/gu)].map((match) => match[1]).sort())
+      .toEqual([
+        "joko:runtime-process-diagnostics:owner:get",
+        "joko:runtime-process-diagnostics:request",
+        "joko:runtime-process-diagnostics:response",
+        "joko:runtime-process-diagnostics:retired",
+        "joko:window:close",
+        "joko:window:minimize",
+        "joko:window:set-zoom-factor",
+        "joko:window:toggle-maximize"
+      ]);
   });
 
   it("has no redistributable hardware SDK input and audits only its fixed resources directory", () => {

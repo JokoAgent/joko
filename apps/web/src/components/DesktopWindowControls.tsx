@@ -8,19 +8,24 @@ export function shouldRenderDesktopWindowControls(platform: string | undefined):
   return platform !== undefined && platform !== "darwin";
 }
 
-/**
- * Window close is deliberately a shell-only hide-to-tray action. It does not
- * navigate away from the document, ask the renderer to choose a lifetime, or
- * disable the other window controls while Electron performs the hide.
- */
-export function requestDesktopWindowClose(api: JokoDesktopApi): void {
+/** Window lifetime remains shell-owned; the renderer only requests close. */
+interface DesktopWindowControlApi {
+  readonly platform: string;
+  readonly window: {
+    minimize(): Promise<void>;
+    toggleMaximize(): Promise<boolean>;
+    close(): Promise<void>;
+  };
+}
+
+export function requestDesktopWindowClose(api: Pick<DesktopWindowControlApi, "window">): void {
   void api.window.close().catch(() => undefined);
 }
 
 export function DesktopWindowControls({ t }: {
   readonly t: Translator;
 }): JSX.Element | null {
-  const desktop = window.jokoDesktop;
+  const desktop: DesktopWindowControlApi | undefined = window.jokoDesktop ?? window.jokoRuntimeProcessDiagnostics;
   const platform = desktop?.platform;
 
   useLayoutEffect(() => {

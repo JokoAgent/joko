@@ -1,125 +1,235 @@
 import type {
-  DesktopDiscoveredNode,
-  DesktopManagedOrchestratorConnection,
-  DesktopManagedOrchestratorStatus,
-  DesktopWindowInteractionSettings
+  DesktopRuntimeProcessMonitorBackend,
+  DesktopRuntimeProcessMonitorOwner,
+  DesktopRuntimeProcessMonitorProcess,
+  DesktopRuntimeProcessMonitorRequest,
+  DesktopRuntimeProcessMonitorResponse,
+  DesktopRuntimeProcessMonitorSession
 } from "./channels.js";
 import type { IpcRendererEvent } from "electron";
 
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
 
-// This secondary window needs service bootstrap plus native frame controls,
-// but no file, notification, media, update, or task-window authority.
 const CHANNELS = Object.freeze({
   windowMinimize: "joko:window:minimize",
   windowToggleMaximize: "joko:window:toggle-maximize",
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowClose: "joko:window:close",
-  windowInteractionGet: "joko:window-interaction:get",
-  windowInteractionSet: "joko:window-interaction:set",
-  windowInteractionChanged: "joko:window-interaction:changed",
-  appGetInfo: "joko:app:get-info",
-  traySetIcon: "joko:tray:set-icon",
-  credentialGet: "joko:credential:get",
-  credentialSet: "joko:credential:set",
-  credentialDelete: "joko:credential:delete",
-  discoveryScan: "joko:discovery:scan",
-  managedOrchestratorGetConnection: "joko:managed-orchestrator:get-connection",
-  managedOrchestratorGetStatus: "joko:managed-orchestrator:get-status",
-  managedOrchestratorRetry: "joko:managed-orchestrator:retry",
-  managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
-  managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout"
+  getOwner: "joko:runtime-process-diagnostics:owner:get",
+  request: "joko:runtime-process-diagnostics:request",
+  response: "joko:runtime-process-diagnostics:response",
+  retired: "joko:runtime-process-diagnostics:retired"
 });
 
 const api = Object.freeze({
+  version: 1 as const,
   platform: process.platform,
-  capabilities: Object.freeze([
-    "app.info",
-    "appearance.zoom",
-    "window.activationClick"
-  ] as const),
-  appInfo: Object.freeze({
-    get: () => ipcRenderer.invoke(CHANNELS.appGetInfo)
-  }),
   window: Object.freeze({
-    minimize: (): Promise<void> => ipcRenderer.invoke(CHANNELS.windowMinimize),
+    minimize: (): Promise<void> => ipcRenderer.invoke(CHANNELS.windowMinimize).then(() => undefined),
     toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke(CHANNELS.windowToggleMaximize),
     setZoomFactor: (zoomFactor: number): Promise<void> => {
-      if (!Number.isFinite(zoomFactor)) return Promise.reject(new TypeError("Desktop zoom factor is invalid."));
-      return ipcRenderer.invoke(CHANNELS.windowSetZoomFactor, zoomFactor);
-    },
-    close: (): Promise<void> => ipcRenderer.invoke(CHANNELS.windowClose)
-  }),
-  windowInteraction: Object.freeze({
-    get: (): Promise<DesktopWindowInteractionSettings> =>
-      ipcRenderer.invoke(CHANNELS.windowInteractionGet).then(parseWindowInteractionSettings),
-    setSwallowActivationClick: (enabled: boolean): Promise<DesktopWindowInteractionSettings> => {
-      if (typeof enabled !== "boolean") return Promise.reject(new TypeError("Desktop activation-click setting is invalid."));
-      return ipcRenderer.invoke(CHANNELS.windowInteractionSet, enabled).then(parseWindowInteractionSettings);
-    },
-    onChanged: (listener: (settings: DesktopWindowInteractionSettings) => void): (() => void) => {
-      if (typeof listener !== "function") throw new TypeError("Window-interaction listener must be a function.");
-      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
-        try { listener(parseWindowInteractionSettings(value)); } catch { /* A later get remains authoritative. */ }
-      };
-      ipcRenderer.on(CHANNELS.windowInteractionChanged, wrapped);
-      return () => ipcRenderer.removeListener(CHANNELS.windowInteractionChanged, wrapped);
-    }
-  }),
-  setTrayIcon: (dataUrl: string): Promise<void> => {
-    if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/png;base64,")) {
-      return Promise.reject(new TypeError("Tray icon is invalid."));
-    }
-    return ipcRenderer.invoke(CHANNELS.traySetIcon, dataUrl);
-  },
-  discovery: Object.freeze({
-    scan: (): Promise<readonly DesktopDiscoveredNode[]> => ipcRenderer.invoke(CHANNELS.discoveryScan)
-  }),
-  managedOrchestrator: Object.freeze({
-    getConnection: (): Promise<DesktopManagedOrchestratorConnection | undefined> =>
-      ipcRenderer.invoke(CHANNELS.managedOrchestratorGetConnection),
-    getStatus: (): Promise<DesktopManagedOrchestratorStatus> => ipcRenderer.invoke(CHANNELS.managedOrchestratorGetStatus),
-    retry: (): Promise<DesktopManagedOrchestratorStatus> => ipcRenderer.invoke(CHANNELS.managedOrchestratorRetry),
-    adoptConnection: (connection: DesktopManagedOrchestratorConnection): Promise<DesktopManagedOrchestratorStatus> =>
-      ipcRenderer.invoke(CHANNELS.managedOrchestratorAdoptConnection, connection),
-    completeLogout: (): Promise<DesktopManagedOrchestratorStatus> =>
-      ipcRenderer.invoke(CHANNELS.managedOrchestratorCompleteLogout)
-  }),
-  credentials: Object.freeze({
-    get: (profileId: string): Promise<string | undefined> => {
-      if (!validProfileId(profileId)) return Promise.reject(new TypeError("Profile identity is invalid."));
-      return ipcRenderer.invoke(CHANNELS.credentialGet, profileId);
-    },
-    set: (profileId: string, secret: string): Promise<void> => {
-      if (!validProfileId(profileId) || !validSecret(secret)) {
-        return Promise.reject(new TypeError("Protected connection input is invalid."));
+      if (!Number.isFinite(zoomFactor) || zoomFactor < 0.5 || zoomFactor > 3) {
+        return Promise.reject(new TypeError("Runtime diagnostics zoom factor is invalid."));
       }
-      return ipcRenderer.invoke(CHANNELS.credentialSet, profileId, secret);
+      return ipcRenderer.invoke(CHANNELS.windowSetZoomFactor, zoomFactor).then(() => undefined);
     },
-    delete: (profileId: string): Promise<void> => {
-      if (!validProfileId(profileId)) return Promise.reject(new TypeError("Profile identity is invalid."));
-      return ipcRenderer.invoke(CHANNELS.credentialDelete, profileId);
-    }
-  })
+    close: (): Promise<void> => ipcRenderer.invoke(CHANNELS.windowClose).then(() => undefined)
+  }),
+  getOwner: (): Promise<DesktopRuntimeProcessMonitorOwner> =>
+    ipcRenderer.invoke(CHANNELS.getOwner).then(parseOwner),
+  request: (request: DesktopRuntimeProcessMonitorRequest): Promise<void> => {
+    const parsed = parseRequest(request);
+    return ipcRenderer.invoke(CHANNELS.request, parsed).then(() => undefined);
+  },
+  onResponse: (listener: (response: DesktopRuntimeProcessMonitorResponse) => void): (() => void) => {
+    if (typeof listener !== "function") throw new TypeError("Runtime diagnostics response listener is invalid.");
+    const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+      try { listener(parseResponse(value)); } catch { /* Ignore malformed projections from a retired document. */ }
+    };
+    ipcRenderer.on(CHANNELS.response, wrapped);
+    return () => ipcRenderer.removeListener(CHANNELS.response, wrapped);
+  },
+  onRetired: (listener: () => void): (() => void) => {
+    if (typeof listener !== "function") throw new TypeError("Runtime diagnostics retirement listener is invalid.");
+    const wrapped = (): void => listener();
+    ipcRenderer.on(CHANNELS.retired, wrapped);
+    return () => ipcRenderer.removeListener(CHANNELS.retired, wrapped);
+  }
 });
 
-contextBridge.exposeInMainWorld("jokoDesktop", api);
+contextBridge.exposeInMainWorld("jokoRuntimeProcessDiagnostics", api);
 
-function parseWindowInteractionSettings(value: unknown): DesktopWindowInteractionSettings {
-  if (typeof value !== "object" || value === null || Array.isArray(value) ||
-    Object.keys(value).join(",") !== "swallowActivationClick" ||
-    typeof (value as Record<string, unknown>)["swallowActivationClick"] !== "boolean") {
-    throw new TypeError("Desktop window-interaction settings are invalid.");
+function parseOwner(value: unknown): DesktopRuntimeProcessMonitorOwner {
+  if (!record(value, ["version", "profileId", "serverId", "connectionGeneration", "snapshotGeneration"]) ||
+    value["version"] !== 1 || !identity(value["profileId"]) || !identity(value["serverId"]) ||
+    !safeGeneration(value["connectionGeneration"]) || !uint64Generation(value["snapshotGeneration"])) {
+    throw new TypeError("Runtime diagnostics owner is invalid.");
   }
   return Object.freeze({
-    swallowActivationClick: (value as DesktopWindowInteractionSettings).swallowActivationClick
+    version: 1,
+    profileId: value["profileId"],
+    serverId: value["serverId"],
+    connectionGeneration: value["connectionGeneration"],
+    snapshotGeneration: value["snapshotGeneration"]
   });
 }
 
-function validProfileId(value: unknown): value is string {
-  return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/u.test(value);
+function parseRequest(value: unknown): DesktopRuntimeProcessMonitorRequest {
+  if (!record(value, ["version", "requestId", "owner", "action"]) || value["version"] !== 1 || !uuid(value["requestId"])) {
+    throw new TypeError("Runtime diagnostics request is invalid.");
+  }
+  const owner = parseOwner(value["owner"]);
+  const action = value["action"];
+  if (record(action, ["kind"]) && action["kind"] === "refresh") {
+    return Object.freeze({ version: 1, requestId: value["requestId"], owner, action: Object.freeze({ kind: "refresh" }) });
+  }
+  if (record(action, ["kind", "backendGeneration", "process"]) && action["kind"] === "terminate" &&
+    safeGeneration(action["backendGeneration"])) {
+    return Object.freeze({
+      version: 1,
+      requestId: value["requestId"],
+      owner,
+      action: Object.freeze({
+        kind: "terminate",
+        backendGeneration: action["backendGeneration"],
+        process: parseProcess(action["process"])
+      })
+    });
+  }
+  throw new TypeError("Runtime diagnostics request action is invalid.");
 }
 
-function validSecret(value: unknown): value is string {
-  return typeof value === "string" && value.length >= 16 && new TextEncoder().encode(value).byteLength <= 64 * 1024;
+function parseResponse(value: unknown): DesktopRuntimeProcessMonitorResponse {
+  if (!record(value, ["version", "requestId", "owner", "result"]) || value["version"] !== 1 || !uuid(value["requestId"])) {
+    throw new TypeError("Runtime diagnostics response is invalid.");
+  }
+  const owner = parseOwner(value["owner"]);
+  const result = value["result"];
+  if (record(result, ["kind"]) && result["kind"] === "terminated") {
+    return Object.freeze({ version: 1, requestId: value["requestId"], owner, result: Object.freeze({ kind: "terminated" }) });
+  }
+  if (record(result, ["kind", "message"]) && result["kind"] === "error" && boundedText(result["message"], 2_048)) {
+    return Object.freeze({
+      version: 1,
+      requestId: value["requestId"],
+      owner,
+      result: Object.freeze({ kind: "error", message: result["message"] })
+    });
+  }
+  if (!record(result, ["kind", "locale", "backends", "sessions"]) || result["kind"] !== "snapshot" ||
+    (result["locale"] !== "en" && result["locale"] !== "zh-CN" && result["locale"] !== "en-XA") ||
+    !Array.isArray(result["backends"]) || result["backends"].length > 128 ||
+    !Array.isArray(result["sessions"]) || result["sessions"].length > 4_096) {
+    throw new TypeError("Runtime diagnostics snapshot is invalid.");
+  }
+  const backends = result["backends"].map(parseBackend);
+  const sessions = result["sessions"].map(parseSession);
+  const backendIds = new Set(backends.map((backend) => backend.backendId));
+  if (backendIds.size !== backends.length || sessions.some((session) => !backendIds.has(session.backendId))) {
+    throw new TypeError("Runtime diagnostics snapshot ownership is invalid.");
+  }
+  const sessionKeys = new Set(sessions.map((session) => `${session.backendId}\u0000${session.sessionId}`));
+  if (sessionKeys.size !== sessions.length || backends.some((backend) => backend.state === "ready" &&
+    backend.processes.some((process) => process.backendId !== backend.backendId ||
+      !sessionKeys.has(`${process.backendId}\u0000${process.sessionId}`)))) {
+    throw new TypeError("Runtime diagnostics process ownership is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    requestId: value["requestId"],
+    owner,
+    result: Object.freeze({
+      kind: "snapshot",
+      locale: result["locale"],
+      backends: Object.freeze(backends),
+      sessions: Object.freeze(sessions)
+    })
+  });
+}
+
+function parseBackend(value: unknown): DesktopRuntimeProcessMonitorBackend {
+  if (record(value, ["backendId", "backendGeneration", "backendName", "usageSupported", "terminateSupported", "state", "capturedAt", "processes"]) &&
+    identity(value["backendId"]) && safeGeneration(value["backendGeneration"]) && displayText(value["backendName"]) && typeof value["usageSupported"] === "boolean" &&
+    typeof value["terminateSupported"] === "boolean" && value["state"] === "ready" &&
+    Number.isSafeInteger(value["capturedAt"]) && (value["capturedAt"] as number) >= 0 &&
+    Array.isArray(value["processes"]) && value["processes"].length <= 512) {
+    return Object.freeze({
+      backendId: value["backendId"], backendGeneration: value["backendGeneration"], backendName: value["backendName"], usageSupported: value["usageSupported"],
+      terminateSupported: value["terminateSupported"], state: "ready", capturedAt: value["capturedAt"] as number,
+      processes: Object.freeze(value["processes"].map(parseProcess))
+    });
+  }
+  if (record(value, ["backendId", "backendGeneration", "backendName", "usageSupported", "terminateSupported", "state", "error"]) &&
+    identity(value["backendId"]) && safeGeneration(value["backendGeneration"]) && displayText(value["backendName"]) && typeof value["usageSupported"] === "boolean" &&
+    typeof value["terminateSupported"] === "boolean" && value["state"] === "error" && boundedText(value["error"], 2_048)) {
+    return Object.freeze({
+      backendId: value["backendId"], backendGeneration: value["backendGeneration"], backendName: value["backendName"], usageSupported: value["usageSupported"],
+      terminateSupported: value["terminateSupported"], state: "error", error: value["error"]
+    });
+  }
+  throw new TypeError("Runtime diagnostics Backend is invalid.");
+}
+
+function parseSession(value: unknown): DesktopRuntimeProcessMonitorSession {
+  if (!record(value, ["sessionId", "backendId", "sessionName", "generation"]) || !identity(value["sessionId"]) ||
+    !identity(value["backendId"]) || !displayText(value["sessionName"]) || !uint64Generation(value["generation"])) {
+    throw new TypeError("Runtime diagnostics Session is invalid.");
+  }
+  return Object.freeze({
+    sessionId: value["sessionId"], backendId: value["backendId"], sessionName: value["sessionName"], generation: value["generation"]
+  });
+}
+
+function parseProcess(value: unknown): DesktopRuntimeProcessMonitorProcess {
+  const keys = ["backendId", "sessionId", "generation", "pid", "cpuPercent", "memoryKb", "processCount", "terminable"];
+  const hasInstance = record(value, [...keys, "processInstanceId"]);
+  if ((!hasInstance && !record(value, keys)) || !identity(value["backendId"]) || !identity(value["sessionId"]) ||
+    !positiveInteger(value["generation"]) || !positiveInteger(value["pid"]) || typeof value["cpuPercent"] !== "number" ||
+    !Number.isFinite(value["cpuPercent"]) || value["cpuPercent"] < 0 || !Number.isSafeInteger(value["memoryKb"]) ||
+    (value["memoryKb"] as number) < 0 || !positiveInteger(value["processCount"]) || typeof value["terminable"] !== "boolean" ||
+    value["terminable"] !== hasInstance ||
+    (hasInstance && !uuid(value["processInstanceId"]))) {
+    throw new TypeError("Runtime diagnostics process is invalid.");
+  }
+  return Object.freeze({
+    backendId: value["backendId"], sessionId: value["sessionId"], generation: value["generation"], pid: value["pid"],
+    cpuPercent: value["cpuPercent"], memoryKb: value["memoryKb"] as number, processCount: value["processCount"],
+    terminable: value["terminable"], ...(hasInstance ? { processInstanceId: value["processInstanceId"] as string } : {})
+  });
+}
+
+function record(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function identity(value: unknown): value is string {
+  return boundedText(value, 512);
+}
+
+function displayText(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 512 && !/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value);
+}
+
+function boundedText(value: unknown, maximum: number): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= maximum && value.trim() === value &&
+    !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function safeGeneration(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,15}$/u.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function uint64Generation(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,19}$/u.test(value) &&
+    BigInt(value) <= 18_446_744_073_709_551_615n;
+}
+
+function uuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
+}
+
+function positiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
 }

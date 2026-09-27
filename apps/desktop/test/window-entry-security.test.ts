@@ -13,6 +13,8 @@ import {
   isAllowedExtensionWindowNavigation,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
+  isAllowedPrimaryWindowNavigation,
+  isAllowedRuntimeProcessMonitorNavigation,
   isAllowedSessionWindowNavigation,
   runtimeProcessMonitorEntryUrl
 } from "../src/security.js";
@@ -98,9 +100,18 @@ describe("trusted auxiliary window entries", () => {
     const entry = runtimeProcessMonitorEntryUrl("joko://app/index.html?discard=private#/settings/about");
     expect(entry).toBe("joko://app/index.html?runtimeProcessMonitor=1");
     expect(isAllowedMainFrameNavigation(entry, policy)).toBe(true);
+    expect(isAllowedRuntimeProcessMonitorNavigation(entry, policy)).toBe(true);
+    expect(isAllowedRuntimeProcessMonitorNavigation(`${entry}#/settings/about`, policy)).toBe(false);
+    expect(isAllowedPrimaryWindowNavigation(entry, policy)).toBe(false);
+    expect(isAllowedPrimaryWindowNavigation("joko://app/index.html#/settings/about", policy)).toBe(true);
     expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
     expect(isAllowedPackagedBundleResource(`${entry}#/runtime-process-monitor`, policy)).toBe(false);
     expect(runtimeProcessMonitorEntryUrl("http://127.0.0.1:4319/app?discard=private#/settings/about"))
       .toBe("http://127.0.0.1:4319/app?runtimeProcessMonitor=1");
+    const developmentPolicy = createNavigationPolicy(resolve("dist/web/index.html"), "http://127.0.0.1:4319/app");
+    expect(isAllowedPrimaryWindowNavigation("http://127.0.0.1:4319/app#/settings/about", developmentPolicy)).toBe(true);
+    expect(isAllowedPrimaryWindowNavigation("http://127.0.0.1:4319/app?runtimeProcessMonitor=1", developmentPolicy)).toBe(false);
+    expect(isAllowedRuntimeProcessMonitorNavigation("http://127.0.0.1:4319/app?runtimeProcessMonitor=1", developmentPolicy)).toBe(true);
+    expect(isAllowedRuntimeProcessMonitorNavigation("http://127.0.0.1:4319/other?runtimeProcessMonitor=1", developmentPolicy)).toBe(false);
   });
 });

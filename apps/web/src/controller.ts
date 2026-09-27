@@ -114,6 +114,8 @@ export interface BrowserInspectorFocusRequest {
 export interface ControllerState {
   readonly ready: boolean;
   readonly connectionState: GatewayConnectionState;
+  /** Process-local occurrence of the currently selected Gateway object. */
+  readonly connectionGeneration?: number;
   readonly profiles: readonly ConnectionProfile[];
   readonly machineCaches: readonly MachineCacheView[];
   readonly machinePresenceByProfile: Readonly<Record<string, MachinePresenceView>>;
@@ -227,6 +229,7 @@ export function useAppController(): AppController {
   const [state, setState] = useState<ControllerState>({
     ready: false,
     connectionState: "disconnected",
+    connectionGeneration: 0,
     profiles: [],
     machineCaches: [],
     machinePresenceByProfile: {},
@@ -528,7 +531,10 @@ export function useAppController(): AppController {
     latestExtensionEditorEffectRef.current.clear();
     extensionTitleSessionRef.current = undefined;
     document.title = "Joko";
-    setState(clearTransientExtensionUiState);
+    setState((current) => ({
+      ...clearTransientExtensionUiState(current),
+      connectionGeneration: generation
+    }));
     return generation;
   }, []);
 
