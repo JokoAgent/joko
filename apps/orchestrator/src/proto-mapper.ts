@@ -367,6 +367,8 @@ export interface SessionMappingContext {
   readonly usage?: UsageSnapshot;
   readonly usageMeasuredAt?: number;
   readonly activeNativeEntryId?: string;
+  /** Latest durable, visible user-authored input; automatic continuations are excluded. */
+  readonly lastUserInputAt?: number;
   readonly codeHostPullRequests?: readonly CodeHostSessionReferenceProjection[];
   readonly derivationOriginAvailability?: {
     readonly sourceSessionAvailable: boolean;
@@ -709,6 +711,9 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
     location: toProtoWorkspaceLocation(session.remoteWorkspace),
     createdAt: toProtoTimestamp(session.createdAt),
     lastActivityAt: toProtoTimestamp(session.updatedAt),
+    lastUserInputAt: context.lastUserInputAt === undefined
+      ? undefined
+      : toProtoTimestamp(context.lastUserInputAt),
     version: toProtoEntityVersion(record.revision, session.binding.generation, session.updatedAt),
     error: undefined
   });

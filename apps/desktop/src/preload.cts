@@ -152,6 +152,18 @@ const DESKTOP_CHANNELS = {
   globalVoiceOpenAccessibility: "joko:global-voice:accessibility:open",
   globalVoiceGetInputMonitoring: "joko:global-voice:input-monitoring:get",
   globalVoiceOpenInputMonitoring: "joko:global-voice:input-monitoring:open",
+  dedicatedHardwareGetState: "joko:hardware-input:state:get",
+  dedicatedHardwareSetSettings: "joko:hardware-input:settings:set",
+  dedicatedHardwareResetSettings: "joko:hardware-input:settings:reset",
+  dedicatedHardwareProbe: "joko:hardware-input:probe",
+  dedicatedHardwareRecoverKeymap: "joko:hardware-input:keymap:recover",
+  dedicatedHardwareOpenInputSettings: "joko:hardware-input:input-settings:open",
+  dedicatedHardwarePublishTasks: "joko:hardware-input:tasks:publish",
+  dedicatedHardwareAcknowledgeTaskFocus: "joko:hardware-input:task-focus:acknowledge",
+  dedicatedHardwareSetPreview: "joko:hardware-input:preview:set",
+  dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
+  dedicatedHardwareAction: "joko:hardware-input:action",
+  dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
@@ -204,6 +216,7 @@ const desktopCapabilities = Object.freeze([
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "files.open",
   "files.revealSource",
+  "hardware.dedicatedInput",
   "layout.reset",
   ...((process.platform === "win32" || process.platform === "linux") ? ["window.mainCloseBehavior" as const] : []),
   "microphone.lifecycle",
@@ -614,6 +627,44 @@ const desktopApi = Object.freeze({
       };
       ipcRenderer.on(DESKTOP_CHANNELS.globalVoiceCommand, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.globalVoiceCommand, wrapped);
+    }
+  }),
+  dedicatedHardware: Object.freeze({
+    getDedicatedHardwareState: (): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareGetState),
+    setDedicatedHardwareSettings: (model: string, settings: unknown): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareSetSettings, { model, settings }),
+    resetDedicatedHardwareSettings: (model: string, scope: "layout" | "all"): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareResetSettings, { model, scope }),
+    probeDedicatedHardware: (model: string): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareProbe, { model }),
+    recoverDedicatedHardwareKeymap: (model: string): Promise<unknown> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareRecoverKeymap, { model }),
+    setDedicatedHardwarePreview: (model: string, enabled: boolean): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareSetPreview, { model, enabled }).then(() => undefined),
+    publishDedicatedHardwareTasks: (catalog: unknown): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, catalog).then(() => undefined),
+    acknowledgeDedicatedHardwareTaskFocus: (acknowledgement: unknown): Promise<boolean> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareAcknowledgeTaskFocus, acknowledgement).then(parseDesktopBoolean),
+    openDedicatedHardwareInputSettings: (): Promise<boolean> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.dedicatedHardwareOpenInputSettings).then(parseDesktopBoolean),
+    onDedicatedHardwareStateChanged: (listener: (state: unknown) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Dedicated hardware state listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
+      ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwareStateChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwareStateChanged, wrapped);
+    },
+    onDedicatedHardwareAction: (listener: (action: unknown) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Dedicated hardware action listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
+      ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwareAction, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwareAction, wrapped);
+    },
+    onDedicatedHardwarePreviewInput: (listener: (input: unknown) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Dedicated hardware preview listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => listener(value);
+      ipcRenderer.on(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, wrapped);
     }
   }),
   chooseFiles: (): Promise<readonly DesktopFile[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.chooseFiles),
@@ -1622,11 +1673,13 @@ function parseDesktopGlobalVoiceShortcutResult(value: unknown): DesktopGlobalVoi
 }
 
 function parseDesktopGlobalVoiceCommand(value: unknown): DesktopGlobalVoiceCommand | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).join(",") !== "type") return undefined;
-  const type = (value as Record<string, unknown>)["type"];
+  if (!isExactGlobalVoiceRecord(value, ["type", "generation"])) return undefined;
+  const type = value["type"];
+  const generation = value["generation"];
   return type === "start" || type === "submit" || type === "cancel" || type === "retry"
-    ? Object.freeze({ type })
+    ? (isDesktopGlobalVoiceGeneration(generation)
+      ? Object.freeze({ type, generation })
+      : undefined)
     : undefined;
 }
 
@@ -1636,38 +1689,70 @@ function parseDesktopGlobalVoiceStatus(value: unknown): DesktopGlobalVoiceStatus
   }
   const candidate = value as Record<string, unknown>;
   const state = candidate["state"];
-  if ((state === "idle" || state === "starting") && Object.keys(candidate).join(",") === "state") {
-    return Object.freeze({ state });
+  const generation = candidate["generation"];
+  if (!isDesktopGlobalVoiceGeneration(generation, true) || (generation === "0" && state !== "idle")) {
+    throw new TypeError("Global voice status is invalid.");
+  }
+  if ((state === "idle" || state === "starting")
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation"])) {
+    return Object.freeze({ state, generation });
   }
   if (state === "listening" || state === "submitting") {
-    if (Object.keys(candidate).sort().join(",") !== "state,transcript"
+    if (!hasExactGlobalVoiceKeys(candidate, ["state", "generation", "transcript"])
       || typeof candidate["transcript"] !== "string"
       || candidate["transcript"].length > 4_096
       || /\u0000/u.test(candidate["transcript"])) {
       throw new TypeError("Global voice status is invalid.");
     }
-    return Object.freeze({ state, transcript: candidate["transcript"] });
+    return Object.freeze({ state, generation, transcript: candidate["transcript"] });
   }
   const errorKind = candidate["errorKind"];
   if (state === "error"
-    && Object.keys(candidate).sort().join(",") === "errorKind,state"
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation", "errorKind"])
     && (errorKind === "unsupported" || errorKind === "permission" || errorKind === "microphone"
       || errorKind === "service" || errorKind === "empty" || errorKind === "insertion")) {
-    return Object.freeze({ state, errorKind });
+    return Object.freeze({ state, generation, errorKind });
   }
   throw new TypeError("Global voice status is invalid.");
 }
 
 function parseDesktopGlobalVoiceCommitRequest(value: unknown): DesktopGlobalVoiceCommitRequest {
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).join(",") !== "text") {
+  if (!isExactGlobalVoiceRecord(value, ["generation", "text"])) {
     throw new TypeError("Global voice result is invalid.");
   }
-  const text = (value as Record<string, unknown>)["text"];
-  if (typeof text !== "string" || text.length === 0 || text.length > 64 * 1024 || /\u0000/u.test(text)) {
+  const generation = value["generation"];
+  const text = value["text"];
+  if (!isDesktopGlobalVoiceGeneration(generation)
+    || typeof text !== "string" || text.length === 0 || text.length > 64 * 1024 || /\u0000/u.test(text)) {
     throw new TypeError("Global voice result is invalid.");
   }
-  return Object.freeze({ text });
+  return Object.freeze({ generation, text });
+}
+
+function isDesktopGlobalVoiceGeneration(value: unknown, allowIdle = false): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 16
+    || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return false;
+  if (!allowIdle && value === "0") return false;
+  return BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function hasExactGlobalVoiceKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function isExactGlobalVoiceRecord(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && hasExactGlobalVoiceKeys(value as Record<string, unknown>, keys);
 }
 
 function parseDesktopGlobalVoiceAccessibilitySnapshot(value: unknown): DesktopGlobalVoiceAccessibilitySnapshot {

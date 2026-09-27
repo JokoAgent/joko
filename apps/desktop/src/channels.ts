@@ -78,6 +78,18 @@ export const DESKTOP_CHANNELS = {
   globalVoiceOpenAccessibility: "joko:global-voice:accessibility:open",
   globalVoiceGetInputMonitoring: "joko:global-voice:input-monitoring:get",
   globalVoiceOpenInputMonitoring: "joko:global-voice:input-monitoring:open",
+  dedicatedHardwareGetState: "joko:hardware-input:state:get",
+  dedicatedHardwareSetSettings: "joko:hardware-input:settings:set",
+  dedicatedHardwareResetSettings: "joko:hardware-input:settings:reset",
+  dedicatedHardwareProbe: "joko:hardware-input:probe",
+  dedicatedHardwareRecoverKeymap: "joko:hardware-input:keymap:recover",
+  dedicatedHardwareOpenInputSettings: "joko:hardware-input:input-settings:open",
+  dedicatedHardwarePublishTasks: "joko:hardware-input:tasks:publish",
+  dedicatedHardwareAcknowledgeTaskFocus: "joko:hardware-input:task-focus:acknowledge",
+  dedicatedHardwareSetPreview: "joko:hardware-input:preview:set",
+  dedicatedHardwareStateChanged: "joko:hardware-input:state:changed",
+  dedicatedHardwareAction: "joko:hardware-input:action",
+  dedicatedHardwarePreviewInput: "joko:hardware-input:preview:input",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
   deepLinkTakePending: "joko:deep-link:take-pending",
@@ -684,11 +696,13 @@ export type DesktopGlobalVoiceShortcutResult =
   | { readonly accepted: true; readonly activation: "hold" | "toggle" }
   | { readonly accepted: false; readonly reason: "unsupported" | "in-use" | "permission" };
 
+export type DesktopGlobalVoiceGeneration = string;
+
 export type DesktopGlobalVoiceCommand =
-  | { readonly type: "start" }
-  | { readonly type: "submit" }
-  | { readonly type: "cancel" }
-  | { readonly type: "retry" };
+  | { readonly type: "start"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly type: "submit"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly type: "cancel"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly type: "retry"; readonly generation: DesktopGlobalVoiceGeneration };
 
 export type DesktopGlobalVoiceErrorKind =
   | "unsupported"
@@ -699,14 +713,110 @@ export type DesktopGlobalVoiceErrorKind =
   | "insertion";
 
 export type DesktopGlobalVoiceStatus =
-  | { readonly state: "idle" }
-  | { readonly state: "starting" }
-  | { readonly state: "listening"; readonly transcript: string }
-  | { readonly state: "submitting"; readonly transcript: string }
-  | { readonly state: "error"; readonly errorKind: DesktopGlobalVoiceErrorKind };
+  | { readonly state: "idle"; readonly generation: DesktopGlobalVoiceGeneration }
+  | { readonly state: "starting"; readonly generation: DesktopGlobalVoiceGeneration }
+  | {
+    readonly state: "listening";
+    readonly generation: DesktopGlobalVoiceGeneration;
+    readonly transcript: string;
+  }
+  | {
+    readonly state: "submitting";
+    readonly generation: DesktopGlobalVoiceGeneration;
+    readonly transcript: string;
+  }
+  | {
+    readonly state: "error";
+    readonly generation: DesktopGlobalVoiceGeneration;
+    readonly errorKind: DesktopGlobalVoiceErrorKind;
+  };
 
 export interface DesktopGlobalVoiceCommitRequest {
+  readonly generation: DesktopGlobalVoiceGeneration;
   readonly text: string;
+}
+
+function hasExactGlobalVoiceKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[]
+): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isExactGlobalVoiceRecord(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && hasExactGlobalVoiceKeys(value as Record<string, unknown>, keys);
+}
+
+function isDesktopGlobalVoiceErrorKind(value: unknown): value is DesktopGlobalVoiceErrorKind {
+  return value === "unsupported"
+    || value === "permission"
+    || value === "microphone"
+    || value === "service"
+    || value === "empty"
+    || value === "insertion";
+}
+
+function invalidGlobalVoiceProtocol(): TypeError {
+  return new TypeError("Global voice protocol value is invalid.");
+}
+
+export function isDesktopGlobalVoiceGeneration(value: unknown, allowIdle = false): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 16
+    || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return false;
+  if (!allowIdle && value === "0") return false;
+  return BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+export function parseDesktopGlobalVoiceCommand(value: unknown): DesktopGlobalVoiceCommand {
+  if (!isExactGlobalVoiceRecord(value, ["type", "generation"])) throw invalidGlobalVoiceProtocol();
+  const type = value.type;
+  if ((type !== "start" && type !== "submit" && type !== "cancel" && type !== "retry")
+    || !isDesktopGlobalVoiceGeneration(value.generation)) throw invalidGlobalVoiceProtocol();
+  return Object.freeze({ type, generation: value.generation });
+}
+
+export function parseDesktopGlobalVoiceStatus(value: unknown): DesktopGlobalVoiceStatus {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw invalidGlobalVoiceProtocol();
+  const candidate = value as Record<string, unknown>;
+  const state = candidate["state"];
+  const generation = candidate["generation"];
+  if (!isDesktopGlobalVoiceGeneration(generation, true)) throw invalidGlobalVoiceProtocol();
+  if (generation === "0" && state !== "idle") throw invalidGlobalVoiceProtocol();
+  if ((state === "idle" || state === "starting")
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation"])) {
+    return Object.freeze({ state, generation });
+  }
+  if ((state === "listening" || state === "submitting")
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation", "transcript"])
+    && typeof candidate["transcript"] === "string"
+    && candidate["transcript"].length <= 4_096
+    && !/\u0000/u.test(candidate["transcript"])) {
+    return Object.freeze({ state, generation, transcript: candidate["transcript"] });
+  }
+  const errorKind = candidate["errorKind"];
+  if (state === "error"
+    && hasExactGlobalVoiceKeys(candidate, ["state", "generation", "errorKind"])
+    && isDesktopGlobalVoiceErrorKind(errorKind)) {
+    return Object.freeze({ state, generation, errorKind });
+  }
+  throw invalidGlobalVoiceProtocol();
+}
+
+export function parseDesktopGlobalVoiceCommitRequest(value: unknown): DesktopGlobalVoiceCommitRequest {
+  if (!isExactGlobalVoiceRecord(value, ["generation", "text"])
+    || !isDesktopGlobalVoiceGeneration(value.generation)
+    || typeof value.text !== "string"
+    || value.text.length === 0
+    || value.text.length > 64 * 1024
+    || /\u0000/u.test(value.text)) throw invalidGlobalVoiceProtocol();
+  return Object.freeze({ generation: value.generation, text: value.text });
 }
 
 export interface DesktopGlobalVoiceAccessibilitySnapshot {

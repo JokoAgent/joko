@@ -10,6 +10,7 @@ interface DesktopManifest {
 }
 
 interface DesktopTsConfig {
+  readonly include?: readonly string[];
   readonly compilerOptions?: {
     readonly outDir?: string;
     readonly tsBuildInfoFile?: string;
@@ -39,6 +40,8 @@ const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.
 const tsconfig = JSON.parse(readFileSync(new URL("../tsconfig.json", import.meta.url), "utf8")) as DesktopTsConfig;
 const config = JSON.parse(readFileSync(new URL("../electron-builder.json", import.meta.url), "utf8")) as BuilderConfig;
 const workspace = readFileSync(new URL("../../../pnpm-workspace.yaml", import.meta.url), "utf8");
+const packagedAudit = readFileSync(new URL("../scripts/audit-packaged.cjs", import.meta.url), "utf8");
+const packagedSmoke = readFileSync(new URL("../scripts/smoke-packaged.mjs", import.meta.url), "utf8");
 
 describe("Desktop distribution", () => {
   it("invalidates incremental state whenever compiled Desktop output is removed", () => {
@@ -118,6 +121,25 @@ describe("Desktop distribution", () => {
             "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"]) })
       ]));
     expect(config.afterPack).toBe("scripts/audit-packaged.cjs");
+  });
+
+  it("compiles, packages, audits, and smoke-checks the isolated hardware utility entry", () => {
+    expect(existsSync(new URL("../src/dedicated-hardware/utility-entry.ts", import.meta.url))).toBe(true);
+    expect(tsconfig.include).toContain("src/**/*.ts");
+    expect(config.files).toContain("dist/**/*.js");
+    expect(packagedAudit).toContain('join("dist", "dedicated-hardware", "utility-entry.js")');
+    expect(packagedSmoke).toContain('resolve(applicationRoot, "dist", "dedicated-hardware", "utility-entry.js")');
+    expect(packagedSmoke).toContain("canonicalRegularFileExists(entry)");
+    expect(packagedSmoke).toContain("function canonicalRegularFileExists(path)");
+  });
+
+  it("has no redistributable hardware SDK input and audits only its fixed resources directory", () => {
+    expect(existsSync(new URL("../resources/dedicated-hardware-sdk", import.meta.url))).toBe(false);
+    expect(config.extraResources.some(({ from, to }) =>
+      from.includes("dedicated-hardware-sdk") || to.includes("dedicated-hardware-sdk")
+    )).toBe(false);
+    expect(packagedAudit).toContain("const APPROVED_DEDICATED_HARDWARE_SDK_ARTIFACTS = Object.freeze([])");
+    expect(packagedAudit).toContain("resolve(resourcesRoot, DEDICATED_HARDWARE_SDK_DIRECTORY)");
   });
 
   it("uses the existing Joko-owned vector and emits installable plus unpackable platform targets", () => {

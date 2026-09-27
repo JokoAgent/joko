@@ -21,6 +21,7 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const releaseRoot = resolve(appRoot, "release");
 const useUnpackedArtifact = parseArguments(process.argv.slice(2));
 const executable = useUnpackedArtifact ? resolveUnpackedExecutable(releaseRoot) : require("electron");
+const dedicatedHardwareUtilityEntry = resolveDedicatedHardwareUtilityEntry(executable, useUnpackedArtifact);
 const markerDirectory = mkdtempSync(resolve(tmpdir(), "joko-desktop-smoke-"));
 const markerPath = resolve(markerDirectory, "result.txt");
 const smokeUserDataPath = resolve(markerDirectory, "user-data");
@@ -74,7 +75,7 @@ try {
   if (claudeSessionSmoke.missingSession !== true || claudeSessionSmoke.workerRetired !== true || claudeSessionSmoke.isolatedProfileUnchanged !== true) {
     throw new Error("Electron-Node Session SDK smoke returned an invalid Worker result.");
   }
-  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
+  process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RUNTIME_SMOKE_OK", dedicatedHardwareUtilityEntry, sqliteVec: sqliteVecSmoke, extensionLibrary: extensionLibrarySmoke, terminal: terminalSmoke, claudeSession: claudeSessionSmoke })}\n`);
 } catch (error) {
   rmSync(markerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   throw error;
@@ -360,6 +361,19 @@ async function createConnectSmokeServer() {
   };
 }
 
+function resolveDedicatedHardwareUtilityEntry(electronExecutable, useUnpacked) {
+  const applicationRoot = !useUnpacked
+    ? appRoot
+    : process.platform === "darwin"
+      ? resolve(dirname(electronExecutable), "..", "Resources", "app")
+      : resolve(dirname(electronExecutable), "resources", "app");
+  const entry = resolve(applicationRoot, "dist", "dedicated-hardware", "utility-entry.js");
+  if (!pathContained(applicationRoot, entry) || !canonicalRegularFileExists(entry)) {
+    throw new Error("The packaged dedicated hardware utility entry is missing or unsafe.");
+  }
+  return realpathSync(entry);
+}
+
 async function createProviderSmokeServer() {
   const observations = { requests: [], unexpectedRequests: [] };
   const server = createServer((request, response) => {
@@ -441,4 +455,10 @@ function samePath(left, right) {
   return process.platform === "win32"
     ? resolve(left).toLowerCase() === resolve(right).toLowerCase()
     : resolve(left) === resolve(right);
+}
+
+function canonicalRegularFileExists(path) {
+  if (!existsSync(path)) return false;
+  const info = lstatSync(path);
+  return info.isFile() && !info.isSymbolicLink() && samePath(realpathSync(path), path);
 }

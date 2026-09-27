@@ -105,7 +105,10 @@ describe("external text insertion", () => {
 
     expect(clipboard.value.buffers.get(fileFormat)).toEqual(Buffer.from("C:\\work\\report.txt\0", "utf16le"));
     expect(clipboard.writeBufferFormats).toEqual(["text/plain", fileFormat]);
-    expect(clipboard.writeCalls).toBe(0);
+    // The first write atomically installs the transcript plus its private
+    // ownership marker. Restoring a file payload must not add a second common
+    // clipboard write; it uses only the exact raw formats captured above.
+    expect(clipboard.writeCalls).toBe(1);
   });
 });
 

@@ -556,7 +556,15 @@ async function mount(initialDraft: ComposerDraft, ownerDocument: Document = docu
       queue={[]}
       workspace={workspace}
       extraDirectories={[]}
-      resources={[]}
+      resources={[{
+        sessionId: session.id,
+        id: "resource-skill",
+        name: "Review",
+        kind: "skill",
+        discoveredRevision: "skill-revision",
+        resourceVersion: "1",
+        runtimeGeneration: 1
+      }]}
       commands={commands}
       messageHistory={[]}
       t={(key) => key}

@@ -10073,6 +10073,29 @@ export class OperationalStore {
   }
 
   /**
+   * Returns the latest surviving user-authored message time for a Session.
+   * Automatic service continuations are control traffic, not user activity.
+   */
+  findLatestVisibleUserMessageAt(sessionId: string): number | undefined {
+    this.assertOpen();
+    const normalizedSessionId = nonBlank(sessionId, "User message activity Session ID");
+    this.getSession(normalizedSessionId);
+    const row = this.database.prepare(`
+      SELECT event.emitted_at
+      FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ?
+        AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'user'
+        AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+      ORDER BY event.global_cursor DESC
+      LIMIT 1
+    `).get(normalizedSessionId) as Row | undefined;
+    return row === undefined ? undefined : numberValue(row["emitted_at"]);
+  }
+
+  /**
    * Returns whether the latest visible observation for any native background
    * task is non-terminal. This deliberately reads durable events instead of
    * relying on SessionHost's live map, so reset admission remains fail-closed

@@ -1217,6 +1217,8 @@ export interface SessionView {
   readonly attention?: SessionAttentionView;
   readonly createdAt?: number;
   readonly updatedAt: number;
+  /** Latest durable user-authored message; service continuations are excluded. */
+  readonly lastUserInputAt?: number;
   /** Lifetime accounting reported for this task; never a context-capacity proxy. */
   readonly usage?: UsageTokensView;
   readonly context?: ContextView;

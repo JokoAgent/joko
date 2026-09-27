@@ -212,6 +212,7 @@ type JokoDesktopCapability =
   | "files.copy"
   | "files.open"
   | "files.revealSource"
+  | "hardware.dedicatedInput"
   | "app.info"
   | "app.update"
   | "attention.badge"
@@ -285,12 +286,20 @@ interface JokoDesktopGlobalVoiceShortcut {
   readonly fn: boolean;
 }
 
+type JokoDesktopGlobalVoiceGeneration = string;
+
+type JokoDesktopGlobalVoiceCommand =
+  | { readonly type: "start"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly type: "submit"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly type: "cancel"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly type: "retry"; readonly generation: JokoDesktopGlobalVoiceGeneration };
+
 type JokoDesktopGlobalVoiceStatus =
-  | { readonly state: "idle" }
-  | { readonly state: "starting" }
-  | { readonly state: "listening"; readonly transcript: string }
-  | { readonly state: "submitting"; readonly transcript: string }
-  | { readonly state: "error"; readonly errorKind: "unsupported" | "permission" | "microphone" | "service" | "empty" | "insertion" };
+  | { readonly state: "idle"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly state: "starting"; readonly generation: JokoDesktopGlobalVoiceGeneration }
+  | { readonly state: "listening"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly transcript: string }
+  | { readonly state: "submitting"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly transcript: string }
+  | { readonly state: "error"; readonly generation: JokoDesktopGlobalVoiceGeneration; readonly errorKind: "unsupported" | "permission" | "microphone" | "service" | "empty" | "insertion" };
 
 interface JokoDesktopApi {
   readonly platform: string;
@@ -433,13 +442,14 @@ interface JokoDesktopApi {
     consumeShortcutRecoveryFailure(): Promise<{ readonly failed: boolean }>;
     setMuteSystemAudio(enabled: boolean): Promise<void>;
     publishStatus(status: JokoDesktopGlobalVoiceStatus): Promise<void>;
-    commit(request: { readonly text: string }): Promise<boolean>;
+    commit(request: { readonly generation: JokoDesktopGlobalVoiceGeneration; readonly text: string }): Promise<boolean>;
     getAccessibility(): Promise<{ readonly status: "granted" | "denied" | "not-required" | "unknown" }>;
     openAccessibility(): Promise<boolean>;
     getInputMonitoring(): Promise<{ readonly status: "granted" | "denied" | "not-required" | "unknown" }>;
     openInputMonitoring(): Promise<boolean>;
-    onCommand(listener: (command: { readonly type: "start" | "submit" | "cancel" | "retry" }) => void): () => void;
+    onCommand(listener: (command: JokoDesktopGlobalVoiceCommand) => void): () => void;
   };
+  readonly dedicatedHardware: import("./dedicated-hardware.js").DedicatedHardwareBridge;
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
   readonly deepLinks: {

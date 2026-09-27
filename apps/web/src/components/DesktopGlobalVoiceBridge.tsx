@@ -14,8 +14,6 @@ import { publishGlobalVoiceShortcutRegistration } from "../global-voice-shortcut
 
 export function DesktopGlobalVoiceBridge({ controller }: { readonly controller: AppController }): null {
   const controllerRef = useRef(controller);
-  const sessionRef = useRef<VoiceInputMediaSession | undefined>(undefined);
-  const generationRef = useRef(0);
   controllerRef.current = controller;
 
   useEffect(() => {
@@ -28,82 +26,16 @@ export function DesktopGlobalVoiceBridge({ controller }: { readonly controller: 
     const publish = (status: JokoDesktopGlobalVoiceStatus): void => {
       if (!disposed) void desktop.globalVoice.publishStatus(status).catch(() => undefined);
     };
-
-    const acceptUpdate = (generation: number, update: VoiceMediaSessionUpdate): void => {
-      if (disposed || generation !== generationRef.current) return;
-      if (update.state === "starting") {
-        publish({ state: "starting" });
-        return;
-      }
-      if (update.state === "listening") {
-        publish({ state: "listening", transcript: previewTranscript(update) });
-        return;
-      }
-      if (update.state === "submitting") {
-        publish({ state: "submitting", transcript: previewTranscript(update) });
-        return;
-      }
-      if (update.state === "error") {
-        if (update.session?.outcome !== undefined) recordVoiceInputSession(update.session);
-        publish({ state: "error", errorKind: desktopGlobalVoiceErrorKind(update.error?.code) });
-        return;
-      }
-      if (update.state === "cancelled") {
-        publish({ state: "idle" });
-        return;
-      }
-      if (update.state !== "done") return;
-      if (update.session?.outcome !== undefined) recordVoiceInputSession(update.session);
-      const text = update.session?.result?.text ?? "";
-      if (text.trim() === "") {
-        publish({ state: "error", errorKind: "empty" });
-        return;
-      }
-      void desktop.globalVoice.commit({ text }).then((inserted) => {
-        if (!inserted && !disposed && generation === generationRef.current) {
-          publish({ state: "error", errorKind: "insertion" });
-        }
-      }).catch(() => {
-        if (!disposed && generation === generationRef.current) {
-          publish({ state: "error", errorKind: "insertion" });
-        }
-      });
-    };
-
-    const begin = (): void => {
-      const previous = sessionRef.current;
-      sessionRef.current = undefined;
-      const generation = ++generationRef.current;
-      void previous?.cancel();
-      const preferences = readVoiceInputPreferences();
-      let session: VoiceInputMediaSession;
-      try {
-        session = createDesktopGlobalVoiceSession(controllerRef.current, preferences, (update) => {
-          acceptUpdate(generation, update);
-        });
-      } catch {
-        publish({ state: "error", errorKind: "unsupported" });
-        return;
-      }
-      sessionRef.current = session;
-      void session.start().catch(() => undefined);
-    };
-
-    const cancel = (): void => {
-      const active = sessionRef.current;
-      sessionRef.current = undefined;
-      generationRef.current += 1;
-      void active?.cancel().finally(() => publish({ state: "idle" }));
-    };
-
-    const retry = (): void => {
-      const active = sessionRef.current;
-      sessionRef.current = undefined;
-      generationRef.current += 1;
-      void (active?.cancel() ?? Promise.resolve()).finally(() => {
-        if (!disposed) begin();
-      });
-    };
+    const runtime = createDesktopGlobalVoiceGenerationRuntime({
+      createSession: (onUpdate) => createDesktopGlobalVoiceSession(
+        controllerRef.current,
+        readVoiceInputPreferences(),
+        onUpdate
+      ),
+      publish,
+      commit: (request) => desktop.globalVoice.commit(request),
+      recordSession: recordVoiceInputSession
+    });
 
     const syncShortcut = (preferences: VoiceInputPreferences): void => {
       const generation = ++shortcutSyncGeneration;
@@ -120,10 +52,7 @@ export function DesktopGlobalVoiceBridge({ controller }: { readonly controller: 
     syncShortcut(readVoiceInputPreferences());
     const unsubscribePreferences = subscribeVoiceInputPreferences(syncShortcut);
     const unsubscribeCommand = desktop.globalVoice.onCommand((command) => {
-      if (command.type === "start") begin();
-      else if (command.type === "submit") void sessionRef.current?.stop().catch(() => undefined);
-      else if (command.type === "cancel") cancel();
-      else retry();
+      runtime.handleCommand(command);
     });
     const unsubscribeShortcutRecovery = desktop.globalVoice.onShortcutRecoveryFailed(() => {
       shortcutRecoverySignalGeneration += 1;
@@ -138,7 +67,6 @@ export function DesktopGlobalVoiceBridge({ controller }: { readonly controller: 
       () => desktop.globalVoice.consumeShortcutRecoveryFailure(),
       () => !disposed && recoverySnapshotGeneration === shortcutRecoverySignalGeneration
     ).catch(() => undefined);
-    const unsubscribeRelease = desktop.microphone.onRelease(cancel);
     return () => {
       disposed = true;
       shortcutSyncGeneration += 1;
@@ -146,15 +74,164 @@ export function DesktopGlobalVoiceBridge({ controller }: { readonly controller: 
       unsubscribeCommand();
       unsubscribeShortcutRecovery();
       unsubscribeShortcutRecovered();
-      unsubscribeRelease();
-      const active = sessionRef.current;
-      sessionRef.current = undefined;
-      generationRef.current += 1;
-      void active?.dispose();
+      runtime.dispose();
       void setDesktopGlobalVoiceShortcut(desktop.globalVoice, "disabled").catch(() => undefined);
     };
   }, []);
   return null;
+}
+
+export interface DesktopGlobalVoiceMediaSessionPort {
+  readonly start: () => Promise<void>;
+  readonly stop: () => Promise<unknown>;
+  readonly cancel: () => Promise<void>;
+  readonly dispose: () => Promise<void>;
+}
+
+export interface DesktopGlobalVoiceGenerationRuntime {
+  readonly handleCommand: (command: JokoDesktopGlobalVoiceCommand) => boolean;
+  readonly dispose: () => void;
+}
+
+export function createDesktopGlobalVoiceGenerationRuntime(options: {
+  readonly createSession: (
+    onUpdate: (update: VoiceMediaSessionUpdate) => void
+  ) => DesktopGlobalVoiceMediaSessionPort;
+  readonly publish: (status: JokoDesktopGlobalVoiceStatus) => void;
+  readonly commit: (request: {
+    readonly generation: JokoDesktopGlobalVoiceGeneration;
+    readonly text: string;
+  }) => Promise<boolean>;
+  readonly recordSession: (session: NonNullable<VoiceMediaSessionUpdate["session"]>) => void;
+}): DesktopGlobalVoiceGenerationRuntime {
+  interface Binding {
+    readonly generation: JokoDesktopGlobalVoiceGeneration;
+    readonly session: DesktopGlobalVoiceMediaSessionPort;
+    terminal: boolean;
+  }
+
+  let disposed = false;
+  let latestGeneration: JokoDesktopGlobalVoiceGeneration = "0";
+  let active: Binding | undefined;
+
+  const publish = (status: JokoDesktopGlobalVoiceStatus): void => {
+    if (!disposed) options.publish(status);
+  };
+
+  const retire = (binding: Binding): void => {
+    binding.terminal = true;
+    if (active === binding) active = undefined;
+  };
+
+  const publishInsertionFailure = (binding: Binding): void => {
+    if (disposed || active !== binding || latestGeneration !== binding.generation) return;
+    retire(binding);
+    publish({ state: "error", generation: binding.generation, errorKind: "insertion" });
+  };
+
+  const acceptUpdate = (binding: Binding, update: VoiceMediaSessionUpdate): void => {
+    if (disposed || active !== binding || binding.terminal) return;
+    const generation = binding.generation;
+    if (update.state === "starting") {
+      publish({ state: "starting", generation });
+      return;
+    }
+    if (update.state === "listening") {
+      publish({ state: "listening", generation, transcript: previewTranscript(update) });
+      return;
+    }
+    if (update.state === "submitting") {
+      publish({ state: "submitting", generation, transcript: previewTranscript(update) });
+      return;
+    }
+    if (update.state === "error") {
+      if (update.session?.outcome !== undefined) options.recordSession(update.session);
+      retire(binding);
+      publish({ state: "error", generation, errorKind: desktopGlobalVoiceErrorKind(update.error?.code) });
+      return;
+    }
+    if (update.state === "cancelled") {
+      retire(binding);
+      publish({ state: "idle", generation });
+      return;
+    }
+    if (update.state !== "done") return;
+    if (update.session?.outcome !== undefined) options.recordSession(update.session);
+    const text = update.session?.result?.text ?? "";
+    if (text.trim() === "") {
+      retire(binding);
+      publish({ state: "error", generation, errorKind: "empty" });
+      return;
+    }
+    binding.terminal = true;
+    void Promise.resolve().then(() => options.commit({ generation, text })).then((inserted) => {
+      if (inserted) {
+        if (active === binding && latestGeneration === generation) active = undefined;
+        return;
+      }
+      publishInsertionFailure(binding);
+    }).catch(() => publishInsertionFailure(binding));
+  };
+
+  const begin = (generation: JokoDesktopGlobalVoiceGeneration): boolean => {
+    if (disposed || !isDesktopGlobalVoiceCommandGeneration(generation)
+      || compareDesktopGlobalVoiceGeneration(generation, latestGeneration) <= 0) return false;
+    latestGeneration = generation;
+    const previous = active;
+    active = undefined;
+    if (previous !== undefined) {
+      previous.terminal = true;
+      void Promise.resolve().then(() => previous.session.cancel()).catch(() => undefined);
+    }
+    let binding: Binding | undefined;
+    let session: DesktopGlobalVoiceMediaSessionPort;
+    try {
+      session = options.createSession((update) => {
+        if (binding !== undefined) acceptUpdate(binding, update);
+      });
+    } catch {
+      publish({ state: "error", generation, errorKind: "unsupported" });
+      return true;
+    }
+    binding = { generation, session, terminal: false };
+    active = binding;
+    void Promise.resolve().then(() => session.start()).catch(() => undefined);
+    return true;
+  };
+
+  const cancel = (generation: JokoDesktopGlobalVoiceGeneration): boolean => {
+    const binding = active;
+    if (disposed || binding === undefined || binding.generation !== generation || binding.terminal) return false;
+    retire(binding);
+    void Promise.resolve().then(() => binding.session.cancel()).catch(() => undefined).finally(() => {
+      if (!disposed && active === undefined && latestGeneration === generation) {
+        publish({ state: "idle", generation });
+      }
+    });
+    return true;
+  };
+
+  return Object.freeze({
+    handleCommand: (command: JokoDesktopGlobalVoiceCommand): boolean => {
+      if (!isDesktopGlobalVoiceCommandGeneration(command.generation)) return false;
+      if (command.type === "start" || command.type === "retry") return begin(command.generation);
+      if (command.type === "cancel") return cancel(command.generation);
+      const binding = active;
+      if (disposed || binding === undefined || binding.generation !== command.generation || binding.terminal) return false;
+      void Promise.resolve().then(() => binding.session.stop()).catch(() => undefined);
+      return true;
+    },
+    dispose: (): void => {
+      if (disposed) return;
+      disposed = true;
+      const binding = active;
+      active = undefined;
+      if (binding !== undefined) {
+        binding.terminal = true;
+        void Promise.resolve().then(() => binding.session.dispose()).catch(() => undefined);
+      }
+    }
+  });
 }
 
 export function publishDesktopGlobalVoiceShortcutRecoveryFailure(): void {
@@ -201,6 +278,19 @@ export function desktopGlobalVoiceErrorKind(code: VoiceMediaErrorCode | undefine
   if (code === "permissionDenied") return "permission";
   if (code === "deviceUnavailable" || code === "deviceBusy" || code === "captureFailed") return "microphone";
   return "service";
+}
+
+function isDesktopGlobalVoiceCommandGeneration(value: unknown): value is JokoDesktopGlobalVoiceGeneration {
+  return typeof value === "string" && value.length > 0 && value.length <= 16
+    && /^[1-9][0-9]*$/u.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+function compareDesktopGlobalVoiceGeneration(
+  left: JokoDesktopGlobalVoiceGeneration,
+  right: JokoDesktopGlobalVoiceGeneration
+): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  return left === right ? 0 : left < right ? -1 : 1;
 }
 
 function previewTranscript(update: VoiceMediaSessionUpdate): string {

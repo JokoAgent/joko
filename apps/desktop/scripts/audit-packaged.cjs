@@ -49,6 +49,20 @@ const FORBIDDEN_EXTENSIONS = new Set([
 ]);
 const MAXIMUM_RUNTIME_FILES = 80_000;
 const MAXIMUM_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024;
+const DEDICATED_HARDWARE_SDK_DIRECTORY = "dedicated-hardware-sdk";
+const DEDICATED_HARDWARE_SDK_LOCK = "joko-dedicated-hardware-sdk.lock.json";
+const DEDICATED_HARDWARE_SDK_PACKAGE = "@worklouder/device-kit-oai";
+const MAXIMUM_DEDICATED_HARDWARE_SDK_LOCK_BYTES = 64 * 1024;
+const MAXIMUM_DEDICATED_HARDWARE_SDK_HANDSHAKE_BYTES = 72 * 1024;
+const MAXIMUM_DEDICATED_HARDWARE_KEYMAP_BACKUP_PATH_CODE_UNITS = 4_096;
+const DEDICATED_HARDWARE_SDK_DIRECTORY_DIGEST_DOMAIN = "joko-dedicated-hardware-sdk-directory-v1";
+const AUDITED_ELECTRON_VERSION = "43.6.0";
+const AUDITED_ELECTRON_MODULES_ABI = 148;
+const AUDITED_NODE_API_VERSION = 10;
+
+// Deliberately empty until an exact artifact has independent installation and
+// redistribution approval. A self-authored lock is not proof of that grant.
+const APPROVED_DEDICATED_HARDWARE_SDK_ARTIFACTS = Object.freeze([]);
 
 module.exports = async function auditPackaged(context) {
   const {
@@ -72,6 +86,19 @@ module.exports = async function auditPackaged(context) {
   const nativeVoiceShortcutRoot = resolve(resourcesRoot, "native-voice-shortcut");
   const nativeSimulatorHidRoot = resolve(resourcesRoot, "native-simulator-hid");
   const nativeSimulatorH264Root = resolve(resourcesRoot, "native-simulator-h264");
+  if (context.packager.config.electronVersion !== AUDITED_ELECTRON_VERSION) {
+    throw new Error("The dedicated hardware SDK ABI audit is not pinned to the packaged Electron version.");
+  }
+  const dedicatedHardwareSdk = await auditDedicatedHardwareSdkDirectory(
+    resolve(resourcesRoot, DEDICATED_HARDWARE_SDK_DIRECTORY),
+    APPROVED_DEDICATED_HARDWARE_SDK_ARTIFACTS,
+    {
+      platform: context.electronPlatformName,
+      architecture: targetArch,
+      electronModulesAbi: AUDITED_ELECTRON_MODULES_ABI,
+      nodeApiVersion: AUDITED_NODE_API_VERSION
+    }
+  );
 
   const updaterConfigPath = resolve(resourcesRoot, "app-update.yml");
   await assertCanonicalRegularFile(updaterConfigPath, "The packaged application is missing app-update.yml.");
@@ -103,7 +130,13 @@ module.exports = async function auditPackaged(context) {
     forbidSourceDirectories: true,
     allowNodeModulesSourceDirectories: true
   });
-  for (const required of ["package.json", join("dist", "main.js"), join("dist", "preload.cjs"), join("dist", "web", "index.html")]) {
+  for (const required of [
+    "package.json",
+    join("dist", "main.js"),
+    join("dist", "preload.cjs"),
+    join("dist", "web", "index.html"),
+    join("dist", "dedicated-hardware", "utility-entry.js")
+  ]) {
     await assertCanonicalRegularFile(resolve(applicationRoot, required), `The packaged application is missing ${required}.`);
   }
   await auditElectronUpdaterRuntime(applicationRoot);
@@ -141,9 +174,395 @@ module.exports = async function auditPackaged(context) {
   const terminal = await auditTerminalRuntimeAssets(runtimeRoot, context.electronPlatformName, targetArch);
   const claudeSession = await auditClaudeSessionRuntimeAssets(runtimeRoot);
   process.stdout.write(
-    `JOKO_DESKTOP_ARTIFACT_AUDIT_OK appFiles=${applicationAudit.files} runtimeFiles=${runtimeAudit.files} runtimeBytes=${runtimeAudit.bytes} npm=${npmRuntime.version} sqliteVec=${sqliteVec.version} terminal=${terminal.version} sessionSdk=${claudeSession.version} voiceShortcut=${nativeVoiceShortcut} target=${context.electronPlatformName}-${targetArch}\n`
+    `JOKO_DESKTOP_ARTIFACT_AUDIT_OK appFiles=${applicationAudit.files} runtimeFiles=${runtimeAudit.files} runtimeBytes=${runtimeAudit.bytes} npm=${npmRuntime.version} sqliteVec=${sqliteVec.version} terminal=${terminal.version} sessionSdk=${claudeSession.version} voiceShortcut=${nativeVoiceShortcut} dedicatedHardwareSdk=${dedicatedHardwareSdk.status} target=${context.electronPlatformName}-${targetArch}\n`
   );
 };
+
+/**
+ * Audits only the explicitly supplied packaged resources directory. It never
+ * discovers SDK candidates in checkouts, installed applications, PATH, or
+ * node_modules. Absence is the expected fail-closed state until an exact
+ * artifact is added to the production approval allowlist above.
+ */
+async function auditDedicatedHardwareSdkDirectory(
+  root,
+  approvedArtifacts = APPROVED_DEDICATED_HARDWARE_SDK_ARTIFACTS,
+  runtimeTarget = currentDedicatedHardwareSdkRuntimeTarget()
+) {
+  const canonicalRoot = resolve(root);
+  const rootInfo = await lstat(canonicalRoot).catch(() => undefined);
+  if (rootInfo === undefined) return Object.freeze({ status: "unavailable" });
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() ||
+      !samePath(await realpath(canonicalRoot), canonicalRoot)) {
+    throw new Error("The packaged dedicated hardware SDK directory is unsafe.");
+  }
+
+  const lockPath = resolve(canonicalRoot, DEDICATED_HARDWARE_SDK_LOCK);
+  const lockBytes = await readStableDedicatedHardwareSdkFile(
+    lockPath,
+    MAXIMUM_DEDICATED_HARDWARE_SDK_LOCK_BYTES
+  );
+  let lock;
+  try {
+    lock = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(lockBytes));
+  } catch {
+    throw new Error("The packaged dedicated hardware SDK lock is invalid JSON or UTF-8.");
+  }
+  if (!isDedicatedHardwareSdkLock(lock)) {
+    throw new Error("The packaged dedicated hardware SDK lock does not match the strict v1 shape.");
+  }
+  if (!sameDedicatedHardwareSdkTarget(lock.target, runtimeTarget)) {
+    throw new Error("The packaged dedicated hardware SDK target or ABI does not match this artifact.");
+  }
+
+  const expectedFiles = [DEDICATED_HARDWARE_SDK_LOCK, ...lock.files.map((entry) => entry.relativePath)].sort();
+  const expectedDirectories = dedicatedHardwareSdkManifestDirectories(lock.files);
+  const before = await discoverDedicatedHardwareSdkTree(canonicalRoot);
+  if (!sameStringArray(before.files, expectedFiles) ||
+      !sameStringArray(before.directories, expectedDirectories)) {
+    throw new Error("The packaged dedicated hardware SDK directory contains unexpected files.");
+  }
+
+  const digestInputs = [];
+  for (const expected of lock.files) {
+    const path = dedicatedHardwareSdkManifestPath(canonicalRoot, expected.relativePath);
+    const bytes = await readStableDedicatedHardwareSdkFile(path, expected.size);
+    const integrity = sha512Integrity(bytes);
+    if (bytes.byteLength !== expected.size || integrity !== expected.integrity) {
+      throw new Error(`The packaged dedicated hardware SDK file failed integrity verification: ${expected.relativePath}`);
+    }
+    digestInputs.push({ ...expected, bytes });
+  }
+  if (createDedicatedHardwareSdkDirectoryIntegrity(digestInputs) !== lock.directoryIntegrity) {
+    throw new Error("The packaged dedicated hardware SDK directory failed canonical integrity verification.");
+  }
+  const after = await discoverDedicatedHardwareSdkTree(canonicalRoot);
+  if (!sameStringArray(after.files, expectedFiles) ||
+      !sameStringArray(after.directories, expectedDirectories)) {
+    throw new Error("The packaged dedicated hardware SDK directory changed while it was audited.");
+  }
+  const finalLockBytes = await readStableDedicatedHardwareSdkFile(
+    lockPath,
+    MAXIMUM_DEDICATED_HARDWARE_SDK_LOCK_BYTES
+  );
+  if (!lockBytes.equals(finalLockBytes)) {
+    throw new Error("The packaged dedicated hardware SDK lock changed while it was audited.");
+  }
+  assertDedicatedHardwareSdkHandshakeBudget({
+    kind: "staged",
+    stagingDirectory: canonicalRoot,
+    manifest: lock
+  });
+
+  const approved = approvedArtifacts.some((candidate) =>
+    isDedicatedHardwareSdkLock(candidate) && canonicalJson(candidate) === canonicalJson(lock)
+  );
+  if (!approved) {
+    throw new Error("No exact dedicated hardware SDK artifact is approved for redistribution.");
+  }
+  return Object.freeze({
+    status: "locked",
+    packageVersion: lock.packageVersion,
+    manifestIntegrity: lock.manifestIntegrity,
+    directoryIntegrity: lock.directoryIntegrity,
+    redistributionGrantId: lock.redistributionGrantId
+  });
+}
+
+function isDedicatedHardwareSdkLock(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [
+    "directoryIntegrity",
+    "entry",
+    "files",
+    "license",
+    "manifestIntegrity",
+    "nativeAddons",
+    "packageName",
+    "packageVersion",
+    "redistributionGrantId",
+    "target",
+    "version"
+  ];
+  if (!(keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]) &&
+    value.version === 1 && value.packageName === DEDICATED_HARDWARE_SDK_PACKAGE &&
+    typeof value.packageVersion === "string" && value.packageVersion.length <= 128 &&
+    /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(value.packageVersion) &&
+    isBoundedDedicatedHardwareSdkIdentity(value.redistributionGrantId, 256) &&
+    isDedicatedHardwareSdkFileReference(value.license, false) &&
+    isDedicatedHardwareSdkTarget(value.target) &&
+    isDedicatedHardwareSdkFileReference(value.entry, true) &&
+    isDedicatedHardwareSdkNativeAddons(value.nativeAddons) &&
+    isDedicatedHardwareSdkFileManifest(value.files) &&
+    isSha512Integrity(value.directoryIntegrity) && isSha512Integrity(value.manifestIntegrity) &&
+    dedicatedHardwareSdkReferencesMatch(value))) return false;
+  const { manifestIntegrity: _manifestIntegrity, ...withoutManifestIntegrity } = value;
+  return createDedicatedHardwareSdkManifestIntegrity(withoutManifestIntegrity) === value.manifestIntegrity;
+}
+
+module.exports.auditDedicatedHardwareSdkDirectory = auditDedicatedHardwareSdkDirectory;
+module.exports.createDedicatedHardwareSdkDirectoryIntegrity = createDedicatedHardwareSdkDirectoryIntegrity;
+module.exports.createDedicatedHardwareSdkManifestIntegrity = createDedicatedHardwareSdkManifestIntegrity;
+module.exports.dedicatedHardwareSdkHandshakeBytes = dedicatedHardwareSdkHandshakeBytes;
+module.exports.assertDedicatedHardwareSdkHandshakeBudget = assertDedicatedHardwareSdkHandshakeBudget;
+
+function dedicatedHardwareSdkHandshakeBytes(sdk, keymapBackupDirectory = maximumKeymapBackupPathBudgetValue()) {
+  return Buffer.byteLength(JSON.stringify({
+    version: 1,
+    generation: 1,
+    requestId: "g1:1",
+    kind: "handshake",
+    sdk,
+    keymapBackupDirectory
+  }), "utf8");
+}
+
+function assertDedicatedHardwareSdkHandshakeBudget(sdk) {
+  const handshakeBytes = dedicatedHardwareSdkHandshakeBytes(sdk);
+  if (handshakeBytes > MAXIMUM_DEDICATED_HARDWARE_SDK_HANDSHAKE_BYTES) {
+    throw new Error("The packaged dedicated hardware SDK identity exceeds the utility handshake boundary.");
+  }
+  return handshakeBytes;
+}
+
+function maximumKeymapBackupPathBudgetValue() {
+  // The strict protocol permits 4,096 UTF-16 code units. A BMP scalar can
+  // consume three UTF-8 bytes per code unit, so reserve a valid POSIX absolute
+  // path at that maximum rather than assuming the build host's short userData.
+  return `/${"\u0800".repeat(MAXIMUM_DEDICATED_HARDWARE_KEYMAP_BACKUP_PATH_CODE_UNITS - 1)}`;
+}
+
+function isDedicatedHardwareSdkTarget(value) {
+  return hasExactObjectKeys(value, ["architecture", "electronModulesAbi", "nodeApiVersion", "platform"]) &&
+    ["win32", "darwin", "linux"].includes(value.platform) && ["x64", "arm64"].includes(value.architecture) &&
+    isPositiveSafeInteger(value.electronModulesAbi) && isPositiveSafeInteger(value.nodeApiVersion);
+}
+
+function isDedicatedHardwareSdkFileReference(value, requireModuleEntry) {
+  return hasExactObjectKeys(value, ["integrity", "relativePath"]) &&
+    isDedicatedHardwareSdkRelativePath(value.relativePath) &&
+    (!requireModuleEntry || value.relativePath.endsWith(".mjs")) && isSha512Integrity(value.integrity);
+}
+
+function isDedicatedHardwareSdkNativeAddons(value) {
+  if (!Array.isArray(value) || value.length > 64) return false;
+  for (const addon of value) {
+    if (!hasExactObjectKeys(addon, ["abi", "identity", "integrity", "relativePath"]) ||
+        !isBoundedDedicatedHardwareSdkIdentity(addon.identity, 256) ||
+        !/^[A-Za-z0-9@][A-Za-z0-9@/._:+-]*$/u.test(addon.identity) ||
+        !isDedicatedHardwareSdkRelativePath(addon.relativePath) || !addon.relativePath.endsWith(".node") ||
+        !isSha512Integrity(addon.integrity) || !["electron-modules", "node-api"].includes(addon.abi)) return false;
+  }
+  return isStrictlySortedUnique(value, (item) => item.identity) &&
+    isCaseInsensitiveUnique(value.map((item) => item.relativePath));
+}
+
+function isDedicatedHardwareSdkFileManifest(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 512) return false;
+  let totalBytes = 0;
+  for (const file of value) {
+    if (!hasExactObjectKeys(file, ["integrity", "relativePath", "size"]) ||
+        !isDedicatedHardwareSdkRelativePath(file.relativePath) || !isPositiveSafeInteger(file.size) ||
+        file.size > 128 * 1024 * 1024 || !isSha512Integrity(file.integrity)) return false;
+    totalBytes += file.size;
+  }
+  return Number.isSafeInteger(totalBytes) && totalBytes <= 512 * 1024 * 1024 &&
+    isStrictlySortedUnique(value, (item) => item.relativePath) &&
+    isCaseInsensitiveUnique(value.map((item) => item.relativePath));
+}
+
+function dedicatedHardwareSdkReferencesMatch(lock) {
+  const fileByPath = new Map(lock.files.map((file) => [file.relativePath, file]));
+  if (fileByPath.get(lock.license.relativePath)?.integrity !== lock.license.integrity ||
+      fileByPath.get(lock.entry.relativePath)?.integrity !== lock.entry.integrity) return false;
+  const nativePaths = new Set(lock.nativeAddons.map((addon) => addon.relativePath));
+  return !lock.nativeAddons.some((addon) => fileByPath.get(addon.relativePath)?.integrity !== addon.integrity) &&
+    !lock.files.some((file) => file.relativePath.endsWith(".node") !== nativePaths.has(file.relativePath));
+}
+
+function createDedicatedHardwareSdkManifestIntegrity(value) {
+  return sha512Integrity(Buffer.from(canonicalJson(value), "utf8"));
+}
+
+function createDedicatedHardwareSdkDirectoryIntegrity(entries) {
+  const digest = createHash("sha512");
+  digest.update(`${DEDICATED_HARDWARE_SDK_DIRECTORY_DIGEST_DOMAIN}\0`, "utf8");
+  for (const entry of entries) {
+    digest.update(JSON.stringify({
+      relativePath: entry.relativePath,
+      size: entry.size,
+      integrity: entry.integrity
+    }), "utf8");
+    digest.update("\0", "utf8");
+    digest.update(entry.bytes);
+    digest.update("\0", "utf8");
+  }
+  return `sha512-${digest.digest("base64")}`;
+}
+
+async function discoverDedicatedHardwareSdkTree(root) {
+  const files = [];
+  const directories = [];
+  const visit = async (directory, relativeDirectory, depth) => {
+    if (depth > 16) throw new Error("The packaged dedicated hardware SDK directory is nested too deeply.");
+    const entries = (await readdir(directory)).sort();
+    if (entries.length > 513 || new Set(entries).size !== entries.length ||
+        !isCaseInsensitiveUnique(entries)) {
+      throw new Error("The packaged dedicated hardware SDK directory entries are invalid or ambiguous.");
+    }
+    for (const name of entries) {
+      if (!isDedicatedHardwareSdkPathSegment(name)) {
+        throw new Error("The packaged dedicated hardware SDK directory contains an unsafe path.");
+      }
+      const path = resolve(directory, name);
+      assertContained(root, path);
+      const info = await lstat(path);
+      if (info.isSymbolicLink() || !samePath(await realpath(path), path)) {
+        throw new Error("The packaged dedicated hardware SDK directory contains a redirected entry.");
+      }
+      const relativePath = relativeDirectory === "" ? name : `${relativeDirectory}/${name}`;
+      if (info.isDirectory()) {
+        directories.push(relativePath);
+        await visit(path, relativePath, depth + 1);
+      } else if (info.isFile()) {
+        files.push(relativePath);
+      } else {
+        throw new Error("The packaged dedicated hardware SDK directory contains a non-regular entry.");
+      }
+    }
+  };
+  await visit(root, "", 0);
+  return Object.freeze({ files: Object.freeze(files.sort()), directories: Object.freeze(directories.sort()) });
+}
+
+async function readStableDedicatedHardwareSdkFile(path, maximumBytes) {
+  if (!samePath(await realpath(path), path)) {
+    throw new Error("The packaged dedicated hardware SDK file is redirected.");
+  }
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.size <= 0 || before.size > maximumBytes) {
+    throw new Error("The packaged dedicated hardware SDK file is missing, unsafe, or outside its size boundary.");
+  }
+  const bytes = await readFile(path);
+  const after = await lstat(path);
+  if (bytes.byteLength !== before.size || !sameDedicatedHardwareSdkFileInfo(before, after) ||
+      !samePath(await realpath(path), path)) {
+    throw new Error("The packaged dedicated hardware SDK file changed while it was audited.");
+  }
+  return bytes;
+}
+
+function dedicatedHardwareSdkManifestDirectories(files) {
+  const directories = new Set();
+  for (const file of files) {
+    const parts = file.relativePath.split("/");
+    for (let index = 1; index < parts.length; index += 1) directories.add(parts.slice(0, index).join("/"));
+  }
+  return [...directories].sort();
+}
+
+function dedicatedHardwareSdkManifestPath(root, relativePath) {
+  const path = resolve(root, ...relativePath.split("/"));
+  assertContained(root, path);
+  return path;
+}
+
+function currentDedicatedHardwareSdkRuntimeTarget() {
+  const electronModulesAbi = Number(process.versions.modules);
+  const nodeApiVersion = Number(process.versions.napi);
+  if (!["win32", "darwin", "linux"].includes(process.platform) ||
+      !["x64", "arm64"].includes(process.arch) ||
+      !isPositiveSafeInteger(electronModulesAbi) || !isPositiveSafeInteger(nodeApiVersion)) return undefined;
+  return { platform: process.platform, architecture: process.arch, electronModulesAbi, nodeApiVersion };
+}
+
+function sameDedicatedHardwareSdkTarget(left, right) {
+  return right !== undefined && left.platform === right.platform && left.architecture === right.architecture &&
+    left.electronModulesAbi === right.electronModulesAbi && left.nodeApiVersion === right.nodeApiVersion;
+}
+
+function sameDedicatedHardwareSdkFileInfo(left, right) {
+  return right.isFile() && !right.isSymbolicLink() && left.size === right.size &&
+    left.dev === right.dev && left.ino === right.ino && left.mtimeMs === right.mtimeMs;
+}
+
+function isDedicatedHardwareSdkRelativePath(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 512 || value.includes("\\") ||
+      value.startsWith("/") || value.endsWith("/") || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) return false;
+  const segments = value.split("/");
+  return segments.length <= 16 && segments.every(isDedicatedHardwareSdkPathSegment);
+}
+
+function isDedicatedHardwareSdkPathSegment(value) {
+  return value.length > 0 && value.length <= 255 && value !== "." && value !== ".." &&
+    /^[A-Za-z0-9@][A-Za-z0-9@._+-]*$/u.test(value);
+}
+
+function isBoundedDedicatedHardwareSdkIdentity(value, maximum) {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum && value.trim() === value &&
+    !hasLoneSurrogate(value) && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function isSha512Integrity(value) {
+  return typeof value === "string" && /^sha512-[A-Za-z0-9+/]{86}==$/u.test(value);
+}
+
+function hasExactObjectKeys(value, expected) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  return keys.length === expected.length && keys.every((key, index) => key === expected[index]);
+}
+
+function isPositiveSafeInteger(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function isStrictlySortedUnique(values, select) {
+  return values.every((value, index) => index === 0 || select(values[index - 1]) < select(value));
+}
+
+function isCaseInsensitiveUnique(values) {
+  return new Set(values.map((value) => value.toLowerCase())).size === values.length;
+}
+
+function sameStringArray(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) throw new TypeError("Canonical SDK manifest numbers must be safe integers.");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(",")}}`;
+  }
+  throw new TypeError("The SDK manifest cannot be canonicalized.");
+}
+
+function sha512Integrity(bytes) {
+  return `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+}
+
+function hasLoneSurrogate(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
 
 async function auditBundledNpmRuntime(runtimeRoot, expected) {
   const manifestPath = resolve(runtimeRoot, expected.manifestRelativePath);

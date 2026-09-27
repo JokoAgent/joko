@@ -55,6 +55,7 @@ import { useHeldVoiceInput } from "./use-held-voice-input.js";
 import { GAMEPAD_SKILL_EVENT, useGamepadVoiceInput } from "../gamepad-client.js";
 import { currentGamepadTaskRoot, useGamepadActions } from "../gamepad-actions.js";
 import { isGamepadSkillBinding, type GamepadSkillBinding } from "../gamepad-input.js";
+import { useAppInputComposerOwner, type AppInputSkillIdentity } from "../app-input-owners.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
@@ -455,8 +456,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
   const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
   const gamepadSkillFlight = useRef<{ readonly owner: object } | undefined>(undefined);
-  const gamepadSkillState = useRef({ owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId });
-  gamepadSkillState.current = { owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId };
+  const gamepadSkillState = useRef({ owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId, resources });
+  gamepadSkillState.current = { owner: sendOwner, locked: composerLocked, bashMode: effectiveBashMode, connected: controller.state.connectionState === "connected", serverId: controller.state.activeProfile?.serverId, resources };
   useLayoutEffect(() => { setGamepadSkillError(undefined); }, [sendOwner]);
   const sendEpochRef = useRef<object | undefined>(undefined);
   useLayoutEffect(() => {
@@ -1617,7 +1618,28 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
   };
   const insertSkillRef = useRef(insert);
   insertSkillRef.current = insert;
-  const receiveGamepadSkillRef = useRef<(binding: GamepadSkillBinding) => void>(() => undefined);
+  const insertAppTextRef = useRef<(value: string) => boolean>(() => false);
+  insertAppTextRef.current = (value) => {
+    if (composerLocked || effectiveBashMode) return false;
+    markDraftEdited(session.id);
+    resetHistoryNavigation();
+    const prefix = composerDocumentIsEmpty(editorDocumentRef.current) || composerDocumentEndsWithWhitespace(editorDocumentRef.current) ? "" : " ";
+    const nextDocument = appendTextToComposerDocument(editorDocumentRef.current, `${prefix}${value}`);
+    const nextText = composerDocumentPlainText(nextDocument);
+    const nextRanges = remapComposerInlineMentionRanges(textRef.current, nextText, inlineMentionRangesRef.current);
+    const nextMentions = composerMentionsFromRanges(mentionsRef.current, nextRanges);
+    editorDocumentRef.current = nextDocument;
+    textRef.current = nextText;
+    mentionsRef.current = nextMentions;
+    setEditorDocument(nextDocument);
+    setText(nextText);
+    replaceInlineMentionRanges(nextRanges);
+    setMentions(nextMentions);
+    closePalette();
+    requestComposerFrame(() => richEditorRef.current?.focus("end"));
+    return true;
+  };
+  const receiveGamepadSkillRef = useRef<(binding: GamepadSkillBinding | AppInputSkillIdentity) => boolean>(() => false);
   receiveGamepadSkillRef.current = (binding) => {
     const source = gamepadSkillState.current;
     const ownerDocument = voiceRoot?.ownerDocument;
@@ -1627,9 +1649,15 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       || ownerDocument.body.classList.contains("modal-open")
       || (taskRoot !== null && taskRoot !== undefined && currentGamepadTaskRoot(ownerDocument) !== taskRoot)) {
       setGamepadSkillError(t("settings.gamepad.skillInputUnavailable"));
-      return;
+      return false;
     }
-    if (gamepadSkillFlight.current?.owner === source.owner) return;
+    const matchingResources = source.resources.filter((resource) => resource.kind === "skill"
+      && resource.id === binding.resourceId && resource.name === binding.name && resource.sessionId === session.id);
+    if (matchingResources.length !== 1) {
+      setGamepadSkillError(t("settings.gamepad.skillInputUnavailable"));
+      return false;
+    }
+    if (gamepadSkillFlight.current?.owner === source.owner) return false;
     const operation = { owner: source.owner };
     gamepadSkillFlight.current = operation;
     setGamepadSkillError(undefined);
@@ -1638,6 +1666,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       && gamepadSkillState.current.owner === source.owner
       && !gamepadSkillState.current.locked && !gamepadSkillState.current.bashMode
       && gamepadSkillState.current.connected && gamepadSkillState.current.serverId === binding.serverId
+      && gamepadSkillState.current.resources === source.resources
       && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument
       && editorDocumentRef.current === sourceDraftDocument
       && !ownerDocument.body.classList.contains("modal-open")
@@ -1655,6 +1684,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
     }).finally(() => {
       if (gamepadSkillFlight.current === operation) gamepadSkillFlight.current = undefined;
     });
+    return true;
   };
   useLayoutEffect(() => {
     if (voiceRoot === undefined) return;
@@ -1668,6 +1698,24 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly 
       delete voiceRoot.dataset.gamepadSkill;
     };
   }, [voiceRoot, sendOwner]);
+
+  useAppInputComposerOwner(voiceRoot, sendOwner, {
+    focus: () => {
+      if (composerLocked) return false;
+      richEditorRef.current?.focus();
+      return true;
+    },
+    insertText: (value) => insertAppTextRef.current(value),
+    insertSkill: (binding) => receiveGamepadSkillRef.current(binding),
+    voice: {
+      enabled: voice.supported && !readOnly && submissionKind === undefined && !effectiveBashMode && hydratedSession === session.id,
+      isActive: voice.isActive,
+      getCaptureIdentity: voice.getCaptureIdentity,
+      start: voice.start,
+      finish: voice.finish,
+      cancel: voice.cancel
+    }
+  });
 
   const openInlineMentionPalette = (): void => {
     if (composerLocked || !canMention) return;

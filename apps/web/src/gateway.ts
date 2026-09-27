@@ -11391,6 +11391,9 @@ function mapSession(
     codeHostPullRequests: session.codeHostPullRequests.map(mapCodeHostPullRequest),
     createdAt: timestampMs(session.createdAt),
     updatedAt: timestampMs(session.lastActivityAt) || timestampMs(session.createdAt),
+    ...(session.lastUserInputAt === undefined
+      ? {}
+      : { lastUserInputAt: timestampMs(session.lastUserInputAt) }),
     ...(cumulativeUsage === undefined ? {} : { usage: mapUsageTokens(cumulativeUsage) }),
     ...(context === undefined ? {} : {
       context: {

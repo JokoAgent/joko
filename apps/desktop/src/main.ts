@@ -40,8 +40,8 @@ import {
   type DesktopDeepLinkNavigation,
   type DesktopDiscoveredNode,
   type DesktopFile,
-  type DesktopGlobalVoiceCommitRequest,
   type DesktopGlobalVoiceCommand,
+  type DesktopGlobalVoiceErrorKind,
   type DesktopGlobalVoiceShortcut,
   type DesktopGlobalVoiceShortcutResult,
   type DesktopGlobalVoiceStatus,
@@ -72,6 +72,8 @@ import {
   isDesktopSessionWindowOwner,
   isInspectorWindowOpenRequest,
   isDesktopLocale,
+  parseDesktopGlobalVoiceCommitRequest,
+  parseDesktopGlobalVoiceStatus,
   parseDesktopPageSearchRequest,
   parseDesktopPageSearchStopAction
 } from "./channels.js";
@@ -128,6 +130,49 @@ import {
   createDesktopKeepAwakeController,
   type DesktopKeepAwakeController
 } from "./keep-awake-controller.js";
+import {
+  SourceAwareVoiceLease,
+  type VoicePressLease,
+  type VoiceLeaseStopReason
+} from "./dedicated-hardware-action/voice-lease.js";
+import {
+  settleCompleteExitOperations,
+  settleGlobalVoiceForExit
+} from "./complete-exit-coordination.js";
+import { DedicatedHardwareActionRouter } from "./dedicated-hardware-action/router.js";
+import {
+  DedicatedHardwareTaskFocusFence,
+  parseDedicatedHardwareTaskFocusAcknowledgement,
+  sendDedicatedHardwareActionDelivery
+} from "./dedicated-hardware-action/task-focus-fence.js";
+import {
+  SystemFrontmostInputController,
+  createPlatformSystemFrontmostInput
+} from "./dedicated-hardware-action/system-frontmost-input.js";
+import { SystemFrontmostVoiceController } from "./dedicated-hardware-action/system-frontmost-voice.js";
+import {
+  createDedicatedHardwareMainActionRuntime,
+  type DedicatedHardwareMainActionRuntime
+} from "./dedicated-hardware-main-actions.js";
+import {
+  createDedicatedHardwareMainController,
+  type DedicatedHardwareMainController,
+  type DedicatedHardwareProjectedState
+} from "./dedicated-hardware-main-controller.js";
+import {
+  dedicatedHardwareSdkStagingDirectory,
+  resolveDedicatedHardwareSdkIdentity
+} from "./dedicated-hardware-sdk.js";
+import {
+  createDedicatedHardwareHostClient,
+  createDedicatedHardwareInputController,
+  createDedicatedHardwareSettingsStore,
+  createElectronDedicatedHardwareUtilityFactory,
+  isDedicatedHardwareModelId,
+  parseDedicatedHardwareSettings,
+  type DedicatedHardwareModelId,
+  type DedicatedHardwareSettings
+} from "./dedicated-hardware/index.js";
 import {
   createDesktopKeepAwakeSettingsStore,
   type DesktopKeepAwakeSettingsStore
@@ -191,7 +236,7 @@ import {
   type NativeVoiceInputMonitoringStatus
 } from "./native-voice-shortcut.js";
 import {
-  insertTextIntoForegroundApplication
+  ExternalTextInsertionCoordinator
 } from "./external-text-insertion.js";
 import {
   createSystemAudioMuteBackend,
@@ -350,10 +395,36 @@ let inspectorWindowOwner: WebContents | undefined;
 let inspectorWindowReady = false;
 let runtimeProcessMonitorWindow: BrowserWindow | undefined;
 let globalVoiceOverlayWindow: BrowserWindow | undefined;
-let globalVoiceNativePressOwnsSession = false;
 let globalVoiceShortcutRecoveryFailurePending = false;
-let globalVoiceActive = false;
-let globalVoiceStatus: DesktopGlobalVoiceStatus = Object.freeze({ state: "idle" });
+type GlobalVoiceInputSource = "shortcut" | "hardware";
+type GlobalVoiceStartMode = "start" | "retry";
+let globalVoiceActiveGeneration: number | undefined;
+let globalVoiceStatus: DesktopGlobalVoiceStatus = Object.freeze({ state: "idle", generation: "0" });
+let globalVoiceRetry: {
+  readonly source: GlobalVoiceInputSource;
+  readonly failedGeneration: number;
+} | undefined;
+let globalVoiceCommitFence: {
+  readonly generation: number;
+  state: "open" | "pending" | "consumed";
+} | undefined;
+let globalVoiceCancellingGeneration: number | undefined;
+let globalVoiceExitAdmissionClosed = false;
+const globalVoiceStartModes = new Map<number, GlobalVoiceStartMode>();
+let globalVoiceShortcutPressLease: VoicePressLease<GlobalVoiceInputSource> | undefined;
+let globalVoiceHardwarePressLease: VoicePressLease<GlobalVoiceInputSource> | undefined;
+const globalVoiceStopWaiters = new Map<number, {
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+  readonly timeout: NodeJS.Timeout;
+}>();
+const globalVoiceInputLease = new SourceAwareVoiceLease<GlobalVoiceInputSource>({
+  backend: {
+    start: (request) => startGlobalVoiceInputLease(request.generation, request.source),
+    stop: (request) => stopGlobalVoiceInputLease(request.generation, request.source, request.reason)
+  }
+});
+const externalTextInsertionCoordinator = new ExternalTextInsertionCoordinator();
 const GLOBAL_VOICE_APPLICATION_SHORTCUT_RECORDING_SUSPENSION = "application-shortcut-recording";
 const GLOBAL_VOICE_NATIVE_CAPTURE_SUSPENSION = "native-shortcut-capture";
 const globalVoiceNativeShortcut = new NativeVoiceShortcutListener({
@@ -426,6 +497,12 @@ const sessionWindowOwners = new Map<string, DesktopSessionWindowOwner>();
 const sessionWindowOwnersByContents = new Map<WebContents, DesktopSessionWindowOwner>();
 const extensionWindows = new Map<string, BrowserWindow>();
 const extensionWindowIdsByContents = new Map<WebContents, string>();
+let dedicatedHardwareController: DedicatedHardwareMainController<WebContents> | undefined;
+let dedicatedHardwareActions: DedicatedHardwareMainActionRuntime<BrowserWindow> | undefined;
+let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | undefined;
+const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
+const dedicatedHardwareWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
+let dedicatedHardwarePowerLifecycleInstalled = false;
 const pageSearchTokensByContents = new WeakMap<WebContents, Map<number, number>>();
 const pageSearchResultBindings = new WeakSet<WebContents>();
 const sessionWindowStates = new Map<string, windowStateKeeper.State>();
@@ -646,6 +723,12 @@ if (!app.requestSingleInstanceLock()) {
     });
   });
   app.on("will-quit", () => {
+    dedicatedHardwareTaskFocusFence.clear();
+    dedicatedHardwareActions?.cancelAll("suspended");
+    dedicatedHardwareActions = undefined;
+    const hardwareController = dedicatedHardwareController;
+    dedicatedHardwareController = undefined;
+    void hardwareController?.dispose().catch(() => undefined);
     void desktopDevicePeerAgentLifecycle?.dispose();
     nativeFileClipboard?.dispose();
     nativeFileOpener?.dispose();
@@ -653,6 +736,21 @@ if (!app.requestSingleInstanceLock()) {
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
     stopGlobalVoiceShortcutCapture();
+    const globalVoiceRecording = globalVoiceInputLease.snapshot();
+    if (globalVoiceRecording.state !== "idle") {
+      sendGlobalVoiceCommand({
+        type: "cancel",
+        generation: globalVoiceGenerationValue(globalVoiceRecording.generation)
+      });
+      resetGlobalVoicePresentation(globalVoiceRecording.generation);
+    } else {
+      resetGlobalVoicePresentation();
+    }
+    for (const [generation, waiter] of globalVoiceStopWaiters) {
+      globalVoiceStopWaiters.delete(generation);
+      clearTimeout(waiter.timeout);
+      waiter.reject(new Error("Application is quitting."));
+    }
     globalVoiceNativeShortcut.dispose();
     globalVoiceSystemAudioOwner = undefined;
     void globalVoiceSystemAudio.releaseAll().catch(() => undefined);
@@ -702,6 +800,7 @@ if (!app.requestSingleInstanceLock()) {
     await initializeDesktopNativeTaskStatus();
     if (shouldRunDesktopUpdateStartup()) desktopUpdateStartupPhase = { kind: "checking" };
     await initializeDesktopKeepAwake();
+    await initializeDedicatedHardwareInput();
     registerIpc();
     installMicrophoneLifecycle();
     installProviderModelPowerLifecycle();
@@ -1915,42 +2014,155 @@ function unregisterGlobalVoiceShortcut(): void {
 }
 
 function activateGlobalVoiceShortcut(): void {
-  if (globalVoiceShortcutRecordingActive()) return;
-  if (globalVoiceActive) {
-    submitGlobalVoiceShortcut();
-    return;
-  }
-  globalVoiceActive = true;
-  beginGlobalVoiceSystemAudio();
-  setGlobalVoiceStatus({ state: "starting" });
-  showGlobalVoiceOverlay();
-  sendGlobalVoiceCommand({ type: "start" });
+  const pressed = pressGlobalVoiceInput("shortcut");
+  if (!pressed.accepted) return;
+  globalVoiceInputLease.release(pressed.lease, "tap");
 }
 
-function submitGlobalVoiceShortcut(): void {
-  if (!globalVoiceActive) return;
+function pressGlobalVoiceInput(source: GlobalVoiceInputSource) {
+  if (globalVoiceAdmissionUnavailable() || externalTextInsertionCoordinator.busy()) {
+    return Object.freeze({ accepted: false as const, reason: "recording-transition" as const });
+  }
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state !== "idle" && recording.source !== source) {
+    return Object.freeze({
+      accepted: false as const,
+      reason: recording.state === "uncertain"
+        ? "recording-uncertain" as const
+        : "recording-transition" as const
+    });
+  }
+  return globalVoiceInputLease.press(source);
+}
+
+function globalVoiceAdmissionUnavailable(): boolean {
+  return quitting || globalVoiceExitAdmissionClosed || managedOrchestratorExitFence.shutdownStarted;
+}
+
+async function cancelGlobalVoiceForExit(): Promise<void> {
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state === "idle") {
+    resetGlobalVoicePresentation();
+    return;
+  }
+  await settleGlobalVoiceForExit(globalVoiceInputLease);
+}
+
+function startGlobalVoiceInputLease(
+  generation: number,
+  source: GlobalVoiceInputSource
+): boolean {
+  const mode = globalVoiceStartModes.get(generation) ?? "start";
+  globalVoiceStartModes.delete(generation);
+  if (globalVoiceAdmissionUnavailable() || globalVoiceShortcutRecordingActive()
+    || externalTextInsertionCoordinator.busy()) return false;
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state === "idle" || recording.generation !== generation || recording.source !== source
+    || globalVoiceActiveGeneration !== undefined) return false;
+  const generationValue = globalVoiceGenerationValue(generation);
+  globalVoiceActiveGeneration = generation;
+  globalVoiceRetry = undefined;
+  globalVoiceCancellingGeneration = undefined;
+  globalVoiceCommitFence = { generation, state: "open" };
+  beginGlobalVoiceSystemAudio();
+  setGlobalVoiceStatus({ state: "starting", generation: generationValue });
+  try {
+    showGlobalVoiceOverlay();
+  } catch {
+    failGlobalVoiceGeneration(generation, "service");
+    return false;
+  }
+  if (sendGlobalVoiceCommand({ type: mode, generation: generationValue })) return true;
+  failGlobalVoiceGeneration(generation, "service");
+  return false;
+}
+
+function stopGlobalVoiceInputLease(
+  generation: number,
+  source: GlobalVoiceInputSource,
+  reason: VoiceLeaseStopReason
+): void | Promise<void> {
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state === "idle" || recording.generation !== generation || recording.source !== source) return;
+  if (globalVoiceActiveGeneration !== generation) {
+    failGlobalVoiceGeneration(generation, "service");
+    return;
+  }
+  const stopped = new Promise<void>((resolve, reject) => {
+    const prior = globalVoiceStopWaiters.get(generation);
+    if (prior !== undefined) {
+      clearTimeout(prior.timeout);
+      prior.reject(new Error("Global voice stop was superseded."));
+    }
+    const timeout = setTimeout(() => {
+      if (globalVoiceStopWaiters.get(generation)?.timeout !== timeout) return;
+      globalVoiceStopWaiters.delete(generation);
+      markGlobalVoiceStopUncertain(generation);
+      reject(new Error("Global voice stop was not acknowledged."));
+    }, 30_000);
+    timeout.unref();
+    globalVoiceStopWaiters.set(generation, { resolve, reject, timeout });
+  });
+  if (reason === "cancel") {
+    globalVoiceCancellingGeneration = generation;
+    if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
+    if (!sendGlobalVoiceCommand({
+      type: "cancel",
+      generation: globalVoiceGenerationValue(generation)
+    })) rejectGlobalVoiceStop(generation, new Error("Global voice cancellation could not be delivered."));
+  } else {
+    submitGlobalVoiceShortcut(generation);
+  }
+  return stopped;
+}
+
+function rejectGlobalVoiceStop(generation: number, error: Error): void {
+  const waiter = globalVoiceStopWaiters.get(generation);
+  if (waiter === undefined) return;
+  globalVoiceStopWaiters.delete(generation);
+  clearTimeout(waiter.timeout);
+  markGlobalVoiceStopUncertain(generation);
+  waiter.reject(error);
+}
+
+function acknowledgeGlobalVoiceInputStopped(generation: number): boolean {
+  const snapshot = globalVoiceInputLease.snapshot();
+  if (snapshot.state === "idle" || snapshot.generation !== generation
+    || !globalVoiceInputLease.acknowledgeStopped(generation)) return false;
+  const waiter = globalVoiceStopWaiters.get(generation);
+  if (waiter === undefined) return true;
+  globalVoiceStopWaiters.delete(generation);
+  clearTimeout(waiter.timeout);
+  waiter.resolve();
+  return true;
+}
+
+function submitGlobalVoiceShortcut(generation: number): boolean {
+  const recording = globalVoiceInputLease.snapshot();
+  if (globalVoiceActiveGeneration !== generation || recording.state === "idle"
+    || recording.generation !== generation) return false;
+  const generationValue = globalVoiceGenerationValue(generation);
   setGlobalVoiceStatus({
     state: "submitting",
-    transcript: globalVoiceStatus.state === "listening" ? globalVoiceStatus.transcript : ""
+    generation: generationValue,
+    transcript: globalVoiceStatus.generation === generationValue && globalVoiceStatus.state === "listening"
+      ? globalVoiceStatus.transcript
+      : ""
   });
-  sendGlobalVoiceCommand({ type: "submit" });
+  if (sendGlobalVoiceCommand({ type: "submit", generation: generationValue })) return true;
+  failGlobalVoiceGeneration(generation, "service");
+  return false;
 }
 
 function handleNativeGlobalVoiceShortcutPhase(phase: "start" | "tap" | "end"): void {
   if (phase === "start") {
-    if (globalVoiceShortcutRecordingActive()) return;
-    const wasActive = globalVoiceActive;
-    activateGlobalVoiceShortcut();
-    globalVoiceNativePressOwnsSession = !wasActive && globalVoiceActive;
+    const pressed = pressGlobalVoiceInput("shortcut");
+    if (pressed.accepted) globalVoiceShortcutPressLease = pressed.lease;
     return;
   }
-  if (phase === "tap") {
-    globalVoiceNativePressOwnsSession = false;
-    return;
-  }
-  const shouldSubmit = globalVoiceNativePressOwnsSession;
-  globalVoiceNativePressOwnsSession = false;
-  if (shouldSubmit) submitGlobalVoiceShortcut();
+  const lease = globalVoiceShortcutPressLease;
+  globalVoiceShortcutPressLease = undefined;
+  if (lease !== undefined) globalVoiceInputLease.release(lease, phase === "tap" ? "tap" : "hold");
 }
 
 function globalVoiceShortcutRecordingActive(): boolean {
@@ -1986,18 +2198,20 @@ async function restoreGlobalVoiceShortcutAfterSuspension(owner: string): Promise
 function handleGlobalVoiceShortcutRestartLimit(): void {
   const registered = globalVoiceShortcutBinding.invalidateNativeBinding();
   stopGlobalVoiceShortcutCapture();
-  globalVoiceNativePressOwnsSession = false;
+  globalVoiceShortcutPressLease = undefined;
+  globalVoiceInputLease.cancelSource("shortcut");
   if (registered) recordGlobalVoiceShortcutRecoveryFailure();
 }
 
-function sendGlobalVoiceCommand(command: DesktopGlobalVoiceCommand): void {
+function sendGlobalVoiceCommand(command: DesktopGlobalVoiceCommand): boolean {
   const contents = mainWindow?.webContents;
-  if (contents === undefined || contents.isDestroyed()) {
-    globalVoiceActive = false;
-    setGlobalVoiceStatus({ state: "error", errorKind: "service" });
-    return;
+  if (contents === undefined || contents.isDestroyed()) return false;
+  try {
+    contents.send(DESKTOP_CHANNELS.globalVoiceCommand, command);
+    return true;
+  } catch {
+    return false;
   }
-  contents.send(DESKTOP_CHANNELS.globalVoiceCommand, command);
 }
 
 function beginGlobalVoiceSystemAudio(): void {
@@ -2082,7 +2296,7 @@ function showGlobalVoiceOverlay(): void {
     callback("");
   });
   window.once("ready-to-show", () => {
-    if (globalVoiceActive && !window.isDestroyed()) window.showInactive();
+    if (globalVoiceStatus.state !== "idle" && !window.isDestroyed()) window.showInactive();
   });
   window.webContents.on("did-finish-load", () => {
     if (!window.isDestroyed()) window.webContents.send(DESKTOP_CHANNELS.globalVoiceStatus, globalVoiceStatus);
@@ -2091,16 +2305,16 @@ function showGlobalVoiceOverlay(): void {
     if (globalVoiceOverlayWindow !== window || quitting) return;
     globalVoiceOverlayWindow = undefined;
     if (!window.isDestroyed()) window.destroy();
-    globalVoiceActive = false;
-    setGlobalVoiceStatus({ state: "error", errorKind: "service" });
+    const generation = currentGlobalVoiceGeneration();
+    if (generation !== undefined) failGlobalVoiceGeneration(generation, "service");
   });
   window.on("closed", () => {
     if (globalVoiceOverlayWindow === window) globalVoiceOverlayWindow = undefined;
   });
   void loadGlobalVoiceOverlayUi(window).catch(() => {
     if (!window.isDestroyed()) window.destroy();
-    globalVoiceActive = false;
-    setGlobalVoiceStatus({ state: "error", errorKind: "service" });
+    const generation = currentGlobalVoiceGeneration();
+    if (generation !== undefined) failGlobalVoiceGeneration(generation, "service");
   });
 }
 
@@ -2148,57 +2362,117 @@ function setGlobalVoiceStatus(status: DesktopGlobalVoiceStatus): void {
   }
 }
 
-function resetGlobalVoicePresentation(): void {
-  globalVoiceActive = false;
-  globalVoiceNativePressOwnsSession = false;
-  setGlobalVoiceStatus({ state: "idle" });
+function mayAcceptGlobalVoiceStatus(status: DesktopGlobalVoiceStatus): boolean {
+  if (status.state === "idle" || status.state === "error") return true;
+  if (globalVoiceStatus.generation !== status.generation) return status.state === "starting";
+  if (status.state === "starting") return globalVoiceStatus.state === "starting";
+  if (status.state === "listening") {
+    return globalVoiceStatus.state === "starting" || globalVoiceStatus.state === "listening";
+  }
+  return globalVoiceStatus.state === "starting"
+    || globalVoiceStatus.state === "listening"
+    || globalVoiceStatus.state === "submitting";
+}
+
+function globalVoiceGenerationValue(generation: number): string {
+  if (!Number.isSafeInteger(generation) || generation <= 0) {
+    throw new TypeError("Global voice generation is invalid.");
+  }
+  return String(generation);
+}
+
+function currentGlobalVoiceGeneration(): number | undefined {
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state !== "idle") return recording.generation;
+  if (globalVoiceActiveGeneration !== undefined) return globalVoiceActiveGeneration;
+  return globalVoiceStatus.generation === "0" ? undefined : Number(globalVoiceStatus.generation);
+}
+
+function globalVoiceGenerationIsCurrent(generation: number): boolean {
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state !== "idle") return recording.generation === generation;
+  if (globalVoiceActiveGeneration !== undefined) return globalVoiceActiveGeneration === generation;
+  return globalVoiceStatus.generation === globalVoiceGenerationValue(generation);
+}
+
+function failGlobalVoiceGeneration(
+  generation: number,
+  errorKind: DesktopGlobalVoiceErrorKind
+): boolean {
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state === "idle" || recording.generation !== generation
+    || (globalVoiceActiveGeneration !== undefined && globalVoiceActiveGeneration !== generation)) return false;
+  const generationValue = globalVoiceGenerationValue(generation);
+  globalVoiceActiveGeneration = undefined;
+  if (globalVoiceCancellingGeneration === generation) globalVoiceCancellingGeneration = undefined;
+  globalVoiceStartModes.delete(generation);
+  if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
+  globalVoiceRetry = { source: recording.source, failedGeneration: generation };
+  if (globalVoiceShortcutPressLease?.recordingGeneration === generation) globalVoiceShortcutPressLease = undefined;
+  if (globalVoiceHardwarePressLease?.recordingGeneration === generation) globalVoiceHardwarePressLease = undefined;
+  if (recording.source === "hardware") dedicatedHardwareSystemVoiceController?.retire();
+  setGlobalVoiceStatus({ state: "error", generation: generationValue, errorKind });
+  acknowledgeGlobalVoiceInputStopped(generation);
+  return true;
+}
+
+function markGlobalVoiceStopUncertain(generation: number): boolean {
+  const recording = globalVoiceInputLease.snapshot();
+  if (recording.state === "idle" || recording.generation !== generation) return false;
+  globalVoiceActiveGeneration = undefined;
+  globalVoiceRetry = undefined;
+  globalVoiceStartModes.delete(generation);
+  if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
+  if (globalVoiceShortcutPressLease?.recordingGeneration === generation) globalVoiceShortcutPressLease = undefined;
+  if (globalVoiceHardwarePressLease?.recordingGeneration === generation) globalVoiceHardwarePressLease = undefined;
+  if (recording.source === "hardware") dedicatedHardwareSystemVoiceController?.retire();
+  setGlobalVoiceStatus({
+    state: "error",
+    generation: globalVoiceGenerationValue(generation),
+    errorKind: "service"
+  });
+  return true;
+}
+
+function resetGlobalVoicePresentation(expectedGeneration?: number): boolean {
+  const recording = globalVoiceInputLease.snapshot();
+  const generation = expectedGeneration
+    ?? (recording.state === "idle" ? currentGlobalVoiceGeneration() : recording.generation);
+  if (generation !== undefined && !globalVoiceGenerationIsCurrent(generation)) return false;
+  if (expectedGeneration !== undefined && generation === undefined) return false;
+
+  if (generation === undefined) {
+    globalVoiceActiveGeneration = undefined;
+    globalVoiceRetry = undefined;
+    globalVoiceCommitFence = undefined;
+    globalVoiceCancellingGeneration = undefined;
+    globalVoiceStartModes.clear();
+    globalVoiceShortcutPressLease = undefined;
+    globalVoiceHardwarePressLease = undefined;
+    dedicatedHardwareSystemVoiceController?.retire();
+    setGlobalVoiceStatus({ state: "idle", generation: "0" });
+  } else {
+    const generationValue = globalVoiceGenerationValue(generation);
+    if (globalVoiceActiveGeneration === generation) globalVoiceActiveGeneration = undefined;
+    if (globalVoiceRetry?.failedGeneration === generation) globalVoiceRetry = undefined;
+    if (globalVoiceCancellingGeneration === generation) globalVoiceCancellingGeneration = undefined;
+    if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
+    globalVoiceStartModes.delete(generation);
+    if (globalVoiceShortcutPressLease?.recordingGeneration === generation) globalVoiceShortcutPressLease = undefined;
+    if (globalVoiceHardwarePressLease?.recordingGeneration === generation) globalVoiceHardwarePressLease = undefined;
+    dedicatedHardwareSystemVoiceController?.retire();
+    acknowledgeGlobalVoiceInputStopped(generation);
+    setGlobalVoiceStatus({ state: "idle", generation: generationValue });
+  }
   const overlay = globalVoiceOverlayWindow;
   if (overlay !== undefined && !overlay.isDestroyed()) overlay.hide();
+  return true;
 }
 
 function destroyGlobalVoiceOverlay(): void {
   const overlay = globalVoiceOverlayWindow;
   globalVoiceOverlayWindow = undefined;
   if (overlay !== undefined && !overlay.isDestroyed()) overlay.destroy();
-}
-
-function parseGlobalVoiceStatus(value: unknown): DesktopGlobalVoiceStatus {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new TypeError("Global voice status is invalid.");
-  }
-  const candidate = value as Record<string, unknown>;
-  const state = candidate["state"];
-  if ((state === "idle" || state === "starting") && Object.keys(candidate).join(",") === "state") {
-    return { state };
-  }
-  if (state === "listening" || state === "submitting") {
-    if (Object.keys(candidate).sort().join(",") !== "state,transcript"
-      || typeof candidate["transcript"] !== "string"
-      || candidate["transcript"].length > 4_096
-      || /\u0000/u.test(candidate["transcript"])) {
-      throw new TypeError("Global voice status is invalid.");
-    }
-    return { state, transcript: candidate["transcript"] };
-  }
-  const errorKind = candidate["errorKind"];
-  if (state === "error" && Object.keys(candidate).sort().join(",") === "errorKind,state"
-    && (errorKind === "unsupported" || errorKind === "permission" || errorKind === "microphone"
-      || errorKind === "service" || errorKind === "empty" || errorKind === "insertion")) {
-    return { state, errorKind };
-  }
-  throw new TypeError("Global voice status is invalid.");
-}
-
-function parseGlobalVoiceCommit(value: unknown): DesktopGlobalVoiceCommitRequest {
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).join(",") !== "text") {
-    throw new TypeError("Global voice result is invalid.");
-  }
-  const text = (value as Record<string, unknown>)["text"];
-  if (typeof text !== "string" || text.length === 0 || text.length > 64 * 1024 || /\u0000/u.test(text)) {
-    throw new TypeError("Global voice result is invalid.");
-  }
-  return { text };
 }
 
 function globalVoiceAccessibilitySnapshot(): { readonly status: "granted" | "denied" | "not-required" | "unknown" } {
@@ -4144,6 +4418,7 @@ async function performDesktopUpdateChannelRelaunch(
   try {
     await stopManagedOrchestratorForCompleteExit();
   } catch {
+    await recoverManagedOrchestratorAfterUpdateApplyFailure().catch(() => undefined);
     reconcileDesktopDevicePeerAgentLifecycle();
     return { accepted: false, reason: "orchestrator-shutdown-failed" };
   }
@@ -4336,8 +4611,8 @@ async function performDesktopCompleteExit(): Promise<void> {
     // authority and prevents a concurrent managed initialization during quit.
     await stopManagedOrchestratorForCompleteExit();
   } catch {
-    managedOrchestratorExitFence.releaseForRecovery();
     quitting = false;
+    await recoverManagedOrchestratorAfterUpdateApplyFailure().catch(() => undefined);
     reconcileDesktopDevicePeerAgentLifecycle();
     reportDesktopCompleteExitFailure("orchestrator-shutdown-failed");
     return;
@@ -4375,10 +4650,10 @@ function reportDesktopCompleteExitFailure(
     type: "error",
     title: "Joko could not quit",
     message: orchestratorShutdownFailed
-      ? "The local Joko service could not be stopped."
+      ? "Joko could not safely finish preparing to quit."
       : "A window did not finish closing.",
     detail: orchestratorShutdownFailed
-      ? "Joko was kept open so you can retry a complete exit without leaving the local Joko service running."
+      ? "Joko was kept open because an active input or local service could not be stopped safely. Resolve the reported issue, then retry complete exit."
       : "Joko was kept open and the local Joko service was restarted. Save or discard pending work, then retry complete exit."
   });
 }
@@ -4395,18 +4670,23 @@ async function stopManagedOrchestratorForUpdateApply(): Promise<void> {
     desktopUpdateNativeInstallQuitHandoffPending = true;
   } catch (error) {
     desktopUpdateNativeInstallQuitHandoffPending = false;
+    await recoverManagedOrchestratorAfterUpdateApplyFailure().catch(() => undefined);
     reconcileDesktopDevicePeerAgentLifecycle();
     throw error;
   }
 }
 
 async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
+  globalVoiceExitAdmissionClosed = true;
   globalVoiceSystemAudioOwner = undefined;
-  await Promise.all([
-    desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
-    managedOrchestratorExitFence.stop(),
-    globalVoiceSystemAudio.releaseAll().catch(() => undefined)
-  ]).then(() => undefined);
+  await settleCompleteExitOperations([
+    cancelGlobalVoiceForExit,
+    () => desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
+    () => managedOrchestratorExitFence.stop(),
+    stopDedicatedHardwareForQuitHandoff,
+    () => externalTextInsertionCoordinator.waitForIdle(),
+    () => globalVoiceSystemAudio.releaseAll().catch(() => undefined)
+  ]);
 }
 
 async function recoverManagedOrchestratorAfterUpdateApplyFailure(): Promise<void> {
@@ -4414,7 +4694,9 @@ async function recoverManagedOrchestratorAfterUpdateApplyFailure(): Promise<void
   desktopUpdateNativeInstallQuitHandoffPending = false;
   if (nativeInstallQuitWasPending) quitting = false;
   if (quitting || desktopUpdateLifecycleDisposed) return;
+  await recoverDedicatedHardwareAfterQuitFailure();
   managedOrchestratorExitFence.releaseForRecovery();
+  globalVoiceExitAdmissionClosed = false;
   if (nativeInstallQuitWasPending) showMainWindow();
   if (managedOrchestratorStatus.state === "disabled") return;
   managedOrchestratorConnection = undefined;
@@ -5068,6 +5350,71 @@ function registerIpc(): void {
     if (parameters.length !== 1) throw new TypeError("Desktop attention clear requires one exact key.");
     requireDesktopAttentionBadgeController().clear(event.sender.id, parseDesktopAttentionKey(parameters[0]));
   });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareGetState, (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event);
+    if (parameters.length !== 0) throw new TypeError("Dedicated hardware state does not accept parameters.");
+    return requireDedicatedHardwareController().snapshot();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareSetSettings, async (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event, { focused: true });
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware settings require one request.");
+    const request = parseDedicatedHardwareSettingsRequest(parameters[0]);
+    dedicatedHardwareTaskFocusFence.clear();
+    return requireDedicatedHardwareController().setSettings(request.model, request.settings);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareResetSettings, async (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event, { focused: true });
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware reset requires one request.");
+    const request = parseDedicatedHardwareResetRequest(parameters[0]);
+    dedicatedHardwareTaskFocusFence.clear();
+    return requireDedicatedHardwareController().resetSettings(request.model, request.scope);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareProbe, (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event, { focused: true });
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware probe requires one request.");
+    const model = parseDedicatedHardwareModelRequest(parameters[0]);
+    const controller = requireDedicatedHardwareController();
+    controller.probe(model);
+    return controller.snapshot();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareRecoverKeymap, async (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event, { focused: true });
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware keymap recovery requires one request.");
+    const model = parseDedicatedHardwareKeymapRecoveryRequest(parameters[0]);
+    dedicatedHardwareTaskFocusFence.clear();
+    return requireDedicatedHardwareController().recoverKeymap(model);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareSetPreview, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware preview requires one request.");
+    const request = parseDedicatedHardwarePreviewRequest(parameters[0]);
+    assertDedicatedHardwareSender(event, { focused: request.enabled });
+    dedicatedHardwareTaskFocusFence.clear();
+    requireDedicatedHardwareController().setPreview(request.model, event.sender, request.enabled);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwarePublishTasks, (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event, { mainOnly: true });
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware tasks require one catalog.");
+    requireDedicatedHardwareController().publishTasks(parameters[0]);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareAcknowledgeTaskFocus, (event, ...parameters: unknown[]) => {
+    const owner = assertDedicatedHardwareSender(event, { mainOnly: true });
+    if (parameters.length !== 1) throw new TypeError("Dedicated hardware task focus requires one acknowledgement.");
+    const acknowledgement = parseDedicatedHardwareTaskFocusAcknowledgement(parameters[0]);
+    if (!dedicatedHardwareTaskFocusFence.consume(
+      event.sender,
+      acknowledgement.focusRequestId,
+      acknowledgement.task
+    )) return false;
+    if (!isDedicatedHardwareActionWindowReady(owner) || owner !== mainWindow) return false;
+    owner.show();
+    owner.focus();
+    return true;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareOpenInputSettings, (event, ...parameters: unknown[]) => {
+    assertDedicatedHardwareSender(event, { focused: true });
+    if (parameters.length !== 0) throw new TypeError("Dedicated hardware input settings do not accept parameters.");
+    return openGlobalVoiceInputMonitoringSettings();
+  });
   ipcMain.on(DESKTOP_CHANNELS.nativeTaskStatusGetAvailability, (event) => {
     event.returnValue = nativeTaskStatusSupported;
   });
@@ -5193,37 +5540,82 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.globalVoicePublishStatus, (event, ...parameters: unknown[]) => {
     assertGlobalVoiceOwnerSender(event);
     if (parameters.length !== 1) throw new TypeError("Global voice status requires one projection.");
-    const status = parseGlobalVoiceStatus(parameters[0]);
+    const status = parseDesktopGlobalVoiceStatus(parameters[0]);
+    const generation = Number(status.generation);
     if (status.state === "idle") {
-      resetGlobalVoicePresentation();
-    } else {
-      globalVoiceActive = status.state !== "error";
-      setGlobalVoiceStatus(status);
-      showGlobalVoiceOverlay();
+      if (generation > 0) resetGlobalVoicePresentation(generation);
+      return;
     }
+    const recording = globalVoiceInputLease.snapshot();
+    if (recording.state === "idle" || recording.generation !== generation
+      || globalVoiceActiveGeneration !== generation) return;
+    if (status.state === "error") {
+      if (failGlobalVoiceGeneration(generation, status.errorKind)) showGlobalVoiceOverlay();
+      return;
+    }
+    if (globalVoiceCancellingGeneration === generation) return;
+    if (!mayAcceptGlobalVoiceStatus(status)) return;
+    setGlobalVoiceStatus(status);
+    showGlobalVoiceOverlay();
   });
   ipcMain.handle(DESKTOP_CHANNELS.globalVoiceCommit, async (event, ...parameters: unknown[]) => {
     assertGlobalVoiceOwnerSender(event);
     if (parameters.length !== 1) throw new TypeError("Global voice commit requires one result.");
-    const request = parseGlobalVoiceCommit(parameters[0]);
-    setGlobalVoiceStatus({ state: "submitting", transcript: request.text.slice(0, 4_096) });
+    const request = parseDesktopGlobalVoiceCommitRequest(parameters[0]);
+    if (globalVoiceAdmissionUnavailable()) return false;
+    const generation = Number(request.generation);
+    const recording = globalVoiceInputLease.snapshot();
+    const fence = globalVoiceCommitFence;
+    if (globalVoiceActiveGeneration !== generation || recording.state === "idle"
+      || recording.generation !== generation || fence?.generation !== generation
+      || fence.state !== "open") return false;
+    fence.state = "pending";
+    const hardwareVoice = recording.source === "hardware";
+    const systemVoice = dedicatedHardwareSystemVoiceController;
+    if (hardwareVoice && (systemVoice === undefined || !systemVoice.hasTargetForActiveRecording())) {
+      fence.state = "consumed";
+      failGlobalVoiceGeneration(generation, "insertion");
+      return false;
+    }
+    setGlobalVoiceStatus({
+      state: "submitting",
+      generation: request.generation,
+      transcript: request.text.slice(0, 4_096)
+    });
     try {
-      const result = await insertTextIntoForegroundApplication(request.text, {
-        clipboard,
-        platform: process.platform,
-        runCommand: runBoundedHostCommand
-      });
+      const result = hardwareVoice
+        ? await externalTextInsertionCoordinator.insertCaptured(request.text, {
+          clipboard,
+          paste: () => systemVoice!.postPasteForActiveRecording()
+        })
+        : await externalTextInsertionCoordinator.insertForeground(request.text, {
+          clipboard,
+          platform: process.platform,
+          runCommand: runBoundedHostCommand
+        });
+      // A paste is not complete until the process-wide clipboard transaction
+      // either restores the prior owner or observes that a new owner replaced
+      // it. Restoration failure keeps the coordinator unavailable.
+      await result.restored;
+      if (!globalVoiceGenerationIsCurrent(generation)
+        || globalVoiceActiveGeneration !== generation
+        || globalVoiceCommitFence !== fence
+        || fence.state !== "pending") return false;
       if (!result.inserted) {
-        globalVoiceActive = false;
-        setGlobalVoiceStatus({ state: "error", errorKind: "insertion" });
+        fence.state = "consumed";
+        failGlobalVoiceGeneration(generation, "insertion");
         return false;
       }
-      void result.restored.catch(() => undefined);
-      resetGlobalVoicePresentation();
-      return true;
+      fence.state = "consumed";
+      return resetGlobalVoicePresentation(generation);
     } catch {
-      globalVoiceActive = false;
-      setGlobalVoiceStatus({ state: "error", errorKind: "insertion" });
+      if (globalVoiceGenerationIsCurrent(generation)
+        && globalVoiceActiveGeneration === generation
+        && globalVoiceCommitFence === fence
+        && fence.state === "pending") {
+        fence.state = "consumed";
+        failGlobalVoiceGeneration(generation, "insertion");
+      }
       return false;
     }
   });
@@ -5258,15 +5650,24 @@ function registerIpc(): void {
       throw new TypeError("Global voice overlay action is invalid.");
     }
     if (parameters[0] === "cancel") {
-      sendGlobalVoiceCommand({ type: "cancel" });
-      resetGlobalVoicePresentation();
+      const recording = globalVoiceInputLease.snapshot();
+      if (recording.state !== "idle") {
+        globalVoiceInputLease.cancelAll();
+      } else {
+        const generation = currentGlobalVoiceGeneration();
+        if (generation !== undefined) resetGlobalVoicePresentation(generation);
+      }
       return;
     }
-    globalVoiceActive = true;
-    beginGlobalVoiceSystemAudio();
-    setGlobalVoiceStatus({ state: "starting" });
-    showGlobalVoiceOverlay();
-    sendGlobalVoiceCommand({ type: "retry" });
+    const retry = globalVoiceRetry;
+    if (retry === undefined || retry.source !== "shortcut"
+      || globalVoiceStatus.state !== "error"
+      || globalVoiceStatus.generation !== globalVoiceGenerationValue(retry.failedGeneration)
+      || globalVoiceInputLease.snapshot().state !== "idle") return;
+    const pressed = pressGlobalVoiceInput("shortcut");
+    if (!pressed.accepted || pressed.effect !== "start") return;
+    globalVoiceStartModes.set(pressed.lease.recordingGeneration, "retry");
+    globalVoiceInputLease.release(pressed.lease, "tap");
   });
   ipcMain.handle(DESKTOP_CHANNELS.chooseFiles, async (event) => {
     assertTrustedIpcSender(event);
@@ -6049,6 +6450,302 @@ function secureStorageAvailable(): boolean {
 async function openExternalSafely(value: string): Promise<void> {
   await shell.openExternal(canonicalExternalUrl(value));
 }
+
+async function initializeDedicatedHardwareInput(): Promise<void> {
+  dedicatedHardwareTaskFocusFence.clear();
+  dedicatedHardwareSystemVoiceController?.retire();
+  dedicatedHardwareSystemVoiceController = undefined;
+  const systemFrontmost = createPlatformSystemFrontmostInput({ platform: process.platform });
+  const systemInput = systemFrontmost.status === "available"
+    ? new SystemFrontmostInputController(systemFrontmost.runner, { wheelNotch: systemFrontmost.wheelNotch })
+    : undefined;
+  const systemVoice = systemFrontmost.status === "available"
+    ? new SystemFrontmostVoiceController(systemFrontmost.runner, {
+      snapshot: () => globalVoiceInputLease.snapshot(),
+      press: () => {
+        const pressed = pressGlobalVoiceInput("hardware");
+        if (pressed.accepted) globalVoiceHardwarePressLease = pressed.lease;
+        return pressed;
+      },
+      release: (lease, kind) => {
+        if (globalVoiceHardwarePressLease?.activation === lease.activation
+          && globalVoiceHardwarePressLease.recordingGeneration === lease.recordingGeneration) {
+          globalVoiceHardwarePressLease = undefined;
+        }
+        return globalVoiceInputLease.release(lease, kind);
+      },
+      cancelHardware: () => {
+        const lease = globalVoiceHardwarePressLease;
+        globalVoiceHardwarePressLease = undefined;
+        return lease !== undefined
+          ? globalVoiceInputLease.release(lease, "cancel")
+          : globalVoiceInputLease.cancelSource("hardware");
+      }
+    })
+    : undefined;
+  dedicatedHardwareSystemVoiceController = systemVoice;
+  const router = new DedicatedHardwareActionRouter<BrowserWindow>({
+    getFocusedWindow: () => BrowserWindow.getFocusedWindow(),
+    getPrimaryWindow: () => mainWindow ?? null,
+    isJokoActionWindow: isDedicatedHardwareActionWindow,
+    isWindowReady: isDedicatedHardwareActionWindowReady,
+    getSystemFrontmostCapabilities: () => ({
+      voice: systemVoice !== undefined && isDedicatedHardwareGlobalVoiceReady() ? "available" : "unsupported",
+      return: systemInput === undefined ? "unsupported" : "available",
+      scroll: systemInput === undefined ? "unsupported" : "available"
+    })
+  });
+  const actions = createDedicatedHardwareMainActionRuntime({
+    router,
+    sendWindow: (window, event) => {
+      const taskPress = event.kind === "button" && event.phase === "press" && event.action.kind === "task";
+      if (!isDedicatedHardwareActionWindowReady(window)) {
+        if (taskPress) dedicatedHardwareTaskFocusFence.clear();
+        return false;
+      }
+      if (taskPress && event.action.focusWindow && window !== mainWindow) {
+        dedicatedHardwareTaskFocusFence.clear();
+        return false;
+      }
+      installDedicatedHardwareWindowLifecycle(window);
+      return sendDedicatedHardwareActionDelivery({
+        fence: dedicatedHardwareTaskFocusFence,
+        owner: window.webContents,
+        event,
+        send: (delivery) => window.webContents.send(DESKTOP_CHANNELS.dedicatedHardwareAction, delivery)
+      });
+    },
+    ...(systemInput === undefined ? {} : { systemInput }),
+    systemVoice: systemVoice ?? { handle: () => false, cancel: () => undefined }
+  });
+  const input = createDedicatedHardwareInputController({
+    emitAction: (_model, event) => {
+      if (!actions.handle(_model, event)) throw new Error("Dedicated hardware action was not admitted.");
+    }
+  });
+  const store = createDedicatedHardwareSettingsStore({
+    directory: join(app.getPath("userData"), "hardware-input")
+  });
+  const host = createDedicatedHardwareHostClient({
+    factory: createElectronDedicatedHardwareUtilityFactory({
+      entryPath: resolve(sourceDirectory, "dedicated-hardware", "utility-entry.js")
+    }),
+    resolveSdkIdentity: () => resolveDedicatedHardwareSdkIdentity({
+      stagingDirectory: dedicatedHardwareSdkStagingDirectory(process.resourcesPath)
+    }),
+    keymapBackupDirectory: join(app.getPath("userData"), "hardware-input", "private-keymap")
+  });
+  const controller = createDedicatedHardwareMainController<WebContents>({
+    store,
+    host,
+    input,
+    onStateChanged: (state) => {
+      dedicatedHardwareTaskFocusFence.clear();
+      broadcastDedicatedHardwareState(state);
+    },
+    onPreviewInput: (owner, previewInput) => {
+      const window = dedicatedHardwareWindowForContents(owner);
+      if (window === undefined || !isDedicatedHardwareActionWindowReady(window)) return;
+      owner.send(DESKTOP_CHANNELS.dedicatedHardwarePreviewInput, previewInput);
+    }
+  });
+  dedicatedHardwareActions = actions;
+  dedicatedHardwareController = controller;
+  try {
+    await controller.initialize();
+  } catch (error) {
+    dedicatedHardwareTaskFocusFence.clear();
+    dedicatedHardwareController = undefined;
+    dedicatedHardwareActions = undefined;
+    if (dedicatedHardwareSystemVoiceController === systemVoice) {
+      systemVoice?.retire();
+      dedicatedHardwareSystemVoiceController = undefined;
+    }
+    actions.cancelAll("host-crashed");
+    await controller.dispose().catch(() => undefined);
+    process.stderr.write(`JOKO_DEDICATED_HARDWARE_INIT_FAILED ${safeSmokeError(error)}\n`);
+  }
+  if (!dedicatedHardwarePowerLifecycleInstalled) {
+    dedicatedHardwarePowerLifecycleInstalled = true;
+    powerMonitor.on("suspend", suspendDedicatedHardwareInput);
+    powerMonitor.on("lock-screen", suspendDedicatedHardwareInput);
+  }
+}
+
+async function stopDedicatedHardwareForQuitHandoff(): Promise<void> {
+  dedicatedHardwareTaskFocusFence.clear();
+  dedicatedHardwareActions?.cancelAll("suspended");
+  dedicatedHardwareActions = undefined;
+  dedicatedHardwareSystemVoiceController?.retire();
+  dedicatedHardwareSystemVoiceController = undefined;
+  const controller = dedicatedHardwareController;
+  dedicatedHardwareController = undefined;
+  await controller?.dispose();
+}
+
+async function recoverDedicatedHardwareAfterQuitFailure(): Promise<void> {
+  if (quitting || dedicatedHardwareController !== undefined) return;
+  await initializeDedicatedHardwareInput();
+}
+
+function suspendDedicatedHardwareInput(): void {
+  dedicatedHardwareTaskFocusFence.clear();
+  dedicatedHardwareActions?.cancelAll("suspended");
+}
+
+function requireDedicatedHardwareController(): DedicatedHardwareMainController<WebContents> {
+  if (dedicatedHardwareController === undefined) {
+    throw new Error("Dedicated hardware input is unavailable.");
+  }
+  return dedicatedHardwareController;
+}
+
+function broadcastDedicatedHardwareState(state: DedicatedHardwareProjectedState): void {
+  for (const window of dedicatedHardwareActionWindows()) {
+    if (!isDedicatedHardwareActionWindowReady(window)) continue;
+    try { window.webContents.send(DESKTOP_CHANNELS.dedicatedHardwareStateChanged, state); } catch { /* Best effort. */ }
+  }
+}
+
+function dedicatedHardwareActionWindows(): readonly BrowserWindow[] {
+  const windows: BrowserWindow[] = [];
+  if (mainWindow !== undefined && !mainWindow.isDestroyed()) windows.push(mainWindow);
+  for (const window of sessionWindows.values()) {
+    if (!window.isDestroyed() && !windows.includes(window)) windows.push(window);
+  }
+  return windows;
+}
+
+function dedicatedHardwareWindowForContents(contents: WebContents): BrowserWindow | undefined {
+  const owner = BrowserWindow.fromWebContents(contents);
+  if (owner === null || owner.isDestroyed() || owner.webContents !== contents) return undefined;
+  if (owner === mainWindow) {
+    return isAllowedMainFrameNavigation(contents.getURL(), navigationPolicy) ? owner : undefined;
+  }
+  const sessionOwner = sessionWindowOwnersByContents.get(contents);
+  return sessionOwner !== undefined
+    && sessionWindows.get(sessionWindowOwnerKey(sessionOwner)) === owner
+    && isAllowedSessionWindowNavigation(contents.getURL(), sessionOwner.sessionId, navigationPolicy)
+    ? owner
+    : undefined;
+}
+
+function isDedicatedHardwareActionWindow(window: BrowserWindow): boolean {
+  return !window.isDestroyed() && dedicatedHardwareWindowForContents(window.webContents) === window;
+}
+
+function isDedicatedHardwareActionWindowReady(window: BrowserWindow): boolean {
+  if (!isDedicatedHardwareActionWindow(window)) return false;
+  const contents = window.webContents;
+  return !contents.isDestroyed() && !contents.isCrashed() && !contents.isLoadingMainFrame();
+}
+
+function isDedicatedHardwareGlobalVoiceReady(): boolean {
+  const window = mainWindow;
+  return window !== undefined && isDedicatedHardwareActionWindowReady(window);
+}
+
+function installDedicatedHardwareWindowLifecycle(window: BrowserWindow): void {
+  const contents = window.webContents;
+  if (dedicatedHardwareWindowLifecycles.has(contents)) return;
+  let retired = false;
+  const onNavigation = (_event: unknown, _url: string, isInPlace: boolean, isMainFrame: boolean): void => {
+    if (isMainFrame && !isInPlace) retire();
+  };
+  const onProcessGone = (): void => retire();
+  const onDestroyed = (): void => retire();
+  const retire = (): void => {
+    if (retired) return;
+    retired = true;
+    contents.removeListener("did-start-navigation", onNavigation);
+    contents.removeListener("render-process-gone", onProcessGone);
+    contents.removeListener("destroyed", onDestroyed);
+    if (dedicatedHardwareWindowLifecycles.get(contents)?.retire === retire) {
+      dedicatedHardwareWindowLifecycles.delete(contents);
+    }
+    dedicatedHardwareController?.retireOwner(contents);
+    dedicatedHardwareActions?.retireWindow(window);
+    dedicatedHardwareTaskFocusFence.retireOwner(contents);
+  };
+  dedicatedHardwareWindowLifecycles.set(contents, { retire });
+  contents.on("did-start-navigation", onNavigation);
+  contents.once("render-process-gone", onProcessGone);
+  contents.once("destroyed", onDestroyed);
+}
+
+function assertDedicatedHardwareSender(
+  event: IpcMainInvokeEvent,
+  options: { readonly focused?: boolean; readonly mainOnly?: boolean } = {}
+): BrowserWindow {
+  assertTrustedIpcSender(event);
+  const owner = dedicatedHardwareWindowForContents(event.sender);
+  if (owner === undefined || (options.mainOnly === true && owner !== mainWindow)) {
+    throw new Error("Dedicated hardware IPC is restricted to an exact Joko application window.");
+  }
+  if (options.focused === true && !owner.isFocused()) {
+    throw new Error("Dedicated hardware user gestures require a focused Joko application window.");
+  }
+  installDedicatedHardwareWindowLifecycle(owner);
+  return owner;
+}
+
+function parseDedicatedHardwareModelRequest(value: unknown): DedicatedHardwareModelId {
+  if (!dedicatedHardwareExactRecord(value, ["model"]) || !isDedicatedHardwareModelId(value.model)) {
+    throw new TypeError("Dedicated hardware model request is invalid.");
+  }
+  return value.model;
+}
+
+function parseDedicatedHardwareSettingsRequest(value: unknown): {
+  readonly model: DedicatedHardwareModelId;
+  readonly settings: DedicatedHardwareSettings;
+} {
+  if (!dedicatedHardwareExactRecord(value, ["model", "settings"]) || !isDedicatedHardwareModelId(value.model)) {
+    throw new TypeError("Dedicated hardware settings request is invalid.");
+  }
+  const settings = parseDedicatedHardwareSettings(value.settings);
+  if (settings === undefined) throw new TypeError("Dedicated hardware settings request is invalid.");
+  return { model: value.model, settings };
+}
+
+function parseDedicatedHardwareKeymapRecoveryRequest(value: unknown): "creator-micro-2" {
+  if (!dedicatedHardwareExactRecord(value, ["model"]) || value.model !== "creator-micro-2") {
+    throw new TypeError("Dedicated hardware keymap recovery request is invalid.");
+  }
+  return value.model;
+}
+
+function parseDedicatedHardwareResetRequest(value: unknown): {
+  readonly model: DedicatedHardwareModelId;
+  readonly scope: "layout" | "all";
+} {
+  if (!dedicatedHardwareExactRecord(value, ["model", "scope"]) || !isDedicatedHardwareModelId(value.model)
+    || (value.scope !== "layout" && value.scope !== "all")) {
+    throw new TypeError("Dedicated hardware reset request is invalid.");
+  }
+  return { model: value.model, scope: value.scope };
+}
+
+function parseDedicatedHardwarePreviewRequest(value: unknown): {
+  readonly model: DedicatedHardwareModelId;
+  readonly enabled: boolean;
+} {
+  if (!dedicatedHardwareExactRecord(value, ["model", "enabled"]) || !isDedicatedHardwareModelId(value.model)
+    || typeof value.enabled !== "boolean") {
+    throw new TypeError("Dedicated hardware preview request is invalid.");
+  }
+  return { model: value.model, enabled: value.enabled };
+}
+
+function dedicatedHardwareExactRecord(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
 
 function assertTrustedIpcSender(event: IpcMainInvokeEvent): void {
   const owner = BrowserWindow.fromWebContents(event.sender);

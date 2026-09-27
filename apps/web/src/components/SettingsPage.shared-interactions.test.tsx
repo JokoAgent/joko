@@ -10,6 +10,7 @@ import { translate } from "../i18n.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type Locale, type Theme } from "../model.js";
 import { writeVoiceInputPreferences } from "../voice-input-preferences.js";
+import { createUnavailableDedicatedHardwareSnapshot, type DedicatedHardwareBridge } from "../dedicated-hardware.js";
 import {
   AppearanceSettings,
   GeneralSettings,
@@ -197,6 +198,41 @@ describe("shared settings interactions", () => {
     expect(window.location.hash).toBe("#/settings/general");
     expect(window.history.length).toBe(before);
     expect(window.history.state).toEqual({ marker: "settings" });
+  });
+
+  it("places dedicated hardware before gamepad and explicitly marks it unavailable without the Desktop capability", async () => {
+    window.history.replaceState(null, "", "/#/settings/shortcuts");
+    const container = await renderSettingsPage(controllerFixture());
+    const hardware = required(container.querySelector<HTMLElement>(".dedicated-hardware-settings"));
+    const gamepad = required(container.querySelector<HTMLElement>(".gamepad-settings"));
+
+    expect(hardware.textContent).toContain("Dedicated hardware is available in Joko Desktop.");
+    expect(hardware.compareDocumentPosition(gamepad) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("uses the dedicated hardware bridge only when its Desktop capability is advertised", async () => {
+    const snapshot = createUnavailableDedicatedHardwareSnapshot();
+    const bridge: DedicatedHardwareBridge = {
+      getDedicatedHardwareState: vi.fn(async () => snapshot),
+      setDedicatedHardwareSettings: vi.fn(async () => undefined),
+      resetDedicatedHardwareSettings: vi.fn(async () => undefined),
+      probeDedicatedHardware: vi.fn(async () => snapshot),
+      recoverDedicatedHardwareKeymap: vi.fn(async () => snapshot),
+      setDedicatedHardwarePreview: vi.fn(async () => undefined),
+      publishDedicatedHardwareTasks: vi.fn(async () => undefined),
+      acknowledgeDedicatedHardwareTaskFocus: vi.fn(async () => false),
+      openDedicatedHardwareInputSettings: vi.fn(async () => true)
+    };
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: { capabilities: ["hardware.dedicatedInput"], platform: "win32", dedicatedHardware: bridge }
+    });
+    window.history.replaceState(null, "", "/#/settings/shortcuts");
+    const container = await renderSettingsPage(controllerFixture());
+
+    await vi.waitFor(() => expect(bridge.getDedicatedHardwareState).toHaveBeenCalled());
+    expect(container.textContent).not.toContain("Dedicated hardware is available in Joko Desktop.");
+    expect(container.textContent).toContain("The skill catalog is not available in this settings view.");
   });
 });
 

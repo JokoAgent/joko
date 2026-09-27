@@ -333,6 +333,10 @@ message Session {
   // Session-owner-bound references. A projection with observed=false has been
   // extracted safely but has no configured capability-owned provider snapshot.
   repeated CodeHostPullRequestProjection code_host_pull_requests = 26;
+  // Latest visible user-authored message accepted into the durable product
+  // timeline. Service-owned automatic continuations are deliberately excluded.
+  // Absence means the Session has no surviving user input.
+  google.protobuf.Timestamp last_user_input_at = 27;
 }
 
 message SessionContextState {

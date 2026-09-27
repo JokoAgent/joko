@@ -3122,6 +3122,57 @@ describe("OperationalStore", () => {
     })).toThrow("cannot page after and before a cursor at the same time");
   });
 
+  it("projects latest visible user activity without counting automatic continuations", () => {
+    const { store } = createFixture();
+    expect(store.findLatestVisibleUserMessageAt("session-1")).toBeUndefined();
+
+    store.appendEvent({
+      id: "assistant-before-user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 100,
+      traceId: "user-activity:assistant",
+      payload: {
+        type: "message_complete",
+        role: "assistant",
+        blocks: [{ kind: "text", text: "Ready" }]
+      }
+    });
+    store.appendEvent({
+      id: "user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 200,
+      traceId: "user-activity:user",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Ship it" }]
+      }
+    });
+    store.appendEvent({
+      id: "automatic-continuation-after-user-activity",
+      backendId: "pi",
+      targetId: "target-1",
+      sessionId: "session-1",
+      generation: 0,
+      emittedAt: 300,
+      traceId: "user-activity:continuation",
+      payload: {
+        type: "message_complete",
+        role: "user",
+        blocks: [{ kind: "text", text: "Continue" }],
+        automaticContinuation: { recoveryId: "user-activity-recovery" }
+      }
+    });
+
+    expect(store.findLatestVisibleUserMessageAt("session-1")).toBe(200);
+  });
+
   it("uses optimistic revisions and active-state checks to fence revoke races", () => {
     const store = createStore();
     const connection = store.createConnection({

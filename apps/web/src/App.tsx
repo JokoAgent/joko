@@ -47,7 +47,7 @@ import {
   type DesktopApplicationMenuPreferenceView
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
-import { useGamepadInput } from "./gamepad-client.js";
+import { GAMEPAD_PANEL_EVENT, useGamepadInput } from "./gamepad-client.js";
 import { toggleGamepadFullscreen } from "./gamepad-fullscreen.js";
 import { currentGamepadTaskRoot, isGamepadInspectorAction, type GamepadInspectorRequest } from "./gamepad-actions.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
@@ -103,6 +103,13 @@ import { isRuntimeProcessMonitorWindow } from "./runtime-process-monitor-window.
 import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
 import type { NewSessionProjectPickerRequest } from "./components/NewSessionPage.js";
+import type { DedicatedHardwareCommand, DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
+import {
+  createDedicatedHardwareTaskCatalog,
+  useDedicatedHardwareInput,
+  useDedicatedHardwareTaskCatalogPublisher,
+  visibleDedicatedHardwareTaskOrder
+} from "./dedicated-hardware-app.js";
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
@@ -119,6 +126,7 @@ const StandaloneAboutPage = lazy(async () => ({ default: (await import("./compon
 const ToolsPage = lazy(async () => ({ default: (await import("./components/ToolsPage.js")).ToolsPage }));
 const EMPTY_TIMELINE: readonly TimelineItemView[] = [];
 const JOKO_PRODUCT_FEEDBACK_URL = "https://github.com/JokoAgent/joko/issues/new";
+const JOKO_DOCUMENTATION_URL = "https://github.com/JokoAgent/joko";
 
 interface ActiveTimelineHistory {
   readonly sessionId: string;
@@ -190,6 +198,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  const dedicatedHardwareBridge = typeof window !== "undefined"
+    && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
+    ? window.jokoDesktop.dedicatedHardware
+    : undefined;
   const bootSessionId = sessionApplicationWindow
     ? new URLSearchParams(window.location.search).get("bootSession") ?? undefined
     : undefined;
@@ -660,6 +672,41 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const sessions = applySessionProjectOverrides(state.snapshot.sessions, sessionProjectOverrides);
     return sessions === state.snapshot.sessions ? state.snapshot : { ...state.snapshot, sessions };
   }, [sessionProjectOverrides, state.snapshot]);
+  const [dedicatedHardwareSidebarOrder, setDedicatedHardwareSidebarOrder] = useState<readonly string[]>([]);
+  useLayoutEffect(() => {
+    const next = auxiliaryApplicationWindow ? [] : visibleDedicatedHardwareTaskOrder(document);
+    setDedicatedHardwareSidebarOrder((current) => current.length === next.length
+      && current.every((id, index) => id === next[index]) ? current : next);
+  });
+  const dedicatedHardwareTaskCatalog = useMemo<DedicatedHardwareTaskCatalog | undefined>(() => {
+    const profile = state.activeProfile;
+    if (dedicatedHardwareBridge === undefined || auxiliaryApplicationWindow || profile === undefined) return undefined;
+    try {
+      return createDedicatedHardwareTaskCatalog({
+        profileId: profile.id,
+        serverId: profile.serverId,
+        connectionGeneration: state.snapshot.generation,
+        snapshotRevision: state.snapshot.revision,
+        sessions: state.ready && state.connectionState === "connected" ? state.snapshot.sessions : [],
+        sidebarSessionIds: dedicatedHardwareSidebarOrder,
+        ...(activeSession === undefined ? {} : { viewedSessionId: activeSession.id })
+      });
+    } catch {
+      return undefined;
+    }
+  }, [
+    activeSession?.id,
+    auxiliaryApplicationWindow,
+    dedicatedHardwareBridge,
+    dedicatedHardwareSidebarOrder,
+    state.activeProfile,
+    state.connectionState,
+    state.ready,
+    state.snapshot.generation,
+    state.snapshot.revision,
+    state.snapshot.sessions
+  ]);
+  useDedicatedHardwareTaskCatalogPublisher(dedicatedHardwareBridge, dedicatedHardwareTaskCatalog);
   useEffect(() => {
     setSessionProjectOverrides((current) => reconcileSessionProjectOverrides(current, state.snapshot.sessions));
   }, [state.snapshot.sessions]);
@@ -1078,12 +1125,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     navigateFromShortcut({ kind: "newSession" });
     return true;
   });
-  useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
+  const dispatchApplicationInputCommand = (action: DedicatedHardwareCommand): void => {
     if (!state.ready || document.body.classList.contains("modal-open")) return;
+    if (action === "previous-panel" || action === "next-panel") {
+      window.dispatchEvent(new CustomEvent(GAMEPAD_PANEL_EVENT, { detail: action === "previous-panel" ? -1 : 1 }));
+      return;
+    }
     if (isGamepadInspectorAction(action)) {
       if (state.connectionState !== "connected" || state.route.kind !== "session" || state.activeProfile === undefined) return;
       const root = currentGamepadTaskRoot(document);
-      const sessionId = root?.dataset.gamepadSessionId;
+      const sessionId = root?.dataset.inputSessionId;
       const owner = state.snapshot.sessions.find((candidate) => candidate.id === sessionId);
       if (owner === undefined || owner.archived || reviewRunForReviewerSession(state.snapshot.reviewRuns, owner.id) !== undefined) return;
       const request: GamepadInspectorRequest = {
@@ -1166,6 +1217,74 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const index = selected === undefined ? -1 : ids.indexOf(selected);
     const sessionId = ids[index === -1 ? 0 : (index + (action === "previous-task" ? -1 : 1) + ids.length) % ids.length];
     if (sessionId !== undefined && sessionId !== selected) navigateFromShortcut({ kind: "session", sessionId });
+  };
+  useGamepadInput(`${state.activeProfile?.id ?? ""}:${state.connectionState}:${appRouteHash(state.route)}:${focusedSplitSessionId ?? activeSession?.id ?? ""}:${activeSession?.generation ?? ""}`, (action) => {
+    if (action !== "none" && action !== "voice") dispatchApplicationInputCommand(action);
+  });
+  useDedicatedHardwareInput(dedicatedHardwareBridge, {
+    command: (action) => {
+      dispatchApplicationInputCommand(action);
+      return true;
+    },
+    task: ({ task, focusRequestId }) => {
+      if (auxiliaryApplicationWindow || document.body.classList.contains("modal-open")) return false;
+      if (task.focusWindow && focusRequestId === null) return false;
+      const source = controllerRef.current.state;
+      const profile = source.activeProfile;
+      const session = source.snapshot.sessions.find((candidate) => candidate.id === task.sessionId);
+      if (!source.ready || source.connectionState !== "connected" || profile?.id !== task.profileId
+        || profile.serverId !== task.serverId
+        || source.snapshot.generation.toString(10) !== task.connectionGeneration
+        || source.snapshot.revision.toString(10) !== task.snapshotRevision
+        || session === undefined || session.archived
+        || session.generation.toString(10) !== task.sessionGeneration || session.targetId !== task.targetId) return false;
+      const owner = {
+        profileId: task.profileId,
+        serverId: profile.serverId,
+        connectionGeneration: source.snapshot.generation,
+        snapshotRevision: source.snapshot.revision,
+        sessionGeneration: session.generation,
+        targetId: session.targetId,
+        navigationRevision: source.navigationRevision ?? 0,
+        ownerDocument: document
+      };
+      const ownsTaskFence = (): boolean => {
+        const current = controllerRef.current.state;
+        const currentSession = current.snapshot.sessions.find((candidate) => candidate.id === task.sessionId);
+        const ownerWindow = owner.ownerDocument.defaultView;
+        return ownerWindow !== null && !ownerWindow.closed
+          && ownerWindow.top === ownerWindow
+          && !owner.ownerDocument.body.classList.contains("modal-open")
+          && owner.ownerDocument.body.dataset.appShortcutRecording !== "1"
+          && owner.ownerDocument.querySelector("[data-gamepad-preview], [data-dedicated-hardware-preview]") === null
+          && owner.ownerDocument.querySelector("[aria-modal='true'], [role='dialog'], [role='listbox'], [role='menu'], [role='combobox'][aria-expanded='true'], [data-morph-side]:not([inert])") === null
+          && !isStartupUpdateInteractionBlocked()
+          && current.ready && current.connectionState === "connected"
+          && current.activeProfile?.id === owner.profileId && current.activeProfile.serverId === owner.serverId
+          && current.snapshot.generation === owner.connectionGeneration
+          && current.snapshot.revision === owner.snapshotRevision
+          && currentSession?.generation === owner.sessionGeneration && currentSession.targetId === owner.targetId
+          && !currentSession.archived;
+      };
+      const ownsNavigation = (): boolean => ownsTaskFence()
+        && (controllerRef.current.state.navigationRevision ?? 0) === owner.navigationRevision;
+      void navigateFromApplicationMenu({ kind: "session", sessionId: task.sessionId }, ownsNavigation)
+        .then((navigated) => {
+          if (!navigated || !task.focusWindow || focusRequestId === null || !ownsTaskFence()) return;
+          void dedicatedHardwareBridge?.acknowledgeDedicatedHardwareTaskFocus({
+            version: 1,
+            focusRequestId,
+            task
+          }).catch(() => undefined);
+        })
+        .catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected"))));
+      return true;
+    },
+    fixedLink: (linkId) => {
+      const url = linkId === "product-feedback" ? JOKO_PRODUCT_FEEDBACK_URL : JOKO_DOCUMENTATION_URL;
+      runAction(`dedicated-hardware-link:${linkId}`, () => controller.openHttpLink(url, { forceExternal: true }));
+      return true;
+    }
   });
   useAppShortcut("toggle-sidebar", shortcutOverrides, (event) => {
     if (shortcutBlocked(event)) return false;

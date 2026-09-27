@@ -5,6 +5,7 @@ import {
 } from "./gamepad-input.js";
 import { isStartupUpdateInteractionBlocked } from "./startup-update-interaction.js";
 import { currentGamepadTaskRoot, dispatchGamepadOwnedAction, isGamepadInspectorAction, isGamepadOwnedAction } from "./gamepad-actions.js";
+import { dispatchAppInputFocusedCommand } from "./app-input-owners.js";
 
 export type GamepadClientStatus = "disabled" | "waiting" | "connected" | "unsupported" | "denied" | "error";
 export interface GamepadClientSnapshot {
@@ -168,11 +169,11 @@ export function createGamepadDomInput(doc: Document, action: (action: GamepadAct
     const focused = doc.activeElement;
     if (focused?.closest("[hidden], [inert], [aria-hidden='true']") !== null && focused !== null) return;
     if (effect.action === "back") {
-      focused?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+      dispatchAppInputFocusedCommand(doc, "back");
       return;
     }
     if (effect.action === "activate") {
-      if (focused instanceof HTMLElement && focused.matches("button:not(:disabled), [role='button']:not([aria-disabled='true'])")) focused.click();
+      dispatchAppInputFocusedCommand(doc, "activate");
       return;
     }
     if (doc.body.classList.contains("modal-open")) return;

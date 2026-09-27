@@ -5,11 +5,14 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController, AppRoute, ControllerState } from "./controller.js";
 import type { GamepadAction } from "./gamepad-input.js";
+import type { DedicatedHardwareRendererHandlers } from "./dedicated-hardware-app.js";
+import type { DedicatedHardwareBridge } from "./dedicated-hardware.js";
 import { DEFAULT_UI_PREFERENCES } from "./local-state.js";
-import { emptySnapshot } from "./model.js";
+import { emptySnapshot, type SessionView } from "./model.js";
 
 const gamepad = vi.hoisted(() => ({
   action: undefined as ((action: GamepadAction) => void) | undefined,
+  dedicated: undefined as DedicatedHardwareRendererHandlers | undefined,
   requestLeave: vi.fn()
 }));
 
@@ -23,15 +26,22 @@ vi.mock("./workspace-document-lifecycle.js", async (importOriginal) => ({
   requestWorkspaceDocumentLeave: gamepad.requestLeave
 }));
 
+vi.mock("./dedicated-hardware-app.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./dedicated-hardware-app.js")>(),
+  useDedicatedHardwareInput: (_bridge: unknown, handlers: DedicatedHardwareRendererHandlers) => { gamepad.dedicated = handlers; }
+}));
+
 import { AppWithController } from "./App.js";
 
 let root: Root | undefined;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.spyOn(document, "hasFocus").mockReturnValue(true);
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
   document.body.replaceChildren();
   document.body.className = "";
   gamepad.action = undefined;
+  gamepad.dedicated = undefined;
   gamepad.requestLeave.mockReset();
 });
 afterEach(async () => {
@@ -39,6 +49,7 @@ afterEach(async () => {
   root = undefined;
   document.body.replaceChildren();
   document.body.className = "";
+  Reflect.deleteProperty(window, "jokoDesktop");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -145,7 +156,79 @@ it("opens the fixed product feedback destination without a task or connection an
   expect(document.querySelector("[role='alert'] button")?.getAttribute("aria-label")).toBe("Dismiss");
 });
 
-function controller(route: AppRoute, connectionState: ControllerState["connectionState"] = "connected"): {
+it("revalidates every dedicated task fence and opens only frozen product links", async () => {
+  const task: SessionView = {
+    id: "task-two", backendId: "backend", targetId: "target-two", name: "Task two", state: "idle",
+    pinned: false, archived: false, generation: 3n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1
+  };
+  const view = controller({ kind: "settings" }, "connected", task);
+  const acknowledgeTaskFocus = vi.fn(async () => true);
+  const hardwareBridge: DedicatedHardwareBridge = {
+    getDedicatedHardwareState: vi.fn(async () => undefined),
+    setDedicatedHardwareSettings: vi.fn(async () => undefined),
+    resetDedicatedHardwareSettings: vi.fn(async () => undefined),
+    probeDedicatedHardware: vi.fn(async () => undefined),
+    recoverDedicatedHardwareKeymap: vi.fn(async () => undefined),
+    setDedicatedHardwarePreview: vi.fn(async () => undefined),
+    publishDedicatedHardwareTasks: vi.fn(async () => undefined),
+    acknowledgeDedicatedHardwareTaskFocus: acknowledgeTaskFocus
+  };
+  Object.defineProperty(window, "jokoDesktop", {
+    configurable: true,
+    value: {
+      capabilities: ["hardware.dedicatedInput"],
+      platform: "win32",
+      dedicatedHardware: hardwareBridge,
+      applicationMenu: {
+        configure: vi.fn(async () => undefined),
+        onCommand: vi.fn(() => () => undefined)
+      }
+    }
+  });
+  const host = document.createElement("div"); document.body.append(host);
+  root = createRoot(host);
+  await act(async () => root?.render(createElement(AppWithController, { controller: view.value })));
+  const action = {
+    kind: "task", profileId: "profile", serverId: "server", connectionGeneration: "11", snapshotRevision: "7",
+    sessionId: task.id, sessionGeneration: "3", targetId: task.targetId, focusWindow: false
+  } as const;
+  expect(gamepad.dedicated).toBeDefined();
+  expect(gamepad.dedicated!.task({ task: { ...action, connectionGeneration: "10" }, focusRequestId: null })).toBe(false);
+  expect(gamepad.dedicated!.task({ task: { ...action, snapshotRevision: "6" }, focusRequestId: null })).toBe(false);
+  expect(gamepad.dedicated!.task({ task: { ...action, sessionGeneration: "2" }, focusRequestId: null })).toBe(false);
+  expect(gamepad.dedicated!.task({ task: { ...action, targetId: "target-stale" }, focusRequestId: null })).toBe(false);
+  expect(gamepad.dedicated!.task({ task: { ...action, serverId: "server-stale" }, focusRequestId: null })).toBe(false);
+  expect(view.navigate).not.toHaveBeenCalled();
+  expect(acknowledgeTaskFocus).not.toHaveBeenCalled();
+
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+  expect(gamepad.dedicated!.task({ task: action, focusRequestId: null })).toBe(true);
+  await act(async () => { await Promise.resolve(); });
+  expect(view.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: task.id });
+  expect(acknowledgeTaskFocus).not.toHaveBeenCalled();
+  const focusTask = { ...action, focusWindow: true } as const;
+  expect(gamepad.dedicated!.task({ task: focusTask, focusRequestId: "1" })).toBe(true);
+  await act(async () => { await Promise.resolve(); });
+  expect(acknowledgeTaskFocus).toHaveBeenCalledExactlyOnceWith({
+    version: 1,
+    focusRequestId: "1",
+    task: focusTask
+  });
+
+  await act(async () => {
+    view.replaceRoute({ kind: "files", sessionId: task.id });
+    root?.render(createElement(AppWithController, { controller: view.value }));
+  });
+  gamepad.requestLeave.mockResolvedValueOnce(false);
+  expect(gamepad.dedicated!.task({ task: focusTask, focusRequestId: "2" })).toBe(true);
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  expect(acknowledgeTaskFocus).toHaveBeenCalledTimes(1);
+  expect(gamepad.dedicated!.fixedLink("documentation")).toBe(true);
+  await act(async () => { await Promise.resolve(); });
+  expect(view.openHttpLink).toHaveBeenCalledWith("https://github.com/JokoAgent/joko", { forceExternal: true });
+});
+
+function controller(route: AppRoute, connectionState: ControllerState["connectionState"] = "connected", task?: SessionView): {
   readonly value: AppController;
   readonly navigate: ReturnType<typeof vi.fn>;
   readonly openHttpLink: ReturnType<typeof vi.fn>;
@@ -163,7 +246,7 @@ function controller(route: AppRoute, connectionState: ControllerState["connectio
     discoveryState: "idle",
     managedOrchestratorStatus: undefined,
     automaticConnectionAvailable: true,
-    snapshot: { ...emptySnapshot(), generation: 11n },
+    snapshot: { ...emptySnapshot(), generation: 11n, revision: task === undefined ? 0n : 7n, sessions: task === undefined ? [] : [task] },
     route,
     navigationRevision: 0,
     preferences: DEFAULT_UI_PREFERENCES,

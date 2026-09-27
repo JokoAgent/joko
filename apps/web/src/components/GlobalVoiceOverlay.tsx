@@ -14,7 +14,7 @@ const ERROR_KEYS: Readonly<Record<Extract<JokoDesktopGlobalVoiceStatus, { readon
   insertion: "voice.global.errors.insertion"
 });
 
-export function GlobalVoiceOverlay({ initialStatus = { state: "starting" } }: { readonly initialStatus?: JokoDesktopGlobalVoiceStatus }): JSX.Element {
+export function GlobalVoiceOverlay({ initialStatus = { state: "idle", generation: "0" } }: { readonly initialStatus?: JokoDesktopGlobalVoiceStatus }): JSX.Element {
   const api = window.jokoVoiceOverlay;
   const [status, setStatus] = useState<JokoDesktopGlobalVoiceStatus>(initialStatus);
   const locale = overlayLocale();
@@ -28,7 +28,9 @@ export function GlobalVoiceOverlay({ initialStatus = { state: "starting" } }: { 
     let active = true;
     const unsubscribe = api.onStatus((value) => { if (active) setStatus(value); });
     void api.getStatus().then((value) => { if (active) setStatus(value); }).catch(() => {
-      if (active) setStatus({ state: "error", errorKind: "service" });
+      if (active) setStatus((current) => current.generation === "0"
+        ? current
+        : { state: "error", generation: current.generation, errorKind: "service" });
     });
     return () => {
       active = false;

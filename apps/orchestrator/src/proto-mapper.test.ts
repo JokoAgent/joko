@@ -441,6 +441,7 @@ describe("proto mapper", () => {
 
     const proto = toProtoSession(stored, {
       runtimeAttached: true,
+      lastUserInputAt: 18,
       derivationOriginAvailability: { sourceSessionAvailable: true, sourceMessageAvailable: true },
       contextState: { compacting: false, autoCompaction: true, autoRetry: false }
     });
@@ -467,6 +468,7 @@ describe("proto mapper", () => {
       },
       contextState: { compacting: false, autoCompaction: true, autoRetry: false }
     });
+    expect(proto.lastUserInputAt).toMatchObject({ seconds: 0n, nanos: 18_000_000 });
     expect(fromProtoSession(proto).binding).toEqual({
       opaqueRef: "opaque:pi:01JZZZ",
       generation: 7
