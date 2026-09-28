@@ -10,7 +10,10 @@ import {
   CapabilitySupport,
   BrowserAutomationTarget,
   BrowserSettingsSchema,
+  CreateWorkspaceEntryMutationSchema,
+  DeleteWorkspaceEntryMutationSchema,
   GitDiffSource,
+  MoveWorkspaceEntryMutationSchema,
   OperationMutationSchema,
   OpenBrowserPageMutationSchema,
   OperationState,
@@ -18,7 +21,9 @@ import {
   RestartBrowserMutationSchema,
   RevokeDeviceMutationSchema,
   WorkspaceEntryListingPolicy,
-  WorkspaceFileChangeKind
+  WorkspaceEntryCreateKind,
+  WorkspaceFileChangeKind,
+  workspaceEntryAbsentRevision
 } from "@joko/contracts";
 import {
   CODEX_LIKE_PROFILE,
@@ -46,7 +51,8 @@ const WORKSPACE_WATCH_PROFILE = {
   displayName: "Workspace Files Fake",
   capabilities: [
     ...PI_LIKE_PROFILE.capabilities,
-    { key: "workspace.files.watch", supported: true }
+    { key: "workspace.files.watch", supported: true },
+    { key: "workspace.files.write", supported: true }
   ]
 } satisfies FakeAdapterProfile;
 
@@ -458,6 +464,204 @@ describe("workspace, artifact, and capability boundaries", () => {
     watchAbort.abort();
     await watchIterator.return?.().catch(() => undefined);
   });
+
+  it("keeps one authenticated workspace's file index, watch, CRUD, search, Blob, and reconnect in one chain", async () => {
+    fixture = await OrchestratorE2eFixture.start({ profiles: [WORKSPACE_WATCH_PROFILE] });
+    const paired = await fixture.pair("Workspace Files owner");
+    const workspaceId = "workspace-main";
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId: WORKSPACE_WATCH_PROFILE.id, targetId: fixture.targetId() })));
+    const owner = (await paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
+    const targetId = owner.sessions.find((session) => session.sessionId === sessionId)?.targetId;
+    expect(owner.targets.find((target) => target.targetId === targetId)?.workspaceId).toBe(workspaceId);
+    const initialIndex = await paired.clients.workspace.listWorkspaceFiles({ workspaceId });
+    expect(initialIndex.relativePaths).toContain("README.md");
+    expect(initialIndex.revision?.etag).not.toBe("");
+
+    const watchAbort = new AbortController();
+    const watcher = paired.clients.workspace.watchWorkspaceFileChanges({
+      scope: { kind: { case: "workspace", value: { workspaceId } } }
+    }, { signal: watchAbort.signal })[Symbol.asyncIterator]();
+    try {
+      expect((await nextWithin(watcher, "initial Files resync")).value.change?.kind).toBe(WorkspaceFileChangeKind.RESYNC);
+      const createDirectory = create(OperationMutationSchema, { payload: {
+        case: "createWorkspaceEntry", value: create(CreateWorkspaceEntryMutationSchema, {
+          workspaceId, relativePath: "notes", kind: WorkspaceEntryCreateKind.DIRECTORY,
+          expectedRevision: workspaceEntryAbsentRevision
+        })
+      } });
+      expect((await submit(paired.clients.operation, paired.connectionId, createDirectory)).state).toBe(OperationState.SUCCEEDED);
+      await nextWorkspacePath(watcher, "notes");
+      const createFile = create(OperationMutationSchema, { payload: {
+        case: "createWorkspaceEntry", value: create(CreateWorkspaceEntryMutationSchema, {
+          workspaceId, relativePath: "notes/checklist.txt", kind: WorkspaceEntryCreateKind.FILE,
+          expectedRevision: workspaceEntryAbsentRevision
+        })
+      } });
+      const createId = randomUUID();
+      expect((await submit(paired.clients.operation, paired.connectionId, createFile, createId)).state).toBe(OperationState.SUCCEEDED);
+      expect((await submit(paired.clients.operation, paired.connectionId, createFile, createId)).state).toBe(OperationState.SUCCEEDED);
+      expect(fixture.application.store.getOperation(createId).status).toBe("completed");
+      await nextWorkspacePath(watcher, "notes/checklist.txt");
+      const listed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
+      const file = listed.entries.find((entry) => entry.relativePath === "notes/checklist.txt");
+      expect(file?.revision?.opaqueRevision).not.toBe("");
+      const emptyPreview = await paired.clients.workspace.readWorkspaceFile({ workspaceId, relativePath: file!.relativePath });
+      const initialRevision = emptyPreview.preview!.entry!.revision!;
+      const contents = "joko-files-chain-marker\n";
+      const saved = await paired.clients.workspace.writeWorkspaceTextFile({
+        workspaceId, relativePath: file!.relativePath, utf8Text: contents, expectedRevision: initialRevision
+      });
+      expect(saved.newRevision?.opaqueRevision).not.toBe(initialRevision.opaqueRevision);
+      expect(saved.entry?.relativePath).toBe(file!.relativePath);
+      await nextWorkspacePath(watcher, file!.relativePath);
+      await expect(paired.clients.workspace.writeWorkspaceTextFile({
+        workspaceId, relativePath: file!.relativePath, utf8Text: "stale overwrite\n", expectedRevision: initialRevision
+      })).rejects.toMatchObject({ code: Code.Aborted });
+      const current = await paired.clients.workspace.readWorkspaceFile({
+        workspaceId, relativePath: file!.relativePath, expectedRevision: saved.newRevision
+      });
+      expect(current.preview?.content).toMatchObject({ case: "text", value: { utf8Text: contents } });
+      const index = await paired.clients.workspace.listWorkspaceFiles({ workspaceId });
+      expect(index.relativePaths).toContain(file!.relativePath);
+      expect(index.revision?.etag).not.toBe(initialIndex.revision?.etag);
+      const searchPage = await paired.clients.workspace.searchWorkspace({
+        workspaceId, query: "joko-files-chain-marker", page: { pageSize: 1 }
+      });
+      expect(searchPage.matches.map((match) => match.relativePath)).toEqual([file!.relativePath]);
+
+      const originalSearch = fixture.application.workspaces.searchStream.bind(fixture.application.workspaces);
+      let searchSignal: AbortSignal | undefined;
+      const searchSpy = vi.spyOn(fixture.application.workspaces, "searchStream").mockImplementation((...args) => {
+        searchSignal = args[3];
+        return (async function* () {
+          for await (const event of originalSearch(...args)) {
+            yield event;
+            if (event.kind === "match") {
+              await new Promise<void>((resolve) => {
+                if (searchSignal?.aborted) resolve();
+                else searchSignal?.addEventListener("abort", () => resolve(), { once: true });
+              });
+            }
+          }
+        })();
+      });
+      const searchAbort = new AbortController();
+      const streamed = paired.clients.workspace.streamWorkspaceSearch({
+        workspaceId, query: "joko-files-chain-marker"
+      }, { signal: searchAbort.signal })[Symbol.asyncIterator]();
+      try {
+        expect((await nextWithin(streamed, "first streamed file hit")).value.event.case).toBe("match");
+        searchAbort.abort();
+        await waitFor(async () => searchSignal?.aborted === true, (value) => value, "search cancellation at Workspace owner");
+        const afterCancel = await nextWithin(streamed, "cancelled file search").then(
+          (result) => result.done ? "done" : result.value.event.case,
+          (error: unknown) => {
+            if (error instanceof ConnectError && error.code === Code.Canceled) return "cancelled";
+            throw error;
+          }
+        );
+        expect(["done", "cancelled"]).toContain(afterCancel);
+      } finally {
+        searchAbort.abort();
+        await streamed.return?.().catch(() => undefined);
+        searchSpy.mockRestore();
+      }
+
+      const complete = await paired.clients.workspace.readWorkspaceFile({
+        workspaceId, relativePath: file!.relativePath, expectedRevision: saved.newRevision,
+        maximumBytes: 1024n, requireBlob: true
+      });
+      expect(complete.preview?.content.case).toBe("blob");
+      if (complete.preview?.content.case !== "blob") throw new Error("Workspace Blob materialization was unavailable.");
+      const blob = complete.preview.content.value;
+      const ticket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: blob.blobId });
+      const downloadUrl = `${fixture.baseUrl}${ticket.ticket!.relativeEndpoint}`;
+      const download = await fetch(downloadUrl, { headers: { authorization: `Bearer ${paired.authKey}` } });
+      expect(download.status).toBe(200);
+      expect(await download.text()).toBe(contents);
+      expect((await fetch(downloadUrl, { headers: { authorization: `Bearer ${paired.authKey}` } })).ok).toBe(false);
+
+      const imagePath = "notes/pixel.png";
+      const imageBytes = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=",
+        "base64"
+      );
+      await writeFile(join(fixture.workspaceDirectory, imagePath), imageBytes);
+      await nextWorkspacePath(watcher, imagePath);
+      const imageListing = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
+      const imageRevision = imageListing.entries.find((entry) => entry.relativePath === imagePath)!.revision;
+      const imagePreview = await paired.clients.workspace.readWorkspaceFile({
+        workspaceId, relativePath: imagePath, expectedRevision: imageRevision, maximumBytes: 1024n
+      });
+      expect(imagePreview.preview?.content.case).toBe("image");
+      if (imagePreview.preview?.content.case !== "image" || imagePreview.preview.content.value.blob === undefined) {
+        throw new Error("The same workspace did not expose a canonical image Blob.");
+      }
+      const imageBlob = imagePreview.preview.content.value.blob;
+      expect(imageBlob).toMatchObject({ mediaType: "image/png", sha256Hex: sha256(imageBytes) });
+      const imageTicket = await paired.clients.artifact.getBlobDownloadTicket({ blobId: imageBlob.blobId });
+      const imageDownload = await fetch(`${fixture.baseUrl}${imageTicket.ticket!.relativeEndpoint}`, {
+        headers: { authorization: `Bearer ${paired.authKey}` }
+      });
+      expect(imageDownload.status).toBe(200);
+      expect(Buffer.from(await imageDownload.arrayBuffer())).toEqual(imageBytes);
+
+      const freshListing = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
+      const metadataRevision = freshListing.entries.find((entry) => entry.relativePath === file!.relativePath)!.revision!.opaqueRevision;
+      const move = create(OperationMutationSchema, { payload: {
+        case: "moveWorkspaceEntry", value: create(MoveWorkspaceEntryMutationSchema, {
+          workspaceId, sourceRelativePath: file!.relativePath, destinationRelativePath: "notes/moved.txt",
+          expectedRevision: metadataRevision
+        })
+      } });
+      expect((await submit(paired.clients.operation, paired.connectionId, move)).state).toBe(OperationState.SUCCEEDED);
+      await nextWorkspacePath(watcher, "notes/moved.txt");
+      await expect(paired.clients.workspace.readWorkspaceFile({
+        workspaceId, relativePath: "notes/moved.txt", expectedRevision: initialRevision
+      })).rejects.toMatchObject({ code: Code.Aborted });
+      const movedListing = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
+      const movedRevision = movedListing.entries.find((entry) => entry.relativePath === "notes/moved.txt")!.revision!.opaqueRevision;
+      const deleteFile = (expectedRevision: string) => create(OperationMutationSchema, { payload: {
+        case: "deleteWorkspaceEntry", value: create(DeleteWorkspaceEntryMutationSchema, {
+          workspaceId, relativePath: "notes/moved.txt", expectedRevision, confirmRecursive: false
+        })
+      } });
+      const staleDelete = await submit(paired.clients.operation, paired.connectionId, deleteFile(metadataRevision));
+      expect(staleDelete.state).toBe(OperationState.FAILED);
+      expect(staleDelete.error?.code).toBe("WORKSPACE_ENTRY_STALE");
+      expect((await submit(paired.clients.operation, paired.connectionId, deleteFile(movedRevision))).state).toBe(OperationState.SUCCEEDED);
+      await nextWorkspacePath(watcher, "notes/moved.txt");
+      const directory = (await paired.clients.workspace.listWorkspaceEntries({ workspaceId })).entries
+        .find((entry) => entry.relativePath === "notes")!;
+      const deleteDirectory = (confirmRecursive: boolean) => create(OperationMutationSchema, { payload: {
+        case: "deleteWorkspaceEntry", value: create(DeleteWorkspaceEntryMutationSchema, {
+          workspaceId, relativePath: "notes", expectedRevision: directory.revision!.opaqueRevision,
+          confirmRecursive
+        })
+      } });
+      const unsafeDelete = await submit(paired.clients.operation, paired.connectionId, deleteDirectory(false));
+      expect(unsafeDelete.state).toBe(OperationState.FAILED);
+      expect(unsafeDelete.error?.code).toBe("WORKSPACE_ENTRY_UNSAFE");
+      expect((await submit(paired.clients.operation, paired.connectionId, deleteDirectory(true))).state).toBe(OperationState.SUCCEEDED);
+      await nextWorkspacePath(watcher, "notes");
+      const reconnected = fixture.clients(paired.authKey);
+      expect((await reconnected.workspace.listWorkspaceFiles({ workspaceId })).relativePaths).not.toContain("notes/moved.txt");
+      expect((await reconnected.workspace.listWorkspaceFiles({ workspaceId })).relativePaths).not.toContain(imagePath);
+      const resumed = reconnected.workspace.watchWorkspaceFileChanges({
+        scope: { kind: { case: "workspace", value: { workspaceId } } }
+      }, { signal: watchAbort.signal })[Symbol.asyncIterator]();
+      try {
+        expect((await nextWithin(resumed, "reconnected Files resync")).value.change?.kind).toBe(WorkspaceFileChangeKind.RESYNC);
+      } finally { await resumed.return?.().catch(() => undefined); }
+      await expect(reconnected.workspace.readWorkspaceFile({
+        workspaceId, relativePath: "../data/orchestrator.db"
+      })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    } finally {
+      watchAbort.abort();
+      await watcher.return?.().catch(() => undefined);
+    }
+  }, 40_000);
 
   it("projects three opposite fake capability profiles and fails closed when Browser is absent", async () => {
     fixture = await OrchestratorE2eFixture.start({ profiles: [PI_LIKE_PROFILE, CODEX_LIKE_PROFILE, MINIMAL_PROFILE] });
