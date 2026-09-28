@@ -4,11 +4,19 @@ import { describe, expect, it, vi } from "vitest";
 import type { AppController } from "./controller.js";
 import type { InteractionView, SessionView, TimelineItemView } from "./model.js";
 import {
+  nativeTaskStatusProjectionOwner,
   projectNativeTaskStatusSnapshot,
   resolveNativeTaskStatusPermissionAction
 } from "./native-task-status-bridge.js";
 
 describe("native task-status Web projection", () => {
+  it("separates Profile and connection generations before comparing snapshot revisions", () => {
+    const first = nativeTaskStatusProjectionOwner({ id: "profile-one", serverId: "node" }, 3n);
+    expect(nativeTaskStatusProjectionOwner({ id: "profile-two", serverId: "node" }, 3n)).not.toBe(first);
+    expect(nativeTaskStatusProjectionOwner({ id: "profile-one", serverId: "node" }, 4n)).not.toBe(first);
+    expect(nativeTaskStatusProjectionOwner({ id: "profile-one", serverId: "other-node" }, 3n)).not.toBe(first);
+  });
+
   it("covers concurrent running, pending-interaction, completed, and error tasks", () => {
     const running = session("running", "running", 2n, 20);
     const permissionSession = session("permission", "waiting", 7n, 30);

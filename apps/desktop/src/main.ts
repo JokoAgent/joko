@@ -1365,6 +1365,7 @@ function createWindow(): void {
         if (rendered !== true) {
           throw new Error("The packaged product renderer did not return its exact ready marker.");
         }
+        if (nativeTaskStatusSupported) await verifyPackagedSmokeNativeTaskStatus(window);
         if (packagedSmokeScope === "full") {
           await verifyPackagedSmokeRuntimeProcessMonitor(window);
           if (process.platform === "win32" || process.platform === "darwin") await verifyPackagedSmokeFullscreen(window);
@@ -1394,6 +1395,62 @@ function createWindow(): void {
   } else {
     beginMainUiLoadRecovery();
   }
+}
+
+async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promise<void> {
+  if (owner.isDestroyed() || owner.webContents.isDestroyed()) {
+    throw new Error("Packaged smoke owner retired before native Task Status verification.");
+  }
+  const ready = await owner.webContents.executeJavaScript(`(async () => {
+    const bridge = window.jokoDesktop?.nativeTaskStatus;
+    if (!window.jokoDesktop?.capabilities.includes("native.taskStatus") || !bridge) return false;
+    const settings = await bridge.getSettings();
+    await bridge.setSettings({ ...settings, enabled: true });
+    await bridge.publish({ ownerId: "desktop-smoke-task-status", revision: "1", locale: "en", sessions: [] });
+    return true;
+  })()`, true) as unknown;
+  if (ready !== true) throw new Error("Native Task Status bridge was unavailable in the product renderer.");
+  const deadline = Date.now() + 5_000;
+  let ambient: BrowserWindow | undefined;
+  while (Date.now() < deadline) {
+    ambient = BrowserWindow.getAllWindows().find((candidate) => candidate.getTitle() === "Joko task status");
+    if (ambient !== undefined && !ambient.isDestroyed() && ambient.isVisible()) break;
+    await waitForPackagedSmokePoll();
+  }
+  if (ambient === undefined || ambient.isDestroyed() || !ambient.isVisible()) {
+    throw new Error("Native Task Status did not create a visible ambient window.");
+  }
+  const idleShape = await ambient.webContents.executeJavaScript(`({
+    idle: Boolean(document.querySelector('.compact-row--idle')),
+    compact: Boolean(document.querySelector('.compact-row')),
+    expanded: Boolean(document.querySelector('.expanded-shell')),
+    ready: document.readyState
+  })`, true) as { readonly idle: boolean; readonly compact: boolean; readonly expanded: boolean; readonly ready: string };
+  const compactHeight = ambient.getBounds().height;
+  if (!idleShape.idle || compactHeight > 64) {
+    throw new Error(`Native Task Status did not render its idle compact state (${JSON.stringify({
+      ...idleShape, height: compactHeight
+    })}).`);
+  }
+  const focusedBefore = BrowserWindow.getFocusedWindow();
+  const expansionDeadline = Date.now() + 5_000;
+  await ambient.webContents.executeJavaScript(
+    "document.querySelector('a[href=\"joko-task-status://toggle\"]')?.click(); true", true
+  );
+  while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
+    await waitForPackagedSmokePoll();
+  }
+  if (ambient.isDestroyed() || ambient.getBounds().height <= compactHeight ||
+    BrowserWindow.getFocusedWindow() !== focusedBefore) {
+    throw new Error("Native Task Status did not expand without changing application focus.");
+  }
+  await owner.webContents.executeJavaScript(`(async () => {
+    const bridge = window.jokoDesktop.nativeTaskStatus;
+    const settings = await bridge.getSettings();
+    await bridge.setSettings({ ...settings, enabled: false });
+  })()`, true);
+  if (!ambient.isDestroyed()) throw new Error("Native Task Status did not retire after opt-out.");
+  recordPackagedSmokeProgress("native_task_status_preview_verified");
 }
 
 function safeSmokeError(error: unknown): string {

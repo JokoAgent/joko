@@ -26,6 +26,9 @@ const MINIMUM_TASK_STATUS_WIDTH = 280;
 const MAXIMUM_TASK_STATUS_WIDTH = 920;
 const TASK_STATUS_SCREEN_EDGE_GUTTER = 12;
 const TASK_STATUS_POINTER_POLL_MS = 50;
+const TASK_STATUS_WINDOW_RECOVERY_MIN_MS = 250;
+const TASK_STATUS_WINDOW_RECOVERY_MAX_MS = 30_000;
+const TASK_STATUS_WINDOW_RECOVERY_RESET_MS = 60_000;
 export const NATIVE_TASK_STATUS_HOVER_INTENT_MS = 500;
 export const NATIVE_TASK_STATUS_POINTER_LEAVE_GRACE_MS = 150;
 export const NATIVE_TASK_STATUS_HOVER_COOLDOWN_MS = 300;
@@ -104,6 +107,7 @@ interface HostedWindow {
   displayIndex: number;
   bounds: NativeTaskStatusWindowBounds;
   renderToken: number;
+  retiring: boolean;
 }
 
 export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOptions): MacNativeTaskStatusHost {
@@ -126,6 +130,9 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
   let compactTimer: unknown;
   let compactTimerAt: number | undefined;
   let compactTimerArmed = false;
+  let recoveryTimer: unknown;
+  let recoveryTimerAt: number | undefined;
+  let recoveryTimerArmed = false;
   let applicationFocused = false;
   let pointerTimer: unknown;
   let pointerTimerArmed = false;
@@ -138,7 +145,10 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
   let layoutPreferences = Object.freeze([
     ...(options.getLayoutPreferences?.() ?? [])
   ]) as readonly DesktopNativeTaskStatusLayoutPreference[];
+  let layoutWriteGeneration = 0;
   const hosted = new Map<number, HostedWindow>();
+  const recoveryAtByDisplay = new Map<number, number>();
+  const recentWindowFailures = new Map<number, { readonly at: number; readonly count: number }>();
   const soundCooldownUntil = new Map<DesktopNativeTaskStatusSoundEvent, number>();
   const terminalRevealUntil = new Map<string, number>();
   const terminalObservedAt = new Map<string, number>();
@@ -183,6 +193,32 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     compactTimer = undefined;
     compactTimerAt = undefined;
     compactTimerArmed = false;
+  };
+
+  const cancelRecoveryTimer = (): void => {
+    if (!recoveryTimerArmed) return;
+    clearTimer(recoveryTimer);
+    recoveryTimer = undefined;
+    recoveryTimerAt = undefined;
+    recoveryTimerArmed = false;
+  };
+
+  const syncRecoveryTimer = (): void => {
+    const deadline = Math.min(...recoveryAtByDisplay.values());
+    if (!Number.isFinite(deadline) || disposed || settings?.enabled !== true) {
+      cancelRecoveryTimer();
+      return;
+    }
+    if (recoveryTimerArmed && recoveryTimerAt === deadline) return;
+    cancelRecoveryTimer();
+    recoveryTimerAt = deadline;
+    recoveryTimerArmed = true;
+    recoveryTimer = setTimer(() => {
+      recoveryTimer = undefined;
+      recoveryTimerAt = undefined;
+      recoveryTimerArmed = false;
+      render();
+    }, Math.max(0, deadline - now()));
   };
 
   const currentSurface = (startDwell = false): {
@@ -457,7 +493,11 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
 
   const destroyWindows = (): void => {
     cancelPointerTimer();
+    cancelRecoveryTimer();
+    recoveryAtByDisplay.clear();
+    recentWindowFailures.clear();
     for (const entry of hosted.values()) {
+      entry.retiring = true;
       if (!entry.window.isDestroyed()) entry.window.destroy();
     }
     hosted.clear();
@@ -554,11 +594,27 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       settings.layout,
       existing
     );
+    const previousPreferences = layoutPreferences;
     layoutPreferences = Object.freeze(existing === undefined
       ? [...layoutPreferences, preference]
       : layoutPreferences.map((candidate) => candidate === existing ? preference : candidate));
     if (options.onLayoutPreference !== undefined) {
-      void Promise.resolve(options.onLayoutPreference(preference)).catch(() => undefined);
+      const generation = ++layoutWriteGeneration;
+      const restore = (): void => {
+        if (disposed || generation !== layoutWriteGeneration) return;
+        layoutPreferences = Object.freeze([...(options.getLayoutPreferences?.() ?? previousPreferences)]);
+        render();
+      };
+      try {
+        const write = options.onLayoutPreference(preference);
+        void Promise.resolve(write).then(() => {
+          if (disposed || generation !== layoutWriteGeneration) return;
+          layoutPreferences = Object.freeze([...(options.getLayoutPreferences?.() ?? layoutPreferences)]);
+          render();
+        }).catch(restore);
+      } catch {
+        restore();
+      }
     }
   };
 
@@ -586,12 +642,19 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       return;
     }
     const selectedIds = new Set(displays.map((display) => display.id));
+    for (const displayId of recoveryAtByDisplay.keys()) {
+      if (!selectedIds.has(displayId)) recoveryAtByDisplay.delete(displayId);
+    }
     for (const [displayId, entry] of hosted) {
       if (selectedIds.has(displayId)) continue;
+      entry.retiring = true;
       if (!entry.window.isDestroyed()) entry.window.destroy();
       hosted.delete(displayId);
     }
     for (const display of displays) {
+      const recoveryAt = recoveryAtByDisplay.get(display.id);
+      if (recoveryAt !== undefined && recoveryAt > now()) continue;
+      recoveryAtByDisplay.delete(display.id);
       const displaySurface = surfaceForDisplay(surface, manualExpandedDisplayId, display.id);
       if (displaySurface === undefined) continue;
       const document = renderNativeTaskStatusDocument(displaySurface, settings, snapshot.locale);
@@ -606,14 +669,26 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       let entry = hosted.get(display.id);
       if (entry === undefined || entry.window.isDestroyed()) {
         const window = options.createWindow(bounds);
-        entry = { displayId: display.id, display, displayIndex, window, bounds, renderToken: 0 };
+        entry = { displayId: display.id, display, displayIndex, window, bounds, renderToken: 0, retiring: false };
         hosted.set(display.id, entry);
         window.onWillNavigate((url) => handleNavigation(display.id, url));
         const target = entry;
         window.onBoundsChanged((next) => handleWindowBoundsChanged(target, next));
         window.denyNewWindows();
         window.onClosed(() => {
-          if (hosted.get(display.id)?.window === window) hosted.delete(display.id);
+          if (hosted.get(display.id)?.window !== window) return;
+          hosted.delete(display.id);
+          if (target.retiring || disposed || settings?.enabled !== true) return;
+          const at = now();
+          const previous = recentWindowFailures.get(display.id);
+          const count = previous !== undefined && at - previous.at < TASK_STATUS_WINDOW_RECOVERY_RESET_MS
+            ? Math.min(previous.count + 1, 8) : 1;
+          recentWindowFailures.set(display.id, { at, count });
+          recoveryAtByDisplay.set(display.id, at + Math.min(
+            TASK_STATUS_WINDOW_RECOVERY_MAX_MS,
+            TASK_STATUS_WINDOW_RECOVERY_MIN_MS * 2 ** (count - 1)
+          ));
+          syncRecoveryTimer();
         });
       } else {
         entry.display = display;
@@ -627,9 +702,15 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       void entry.window.loadDocument(dataUrl).then(() => {
         if (!disposed && hosted.get(display.id) === target && target.renderToken === renderToken &&
           !target.window.isDestroyed()) target.window.showInactive();
-      }).catch(() => undefined);
+      }).catch(() => {
+        if (!disposed && hosted.get(display.id) === target && target.renderToken === renderToken &&
+          !target.window.isDestroyed()) {
+          target.window.destroy();
+        }
+      });
     }
     syncPointerTimer();
+    syncRecoveryTimer();
   };
 
   return Object.freeze({
@@ -682,6 +763,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       cancelTerminalTimer();
       cancelSmartTimer();
       cancelCompactTimer();
+      cancelRecoveryTimer();
       destroyWindows();
     }
   });

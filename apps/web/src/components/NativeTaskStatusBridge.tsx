@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { JSX } from "react";
 import type { AppController } from "../controller.js";
-import { projectNativeTaskStatusSnapshot, resolveNativeTaskStatusPermissionAction } from "../native-task-status-bridge.js";
+import { nativeTaskStatusProjectionOwner, projectNativeTaskStatusSnapshot, resolveNativeTaskStatusPermissionAction } from "../native-task-status-bridge.js";
 
 export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSessionIds }: {
   readonly controller: AppController;
@@ -12,7 +12,10 @@ export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSess
   controllerRef.current = controller;
   const desktop = typeof window === "undefined" ? undefined : window.jokoDesktop;
   const supported = desktop?.capabilities.includes("native.taskStatus") === true;
-  const ownerId = controller.state.activeProfile?.serverId;
+  const ownerId = controller.state.activeProfile === undefined ? undefined : nativeTaskStatusProjectionOwner(
+    controller.state.activeProfile,
+    controller.state.snapshot.generation
+  );
 
   useEffect(() => {
     if (!supported || desktop === undefined) return;
