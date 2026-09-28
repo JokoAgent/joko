@@ -3613,6 +3613,14 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .task-import-row.is-success em { color: var(--green); }
 .task-import-footer { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 14px; flex: 0 0 auto; border-top: 1px solid var(--line); padding: 9px 14px; }
 .task-import-footer p { margin: 0; color: var(--text-soft); font-size: var(--text-11); }
+.native-catalog-recovery { margin: 12px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-raised); padding: 12px; }
+.native-catalog-recovery > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.native-catalog-recovery > header strong { font-size: var(--text-12); }
+.native-catalog-recovery__item { display: flex; align-items: flex-start; gap: 10px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; }
+.native-catalog-recovery__item > svg { width: 17px; height: 17px; flex: 0 0 auto; color: var(--text-soft); }
+.native-catalog-recovery__item > div { min-width: 0; }
+.native-catalog-recovery__item strong { display: block; overflow-wrap: anywhere; font-size: var(--text-12); }
+.native-catalog-recovery__item p { margin: 4px 0 8px; color: var(--text-soft); font-size: var(--text-11); }
 .policy-card header { display: flex; align-items: center; }.policy-card header > svg { flex: 1; color: var(--text-soft); }.policy-card h3 { margin: 14px 0 5px; }.policy-card p { margin: 0; color: var(--text-soft); font-size: var(--text-11); line-height: 1.48; }.policy-card--accent { border-color: color-mix(in srgb, var(--accent) 26%, var(--line)); }.policy-card--danger { border-color: color-mix(in srgb, var(--red) 30%, var(--line)); }.policy-grid + .security-callout { margin-top: 14px; }
 .diagnostics-summary { display: flex; margin-top: 14px; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: var(--surface-raised); }.diagnostics-summary > svg { color: var(--blue); }.diagnostics-summary > div { flex: 1; }.diagnostics-summary h3 { margin: 0; }.diagnostics-summary p { margin: 3px 0 0; color: var(--text-faint); font-family: var(--app-font-code, var(--app-font-code-default)); font-size: 9px; }.diagnostic-list { display: grid; gap: 8px; margin-top: 12px; }.diagnostic-list article { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--line); border-radius: 10px; padding: 11px; background: var(--surface-raised); }.diagnostic-list p { margin: 3px 0; color: var(--text-soft); }.diagnostic-list small { color: var(--text-faint); }
 

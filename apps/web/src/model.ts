@@ -4913,6 +4913,22 @@ export interface NativeSessionCatalogView {
   readonly snapshotToken: string;
 }
 
+export interface NativeCatalogAdoptionView {
+  readonly operationId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly title: string;
+  readonly state: "pending" | "adopted" | "absent";
+  readonly revision: bigint;
+  readonly updatedAt: number;
+  readonly sessionId?: string;
+}
+
+export interface NativeCatalogAdoptionResolutionView {
+  readonly adoption: NativeCatalogAdoptionView;
+  readonly inspection: "present" | "absent" | "unknown";
+}
+
 export interface NewSessionDraft {
   readonly targetId: string;
   /** Exact Target revision whose workspace was prepared for this creation. */
@@ -5574,6 +5590,8 @@ export interface OperationApi {
     backendId: string,
     options?: { readonly signal?: AbortSignal; readonly force?: boolean }
   ): Promise<NativeSessionCatalogView>;
+  listNativeCatalogAdoptions(signal?: AbortSignal): Promise<readonly NativeCatalogAdoptionView[]>;
+  reconcileNativeCatalogAdoption(operationId: string): Promise<NativeCatalogAdoptionResolutionView>;
   createTarget(draft: TargetDraft): Promise<string>;
   createRemoteTarget(draft: RemoteTargetDraft): Promise<string>;
   createDevicePeerTarget(draft: DevicePeerTargetDraft): Promise<string>;

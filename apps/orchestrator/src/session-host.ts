@@ -53,6 +53,7 @@ import {
   AuthorizationError,
   InvalidStateTransitionError,
   OperationConflictError,
+  OperationInProgressError,
   OperationPreviouslyFailedError,
   RevisionConflictError,
   StoreError,
@@ -66,6 +67,7 @@ import type {
   NativeSessionDerivationRecord,
   OperationExecution,
   OperationalStore,
+  NativeCatalogAdoptionRecord,
   PendingContextRebuild,
   PersistedEvent,
   PortableReplacementCleanupRecord,
@@ -438,6 +440,8 @@ interface PortableImportActivationRecord {
 
 export interface CreateSessionInput {
   readonly operationId: string;
+  /** The authenticated product request whose effect is this exact creation. */
+  readonly requestOperationId?: string;
   readonly connection: ConnectionRecord;
   readonly targetId: string;
   readonly title: string;
@@ -603,6 +607,22 @@ export interface PortableReplacementCleanupStatus {
 
 export interface PortableReplacementCleanupResolution {
   readonly cleanup: PortableReplacementCleanupStatus;
+  readonly inspection: "present" | "absent" | "unknown";
+}
+
+export interface NativeCatalogAdoptionStatus {
+  readonly operationId: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly title: string;
+  readonly state: "pending" | "adopted" | "absent";
+  readonly revision: bigint;
+  readonly updatedAt: number;
+  readonly sessionId?: string;
+}
+
+export interface NativeCatalogAdoptionResolution {
+  readonly adoption: NativeCatalogAdoptionStatus;
   readonly inspection: "present" | "absent" | "unknown";
 }
 
@@ -801,6 +821,7 @@ export class SessionHost {
   readonly #portableReplacementFences = new Map<string, symbol>();
   readonly #portableImportDrafts = new Map<string, PortableImportDraft>();
   readonly #nativeBindingLocks = new Map<string, Promise<void>>();
+  readonly #nativeCatalogAdoptionFlights = new Set<string>();
   readonly #turnOverrideLeases = new Map<string, TurnOverrideLease>();
   readonly #sessionRuntimeControl = new SessionRuntimeControlRegistry();
   readonly #sessionRuntimeControlTails = new Map<string, Promise<void>>();
@@ -6652,6 +6673,120 @@ export class SessionHost {
     return this.resolvePortableReplacementCleanupForUser(input);
   }
 
+  listNativeCatalogAdoptionsForUser(input: {
+    readonly connection: ConnectionRecord;
+    readonly limit: number;
+    readonly offset: number;
+  }): { readonly adoptions: readonly NativeCatalogAdoptionStatus[]; readonly total: number } {
+    this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    return {
+      adoptions: this.#store.listPendingNativeCatalogAdoptions(input.connection.id, input.limit, input.offset)
+        .map(nativeCatalogAdoptionStatus),
+      total: this.#store.countPendingNativeCatalogAdoptions(input.connection.id)
+    };
+  }
+
+  getNativeCatalogAdoptionForUser(input: {
+    readonly connection: ConnectionRecord;
+    readonly operationId: string;
+  }): NativeCatalogAdoptionStatus {
+    this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    const adoption = this.#store.findNativeCatalogAdoptionForRequest(input.operationId)
+      ?? this.#store.getNativeCatalogAdoption(input.operationId);
+    if (this.#store.getOperation(adoption.operationId).connectionId !== input.connection.id) {
+      throw new AuthorizationError("Native catalog adoption belongs to another connection.");
+    }
+    return nativeCatalogAdoptionStatus(adoption);
+  }
+
+  async reconcileNativeCatalogAdoptionForUser(input: {
+    readonly connection: ConnectionRecord;
+    readonly operationId: string;
+  }): Promise<NativeCatalogAdoptionResolution> {
+    this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+    const original = this.#store.findNativeCatalogAdoptionForRequest(input.operationId)
+      ?? this.#store.getNativeCatalogAdoption(input.operationId);
+    const operation = this.#store.getOperation(original.operationId);
+    if (operation.connectionId !== input.connection.id) {
+      throw new AuthorizationError("Native catalog adoption belongs to another connection.");
+    }
+    if (original.state === "adopted" || original.state === "absent"
+      || this.#nativeCatalogAdoptionFlights.has(original.operationId)) {
+      return { adoption: nativeCatalogAdoptionStatus(original), inspection: "unknown" };
+    }
+    return this.withNativeBindingLock(original.backendId, original.binding.opaqueRef, async () => {
+      const current = this.#store.getNativeCatalogAdoption(original.operationId);
+      if ((current.state !== "claimed" && current.state !== "unknown")
+        || this.#nativeCatalogAdoptionFlights.has(current.operationId)) {
+        return { adoption: nativeCatalogAdoptionStatus(current), inspection: "unknown" };
+      }
+      let inspection: "present" | "absent" | "unknown" = "unknown";
+      let releaseAdmission: (() => void) | undefined;
+      try {
+        const adapter = this.requireAdapter(current.backendId);
+        const generation = this.requireAdapterGeneration(current.backendId, adapter);
+        const request = current.requestOperationId === undefined
+          ? undefined : this.#store.getOperation(current.requestOperationId);
+        if (generation !== current.backendGeneration
+          || this.#store.getTarget(current.targetId).revision !== current.targetRevision
+          || (current.projectId !== undefined
+            && this.#store.getTarget(current.projectId).revision !== current.projectRevision)
+          || operation.status !== "started"
+          || (request !== undefined && (request.status !== "started"
+            || request.connectionId !== operation.connectionId))) {
+          throw new StoreError("Native catalog adoption lost its exact current owner.");
+        }
+        releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
+        this.assertCurrentAdapterGeneration(current.backendId, adapter, generation);
+        inspection = await adapter.inspectCatalogSessionMaterialization?.(
+          current.binding, current.recoveryReference
+        ) ?? "unknown";
+        this.assertCurrentAdapterGeneration(current.backendId, adapter, generation);
+        if (inspection === "present") {
+          this.#store.transaction((store) => {
+            store.completeAuthorizedDeferredEffectOperation(
+              input.connection.id,
+              input.connection.authKeyDigest,
+              operation.id,
+              operation.bodyHash,
+              (transaction) => this.adoptNativeCatalogSession(transaction, current, Date.now())
+            );
+            this.completeRequestingCatalogOperation(store, current, input.connection);
+          });
+          this.invalidateNativeSessionCatalog(current.backendId);
+        } else if (inspection === "absent") {
+          this.#store.transaction((store) => {
+            store.confirmNativeCatalogAdoptionState(current.operationId, current.revision, "absent");
+            const failure = new JokoError({
+              code: "NATIVE_CATALOG_NOT_MATERIALIZED",
+              message: "The claimed native catalog task was not materialized.",
+              phase: "session",
+              retryable: false,
+              stateMayHaveChanged: false,
+              recovery: "Refresh the task catalog before starting a new import."
+            });
+            store.failEffectOperation(current.operationId, operation.bodyHash, failure);
+            if (request !== undefined) store.failEffectOperation(request.id, request.bodyHash, failure);
+          });
+        } else {
+          this.#store.markNativeCatalogAdoptionUnknown(current.operationId);
+        }
+      } catch {
+        inspection = "unknown";
+        this.#store.markNativeCatalogAdoptionUnknown(current.operationId);
+      } finally {
+        releaseAdmission?.();
+      }
+      return {
+        adoption: nativeCatalogAdoptionStatus(this.#store.getNativeCatalogAdoption(current.operationId)),
+        inspection
+      };
+    });
+  }
+
   private async resolvePortableReplacementCleanupForUser(input: {
     readonly connection: ConnectionRecord;
     readonly importedSessionId: string;
@@ -9448,6 +9583,7 @@ export class SessionHost {
       const now = Date.now();
       let nativeStart = input.nativeStart ?? { kind: "new" as const };
       let catalogEntry: NativeSessionCatalogEntry | undefined;
+      let catalogProjectRevision: bigint | undefined;
       if (input.catalogImport !== undefined) {
         if (nativeStart.kind !== "attach" || input.worktree !== undefined) {
           throw new StoreError("Catalog import presentation requires a non-Worktree native attach.");
@@ -9487,6 +9623,7 @@ export class SessionHost {
         }
         if (input.catalogImport.projectId !== undefined) {
           const projectTarget = this.#store.getTarget(input.catalogImport.projectId);
+          catalogProjectRevision = projectTarget.revision;
           if (projectTarget.descriptor.backendId !== target.descriptor.backendId) {
             throw new StoreError("Catalog import project does not belong to the runtime Backend.");
           }
@@ -9582,7 +9719,27 @@ export class SessionHost {
             })()
           : await (async () => {
               if (adapter.bindCatalogSession === undefined) throw nativeStartUnsupported("attach");
-              return adapter.bindCatalogSession(catalogEntry, context.generation);
+              return adapter.bindCatalogSession(catalogEntry, context.generation, async ({ binding, recoveryReference }) => {
+                if (!("connection" in input)) throw new StoreError("Catalog materialization requires its original connection.");
+                this.#store.claimNativeCatalogAdoption({
+                  operationId: claim.operation.id,
+                  ...(input.requestOperationId === undefined ? {} : { requestOperationId: input.requestOperationId }),
+                  operationBodyHash: claim.operation.bodyHash,
+                  connectionId: input.connection.id,
+                  authKeyDigest: input.connection.authKeyDigest,
+                  sessionId,
+                  backendId: target.descriptor.backendId,
+                  targetId: target.descriptor.id,
+                  ...(input.catalogImport?.projectId === undefined ? {} : { projectId: input.catalogImport.projectId }),
+                  ...(catalogProjectRevision === undefined ? {} : { projectRevision: catalogProjectRevision }),
+                  targetRevision: target.revision,
+                  backendGeneration: backendInstanceGeneration,
+                  binding,
+                  entry: catalogEntry,
+                  recoveryReference
+                });
+                this.#nativeCatalogAdoptionFlights.add(claim.operation.id);
+              });
             })();
         catalogBinding = catalogEntry === undefined ? undefined : resolved;
         nativeStart = { kind: "attach", nativeReference: resolved.opaqueRef };
@@ -9661,6 +9818,13 @@ export class SessionHost {
           backendInstanceGeneration
         );
         const complete = (store: OperationalStore): { readonly sessionId: string } => {
+            const catalogAdoption = store.findNativeCatalogAdoption(input.operationId);
+            if (catalogAdoption !== undefined) {
+              if (catalogBinding === undefined || catalogAdoption.binding.opaqueRef !== binding.opaqueRef) {
+                throw new StoreError("Catalog adoption lost its exact native binding.");
+              }
+              return this.adoptNativeCatalogSession(store, catalogAdoption, now);
+            }
             const currentTarget = this.assertTargetAcceptsSessionCreation(store, input.targetId);
             if (currentTarget.revision !== target.revision) {
               throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
@@ -9761,14 +9925,21 @@ export class SessionHost {
             }
             return { sessionId };
         };
+        const catalogAdoption = this.#store.findNativeCatalogAdoption(input.operationId);
         const result = authorized
-          ? this.#store.completeAuthorizedDeferredEffectOperation(
-            input.connection.id,
-            input.connection.authKeyDigest,
-            claim.operation.id,
-            claim.operation.bodyHash,
-            complete
-          )
+          ? this.#store.transaction((store) => {
+            const execution = store.completeAuthorizedDeferredEffectOperation(
+              input.connection.id,
+              input.connection.authKeyDigest,
+              claim.operation.id,
+              claim.operation.bodyHash,
+              complete
+            );
+            if (catalogAdoption !== undefined) {
+              this.completeRequestingCatalogOperation(store, catalogAdoption, input.connection);
+            }
+            return execution;
+          })
           : this.#store.completeDeferredEffectOperation(
             claim.operation.id,
             claim.operation.bodyHash,
@@ -9825,6 +9996,11 @@ export class SessionHost {
         ? await executeWithParentFence()
         : await this.withNativeBindingLock(target.descriptor.backendId, lockedReference, executeWithParentFence);
     } catch (error) {
+      const catalogAdoption = this.#store.findNativeCatalogAdoption(input.operationId);
+      if (catalogAdoption !== undefined && (catalogAdoption.state === "claimed" || catalogAdoption.state === "unknown")) {
+        this.#store.markNativeCatalogAdoptionUnknown(input.operationId);
+        throw new OperationInProgressError(input.operationId);
+      }
       if (createdBinding !== undefined && adapterForCleanup !== undefined && contextForCleanup !== undefined) {
         await adapterForCleanup.closeSession(createdBinding, contextForCleanup).catch(() => undefined);
       }
@@ -9834,11 +10010,92 @@ export class SessionHost {
       }
       return this.failClaimedEffect(operationKind, claim.operation.id, claim.operation.bodyHash, error);
     } finally {
+      this.#nativeCatalogAdoptionFlights.delete(claim.operation.id);
       releaseBackendAdmission?.();
       if (scheduledWorktreeSessionId !== undefined) {
         this.#scheduledWorktreeCreations.delete(scheduledWorktreeSessionId);
       }
     }
+  }
+
+  private adoptNativeCatalogSession(
+    store: OperationalStore,
+    adoption: NativeCatalogAdoptionRecord,
+    at: number
+  ): { readonly sessionId: string } {
+    const settledAt = Math.max(at, adoption.updatedAt);
+    const target = this.assertTargetAcceptsSessionCreation(store, adoption.targetId);
+    if (target.revision !== adoption.targetRevision || target.descriptor.backendId !== adoption.backendId
+      || target.descriptor.remoteWorkspace !== undefined
+      || store.getBackend(adoption.backendId).descriptor.instanceGeneration !== adoption.backendGeneration
+      || adoption.entry.nativeSessionId !== adoption.binding.nativeSessionId
+      || (adoption.entry.placement === "dialogue" ? adoption.projectId !== undefined : adoption.projectId === undefined)) {
+      throw new StoreError("Catalog adoption lost its exact native or Target owner.");
+    }
+    if (adoption.projectId !== undefined) {
+      const project = store.getTarget(adoption.projectId);
+      if (project.revision !== adoption.projectRevision || project.descriptor.backendId !== adoption.backendId) {
+        throw new StoreError("Catalog adoption lost its exact project owner.");
+      }
+    }
+    const duplicate = store.findLiveSessionByNativeBinding(adoption.backendId, adoption.binding.opaqueRef);
+    if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
+    const descriptor: SessionDescriptor = {
+      id: adoption.sessionId,
+      backendId: adoption.backendId,
+      targetId: adoption.targetId,
+      ...(adoption.projectId === undefined ? {} : { projectId: adoption.projectId }),
+      title: adoption.entry.title?.trim() || adoption.entry.nativeSessionId || "Untitled task",
+      binding: adoption.binding,
+      pinned: false,
+      archived: adoption.entry.archived,
+      permissionMode: "ask",
+      planMode: false,
+      fastMode: false,
+      createdAt: adoption.entry.createdAt,
+      updatedAt: adoption.entry.modifiedAt
+    };
+    const created = store.createSession(descriptor, {
+      nativeSessionBlank: false,
+      nativeCatalogAdoptionOperationId: adoption.operationId
+    });
+    if (adoption.entry.placement === "dialogue") {
+      store.moveSessionProject({
+        sessionId: adoption.sessionId,
+        expectedRevision: created.revision,
+        movedAt: adoption.entry.modifiedAt
+      });
+    } else {
+      store.appendEvent({
+        id: stableId("event", `${adoption.operationId}:created-session`),
+        backendId: adoption.backendId,
+        targetId: adoption.targetId,
+        sessionId: adoption.sessionId,
+        operationId: adoption.operationId,
+        generation: adoption.binding.generation,
+        emittedAt: settledAt,
+        traceId: `created-session:${adoption.sessionId}:${adoption.binding.generation}`,
+        payload: { type: "session_changed" }
+      });
+    }
+    store.confirmNativeCatalogAdoptionState(adoption.operationId, adoption.revision, "adopted", settledAt);
+    return { sessionId: adoption.sessionId };
+  }
+
+  private completeRequestingCatalogOperation(
+    store: OperationalStore,
+    adoption: NativeCatalogAdoptionRecord,
+    connection: ConnectionRecord
+  ): void {
+    if (adoption.requestOperationId === undefined) return;
+    const request = store.getOperation(adoption.requestOperationId);
+    store.completeAuthorizedDeferredEffectOperation(
+      connection.id,
+      connection.authKeyDigest,
+      request.id,
+      request.bodyHash,
+      () => ({ accepted: true, resultCase: "session", entityId: adoption.sessionId })
+    );
   }
 
   private providerAuthenticationAvailable(
@@ -14458,6 +14715,19 @@ function portableReplacementCleanupStatus(
     worktreeState: record.worktreeState,
     revision: record.revision,
     updatedAt: record.updatedAt
+  };
+}
+
+function nativeCatalogAdoptionStatus(record: NativeCatalogAdoptionRecord): NativeCatalogAdoptionStatus {
+  return {
+    operationId: record.requestOperationId ?? record.operationId,
+    backendId: record.backendId,
+    targetId: record.targetId,
+    title: record.entry.title?.trim() || record.entry.nativeSessionId || "Untitled task",
+    state: record.state === "claimed" || record.state === "unknown" ? "pending" : record.state,
+    revision: record.revision,
+    updatedAt: record.updatedAt,
+    ...(record.state === "adopted" ? { sessionId: record.sessionId } : {})
   };
 }
 

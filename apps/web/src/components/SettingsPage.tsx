@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import { UsageHistorySection } from "./UsageHistorySection.js";
+import { NativeCatalogAdoptionRecovery } from "./NativeCatalogAdoptionRecovery.js";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { capabilityNames } from "@joko/contracts";
 import {
@@ -972,6 +973,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [importing, setImporting] = useState(false);
+  const [adoptionRefresh, setAdoptionRefresh] = useState(0);
   const [itemStates, setItemStates] = useState<ReadonlyMap<string, "importing" | "success" | "error">>(() => new Map());
   const scanGeneration = useRef(0);
 
@@ -1282,6 +1284,7 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         }
       } finally {
         setImporting(false);
+        setAdoptionRefresh((value) => value + 1);
       }
     });
   };
@@ -1296,6 +1299,10 @@ export function TaskImportSettings({ controller, snapshot, onImportPortable, run
         <Button tone="primary" disabled={scanning || sources.length === 0} onClick={() => void runScan(true)}><RefreshCw className={cx(scanning && "is-spinning")} aria-hidden="true" />{scanning ? t("settings.sessionImport.scanning") : t("settings.sessionImport.scan")}</Button>
       </div>
     </header>
+    <NativeCatalogAdoptionRecovery controller={controller} t={t} refreshKey={adoptionRefresh} onResolved={() => {
+      void controller.refresh().catch(() => undefined);
+      void runScan(true).catch(() => undefined);
+    }} />
     <section className="task-import-surface" aria-busy={scanning}>
       {sources.length === 0 ? <div className="task-import-empty"><FileInput aria-hidden="true" /><strong>{t("settings.sessionImport.unavailableTitle")}</strong><p>{t("settings.sessionImport.unavailableBody")}</p></div>
         : scan === undefined ? <div className="task-import-empty"><FileInput aria-hidden="true" /><strong>{t("settings.sessionImport.emptyTitle")}</strong><p>{t("settings.sessionImport.emptyBody")}</p></div>

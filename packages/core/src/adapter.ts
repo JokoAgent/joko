@@ -446,8 +446,18 @@ export interface BackendAdapter {
   /** Convert an entry returned by the Adapter's catalog into a dormant binding without starting a runtime. */
   bindCatalogSession?(
     entry: NativeSessionCatalogEntry,
-    generation: number
+    generation: number,
+    /** Persist this exact effect owner before any native profile write; unused by read-only binds. */
+    claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
   ): Promise<NativeSessionBinding>;
+  /** Read-only proof for one persisted, pre-adoption catalog materialization owner. */
+  inspectCatalogSessionMaterialization?(
+    binding: NativeSessionBinding,
+    recoveryReference: string
+  ): Promise<"present" | "absent" | "unknown">;
   createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
   resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
   inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;

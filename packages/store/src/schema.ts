@@ -2100,6 +2100,31 @@ CREATE TABLE portable_replacement_cleanups (
         CHECK (imported_session_id <> replaced_session_id)
       ) STRICT;
 
+CREATE TABLE native_catalog_adoptions (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+          request_operation_id TEXT UNIQUE REFERENCES operations(id) ON DELETE RESTRICT,
+        session_id TEXT NOT NULL UNIQUE,
+        backend_id TEXT NOT NULL REFERENCES backends(id) ON DELETE RESTRICT,
+        target_id TEXT NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
+        project_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
+        project_revision INTEGER CHECK (project_revision >= 1),
+        target_revision INTEGER NOT NULL CHECK (target_revision >= 1),
+        backend_generation INTEGER NOT NULL CHECK (backend_generation >= 0),
+        binding_json TEXT NOT NULL CHECK (json_valid(binding_json)),
+        entry_json TEXT NOT NULL CHECK (json_valid(entry_json)),
+        recovery_json TEXT NOT NULL CHECK (json_valid(recovery_json)),
+        native_reference TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'unknown', 'adopted', 'absent')),
+        created_at INTEGER NOT NULL CHECK (created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK ((project_id IS NULL) = (project_revision IS NULL))
+      ) STRICT;
+
+CREATE UNIQUE INDEX native_catalog_adoptions_pending_reference
+        ON native_catalog_adoptions(backend_id, native_reference)
+        WHERE state IN ('claimed', 'unknown');
+
 CREATE TABLE session_lifecycle_cleanups (
         operation_id TEXT PRIMARY KEY CHECK (
           length(trim(operation_id)) BETWEEN 1 AND 256

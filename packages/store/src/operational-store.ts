@@ -237,6 +237,7 @@ import type {
   SetMessagingConnectionEnabledInput,
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
+  NativeCatalogAdoptionRecord,
   PortableReplacementCleanupRecord,
   SessionSnapshot,
   SessionAttentionRecord,
@@ -3227,9 +3228,18 @@ export class OperationalStore {
 
   createSession(
     descriptor: SessionDescriptor,
-    options: { readonly nativeSessionBlank?: boolean; readonly derivationOperationId?: string } = {}
+    options: {
+      readonly nativeSessionBlank?: boolean;
+      readonly derivationOperationId?: string;
+      readonly nativeCatalogAdoptionOperationId?: string;
+    } = {}
   ): StoredSession {
     return this.write(() => {
+      const pendingCatalog = this.findPendingNativeCatalogAdoptionForBinding(descriptor.backendId, descriptor.binding.opaqueRef);
+      if (pendingCatalog !== undefined && (pendingCatalog.operationId !== options.nativeCatalogAdoptionOperationId
+        || pendingCatalog.sessionId !== descriptor.id)) {
+        throw new StoreError("The native task belongs to an unfinished catalog adoption.");
+      }
       const derivation = this.assertNativeBindingAdoptionAllowed(descriptor, options.derivationOperationId);
       const target = this.getTarget(descriptor.targetId);
       if (target.descriptor.backendId !== descriptor.backendId) {
@@ -12453,6 +12463,11 @@ export class OperationalStore {
             SELECT 1 FROM session_lifecycle_cleanups AS cleanup
             WHERE cleanup.operation_id = operation.id AND cleanup.state = 'pending'
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM native_catalog_adoptions AS adoption
+            WHERE (adoption.operation_id = operation.id AND adoption.state IN ('claimed', 'unknown'))
+              OR (adoption.request_operation_id = operation.id AND adoption.state IN ('claimed', 'unknown', 'adopted'))
+          )
         ORDER BY created_at, id
       `).all() as Row[];
       const effectError = effectOutcomeUnknownError();
@@ -13822,6 +13837,192 @@ export class OperationalStore {
     `).all(nonBlank(importedSessionId, "Imported Session ID")) as Row[];
     if (rows.length > 1) throw new StoreError("Imported Session has ambiguous portable replacement cleanup ownership.");
     return rows[0] === undefined ? undefined : portableReplacementCleanupFromRow(rows[0]);
+  }
+
+  claimNativeCatalogAdoption(input: {
+    readonly operationId: string;
+    readonly requestOperationId?: string;
+    readonly operationBodyHash: string;
+    readonly connectionId: string;
+    readonly authKeyDigest: string;
+    readonly sessionId: string;
+    readonly backendId: string;
+    readonly targetId: string;
+    readonly projectId?: string;
+    readonly projectRevision?: bigint;
+    readonly targetRevision: bigint;
+    readonly backendGeneration: number;
+    readonly binding: NativeSessionBinding;
+    readonly entry: NativeCatalogAdoptionRecord["entry"];
+    readonly recoveryReference: string;
+    readonly at?: number;
+  }): NativeCatalogAdoptionRecord {
+    const at = input.at ?? this.now();
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
+    return this.write(() => {
+      this.authorizeConnection(input.connectionId, input.authKeyDigest);
+      const operation = this.getOperation(input.operationId);
+      if (operation.connectionId !== input.connectionId || operation.kind !== "create_session"
+        || operation.bodyHash !== input.operationBodyHash || operation.status !== "started") {
+        throw new StoreError("Native catalog adoption lost its original Operation.");
+      }
+      if (input.requestOperationId !== undefined) {
+        const request = this.getOperation(input.requestOperationId);
+        if (request.connectionId !== input.connectionId || request.kind !== "createSession"
+          || request.status !== "started" || request.id === operation.id) {
+          throw new StoreError("Native catalog adoption lost its requesting Operation.");
+        }
+      }
+      const target = this.getTarget(input.targetId);
+      const project = input.projectId === undefined ? undefined : this.getTarget(input.projectId);
+      if (target.revision !== input.targetRevision || target.descriptor.backendId !== input.backendId
+        || (project === undefined ? input.projectRevision !== undefined
+          : project.revision !== input.projectRevision || project.descriptor.backendId !== input.backendId)
+        || this.getBackend(input.backendId).descriptor.instanceGeneration !== input.backendGeneration
+        || input.binding.generation < 1 || input.binding.nativeSessionId === undefined
+        || input.entry.nativeSessionId !== input.binding.nativeSessionId
+        || input.binding.opaqueRef.trim().length === 0 || input.recoveryReference.trim().length === 0
+        || this.findLiveSessionByNativeBinding(input.backendId, input.binding.opaqueRef) !== undefined) {
+        throw new StoreError("Native catalog adoption lost its exact Backend, Target, or native identity.");
+      }
+      const existing = this.findNativeCatalogAdoption(input.operationId);
+      if (existing !== undefined) throw new StoreError("Native catalog adoption was already claimed.");
+      const pending = this.database.prepare(`
+        SELECT operation_id FROM native_catalog_adoptions
+        WHERE backend_id = ? AND native_reference = ? AND state IN ('claimed', 'unknown') LIMIT 1
+      `).get(input.backendId, input.binding.opaqueRef) as Row | undefined;
+      if (pending !== undefined) throw new StoreError("The native task already has a pending catalog adoption.");
+      this.database.prepare(`
+        INSERT INTO native_catalog_adoptions(
+          operation_id, request_operation_id, session_id, backend_id, target_id, project_id, project_revision, target_revision,
+          backend_generation, binding_json, entry_json, recovery_json,
+          native_reference, state, created_at, updated_at, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)
+      `).run(
+        input.operationId, input.requestOperationId ?? null, input.sessionId, input.backendId, input.targetId,
+        input.projectId ?? null, input.projectRevision === undefined ? null : asSqlInteger(input.projectRevision),
+        asSqlInteger(input.targetRevision), input.backendGeneration,
+        serializeJson(input.binding), serializeJson(input.entry), serializeJson(input.recoveryReference),
+        input.binding.opaqueRef, at, at, asSqlInteger(this.requireActiveRevision())
+      );
+      return this.getNativeCatalogAdoption(input.operationId);
+    });
+  }
+
+  findNativeCatalogAdoption(operationId: string): NativeCatalogAdoptionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM native_catalog_adoptions WHERE operation_id = ?")
+      .get(nonBlank(operationId, "Operation ID")) as Row | undefined;
+    return row === undefined ? undefined : nativeCatalogAdoptionFromRow(row);
+  }
+
+  findNativeCatalogAdoptionForRequest(operationId: string): NativeCatalogAdoptionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM native_catalog_adoptions WHERE request_operation_id = ?")
+      .get(nonBlank(operationId, "Request Operation ID")) as Row | undefined;
+    return row === undefined ? undefined : nativeCatalogAdoptionFromRow(row);
+  }
+
+  getNativeCatalogAdoption(operationId: string): NativeCatalogAdoptionRecord {
+    const record = this.findNativeCatalogAdoption(operationId);
+    if (record === undefined) throw new NotFoundError("Native catalog adoption", operationId);
+    return record;
+  }
+
+  findPendingNativeCatalogAdoptionForBinding(backendId: string, opaqueRef: string): NativeCatalogAdoptionRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM native_catalog_adoptions
+      WHERE backend_id = ? AND native_reference = ? AND state IN ('claimed', 'unknown') LIMIT 1
+    `).get(nonBlank(backendId, "Backend ID"), nonBlank(opaqueRef, "Native reference")) as Row | undefined;
+    return row === undefined ? undefined : nativeCatalogAdoptionFromRow(row);
+  }
+
+  listPendingNativeCatalogAdoptions(connectionId?: string, limit = 100, offset = 0): NativeCatalogAdoptionRecord[] {
+    this.assertOpen();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new StoreError("Native catalog adoption page size is invalid.");
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new StoreError("Native catalog adoption page offset is invalid.");
+    return (this.database.prepare(`
+      SELECT adoption.* FROM native_catalog_adoptions AS adoption
+      JOIN operations AS operation ON operation.id = adoption.operation_id
+      WHERE adoption.state IN ('claimed', 'unknown')
+        AND (? IS NULL OR operation.connection_id = ?)
+      ORDER BY adoption.created_at, adoption.operation_id LIMIT ? OFFSET ?
+    `).all(connectionId ?? null, connectionId ?? null, limit, offset) as Row[]).map(nativeCatalogAdoptionFromRow);
+  }
+
+  countPendingNativeCatalogAdoptions(connectionId?: string): number {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count FROM native_catalog_adoptions AS adoption
+      JOIN operations AS operation ON operation.id = adoption.operation_id
+      WHERE adoption.state IN ('claimed', 'unknown')
+        AND (? IS NULL OR operation.connection_id = ?)
+    `).get(connectionId ?? null, connectionId ?? null) as Row;
+    return numberValue(row["count"]);
+  }
+
+  markNativeCatalogAdoptionUnknown(operationId: string, at = this.now()): NativeCatalogAdoptionRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
+    return this.write(() => {
+      const current = this.getNativeCatalogAdoption(operationId);
+      if (current.state !== "claimed") return current;
+      this.database.prepare(`
+        UPDATE native_catalog_adoptions SET state = 'unknown', updated_at = ?, revision = ?
+        WHERE operation_id = ? AND state IN ('claimed', 'unknown')
+      `).run(at, asSqlInteger(this.requireActiveRevision()), operationId);
+      return this.getNativeCatalogAdoption(operationId);
+    });
+  }
+
+  confirmNativeCatalogAdoptionState(
+    operationId: string,
+    expectedRevision: bigint,
+    state: "adopted" | "absent",
+    at = this.now()
+  ): NativeCatalogAdoptionRecord {
+    if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
+    return this.write(() => {
+      const current = this.getNativeCatalogAdoption(operationId);
+      if ((current.state !== "claimed" && current.state !== "unknown")
+        || current.revision !== expectedRevision) throw new StoreError("Native catalog adoption changed during reconciliation.");
+      const operation = this.getOperation(operationId);
+      const target = this.getTarget(current.targetId);
+      const request = current.requestOperationId === undefined
+        ? undefined : this.getOperation(current.requestOperationId);
+      if (operation.kind !== "create_session" || operation.status !== "started"
+        || (request !== undefined && (request.kind !== "createSession" || request.status !== "started"
+          || request.connectionId !== operation.connectionId))
+        || target.revision !== current.targetRevision || target.descriptor.backendId !== current.backendId
+        || this.getBackend(current.backendId).descriptor.instanceGeneration !== current.backendGeneration
+        || (current.projectId === undefined ? current.projectRevision !== undefined
+          : this.getTarget(current.projectId).revision !== current.projectRevision
+            || this.getTarget(current.projectId).descriptor.backendId !== current.backendId)) {
+        throw new StoreError("Native catalog adoption lost its exact Operation or owner.");
+      }
+      const sessionRow = this.database.prepare("SELECT id FROM product_sessions WHERE id = ?")
+        .get(current.sessionId) as Row | undefined;
+      if (state === "absent") {
+        if (sessionRow !== undefined
+          || this.findLiveSessionByNativeBinding(current.backendId, current.binding.opaqueRef) !== undefined) {
+          throw new StoreError("Native catalog adoption cannot be declared absent after product adoption.");
+        }
+      } else {
+        if (sessionRow === undefined) throw new StoreError("Native catalog adoption has no product Session.");
+        const adopted = this.getSession(current.sessionId).descriptor;
+        if (adopted.backendId !== current.backendId || adopted.targetId !== current.targetId
+          || adopted.binding.opaqueRef !== current.binding.opaqueRef
+          || adopted.binding.generation !== current.binding.generation) {
+          throw new StoreError("Native catalog adoption lost its exact product Session.");
+        }
+      }
+      const changed = this.database.prepare(`
+        UPDATE native_catalog_adoptions SET state = ?, updated_at = ?, revision = ?
+        WHERE operation_id = ? AND state IN ('claimed', 'unknown') AND revision = ?
+      `).run(state, at, asSqlInteger(this.requireActiveRevision()), operationId, asSqlInteger(expectedRevision));
+      if (changed.changes !== 1) throw new StoreError("Native catalog adoption changed during reconciliation.");
+      return this.getNativeCatalogAdoption(operationId);
+    });
   }
 
   listPendingPortableReplacementCleanups(): PortableReplacementCleanupRecord[] {
@@ -20128,6 +20329,45 @@ function portableReplacementCleanupFromRow(row: Row): PortableReplacementCleanup
     nativeState: enumValue(row["native_state"], ["pending", "dispatched", "unknown", "completed"] as const),
     worktreeState: enumValue(row["worktree_state"], ["pending", "completed"] as const),
     ...(failureCode === undefined ? {} : { failureCode }),
+    createdAt: numberValue(row["created_at"]),
+    updatedAt: numberValue(row["updated_at"]),
+    revision: toBigInt(row["revision"])
+  };
+}
+
+function nativeCatalogAdoptionFromRow(row: Row): NativeCatalogAdoptionRecord {
+  const rawBinding = parseJson<unknown>(stringValue(row["binding_json"]));
+  const rawEntry = parseJson<unknown>(stringValue(row["entry_json"]));
+  const recoveryReference = parseJson<unknown>(stringValue(row["recovery_json"]));
+  if (!isRecord(rawBinding) || typeof rawBinding["opaqueRef"] !== "string"
+    || typeof rawBinding["nativeSessionId"] !== "string"
+    || !Number.isSafeInteger(rawBinding["generation"]) || Number(rawBinding["generation"]) < 1
+    || !isRecord(rawEntry) || typeof rawEntry["nativeReference"] !== "string"
+    || rawEntry["nativeSessionId"] !== rawBinding["nativeSessionId"]
+    || typeof rawEntry["createdAt"] !== "number" || !Number.isSafeInteger(rawEntry["createdAt"])
+    || typeof rawEntry["modifiedAt"] !== "number" || !Number.isSafeInteger(rawEntry["modifiedAt"])
+    || typeof rawEntry["archived"] !== "boolean"
+    || (rawEntry["placement"] !== "project" && rawEntry["placement"] !== "dialogue")
+    || (rawEntry["existingMatch"] !== "binding" && rawEntry["existingMatch"] !== "binding_and_placement")
+    || !["title", "workingDirectory", "projectDirectory"].every((key) => rawEntry[key] === undefined || typeof rawEntry[key] === "string")
+    || typeof recoveryReference !== "string" || recoveryReference.trim().length === 0
+    || stringValue(row["native_reference"]) !== rawBinding["opaqueRef"]) {
+    throw new StoreError("Native catalog adoption receipt is invalid.");
+  }
+  return {
+    operationId: stringValue(row["operation_id"]),
+    ...(row["request_operation_id"] === null ? {} : { requestOperationId: stringValue(row["request_operation_id"]) }),
+    sessionId: stringValue(row["session_id"]),
+    backendId: stringValue(row["backend_id"]),
+    targetId: stringValue(row["target_id"]),
+    ...(row["project_id"] === null ? {} : { projectId: stringValue(row["project_id"]) }),
+    ...(row["project_revision"] === null ? {} : { projectRevision: toBigInt(row["project_revision"]) }),
+    targetRevision: toBigInt(row["target_revision"]),
+    backendGeneration: numberValue(row["backend_generation"]),
+    binding: rawBinding as unknown as NativeSessionBinding,
+    entry: rawEntry as unknown as NativeCatalogAdoptionRecord["entry"],
+    recoveryReference,
+    state: enumValue(row["state"], ["claimed", "unknown", "adopted", "absent"] as const),
     createdAt: numberValue(row["created_at"]),
     updatedAt: numberValue(row["updated_at"]),
     revision: toBigInt(row["revision"])

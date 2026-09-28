@@ -2212,6 +2212,8 @@ export function useAppController(): AppController {
     listTargetWorktreeSources: (targetId, signal) => gateway().listTargetWorktreeSources(targetId, signal),
     discoverNativeSessions: (targetId, signal) => gateway().discoverNativeSessions(targetId, signal),
     scanNativeSessionCatalog: (backendId, options) => gateway().scanNativeSessionCatalog(backendId, options),
+    listNativeCatalogAdoptions: (signal) => gateway().listNativeCatalogAdoptions(signal),
+    reconcileNativeCatalogAdoption: (operationId) => gateway().reconcileNativeCatalogAdoption(operationId),
     archiveTarget: (targetId, archived) => gateway().archiveTarget(targetId, archived),
     deleteTarget: (targetId, deleteManagedWorkspace) => gateway().deleteTarget(targetId, deleteManagedWorkspace),
     setWorkspaceTrust: (workspaceId, trusted) => gateway().setWorkspaceTrust(workspaceId, trusted),

@@ -2373,6 +2373,37 @@ export function createConnectServices(application: OrchestratorApplication): Con
         snapshotToken: snapshot.token
       };
     },
+    listNativeCatalogAdoptions: (request, context) => {
+      const connection = authenticate(context);
+      const page = storePageWindow(request.page);
+      const result = dependencies.sessionHost.listNativeCatalogAdoptionsForUser({
+        connection: stableConnection(connection),
+        ...page
+      });
+      const next = page.offset + result.adoptions.length;
+      return {
+        adoptions: result.adoptions.map(protoNativeCatalogAdoption),
+        page: create(contract.PageInfoSchema, {
+          nextPageToken: next < result.total ? encodePageToken(next) : "",
+          totalSize: BigInt(result.total)
+        })
+      };
+    },
+    reconcileNativeCatalogAdoption: async (request, context) => {
+      const connection = authenticate(context);
+      const result = await dependencies.sessionHost.reconcileNativeCatalogAdoptionForUser({
+        connection: stableConnection(connection),
+        operationId: nonBlankRequest(request.operationId, "operation_id")
+      });
+      return {
+        adoption: protoNativeCatalogAdoption(result.adoption),
+        inspection: result.inspection === "present"
+          ? contract.NativeCatalogAdoptionInspection.PRESENT
+          : result.inspection === "absent"
+            ? contract.NativeCatalogAdoptionInspection.ABSENT
+            : contract.NativeCatalogAdoptionInspection.UNKNOWN
+      };
+    },
     getNativeSessionTree: async (request, context) => {
       authenticate(context);
       const stored = dependencies.store.getSession(request.sessionId);
@@ -7337,6 +7368,25 @@ function mapNativeSessionCatalogEntry(
     ...(targetId === undefined ? {} : { targetId }),
     ...(projectTargetId === undefined ? {} : { projectTargetId }),
     ...(existingSessionId === undefined ? {} : { existingSessionId })
+  });
+}
+
+function protoNativeCatalogAdoption(
+  value: import("./session-host.js").NativeCatalogAdoptionStatus
+): contract.NativeCatalogAdoption {
+  return create(contract.NativeCatalogAdoptionSchema, {
+    operationId: value.operationId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    title: value.title,
+    state: value.state === "pending"
+      ? contract.NativeCatalogAdoptionState.PENDING
+      : value.state === "adopted"
+        ? contract.NativeCatalogAdoptionState.ADOPTED
+        : contract.NativeCatalogAdoptionState.ABSENT,
+    revision: value.revision,
+    updatedAt: toProtoTimestamp(value.updatedAt),
+    ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId })
   });
 }
 
@@ -16017,36 +16067,52 @@ async function dispatchMutation(
         body: mutation,
         precondition: (store) => validatePreconditions(store, mutation),
         commit: () => outcome,
+        preserveClaimOnEffectFailure: () => {
+          const adoption = dependencies.store.findNativeCatalogAdoptionForRequest(operationId);
+          return adoption?.state === "claimed" || adoption?.state === "unknown";
+        },
         effect: async () => {
-          const nested = await dependencies.sessionHost.createSession({
-            operationId: nestedId,
-            connection,
-            targetId: payload.value.targetId,
-            title: payload.value.displayName || "New task",
-            ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
-            ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
-            ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
-            fastMode: model?.fastMode ?? false,
-            permissionMode: corePermission(payload.value.permissionMode),
-            planMode: payload.value.planMode,
-            initialPlacement,
-            ...(catalogImport === undefined ? {} : { catalogImport }),
-            ...(payload.value.useWorktree ? {
-              worktree: {
-                ...(worktreeSourceRef === undefined ? {} : { sourceRef: worktreeSourceRef }),
-                refreshRemote: payload.value.refreshWorktreeRemote
-              }
-            } : {}),
-            ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
-            nativeStart: nativeStart?.case === "attach"
-              ? { kind: "attach", nativeReference: nativeStart.value.opaqueNativeReference }
-              : {
-                  kind: "new",
-                  ...(nativeStart?.case === "newSession" && nativeStart.value.parentNativeReference !== ""
-                    ? { parentNativeReference: nativeStart.value.parentNativeReference }
-                    : {})
+          let nested: Awaited<ReturnType<typeof dependencies.sessionHost.createSession>>;
+          try {
+            nested = await dependencies.sessionHost.createSession({
+              operationId: nestedId,
+              ...(catalogImport === undefined ? {} : { requestOperationId: operationId }),
+              connection,
+              targetId: payload.value.targetId,
+              title: payload.value.displayName || "New task",
+              ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
+              ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
+              ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
+              fastMode: model?.fastMode ?? false,
+              permissionMode: corePermission(payload.value.permissionMode),
+              planMode: payload.value.planMode,
+              initialPlacement,
+              ...(catalogImport === undefined ? {} : { catalogImport }),
+              ...(payload.value.useWorktree ? {
+                worktree: {
+                  ...(worktreeSourceRef === undefined ? {} : { sourceRef: worktreeSourceRef }),
+                  refreshRemote: payload.value.refreshWorktreeRemote
                 }
-          });
+              } : {}),
+              ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
+              nativeStart: nativeStart?.case === "attach"
+                ? { kind: "attach", nativeReference: nativeStart.value.opaqueNativeReference }
+                : {
+                    kind: "new",
+                    ...(nativeStart?.case === "newSession" && nativeStart.value.parentNativeReference !== ""
+                      ? { parentNativeReference: nativeStart.value.parentNativeReference }
+                      : {})
+                  }
+            });
+          } catch (error) {
+            const adoption = dependencies.store.findNativeCatalogAdoptionForRequest(operationId);
+            if (error instanceof OperationInProgressError
+              && adoption !== undefined
+              && (adoption.state === "claimed" || adoption.state === "unknown")) {
+              throw new OperationInProgressError(operationId);
+            }
+            throw error;
+          }
           if (nested.value.sessionId !== sessionId) throw new Error("CreateSession returned a non-deterministic Session ID.");
         }
       });

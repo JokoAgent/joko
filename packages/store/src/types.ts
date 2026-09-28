@@ -13,6 +13,7 @@ import type {
   InteractionDecision,
   InteractionId,
   InteractionPayload,
+  NativeSessionCatalogEntry,
   OperationId,
   PiEventMetadata,
   PromptInput,
@@ -1633,6 +1634,26 @@ export interface PortableReplacementCleanupRecord {
   readonly nativeState: "pending" | "dispatched" | "unknown" | "completed";
   readonly worktreeState: "pending" | "completed";
   readonly failureCode?: string;
+  readonly createdAt: UnixMillis;
+  readonly updatedAt: UnixMillis;
+  readonly revision: bigint;
+}
+
+/** Pre-effect owner of a cross-profile native catalog placement awaiting product adoption. */
+export interface NativeCatalogAdoptionRecord {
+  readonly operationId: OperationId;
+    readonly requestOperationId?: OperationId;
+  readonly sessionId: SessionId;
+  readonly backendId: BackendId;
+  readonly targetId: TargetId;
+  readonly projectId?: TargetId;
+  readonly projectRevision?: bigint;
+  readonly targetRevision: bigint;
+  readonly backendGeneration: number;
+  readonly binding: SessionDescriptor["binding"];
+  readonly entry: NativeSessionCatalogEntry;
+  readonly recoveryReference: string;
+  readonly state: "claimed" | "unknown" | "adopted" | "absent";
   readonly createdAt: UnixMillis;
   readonly updatedAt: UnixMillis;
   readonly revision: bigint;

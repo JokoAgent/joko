@@ -38,6 +38,7 @@ export interface CodexCatalogMaterializationInput {
   readonly activeProfileDirectory: string;
   readonly source: CodexCatalogSource;
   readonly entry: NativeSessionCatalogEntry;
+  readonly claim: (recoveryReference: string) => Promise<void>;
 }
 
 export async function validateCodexCatalogSource(
@@ -87,6 +88,25 @@ export async function materializeCodexCatalogSession(
     throw materializationUnavailable("The active Codex profile has no state database.");
   }
   assertActiveIdentityAvailable(activeDatabasePath, input.entry.nativeSessionId ?? "", targetRollout);
+  const databaseIdentity = await physicalFileIdentity(activeDatabasePath);
+  if (databaseIdentity === undefined) throw materializationUnavailable("The active Codex state database is unavailable.");
+  const sourceDigest = await fileDigest(sourceRollout);
+  const expectedRow = readExpectedMaterializedRow(activeDatabasePath, targetRollout, sourceState, input.entry);
+  await input.claim(JSON.stringify({
+    version: 1,
+    activeProfileDirectory: activeProfile,
+    activeDatabasePath,
+    databaseDevice: databaseIdentity.device,
+    databaseInode: databaseIdentity.inode,
+    source: input.source,
+    entry: input.entry,
+    targetRollout,
+    sourceDigest,
+    rowColumns: expectedRow.columns,
+    rowFingerprint: expectedRow.fingerprint
+  }));
+  await assertRolloutFence(sourceRollout, rollout);
+  if (await fileDigest(sourceRollout) !== sourceDigest) throw sourceChanged();
   const published = await publishRollout(activeProfile, sourceRollout, targetRollout, rollout);
   let databaseCommitted = false;
   try {
@@ -95,12 +115,15 @@ export async function materializeCodexCatalogSession(
     await readAndValidateSource(input.source, input.entry.nativeSessionId ?? "");
     await assertRolloutFence(sourceRollout, rollout);
     if (await fileDigest(sourceRollout) !== published.digest) throw sourceChanged();
+    if (published.digest !== sourceDigest) throw sourceChanged();
+    await assertDatabaseIdentity(activeDatabasePath, databaseIdentity);
 
     publishThreadRow({
       databasePath: activeDatabasePath,
       targetRollout,
       sourceRow: sourceState,
-      entry: input.entry
+      entry: input.entry,
+      expectedRowFingerprint: expectedRow.fingerprint
     });
     databaseCommitted = true;
     await updateProjectlessPlacement(
@@ -117,6 +140,167 @@ export async function materializeCodexCatalogSession(
         published.digest
       );
     }
+    throw error;
+  }
+}
+
+function readExpectedMaterializedRow(
+  databasePath: string,
+  targetRollout: string,
+  sourceRow: SqliteRow | undefined,
+  entry: NativeSessionCatalogEntry
+): { readonly columns: readonly string[]; readonly fingerprint: string } {
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+    database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+    database.exec("PRAGMA query_only = ON");
+    const values = materializedRowValues(readTableColumns(database), { targetRollout, sourceRow, entry });
+    const columns = [...values.keys()].sort();
+    return { columns, fingerprint: projectedRowFingerprint(values, columns) };
+  } catch (error) {
+    if (isMaterializationError(error)) throw error;
+    throw materializationUnavailable("The active Codex state schema could not be checked safely.");
+  } finally {
+    database?.close();
+  }
+}
+
+/** Read-only classification of one previously claimed active-profile placement. */
+export async function inspectCodexCatalogMaterialization(
+  recoveryReference: string,
+  configuredActiveProfileDirectory: string,
+  expectedNativeSessionId: string
+): Promise<"present" | "absent" | "unknown"> {
+  try {
+    if (recoveryReference.length > 32_768) return "unknown";
+    const claim = objectRecord(JSON.parse(recoveryReference) as unknown);
+    const source = objectRecord(claim?.["source"]);
+    const entry = objectRecord(claim?.["entry"]);
+    const columns = claim?.["rowColumns"];
+    if (claim?.["version"] !== 1 || source === undefined || entry === undefined
+      || typeof claim["activeProfileDirectory"] !== "string"
+      || typeof claim["activeDatabasePath"] !== "string"
+      || typeof claim["targetRollout"] !== "string"
+      || typeof source["profileDirectory"] !== "string"
+      || typeof source["profileKey"] !== "string"
+      || typeof source["fingerprint"] !== "string"
+      || typeof entry["nativeSessionId"] !== "string"
+      || entry["nativeSessionId"] !== expectedNativeSessionId
+      || typeof entry["archived"] !== "boolean"
+      || (entry["placement"] !== "dialogue" && entry["placement"] !== "project")
+      || typeof claim["databaseDevice"] !== "string" || !/^\d+$/u.test(claim["databaseDevice"])
+      || typeof claim["databaseInode"] !== "string" || !/^\d+$/u.test(claim["databaseInode"])
+      || !Array.isArray(columns) || columns.length < 2 || columns.length > 128
+      || !columns.every((value) => typeof value === "string" && value.length > 0)
+      || new Set(columns).size !== columns.length
+      || !columns.includes("id") || !columns.includes("rollout_path")
+      || typeof claim["sourceDigest"] !== "string" || !/^[a-f0-9]{64}$/u.test(claim["sourceDigest"])
+      || typeof claim["rowFingerprint"] !== "string" || !/^[a-f0-9]{64}$/u.test(claim["rowFingerprint"])) return "unknown";
+    const activeProfile = await canonicalDirectory(configuredActiveProfileDirectory);
+    if (!samePath(activeProfile, claim["activeProfileDirectory"])
+      || !isAbsolute(source["profileDirectory"])
+      || samePath(activeProfile, source["profileDirectory"])
+      || !pathInside(activeProfile, claim["activeDatabasePath"])
+      || !/^state_\d+\.sqlite$/iu.test(basename(claim["activeDatabasePath"]))
+      || !samePath(materializedRolloutPath(
+        activeProfile, source["profileKey"], source["fingerprint"],
+        entry["nativeSessionId"], entry["archived"]
+      ), claim["targetRollout"])) return "unknown";
+    const currentDatabasePath = await newestStateDatabase(activeProfile);
+    if (currentDatabasePath === undefined || !samePath(currentDatabasePath, claim["activeDatabasePath"])) return "unknown";
+    const databaseInfo = await physicalFileIdentity(currentDatabasePath);
+    if (databaseInfo === undefined || databaseInfo.device !== claim["databaseDevice"]
+      || databaseInfo.inode !== claim["databaseInode"]
+      || !samePath(await realpath(currentDatabasePath), currentDatabasePath)) return "unknown";
+    const target = claim["targetRollout"];
+    const nested = relative(activeProfile, dirname(target));
+    if (nested === "" || nested.startsWith("..") || isAbsolute(nested)) return "unknown";
+    let cursor = activeProfile;
+    let missingParent = false;
+    for (const segment of nested.split(/[\\/]+/u).filter((value) => value !== "")) {
+      cursor = join(cursor, segment);
+      const info = await lstatIfPresent(cursor);
+      if (info === undefined) { missingParent = true; break; }
+      if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(cursor), cursor)) return "unknown";
+    }
+    const rolloutInfo = missingParent ? undefined : await lstatIfPresent(target);
+    if (rolloutInfo !== undefined && (!rolloutInfo.isFile() || rolloutInfo.isSymbolicLink()
+      || !samePath(await realpath(target), target))) return "unknown";
+    let row: SqliteRow | undefined;
+    let database: DatabaseSync | undefined;
+    try {
+      database = new DatabaseSync(currentDatabasePath, { readOnly: true });
+      database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+      database.exec("PRAGMA query_only = ON");
+      row = database.prepare('SELECT * FROM "threads" WHERE "id" = ? LIMIT 1')
+        .get(entry["nativeSessionId"]) as SqliteRow | undefined;
+    } finally {
+      database?.close();
+    }
+    const state = await readStateSnapshotForInspection(join(activeProfile, PROFILE_STATE_FILE));
+    const rawIds = state.record[PROJECTLESS_IDS_FIELD];
+    if (rawIds !== undefined && (!Array.isArray(rawIds)
+      || !rawIds.every((value) => typeof value === "string"))) return "unknown";
+    const inProjectless = (rawIds as readonly string[] | undefined)?.includes(entry["nativeSessionId"]) ?? false;
+    if (rolloutInfo === undefined && row === undefined && !inProjectless) return "absent";
+    if (rolloutInfo === undefined || row === undefined
+      || inProjectless !== (entry["placement"] === "dialogue")
+      || projectedRowFingerprint(row, columns) !== claim["rowFingerprint"]
+      || await fileDigest(target) !== claim["sourceDigest"]) return "unknown";
+    const after = await fileIdentity(target);
+    if (after === undefined || after.size !== rolloutInfo.size
+      || after.modifiedAt !== Math.trunc(Number(rolloutInfo.mtimeMs))
+      || after.device !== rolloutInfo.dev || after.inode !== rolloutInfo.ino) return "unknown";
+    await assertDatabaseIdentity(currentDatabasePath, databaseInfo);
+    return "present";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function readStateSnapshotForInspection(file: string): Promise<{ readonly record: Record<string, unknown> }> {
+  const before = await lstatIfPresent(file);
+  if (before === undefined) return { record: {} };
+  if (!before.isFile() || before.isSymbolicLink() || before.size > MAXIMUM_PROFILE_STATE_BYTES
+    || !samePath(await realpath(file), file)) throw targetConflict();
+  const contents = await readFile(file, "utf8");
+  const record = objectRecord(JSON.parse(contents) as unknown);
+  const after = await lstatIfPresent(file);
+  if (record === undefined || after === undefined || !after.isFile() || after.isSymbolicLink()
+    || after.size !== before.size || Math.trunc(Number(after.mtimeMs)) !== Math.trunc(Number(before.mtimeMs))
+    || after.dev !== before.dev || after.ino !== before.ino) throw targetConflict();
+  return { record };
+}
+
+async function lstatIfPresent(path: string): Promise<Awaited<ReturnType<typeof lstat>> | undefined> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (nodeErrorCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+async function assertDatabaseIdentity(path: string, expected: PhysicalFileIdentity): Promise<void> {
+  const current = await physicalFileIdentity(path);
+  if (current === undefined || current.device !== expected.device || current.inode !== expected.inode) {
+    throw targetConflict();
+  }
+}
+
+interface PhysicalFileIdentity {
+  readonly device: string;
+  readonly inode: string;
+}
+
+async function physicalFileIdentity(path: string): Promise<PhysicalFileIdentity | undefined> {
+  try {
+    const info = await lstat(path, { bigint: true });
+    if (!info.isFile() || info.isSymbolicLink()) throw targetConflict();
+    return { device: info.dev.toString(10), inode: info.ino.toString(10) };
+  } catch (error) {
+    if (nodeErrorCode(error, "ENOENT")) return undefined;
     throw error;
   }
 }
@@ -306,6 +490,7 @@ function publishThreadRow(input: {
   readonly targetRollout: string;
   readonly sourceRow: SqliteRow | undefined;
   readonly entry: NativeSessionCatalogEntry;
+  readonly expectedRowFingerprint: string;
 }): void {
   const nativeSessionId = input.entry.nativeSessionId ?? "";
   let database: DatabaseSync | undefined;
@@ -330,6 +515,9 @@ function publishThreadRow(input: {
     const values = materializedRowValues(columns, input);
     const names = [...values.keys()];
     if (names.length === 0) throw materializationUnavailable("The active state schema is unsupported.");
+    if (projectedRowFingerprint(values, [...names].sort()) !== input.expectedRowFingerprint) {
+      throw materializationUnavailable("The active Codex state schema changed during import.");
+    }
     database.prepare(`INSERT INTO "threads" (${names.map(quoteIdentifier).join(", ")}) VALUES (${names.map(() => "?").join(", ")})`)
       .run(...names.map((name) => values.get(name) ?? null));
     database.exec("COMMIT");
@@ -571,6 +759,19 @@ function sqliteRowFingerprint(row: SqliteRow): string {
     if (typeof value === "bigint") return [key, `bigint:${value.toString(10)}`];
     if (value instanceof Uint8Array) return [key, `bytes:${Buffer.from(value).toString("base64")}`];
     return [key, value];
+  });
+  return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
+}
+
+function projectedRowFingerprint(
+  values: ReadonlyMap<string, SqliteValue> | SqliteRow,
+  columns: readonly string[]
+): string {
+  const stable = columns.map((key) => {
+    const value = values instanceof Map ? values.get(key) : (values as SqliteRow)[key];
+    if (typeof value === "bigint") return [key, `bigint:${value.toString(10)}`];
+    if (value instanceof Uint8Array) return [key, `bytes:${Buffer.from(value).toString("base64")}`];
+    return [key, value === undefined ? "missing" : value];
   });
   return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
 }

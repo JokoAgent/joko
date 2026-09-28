@@ -188,6 +188,8 @@ import {
   PortableReplacementNativeState,
   PortableReplacementWorktreeState,
   PortableReplacementInspection,
+  NativeCatalogAdoptionState,
+  NativeCatalogAdoptionInspection,
   PiQueueMode,
   PolicySettingsSchema,
   ProviderConfigurationSchema,
@@ -852,6 +854,8 @@ import type {
   NativeSessionCandidateView,
   NativeSessionCatalogEntryView,
   NativeSessionCatalogView,
+  NativeCatalogAdoptionView,
+  NativeCatalogAdoptionResolutionView,
   NewSessionDraft,
   McpServerView,
   NativeSessionTreeNodeView,
@@ -2185,6 +2189,65 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       existingCount: numberValue(response.existingCount),
       snapshotToken: response.snapshotToken
     };
+  }
+
+  async listNativeCatalogAdoptions(signal?: AbortSignal): Promise<readonly NativeCatalogAdoptionView[]> {
+    const client = createClient(SessionService, this.requireTransport());
+    const values: NativeCatalogAdoptionView[] = [];
+    const seenIds = new Set<string>();
+    const consumedTokens = new Set<string>();
+    let pageToken = "";
+    let total: bigint | undefined;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await client.listNativeCatalogAdoptions(
+        { page: { pageSize: 500, pageToken } },
+        { signal: signal ?? this.#abort?.signal }
+      );
+      const pageTotal = response.page?.totalSize;
+      if (pageTotal === undefined || pageTotal < 0n || pageTotal > 50_000n
+        || (total !== undefined && total !== pageTotal)) {
+        throw new GatewayError("Orchestrator returned an inconsistent native adoption directory.");
+      }
+      total = pageTotal;
+      for (const record of response.adoptions) {
+        const mapped = mapNativeCatalogAdoption(record);
+        if (seenIds.has(mapped.operationId)) {
+          throw new GatewayError("Orchestrator repeated a native adoption Operation.");
+        }
+        seenIds.add(mapped.operationId);
+        values.push(mapped);
+      }
+      const next = response.page?.nextPageToken ?? "";
+      if (next === "") {
+        if (BigInt(values.length) !== total) {
+          throw new GatewayError("Orchestrator returned an incomplete native adoption directory.");
+        }
+        return values;
+      }
+      if (next === pageToken || consumedTokens.has(next) || response.adoptions.length === 0) {
+        throw new GatewayError("Orchestrator returned a cyclic native adoption page.");
+      }
+      consumedTokens.add(next);
+      pageToken = next;
+    }
+    throw new GatewayError("Native adoption directory exceeded the safe pagination limit.");
+  }
+
+  async reconcileNativeCatalogAdoption(operationId: string): Promise<NativeCatalogAdoptionResolutionView> {
+    if (!validSessionMentionId(operationId)) throw new GatewayError("Native adoption Operation ID is invalid.");
+    const client = createClient(SessionService, this.requireTransport());
+    const response = await client.reconcileNativeCatalogAdoption(
+      { operationId },
+      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+    );
+    if (response.adoption === undefined) throw new GatewayError("Orchestrator omitted the native adoption receipt.");
+    const adoption = mapNativeCatalogAdoption(response.adoption);
+    if (adoption.operationId !== operationId) throw new GatewayError("Orchestrator returned another native adoption Operation.");
+    const inspection = response.inspection === NativeCatalogAdoptionInspection.PRESENT ? "present"
+      : response.inspection === NativeCatalogAdoptionInspection.ABSENT ? "absent"
+        : response.inspection === NativeCatalogAdoptionInspection.UNKNOWN ? "unknown" : undefined;
+    if (inspection === undefined) throw new GatewayError("Orchestrator returned an unknown native adoption inspection.");
+    return { adoption, inspection };
   }
 
   async setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void> {
@@ -15916,6 +15979,35 @@ function mapNativeSessionCatalogEntry(entry: NativeSessionCatalogEntry): NativeS
     ...(entry.existingSessionId === undefined || entry.existingSessionId.length === 0
       ? {}
       : { existingSessionId: entry.existingSessionId })
+  };
+}
+
+function mapNativeCatalogAdoption(
+  value: import("@joko/contracts").NativeCatalogAdoption
+): NativeCatalogAdoptionView {
+  const state = value.state === NativeCatalogAdoptionState.PENDING ? "pending"
+    : value.state === NativeCatalogAdoptionState.ADOPTED ? "adopted"
+      : value.state === NativeCatalogAdoptionState.ABSENT ? "absent" : undefined;
+  const updatedAt = timestampMs(value.updatedAt);
+  if (state === undefined || !validSessionMentionId(value.operationId)
+    || !validSessionMentionId(value.backendId) || !validSessionMentionId(value.targetId)
+    || value.title.trim().length === 0 || value.title.length > 1_024
+    || /[\u0000-\u001f\u007f]/u.test(value.title)
+    || value.revision <= 0n || value.updatedAt === undefined
+    || !Number.isSafeInteger(updatedAt) || updatedAt < 0
+    || (state === "adopted" ? !validSessionMentionId(value.sessionId)
+      : value.sessionId !== undefined)) {
+    throw new GatewayError("Orchestrator returned an invalid native adoption receipt.");
+  }
+  return {
+    operationId: value.operationId,
+    backendId: value.backendId,
+    targetId: value.targetId,
+    title: value.title,
+    state,
+    revision: value.revision,
+    updatedAt,
+    ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId })
   };
 }
 

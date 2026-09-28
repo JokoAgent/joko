@@ -11161,6 +11161,122 @@ describe("SessionHost", () => {
     expect(replacement.catalogBindingCalls).toBe(0);
   });
 
+  it("resumes a claimed native catalog placement through the original Operation after Host restart", async () => {
+    const native = { state: "absent" as "present" | "absent" | "unknown", binds: 0 };
+    const adapter = new ClaimedCatalogImportFakeAdapter(native);
+    const fixture = await createFixture(adapter);
+    const catalogWorkspace = resolve("C:/catalog-recovery-workspace");
+    await fixture.host.registerTarget({
+      id: "target-catalog-recovery", backendId: adapter.id, displayName: "Catalog recovery",
+      workspaceRoot: catalogWorkspace, managed: false, trusted: true
+    });
+    adapter.catalogEntry = {
+      nativeReference: "managed://source/catalog-recovery",
+      nativeSessionId: "catalog-recovery-native", title: "Recovered task",
+      workingDirectory: catalogWorkspace, createdAt: 23, modifiedAt: 123,
+      archived: false, placement: "dialogue", existingMatch: "binding_and_placement"
+    };
+    const snapshot = await fixture.host.scanNativeSessionCatalogSnapshot(adapter.id, true);
+    const operationId = "catalog-recovery-operation";
+    await expect(fixture.host.createSession({
+      operationId, connection: fixture.connection, targetId: "target-catalog-recovery",
+      title: "Recovered task", fastMode: false, permissionMode: "ask", planMode: false,
+      initialPlacement: "dialogue",
+      catalogImport: { archived: false, createdAt: 23, modifiedAt: 123, snapshotToken: snapshot.token },
+      nativeStart: { kind: "attach", nativeReference: adapter.catalogEntry.nativeReference }
+    })).rejects.toThrow();
+    const receipt = fixture.store.getNativeCatalogAdoption(operationId);
+    expect(receipt).toMatchObject({ state: "unknown", backendId: adapter.id });
+    expect(fixture.store.getOperation(operationId).status).toBe("started");
+    expect(native.binds).toBe(1);
+    expect(fixture.store.listSessions({ includeDeleted: true }).some((item) => item.descriptor.id === receipt.sessionId))
+      .toBe(false);
+    const stranger = fixture.store.createConnection({
+      id: "catalog-recovery-stranger", name: "Another device", authKeyDigest: "other-digest"
+    });
+    expect(fixture.host.listNativeCatalogAdoptionsForUser({ connection: stranger, limit: 10, offset: 0 }).adoptions)
+      .toEqual([]);
+    await expect(fixture.host.reconcileNativeCatalogAdoptionForUser({ connection: stranger, operationId }))
+      .rejects.toBeInstanceOf(AuthorizationError);
+
+    await fixture.host.dispose();
+    const resumedAdapter = new ClaimedCatalogImportFakeAdapter(native);
+    const resumed = new SessionHost(fixture.store, fixture.artifacts, [resumedAdapter]);
+    cleanups.push(() => resumed.dispose());
+    await resumed.initialize();
+    const result = await resumed.reconcileNativeCatalogAdoptionForUser({
+      connection: fixture.connection, operationId
+    });
+    expect(result).toMatchObject({ inspection: "present", adoption: { state: "adopted", sessionId: receipt.sessionId } });
+    expect(fixture.store.getOperation(operationId).status).toBe("completed");
+    expect(fixture.store.getSession(receipt.sessionId).descriptor.binding).toEqual(receipt.binding);
+    expect(native.binds).toBe(1);
+    expect(resumed.listNativeCatalogAdoptionsForUser({ connection: fixture.connection, limit: 10, offset: 0 }).adoptions)
+      .toEqual([]);
+  });
+
+  it.each(["absent", "unknown", "owner_drift"] as const)(
+    "keeps a claimed native catalog placement safe when reconciliation is %s",
+    async (scenario) => {
+      const native = {
+        state: "absent" as "present" | "absent" | "unknown",
+        binds: 0,
+        materializeOnBind: scenario !== "absent"
+      };
+      const adapter = new ClaimedCatalogImportFakeAdapter(native);
+      const fixture = await createFixture(adapter);
+      const workspace = resolve("C:/catalog-recovery-branches");
+      await fixture.host.registerTarget({
+        id: "target-catalog-branches", backendId: adapter.id, displayName: "Catalog recovery",
+        workspaceRoot: workspace, managed: false, trusted: true
+      });
+      adapter.catalogEntry = {
+        nativeReference: "managed://source/catalog-branches",
+        nativeSessionId: "catalog-branches-native", title: "Recovered task",
+        workingDirectory: workspace, createdAt: 23, modifiedAt: 123,
+        archived: false, placement: "dialogue", existingMatch: "binding_and_placement"
+      };
+      const snapshot = await fixture.host.scanNativeSessionCatalogSnapshot(adapter.id, true);
+      const operationId = `catalog-${scenario}-operation`;
+      await expect(fixture.host.createSession({
+        operationId, connection: fixture.connection, targetId: "target-catalog-branches",
+        title: "Recovered task", fastMode: false, permissionMode: "ask", planMode: false,
+        initialPlacement: "dialogue",
+        catalogImport: { archived: false, createdAt: 23, modifiedAt: 123, snapshotToken: snapshot.token },
+        nativeStart: { kind: "attach", nativeReference: adapter.catalogEntry.nativeReference }
+      })).rejects.toThrow();
+      const receipt = fixture.store.getNativeCatalogAdoption(operationId);
+      if (scenario === "unknown") native.state = "unknown";
+      if (scenario === "owner_drift") {
+        fixture.store.upsertTarget({
+          ...fixture.store.getTarget(receipt.targetId).descriptor,
+          displayName: "Changed Target"
+        });
+      }
+      await fixture.host.dispose();
+      const resumed = new SessionHost(fixture.store, fixture.artifacts, [new ClaimedCatalogImportFakeAdapter(native)]);
+      cleanups.push(() => resumed.dispose());
+      await resumed.initialize();
+      const result = await resumed.reconcileNativeCatalogAdoptionForUser({
+        connection: fixture.connection, operationId
+      });
+      expect(native.binds).toBe(1);
+      expect(fixture.store.listSessions({ includeDeleted: true }).some((item) => item.descriptor.id === receipt.sessionId))
+        .toBe(false);
+      if (scenario === "absent") {
+        expect(result).toMatchObject({ inspection: "absent", adoption: { state: "absent" } });
+        expect(fixture.store.getOperation(operationId).status).toBe("failed");
+        expect(resumed.listNativeCatalogAdoptionsForUser({ connection: fixture.connection, limit: 10, offset: 0 }).adoptions)
+          .toEqual([]);
+      } else {
+        expect(result).toMatchObject({ inspection: "unknown", adoption: { state: "pending" } });
+        expect(fixture.store.getOperation(operationId).status).toBe("started");
+        expect(resumed.listNativeCatalogAdoptionsForUser({ connection: fixture.connection, limit: 10, offset: 0 }).adoptions)
+          .toHaveLength(1);
+      }
+    }
+  );
+
   it("authoritatively validates catalog reclassification without overwriting newer local presentation", async () => {
     const adapter = new CatalogImportFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -16420,7 +16536,11 @@ class CatalogImportFakeAdapter extends ObservedAttachFakeAdapter {
 
   async bindCatalogSession(
     entry: NativeSessionCatalogEntry,
-    generation: number
+    generation: number,
+    _claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
   ): Promise<NativeSessionBinding> {
     this.catalogBindingCalls += 1;
     return {
@@ -16428,6 +16548,39 @@ class CatalogImportFakeAdapter extends ObservedAttachFakeAdapter {
       ...(entry.nativeSessionId === undefined ? {} : { nativeSessionId: entry.nativeSessionId }),
       generation
     };
+  }
+}
+
+class ClaimedCatalogImportFakeAdapter extends CatalogImportFakeAdapter {
+  constructor(private readonly native: {
+    state: "present" | "absent" | "unknown";
+    binds: number;
+    materializeOnBind?: boolean;
+  }) {
+    super();
+  }
+
+  override async bindCatalogSession(
+    entry: NativeSessionCatalogEntry,
+    generation: number,
+    claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
+  ): Promise<NativeSessionBinding> {
+    this.native.binds += 1;
+    const binding = {
+      opaqueRef: `managed://active/${entry.nativeSessionId}`,
+      nativeSessionId: entry.nativeSessionId,
+      generation
+    };
+    await claimMaterialization({ binding, recoveryReference: JSON.stringify({ version: 1, owner: entry.nativeReference }) });
+    if (this.native.materializeOnBind !== false) this.native.state = "present";
+    throw new Error("The native placement completed but its reply was lost.");
+  }
+
+  async inspectCatalogSessionMaterialization(): Promise<"present" | "absent" | "unknown"> {
+    return this.native.state;
   }
 }
 

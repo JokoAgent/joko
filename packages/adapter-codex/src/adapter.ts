@@ -67,6 +67,7 @@ import {
 } from "./protocol.js";
 import { projectCodexNativeHistory } from "./native-history.js";
 import {
+  inspectCodexCatalogMaterialization,
   materializeCodexCatalogSession,
   validateCodexCatalogSource
 } from "./session-materialization.js";
@@ -1517,7 +1518,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async bindCatalogSession(
     entry: NativeSessionCatalogEntry,
-    generation: number
+    generation: number,
+    claimMaterialization: (claim: {
+      readonly binding: NativeSessionBinding;
+      readonly recoveryReference: string;
+    }) => Promise<void>
   ): Promise<NativeSessionBinding> {
     this.#assertOpen();
     const activeProfileKey = await this.#activeProfileKey;
@@ -1539,12 +1544,31 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       || parsed.sourceFingerprint !== source.fingerprint) {
       throw expiredCatalogReference();
     }
+    const binding = bindingForThread(parsed.threadId, generation, activeProfileKey);
     await this.#withCatalogMaterializationLock(() => materializeCodexCatalogSession({
       activeProfileDirectory: this.#profileDirectory,
       source,
-      entry
+      entry,
+      claim: async (recoveryReference) => claimMaterialization({ binding, recoveryReference })
     }));
-    return bindingForThread(parsed.threadId, generation, activeProfileKey);
+    return binding;
+  }
+
+  async inspectCatalogSessionMaterialization(
+    binding: NativeSessionBinding,
+    recoveryReference: string
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      this.#assertOpen();
+      const parsed = parseNativeReference(binding.opaqueRef);
+      if (binding.nativeSessionId !== parsed.threadId
+        || parsed.profileKey !== await this.#activeProfileKey) return "unknown";
+      return await inspectCodexCatalogMaterialization(
+        recoveryReference, this.#profileDirectory, parsed.threadId
+      );
+    } catch {
+      return "unknown";
+    }
   }
 
   async getNativeHistoryProjection(context: AdapterContext): Promise<NativeHistoryProjection> {

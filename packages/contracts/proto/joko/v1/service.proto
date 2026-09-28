@@ -94,6 +94,8 @@ service SessionService {
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc DiscoverNativeSessions(DiscoverNativeSessionsRequest) returns (DiscoverNativeSessionsResponse);
   rpc ScanNativeSessionCatalog(ScanNativeSessionCatalogRequest) returns (ScanNativeSessionCatalogResponse);
+  rpc ListNativeCatalogAdoptions(ListNativeCatalogAdoptionsRequest) returns (ListNativeCatalogAdoptionsResponse);
+  rpc ReconcileNativeCatalogAdoption(ReconcileNativeCatalogAdoptionRequest) returns (ReconcileNativeCatalogAdoptionResponse);
   rpc GetNativeSessionTree(GetNativeSessionTreeRequest) returns (GetNativeSessionTreeResponse);
   rpc GetSessionStatistics(GetSessionStatisticsRequest) returns (GetSessionStatisticsResponse);
   rpc ListRuntimeCommands(ListRuntimeCommandsRequest) returns (ListRuntimeCommandsResponse);
@@ -975,6 +977,49 @@ message ScanNativeSessionCatalogResponse {
   uint64 rejected_count = 2;
   uint64 existing_count = 3;
   string snapshot_token = 4;
+}
+
+enum NativeCatalogAdoptionState {
+  NATIVE_CATALOG_ADOPTION_STATE_UNSPECIFIED = 0;
+  NATIVE_CATALOG_ADOPTION_STATE_PENDING = 1;
+  NATIVE_CATALOG_ADOPTION_STATE_ADOPTED = 2;
+  NATIVE_CATALOG_ADOPTION_STATE_ABSENT = 3;
+}
+
+enum NativeCatalogAdoptionInspection {
+  NATIVE_CATALOG_ADOPTION_INSPECTION_UNSPECIFIED = 0;
+  NATIVE_CATALOG_ADOPTION_INSPECTION_PRESENT = 1;
+  NATIVE_CATALOG_ADOPTION_INSPECTION_ABSENT = 2;
+  NATIVE_CATALOG_ADOPTION_INSPECTION_UNKNOWN = 3;
+}
+
+message NativeCatalogAdoption {
+  string operation_id = 1;
+  string backend_id = 2;
+  string target_id = 3;
+  string title = 4;
+  NativeCatalogAdoptionState state = 5;
+  uint64 revision = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  optional string session_id = 8;
+}
+
+message ListNativeCatalogAdoptionsRequest {
+  PageRequest page = 1;
+}
+
+message ListNativeCatalogAdoptionsResponse {
+  repeated NativeCatalogAdoption adoptions = 1;
+  PageInfo page = 2;
+}
+
+message ReconcileNativeCatalogAdoptionRequest {
+  string operation_id = 1;
+}
+
+message ReconcileNativeCatalogAdoptionResponse {
+  NativeCatalogAdoption adoption = 1;
+  NativeCatalogAdoptionInspection inspection = 2;
 }
 
 message GetSessionRequest {

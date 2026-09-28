@@ -1146,8 +1146,16 @@ describe("CodexBackendAdapter", () => {
       placement: "dialogue"
     });
 
-    const first = await adapter.bindCatalogSession(entry, 3);
-    const second = await adapter.bindCatalogSession(entry, 3);
+    let claimCount = 0;
+    const claim = vi.fn(async (value: { readonly binding: NativeSessionBinding; readonly recoveryReference: string }) => {
+      claimCount += 1;
+      expect(value.binding.nativeSessionId).toBe(fixture.nativeSessionId);
+      if (claimCount === 1) expect(readCatalogThread(fixture.active, fixture.nativeSessionId)).toBeUndefined();
+      expect(JSON.parse(value.recoveryReference)).toMatchObject({ version: 1 });
+    });
+    const first = await adapter.bindCatalogSession(entry, 3, claim);
+    const second = await adapter.bindCatalogSession(entry, 3, claim);
+    expect(claim).toHaveBeenCalledTimes(2);
     expect(second).toEqual(first);
     expect(first.nativeSessionId).toBe(fixture.nativeSessionId);
     expect(first.opaqueRef).not.toBe(entry.nativeReference);
@@ -1166,6 +1174,32 @@ describe("CodexBackendAdapter", () => {
     expect(rescanned.entries[0]?.nativeReference).toBe(first.opaqueRef);
   });
 
+  it("classifies a claimed cross-profile placement without repeating or creating native state", async () => {
+    const fixture = await catalogProfileFixture("77777777-7777-4777-8777-777777777777", false);
+    const adapter = catalogOnlyAdapter(fixture.active, fixture.source);
+    cleanups.push(() => adapter.dispose());
+    const entry = (await adapter.scanNativeSessionCatalog()).entries[0]!;
+    let claimed: { readonly binding: NativeSessionBinding; readonly recoveryReference: string } | undefined;
+    await expect(adapter.bindCatalogSession(entry, 2, async (value) => {
+      claimed = value;
+      throw new Error("The durable claim was rejected.");
+    })).rejects.toThrow("The durable claim was rejected.");
+    if (claimed === undefined) throw new Error("Expected a pre-effect claim.");
+    expect(readCatalogThread(fixture.active, fixture.nativeSessionId)).toBeUndefined();
+    expect(await adapter.inspectCatalogSessionMaterialization(claimed.binding, claimed.recoveryReference))
+      .toBe("absent");
+    const binding = await adapter.bindCatalogSession(entry, 2, async () => undefined);
+    expect(binding).toEqual(claimed.binding);
+    expect(await adapter.inspectCatalogSessionMaterialization(binding, claimed.recoveryReference))
+      .toBe("present");
+    const row = readCatalogThread(fixture.active, fixture.nativeSessionId);
+    await writeFile(String(row?.["rollout_path"]), "external replacement\n", "utf8");
+    expect(await adapter.inspectCatalogSessionMaterialization(binding, claimed.recoveryReference))
+      .toBe("unknown");
+    expect(await adapter.inspectCatalogSessionMaterialization({ ...binding, nativeSessionId: "other" }, claimed.recoveryReference))
+      .toBe("unknown");
+  });
+
   it("fails closed when an external rollout changes after scanning", async () => {
     const fixture = await catalogProfileFixture("22222222-2222-4222-8222-222222222222", false);
     const adapter = catalogOnlyAdapter(fixture.active, fixture.source);
@@ -1174,7 +1208,7 @@ describe("CodexBackendAdapter", () => {
 
     await writeFile(fixture.sourceRollout, `${fixture.rolloutContent}changed\n`, "utf8");
 
-    await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+    await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
       publicError: { code: "CODEX_CATALOG_SOURCE_CHANGED" }
     });
   });
@@ -1213,7 +1247,7 @@ describe("CodexBackendAdapter", () => {
       }
 
       await expect(adapter.scanNativeSessionCatalog()).resolves.toMatchObject({ entries: [{}] });
-      await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+      await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
         publicError: { code: "CODEX_CATALOG_SOURCE_CHANGED" }
       });
     }
@@ -1236,7 +1270,7 @@ describe("CodexBackendAdapter", () => {
       modifiedAt: 2_000
     });
 
-    await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+    await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
       publicError: { code: "CODEX_CATALOG_TARGET_CONFLICT" }
     });
     await expect(readFile(conflictingRollout, "utf8")).resolves.toBe("conflict\n");
@@ -1259,7 +1293,7 @@ describe("CodexBackendAdapter", () => {
     }
     if (!linked) return;
     try {
-      await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+      await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
         publicError: { code: "CODEX_CATALOG_TARGET_CONFLICT" }
       });
       await expect(readdir(outside)).resolves.toEqual([]);
@@ -1286,7 +1320,7 @@ describe("CodexBackendAdapter", () => {
       database.close();
     }
 
-    await expect(adapter.bindCatalogSession(entry, 2)).rejects.toMatchObject({
+    await expect(adapter.bindCatalogSession(entry, 2, async () => undefined)).rejects.toMatchObject({
       publicError: { code: "CODEX_CATALOG_MATERIALIZATION_UNAVAILABLE" }
     });
     const published = await readdir(join(fixture.active, "sessions", "catalog-imports"), {

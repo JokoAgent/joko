@@ -2330,6 +2330,70 @@ describe("OperationalStore", () => {
     expect(store.getOperation(claim.operation.id).status).toBe("completed");
   });
 
+  it("persists an exact native catalog adoption owner before cross-profile materialization", () => {
+    const fixture = createFixture();
+    const store = fixture.store;
+    const connection = store.createConnection({
+      id: "catalog-adoption-connection", name: "Catalog adoption client", authKeyDigest: "catalog-adoption-digest"
+    });
+    const claim = store.claimAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest,
+      { id: "catalog-adoption-operation", kind: "create_session", body: { targetId: "target-1" } }
+    );
+    if (!claim.claimed) throw new Error("Expected a catalog import Operation claim.");
+    const input = {
+      operationId: claim.operation.id,
+      operationBodyHash: claim.operation.bodyHash,
+      connectionId: connection.id,
+      authKeyDigest: connection.authKeyDigest,
+      sessionId: "catalog-adoption-session",
+      backendId: "pi",
+      targetId: "target-1",
+      targetRevision: store.getTarget("target-1").revision,
+      backendGeneration: store.getBackend("pi").descriptor.instanceGeneration,
+      binding: { opaqueRef: "native://active/exact", nativeSessionId: "native-exact", generation: 1 },
+      entry: {
+        nativeReference: "native://source/exact", nativeSessionId: "native-exact", title: "Source task",
+        workingDirectory: store.getTarget("target-1").descriptor.workspaceRoot,
+        createdAt: 1, modifiedAt: 2, archived: false,
+        placement: "project" as const, existingMatch: "binding_and_placement" as const
+      },
+      recoveryReference: JSON.stringify({ version: 1, source: "exact" })
+    };
+    expect(() => store.claimNativeCatalogAdoption({ ...input, targetRevision: 0n })).toThrow(StoreError);
+    const recorded = store.claimNativeCatalogAdoption(input);
+    expect(recorded).toMatchObject({ state: "claimed", sessionId: input.sessionId, binding: input.binding });
+    expect(() => store.claimNativeCatalogAdoption(input)).toThrow(StoreError);
+    expect(() => store.createSession({
+      ...store.getSession("session-1").descriptor,
+      id: "catalog-adoption-duplicate",
+      binding: input.binding
+    })).toThrow(StoreError);
+    const other = store.claimAuthorizedDeferredEffectOperation(
+      connection.id, connection.authKeyDigest,
+      { id: "catalog-adoption-other", kind: "create_session", body: { targetId: "target-1" } }
+    );
+    if (!other.claimed) throw new Error("Expected another catalog import Operation claim.");
+    expect(() => store.claimNativeCatalogAdoption({
+      ...input, operationId: other.operation.id, operationBodyHash: other.operation.bodyHash,
+      sessionId: "catalog-adoption-other-session"
+    })).toThrow(StoreError);
+    const filePath = store.filePath;
+    store.close();
+    const reopened = new OperationalStore(filePath);
+    cleanups.push(() => reopened.close());
+    expect(reopened.listPendingNativeCatalogAdoptions()).toHaveLength(1);
+    expect(reopened.getOperation(claim.operation.id).status).toBe("started");
+    const unknown = reopened.markNativeCatalogAdoptionUnknown(claim.operation.id);
+    expect(unknown.state).toBe("unknown");
+    expect(() => reopened.confirmNativeCatalogAdoptionState(claim.operation.id, recorded.revision, "absent"))
+      .toThrow(StoreError);
+    expect(reopened.confirmNativeCatalogAdoptionState(claim.operation.id, unknown.revision, "absent").state)
+      .toBe("absent");
+    expect(reopened.listPendingNativeCatalogAdoptions()).toHaveLength(0);
+    expect(reopened.getOperation(claim.operation.id).status).toBe("started");
+  });
+
   it("rolls back a failed deferred finalizer and leaves the claim available for a failure tombstone", () => {
     const store = createStore();
     const connection = store.createConnection({
